@@ -6,7 +6,7 @@ use crate::error::{EngineResult, TnEngineError};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain, ProviderError,
+    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, ProviderError,
     RethEnv,
 };
 use tn_types::{
@@ -96,13 +96,18 @@ pub fn execute_consensus_output(
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
-    let anchor_hash = canonical_header.hash();
     // The pre-output canonical tip. Each block eagerly advances the shared in-memory state
     // (see `execute_payload`), but the durable commit happens only after the whole output builds.
     // If a later block fails, the earlier blocks' advance is rolled back to this header so no
     // phantom canonical head survives (see `rollback_in_memory_output`).
     let anchor_header = canonical_header.clone();
-    let mut ancestors: Vec<DeferredTrieData> = Vec::with_capacity(batches.len().max(1));
+    // ONE output-scoped trie overlay, anchored at the pre-output database tip. Each built
+    // block's sorted deltas are merged into it in place, so later blocks' state roots layer
+    // the accumulated deltas over the database instead of re-merging every unpersisted
+    // ancestor per block through reth's memory-overlay provider (#1301). Dropped with this
+    // scope: persistence uses the per-block deltas, never this accumulation, and an error
+    // path discards it together with the rolled-back in-memory advance.
+    let mut output_overlay = OutputTrieOverlay::new();
 
     if batches.is_empty() {
         if !output.close_epoch() {
@@ -149,6 +154,9 @@ pub fn execute_consensus_output(
             .ok_or(TnEngineError::UnknownAuthority(leader.clone()))
             .inspect_err(|e| error!(target: "engine", ?e, "failed to find leader's execution address for empty output"))?;
 
+        // Pre-fork this reduces to the bare consensus header digest (zero batch digest);
+        // post-fork it is the seed-chain PREVRANDAO derivation (#1247).
+        let mix_hash = output.prev_randao(0, B256::ZERO);
         let payload = TNPayload::new(
             canonical_header,
             beneficiary,
@@ -158,8 +166,8 @@ pub fn execute_consensus_output(
             output_digest,
             base_fee_per_gas,
             gas_limit,
-            output_digest, // use output digest for mix hash
-            0,             // Use worker 0 becuase we have to provide on.
+            mix_hash,
+            0, // Use worker 0 becuase we have to provide on.
         );
 
         debug!(target: "engine", "executing empty batch payload");
@@ -171,8 +179,7 @@ pub fn execute_consensus_output(
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
-            anchor_hash,
-            &ancestors,
+            &mut output_overlay,
         );
         // On failure, revert the in-memory advance applied by any earlier block of this output so
         // the propagated error never leaves a phantom canonical head observable to RPC. The leader
@@ -181,9 +188,6 @@ pub fn execute_consensus_output(
         canonical_header = executed.inspect_err(|_| {
             rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
         })?;
-        if let Some(last_block) = executed_blocks.last() {
-            ancestors.push(last_block.trie_data_handle());
-        }
     } else {
         // loop and construct blocks from batches with transactions
         for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
@@ -197,12 +201,18 @@ pub fn execute_consensus_output(
             let base_fee_per_gas = batch.base_fee_per_gas;
             let gas_limit = max_batch_gas(epoch);
 
-            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch
-            // for round
-            let mix_hash = output_digest ^ batch_digest;
+            // Pre-fork: XOR with the worker's digest for a unique mix hash per batch in the
+            // round. Post-fork: the seed-chain PREVRANDAO derivation, still unique per batch
+            // via the batch index but immune to payload grinding (#1247).
+            let mix_hash = output.prev_randao(batch_index, batch_digest);
+            // The block beneficiary that receives this batch's priority fees is the producer's
+            // own `Batch::beneficiary` (#1222). That field is covered by the batch digest, so a
+            // byzantine header that copies another validator's batch digest cannot redirect the
+            // fees: whichever header references the digest, the batch carries its producer's
+            // beneficiary.
             let payload = TNPayload::new(
                 canonical_header,
-                cert_batch.address,
+                batch.beneficiary,
                 batch_index,
                 batch_digest,
                 &output,
@@ -220,8 +230,7 @@ pub fn execute_consensus_output(
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
-                anchor_hash,
-                &ancestors,
+                &mut output_overlay,
             );
             // On failure of a later block, revert the in-memory advance applied by the earlier
             // blocks of this output so the propagated (node-halting) error never leaves a phantom
@@ -236,9 +245,6 @@ pub fn execute_consensus_output(
                     &executed_blocks,
                 )
             })?;
-            if let Some(last_block) = executed_blocks.last() {
-                ancestors.push(last_block.trie_data_handle());
-            }
             // Advances gas accounting before durable finalization, safe for the reason documented
             // at the top of this function. `inc_block` skips any block whose `gas_used` is zero, so
             // a restart replay does not inflate the per-worker block count.
@@ -283,18 +289,21 @@ pub fn execute_consensus_output(
 }
 
 /// Execute the transaction and update canon chain in-memory.
+///
+/// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
+/// computes this block's state root layered over it and then extends it with the block's
+/// sorted deltas for the NEXT block of the output (#1301).
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
-    anchor_hash: B256,
-    ancestors: &[DeferredTrieData],
+    output_overlay: &mut OutputTrieOverlay,
 ) -> EngineResult<SealedHeader> {
     // execute
     let next_canonical_block =
-        reth_env.build_block_from_batch_payload(payload, transactions, anchor_hash, ancestors)?;
+        reth_env.build_block_from_batch_payload(payload, transactions, output_overlay)?;
     debug!(target: "engine", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
@@ -303,10 +312,11 @@ fn execute_payload(
     crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
-    // output: the next block in the loop resolves its parent state through this advance. The
-    // advance is speculative until the whole output commits durably after the loop; if a later
-    // block fails to build, `execute_consensus_output` compensates it via
-    // `rollback_in_memory_output`.
+    // output: the next block in the loop resolves its parent state through this advance
+    // (account/storage/bytecode reads via reth's memory overlay; the state root itself runs
+    // over `output_overlay` instead, see #1301). The advance is speculative until the whole
+    // output commits durably after the loop; if a later block fails to build,
+    // `execute_consensus_output` compensates it via `rollback_in_memory_output`.
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });

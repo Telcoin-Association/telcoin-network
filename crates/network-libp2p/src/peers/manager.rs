@@ -17,7 +17,7 @@ use crate::{
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
-use rand::seq::{IteratorRandom as _, SliceRandom as _};
+use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -691,8 +691,12 @@ impl PeerManager {
 
         // seed discovery peers from peer exchange
         if current_count < max_discovery_peers {
-            // convert eligible peers to `PeerInfo` for processing
-            let mut peers: Vec<_> = peers
+            // reservoir-sample the missing target number of eligible peers so the
+            // collected buffer and the shuffle stay bounded by the open discovery
+            // slots; the per-entry eligibility pass still visits each codec-bounded entry
+            let peers_to_take = max_discovery_peers - current_count;
+            let mut rng = rand::rng();
+            let peers = peers
                 .into_iter()
                 .filter_map(|(_, (net_key, addrs))| {
                     let info =
@@ -707,20 +711,15 @@ impl PeerManager {
                         None
                     }
                 })
-                .collect();
+                .choose_multiple(&mut rng, peers_to_take);
 
-            debug!(target: "peer-manager", eligible=?peers, "processing peer exchange");
+            debug!(target: "peer-manager", sampled=?peers, "processing peer exchange");
 
-            // shuffle all peers
-            let mut rng = rand::rng();
-            peers.shuffle(&mut rng);
-
-            // add target number of peers for discovery
-            let peers_to_take = max_discovery_peers - current_count;
-            for peer in peers.into_iter().take(peers_to_take) {
+            // add sampled peers for discovery
+            peers.into_iter().for_each(|peer| {
                 debug!(target: "peer-manager", peer=?peer.peer_id, "added peer to discovery peers");
                 self.discovery_peers.insert(peer.peer_id, peer.addrs);
-            }
+            });
         }
     }
 
@@ -1173,12 +1172,31 @@ impl PeerManager {
 
     /// Process newly discovered peers for potential dial attempts.
     ///
-    /// Only eligible peers are stored for dialing during heartbeat.
+    /// Only eligible peers are stored for dialing during heartbeat. The set is bounded to
+    /// `max_discovery_peers` at insert time, so the bound holds within a heartbeat window
+    /// instead of relying on the next heartbeat to prune overshoot (issue #1252). The bound is
+    /// enforced by merging the newcomers and then randomly evicting down to the cap, never by
+    /// rejecting newcomers: a first-come cap would let whoever fills the set first (or an
+    /// attacker feeding eligible-but-unreachable ids) own the pool and starve fresh kad
+    /// results, while random eviction over the union keeps the pool rotating exactly like the
+    /// heartbeat prune it mirrors. [`Self::process_peer_exchange`] stays fill-to-spare-capacity
+    /// only, which keeps kad-discovered peers prioritized over exchange peers.
     pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
         peers.retain(|peer| self.eligible_for_discovery(peer));
-        let peers: HashSet<_> = peers.into_iter().map(|info| (info.peer_id, info.addrs)).collect();
         trace!(target: "peer-manager", ?peers, "adding eligible peers to discovery map");
-        self.discovery_peers.extend(peers);
+        self.discovery_peers.extend(peers.into_iter().map(|info| (info.peer_id, info.addrs)));
+
+        // sample down to the cap over old and new entries alike
+        let max_discovery_peers = self.config.max_discovery_peers();
+        let excess = self.discovery_peers.len().saturating_sub(max_discovery_peers);
+        if excess > 0 {
+            let mut rng = rand::rng();
+            let to_remove: Vec<PeerId> =
+                self.discovery_peers.keys().copied().choose_multiple(&mut rng, excess);
+            to_remove.into_iter().for_each(|peer| {
+                self.discovery_peers.remove(&peer);
+            });
+        }
     }
 
     /// Check peer counts and initiate dial attempts to maintain connection targets.

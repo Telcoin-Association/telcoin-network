@@ -9,8 +9,8 @@ use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, EpochVote, Noticer, TaskSpawner, TnReceiver as _,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
+    EpochVote, ShutdownNotifier, TaskSpawner, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -18,7 +18,7 @@ use tokio::sync::{
 };
 use tracing::{error, info, warn};
 
-type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
+type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>)>;
 
 /// Per-iteration wait for the next epoch vote in [`manage_epoch_votes`]'s collection loop.
 pub(crate) const EPOCH_VOTE_RECV_TIMEOUT: Duration = Duration::from_millis(2500);
@@ -33,6 +33,11 @@ pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
 /// Number of peer-recovery attempts [`manage_epoch_votes`] makes (each one
 /// `request_epoch_cert` call) after failing to reach a local vote quorum.
 pub(crate) const EPOCH_CERT_RECOVERY_ATTEMPTS: u32 = 5;
+
+/// Delay before gossiping our freshly-signed epoch vote, so slower nodes can reach the new epoch
+/// and hold its record before our vote arrives (otherwise they drop it and wait for a republish).
+/// The local collector is still seeded immediately; only the outbound gossip is staggered.
+const INITIAL_VOTE_PUBLISH_DELAY: Duration = Duration::from_millis(500);
 
 /// Both save and persist an epoch record and cert with logging.
 async fn save_and_persist_with_logs(
@@ -63,6 +68,7 @@ async fn manage_epoch_votes(
     primary_network: PrimaryNetworkHandle,
     mut vote_rx: Receiver<EpochVote>,
     consensus_chain: ConsensusChain,
+    node_shutdown: ShutdownNotifier,
 ) {
     let epoch_hash = epoch_rec.digest();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
@@ -74,37 +80,24 @@ async fn manage_epoch_votes(
 
     // If we are in the committee, sign and publish our vote
     let me = key_config.primary_public_key();
-    if committee_keys.contains(&me) {
-        committee_keys.remove(&me);
-        let epoch_vote = epoch_rec.sign_vote(&key_config);
-        // The aggregate must hold exactly one signature per bitmap bit, so a
-        // signature is only ever pushed when its authority index is newly
-        // inserted — a redelivered vote can then never desync the two.
-        if let Some(idx) = committee_index.get(&me) {
-            if signed_authorities.insert(*idx as u32) {
-                sigs.push(epoch_vote.signature);
-            }
-        }
-        info!(
-            target: "epoch-manager",
-            "publishing epoch record {epoch_hash}",
-        );
-        let _ = primary_network.publish_epoch_vote(epoch_vote).await;
-        my_vote = Some(epoch_vote);
-    }
     // Collect votes from peers
     let mut reached_quorum = false;
     let mut timeout = EPOCH_VOTE_RECV_TIMEOUT;
     let mut timeouts = 0;
-    let mut alt_recs: HashMap<EpochDigest, usize> = HashMap::default();
     let committee_size = epoch_rec.committee.len() as u64;
     let quorum = epoch_rec.super_quorum();
+    let shutdown = node_shutdown.subscribe();
     loop {
         tokio::select! {
+            _ = &shutdown => return,
             result = tokio::time::timeout(timeout, vote_rx.recv()) => {
                 match result {
                     Ok(None) => break,  // Channel closed- we are done.
                     Ok(Some(vote)) => {
+                        if vote.public_key == me {
+                            // Record our vote if we see it for this epoch so we can revote if/when needed.
+                            my_vote = Some(vote);
+                        }
                         if vote.epoch != epoch_rec.epoch {
                             continue;
                         }
@@ -130,25 +123,12 @@ async fn manage_epoch_votes(
                                 }
                             }
                         } else if vote.epoch_hash != epoch_hash {
-                            // Defense-in-depth: the primary gossip handler now only forwards votes
-                            // whose digest matches the record it holds, so this branch is not
-                            // reached in normal operation (a forked local record instead recovers
-                            // via the epoch-cert download path below).
-                            // Track votes for alternative epoch records — remove key so
-                            // a validator can only vote once (correct or alt), no equivocation.
-                            if committee_keys.remove(&vote.public_key) {
-                                let count = alt_recs.entry(vote.epoch_hash).or_default();
-                                *count += 1;
-                                if *count >= quorum {
-                                    error!(
-                                        target: "epoch-manager",
-                                        "Reached quorum on epoch record {} instead of {}.",
-                                        vote.epoch_hash,
-                                        epoch_hash,
-                                    );
-                                    break;
-                                }
-                            }
+                            error!(
+                                target: "epoch-manager",
+                                "Received an epoch record vote for {} instead of {}. This should not be possible (gossip is filtered).",
+                                vote.epoch_hash,
+                                epoch_hash,
+                            );
                         }
                     }
                     Err(_) => {
@@ -173,6 +153,12 @@ async fn manage_epoch_votes(
             target: "epoch-manager",
             "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
         );
+        // Republish our vote one final time.  This is not strictly needed but if we were the first
+        // validator to close the epoch and we got no timeouts the laggy validators may have
+        // missed our vote- give them one more chance.
+        if let Some(vote) = my_vote {
+            let _ = primary_network.publish_epoch_vote(vote).await;
+        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -234,11 +220,15 @@ async fn manage_epoch_votes(
                     {
                         let new_epoch_hash = new_epoch_rec.digest();
                         if new_epoch_hash != epoch_hash {
-                            warn!(
+                            error!(
                                 target: "epoch-manager",
-                                "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
+                                "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
                             );
-                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
+                            // We generated a different record than the network certified, so we
+                            // have forked. A fork is not something a node can safely recover from
+                            // (records are deterministic, so ours is simply wrong) — fail-stop
+                            // rather than adopt the network's record and pretend to recover.
+                            node_shutdown.notify();
                         } else {
                             info!(
                                 target: "epoch-manager",
@@ -265,7 +255,7 @@ async fn manage_epoch_votes(
         if !got_epoch_record {
             error!(
                 target: "epoch-manager",
-                "Failed to retrieve an epoch record for epoch {}",
+                "Failed to retrieve an epoch record for epoch {}- We have a missing epoch certificate, if this is not local then sync will be compromised!",
                 epoch_rec.epoch,
             );
         }
@@ -273,28 +263,23 @@ async fn manage_epoch_votes(
 }
 
 /// Direct a newly received vote to it's task.
-fn get_new_vote_channel(epoch: Epoch, vote_queues: &mut VoteQueue) -> Option<Receiver<EpochVote>> {
-    for q in vote_queues.iter_mut() {
-        if q.0 == epoch {
-            return q.2.take();
-        }
-    }
-    let (epoch_vote_tx, epoch_vote_rx) = mpsc::channel(10_000);
-    if vote_queues.len() >= 5 {
-        vote_queues.pop_front();
-    }
-    vote_queues.push_back((epoch, epoch_vote_tx, None));
-    Some(epoch_vote_rx)
-}
-
-/// Direct a newly received vote to it's task.
-async fn handle_new_vote(vote: EpochVote, vote_queues: &mut VoteQueue) {
+async fn handle_new_vote(
+    vote: EpochVote,
+    vote_queues: &mut VoteQueue,
+    consensus_chain: ConsensusChain,
+    key_config: KeyConfig,
+    primary_network: PrimaryNetworkHandle,
+    task_spawner: &TaskSpawner,
+    node_shutdown: ShutdownNotifier,
+) {
     let mut remove = None;
     let mut found = false;
     for (i, q) in vote_queues.iter().enumerate() {
         if q.0 == vote.epoch {
+            // We already have a collector for this epoch so send to it.
             if q.1.send(vote).await.is_err() {
                 remove = Some(i);
+                break;
             }
             found = true;
             break;
@@ -304,19 +289,38 @@ async fn handle_new_vote(vote: EpochVote, vote_queues: &mut VoteQueue) {
         vote_queues.remove(remove);
     }
     if !found {
-        let latest_epoch = vote_queues.iter().last().map(|q| q.0);
-        if let Some(latest) = latest_epoch {
-            if vote.epoch != latest + 1 {
-                // Only collect for one future epoch.
-                return;
-            }
-        }
+        // We do not have a collector for this epoch so start one and send it this vote.
         let (epoch_vote_tx, epoch_vote_rx) = mpsc::channel(10_000);
+        // If we recieve a valid vote and aren't collecting votes to certify then start.
+        let Some((epoch_rec, None)) =
+            consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
+        else {
+            // Missing the record or it is certified.  These were pre-checked when the gossip came
+            // in so this should not happen.
+            return;
+        };
+        // Spawn the vote collector in response to a vote if it was missing.
+        // This allows the possibility of recovering a cert with a republished vote even if stale.
+        task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
+            manage_epoch_votes(
+                epoch_rec,
+                key_config,
+                primary_network,
+                epoch_vote_rx,
+                consensus_chain,
+                node_shutdown,
+            )
+            .await;
+            Ok(())
+        });
         if epoch_vote_tx.send(vote).await.is_ok() {
+            // In a properly working system only one collector at a time should run.
+            // Allow some extras though in case we have to handle epoch certification exceptions in
+            // the future.
             if vote_queues.len() >= 5 {
                 vote_queues.pop_front();
             }
-            vote_queues.push_back((vote.epoch, epoch_vote_tx, Some(epoch_vote_rx)));
+            vote_queues.push_back((vote.epoch, epoch_vote_tx));
         }
     }
 }
@@ -332,19 +336,20 @@ pub(crate) fn spawn_epoch_vote_collector(
     key_config: KeyConfig,
     primary_network: PrimaryNetworkHandle,
     node_task_spawner: TaskSpawner,
-    node_shutdown: Noticer,
+    node_shutdown: ShutdownNotifier,
 ) {
     let mut vote_rx = consensus_bus.subscribe_new_epoch_votes();
     let mut epoch_rx = consensus_bus.epoch_record_watch().subscribe();
     let task_spawner = node_task_spawner.clone();
     let mut vote_queues: VoteQueue = VecDeque::with_capacity(5);
+    let shutdown = node_shutdown.subscribe();
 
     node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
         loop {
             // Wait for an EpochRecord to arrive
             let epoch_rec = loop {
                 tokio::select! {
-                    _ = &node_shutdown => return Ok(()),
+                    _ = &shutdown => return Ok(()),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -354,32 +359,69 @@ pub(crate) fn spawn_epoch_vote_collector(
                         match result {
                             None => return Ok(()),  // Channel closed- we are done.
                             Some(vote) => {
-                                handle_new_vote(vote, &mut vote_queues).await;
+                                handle_new_vote(vote, &mut vote_queues, consensus_chain.clone(), key_config.clone(),
+                                    primary_network.clone(), &task_spawner, node_shutdown.clone()).await;
                             }
                         }
                     }
                 }
             };
 
-            if let Some(epoch_vote_rx) = get_new_vote_channel(epoch_rec.epoch, &mut vote_queues) {
-                let consensus_chain = consensus_chain.clone();
-                let primary_network = primary_network.clone();
-                let key_config = key_config.clone();
-                task_spawner.spawn_task(
-                    format!("epoch votes for epoch {}", epoch_rec.epoch),
-                    async move {
-                        manage_epoch_votes(
-                            epoch_rec,
-                            key_config,
-                            primary_network,
-                            epoch_vote_rx,
-                            consensus_chain,
-                        )
-                        .await;
-                        Ok(())
-                    },
-                );
+            let me = key_config.primary_public_key();
+            // Failsafe for a previous epoch whose certification failed (e.g. some of its committee
+            // were down for an hour or two). It should never fire under normal conditions.
+            //
+            // Deliberately NOT gated on node mode / `is_active_cvv()`: that reflects the CURRENT
+            // committee, but the node we need here was in epoch N-1's committee and may have rotated
+            // out of N's (now an `Observer`) — precisely the node that should re-vote to certify N-1.
+            // Membership in N-1's committee (checked below) is the only correct gate. This is already
+            // sync-safe: state-sync saves each record together with its cert (`epochs().save`) and
+            // never fires `epoch_record_watch`, so a syncing node's historic records are certified and
+            // this arm is skipped.
+            if epoch_rec.epoch > 0 {
+                // Previous epoch has no cert; if we were in its committee, re-sign and re-publish our
+                // vote to trigger a fresh collection attempt.
+                if let Some((last_epoch_rec, None)) = consensus_chain.epochs().get_epoch_by_number(epoch_rec.epoch.saturating_sub(1)).await {
+                    // No cert for last epoch.  Were we in the committee?
+                    if last_epoch_rec.committee.contains(&me) {
+                        // If so then lets send a vote out which will trigger a new collection attempt.
+                        let epoch_vote = last_epoch_rec.sign_vote(&key_config);
+                        error!(
+                            target: "epoch-manager",
+                            "Failed to certify last epoch, re-publishing epoch record vote for epoch {} {}", last_epoch_rec.epoch, last_epoch_rec.digest()
+                        );
+                        // Sending our vote to this channel will trigger us to start the vote collector when we get it.
+                        // The other committe members of last epoch should also do the same.
+                        // This should not happen and if it does certification may fail again but retry after an epoch anyway.
+                        let _ = consensus_bus.new_epoch_votes().send(epoch_vote).await;
+                        let _ = primary_network.publish_epoch_vote(epoch_vote).await;
+                    }
+                }
             }
+            let epoch_hash = epoch_rec.digest();
+            // If we already have a cert (for instance we are catching up) then don't vote.
+            if consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_none() {
+                // If we are in the committee and this epoch is un-certified, sign and publish our vote
+                if epoch_rec.committee.contains(&me) {
+                    let epoch_vote = epoch_rec.sign_vote(&key_config);
+                    info!(
+                        target: "epoch-manager",
+                        "publishing epoch record vote for epoch {} {epoch_hash}", epoch_rec.epoch,
+                    );
+                    // Sending our vote to this channel will trigger us to start the vote collector when we get it.
+                    let _ = consensus_bus.new_epoch_votes().send(epoch_vote).await;
+                    let primary_network_clone = primary_network.clone();
+                    task_spawner.spawn_task("publish_epoch_vote_delayed", async move {
+                        // Stagger the outbound gossip (see INITIAL_VOTE_PUBLISH_DELAY) so slower
+                        // nodes reach the new epoch and hold its record before our vote arrives;
+                        // republishes cover any that still miss it.
+                        tokio::time::sleep(INITIAL_VOTE_PUBLISH_DELAY).await;
+                        let _ = primary_network_clone.publish_epoch_vote(epoch_vote).await;
+                        Ok(())
+                    });
+                }
+            }
+            // See spawn_epoch_record_collector() for how syncing nodes can keep up there epoch certs if not following the tip.
         }
     });
 }
@@ -439,12 +481,12 @@ mod epoch_vote_collector_tests {
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_primary::{
         network::{PrimaryRequest, PrimaryResponse},
-        ConsensusBus,
+        ConsensusBus, NodeMode,
     };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::wait_until;
     use tn_test_utils_committee::CommitteeFixture;
-    use tn_types::{BlsKeypair, Notifier, TaskManager, TnSender as _};
+    use tn_types::{BlsKeypair, TaskManager};
 
     /// #1198 startup re-vote: a persisted-but-uncertified latest record re-fires the watch.
     #[tokio::test]
@@ -590,7 +632,7 @@ mod epoch_vote_collector_tests {
         spawn_publish_ack(net_rx);
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
@@ -598,7 +640,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // Sign votes from the 3 other committee members
@@ -685,7 +727,7 @@ mod epoch_vote_collector_tests {
         });
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
@@ -693,7 +735,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // Sign votes from the 3 other committee members
@@ -710,6 +752,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Wait for collector to aggregate and store
@@ -777,7 +824,7 @@ mod epoch_vote_collector_tests {
         });
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         // The node's own vote, as gossip would echo it back
         let echoed_self_vote = epoch_rec.sign_vote(&key_config);
@@ -788,7 +835,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // Buffer the echoed self-vote plus two peer votes: kp1 (self-sign) + kp2 + kp3 = quorum 3
@@ -799,6 +846,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
@@ -880,7 +932,7 @@ mod epoch_vote_collector_tests {
         });
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
@@ -888,7 +940,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // kp2 signs a vote for the ALT epoch record
@@ -910,6 +962,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
 
         // Send the correct epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Wait for collector to aggregate and store.
@@ -981,7 +1038,7 @@ mod epoch_vote_collector_tests {
         });
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
@@ -989,7 +1046,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // The ejected key signs a valid vote for the correct record — must not be counted
@@ -1002,6 +1059,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // kp1 (self) + kp2 = 2 < 3: the ejected vote must not tip this over quorum
@@ -1083,7 +1145,7 @@ mod epoch_vote_collector_tests {
         });
 
         let task_manager = TaskManager::default();
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
@@ -1091,7 +1153,7 @@ mod epoch_vote_collector_tests {
             key_config,
             primary_network,
             task_manager.get_spawner(),
-            node_shutdown.subscribe(),
+            node_shutdown.clone(),
         );
 
         // Three member votes form quorum without any self-sign from the ejected node
@@ -1103,6 +1165,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // Send the epoch record — the self-sign gate must skip the non-member node key
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Quorum (3 of 4) reached without a fourth vote: collector waits its 1s straggler
@@ -1119,6 +1186,104 @@ mod epoch_vote_collector_tests {
         assert!(cert.signed_authorities.contains(2));
 
         // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// The previous-epoch certification failsafe is gated on PREVIOUS-committee membership, NOT on
+    /// node mode. A node that was in epoch N-1's committee but has rotated out of N's committee
+    /// runs as an `Observer` (`is_active_cvv() == false`), yet it must still re-vote to help
+    /// certify an uncertified N-1. Here kp1 is in epoch 0's committee but not epoch 1's; epoch
+    /// 0 needs kp1's failsafe vote to reach quorum, so it certifies only because the failsafe
+    /// is not mode-gated.
+    #[tokio::test]
+    async fn test_previous_epoch_recovery_not_gated_by_node_mode() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1: in epoch 0's committee (super_quorum 3) but rotated OUT of epoch 1's.
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Previous epoch (0): uncertified, kp1 in committee — the failsafe target.
+        let prev_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let prev_hash = prev_rec.digest();
+        // Current epoch (1): kp1 is NOT in this committee (rotated out).
+        let cur_rec = EpochRecord {
+            epoch: 1,
+            committee: vec![pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("prev_epoch_recovery_not_gated").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Seed both records uncertified so the collector's `get_epoch_by_*` lookups find them.
+        consensus_chain.epochs().save_record(prev_rec.clone()).await.unwrap();
+        consensus_chain.epochs().save_record(cur_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Mock network: drain and ack publishes.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+
+        // kp1 rotated out of epoch 1's committee, so it runs as an Observer — is_active_cvv() is
+        // false. The failsafe must still fire because kp1 was in epoch 0's committee.
+        consensus_bus.app().node_mode().send_replace(NodeMode::Observer);
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+
+        // Two epoch-0 peers vote — one short of quorum(3). Only kp1's failsafe vote can complete
+        // it.
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(prev_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(prev_rec.sign_vote(&kc3)).await.unwrap();
+
+        // Epoch 1 arriving triggers the previous-epoch failsafe for epoch 0.
+        consensus_bus.app().epoch_record_watch().send_replace(Some(cur_rec.clone()));
+
+        // Despite the Observer mode, the failsafe re-votes for epoch 0 and completes quorum.
+        wait_until(Duration::from_secs(5), "epoch 0 certified via failsafe", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(prev_hash).await.is_some())
+        })
+        .await
+        .unwrap();
+
         node_shutdown.notify();
     }
 }

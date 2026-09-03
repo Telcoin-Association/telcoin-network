@@ -16,6 +16,7 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::mintCall;
 use tn_reth::{
     payload::TNPayload,
+    system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -175,18 +176,27 @@ impl PipelineTestEnv {
                     .with_balance(governance_safe_balance)
                     .with_code(Some(Bytes::from_static(GOVERNANCE_FORWARDER_BYTECODE))),
             ),
-            // Precompile account with balance and total supply storage
+            // Precompile account with balance and total supply storage.
+            //
+            // `extend_accounts` replaces the canonical `0x7e1` entry inherited from
+            // `test_genesis()` rather than merging into it, so the genesis code has to be restated
+            // here. Without it the account is code-less, and once its balance reaches zero (a full
+            // burn of the pool) it is empty by EIP-158 and gets cleared at the end of the block
+            // that touched it - taking the total supply slot with it.
             (
                 TELCOIN_PRECOMPILE_ADDRESS,
-                GenesisAccount::default().with_balance(precompile_balance).with_storage(Some({
-                    let mut storage = std::collections::BTreeMap::new();
-                    // Slot 100 = totalSupply
-                    storage.insert(
-                        tn_types::B256::from(U256::from(100)),
-                        tn_types::B256::from(total_supply),
-                    );
-                    storage
-                })),
+                GenesisAccount::default()
+                    .with_balance(precompile_balance)
+                    .with_code(Some(Bytes::from_static(PRECOMPILE_GENESIS_BYTECODE)))
+                    .with_storage(Some({
+                        let mut storage = std::collections::BTreeMap::new();
+                        // Slot 100 = totalSupply
+                        storage.insert(
+                            tn_types::B256::from(U256::from(100)),
+                            tn_types::B256::from(total_supply),
+                        );
+                        storage
+                    })),
             ),
         ];
         #[cfg(feature = "faucet")]
@@ -254,10 +264,13 @@ impl PipelineTestEnv {
         // 2. Build TNPayload
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
-        // 3. Build and execute block
-        let anchor_hash = self.canonical_header.hash();
-        let block =
-            self.reth_env.build_block_from_batch_payload(payload, &txs, anchor_hash, &[])?;
+        // 3. Build and execute block. Each block persists in step 5 before the next build,
+        // so a fresh empty overlay per block is exact (#1301).
+        let block = self.reth_env.build_block_from_batch_payload(
+            payload,
+            &txs,
+            &mut tn_reth::OutputTrieOverlay::new(),
+        )?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -372,7 +385,7 @@ impl PipelineTestEnv {
 /// Create a `ConsensusOutput` with a controlled timestamp.
 ///
 /// Adapted from `lib.rs:1478-1510`.
-fn consensus_output_for_test(
+pub(crate) fn consensus_output_for_test(
     round: u32,
     epoch: u32,
     subdag_index: u64,
@@ -404,4 +417,22 @@ fn consensus_output_for_test(
         VecDeque::new(),
         Vec::new(),
     )
+}
+
+/// A built block retains no cumulative ancestor trie overlay (#1266).
+///
+/// No consumer on the node's path reads `anchored_trie_input`: persistence and
+/// canonical-chain notifications use the per-block sorted deltas, and state roots and
+/// RPC proofs over unpersisted blocks assemble their trie input from those same deltas.
+/// Building the cumulative overlay cost `O(N^2 * M)` copy work and transient memory per
+/// consensus output, because reth's parent-reuse fast path deep-copies it for every
+/// block whose parent bundle is still alive.
+#[test]
+fn test_built_block_retains_no_cumulative_trie_overlay() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let first = env.execute_block(Vec::new())?;
+    let second = env.execute_block(Vec::new())?;
+    assert!(first.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    assert!(second.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    Ok(())
 }

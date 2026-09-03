@@ -8,6 +8,17 @@
 //! source of canonical blocks: there is no fork choice and no reorg path, and every
 //! committed block is final by construction.
 //!
+//! # State roots for multi-block output (#1301)
+//!
+//! Within one `ConsensusOutput`, each block's state root is computed by TN's own
+//! layered path (`OutputTrieOverlay` in `output_overlay.rs`) rather than reth's
+//! `MemoryOverlayStateProvider`: an output-scoped overlay accumulates the built
+//! blocks' sorted deltas in place, and the root runs directly against a read-only
+//! database transaction with the current block's deltas layered over the overlay.
+//! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
+//! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
+//! cost bound. All other state reads still resolve through reth's memory overlay.
+//!
 //! # Deliberate transaction drops (fork safety)
 //!
 //! Block building silently drops transactions on exactly two paths:
@@ -33,7 +44,8 @@
 //! in the database. Durability is NOT all-or-nothing, though: `save_blocks` also
 //! appends to the process-wide static-file writers, and that progress is fsynced
 //! outside the transaction, so a fault after the append leaves the writers advanced
-//! for reth's startup consistency check to reconcile on restart. Read that method's
+//! for reth's startup consistency check (run by `RethEnv::init_provider_factory`,
+//! issue #1238) to reconcile on restart. Read that method's
 //! error contract before retrying it. Only after that commit
 //! does [`RethEnv::announce_executed_output`] report the new tip over the engine
 //! update channel (`blocking_send`) and then broadcast the canonical-state
@@ -47,7 +59,7 @@ use std::sync::Arc;
 
 use alloy::primitives::FixedBytes;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use reth_chain_state::{DeferredTrieData, ExecutedBlock, NewCanonicalChain};
+use reth_chain_state::{ComputedTrieData, ExecutedBlock, NewCanonicalChain};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
     execute::{BlockBuilder as _, BlockBuilderOutcome},
@@ -60,7 +72,7 @@ use reth_provider::{
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
-    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned, B256,
+    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
 };
 use tracing::{debug, error, info, warn};
 
@@ -71,7 +83,10 @@ use crate::{
     TNPrimitives,
 };
 
-use super::RethEnv;
+use super::{
+    output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
+    RethEnv,
+};
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -81,12 +96,47 @@ impl RethEnv {
     /// validation (`InvalidTx`, e.g. duplicates across workers' batches) are dropped
     /// deterministically — see the module docs for why dropping is fork-safe. Any
     /// other execution error fails the whole attempt.
+    ///
+    /// The returned block's trie bundle holds only this block's own sorted state and
+    /// trie-update deltas. It never carries the cumulative ancestor overlay, so
+    /// `anchored_trie_input` is `None`. No consumer on the node's path reads that
+    /// overlay: persistence and canonical-chain notifications use the per-block deltas.
+    /// Building the overlay was also not O(1) here: the parent's bundle keeps the
+    /// overlay `Arc`s alive, so reth's parent-reuse fast path (`Arc::make_mut`)
+    /// deep-copies the whole cumulative overlay for every block - one `ConsensusOutput`
+    /// of `N` blocks with `M` state updates each paid `O(N^2 * M)` copy work and
+    /// transient memory (#1266).
+    ///
+    /// # State-root path (#1301)
+    ///
+    /// The state root does NOT go through reth's `MemoryOverlayStateProvider`, whose
+    /// `state_root_with_updates` re-merges, deep-copies, and re-sorts EVERY in-memory
+    /// ancestor's deltas per block - the second, reth-side `O(N^2 * M)` term, which is
+    /// bypassed here rather than fixed upstream. Instead the caller-supplied `overlay`
+    /// accumulates the output's already-sorted per-block deltas in place, and the root
+    /// runs against a fresh read-only database transaction with layered in-memory
+    /// cursors: current block's sorted deltas over the accumulated overlay over the
+    /// database, prefix sets from the current block only (see
+    /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
+    /// still resolve through reth's memory overlay, unchanged.
+    ///
+    /// Honest bound (in-place-merge variant, the one that landed): per block,
+    /// `O(M log M)` to sort the block's own deltas, an `O(M)`-driven trie walk, and
+    /// ONE linear merge pass `O(|accumulated| + M)`. Per output the merges sum to
+    /// `O(N * D + N * M)` where `D` is the DISTINCT keys touched across the output;
+    /// with fully disjoint keys the raw element copies still sum to `O(N^2 * M)` - but
+    /// as a single pass with no allocation churn, versus reth's three passes plus full
+    /// clone plus re-sort. This is NOT a flat `O(N * M)`; the LSM-style layered-runs
+    /// variant would achieve `O(N * M log)` and was not needed.
+    ///
+    /// Callers that persist every block before building the next (tests, e2e helpers)
+    /// pass a fresh empty overlay per block: the database then already holds the
+    /// parent state, so the empty overlay is exact.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
-        anchor_hash: B256,
-        ancestors: &[DeferredTrieData],
+        overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
@@ -179,18 +229,31 @@ impl RethEnv {
             }
         }
 
-        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
-            builder.finish(&state_provider)?;
+        // Scope the wrapper so its borrows of the overlay are dropped before the
+        // overlay is extended below (`Arc::make_mut` must not see a live borrow).
+        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
+            let root_provider = OverlayRootStateProvider::new(
+                &state_provider,
+                overlay,
+                &self.inner.blockchain_provider,
+            );
+            builder.finish(&root_provider)?
+        };
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
             BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
-        let computed_trie_data = DeferredTrieData::sort_and_build_trie_input(
-            Arc::new(hashed_state),
-            Arc::new(trie_updates),
-            anchor_hash,
-            ancestors,
+        let (sorted_hashed_state, sorted_trie_updates) =
+            rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
+        let computed_trie_data = ComputedTrieData::without_trie_input(
+            Arc::new(sorted_hashed_state),
+            Arc::new(sorted_trie_updates),
         );
+        // Accumulate this block's sorted deltas into the output-scoped overlay so the
+        // NEXT block's layered state root sees them without re-merging its ancestors
+        // (#1301). One linear merge pass; the `Arc`s are shared with the block's
+        // `ComputedTrieData`, so nothing is recomputed.
+        overlay.extend_from_block(&computed_trie_data);
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
@@ -244,7 +307,9 @@ impl RethEnv {
     /// itself) aborts the database transaction but leaves the static-file writer
     /// advanced, so a repeat call trips over it with
     /// `ProviderError::UnexpectedStaticFileBlockNumber`; reth's startup consistency
-    /// check reconciles the divergence on restart. Callers retrying this method must
+    /// check, which `RethEnv::init_provider_factory` runs on every construction
+    /// (issue #1238), reconciles the divergence on restart. Callers retrying this
+    /// method must
     /// treat that error as terminal (see the engine's `persist_output_with_retry`).
     /// Post-commit reporting lives in [`Self::announce_executed_output`] so the commit
     /// boundary is a function boundary rather than an error-classification exercise
