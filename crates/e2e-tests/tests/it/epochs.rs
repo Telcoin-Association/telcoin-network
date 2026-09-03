@@ -24,7 +24,10 @@ use tn_reth::{
 use tn_storage::pack_validate::{validate_pack_file, Verdict};
 use tn_test_utils::wait_until;
 use tn_types::{
-    forks::{multi_workers_fork_active, seed_signature_active},
+    forks::{
+        leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
+        seed_signature_active,
+    },
     keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256,
 };
 use tokio::time::timeout;
@@ -48,13 +51,18 @@ const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
 /// node it spawns (`tn_types::forks::seed_signature_fork_epoch_override`).
 const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
 
-/// Multi-workers fork epoch for [`test_epoch_sync_across_multi_workers_fork`].
+/// Environment variable selecting the leader-seeded-ordering fork epoch (#1260) for this process
+/// and every node it spawns (`tn_types::forks::leader_seeded_ordering_fork_epoch_override`).
+const LEADER_SEEDED_ORDERING_FORK_ENV: &str = "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH";
+
+/// Fork epoch for the cross-fork sync tests, [`test_epoch_sync_across_multi_workers_fork`] and
+/// [`test_epoch_sync_across_leader_seeded_ordering_fork`].
 ///
 /// The kill in [`test_epoch_sync_inner`] happens after `loop_epochs` has watched three boundaries
 /// pass, so the epoch open at that point is at least 3 and the sealed set — which stops two below
-/// it, see [`sealed_epochs`] — always covers epochs 0 and 1. Pinning the fork at 1 therefore
-/// guarantees those sealed packs straddle it: epoch 0 in the legacy single-worker committee
-/// layout, epoch 1 onward in the multi-worker one.
+/// it, see [`sealed_epochs`] — always covers epochs 0 and 1. Pinning a fork at 1 therefore
+/// guarantees those sealed packs straddle it: epoch 0 written pre-fork (the legacy single-worker
+/// committee layout, or the legacy DFS commit order), epoch 1 onward written post-fork.
 const CROSS_FORK_EPOCH: Epoch = 1;
 
 async fn test_epoch_boundary_inner(
@@ -521,50 +529,71 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin every fork epoch this suite's decoding depends on — the multi-workers fork (#554) and
-/// the seed-signature fork (#1032) — for this process and every node it spawns.
+/// Pin every fork epoch this suite depends on, the multi-workers fork (#554), the seed-signature
+/// fork (#1032), and the leader-seeded-ordering fork (#1260), for this process and every node it
+/// spawns.
 ///
-/// Step 8 decodes sealed pack bytes in the harness, and that reaches both gates: the `EpochMeta`'s
-/// [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every nested
-/// `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to the same
-/// fork points the nodes wrote under. Left alone the two sides disagree the same way for each
-/// fork: `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while
-/// this (non-adiri) harness build is active from genesis without it. Writing the variables settles
-/// both sides at once — children inherit them verbatim at spawn, and the harness's own overrides
-/// latch them on first read.
+/// Step 8 decodes sealed pack bytes in the harness, and that reaches the first two gates: the
+/// `EpochMeta`'s [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every
+/// nested `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to
+/// the same fork points the nodes wrote under. Left alone the two sides disagree the same way for
+/// each of those forks: `TestBinary::command` forwards `u32::MAX` to a child when the variable is
+/// unset, while this (non-adiri) harness build is active from genesis without it. Writing the
+/// variables settles both sides at once — children inherit them verbatim at spawn, and the
+/// harness's own overrides latch them on first read. The leader-seeded-ordering fork changes no
+/// serialized layout, only the commit order nodes write inside a pack, so the harness decode does
+/// not consult it; it is pinned here for the children (and against a latched-earlier override),
+/// with the always-armed `0` default `TestBinary::command` forwards for it.
 ///
-/// Both forks are pinned, not just the one a given test is about. Pinning only one leaves the other
-/// asymmetric whenever the suite runs outside the Makefile wrapper that exports it, and the
+/// Every fork is pinned, not just the one a given test is about. Pinning only some leaves the rest
+/// asymmetric whenever the suite runs outside the Makefile wrapper that exports them, and the
 /// symptom is misleading: children write dormant-layout headers, the harness decodes them as
 /// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
 ///
-/// `force_multi_workers` states the multi-workers fork epoch outright, for a test whose
-/// claim is about a specific boundary. `None` — and the seed-signature pin always — inherits
-/// whatever the lane exported, defaulting to the dormant `u32::MAX` that `TestBinary::command`
-/// would have forwarded anyway, so `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
+/// Each `force_*` argument states that fork epoch outright, for a test whose claim is about a
+/// specific boundary. `None` inherits whatever the lane exported, defaulting to what
+/// `TestBinary::command` would have forwarded anyway (the dormant `u32::MAX`, or `0` for the
+/// leader-seeded-ordering fork), so `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
 /// meaning what it says.
 ///
-/// Call once per test, before the first node spawn and before anything in the process reads either
+/// Call once per test, before the first node spawn and before anything in the process reads any
 /// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
 /// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
 /// plain `cargo test` two of these tests in one process would fight over it, and the assertions
 /// below are what turn that into a loud failure instead of a mis-decoded pack.
-fn pin_fork_epochs(force_multi_workers: Option<Epoch>) {
+fn pin_fork_epochs(
+    force_multi_workers: Option<Epoch>,
+    force_seed_signature: Option<Epoch>,
+    force_leader_seeded: Option<Epoch>,
+) {
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
-    // dormant `u32::MAX` when it exported nothing. an unparseable value normalizes to the same
-    // dormant default the gate would have fallen back to.
-    let lane = |var: &str| -> Epoch {
-        std::env::var(var).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(u32::MAX)
+    // stated per-fork default when it exported nothing. an unparseable value normalizes to the
+    // same default the gate would have fallen back to.
+    let lane = |var: &str, default: Epoch| -> Epoch {
+        std::env::var(var).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(default)
     };
 
-    // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the two
-    // cannot drift apart in mechanism; they arm independently, so each carries its own gate
+    // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the
+    // forks cannot drift apart in mechanism; they arm independently, so each carries its own gate
     pin_fork_epoch(
         MULTI_WORKERS_FORK_ENV,
-        force_multi_workers.unwrap_or_else(|| lane(MULTI_WORKERS_FORK_ENV)),
+        force_multi_workers.unwrap_or_else(|| lane(MULTI_WORKERS_FORK_ENV, u32::MAX)),
         multi_workers_fork_active,
     );
-    pin_fork_epoch(SEED_SIGNATURE_FORK_ENV, lane(SEED_SIGNATURE_FORK_ENV), seed_signature_active);
+    pin_fork_epoch(
+        SEED_SIGNATURE_FORK_ENV,
+        force_seed_signature.unwrap_or_else(|| lane(SEED_SIGNATURE_FORK_ENV, u32::MAX)),
+        seed_signature_active,
+    );
+    // the leader-seeded gate (`leader_seeded_ordering_active`) conjoins the seed-signature fork
+    // fail-closed, so asserting through the gate would entangle this pin with the seed pin's
+    // value: with the seed fork dormant the gate reads false at every epoch, pinned or not. pin
+    // through the conjunct-free override reader instead; same latched-earlier failure mode.
+    pin_fork_epoch_override(
+        LEADER_SEEDED_ORDERING_FORK_ENV,
+        force_leader_seeded.unwrap_or_else(|| lane(LEADER_SEEDED_ORDERING_FORK_ENV, 0)),
+        leader_seeded_ordering_fork_epoch_override,
+    );
 }
 
 /// Write `fork_epoch` to the `var` override and check `gate` reads the same fork point back.
@@ -589,6 +618,25 @@ fn pin_fork_epoch(var: &str, fork_epoch: Epoch, gate: impl Fn(Epoch) -> bool) {
              to another value before this test pinned it"
         );
     }
+    info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
+}
+
+/// Write `fork_epoch` to the `var` override and check the override reader `read` latched it.
+///
+/// The [`pin_fork_epoch`] variant for a fork whose public gate conjoins another fork (the
+/// leader-seeded ordering conjoins the seed signature): the gate cannot witness this pin on its
+/// own, but equality on the conjunct-free override reader gives callers the same guarantee, an
+/// override that latched before this pin becomes a named failure instead of nodes silently
+/// running a different fork point than the test states.
+fn pin_fork_epoch_override(var: &str, fork_epoch: Epoch, read: impl Fn() -> Option<Epoch>) {
+    std::env::set_var(var, fork_epoch.to_string());
+
+    assert_eq!(
+        read(),
+        Some(fork_epoch),
+        "harness override must read back the pinned fork epoch {fork_epoch}: {var} latched to \
+         another value before this test pinned it"
+    );
     info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
 }
 
@@ -684,9 +732,9 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    // whatever fork epochs the lane stated, dormant by default - this test is about sync, not about
-    // either fork, but the harness still decodes pack bytes and must agree with the nodes
-    pin_fork_epochs(None);
+    // whatever fork epochs the lane stated, defaults otherwise - this test is about sync, not
+    // about any fork, but the harness still decodes pack bytes and must agree with the nodes
+    pin_fork_epochs(None, None, None);
 
     run_epoch_sync_scenario("epoch_sync").await.map(|_sealed| ())
 }
@@ -705,8 +753,8 @@ async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     // forced rather than inherited: this test's claim is a crossing at a known multi-workers
     // epoch, so it states that fork point even when the lane exported a different one. the
-    // seed-signature pin still follows the lane - this test makes no claim about it.
-    pin_fork_epochs(Some(CROSS_FORK_EPOCH));
+    // other pins still follow the lane - this test makes no claim about them.
+    pin_fork_epochs(Some(CROSS_FORK_EPOCH), None, None);
 
     let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?;
 
@@ -718,6 +766,48 @@ async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
         sealed.start < CROSS_FORK_EPOCH && CROSS_FORK_EPOCH < sealed.end,
         "sealed epochs {sealed:?} do not straddle the multi-workers fork at \
          {CROSS_FORK_EPOCH}: the restart proved only one committee layout"
+    );
+
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Test that an epoch pack archive spanning the leader-seeded-ordering fork boundary (#1260)
+/// survives a restart.
+///
+/// The same kill/restart scenario as [`test_epoch_sync`], with the ordering fork pinned at
+/// [`CROSS_FORK_EPOCH`] so one datadir holds commits linearized both ways: epoch 0 sealed under
+/// the legacy DFS discovery order, every later epoch under the seeded tie-break. The
+/// seed-signature fork is forced active from genesis because the gate
+/// (`tn_types::forks::leader_seeded_ordering_active`) conjoins it fail-closed: with the seed fork
+/// left on the lane's dormant default the pinned fork point would be inert, every epoch would
+/// seal in the legacy order, and this would quietly reduce to [`test_epoch_sync`].
+///
+/// Unlike the multi-workers fork this one changes no serialized layout, only the order of commits
+/// inside a sealed pack, so step 8's pack decode is layout-identical on both sides of the
+/// boundary and needs no ordering-fork pin of its own. The kill/restart checks are still the
+/// load-bearing ones: the restarted node re-reads its own history across the boundary to decide
+/// which epochs it needs, back-fills what it missed, and the packs sealed under each order must
+/// revalidate and survive byte-for-byte.
+async fn test_epoch_sync_across_leader_seeded_ordering_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // both forced rather than inherited: this test's claim is a crossing at a known
+    // ordering-fork epoch with the seed fork active beneath it (the conjunct above), so it
+    // states both fork points even when the lane exported different ones. the multi-workers
+    // pin still follows the lane - this test makes no claim about committee layout.
+    pin_fork_epochs(None, Some(0), Some(CROSS_FORK_EPOCH));
+
+    let sealed = run_epoch_sync_scenario("epoch_sync_seeded").await?;
+
+    // The revalidated packs span both commit orders only if the fork epoch sits strictly inside
+    // them. Assert it rather than trusting the arithmetic in `CROSS_FORK_EPOCH`: a shorter run,
+    // or a wider safety margin in `sealed_epochs`, would otherwise quietly reduce this to the
+    // single-order test above.
+    assert!(
+        sealed.start < CROSS_FORK_EPOCH && CROSS_FORK_EPOCH < sealed.end,
+        "sealed epochs {sealed:?} do not straddle the leader-seeded-ordering fork at \
+         {CROSS_FORK_EPOCH}: the restart proved only one commit order"
     );
 
     Ok(())

@@ -306,6 +306,9 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
 /// active from genesis, exactly as with the seed-signature fork (like
 /// [`SEED_SIGNATURE_FORK_EPOCH`], this constant does not exist there).
+///
+/// The full fork schedule is logged at startup so operators can diff it across the fleet; a
+/// compile-time constant that differs between binaries has no other in-protocol detection.
 #[cfg(feature = "adiri")]
 pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
 
@@ -526,16 +529,34 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 /// proposer-controlled fields (the `payload` insertion order and `created_at`), so a Byzantine
 /// proposer can grind its own digest to steer its certificate toward either end of its round,
 /// and that order reaches execution with no re-sort. Post-fork, `order_dag` keys the
-/// intra-round order on `blake3(leader_digest || certificate_digest)` instead: no proposer
-/// other than the leader knows that digest when it builds its own header, so a non-leader
-/// position cannot be ground in advance, while the order stays a pure function of committed
-/// data that every honest node derives identically. The schedule-determined leader keeps a
-/// residual grind over its own sub-DAG's permutations on its own turn; `order_dag`'s
-/// `leader_seeded_key` documents why that residual is accepted.
+/// intra-round order on `blake3(domain || seed || certificate_digest)` instead, where `seed`
+/// is the epoch seed chain value the commit folds into `CommittedSubDag::randomness`: the
+/// chain value is fixed by the previous published commit and the leader's contribution is its
+/// deterministic BLS seed signature, so no proposer, the committing leader included, can
+/// enumerate candidate orders after observing the sub-DAG, while the order stays a pure
+/// function of committed data that every honest node derives identically. The accepted
+/// residual is the seed chain's own propose-or-withhold last-actor bias; `order_dag`'s
+/// `intra_round_key` documents it.
 ///
 /// The gate ([`leader_seeded_ordering_active`]) always reads the epoch carried inside the
 /// committed leader, never node-local committee state, so replay of a historical commit
 /// reproduces the historical execution sequence.
+///
+/// # Arming constraints (compile-time asserted below)
+///
+/// - **At or above [`SEED_SIGNATURE_FORK_EPOCH`].** The seeded key folds the leader's seed
+///   signature into the epoch seed chain, which only carries digest-pinned values once the
+///   seed fork is active. [`leader_seeded_ordering_active`] additionally conjoins
+///   [`seed_signature_active`] fail-closed, so a mis-ordered schedule stays on the legacy
+///   order instead of keying commits on a forkable value.
+/// - **Strictly above [`ADIRI_DUP_BATCH_EPOCH`].** Duplicate-batch attribution is
+///   intra-round-position-sensitive for adiri epochs at or below that cutoff: a batch
+///   referenced by two headers is credited to whichever header comes first in sequence and
+///   dropped from the second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork
+///   permutes exactly that sequence, so arming it at or below the cutoff would change
+///   replayed attribution on adiri, a resync divergence rather than just a reordering. The
+///   epoch-setting PR is the place this bites, and that PR will not be looking at the
+///   dup-batch interaction; the assert makes it look.
 ///
 /// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
 /// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
@@ -555,13 +576,39 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 /// and this constant does not exist there.
 pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
 
+/// Compile-time enforcement of the first arming constraint documented on
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a rollout PR that sets this fork below the seed
+/// fork fails to compile instead of shipping a gate that silently stays dormant until the
+/// seed fork fires (the [`leader_seeded_ordering_active`] conjunct).
+#[cfg(feature = "adiri")]
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "always true only while LEADER_SEEDED_ORDERING_FORK_EPOCH is the `u32::MAX` \
+              placeholder; once the rollout PR lowers the constant the comparison becomes \
+              live and this expectation flags itself for removal"
+)]
+const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
+
+/// Compile-time enforcement of the second arming constraint documented on
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: arming the fork at or below
+/// [`ADIRI_DUP_BATCH_EPOCH`] would permute duplicate-batch attribution on replay (the
+/// same relation `consensus_pack.rs` pins for its shared-batch scenarios).
+#[cfg(feature = "adiri")]
+const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH > ADIRI_DUP_BATCH_EPOCH);
+
 /// Whether the committed sub-DAG of a leader of `epoch` orders same-round certificates by the
-/// leader-seeded tie-break `blake3(leader_digest || certificate_digest)` instead of the legacy
+/// seeded tie-break `blake3(domain || seed || certificate_digest)` instead of the legacy
 /// DFS discovery order (#1260).
 ///
 /// Gates the linearization in `order_dag`. Callers MUST pass the epoch carried inside the
 /// committed leader (`leader.epoch()`), never `Committee::epoch()` or other node-local state,
 /// so that a replayed historical commit keeps its historical order.
+///
+/// Requires [`seed_signature_active`] as a fail-closed conjunct, exactly as
+/// [`prevrandao_seed_active`] does: the seeded key folds the leader's seed signature into the
+/// epoch seed chain, which is digest-pinned only once the seed fork is active. If an override
+/// or a future fork schedule orders the two forks the other way, the gate stays on the legacy
+/// order (the status quo) instead of leaving `order_dag` to degrade on a missing signature.
 ///
 /// Adiri builds activate at [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]; all other builds are active
 /// from genesis (mainnet never produced a legacy-ordered commit). Under `test-utils`, an
@@ -570,6 +617,14 @@ pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
 /// rather than inheriting whichever one its feature set happens to select.
 #[inline]
 pub fn leader_seeded_ordering_active(epoch: Epoch) -> bool {
+    seed_signature_active(epoch) && leader_seeded_ordering_fork_point_active(epoch)
+}
+
+/// This build's effective leader-seeded-ordering fork point (any `test-utils` override
+/// applied), without the [`seed_signature_active`] conjunct [`leader_seeded_ordering_active`]
+/// enforces.
+#[inline]
+fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
         leader_seeded_ordering_fork_epoch_override()
@@ -918,10 +973,105 @@ mod tests {
              the override is OnceLock-latched, so run the unset case in its own process",
         );
         [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            // The fork point is the half that carries the override; the public gate wraps it
+            // in the `seed_signature_active` conjunct, which is orthogonal to the override.
+            assert_eq!(
+                leader_seeded_ordering_fork_point_active(epoch),
+                leader_seeded_ordering_build_fork_active(epoch),
+                "an unset override must not shift the fork point at epoch {epoch}",
+            );
             assert_eq!(
                 leader_seeded_ordering_active(epoch),
-                leader_seeded_ordering_build_fork_active(epoch),
-                "an unset override must not shift the gate at epoch {epoch}",
+                seed_signature_active(epoch) && leader_seeded_ordering_build_fork_active(epoch),
+                "the public gate must be exactly the fail-closed conjunction at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Sentinel selecting the child dispatch of
+    /// [`leader_seeded_conjunct_blocks_when_seed_fork_is_later`]: a dedicated variable rather
+    /// than the fork overrides themselves, so lane-exported fork variables cannot be mistaken
+    /// for a child spawn.
+    #[cfg(feature = "test-utils")]
+    const TN_TEST_SEED_CONJUNCT_CHILD: &str = "TN_TEST_LEADER_SEEDED_CONJUNCT_CHILD";
+
+    /// The `seed_signature_active` conjunct in [`leader_seeded_ordering_active`] blocks the
+    /// gate when the seed fork is scheduled later than the leader-seeded fork point (#1260).
+    ///
+    /// This is the only configuration where the conjunct is observable: the compile-time
+    /// assert `LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH` makes the fork
+    /// point imply the conjunct whenever the overrides are unset, so the in-process "exactly
+    /// the fail-closed conjunction" assert above cannot catch deletion of the
+    /// `seed_signature_active &&` term. Spawns THIS test binary with the seed fork pinned
+    /// dormant (`4294967295`) and the leader-seeded fork point pinned to `0`: both overrides
+    /// latch in process-wide `OnceLock`s, so the crossed schedule needs its own process. The
+    /// child's harness output must report exactly one passed test: a drifted name would match
+    /// nothing and still exit 0, so exit status alone would be a vacuous pass.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn leader_seeded_conjunct_blocks_when_seed_fork_is_later() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let fn_name = "child_leader_seeded_conjunct_blocks";
+        let name = module_path!()
+            .split_once("::")
+            .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"));
+        let mut command = std::process::Command::new(exe);
+        command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+        command.env(TN_TEST_SEED_CONJUNCT_CHILD, "1");
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        command.env("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", "0");
+        let output = command.output().expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// Child of [`leader_seeded_conjunct_blocks_when_seed_fork_is_later`], spawned with the
+    /// seed fork dormant and the leader-seeded fork point active from genesis: the fork point
+    /// says yes at every probed epoch, so any `false` from the public gate is attributable to
+    /// the `seed_signature_active` conjunct alone.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    #[ignore = "spawned by leader_seeded_conjunct_blocks_when_seed_fork_is_later with a \
+                controlled env"]
+    fn child_leader_seeded_conjunct_blocks() {
+        assert!(
+            std::env::var_os(TN_TEST_SEED_CONJUNCT_CHILD).is_some(),
+            "this child runs only under leader_seeded_conjunct_blocks_when_seed_fork_is_later, \
+             which pins both fork overrides in the spawn env",
+        );
+        // Both overrides latch in process-wide `OnceLock`s, so a child launched without them
+        // in its env cannot observe the crossed schedule. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(u32::MAX),
+            "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
+             spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        assert_eq!(
+            leader_seeded_ordering_fork_epoch_override(),
+            Some(0),
+            "this child requires TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=0 latched from its \
+             spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        // 383 is adiri's SEED_SIGNATURE_FORK_EPOCH, written as a literal because the
+        // constant does not exist on non-adiri builds and this child is not adiri-gated.
+        [0, 1, 383, u32::MAX - 1].into_iter().for_each(|epoch| {
+            assert!(
+                leader_seeded_ordering_fork_point_active(epoch),
+                "the fork point is pinned to 0, so it must be active at epoch {epoch}; \
+                 otherwise the gate assertion below would not isolate the conjunct",
+            );
+            assert!(
+                !leader_seeded_ordering_active(epoch),
+                "the dormant seed fork must block the public gate at epoch {epoch} even \
+                 though the leader-seeded fork point is active from 0",
             );
         });
     }

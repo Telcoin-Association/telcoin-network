@@ -10,13 +10,13 @@ use crate::{
     },
     ConsensusBus,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    forks, AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
+    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
     ExecHeader, Header, HeaderDigest, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver,
     TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
@@ -1530,28 +1530,14 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     assert!(committed);
 }
 
-/// Reports whether this process runs the post-fork branch of `order_dag`. Without the `adiri`
-/// feature the gate is active for every epoch, so on the default test build the four tests
-/// below always run in full. On an `adiri` feature-unified build (or with a high
-/// `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` latched, once per process) the fork is correctly
-/// dormant, so the tests skip with a loud note instead of failing on a build where the seeded
-/// branch cannot be observed.
-fn seeded_branch_active() -> bool {
-    let active = forks::leader_seeded_ordering_active(0);
-    if !active {
-        eprintln!(
-            "skipping leader-seeded ordering assertions: the fork is dormant in this build \
-             (adiri feature unified, or TN_LEADER_SEEDED_ORDERING_FORK_EPOCH latched high)"
-        );
-    }
-    active
-}
-
 /// Builds an optimal DAG for rounds 1..=6 over the default four-authority committee and returns
 /// the populated consensus state.
 ///
-/// Certificate digests are random per process run (mock payloads embed random transactions), so
-/// the tests below assert structural and statistical properties rather than exact sequences.
+/// The fixture headers carry the deterministic per-author BLS seed signatures stamped by
+/// `mock_certificate_with_epoch`, so the seeded arm of `order_dag_inner` folds a distinct seed
+/// for each candidate leader. Certificate digests are random per process run (mock payloads
+/// embed random transactions), so the tests below assert structural and statistical properties
+/// rather than exact sequences.
 fn seeded_ordering_state() -> ConsensusState {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
@@ -1571,13 +1557,19 @@ fn seeded_ordering_state() -> ConsensusState {
 
 /// Returns two distinct round-6 certificates that stand in as alternative leaders over the same
 /// sub-DAG: an optimal DAG makes every certificate of rounds 1..=5 reachable from either one.
+///
+/// The pair is deterministic (the two smallest round-6 digests): the dag's inner map iterates
+/// in per-process random order, so picking whatever `values()` yields first would make a
+/// failing run irreproducible.
 fn two_round_6_leaders(state: &ConsensusState) -> (Certificate, Certificate) {
     let mut candidates = state
         .dag
         .get(&6)
         .expect("round 6 exists in the populated DAG")
         .values()
-        .map(|(_digest, certificate)| certificate.clone());
+        .map(|(_digest, certificate)| (certificate.digest(), certificate.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_values();
     let first = candidates.next().expect("at least one round 6 certificate");
     let second = candidates.next().expect("at least two round 6 certificates");
     assert_ne!(first.digest(), second.digest(), "leaders must be distinct");
@@ -1592,102 +1584,126 @@ fn digests_by_round(ordered: &[Certificate]) -> HashMap<Round, Vec<HeaderDigest>
     })
 }
 
-/// Post-fork `order_dag` invariants (#1260): rounds never decrease, the leader is the final
-/// certificate, and the leader-seeded tie-break only permutes certificates within their round,
-/// so per-round membership is exactly what the legacy round-only sort would emit.
-#[tokio::test]
-async fn order_dag_seeded_sort_preserves_rounds_and_membership() {
-    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
-    if seeded_branch_active() {
-        let state = seeded_ordering_state();
-        let (leader, _other) = two_round_6_leaders(&state);
-
-        // WHEN
-        let ordered = utils::order_dag(&leader, &state);
-
-        // THEN the leader sorts last and rounds are non-decreasing
-        assert_eq!(ordered.last().expect("commit is non-empty").digest(), leader.digest());
-        ordered.iter().zip(ordered.iter().skip(1)).for_each(|(previous, next)| {
-            assert!(previous.round() <= next.round(), "rounds must be non-decreasing");
-        });
-
-        // AND per-round membership equals the sub-DAG: every certificate of rounds 1..=5
-        // exactly once, plus the leader alone at round 6. The seeded sort may only permute
-        // within a round.
-        let by_round = digests_by_round(&ordered);
-        let committee_size = state.dag.get(&1).expect("round 1 exists").len();
-        (1..=5).for_each(|round| {
-            let expected = state
-                .dag
-                .get(&round)
-                .expect("round exists in the DAG")
-                .values()
-                .map(|(digest, _certificate)| *digest)
-                .collect::<BTreeSet<_>>();
-            let committed = by_round.get(&round).expect("round appears in the commit");
-            let actual = committed.iter().copied().collect::<BTreeSet<_>>();
-            assert_eq!(actual, expected, "round {round} membership must match the DAG");
-            assert_eq!(committed.len(), expected.len(), "round {round} has no duplicates");
-        });
-        assert_eq!(by_round.get(&6).expect("leader round appears"), &vec![leader.digest()]);
-        assert_eq!(ordered.len(), 5 * committee_size + 1, "five full rounds plus the leader");
-    }
-}
-
-/// The seeded order is a pure function of the leader and the DAG: two `order_dag` calls with
-/// the same leader emit the identical sequence, so every honest node derives the same commit.
-#[tokio::test]
-async fn order_dag_seeded_sort_is_deterministic() {
-    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
-    if seeded_branch_active() {
-        let state = seeded_ordering_state();
-        let (leader, _other) = two_round_6_leaders(&state);
-
-        // WHEN
-        let first: Vec<_> = utils::order_dag(&leader, &state).iter().map(|x| x.digest()).collect();
-        let second: Vec<_> = utils::order_dag(&leader, &state).iter().map(|x| x.digest()).collect();
-
-        // THEN
-        assert_eq!(first, second, "repeated calls must agree digest for digest");
-    }
-}
-
-/// The intra-round order is keyed on the committed leader's digest (#1260): two distinct
-/// round-6 leaders over the same optimal sub-DAG commit the same certificates for rounds 1..=5
-/// but disagree on at least one round's permutation. This is the anti-grinding property: a
-/// proposer cannot steer its position without knowing the future leader.
+/// Asserts that the seeded arm of `order_dag_inner` is observable for this leader: its header
+/// must carry a seed signature.
 ///
-/// Statistical, not absolute: modelling blake3 as a random oracle, two independent leader keys
+/// On an adiri-unified test build the epoch-0 fixtures sit below `SEED_SIGNATURE_FORK_EPOCH`,
+/// `Header::seed_signature()` returns `None`, and `order_dag_inner(.., true)` folds no
+/// per-leader seed, so the seeded arm silently degrades to the legacy sort: the seeded-arm
+/// tests below would pass vacuously and the arms-disagree test would fail confusingly. Fail
+/// loudly rather than assert a property this build cannot exhibit; a silent skip here would
+/// read as a pass.
+fn assert_seeded_arm_observable(leader: &Certificate) {
+    assert!(
+        leader.header().seed_signature().is_some(),
+        "this build gates seed signatures off at the fixture epoch (adiri feature unified): \
+         the seeded-arm tests would silently exercise the legacy path; pin the fixture epoch \
+         above SEED_SIGNATURE_FORK_EPOCH or run without adiri",
+    );
+}
+
+/// Post-fork `order_dag` invariants (#1260): rounds never decrease, the leader is the final
+/// certificate, and the seed-chain tie-break only permutes certificates within their round,
+/// so per-round membership is exactly what the legacy round-only sort would emit.
+#[test]
+fn order_dag_seeded_sort_preserves_rounds_and_membership() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let ordered = utils::order_dag_inner(&leader, &state, true);
+
+    // THEN the leader sorts last and rounds are non-decreasing
+    assert_eq!(ordered.last().expect("commit is non-empty").digest(), leader.digest());
+    ordered.iter().zip(ordered.iter().skip(1)).for_each(|(previous, next)| {
+        assert!(previous.round() <= next.round(), "rounds must be non-decreasing");
+    });
+
+    // AND per-round membership equals the sub-DAG: every certificate of rounds 1..=5
+    // exactly once, plus the leader alone at round 6. The seeded sort may only permute
+    // within a round.
+    let by_round = digests_by_round(&ordered);
+    let committee_size = state.dag.get(&1).expect("round 1 exists").len();
+    (1..=5).for_each(|round| {
+        let expected = state
+            .dag
+            .get(&round)
+            .expect("round exists in the DAG")
+            .values()
+            .map(|(digest, _certificate)| *digest)
+            .collect::<BTreeSet<_>>();
+        let committed = by_round.get(&round).expect("round appears in the commit");
+        let actual = committed.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "round {round} membership must match the DAG");
+        assert_eq!(committed.len(), expected.len(), "round {round} has no duplicates");
+    });
+    assert_eq!(by_round.get(&6).expect("leader round appears"), &vec![leader.digest()]);
+    assert_eq!(ordered.len(), 5 * committee_size + 1, "five full rounds plus the leader");
+}
+
+/// The seeded order is a pure function of the committed leader, the DAG, and the epoch seed
+/// chain value: two calls with the same inputs emit the identical sequence, so every honest
+/// node derives the same commit.
+#[test]
+fn order_dag_seeded_sort_is_deterministic() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let first: Vec<_> =
+        utils::order_dag_inner(&leader, &state, true).iter().map(|x| x.digest()).collect();
+    let second: Vec<_> =
+        utils::order_dag_inner(&leader, &state, true).iter().map(|x| x.digest()).collect();
+
+    // THEN
+    assert_eq!(first, second, "repeated calls must agree digest for digest");
+}
+
+/// The intra-round order is keyed on the epoch seed chain (#1260): the tie-break key is
+/// `blake3(domain || seed || certificate_digest)` where `seed` folds the leader's round and
+/// its deterministic BLS seed signature into the chain value the commit is about to fold into
+/// `CommittedSubDag::randomness`. Two distinct round-6 leaders over the same optimal sub-DAG
+/// commit the same certificates for rounds 1..=5 but disagree on at least one round's
+/// permutation, because their per-author deterministic seed signatures differ, so the folded
+/// seeds differ. This is the anti-grinding property: a proposer cannot steer its position
+/// without knowing the future leader's seed contribution, which is unpublished while it builds
+/// its header.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, two independent seeds
 /// induce independent orders on each four-certificate round, so all five rounds coincide with
 /// probability at most (1 / 24)^5, under 2e-7 per run.
-#[tokio::test]
-async fn order_dag_seeded_sort_depends_on_the_leader() {
-    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
-    if seeded_branch_active() {
-        let state = seeded_ordering_state();
-        let (leader_a, leader_b) = two_round_6_leaders(&state);
+#[test]
+fn order_dag_seeded_sort_depends_on_the_leader() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader_a, leader_b) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader_a);
+    assert_seeded_arm_observable(&leader_b);
 
-        // WHEN ordering the shared rounds 1..=5 under each leader (round 6 holds only the
-        // leader itself, so it is excluded from the comparison)
-        let below_leader = |leader: &Certificate| {
-            utils::order_dag(leader, &state)
-                .iter()
-                .filter(|x| x.round() <= 5)
-                .map(|x| x.digest())
-                .collect::<Vec<_>>()
-        };
-        let order_a = below_leader(&leader_a);
-        let order_b = below_leader(&leader_b);
+    // WHEN ordering the shared rounds 1..=5 under each leader (round 6 holds only the
+    // leader itself, so it is excluded from the comparison)
+    let below_leader = |leader: &Certificate| {
+        utils::order_dag_inner(leader, &state, true)
+            .iter()
+            .filter(|x| x.round() <= 5)
+            .map(|x| x.digest())
+            .collect::<Vec<_>>()
+    };
+    let order_a = below_leader(&leader_a);
+    let order_b = below_leader(&leader_b);
 
-        // THEN both commits carry the same certificates
-        assert_eq!(
-            order_a.iter().copied().collect::<BTreeSet<_>>(),
-            order_b.iter().copied().collect::<BTreeSet<_>>(),
-            "both leaders must commit the same sub-DAG"
-        );
-        // AND the leader digest reseeds the intra-round permutation
-        assert_ne!(order_a, order_b, "distinct leaders must produce distinct intra-round orders");
-    }
+    // THEN both commits carry the same certificates
+    assert_eq!(
+        order_a.iter().copied().collect::<BTreeSet<_>>(),
+        order_b.iter().copied().collect::<BTreeSet<_>>(),
+        "both leaders must commit the same sub-DAG"
+    );
+    // AND the leader's seed signature reseeds the intra-round permutation
+    assert_ne!(order_a, order_b, "distinct leaders must produce distinct intra-round orders");
 }
 
 /// The seeded order does not reduce to ascending certificate-digest order: a certificate's
@@ -1697,23 +1713,207 @@ async fn order_dag_seeded_sort_depends_on_the_leader() {
 /// Statistical, not absolute: the seeded permutation matches digest-ascending order on all five
 /// four-certificate rounds with probability at most (1 / 24)^5, under 2e-7 per run, modelling
 /// blake3 as a random oracle over this run's random fixture digests.
-#[tokio::test]
-async fn order_dag_seeded_sort_is_not_digest_ascending() {
-    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
-    if seeded_branch_active() {
-        let state = seeded_ordering_state();
-        let (leader, _other) = two_round_6_leaders(&state);
+#[test]
+fn order_dag_seeded_sort_is_not_digest_ascending() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
 
-        // WHEN
-        let by_round = digests_by_round(&utils::order_dag(&leader, &state));
+    // WHEN
+    let by_round = digests_by_round(&utils::order_dag_inner(&leader, &state, true));
 
-        // THEN at least one round's seeded order differs from its digest-ascending order
-        let any_round_differs = (1..=5).any(|round| {
-            let seeded = by_round.get(&round).expect("round appears in the commit");
-            let ascending =
-                seeded.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-            *seeded != ascending
-        });
-        assert!(any_round_differs, "seeded order must not equal ascending digest order");
-    }
+    // THEN at least one round's seeded order differs from its digest-ascending order
+    let any_round_differs = (1..=5).any(|round| {
+        let seeded = by_round.get(&round).expect("round appears in the commit");
+        let ascending =
+            seeded.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        *seeded != ascending
+    });
+    assert!(any_round_differs, "seeded order must not equal ascending digest order");
+}
+
+/// Recomputes the legacy commit sequence independently of `order_dag_inner`: a pre-order DFS
+/// popped from a stack seeded with the leader, resolving each certificate's parent digests in
+/// the previous round of `state.dag`, skipping digests already seen and certificates at or
+/// below their authority's `last_committed` round, then a stable sort by round (which keeps
+/// the DFS discovery order within each round).
+fn legacy_replay_sequence(leader: &Certificate, state: &ConsensusState) -> Vec<HeaderDigest> {
+    let mut stack = vec![leader.clone()];
+    let mut seen: HashSet<HeaderDigest> = HashSet::new();
+    let mut discovered = std::iter::from_fn(|| {
+        stack.pop().map(|certificate| {
+            certificate.header().parents().iter().for_each(|parent| {
+                state
+                    .dag
+                    .get(&(certificate.round() - 1))
+                    .and_then(|entries| entries.values().find(|(digest, _)| digest == parent))
+                    .into_iter()
+                    .for_each(|(digest, parent_certificate)| {
+                        let committed = state
+                            .last_committed
+                            .get(parent_certificate.origin())
+                            .map_or_else(|| false, |r| &parent_certificate.round() <= r);
+                        if !seen.contains(digest) && !committed {
+                            seen.insert(*digest);
+                            stack.push(parent_certificate.clone());
+                        }
+                    });
+            });
+            certificate
+        })
+    })
+    .collect::<Vec<_>>();
+    discovered.sort_by_key(|certificate| certificate.round());
+    discovered.iter().map(|certificate| certificate.digest()).collect()
+}
+
+/// Legacy-arm pin (#1260): for a fixed state and leader, `order_dag_inner(.., false)` must
+/// equal the stable round-sort of the DFS discovery order, recomputed here by
+/// [`legacy_replay_sequence`], an independent reimplementation of the traversal.
+///
+/// This order must never change: historical pre-fork commits (the adiri chain included)
+/// replay through the legacy arm, and any drift would re-execute them in a different order.
+#[test]
+fn order_dag_legacy_arm_matches_independent_replay() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+
+    // WHEN
+    let legacy: Vec<_> =
+        utils::order_dag_inner(&leader, &state, false).iter().map(|x| x.digest()).collect();
+
+    // THEN
+    assert_eq!(
+        legacy,
+        legacy_replay_sequence(&leader, &state),
+        "the legacy arm must reproduce the stable round-sorted DFS discovery order"
+    );
+}
+
+/// The two arms of `order_dag_inner` agree on per-round membership for the same state and
+/// leader but disagree on at least one round's permutation: the seed-chain tie-break reorders
+/// certificates within rounds and does nothing else.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, the seeded permutation
+/// reproduces the legacy DFS order on all five four-certificate rounds with probability at
+/// most (1 / 24)^5, under 2e-7 per run.
+#[test]
+fn order_dag_arms_share_membership_and_disagree_on_order() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let seeded = digests_by_round(&utils::order_dag_inner(&leader, &state, true));
+    let legacy = digests_by_round(&utils::order_dag_inner(&leader, &state, false));
+
+    // THEN per-round membership is identical
+    (1..=6).for_each(|round| {
+        let seeded_round = seeded.get(&round).expect("round appears in the seeded commit");
+        let legacy_round = legacy.get(&round).expect("round appears in the legacy commit");
+        assert_eq!(
+            seeded_round.iter().copied().collect::<BTreeSet<_>>(),
+            legacy_round.iter().copied().collect::<BTreeSet<_>>(),
+            "round {round} membership must agree across the arms"
+        );
+    });
+    // AND at least one round's permutation differs
+    let any_round_differs = (1..=5).any(|round| seeded.get(&round) != legacy.get(&round));
+    assert!(any_round_differs, "the seeded arm must permute at least one round");
+}
+
+/// Sentinel selecting the child dispatch of [`order_dag_wrapper_consults_the_fork_gate`]: a
+/// dedicated variable rather than the fork override itself, so a lane-exported
+/// `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` cannot be mistaken for a child spawn.
+const TN_TEST_ORDER_DAG_WRAPPER_CHILD: &str = "TN_TEST_ORDER_DAG_WRAPPER_CHILD";
+
+/// Names a sibling `#[ignore]` child test as the libtest filter string for THIS binary: the
+/// module path minus its crate segment, joined to the bare function name.
+fn child_test_name(fn_name: &str) -> String {
+    module_path!()
+        .split_once("::")
+        .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"))
+}
+
+/// Production-wrapper gate pin (#1260): `order_dag` must consult
+/// `forks::leader_seeded_ordering_active(leader.epoch())`, test override included, rather
+/// than hardcoding an arm.
+///
+/// Every other test reaches the arms through the `order_dag_inner` seam with a literal bool,
+/// and on default builds the gate is constant-true, so a wrapper regression (hardcoding
+/// `true`, or reading node-local state that happens to agree) is unobservable in-process.
+/// This parent spawns THIS test binary with `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295`
+/// (dormant) in the child's env: the override latches in a process-wide `OnceLock`, so the
+/// dormant configuration needs its own process. The child's harness output must report
+/// exactly one passed test: a drifted name would match nothing and still exit 0, so exit
+/// status alone would be a vacuous pass.
+///
+/// What this does and does not discriminate: it proves the wrapper consults the fork gate
+/// (override included) instead of hardcoding an arm; it cannot distinguish `leader.epoch()`
+/// from node-local epoch state in-process, because every fixture certificate shares one
+/// epoch.
+#[test]
+fn order_dag_wrapper_consults_the_fork_gate() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let name = child_test_name("child_order_dag_wrapper_observes_dormant_gate");
+    let mut command = std::process::Command::new(exe);
+    command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+    command.env(TN_TEST_ORDER_DAG_WRAPPER_CHILD, "1");
+    command.env("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", u32::MAX.to_string());
+    let output = command.output().expect("spawn child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+/// Child of [`order_dag_wrapper_consults_the_fork_gate`], spawned with the leader-seeded
+/// ordering fork pinned dormant: the wrapper must observe the dormant gate and emit exactly
+/// the legacy sequence, while the seeded arm, forced through the seam, still differs.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, the forced seeded
+/// permutation reproduces the legacy order on all five four-certificate rounds with
+/// probability at most (1 / 24)^5, under 2e-7 per run.
+#[test]
+#[ignore = "spawned by order_dag_wrapper_consults_the_fork_gate with a controlled env"]
+fn child_order_dag_wrapper_observes_dormant_gate() {
+    assert!(
+        std::env::var_os(TN_TEST_ORDER_DAG_WRAPPER_CHILD).is_some(),
+        "this child runs only under order_dag_wrapper_consults_the_fork_gate, which pins the \
+         fork override in the spawn env; running it directly proves nothing about the wrapper",
+    );
+    // The override latches in a process-wide `OnceLock`, so a child launched WITHOUT the
+    // variable in its env cannot observe the dormant gate. Fail loudly rather than assert a
+    // property this process cannot hold; a silent skip here would read as a pass.
+    assert_eq!(
+        tn_types::forks::leader_seeded_ordering_fork_epoch_override(),
+        Some(u32::MAX),
+        "this child requires TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295 latched from its \
+         spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+    );
+
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    let digests = |ordered: &[Certificate]| ordered.iter().map(|x| x.digest()).collect::<Vec<_>>();
+    let wrapper = digests(&utils::order_dag(&leader, &state));
+    let legacy = digests(&utils::order_dag_inner(&leader, &state, false));
+    let seeded = digests(&utils::order_dag_inner(&leader, &state, true));
+
+    assert_eq!(
+        wrapper, legacy,
+        "order_dag must observe the dormant fork gate and take the legacy arm digest for digest",
+    );
+    assert_ne!(
+        wrapper, seeded,
+        "the arms must disagree here, or the equality above is vacuous and this child cannot \
+         tell which arm the wrapper took",
+    );
 }

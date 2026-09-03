@@ -38,25 +38,38 @@ impl TestBinary {
     ///
     /// Pins every fork-epoch override on the child so spawned nodes run the fork points the
     /// harness states rather than their build defaults (non-adiri builds are otherwise active
-    /// from genesis for both forks). With nothing in the harness environment each pin is
-    /// `u32::MAX`, holding that fork dormant: wire-identical to pre-fork mainnet for the seed
-    /// signature, the legacy single-worker layout for the committee worker list. A harness-level
-    /// value is forwarded verbatim so a fork-active lane can export
-    /// `TN_SEED_SIGNATURE_FORK_EPOCH=0` or `TN_MULTI_WORKERS_FORK_EPOCH=1`, and a single test
-    /// can still override a pin with its own later `env()` call. Only binaries built with
-    /// `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see `make build-e2e-bin`)
-    /// consult these variables; production binaries ignore them.
+    /// from genesis for every fork). With nothing in the harness environment the seed-signature
+    /// and multi-workers pins are `u32::MAX`, holding those forks dormant: wire-identical to
+    /// pre-fork mainnet for the seed signature, the legacy single-worker layout for the
+    /// committee worker list. The leader-seeded-ordering pin defaults to `0` instead: its gate
+    /// (`tn_types::forks::leader_seeded_ordering_active`) conjoins the seed-signature fork
+    /// fail-closed, so with the seed fork dormant the seeded ordering stays off regardless of
+    /// this pin, and `0` means "the fork point itself never blocks; the seed fork governs",
+    /// which is what a non-adiri production build does. A harness-level value is forwarded
+    /// verbatim so a lane can export `TN_SEED_SIGNATURE_FORK_EPOCH=0` or
+    /// `TN_MULTI_WORKERS_FORK_EPOCH=1` or `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=1`, and a
+    /// single test can still override a pin with its own later `env()` call. Only binaries
+    /// built with `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see
+    /// `make build-e2e-bin`) consult these variables; production binaries ignore them.
     pub fn command(&self) -> std::process::Command {
         let mut command = match self {
             TestBinary::Prebuilt(path) => std::process::Command::new(path),
             TestBinary::Cargo(run) => run.command(),
         };
-        // one loop rather than a block per variable so the two forks cannot drift apart in
-        // mechanism; they arm independently, so each is read and forwarded on its own
-        for var in ["TN_SEED_SIGNATURE_FORK_EPOCH", "TN_MULTI_WORKERS_FORK_EPOCH"] {
-            let fork_epoch = std::env::var(var).unwrap_or_else(|_| u32::MAX.to_string());
+        // one loop rather than a block per variable so the forks cannot drift apart in
+        // mechanism; they arm independently, so each is read and forwarded on its own, and
+        // each carries its own default (the leader-seeded fork is governed by its seed
+        // conjunct, so its fork point defaults to the always-armed 0 rather than dormant)
+        [
+            ("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX),
+            ("TN_MULTI_WORKERS_FORK_EPOCH", u32::MAX),
+            ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", 0),
+        ]
+        .into_iter()
+        .for_each(|(var, default)| {
+            let fork_epoch = std::env::var(var).unwrap_or_else(|_| default.to_string());
             command.env(var, fork_epoch);
-        }
+        });
         command
     }
 }
