@@ -13,10 +13,10 @@
 //!   discarding transactions mined in the lost rounds (issue #1236). A retry interval re-arms the
 //!   residual reload between notifications, so a large dirty set drains at the retry cadence even
 //!   when notification traffic goes quiet (issue #1304).
-//! - [`TxPool::get_pending_base_fee`] currently returns `MIN_PROTOCOL_BASE_FEE` (7 wei)
-//!   unconditionally; issue 114 tracks computing a real per-round base fee. Both callers (the task
-//!   above and the batch builder's maintenance path) use it only as the fallback when a tip header
-//!   carries no `base_fee_per_gas` — otherwise the pool's pending base fee tracks the new tip's.
+//! - The pool's pending base fee always comes from the shared per-worker [`BaseFeeContainer`] (the
+//!   gas accumulator's fee for the current epoch). Canonical tip headers never set it: at an epoch
+//!   boundary the tip is the previous epoch's closing block, whose header carries the old epoch's
+//!   fee (issue #1262).
 //! - [`new_pool_txn`] hard-codes `propagate: false` (reth's flag for devp2p tx gossip): transaction
 //!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
 //!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
@@ -58,8 +58,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_types::{
-    Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
-    TxHash, MIN_PROTOCOL_BASE_FEE, U256,
+    gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
+    TaskSpawner, TransactionSigned, TxHash, U256,
 };
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
@@ -137,8 +137,6 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
 pub trait TxPool {
     /// Return an iterator over the best transactions in a pool.
     fn best_transactions(&self) -> BestTxns;
-    /// Return the pending txn base fee.
-    fn get_pending_base_fee(&self) -> u64;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
     /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
@@ -162,6 +160,9 @@ pub trait TxPool {
 pub struct WorkerTxPool(
     EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
     BlockchainProvider<TelcoinNode>,
+    /// The shared per-worker base-fee container: the single source of the pool's pending base
+    /// fee (issue #1262).
+    BaseFeeContainer,
 );
 
 impl From<WorkerTxPool>
@@ -179,8 +180,10 @@ impl WorkerTxPool {
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
-        let this = Self::build(node_config, task_spawner, blockchain_provider, evm_config)?;
+        let this =
+            Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
         Ok(this)
     }
@@ -195,6 +198,7 @@ impl WorkerTxPool {
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
@@ -253,7 +257,7 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone()))
+        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee))
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -498,11 +502,16 @@ impl WorkerTxPool {
             })
     }
 
-    /// update pool to remove mined transactions
+    /// Apply a canonical state update to the pool: remove mined transactions and refresh
+    /// changed accounts.
+    ///
+    /// The pending base fee always comes from the worker's shared [`BaseFeeContainer`], the fee
+    /// for the current epoch. At an epoch boundary the canonical tip is the previous epoch's
+    /// closing block and its header carries the old epoch's fee, so tip headers must never set
+    /// the pool's fee (issue #1262).
     pub fn update_canonical_state(
         &self,
         new_tip: &SealedBlock,
-        pending_block_base_fee: u64,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
@@ -510,7 +519,7 @@ impl WorkerTxPool {
         // create canonical state update
         let update = CanonicalStateUpdate {
             new_tip,
-            pending_block_base_fee,
+            pending_block_base_fee: self.2.base_fee(),
             pending_block_blob_fee,
             changed_accounts,
             mined_transactions,
@@ -561,11 +570,9 @@ impl WorkerTxPool {
 
         debug!(target: "block-builder", ?mined_transactions);
 
-        let base_fee_per_gas = tip.base_fee_per_gas.unwrap_or_else(|| self.get_pending_base_fee());
         // sync fn so self will block until all pool updates are complete
         self.update_canonical_state(
             tip.sealed_block(),
-            base_fee_per_gas,
             Some(u128::MAX), // set max fee for blobs
             mined_transactions,
             changed_accounts,
@@ -645,14 +652,6 @@ impl WorkerTxPool {
 impl TxPool for WorkerTxPool {
     fn best_transactions(&self) -> BestTxns {
         BestTxns { inner: self.0.best_transactions() }
-    }
-
-    /// Return the pending txn base fee.  Currently just the min protocol base fee.
-    fn get_pending_base_fee(&self) -> u64 {
-        // TODO issue 114: calculate the next basefee HERE for the entire round
-        //
-        // for now, always use lowest base fee possible
-        MIN_PROTOCOL_BASE_FEE
     }
 
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
@@ -776,7 +775,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{
-        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager, U256,
+        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Build a pool over a chain whose genesis funds the factory's sender, so a rejected
@@ -793,7 +793,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
     }
 
@@ -830,7 +830,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let tx = tx_factory.create_eip1559(
@@ -907,7 +907,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let encoded_txs: Vec<Vec<u8>> = (0..3)
@@ -954,7 +954,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let tx = tx_factory.create_eip1559(
             chain.clone(),
@@ -1004,7 +1004,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let dirty: AddressSet = (1u8..=3).map(Address::repeat_byte).collect();
 
@@ -1040,7 +1040,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let encoded_txs: Vec<Vec<u8>> = factories
             .iter_mut()
@@ -1115,7 +1115,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let updates: Vec<Result<CanonStateNotification, BroadcastStreamRecvError>> = Vec::new();
         let ended = tokio::time::timeout(
@@ -1147,7 +1147,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let tx = tx_factory.create_eip1559(
             chain.clone(),
@@ -1206,7 +1206,7 @@ mod tests {
             rpc_args,
         )
         .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let tx = tx_factory.create_eip1559(
@@ -1223,6 +1223,34 @@ mod tests {
             .await
             .expect_err("local transaction over the cap is refused by the validator");
         assert!(format!("{err:?}").contains("ExceedsFeeCap"), "unexpected error: {err:?}");
+    }
+
+    /// Regression test for issue #1262: a canonical tip whose header carries another epoch's
+    /// base fee must not overwrite the pool's pending base fee. The pending fee always comes
+    /// from the worker's shared [`BaseFeeContainer`].
+    #[tokio::test]
+    async fn test_canonical_update_cannot_clobber_epoch_base_fee() {
+        const EPOCH_FEE: u64 = MIN_PROTOCOL_BASE_FEE + 1234;
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::new(EPOCH_FEE)).unwrap();
+
+        // The genesis header carries the chain's default fee. It must differ from EPOCH_FEE,
+        // or the assertion below could not distinguish the container from the tip header.
+        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
+
+        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+
+        assert_eq!(
+            pool.block_info().pending_basefee,
+            EPOCH_FEE,
+            "a canonical tip from the previous epoch must not clobber the epoch base fee",
+        );
     }
 
     #[test]
