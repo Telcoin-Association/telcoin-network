@@ -1113,6 +1113,19 @@ impl Inner {
             // not heal, so this is terminal — surface the same remediation as the recovery path.
             return Err(Self::corrupt_pack(&base_dir));
         }
+        // Clamp the read-only data handle's read bound to the index-attested committed length.
+        // `files_consistent` just proved `data.file_len() == data_file_length` (a sealed pack has
+        // no capacity padding), so this is a no-op today — but it makes the read bound
+        // provably the attested end, so a read can never touch bytes a writer truncation
+        // would remove even if a padded file ever reached here. Defense-in-depth for the
+        // read-only-mmap SIGBUS window.
+        let attested = consensus_digests.data_file_length();
+        debug_assert_eq!(
+            data.file_len(),
+            attested,
+            "a sealed pack's physical length must equal the index-attested length"
+        );
+        data.set_read_bound(attested);
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
 

@@ -217,11 +217,21 @@ impl MmapDataFile {
         let (backing, capacity) = if orig_len == 0 {
             (Backing::Empty, 0)
         } else if read_only {
-            // SAFETY: single-writer pack model — the file is not concurrently truncated/replaced.
+            // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
+            // clean-closed (its `Drop` truncated the mmap capacity padding away, so physical ==
+            // logical) and has no live writer. A writer that later shrinks the file under this
+            // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
+            // error path catches. The pack upholds this: `get_static` serves the live epoch from
+            // the writer handle (never a read-only map of it), and `open_static` runs
+            // only on sealed epochs and is gated by `files_consistent`. As
+            // defense-in-depth, the read bound (`end`) is additionally clamped to the
+            // index-attested length via `set_read_bound`, so reads never touch bytes a
+            // writer truncation could remove even if that discipline slipped.
             let map = unsafe { Mmap::map(&file)? };
             (Backing::Ro(map), orig_len)
         } else {
-            // SAFETY: as above; we hold the file open for writing for this handle's lifetime.
+            // SAFETY: single-writer pack model — we hold the file open for writing for this
+            // handle's lifetime and nothing else writes/truncates it concurrently.
             let map = unsafe { MmapMut::map_mut(&file)? };
             (Backing::Rw(map), orig_len)
         };
@@ -257,6 +267,22 @@ impl MmapDataFile {
     /// Logical length (bytes of real data) — also the position a new record is appended at.
     pub fn len(&self) -> u64 {
         self.end
+    }
+
+    /// Clamp a read-only handle's read bound down to `logical_end` (the caller's index-attested
+    /// record end). `slice`/`read`/`len` are all bounded by `end`, so after this no read touches a
+    /// byte above `logical_end` — the region a writer truncation would remove — even if this handle
+    /// mapped a file that was physically padded past its logical data. Never grows `end` (a
+    /// read-only handle cannot have more logical data than it opened with) and does not re-map: the
+    /// mapping may still span padding, but those pages are never accessed. No-op on a writable
+    /// handle.
+    pub fn set_read_bound(&mut self, logical_end: u64) {
+        if self.read_only {
+            self.end = self.end.min(logical_end);
+            if self.seek_pos > self.end {
+                self.seek_pos = self.end;
+            }
+        }
     }
 
     /// Is the logical file empty?
@@ -567,10 +593,13 @@ impl MmapDataFile {
         self.backing = Backing::Empty;
         if disk_len > 0 {
             self.backing = if self.read_only {
-                // SAFETY: single-writer model.
+                // SAFETY: read-only refresh is only sound while the underlying file is sealed (a
+                // cleanly-closed writer, physical == logical, no live writer). Following a
+                // mid-append writer would adopt its padded physical size and SIGBUS on a later
+                // truncation; pair with `set_read_bound` (see the read-only branch of `open_with`).
                 Backing::Ro(unsafe { Mmap::map(&self.file)? })
             } else {
-                // SAFETY: as above.
+                // SAFETY: single-writer model — this handle is the sole writer for its lifetime.
                 Backing::Rw(unsafe { MmapMut::map_mut(&self.file)? })
             };
         }
@@ -1054,6 +1083,51 @@ mod tests {
         let mut buf = vec![0u8; 80];
         ro.read_exact(&mut buf).expect("read");
         assert_eq!(&buf[..50], &pattern(50)[..]);
+    }
+
+    /// A read-only handle bounded to the logical length never reads the writer's capacity padding,
+    /// so a later writer truncation (which removes that padding) cannot deliver SIGBUS: bounded
+    /// reads stay within the committed region that survives the truncation.
+    #[test]
+    fn ro_read_bound_keeps_reads_below_a_later_truncation() {
+        let tmp = TempDir::with_prefix("mmap_df_bound").expect("temp dir");
+        let path = tmp.path().join("data");
+        // Writer stays LIVE (not dropped), so the physical file keeps its capacity padding.
+        let mut w = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open writer");
+        w.write_all(&pattern(50)).expect("write");
+        w.sync_all().expect("sync");
+        let physical = std::fs::metadata(&path).expect("metadata").len();
+        assert!(
+            physical > 50,
+            "a live writer file must be padded past its logical data ({physical})"
+        );
+
+        // A read-only handle adopts the padded physical length...
+        let mut ro = MmapDataFile::open(&path, true).expect("open ro");
+        assert_eq!(ro.len(), physical);
+        // ...clamp its read bound to the logical data length.
+        ro.set_read_bound(50);
+        assert_eq!(ro.len(), 50, "the read bound clamps len to the logical end");
+        // `set_read_bound` never grows the bound.
+        ro.set_read_bound(physical);
+        assert_eq!(ro.len(), 50, "the read bound never grows back toward the padding");
+        // A slice past the bound is a clean `None`, never a fault into the padding.
+        assert!(ro.slice(0, 50).is_some());
+        assert!(ro.slice(0, 51).is_none(), "reads never exceed the clamped bound");
+        assert!(ro.slice(50, 1).is_none());
+
+        // The writer truncates the padding away on clean close. The read-only handle, bounded to
+        // `[0, 50)`, still reads the committed bytes and never touches a now-truncated page.
+        drop(w);
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            50,
+            "clean close truncates padding"
+        );
+        ro.seek(SeekFrom::Start(0)).expect("seek");
+        let mut buf = vec![0u8; 50];
+        ro.read_exact(&mut buf).expect("bounded read survives the truncation");
+        assert_eq!(&buf[..], &pattern(50)[..]);
     }
 
     #[test]

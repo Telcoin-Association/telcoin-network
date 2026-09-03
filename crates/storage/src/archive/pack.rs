@@ -55,6 +55,14 @@ where
         self.inner.file_len()
     }
 
+    /// Clamp a read-only pack's read bound down to `logical_end` (the index-attested record end),
+    /// so reads never touch bytes above the committed data even if the underlying file were
+    /// physically padded. Defense-in-depth against the read-only-mmap SIGBUS window; no-op on a
+    /// writable pack.
+    pub fn set_read_bound(&mut self, logical_end: u64) {
+        self.inner.data_file.set_read_bound(logical_end);
+    }
+
     /// Reconcile the physical data file down to its logical length, dropping any capacity padding
     /// the mmap backend leaves past `end` (the mapping must be >= the file). Afterwards a separate
     /// handle reading the file to EOF observes exactly `[0, end)` with no trailing zero-padding.
