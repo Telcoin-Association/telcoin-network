@@ -545,18 +545,17 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 /// # Arming constraints (compile-time asserted below)
 ///
 /// - **At or above [`SEED_SIGNATURE_FORK_EPOCH`].** The seeded key folds the leader's seed
-///   signature into the epoch seed chain, which only carries digest-pinned values once the
-///   seed fork is active. [`leader_seeded_ordering_active`] additionally conjoins
-///   [`seed_signature_active`] fail-closed, so a mis-ordered schedule stays on the legacy
-///   order instead of keying commits on a forkable value.
+///   signature into the epoch seed chain, which only carries digest-pinned values once the seed
+///   fork is active. [`leader_seeded_ordering_active`] additionally conjoins
+///   [`seed_signature_active`] fail-closed, so a mis-ordered schedule stays on the legacy order
+///   instead of keying commits on a forkable value.
 /// - **Strictly above [`ADIRI_DUP_BATCH_EPOCH`].** Duplicate-batch attribution is
-///   intra-round-position-sensitive for adiri epochs at or below that cutoff: a batch
-///   referenced by two headers is credited to whichever header comes first in sequence and
-///   dropped from the second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork
-///   permutes exactly that sequence, so arming it at or below the cutoff would change
-///   replayed attribution on adiri, a resync divergence rather than just a reordering. The
-///   epoch-setting PR is the place this bites, and that PR will not be looking at the
-///   dup-batch interaction; the assert makes it look.
+///   intra-round-position-sensitive for adiri epochs at or below that cutoff: a batch referenced by
+///   two headers is credited to whichever header comes first in sequence and dropped from the
+///   second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork permutes exactly that
+///   sequence, so arming it at or below the cutoff would change replayed attribution on adiri, a
+///   resync divergence rather than just a reordering. The epoch-setting PR is the place this bites,
+///   and that PR will not be looking at the dup-batch interaction; the assert makes it look.
 ///
 /// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
 /// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
