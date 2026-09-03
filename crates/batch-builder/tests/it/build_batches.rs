@@ -17,9 +17,10 @@ use tn_reth::{
 use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_test_utils::wait_until;
 use tn_types::{
-    gas_accumulator::GasAccumulator, test_genesis, Address, Batch, BatchValidation, Bytes,
-    Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database,
-    Encodable2718, GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database, Encodable2718,
+    GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
     MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -71,7 +72,7 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
 
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
     let address = Address::from(U160::from(333));
 
     // build execution block proposer
@@ -229,7 +230,7 @@ async fn test_batch_builder_produces_valid_batches() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
@@ -401,7 +402,7 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
     let address = Address::from(U160::from(333));
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
