@@ -275,6 +275,10 @@ pub struct HdxIndex<
     synced: bool,
     bloom: Bloom,
     _index_dir: PathBuf,
+    /// Test-only: when set, the next bucket split fails mid-way (after both buckets are zeroed) to
+    /// exercise the rollback in [`Self::split_one_bucket`].
+    #[cfg(test)]
+    fail_next_split: bool,
 }
 
 /// Counts from [`HdxIndex::bucket_crc_scan`] over the main buckets: how many are dirty
@@ -408,7 +412,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             synced: true,
             bloom,
             _index_dir: dir.to_owned(),
+            #[cfg(test)]
+            fail_next_split: false,
         })
+    }
+
+    /// Test-only failure injector: make the next bucket split fail mid-way (both buckets zeroed,
+    /// nothing re-inserted) so [`Self::split_one_bucket`]'s rollback can be exercised.
+    #[cfg(test)]
+    fn fail_next_split_for_test(&mut self) {
+        self.fail_next_split = true;
     }
 
     /// Number of keys hashed in this index.
@@ -714,6 +727,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// written at the current file end (which the random-write mmap extends).
     fn split_one_bucket(&mut self) -> Result<(), AppendError> {
         let old_modulus = self.modulus;
+        let old_buckets = self.buckets();
         // The bucket being split. `checked_sub` so a broken invariant surfaces as corruption rather
         // than wrapping (release builds) to a huge index whose `slice_mut` returns `None` and is
         // misreported as a spurious `ReadOnly`.
@@ -724,22 +738,58 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 old_modulus / 2
             ))
         })? as u64;
+        let split_pos = self.bucket_pos(split_bucket);
+
+        // Gather the split bucket's elements (shared borrows) BEFORE any mutation, then snapshot
+        // the bucket's raw bytes, so a failure part-way through the redistribute can fully
+        // restore the pre-split state instead of dropping the collected digests. Without
+        // the restore the index would serve false negatives for them (the mapping is not
+        // the durability source, so nothing rebuilds it) until the next restart. `collect`
+        // reads `bucket_pos(split_bucket)` + the odx chain — neither depends on the bucket
+        // count / modulus — so it is safe here.
+        let elements = self.collect_bucket_elements(split_bucket)?;
+        let original = match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
+            Some(buf) => buf.to_vec(),
+            None => return Err(AppendError::ReadOnly),
+        };
+
+        if let Err(e) = self.redistribute_split(split_bucket, split_pos, elements) {
+            // Restore the pre-split state: the bucket/modulus counters revert, and rewriting the
+            // split bucket's original bytes restores its overflow pointer — the odx is append-only,
+            // so the failed re-inserts only *appended* records and the original chain is intact, so
+            // every original element is reachable again. The new bucket, the `ensure_len` growth,
+            // and any orphan odx records are inert once `buckets` is reverted (the new
+            // bucket is beyond the count; orphans are unreferenced). `values` is
+            // untouched (redistribute uses `inc_values=false`). The triggering `save`
+            // still errors out (`expand_buckets` propagates this), so the record writer
+            // manages the failure with the index no worse than before.
+            self.modulus = old_modulus;
+            self.header.buckets = old_buckets;
+            if let Some(buf) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+                buf.copy_from_slice(&original);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The mutating half of a bucket split: allocate the new bucket, clear the split/new pair, and
+    /// redistribute `elements` across them. Separated from [`Self::split_one_bucket`] so a failure
+    /// here can be rolled back to the snapshot that caller took. On success the split bucket and
+    /// the appended `new_bucket` hold the rehashed elements; on error the mapping is left
+    /// mid-split and the caller restores it.
+    fn redistribute_split(
+        &mut self,
+        split_bucket: u64,
+        split_pos: u64,
+        elements: Vec<(B256, u64)>,
+    ) -> Result<(), AppendError> {
         self.inc_buckets();
         // The newly created bucket that some of split_bucket's items may move into.
         let new_bucket = self.buckets() as u64 - 1;
         // Don't want buckets and modulus to be the same, so +1.
         self.modulus = (self.buckets() + 1).next_power_of_two();
-        let split_pos = self.bucket_pos(split_bucket);
         let new_pos = self.bucket_pos(new_bucket);
-
-        // Gather the split bucket's elements (shared borrows) BEFORE clearing either bucket, then
-        // redistribute into two freshly-zeroed buckets — mirroring the original `HdxIndex` split,
-        // which builds fresh buffers. The split bucket must be cleared too: if it kept its old
-        // contents, the elements that move to `new_bucket` would linger here as stale duplicates,
-        // and a later re-split would re-collect them, hash them into a third bucket, and trip the
-        // guard below (they are never consulted by lookups, so the only visible symptom is that
-        // panic plus unbounded overflow-chain growth).
-        let elements = self.collect_bucket_elements(split_bucket)?;
 
         // Clear both buckets before redistributing. The split bucket is already within the logical
         // end, so zero it in place. The new bucket lies at/after the current end (buckets are
@@ -758,6 +808,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             buffer.fill(0);
         } else {
             return Err(AppendError::ReadOnly);
+        }
+
+        // Test-only: simulate a mid-split failure with both buckets already zeroed (the worst case
+        // for element loss) so the caller's rollback is exercised.
+        #[cfg(test)]
+        if self.fail_next_split {
+            self.fail_next_split = false;
+            return Err(AppendError::CrcError);
         }
 
         for (hash, rec_pos) in elements {
@@ -1056,6 +1114,56 @@ mod tests {
             matches!(idx.split_one_bucket(), Err(AppendError::CorruptIndex(_))),
             "split underflow must error, not wrap"
         );
+    }
+
+    /// A failed bucket split must roll back, not drop the collected elements: after an injected
+    /// mid-split failure the split bucket's keys still load (without the rollback they would be
+    /// lost in-process until a restart rebuilt the index from the WAL), and the save that
+    /// triggered the split errors out so the record writer can manage it.
+    #[test]
+    fn test_failed_split_rolls_back_and_preserves_elements() {
+        let tmp = TempDir::with_prefix("test_hdx_split_rollback").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+
+        // The first split splits `buckets - modulus/2`. Collect several keys that hash there so the
+        // split bucket is non-empty — its elements are exactly what a broken split would drop.
+        let split_bucket = idx.buckets() as u64 - (idx.modulus as u64) / 2;
+        let mut targets = Vec::new();
+        let mut i = 0u64;
+        while targets.len() < 5 {
+            let k = key(i);
+            if idx.hash_to_bucket(k.as_slice()) == split_bucket {
+                targets.push((k, i));
+            }
+            i += 1;
+        }
+        for (k, pos) in &targets {
+            idx.save(*k, *pos).expect("save target");
+            assert_eq!(idx.load(*k).expect("load before split"), *pos);
+        }
+
+        // Force the next save to trigger a split, and make that split fail after both buckets are
+        // zeroed (nothing re-inserted) — the worst case for element loss.
+        idx.expand_at_capacity = idx.header.values;
+        idx.fail_next_split_for_test();
+        let trigger = key(1_000_000);
+        assert!(
+            matches!(idx.save(trigger, 42), Err(AppendError::CrcError)),
+            "the save that triggers a failed split must error out"
+        );
+
+        // Rollback preserved every split-bucket key; the triggering key was never inserted.
+        for (k, pos) in &targets {
+            assert_eq!(idx.load(*k).expect("a split-bucket key must survive a failed split"), *pos);
+        }
+        assert!(matches!(idx.load(trigger), Err(FetchError::NotFound)));
+
+        // Retry now the injector is cleared: the split succeeds and every key is present.
+        idx.save(trigger, 42).expect("retry after the transient split failure");
+        for (k, pos) in &targets {
+            assert_eq!(idx.load(*k).expect("load after a successful split"), *pos);
+        }
+        assert_eq!(idx.load(trigger).expect("trigger loads after retry"), 42);
     }
 
     /// Full lifecycle on the memory-mapped, cache-free index: fill (forcing bucket splits, i.e.
