@@ -329,6 +329,7 @@ where
                 AppendError::SerializeValue(_)
                 | AppendError::ReadOnly
                 | AppendError::CrcError
+                | AppendError::CorruptIndex(_)
                 | AppendError::DuplicateKey => {}
             }
         }

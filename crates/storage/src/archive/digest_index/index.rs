@@ -475,29 +475,48 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         u64::from_le_bytes(b)
     }
 
-    /// Number of elements currently stored in a bucket buffer.
-    fn bucket_elements(buf: &[u8]) -> usize {
+    /// Number of elements stored in a bucket buffer, validated against the bucket geometry.
+    ///
+    /// The count is a raw `u32` from `buf[8..12]` on the CRC-free read path, so it is untrusted. A
+    /// bucket physically holds at most [`Self::BUCKET_ELEMENTS`]; a larger value is corruption, and
+    /// consuming it unchecked would slice past the fixed-size buffer and panic. Returns `None` on
+    /// an out-of-range count so callers can surface a clean error instead of crashing.
+    fn bucket_elements(buf: &[u8]) -> Option<usize> {
         let mut b = [0_u8; 4];
         b.copy_from_slice(&buf[8..12]);
-        u32::from_le_bytes(b) as usize
+        let n = u32::from_le_bytes(b) as usize;
+        (n <= Self::BUCKET_ELEMENTS).then_some(n)
     }
 
     /// Scan a single bucket buffer for `key`, returning its stored record position if present.
-    fn scan_bucket(buf: &[u8], key: &[u8]) -> Option<u64> {
-        for i in 0..Self::bucket_elements(buf) {
+    /// Errors (rather than panics) if the on-disk element count is out of range for the bucket
+    /// geometry.
+    fn scan_bucket(buf: &[u8], key: &[u8]) -> Result<Option<u64>, FetchError> {
+        let elements = Self::bucket_elements(buf).ok_or_else(|| {
+            FetchError::CorruptIndex("bucket element count exceeds bucket capacity".to_string())
+        })?;
+        for i in 0..elements {
             let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
             if &buf[pos..pos + KSIZE] == key {
                 let mut p = [0_u8; 8];
                 p.copy_from_slice(&buf[pos + KSIZE..pos + KSIZE + 8]);
-                return Some(u64::from_le_bytes(p));
+                return Ok(Some(u64::from_le_bytes(p)));
             }
         }
-        None
+        Ok(None)
     }
 
-    /// Push every not-yet-seen `(digest, position)` element of a bucket buffer into `out`.
-    fn collect_from_buffer(buf: &[u8], out: &mut Vec<(B256, u64)>, seen: &mut BTreeSet<B256>) {
-        for i in 0..Self::bucket_elements(buf) {
+    /// Push every not-yet-seen `(digest, position)` element of a bucket buffer into `out`. Errors
+    /// (rather than panics) if the on-disk element count is out of range for the bucket geometry.
+    fn collect_from_buffer(
+        buf: &[u8],
+        out: &mut Vec<(B256, u64)>,
+        seen: &mut BTreeSet<B256>,
+    ) -> Result<(), AppendError> {
+        let elements = Self::bucket_elements(buf).ok_or_else(|| {
+            AppendError::CorruptIndex("bucket element count exceeds bucket capacity".to_string())
+        })?;
+        for i in 0..elements {
             let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
             let hash = B256::from_slice(&buf[pos..pos + KSIZE]);
             if seen.insert(hash) {
@@ -506,6 +525,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 out.push((hash, u64::from_le_bytes(p)));
             }
         }
+        Ok(())
     }
 
     /// Look up `key`, reading bucket bytes zero-copy from the mappings (main bucket in the hdx,
@@ -515,29 +535,44 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                if let Some(pos) = Self::scan_bucket(buf, key) {
+                if let Some(pos) = Self::scan_bucket(buf, key)? {
                     return Ok(Some(pos));
                 }
                 Self::read_overflow_pos(buf)
             }
-            None => return Ok(None),
+            // A bucket `< buckets()` is always mapped in a sound index; a short hdx (e.g. an
+            // unclean shutdown or bit rot) is corruption, not a missing key. Surface it
+            // distinctly so `load` does not fold it into `NotFound`.
+            None => {
+                return Err(FetchError::CorruptIndex(format!(
+                    "hdx mapping does not cover bucket {bucket}"
+                )))
+            }
         };
-        // Follow the append-only overflow chain, one zero-copy slice per hop.
+        // Follow the append-only overflow chain, one zero-copy slice per hop. Each pointer must
+        // point strictly backwards into an already-written odx record; seed the bound with the odx
+        // length so the FIRST hop (read from a possibly-corrupt main bucket) is validated the same
+        // as later hops -- an unvalidated first hop could otherwise index arbitrary bytes.
+        let mut upper_bound = self.odx_file.len();
         while overflow_pos > 0 {
+            if overflow_pos >= upper_bound {
+                return Err(FetchError::CorruptIndex(format!(
+                    "overflow pointer {overflow_pos} is not strictly backwards (bound {upper_bound})"
+                )));
+            }
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
                 Some(buf) => buf,
-                None => return Err(FetchError::CrcFailed),
+                None => {
+                    return Err(FetchError::CorruptIndex(format!(
+                        "odx mapping does not cover overflow record at {overflow_pos}"
+                    )))
+                }
             };
-            if let Some(pos) = Self::scan_bucket(buf, key) {
+            if let Some(pos) = Self::scan_bucket(buf, key)? {
                 return Ok(Some(pos));
             }
-            let next = Self::read_overflow_pos(buf);
-            // A non-terminal link must point strictly backwards (the log is append-only); anything
-            // else is corruption, so bail rather than loop forever.
-            if next != 0 && next >= overflow_pos {
-                return Err(FetchError::CrcFailed);
-            }
-            overflow_pos = next;
+            upper_bound = overflow_pos;
+            overflow_pos = Self::read_overflow_pos(buf);
         }
         Ok(None)
     }
@@ -551,22 +586,38 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                Self::collect_from_buffer(buf, &mut out, &mut seen);
+                Self::collect_from_buffer(buf, &mut out, &mut seen)?;
                 Self::read_overflow_pos(buf)
             }
-            None => return Ok(out),
+            // The split bucket is `< buckets()`, so it must be mapped; a `None` here is a short/
+            // corrupt hdx. Surface it rather than silently redistributing an empty bucket (which
+            // would drop the bucket's elements).
+            None => {
+                return Err(AppendError::CorruptIndex(format!(
+                    "hdx mapping does not cover bucket {bucket}"
+                )))
+            }
         };
+        // Validate each overflow pointer before slicing, seeding the bound with the odx length so
+        // the first hop (from a possibly-corrupt main bucket) is validated the same as later hops.
+        let mut upper_bound = self.odx_file.len();
         while overflow_pos > 0 {
+            if overflow_pos >= upper_bound {
+                return Err(AppendError::CorruptIndex(format!(
+                    "overflow pointer {overflow_pos} is not strictly backwards (bound {upper_bound})"
+                )));
+            }
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
                 Some(buf) => buf,
-                None => return Err(AppendError::CrcError),
+                None => {
+                    return Err(AppendError::CorruptIndex(format!(
+                        "odx mapping does not cover overflow record at {overflow_pos}"
+                    )))
+                }
             };
-            Self::collect_from_buffer(buf, &mut out, &mut seen);
-            let next = Self::read_overflow_pos(buf);
-            if next != 0 && next >= overflow_pos {
-                return Err(AppendError::CrcError);
-            }
-            overflow_pos = next;
+            Self::collect_from_buffer(buf, &mut out, &mut seen)?;
+            upper_bound = overflow_pos;
+            overflow_pos = Self::read_overflow_pos(buf);
         }
         Ok(out)
     }
@@ -663,8 +714,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// written at the current file end (which the random-write mmap extends).
     fn split_one_bucket(&mut self) -> Result<(), AppendError> {
         let old_modulus = self.modulus;
-        // The bucket being split.
-        let split_bucket = (self.buckets() - (old_modulus / 2)) as u64;
+        // The bucket being split. `checked_sub` so a broken invariant surfaces as corruption rather
+        // than wrapping (release builds) to a huge index whose `slice_mut` returns `None` and is
+        // misreported as a spurious `ReadOnly`.
+        let split_bucket = self.buckets().checked_sub(old_modulus / 2).ok_or_else(|| {
+            AppendError::CorruptIndex(format!(
+                "split-bucket underflow: buckets {} < modulus/2 {}",
+                self.buckets(),
+                old_modulus / 2
+            ))
+        })? as u64;
         self.inc_buckets();
         // The newly created bucket that some of split_bucket's items may move into.
         let new_bucket = self.buckets() as u64 - 1;
@@ -892,10 +951,111 @@ mod tests {
 
     use super::*;
 
+    /// Concrete default instantiation, so associated consts/fns (`BUCKET_SIZE`, `scan_bucket`, …)
+    /// resolve without spelling out the const-generic parameters at every use.
+    type Idx = HdxIndex<32, BuildHasherDefault<FxHasher>>;
+
     fn key(i: u64) -> B256 {
         let mut hasher = DefaultHashFunction::new();
         hasher.update(&format!("idx-{i}").into_bytes());
         B256::from_slice(hasher.finalize().as_bytes())
+    }
+
+    fn open_index(tmp: &Path) -> HdxIndex {
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        HdxIndex::open_hdx_file(
+            tmp.join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("hdx mmap")
+    }
+
+    /// The CRC-free read path must reject an out-of-range on-disk element count with an error,
+    /// never slice past the fixed bucket buffer and panic.
+    #[test]
+    fn test_scan_bucket_rejects_oversized_element_count() {
+        let mut buf = vec![0u8; Idx::BUCKET_SIZE];
+        let k = key(1);
+        buf[8..12].copy_from_slice(&(Idx::BUCKET_ELEMENTS as u32 + 1).to_le_bytes());
+        assert!(matches!(Idx::scan_bucket(&buf, k.as_slice()), Err(FetchError::CorruptIndex(_))));
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        assert!(matches!(
+            Idx::collect_from_buffer(&buf, &mut out, &mut seen),
+            Err(AppendError::CorruptIndex(_))
+        ));
+        // The maximum u32 must be rejected too (not merely wrapped or truncated).
+        buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(Idx::scan_bucket(&buf, k.as_slice()), Err(FetchError::CorruptIndex(_))));
+    }
+
+    /// A corrupt element count reached through a real `load` errors instead of wedging on a panic.
+    #[test]
+    fn test_load_rejects_corrupt_element_count() {
+        let tmp = TempDir::with_prefix("test_hdx_corrupt_count").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        let k = key(7);
+        idx.save(k, 42).expect("save");
+        assert_eq!(idx.load(k).expect("load"), 42);
+        let bucket = idx.hash_to_bucket(k.as_slice());
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice");
+        buf[8..12].copy_from_slice(&(Idx::BUCKET_ELEMENTS as u32 + 5).to_le_bytes());
+        assert!(
+            matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
+            "a corrupt element count must error, not panic"
+        );
+    }
+
+    /// The first overflow-chain hop (read from a possibly-corrupt main bucket) must be validated:
+    /// a forward/garbage pointer errors rather than indexing arbitrary bytes or looping.
+    #[test]
+    fn test_find_rejects_unvalidated_first_overflow_hop() {
+        let tmp = TempDir::with_prefix("test_hdx_overflow_ptr").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        let k = key(3);
+        idx.save(k, 9).expect("save");
+        let bucket = idx.hash_to_bucket(k.as_slice());
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice");
+        // Point the first overflow hop forward, past any written odx record.
+        buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        // Look up an absent key so the scan falls through to the (corrupt) overflow pointer.
+        let absent = key(987_654);
+        assert!(matches!(
+            idx.find_in_bucket(bucket, absent.as_slice()),
+            Err(FetchError::CorruptIndex(_))
+        ));
+    }
+
+    /// A bucket the mapping does not cover (short/corrupt hdx) must be a distinct error, not folded
+    /// into `NotFound` — otherwise corruption is indistinguishable from a missing key.
+    #[test]
+    fn test_find_out_of_range_mapping_is_corrupt_not_notfound() {
+        let tmp = TempDir::with_prefix("test_hdx_short_map").expect("temp dir");
+        let idx = open_index(tmp.path());
+        let res = idx.find_in_bucket(u32::MAX as u64, key(1).as_slice());
+        assert!(
+            matches!(res, Err(FetchError::CorruptIndex(_))),
+            "out-of-range mapping must be CorruptIndex, got {res:?}"
+        );
+        assert!(!matches!(res, Err(FetchError::NotFound)));
+    }
+
+    /// A broken split invariant must surface as corruption via `checked_sub`, not wrap to a huge
+    /// index misreported as a spurious `ReadOnly`.
+    #[test]
+    fn test_split_bucket_underflow_is_corrupt_index() {
+        let tmp = TempDir::with_prefix("test_hdx_split_underflow").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        // Force modulus/2 > buckets() so the split-bucket subtraction underflows.
+        idx.modulus = idx.buckets().saturating_mul(4) + 4;
+        assert!(
+            matches!(idx.split_one_bucket(), Err(AppendError::CorruptIndex(_))),
+            "split underflow must error, not wrap"
+        );
     }
 
     /// Full lifecycle on the memory-mapped, cache-free index: fill (forcing bucket splits, i.e.

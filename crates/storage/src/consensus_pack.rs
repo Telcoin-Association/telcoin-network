@@ -1557,6 +1557,7 @@ pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
         FetchError::DeserializeValue(_)
         | FetchError::IO(_)
         | FetchError::CrcFailed
+        | FetchError::CorruptIndex(_)
         | FetchError::RequestedSizeTooLarge(_, _)
         | FetchError::RequestedDecompressSizeTooLarge(_) => false,
     }
