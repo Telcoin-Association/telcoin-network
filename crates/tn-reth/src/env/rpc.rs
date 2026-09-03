@@ -231,7 +231,7 @@ mod tests {
             reth::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
             .get_rpc_server(pool, network, BaseFeeContainer::default(), RpcModule::new(()))
