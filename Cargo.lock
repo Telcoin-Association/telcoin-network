@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -11665,6 +11666,7 @@ dependencies = [
 name = "tn-config"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm-siv",
  "backoff",
  "bs58",
@@ -11683,6 +11685,7 @@ dependencies = [
  "tn-network-types",
  "tn-types",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
