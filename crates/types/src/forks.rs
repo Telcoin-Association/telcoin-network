@@ -523,6 +523,35 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+/// Every `test-utils` fork-epoch override actually in force in this process, for the startup
+/// fork-schedule log (#1086).
+///
+/// Callable from any build so the CLI logs the effective schedule without having to know whether
+/// `tn-types`' `test-utils` was unified into the binary it is compiled into. Always empty in a
+/// production binary, where the overrides are compiled out and no environment variable can
+/// repoint a fork; empty in a `test-utils` build too when nothing is exported. Without this the
+/// startup line reports the compiled constants only, and a `test-utils` binary running every fork
+/// dormant (what the e2e harness spawns) logs "active from genesis" while executing the legacy
+/// derivations — the shape of a `mix_hash` mismatch that is otherwise invisible in the logs.
+///
+/// Only variables that parsed are listed, so an entry means "pinned here", absence means "using
+/// this build's own fork point". Values latch on first read like the individual overrides do.
+pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
+    #[cfg(feature = "test-utils")]
+    {
+        [
+            ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
+            ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
+            ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+        ]
+        .into_iter()
+        .filter_map(|(var, fork_epoch)| fork_epoch.map(|fork_epoch| (var, fork_epoch)))
+        .collect()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +717,43 @@ mod tests {
                 "an unset override must not shift the fork point at epoch {epoch}",
             );
         });
+    }
+
+    /// [`fork_epoch_overrides`] reports exactly the pins in force, and nothing else.
+    ///
+    /// Runs in every feature set: without `test-utils` the list is unconditionally empty, and with
+    /// it the list is empty in a process that exported nothing. That second case is why the
+    /// startup log can print an entry and mean it — the same reason the three
+    /// `*_override_is_inert_when_unset` tests need a variable-free process, and the same loud
+    /// failure if one latched first.
+    #[test]
+    fn fork_epoch_overrides_lists_only_the_pins_in_force() {
+        #[cfg(not(feature = "test-utils"))]
+        assert!(
+            fork_epoch_overrides().is_empty(),
+            "a build without test-utils compiles the overrides out and can never report one",
+        );
+        #[cfg(feature = "test-utils")]
+        {
+            let reported = fork_epoch_overrides();
+            let pinned = [
+                ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
+                ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
+                ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+            ];
+            pinned.into_iter().for_each(|(var, fork_epoch)| {
+                assert_eq!(
+                    reported.iter().find(|(name, _)| *name == var).map(|(_, epoch)| *epoch),
+                    fork_epoch,
+                    "{var} must be reported exactly when it is pinned, at the pinned value",
+                );
+            });
+            assert_eq!(
+                reported.len(),
+                pinned.iter().filter(|(_, fork_epoch)| fork_epoch.is_some()).count(),
+                "no fork may be reported that is not pinned: {reported:?}",
+            );
+        }
     }
 
     /// Seed-dormant epochs never take the seeded arm: the observable half of the fail-closed

@@ -12,7 +12,7 @@ use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -135,6 +135,20 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             target: "cli",
             "fork schedule: seed_signature, prevrandao and multi_workers active from genesis"
         );
+
+        // Both lines above report compiled fork points, which a `test-utils` binary does not have
+        // to obey: the e2e harness spawns nodes with every fork pinned dormant, and they log
+        // "active from genesis" while executing the legacy derivations. Name the pins that are
+        // actually in force so the startup log stays diffable there too. Empty and silent in a
+        // production binary, where the overrides are compiled out of `tn-types` entirely.
+        for (var, fork_epoch) in tn_types::forks::fork_epoch_overrides() {
+            warn!(
+                target: "cli",
+                var,
+                fork_epoch,
+                "fork schedule OVERRIDDEN by the environment; this is a test-utils build"
+            );
+        }
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
