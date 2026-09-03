@@ -690,13 +690,23 @@ mod tests {
         });
     }
 
-    /// The fail-closed conjunct documented on [`prevrandao_seed_active`]: a seed-inactive epoch
-    /// must stay on the legacy XOR even where the PREVRANDAO fork point itself is active, so the
-    /// hash never folds the forkable legacy leader-aggregate seed.
+    /// Seed-dormant epochs never take the seeded arm: the observable half of the fail-closed
+    /// conjunct documented on [`prevrandao_seed_active`].
+    ///
+    /// This pins the outcome, not the conjunct in isolation. Catching a deleted
+    /// `seed_signature_active(epoch) &&` needs an epoch where the fork point is active while the
+    /// seed fork is not, and no such epoch exists here: the const assert above forces
+    /// `PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH`, so every seed-dormant epoch is
+    /// fork-point-dormant too — asserted below so the limitation stays visible rather than
+    /// implied. The ordering assert is what enforces the contract for the shipped constants; the
+    /// runtime conjunct is the backstop for an override-driven schedule, and it is observable
+    /// only in a process that sets `TN_PREVRANDAO_FORK_EPOCH` below the seed fork.
     #[cfg(feature = "adiri")]
     #[test]
-    fn prevrandao_seed_active_is_closed_by_the_seed_conjunct() {
-        [0, 1, SEED_SIGNATURE_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+    fn prevrandao_seed_active_stays_legacy_on_seed_dormant_epochs() {
+        // `saturating_sub` rather than `- 1` so a rollout that ever put the seed fork at genesis
+        // fails through the assertion message below instead of an underflow panic here.
+        [0, 1, SEED_SIGNATURE_FORK_EPOCH.saturating_sub(1)].into_iter().for_each(|epoch| {
             assert!(
                 !seed_signature_active(epoch),
                 "epoch {epoch} must be seed-dormant for this test to mean anything",
@@ -705,6 +715,15 @@ mod tests {
                 !prevrandao_seed_active(epoch),
                 "epoch {epoch} is seed-dormant, so the PREVRANDAO gate must stay closed \
                  regardless of the fork point",
+            );
+            // the vacuity this test cannot escape, stated rather than left for a reader to
+            // rediscover: both conjuncts are false here, so either one alone would satisfy the
+            // assertion above
+            assert!(
+                !prevrandao_fork_point_active(epoch),
+                "epoch {epoch} is expected to be fork-point-dormant as well; if a schedule ever \
+                 makes it active here, this test becomes a live check of the seed conjunct and \
+                 this assertion is what should be deleted",
             );
         });
     }
