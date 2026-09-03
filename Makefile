@@ -48,6 +48,9 @@ help:
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
+	@echo "make test-e2e-forked" ;
+	@echo "    :::> Run the e2e suite with the seed-signature and PREVRANDAO forks armed from genesis." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -166,8 +169,8 @@ TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
 # `output_digest ^ batch_digest` mix hash, what adiri has already executed); non-adiri builds
 # are otherwise active from genesis. NOT independent of the seed-signature variable in the
 # arming direction: `prevrandao_seed_active` requires `seed_signature_active`, so a lane needs
-# BOTH armed to reach the seeded derivation:
-#   TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 make test-e2e
+# BOTH armed to reach the seeded derivation. That invocation is the `test-e2e-forked` target
+# below, which is what keeps the seeded arm from having zero process-level coverage.
 # Pinning it here is also what keeps a `TN_SEED_SIGNATURE_FORK_EPOCH=0` lane from silently
 # arming PREVRANDAO as a side effect on a non-adiri build.
 # Only test-utils builds consult it (tn_types::forks::prevrandao_fork_epoch_override).
@@ -188,6 +191,17 @@ test-epochs: build-e2e-bin
 # run e2e tests
 test-e2e: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+
+# run the e2e tests with the PREVRANDAO fork ARMED, the only invocation that executes the
+# seeded mix hash on spawned nodes. Both variables are required and neither is redundant:
+# `prevrandao_seed_active` is their conjunction, so arming PREVRANDAO alone leaves the legacy
+# XOR in force. Until the arming PR lands this is the post-fork wire format's only
+# process-level coverage; a script still using the older one-variable
+# `TN_SEED_SIGNATURE_FORK_EPOCH=0 make test-e2e` form now exercises the legacy arm.
+# Recursive rather than a second nextest line so the lane cannot drift from `test-e2e`;
+# command-line assignments override the `?=` defaults above.
+test-e2e-forked:
+	$(MAKE) test-e2e TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
