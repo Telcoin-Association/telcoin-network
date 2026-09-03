@@ -6,7 +6,8 @@
 //! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
 //! certified batch carried a transaction whose signer could not be recovered) and
 //! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
-//! independently-batching workers). See [`RethEnvMetrics`] for per-series semantics.
+//! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
+//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics.
 //!
 //! Observer transaction forwarding. A base series counts every transaction handed to the
 //! forwarder ([`crate::WorkerRpcForwarder`]): `tn_reth.forwarded_txns_queued_total`. Read
@@ -57,7 +58,9 @@
 //! `WorkerRpcForwarder::new`) then force registration so every counter exists at zero from
 //! process start.
 
+use alloy_evm::InvalidTxError;
 use reth_metrics::{metrics::Counter, Metrics};
+use reth_revm::context::result::InvalidTransaction;
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -76,18 +79,19 @@ use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 /// the noop one.
 pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnvMetrics::default);
 
-/// Register every [`RethEnvMetrics`] counter with the global recorder without recording an
-/// event.
+/// Register every [`RethEnvMetrics`] counter and every labeled skip series with the global
+/// recorder without recording an event.
 ///
-/// Registration happens when the `LazyLock` is first forced, and the sites that force it are
-/// drop paths a healthy node never takes plus the pool maintenance task's lag recovery
-/// (`mark_drifted` in `txn_pool.rs`), which a healthy node also never reaches. Without this
-/// call the series would simply not
-/// exist in a scrape until the first drop, which breaks the counters in the two ways that
-/// matter: an absent series is indistinguishable from a broken exporter or a mistyped metric
-/// name, so the "alert on any nonzero value" rule can never be verified in its negative case;
-/// and `rate()` over a series whose very first sample is already nonzero renders no step, so a
-/// one-shot drop burst on an otherwise quiet node stays invisible on the dashboard.
+/// For the derive-based counters, registration happens when the `LazyLock` is first forced,
+/// and the sites that force it are drop paths a healthy node never takes plus the pool
+/// maintenance task's lag recovery (`mark_drifted` in `txn_pool.rs`), which a healthy node
+/// also never reaches. Without this call the series would simply not exist in a scrape until
+/// the first drop, which breaks the counters in the two ways that matter: an absent series is
+/// indistinguishable from a broken exporter or a mistyped metric name, so the "alert on any
+/// nonzero value" rule can never be verified in its negative case; and `rate()` over a series
+/// whose very first sample is already nonzero renders no step, so a one-shot drop burst on an
+/// otherwise quiet node stays invisible on the dashboard. The labeled skip series need the
+/// same treatment per label value, which [`register_invalid_tx_skip_series`] provides.
 ///
 /// Called from [`crate::RethEnv::new`], which runs after `tn_metrics::install_recorder`, so
 /// every counter baselines at zero from process start . . . the same way the worker and
@@ -96,14 +100,18 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 /// renders no step for the first event.
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
+    register_invalid_tx_skip_series();
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
 /// the worker pool's canonical-state subscription health.
 ///
-/// The two block-building counters cover transactions that `build_block_from_batch_payload`
-/// silently declines to include in the block it returns. The two drop sites have opposite
-/// expectedness, so they are counted separately rather than summed - see the per-field docs.
+/// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
+/// cover transactions that `build_block_from_batch_payload` silently declines to include in
+/// the block it returns. The two drop sites have opposite expectedness, so they are counted
+/// separately rather than summed - see the per-series docs. The skip series lives outside
+/// this struct because it carries a `reason` label, which the derive cannot express (see the
+/// module docs).
 #[derive(Metrics)]
 #[metrics(scope = "tn_reth")]
 pub(crate) struct RethEnvMetrics {
@@ -114,14 +122,6 @@ pub(crate) struct RethEnvMetrics {
     /// issues #933 / #938); reaching that path at all means a batch carrying undecodable
     /// transaction bytes was certified, i.e. batch validation was bypassed somewhere upstream.
     pub(crate) unrecoverable_txs_dropped_total: Counter,
-
-    /// Transactions skipped while building a block because the EVM rejected them as invalid.
-    ///
-    /// Not an error signal, and not alertable: workers batch independently, so the same
-    /// transaction can legitimately reach execution twice within one consensus output and the
-    /// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
-    /// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
-    pub(crate) invalid_txs_skipped_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
     ///
@@ -152,6 +152,153 @@ pub(crate) struct RethEnvMetrics {
     /// does not fall back to zero means the resync is stuck retrying the same senders and
     /// the pool's view of them stays stale.
     pub(crate) canon_state_resync_read_failures_total: Counter,
+}
+
+/// Counter name for transactions skipped while building a block because the EVM rejected them
+/// as invalid, kept next to its only emission helper so the registration in
+/// [`register_invalid_tx_skip_series`] and the increment in [`record_invalid_tx_skipped`]
+/// cannot drift apart.
+///
+/// Not an error signal, and not alertable: workers batch independently, so the same
+/// transaction can legitimately reach execution twice within one consensus output and the
+/// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
+/// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
+///
+/// One series per [`InvalidTxSkipReason`], so a dashboard reads the total as a sum over the
+/// `reason` label. The label restores in metrics what issue #1263 / PR #1274 moved out of the
+/// default operator log: the skip cause is now a `debug!` line, so without the label a
+/// climbing counter cannot be told apart into expected duplicates and everything else
+/// (issue #1284).
+const INVALID_TXS_SKIPPED: &str = "tn_reth.invalid_txs_skipped_total";
+
+/// Why the EVM rejected a transaction that was skipped while building a block.
+///
+/// The variants label [`INVALID_TXS_SKIPPED`], one series per reason, all registered at zero
+/// by [`register_invalid_tx_skip_series`]. The set is closed on purpose: the underlying
+/// [`InvalidTransaction`] enum is wide and version-owned by revm, so mapping it onto a small
+/// fixed vocabulary keeps the label cardinality bounded across dependency upgrades. The named
+/// variants are the causes block building actually produces from certified batches; everything
+/// else collapses into [`Self::Other`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InvalidTxSkipReason {
+    /// The transaction's nonce was already consumed. The expected-duplicate signal: workers
+    /// batch independently, so the same transaction can appear in two batches of one consensus
+    /// output, and every copy after the first fails execution with exactly this cause. A
+    /// steady rate here is normal operation.
+    NonceTooLow,
+    /// The transaction's nonce is ahead of the sender's state, i.e. a later transaction
+    /// arrived without its predecessor. Batches admit transactions the pool ordered, so a
+    /// sustained rate means gaps between what workers batch and what execution sees.
+    NonceTooHigh,
+    /// The sender could not cover `value + gas_limit * gas_price` at execution time. Balance
+    /// is validated at batch admission, so this fires when earlier transactions in the same
+    /// consensus output drained the account first.
+    InsufficientFunds,
+    /// The transaction's fee cap fell below the block base fee. Batches are validated against
+    /// the base fee their worker advertised, so this cause marks a base-fee disagreement
+    /// between batch admission and execution.
+    FeeCapBelowBaseFee,
+    /// Every other [`InvalidTransaction`] cause, and any invalid-transaction error that does
+    /// not expose one. The bounded catch-all that keeps the label set fixed; the `debug!` line
+    /// at the skip site still carries the exact error for anyone who needs it.
+    Other,
+}
+
+impl InvalidTxSkipReason {
+    /// Every variant, for zero-registration in [`register_invalid_tx_skip_series`].
+    ///
+    /// Hand-maintained: the exhaustive match in [`Self::label`] is the compile-time tripwire
+    /// a new variant hits, and this list must be extended in the same edit - a variant
+    /// missing here skips zero-registration silently, and the register-at-zero test cannot
+    /// notice because it iterates this same list.
+    const ALL: [Self; 5] = [
+        Self::NonceTooLow,
+        Self::NonceTooHigh,
+        Self::InsufficientFunds,
+        Self::FeeCapBelowBaseFee,
+        Self::Other,
+    ];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NonceTooLow => "nonce_too_low",
+            Self::NonceTooHigh => "nonce_too_high",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::FeeCapBelowBaseFee => "fee_cap_below_base_fee",
+            Self::Other => "other",
+        }
+    }
+
+    /// Map the EVM's rejection of one transaction onto the bounded label set.
+    ///
+    /// The match on [`InvalidTransaction`] is exhaustive so that a revm upgrade that adds a
+    /// variant fails to compile here rather than silently landing in a bucket nobody chose.
+    /// An error that exposes no underlying [`InvalidTransaction`] is [`Self::Other`]: it
+    /// cannot be classified, and the catch-all is exactly the series for that.
+    ///
+    /// The parameter is a trait object because that is the shape the caller holds:
+    /// `BlockValidationError::InvalidTx` stores `Box<dyn InvalidTxError>`, so the erasure is
+    /// upstream's, and a generic here would monomorphize over the same `dyn` type anyway.
+    pub(crate) fn classify(error: &dyn InvalidTxError) -> Self {
+        error.as_invalid_tx_err().map_or(Self::Other, |cause| match cause {
+            InvalidTransaction::NonceTooLow { .. } => Self::NonceTooLow,
+            InvalidTransaction::NonceTooHigh { .. } => Self::NonceTooHigh,
+            InvalidTransaction::LackOfFundForMaxFee { .. } => Self::InsufficientFunds,
+            InvalidTransaction::GasPriceLessThanBasefee => Self::FeeCapBelowBaseFee,
+            InvalidTransaction::PriorityFeeGreaterThanMaxFee
+            | InvalidTransaction::CallerGasLimitMoreThanBlock
+            | InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+            | InvalidTransaction::GasFloorMoreThanGasLimit { .. }
+            | InvalidTransaction::RejectCallerWithCode
+            | InvalidTransaction::OverflowPaymentInTransaction
+            | InvalidTransaction::NonceOverflowInTransaction
+            | InvalidTransaction::CreateInitCodeSizeLimit
+            | InvalidTransaction::InvalidChainId
+            | InvalidTransaction::MissingChainId
+            | InvalidTransaction::TxGasLimitGreaterThanCap { .. }
+            | InvalidTransaction::AccessListNotSupported
+            | InvalidTransaction::MaxFeePerBlobGasNotSupported
+            | InvalidTransaction::BlobVersionedHashesNotSupported
+            | InvalidTransaction::BlobGasPriceGreaterThanMax { .. }
+            | InvalidTransaction::EmptyBlobs
+            | InvalidTransaction::BlobCreateTransaction
+            | InvalidTransaction::TooManyBlobs { .. }
+            | InvalidTransaction::BlobVersionNotSupported
+            | InvalidTransaction::AuthorizationListNotSupported
+            | InvalidTransaction::AuthorizationListInvalidFields
+            | InvalidTransaction::EmptyAuthorizationList
+            | InvalidTransaction::Eip2930NotSupported
+            | InvalidTransaction::Eip1559NotSupported
+            | InvalidTransaction::Eip4844NotSupported
+            | InvalidTransaction::Eip7702NotSupported
+            | InvalidTransaction::Eip7873NotSupported
+            | InvalidTransaction::Eip7873MissingTarget
+            | InvalidTransaction::Str(_) => Self::Other,
+        })
+    }
+}
+
+/// Register one skip series per [`InvalidTxSkipReason`] with the current recorder without
+/// recording an event.
+///
+/// Called from [`init`]. The per-reason zero registrations carry the same weight as the
+/// unlabeled ones documented there: a reason that only appears once it fires cannot be told
+/// apart from a mistyped label value, and its first `rate()` step is lost.
+fn register_invalid_tx_skip_series() {
+    InvalidTxSkipReason::ALL.iter().for_each(|reason| {
+        metrics::counter!(INVALID_TXS_SKIPPED, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one transaction skipped while building a block, labeled by [`InvalidTxSkipReason`].
+///
+/// The call site pairs with a `debug!` line carrying the exact error, so the counter is the
+/// dashboard-visible half of a skip the debug log already describes (issue #1284). The macro
+/// path re-resolves the recorder on every call, matching [`ForwarderMetrics`] and keeping the
+/// series observable from a unit test.
+pub(crate) fn record_invalid_tx_skipped(reason: InvalidTxSkipReason) {
+    metrics::counter!(INVALID_TXS_SKIPPED, "reason" => reason.label()).increment(1);
 }
 
 /// Counter names for the observer forwarder, kept next to their only emission sites so the
@@ -515,7 +662,6 @@ mod tests {
             // construct directly (not via the static) so handles bind to the local recorder
             let metrics = RethEnvMetrics::new_with_labels(Vec::<metrics::Label>::new());
             metrics.unrecoverable_txs_dropped_total.increment(2);
-            metrics.invalid_txs_skipped_total.increment(5);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -528,11 +674,10 @@ mod tests {
 
         let (_, _, _, value) = find("tn_reth.unrecoverable_txs_dropped_total");
         assert!(matches!(value, DebugValue::Counter(2)));
-        let (_, _, _, value) = find("tn_reth.invalid_txs_skipped_total");
-        assert!(matches!(value, DebugValue::Counter(5)));
     }
 
-    /// Construction alone must register every series at zero, with no event having happened.
+    /// Construction alone must register every derive-based series at zero, with no event
+    /// having happened.
     ///
     /// This is the property [`init`] relies on: a healthy node that never drops a transaction
     /// or falls behind the canonical-state broadcast still exports every counter, so
@@ -559,8 +704,6 @@ mod tests {
         };
 
         let (_, _, _, value) = find("tn_reth.unrecoverable_txs_dropped_total");
-        assert!(matches!(value, DebugValue::Counter(0)));
-        let (_, _, _, value) = find("tn_reth.invalid_txs_skipped_total");
         assert!(matches!(value, DebugValue::Counter(0)));
         let (_, _, _, value) = find("tn_reth.canon_state_lagged_total");
         assert!(matches!(value, DebugValue::Counter(0)));
@@ -626,7 +769,10 @@ mod tests {
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_QUEUED), DebugValue::Counter(0)));
         ForwardDropReason::ALL.into_iter().for_each(|reason| {
             assert!(
-                matches!(reason_series(&snapshot, reason.label()), DebugValue::Counter(0)),
+                matches!(
+                    reason_series(&snapshot, FORWARDED_TXNS_DROPPED, reason.label()),
+                    DebugValue::Counter(0)
+                ),
                 "reason {} must be registered at zero by init",
                 reason.label()
             );
@@ -639,17 +785,126 @@ mod tests {
 
         let snapshot = snapshotter.snapshot().into_vec();
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_QUEUED), DebugValue::Counter(9)));
-        assert!(matches!(reason_series(&snapshot, "batch_shed"), DebugValue::Counter(3)));
+        assert!(matches!(
+            reason_series(&snapshot, FORWARDED_TXNS_DROPPED, "batch_shed"),
+            DebugValue::Counter(3)
+        ));
         ForwardDropReason::ALL
             .into_iter()
             .filter(|reason| *reason != ForwardDropReason::BatchShed)
             .for_each(|reason| {
                 assert!(
-                    matches!(reason_series(&snapshot, reason.label()), DebugValue::Counter(0)),
+                    matches!(
+                        reason_series(&snapshot, FORWARDED_TXNS_DROPPED, reason.label()),
+                        DebugValue::Counter(0)
+                    ),
                     "a batch_shed drop must not move the {} series",
                     reason.label()
                 );
             });
+    }
+
+    /// [`register_invalid_tx_skip_series`] must register one skip series per
+    /// [`InvalidTxSkipReason`] at zero, and a recorded skip must move only its own reason's
+    /// series.
+    ///
+    /// Same property the forwarder drop series is held to: a reason that only appears once it
+    /// fires cannot be told apart from a mistyped label value, and its first `rate()` step is
+    /// lost.
+    #[test]
+    fn test_invalid_tx_skip_reasons_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            register_invalid_tx_skip_series();
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        InvalidTxSkipReason::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, INVALID_TXS_SKIPPED, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_invalid_tx_skipped(InvalidTxSkipReason::NonceTooLow);
+            record_invalid_tx_skipped(InvalidTxSkipReason::NonceTooLow);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(
+            reason_series(&snapshot, INVALID_TXS_SKIPPED, "nonce_too_low"),
+            DebugValue::Counter(2)
+        ));
+        InvalidTxSkipReason::ALL
+            .into_iter()
+            .filter(|reason| *reason != InvalidTxSkipReason::NonceTooLow)
+            .for_each(|reason| {
+                assert!(
+                    matches!(
+                        reason_series(&snapshot, INVALID_TXS_SKIPPED, reason.label()),
+                        DebugValue::Counter(0)
+                    ),
+                    "a nonce_too_low skip must not move the {} series",
+                    reason.label()
+                );
+            });
+    }
+
+    /// [`InvalidTxSkipReason::classify`] must map each named cause to its own label and
+    /// everything else - including an error that exposes no [`InvalidTransaction`] - to
+    /// [`InvalidTxSkipReason::Other`].
+    #[test]
+    fn test_invalid_tx_skip_reason_classification() {
+        assert_eq!(
+            InvalidTxSkipReason::classify(&InvalidTransaction::NonceTooLow { tx: 1, state: 2 }),
+            InvalidTxSkipReason::NonceTooLow
+        );
+        assert_eq!(
+            InvalidTxSkipReason::classify(&InvalidTransaction::NonceTooHigh { tx: 9, state: 2 }),
+            InvalidTxSkipReason::NonceTooHigh
+        );
+        assert_eq!(
+            InvalidTxSkipReason::classify(&InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::default(),
+                balance: Box::default(),
+            }),
+            InvalidTxSkipReason::InsufficientFunds
+        );
+        assert_eq!(
+            InvalidTxSkipReason::classify(&InvalidTransaction::GasPriceLessThanBasefee),
+            InvalidTxSkipReason::FeeCapBelowBaseFee
+        );
+        assert_eq!(
+            InvalidTxSkipReason::classify(&InvalidTransaction::RejectCallerWithCode),
+            InvalidTxSkipReason::Other
+        );
+        assert_eq!(InvalidTxSkipReason::classify(&OpaqueTxError), InvalidTxSkipReason::Other);
+    }
+
+    /// An invalid-transaction error that exposes no underlying [`InvalidTransaction`],
+    /// exercising the unclassifiable branch of [`InvalidTxSkipReason::classify`].
+    #[derive(Debug)]
+    struct OpaqueTxError;
+
+    impl std::fmt::Display for OpaqueTxError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("opaque invalid-transaction error")
+        }
+    }
+
+    impl std::error::Error for OpaqueTxError {}
+
+    impl InvalidTxError for OpaqueTxError {
+        fn as_invalid_tx_err(&self) -> Option<&InvalidTransaction> {
+            None
+        }
     }
 
     /// One series of a [`DebuggingRecorder`] snapshot, looked up by metric name.
@@ -674,7 +929,7 @@ mod tests {
             .unwrap_or_else(|| panic!("metric {name} not registered without an event"))
     }
 
-    /// The dropped-transactions series for one `reason` label value.
+    /// The series of a `reason`-labeled counter for one label value.
     ///
     /// [`series`] cannot serve here: all reasons share the metric name, so a name-only lookup
     /// returns whichever series the snapshot happens to list first.
@@ -685,16 +940,17 @@ mod tests {
             Option<metrics::SharedString>,
             DebugValue,
         )],
+        name: &str,
         reason: &str,
     ) -> &'a DebugValue {
         snapshot
             .iter()
             .find(|(key, ..)| {
-                key.key().name() == FORWARDED_TXNS_DROPPED
+                key.key().name() == name
                     && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
             })
             .map(|(.., value)| value)
-            .unwrap_or_else(|| panic!("dropped series for reason {reason} not registered"))
+            .unwrap_or_else(|| panic!("{name} series for reason {reason} not registered"))
     }
 
     /// Read one gauge out of a snapshot, selecting by `call` label when one is given.
