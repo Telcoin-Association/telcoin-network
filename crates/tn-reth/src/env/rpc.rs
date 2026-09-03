@@ -104,6 +104,16 @@ impl RethEnv {
             .with_consensus(tn_execution.clone());
 
         let modules_config = self.node_config().rpc.transport_rpc_module_config();
+        // Reth fills an enabled IPC transport with `default_ipc_modules()` (every
+        // `RethRpcModule` variant, admin and txpool included) and no CLI flag narrows it,
+        // so the allowlist that validates `--http.api`/`--ws.api` never sees the IPC slot.
+        // Rewrite the slot with the validated set (see `RethConfig::ipc_modules`).
+        let ipc_enabled = modules_config.ipc().is_some();
+        let modules_config = if ipc_enabled {
+            modules_config.with_ipc(crate::RethConfig::ipc_modules())
+        } else {
+            modules_config
+        };
         let eth_api = apply_eth_config(
             EthApi::builder(
                 self.inner.blockchain_provider.clone(),
@@ -168,7 +178,10 @@ mod tests {
     use reth_transaction_pool::noop::NoopTransactionPool;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, B256, U256};
+    use tn_types::{
+        gas_accumulator::BaseFeeContainer, test_genesis, Address, Bytes, Encodable2718 as _,
+        TaskManager, B256, U256,
+    };
     use url::Url;
 
     /// Build a temp env with the given `--rpc.txfeecap` value (wei) and return the
@@ -194,12 +207,51 @@ mod tests {
             rpc_args,
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
             .get_rpc_server(pool.clone(), network, BaseFeeContainer::default(), RpcModule::new(()))
             .expect("rpc server with fee-cap guard");
         (server.methods_by(|name| name.starts_with("eth_send")), pool, chain)
+    }
+
+    /// The IPC transport must serve the validated allowlist, not reth's
+    /// `default_ipc_modules()` (every module, admin and txpool included). The default
+    /// `rpc_args` serve IPC only, so the methods below are exactly the IPC registration.
+    #[tokio::test]
+    async fn test_ipc_transport_serves_only_the_validated_modules() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            reth::args::RpcServerArgs::default(),
+        )
+        .expect("temp chain env");
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        let server = reth_env
+            .get_rpc_server(pool, network, BaseFeeContainer::default(), RpcModule::new(()))
+            .expect("rpc server");
+
+        let disallowed = server.methods_by(|name| {
+            name.starts_with("admin_")
+                || name.starts_with("txpool_")
+                || name.starts_with("debug_")
+                || name.starts_with("trace_")
+        });
+        assert_eq!(
+            disallowed.method_names().count(),
+            0,
+            "IPC must not serve admin, txpool, debug, or trace methods"
+        );
+        assert!(
+            server.methods_by(|name| name.starts_with("eth_")).method_names().count() > 0,
+            "IPC still serves the eth namespace"
+        );
     }
 
     #[tokio::test]
@@ -406,14 +458,12 @@ mod tests {
             None,
             reth::args::RpcServerArgs::default(),
         )?;
-        let pool = reth_env.init_txn_pool()?;
+        // One shared container for the pool and the RPC server, as in production (#1262).
+        let base_fee = BaseFeeContainer::default();
+        let pool = reth_env.init_txn_pool(base_fee.clone())?;
         let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
-        let server = reth_env.get_rpc_server(
-            pool,
-            network.clone(),
-            BaseFeeContainer::default(),
-            RpcModule::new(()),
-        )?;
+        let server =
+            reth_env.get_rpc_server(pool, network.clone(), base_fee, RpcModule::new(()))?;
         let methods = server.methods_by(|name| name == "eth_syncing");
 
         let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
@@ -480,10 +530,12 @@ mod tests {
             reth::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        // One shared container for the pool and the RPC server, as in production (#1262).
+        let base_fee = BaseFeeContainer::new(epoch_fee);
+        let pool = reth_env.init_txn_pool(base_fee.clone()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool, network, BaseFeeContainer::new(epoch_fee), RpcModule::new(()))
+            .get_rpc_server(pool, network, base_fee, RpcModule::new(()))
             .expect("rpc server with corrected fee history");
         server.methods_by(|name| name == "eth_feeHistory" || name == "eth_blobBaseFee")
     }

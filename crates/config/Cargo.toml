@@ -30,11 +30,23 @@ bs58 = { workspace = true }
 
 # Crypto specific to key wrapping, not used elsewhere.
 aes-gcm-siv = "0.11.1"
+# Direct dependency only for its `zeroize` feature: the AES round-key schedule expanded from
+# the wrapping key is invertible back to it, and the feature adds the `Drop` impls that clear
+# the schedule when the cipher object drops. Keep this on the same major as the `aes` that
+# aes-gcm-siv depends on: if the resolver ever splits them, the feature lands on a dead copy
+# and the schedule silently stops being cleared.
+aes = { version = "0.8.4", features = ["zeroize"] }
 pbkdf2 = "0.12.2"
 sha2 = "0.10.8"
+# Clears derived key material and decrypt buffers on drop.
+zeroize = "1.8.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Lets the key-permission tests run under a deliberately permissive umask, so they fail if the
+# writer ever regresses to relying on the ambient umask for restrictiveness.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 default = []
