@@ -116,20 +116,13 @@ where
     let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
     // resolve the source reader and its byte cap through the `Option`'s combinator
-    // rather than a Some/None branch: a full pack streams to EOF (`u64::MAX` never
-    // bounds the `take` below), a partial prefix is capped at its `[0, end)`
-    // verifiable length. Both arms normalize to one boxed future so `map_or_else`
-    // can pick either; a missing pack (or an out-of-range partial stop point) sheds
-    // cleanly so the requester retries elsewhere.
+    // rather than a Some/None branch: a full pack is capped at its logical `[0, data_len)`
+    // length, a partial prefix at its `[0, end)` verifiable length. Both `get_*_epoch_stream`
+    // calls now return `(reader, cap)`, so `map_or_else` picks either directly; a missing pack
+    // (or an out-of-range partial stop point) sheds cleanly so the requester retries elsewhere.
     let source = stop_number
         .map_or_else(
-            || {
-                consensus_chain
-                    .get_epoch_stream(epoch)
-                    .map_ok(|reader| (reader, u64::MAX))
-                    .map_err(drop)
-                    .boxed()
-            },
+            || consensus_chain.get_epoch_stream(epoch).map_err(drop).boxed(),
             |number| consensus_chain.get_partial_epoch_stream(epoch, number).map_err(drop).boxed(),
         )
         .await;

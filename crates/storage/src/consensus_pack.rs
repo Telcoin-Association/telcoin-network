@@ -4110,9 +4110,10 @@ pub(crate) mod test {
     /// capacity. A raw read-to-EOF `std::fs::copy` would carry that trailing zero padding and the
     /// importer's record walk would fail its CRC on the zeros (the e2e "crc32 mismatch").
     /// `reconcile_data_len` truncates the file to its logical length so a read-to-EOF copy
-    /// round-trips through `stream_import`. (Still used to serve a sealed epoch over the wire in
-    /// `get_epoch_stream`; the state export instead bounds its copy to `data_file_len` — see
-    /// `test_bounded_copy_of_padded_pack_stream_imports`.)
+    /// round-trips through `stream_import`. (Both the state export and `get_epoch_stream` now
+    /// instead bound their read to `data_file_len` — see
+    /// `test_bounded_copy_of_padded_pack_stream_imports`; `reconcile_data_len` is retained only
+    /// pending its removal.)
     #[tokio::test]
     async fn test_reconcile_before_copy_lets_raw_copy_stream_import() {
         let temp_dir = TempDir::with_prefix("test_cp_reconcile_copy").expect("temp dir");

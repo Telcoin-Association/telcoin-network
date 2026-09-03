@@ -581,12 +581,13 @@ impl ConsensusChain {
         }
     }
 
-    /// Return a stream reader for the log file of epoch.
-    /// Verifies the epoch pack is complete or will return an error.
+    /// Return a stream reader for the data file of `epoch` together with its logical length.
+    /// Verifies the epoch pack is complete or returns an error. The caller streams exactly `[0,
+    /// data_len)`.
     pub async fn get_epoch_stream(
         &self,
         epoch: Epoch,
-    ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
+    ) -> Result<(Box<dyn ReadStream>, u64), ConsensusChainError> {
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
                 match pack.latest_consensus_header().await? {
@@ -595,17 +596,17 @@ impl ConsensusChain {
                         if epoch_record.final_consensus.number == last_header.number
                             && epoch_final_hash == last_header.digest()
                         {
-                            // The mmap data-file backend zero-pads the physical file past the
-                            // logical `end` (the mapping must be >= the file). Reconcile it to
-                            // `end` (flush pending writes, then
-                            // truncate the padding, as a clean close
-                            // does) so the raw read-to-EOF below yields exactly `[0, end)` and not
-                            // trailing zero-padding the receiver cannot decode.
-                            pack.reconcile_data_len().await?;
+                            // Return the logical data length so the caller streams exactly
+                            // `[0, data_len)` and never the mmap capacity padding the physical file
+                            // may carry past `end`. A sealed epoch was clean-closed (physical ==
+                            // logical) and `open_static` already rejects an inconsistent file, so
+                            // this bound is belt-and-suspenders — but it lets the pack own its own
+                            // length instead of a network-triggered truncate of the served file.
+                            let data_len = pack.data_file_len().await?;
                             drop(pack);
                             let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                             let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
-                            Ok(Box::new(stream))
+                            Ok((Box::new(stream), data_len))
                         } else {
                             Err(ConsensusChainError::StreamUnavailable)
                         }
@@ -1355,7 +1356,7 @@ impl ConsensusChainReader for ConsensusChain {
             .map_err(Into::into)
     }
 
-    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<Box<dyn ReadStream>> {
+    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<(Box<dyn ReadStream>, u64)> {
         ConsensusChain::get_epoch_stream(self, epoch).await.map_err(Into::into)
     }
 
@@ -1792,9 +1793,10 @@ mod test {
         let consensus_chain2 =
             ConsensusChain::new(temp_dir2.path().to_owned(), committee.clone()).unwrap();
         consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
-        let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2
-            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
             .await
             .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
@@ -2506,7 +2508,8 @@ mod test {
             let target = Arc::new(
                 ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap(),
             );
-            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+            use tokio::io::AsyncReadExt as _;
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
 
             // Hammer `new_epoch` for the whole duration of the single concurrent
             // `stream_import` below, clearing the cached pack before each call so it actually
@@ -2534,7 +2537,12 @@ mod test {
             };
 
             let import_result = target
-                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .stream_import(
+                    stream.take(len),
+                    &epoch_record,
+                    &previous_epoch,
+                    Duration::from_secs(5),
+                )
                 .await;
             done.store(true, Ordering::Relaxed);
             let new_epoch_result = new_epoch_task.await.expect("new_epoch task panicked");
@@ -2604,9 +2612,15 @@ mod test {
             let target =
                 ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
             // Import epoch 0 from the source: the target's current pack becomes a static pack.
-            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+            use tokio::io::AsyncReadExt as _;
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
             target
-                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .stream_import(
+                    stream.take(len),
+                    &epoch_record,
+                    &previous_epoch,
+                    Duration::from_secs(5),
+                )
                 .await
                 .expect("stream import");
             // Replay the imported outputs the way an executing observer would; this advances
