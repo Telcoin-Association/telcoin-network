@@ -35,6 +35,10 @@ sha2 = "0.10.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Lets the key-permission tests run under a deliberately permissive umask, so they fail if the
+# writer ever regresses to relying on the ambient umask for restrictiveness.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 default = []

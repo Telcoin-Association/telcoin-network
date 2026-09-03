@@ -33,7 +33,10 @@ use reth_provider::{
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::GasAccumulator, Address, SealedHeader, TaskManager, TaskSpawner};
+use tn_types::{
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, SealedHeader, TaskManager, TaskSpawner,
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -384,12 +387,16 @@ impl RethEnv {
     }
 
     /// Initialize a new transaction pool for worker.
-    pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
+    ///
+    /// The `base_fee` container supplies the pool's pending base fee for the worker's current
+    /// epoch (issue #1262).
+    pub fn init_txn_pool(&self, base_fee: BaseFeeContainer) -> eyre::Result<WorkerTxPool> {
         WorkerTxPool::new(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
+            base_fee,
         )
     }
 
@@ -399,12 +406,16 @@ impl RethEnv {
     /// whose maintenance task missed `Commit` notifications, and reproducing that state
     /// deterministically requires committing canonical blocks while no task is subscribed.
     #[cfg(test)]
-    pub(crate) fn init_txn_pool_without_maintenance(&self) -> eyre::Result<WorkerTxPool> {
+    pub(crate) fn init_txn_pool_without_maintenance(
+        &self,
+        base_fee: BaseFeeContainer,
+    ) -> eyre::Result<WorkerTxPool> {
         WorkerTxPool::build(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
+            base_fee,
         )
     }
 
