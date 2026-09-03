@@ -11670,6 +11670,7 @@ dependencies = [
  "bs58",
  "eyre",
  "humantime-serde",
+ "libc",
  "libp2p",
  "pbkdf2",
  "rand 0.9.2",
@@ -12099,6 +12100,7 @@ dependencies = [
 name = "tn-worker-gateway"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "axum",
  "clap",
  "eyre",

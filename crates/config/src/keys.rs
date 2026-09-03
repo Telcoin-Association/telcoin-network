@@ -54,6 +54,156 @@ fn warn_weak_kdf(msg: &str) {
     eprintln!("WARNING: {msg}");
 }
 
+/// Create the node-keys directory owner-only (0700), creating parent directories as needed.
+///
+/// `std::fs::create_dir` applies `0o777 & !umask`, i.e. 0755 at the usual umask of 022, which
+/// leaves the key directory world-traversable. A directory that already exists but is still
+/// empty is tightened to 0700: it holds no key material yet, so its mode is this code's to
+/// set (the CLI pre-creates the path before the key writer runs). A populated directory's
+/// mode belongs to the operator and is left alone; the read path warns about it instead.
+///
+/// Exported for the CLI's `keytool generate` flow, which prepares the directory before
+/// [`KeyConfig::generate_and_save`] runs.
+pub fn create_keys_dir(path: &std::path::Path) -> std::io::Result<()> {
+    // The parent chain (the datadir) holds no key material; default modes are fine there.
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            tighten_empty_keys_dir(path)
+        } else {
+            Err(e)
+        }
+    })
+}
+
+/// Tighten an existing key directory to 0700 while it is still empty.
+///
+/// Covers the `AlreadyExists` case of [`create_keys_dir`]: an empty directory holds no
+/// operator-managed key material yet, so restoring the owner-only default cannot conflict
+/// with a deliberate operator choice the way re-moding a populated deployment would.
+#[cfg(unix)]
+fn tighten_empty_keys_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let is_empty = std::fs::read_dir(path)?.next().is_none();
+    if is_empty {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_empty_keys_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Write `contents` to `path` readable only by the owner (0600).
+///
+/// `std::fs::write` applies `0o666 & !umask`, i.e. 0644 at the usual umask of 022. For a
+/// keyfile that is world-readable, and in the no-passphrase configuration the file is the BLS
+/// private key in the clear.
+///
+/// The bytes go to a fresh sibling temp file (`<name>.tmp`) created owner-only, which is then
+/// renamed over `path`. The mode is set at creation so there is no window in which the key
+/// exists at a looser mode, and the pre-existing file is replaced only after the new contents
+/// are fully on disk - a failure part-way (a filesystem that rejects the write, a crash)
+/// leaves the old keyfile intact instead of truncated. A re-run over a keyfile written by an
+/// older build replaces it with an owner-only one for the same reason.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "secret file path has no file name")
+    })?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(&tmp_name);
+
+    // A run that died between creating and renaming the temp file leaves it behind; remove it
+    // so `create_new` below can insist on a fresh file whose owner-only mode it controls.
+    std::fs::remove_file(&tmp_path)
+        .or_else(|e| (e.kind() == std::io::ErrorKind::NotFound).then_some(()).ok_or(e))?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&tmp_path)?;
+    file.write_all(contents.as_bytes())?;
+    // Flush to disk before the rename: otherwise a crash could replace the old keyfile with
+    // one whose contents never landed.
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)
+}
+
+/// The group/other-accessible mode of `path`, `None` when the mode is owner-only or `path`
+/// cannot be inspected (absent file). The returned mode is masked to the permission bits.
+#[cfg(unix)]
+fn loose_mode(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    (mode & 0o077 != 0).then_some(mode & 0o7777)
+}
+
+/// Warn when existing key material is accessible by anyone other than its owner.
+///
+/// Keys and directories written by a build predating owner-only permissions keep their loose
+/// mode - a populated deployment is never re-moded behind the operator's back - so tell the
+/// operator instead of silently leaving a world-readable validator key on disk. Covers the
+/// key directory, the keyfile about to be read, and (with a passphrase in use) a stale
+/// cleartext keyfile left beside the wrapped one by a pre-passphrase deployment.
+#[cfg(unix)]
+fn warn_if_key_permissions_are_loose(
+    keys_dir: &std::path::Path,
+    keyfile: &std::path::Path,
+    stale_cleartext: Option<&std::path::Path>,
+) {
+    if let Some(mode) = loose_mode(keys_dir) {
+        warn_weak_kdf(&format!(
+            "BLS key directory {} is accessible beyond its owner (mode {mode:o}); it was \
+             created by an older build. Restrict it with: chmod 700 {}",
+            keys_dir.display(),
+            keys_dir.display()
+        ));
+    }
+    if let Some(mode) = loose_mode(keyfile) {
+        warn_weak_kdf(&format!(
+            "BLS keyfile {} is readable beyond its owner (mode {mode:o}); it was written by an \
+             older build. Restrict it with: chmod 600 {}",
+            keyfile.display(),
+            keyfile.display()
+        ));
+    }
+    if let Some((path, mode)) = stale_cleartext.and_then(|p| loose_mode(p).map(|m| (p, m))) {
+        warn_weak_kdf(&format!(
+            "stale cleartext BLS keyfile {} lies beside the wrapped keyfile and is readable \
+             beyond its owner (mode {mode:o}). Delete it, or restrict it with: chmod 600 {}",
+            path.display(),
+            path.display()
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_key_permissions_are_loose(
+    _keys_dir: &std::path::Path,
+    _keyfile: &std::path::Path,
+    _stale_cleartext: Option<&std::path::Path>,
+) {
+}
+
 #[derive(Debug)]
 struct KeyConfigInner {
     // DO NOT expose the private key to other code.  Tests that need this will provide a primary
@@ -165,21 +315,25 @@ impl KeyConfig {
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
+        let keys_dir = tn_datadir.node_keys_path();
         // If we don't have a wrapped file then try an unencrypted file before failure.
-        let passphrase = if std::fs::exists(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))
-            .unwrap_or(false)
-        {
+        let passphrase = if std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false) {
             passphrase
         } else {
             None
         };
 
         // load keys to start the primary
-        let contents = if passphrase.is_some() {
-            std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))?
+        let keyfile = if passphrase.is_some() {
+            keys_dir.join(BLS_WRAPPED_KEYFILE)
         } else {
-            std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_KEYFILE))?
+            keys_dir.join(BLS_KEYFILE)
         };
+        // With a passphrase in use the cleartext keyfile is never read, but one left behind by
+        // a pre-passphrase deployment is still the BLS private key on disk - point at it.
+        let stale_cleartext = passphrase.is_some().then(|| keys_dir.join(BLS_KEYFILE));
+        warn_if_key_permissions_are_loose(&keys_dir, &keyfile, stale_cleartext.as_deref());
+        let contents = std::fs::read_to_string(&keyfile)?;
         let primary_seed =
             std::fs::read_to_string(tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE))
                 .unwrap_or_else(|_| "primary network keypair".to_string());
@@ -259,18 +413,26 @@ impl KeyConfig {
         let worker_seed = "worker network keypair";
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, primary_seed);
-        // Make sure we have the validator dir.
+        // Make sure we have the validator dir, owner-only.
         // Don't error out if path exists.
-        let _ = std::fs::create_dir(tn_datadir.node_keys_path());
+        create_keys_dir(&tn_datadir.node_keys_path())?;
         if let Some(passphrase) = passphrase {
             let contents = Self::wrap_bls_key(&primary_keypair, &passphrase, rounds)?;
-            std::fs::write(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), contents)?;
+            write_secret_file(&tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), &contents)?;
         } else {
             let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
-            std::fs::write(tn_datadir.node_keys_path().join(BLS_KEYFILE), contents)?;
+            write_secret_file(&tn_datadir.node_keys_path().join(BLS_KEYFILE), &contents)?;
         }
-        std::fs::write(tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE), primary_seed)?;
-        std::fs::write(tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE), worker_seed)?;
+        // The seed files hold fixed public strings rather than secrets, but there is no reason
+        // for anything under node-keys to be world-readable.
+        write_secret_file(
+            &tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
+            primary_seed,
+        )?;
+        write_secret_file(
+            &tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE),
+            worker_seed,
+        )?;
         Ok(Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
@@ -392,6 +554,247 @@ mod tests {
             .encrypt(Nonce::from_slice(&nonce_bytes), &keypair.to_bytes()[..])
             .expect("test_only encrypt");
         bs58::encode([&salt[..], &nonce_bytes[..], &ciphertext[..]].concat()).into_string()
+    }
+
+    /// Run `f` with the process umask set to 0, restoring it afterwards.
+    ///
+    /// The permission tests must not be able to pass merely because the developer's or CI
+    /// runner's umask happened to strip the group and other bits: at umask 0 the only thing
+    /// keeping a keyfile owner-only is the mode this code asks for explicitly.
+    ///
+    /// The umask is process-global, so these tests must not run concurrently with anything else
+    /// that creates files. Rust runs tests in threads, hence the mutex.
+    #[cfg(unix)]
+    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII: set the process umask to 0, restore the previous value on drop.
+    ///
+    /// The restore must run on unwind too: the permission tests use `expect`, and without the
+    /// `Drop` a failing test would leave the whole test binary running at umask 0,
+    /// contaminating every later test that creates files.
+    #[cfg(unix)]
+    struct PermissiveUmask {
+        previous: libc::mode_t,
+    }
+
+    #[cfg(unix)]
+    impl PermissiveUmask {
+        /// Zero the process umask; the caller must hold [`UMASK_LOCK`].
+        fn set() -> Self {
+            // SAFETY: `umask` is always successful and returns the previous mask.
+            Self { previous: unsafe { libc::umask(0) } }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PermissiveUmask {
+        fn drop(&mut self) {
+            // SAFETY: `umask` is always successful and returns the previous mask.
+            unsafe { libc::umask(self.previous) };
+        }
+    }
+
+    /// Run `f` with the process umask set to 0, restoring it afterwards (unwind included).
+    #[cfg(unix)]
+    fn with_permissive_umask<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _umask = PermissiveUmask::set();
+        f()
+    }
+
+    /// Every file the key writer creates must be owner-only, and so must the directory.
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let datadir = tmp_dir.path().to_path_buf();
+
+        with_permissive_umask(|| {
+            // The shared impl rather than `generate_and_save`, so the test keeps the fast KDF
+            // without depending on the `test-utils` feature being enabled.
+            KeyConfig::generate_and_save_with_rounds(
+                &datadir,
+                Some("passphrase".to_string()),
+                TEST_ONLY_INSECURE_ROUNDS,
+            )
+            .expect("generate keys");
+        });
+
+        let keys_dir = datadir.node_keys_path();
+        let dir_mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
+        assert_eq!(
+            dir_mode & 0o077,
+            0,
+            "node-keys dir is accessible beyond its owner: {:o}",
+            dir_mode & 0o7777
+        );
+
+        for name in [BLS_WRAPPED_KEYFILE, PRIMARY_NETWORK_SEED_FILE, WORKER_NETWORK_SEED_FILE] {
+            let path = keys_dir.join(name);
+            let mode = std::fs::metadata(&path).expect(name).permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{name} is readable beyond its owner: {:o}", mode & 0o7777);
+        }
+    }
+
+    /// The no-passphrase path writes the BLS private key in the clear, so it matters most.
+    #[cfg(unix)]
+    #[test]
+    fn cleartext_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let datadir = tmp_dir.path().to_path_buf();
+
+        with_permissive_umask(|| {
+            KeyConfig::generate_and_save_with_rounds(&datadir, None, TEST_ONLY_INSECURE_ROUNDS)
+                .expect("generate keys");
+        });
+
+        let path = datadir.node_keys_path().join(BLS_KEYFILE);
+        let mode = std::fs::metadata(&path).expect("bls.key").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "cleartext bls.key is readable beyond its owner: {:o}",
+            mode & 0o7777
+        );
+    }
+
+    /// A keyfile left loose by an older build is tightened rather than silently rewritten at
+    /// the old mode.
+    #[cfg(unix)]
+    #[test]
+    fn existing_loose_key_file_is_tightened_on_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let path = tmp_dir.path().join("bls.kw");
+
+        std::fs::write(&path, "old").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        with_permissive_umask(|| {
+            write_secret_file(&path, "new").expect("rewrite");
+        });
+
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "pre-existing file kept a loose mode: {:o}", mode & 0o7777);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+    }
+
+    /// The CLI pre-creates the key directory before `generate_and_save` runs, so the
+    /// `AlreadyExists` case must tighten a still-empty directory rather than keep the loose
+    /// mode `create_dir_all` gave it (regression: that case used to be a no-op, which made
+    /// the 0700 mode dead for every fresh `tn keytool generate` install).
+    ///
+    /// The loose mode is set with an explicit chmod rather than via the umask, so the test is
+    /// deterministic in any environment.
+    #[cfg(unix)]
+    #[test]
+    fn empty_keys_dir_is_tightened_on_create() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let dir = tmp_dir.path().join("node-keys");
+        std::fs::create_dir_all(&dir).expect("pre-create keys dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        create_keys_dir(&dir).expect("create over empty dir");
+
+        let mode = std::fs::metadata(&dir).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "empty pre-existing keys dir kept a loose mode: {:o}",
+            mode & 0o7777
+        );
+    }
+
+    /// A populated key directory's mode belongs to the operator: creation must leave it
+    /// alone (the read path warns instead; an existing deployment is never re-moded).
+    #[cfg(unix)]
+    #[test]
+    fn populated_keys_dir_mode_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let dir = tmp_dir.path().join("node-keys");
+        std::fs::create_dir_all(&dir).expect("pre-create keys dir");
+        std::fs::write(dir.join(BLS_WRAPPED_KEYFILE), "existing key").expect("populate");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        create_keys_dir(&dir).expect("create over populated dir");
+
+        let mode = std::fs::metadata(&dir).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755, "populated keys dir mode must be left alone");
+    }
+
+    /// A temp file left behind by a run that died between write and rename must not wedge
+    /// the next write, and the write must land through the rename (no temp file remains).
+    #[test]
+    fn stale_temp_file_does_not_block_secret_write() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let path = tmp_dir.path().join(BLS_WRAPPED_KEYFILE);
+        let tmp_path = tmp_dir.path().join("bls.kw.tmp");
+
+        std::fs::write(&tmp_path, "half-written").expect("stale tmp");
+        write_secret_file(&path, "fresh").expect("write over stale tmp");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "fresh");
+        assert!(!tmp_path.exists(), "temp file must be renamed over the target");
+    }
+
+    /// A failing permission test must not leave the whole test binary at umask 0: the
+    /// restore has to run on unwind, not only on return.
+    #[cfg(unix)]
+    #[test]
+    fn umask_is_restored_when_the_closure_panics() {
+        // Hold the lock across the whole check so no other permission test's umask-0 window
+        // can interleave between the unwind and the reads below.
+        let _lock = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: `umask` is always successful; set-then-restore reads the current value.
+        let before = unsafe { libc::umask(0o022) };
+        unsafe { libc::umask(before) };
+
+        let result = std::panic::catch_unwind(|| {
+            let _umask = PermissiveUmask::set();
+            panic!("intentional panic: exercising the unwind path");
+        });
+        assert!(result.is_err(), "the closure must have panicked");
+
+        // SAFETY: `umask` is always successful; set-then-restore reads the current value.
+        let after = unsafe { libc::umask(0o022) };
+        unsafe { libc::umask(after) };
+        assert_eq!(before, after, "umask must be restored when the closure unwinds");
+    }
+
+    /// `loose_mode` is the single predicate behind every read-time permission warning: it
+    /// must flag group/other bits, stay quiet on owner-only modes, and treat an absent path
+    /// as nothing to warn about.
+    #[cfg(unix)]
+    #[test]
+    fn loose_mode_flags_only_group_and_other_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file = tmp_dir.path().join("keyfile");
+        std::fs::write(&file, "key").expect("write");
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(loose_mode(&file), None, "owner-only file must not be flagged");
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        assert_eq!(loose_mode(&file), Some(0o640), "group-readable file must be flagged");
+
+        let dir = tmp_dir.path().join("subdir");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+        assert_eq!(loose_mode(&dir), Some(0o750), "group-traversable dir must be flagged");
+
+        assert_eq!(loose_mode(&tmp_dir.path().join("absent")), None, "absent path is quiet");
     }
 
     /// Write `wrapped` as `bls.kw` under a fresh datadir so `read_config` exercises the
