@@ -655,6 +655,21 @@ mod tests {
     #[cfg(feature = "adiri")]
     const _: () = assert!(crate::forks::PREVRANDAO_FORK_EPOCH != 0);
 
+    /// The keeper discriminates the PREVRANDAO gate only while a seed-ACTIVE epoch exists below
+    /// the fork point. `forks`' own ordering assert permits equality, and at equality the
+    /// keeper's `pre_fork` probe is seed-dormant: every assertion in it would then pass through
+    /// the seed conjunct alone, so deleting the PREVRANDAO fork point from
+    /// `prevrandao_seed_active` would leave the keeper green. Pin the strict inequality here
+    /// rather than tightening `forks`, which states a rollout contract (`>=`) that is correct on
+    /// its own terms; an arming PR that lands on equality fails to compile its tests and has to
+    /// retarget the keeper deliberately.
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(
+        crate::forks::PREVRANDAO_FORK_EPOCH > crate::forks::SEED_SIGNATURE_FORK_EPOCH,
+        "PREVRANDAO_FORK_EPOCH must be strictly above SEED_SIGNATURE_FORK_EPOCH for \
+         prev_randao_switches_arms_at_the_prevrandao_fork_epoch to discriminate the arms",
+    );
+
     /// Build an output whose leader header carries `epoch`, so the fork arm is selected by the
     /// committing leader's epoch rather than by this build's feature set.
     fn output_at_epoch(epoch: Epoch, number: u64, digests: Vec<BlockHash>) -> ConsensusOutput {
@@ -789,19 +804,27 @@ mod tests {
             seeded_prev_randao(seeded.committee_shuffle_seed(), 11, 0),
             "the gate must fire from PREVRANDAO_FORK_EPOCH onward (`>=`, not `>`)",
         );
+        // discriminate the arms on ONE output. Comparing `legacy` against `seeded` would pass
+        // through their differing leader headers even if the gate never fired at all, so the
+        // post-fork value is checked against the legacy recomposition of its own output.
+        let seeded_as_legacy: B256 = B256::from(seeded.digest()) ^ digest;
         assert_ne!(
-            legacy.prev_randao(0, digest),
             seeded.prev_randao(0, digest),
-            "the two arms must actually produce different values at the boundary",
+            seeded_as_legacy,
+            "at PREVRANDAO_FORK_EPOCH the seeded arm must not reproduce that output's legacy XOR",
         );
     }
 
     /// The always-active counterpart (non-adiri): no dormant epoch exists to switch from, so this
     /// states that every epoch takes the seeded arm rather than asserting a switch vacuously.
+    ///
+    /// The grid is genesis, two early epochs, a mid-range epoch and the ceiling. Nothing here
+    /// mirrors an adiri fork constant: none of them exist in this build, so a literal epoch
+    /// borrowed from that schedule could only go stale.
     #[cfg(not(feature = "adiri"))]
     #[test]
     fn prev_randao_takes_the_seeded_arm_at_every_epoch_without_adiri() {
-        [0u32, 1, 383, Epoch::MAX].into_iter().for_each(|epoch| {
+        [0u32, 1, 2, Epoch::MAX / 2, Epoch::MAX].into_iter().for_each(|epoch| {
             let digest = BlockHash::repeat_byte(0x55);
             let output = output_at_epoch(epoch, 11, vec![digest]);
             assert!(
