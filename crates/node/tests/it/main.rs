@@ -113,6 +113,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -367,6 +368,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -538,6 +540,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -732,6 +735,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -1433,6 +1437,7 @@ async fn test_entry_reads_static_fee_at_boundary() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -1611,6 +1616,7 @@ async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -1783,6 +1789,7 @@ async fn test_entry_read_matches_close_written_eip1559_fee() -> eyre::Result<()>
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
@@ -1938,6 +1945,7 @@ async fn test_entry_reads_written_fee_after_empty_close() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
