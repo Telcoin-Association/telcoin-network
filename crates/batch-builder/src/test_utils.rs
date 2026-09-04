@@ -4,10 +4,11 @@ use crate::{build_batch, BatchBuilderOutput};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 use tn_reth::{
-    new_pool_txn, BestTransactions, InvalidPoolTransactionError, PoolTxn, PoolTxnId,
-    SenderIdentifiers, TxPool,
+    new_pool_txn, BestTransactions, InvalidPoolTransactionError, PeerBatchTxs, PoolTxn, PoolTxnId,
+    SenderId, SenderIdentifiers, TxPool,
 };
 use tn_types::{Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, U256};
 
@@ -25,14 +26,33 @@ pub fn execute_test_batch(test_batch: &mut Batch) {
     // Don't reset base_fee_per_gas, some tests need that value to remain.
 }
 
+/// The deferral TTL every [`TestPool`] uses.
+///
+/// Long enough that a build started after [`TxPool::record_peer_batch`] always observes the
+/// deferral, so builder tests never race the clock.
+const TEST_PEER_BATCH_TTL: Duration = Duration::from_secs(3600);
+
 /// A test pool that ensures every transaction is in the pending pool
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TestPool {
     transactions: Vec<Arc<PoolTxn>>,
     by_id: BTreeMap<PoolTxnId, Arc<PoolTxn>>,
     /// Per-sender balances returned by [`TxPool::get_account_balance`]. A sender that is absent
     /// here reports [`U256::MAX`], preserving the behavior of tests that do not exercise balance.
     balances: BTreeMap<Address, U256>,
+    /// Transactions seen inside a validated peer batch, deferred by the builder (issue #1329).
+    peer_batch_txs: PeerBatchTxs,
+}
+
+impl Default for TestPool {
+    fn default() -> Self {
+        Self {
+            transactions: Vec::new(),
+            by_id: BTreeMap::new(),
+            balances: BTreeMap::new(),
+            peer_batch_txs: PeerBatchTxs::new(TEST_PEER_BATCH_TTL),
+        }
+    }
 }
 
 impl TxPool for TestPool {
@@ -51,6 +71,12 @@ impl TxPool for TestPool {
     }
     fn get_account_balance(&self, address: Address) -> U256 {
         self.balances.get(&address).copied().unwrap_or(U256::MAX)
+    }
+    fn record_peer_batch(&self, hashes: &[TxHash]) {
+        self.peer_batch_txs.record(hashes)
+    }
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+        self.peer_batch_txs.is_deferred(hash)
     }
 }
 
@@ -93,7 +119,7 @@ impl TestPool {
                 valid_tx
             })
             .collect();
-        Self { transactions, by_id: by_id.into_iter().collect(), balances: BTreeMap::new() }
+        Self { transactions, by_id: by_id.into_iter().collect(), ..Default::default() }
     }
 
     fn best_transactions_int(&self) -> Box<dyn BestTransactions<Item = Arc<PoolTxn>>> {
@@ -137,7 +163,12 @@ struct BestTestTransactions {
     /// then can be moved from the `all` set to the `independent` set.
     independent: VecDeque<Arc<PoolTxn>>,
     /// There might be the case where a yielded transactions is invalid, this will track it.
-    invalid: HashSet<TxHash>,
+    ///
+    /// Senders, not hashes, mirroring reth's `BestTransactions`: marking a transaction invalid
+    /// must also skip its descendants (the sender's later nonces), which are already unlocked by
+    /// the time the caller marks it. Tracking hashes alone would still yield the successor and
+    /// pack a nonce-gapped batch.
+    invalid: HashSet<SenderId>,
     /// Flag to control whether to skip blob transactions (EIP4844).
     skip_blobs: bool,
 }
@@ -145,7 +176,7 @@ struct BestTestTransactions {
 impl BestTestTransactions {
     /// Mark the transaction and it's descendants as invalid.
     fn mark_invalid(&mut self, tx: &Arc<PoolTxn>) {
-        self.invalid.insert(*tx.hash());
+        self.invalid.insert(tx.sender_id());
     }
 }
 
@@ -176,8 +207,8 @@ impl Iterator for BestTestTransactions {
             let best = self.independent.pop_front()?.clone();
             let hash = best.transaction.transaction().hash();
 
-            // skip transactions that were marked as invalid
-            if self.invalid.contains(hash) {
+            // skip transactions whose sender was marked invalid (this transaction or an ancestor)
+            if self.invalid.contains(&best.sender_id()) {
                 tracing::debug!(
                     target: "test-txpool",
                     "[{:?}] skipping invalid transaction",

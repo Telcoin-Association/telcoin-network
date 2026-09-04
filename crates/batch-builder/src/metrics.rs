@@ -22,6 +22,8 @@ pub(crate) struct BatchBuilderMetrics {
     pub(crate) batches_sealed_total: Counter,
     /// Time from spawning a batch build until the worker's quorum ack resolves.
     pub(crate) seal_duration_seconds: Histogram,
+    /// Total transactions skipped because a validated peer batch already carries them (#1329).
+    pub(crate) peer_deferred_txs_total: Counter,
 }
 
 impl BatchBuilderMetrics {

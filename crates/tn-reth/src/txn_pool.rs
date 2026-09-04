@@ -44,7 +44,7 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use reth_transaction_pool::{
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
-        PoolError,
+        PoolError, PoolTransactionError,
     },
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
@@ -59,8 +59,8 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    error::TnRethResult, evm::TnEvmConfig, metrics::RETH_METRICS, traits::TelcoinNode, PoolTxn,
-    PoolTxnId,
+    error::TnRethResult, evm::TnEvmConfig, metrics::RETH_METRICS, peer_batch::PeerBatchTxs,
+    traits::TelcoinNode, PoolTxn, PoolTxnId,
 };
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
@@ -105,6 +105,14 @@ pub trait TxPool {
     /// only keep a sender's remaining transactions parked, never promote an unfunded one, and the
     /// engine's authoritative canonical update corrects it within the same consensus round.
     fn get_account_balance(&self, address: Address) -> U256;
+    /// Remember `hashes` as packed by a peer batch this node has just validated.
+    ///
+    /// The builder skips a remembered hash for
+    /// [`PEER_BATCH_DEFER_TTL`](crate::PEER_BATCH_DEFER_TTL) so this node does not pack a copy
+    /// of a transaction a peer is already proposing.
+    fn record_peer_batch(&self, hashes: &[TxHash]);
+    /// Return true if `hash` is still deferred by a validated peer batch.
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool;
 }
 
 /// A telcoin network transaction pool.
@@ -119,6 +127,9 @@ pub struct WorkerTxPool(
     /// The shared per-worker base-fee container: the single source of the pool's pending base
     /// fee (issue #1262).
     BaseFeeContainer,
+    /// The transactions this node has seen inside a validated peer batch, deferred by the
+    /// builder while that peer batch is in flight (issue #1329).
+    PeerBatchTxs,
 );
 
 impl From<WorkerTxPool>
@@ -213,7 +224,7 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee))
+        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee, PeerBatchTxs::default()))
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -561,6 +572,14 @@ impl WorkerTxPool {
     pub fn pool_size(&self) -> PoolSize {
         self.0.pool_size()
     }
+
+    /// The shared window of transactions seen inside a validated peer batch.
+    ///
+    /// The batch validator records into this window and the batch builder reads it, so a
+    /// transaction a peer is already proposing is not packed again here (issue #1329).
+    pub fn peer_batch_txs(&self) -> &PeerBatchTxs {
+        &self.3
+    }
 }
 
 impl TxPool for WorkerTxPool {
@@ -584,6 +603,14 @@ impl TxPool for WorkerTxPool {
             .flatten()
             .map(|account| account.balance)
             .unwrap_or(U256::ZERO)
+    }
+
+    fn record_peer_batch(&self, hashes: &[TxHash]) {
+        self.3.record(hashes)
+    }
+
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+        self.3.is_deferred(hash)
     }
 }
 
@@ -641,6 +668,45 @@ impl BestTxns {
                 Eip7702PoolTransactionError::MissingEip7702AuthorizationList,
             ),
         );
+    }
+
+    /// Skip a transaction a validated peer batch already carries.
+    ///
+    /// Marking it invalid for this build also skips the sender's later nonces: a nonce-gapped
+    /// copy would only be skipped at execution, after paying for batch space and a vote round.
+    /// The transaction stays in the pool and is packed normally once the deferral expires (or
+    /// leaves the pool with the peer batch's execution), so this is not a rejection.
+    pub fn peer_deferred(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::Other(Box::new(PeerBatchDeferred)),
+        );
+    }
+}
+
+/// The pool error reported when the builder skips a transaction already packed by a validated
+/// peer batch (issue #1329).
+///
+/// This is a local scheduling decision, not a judgement about the transaction: `is_bad_transaction`
+/// is false, so no peer is penalized and the transaction stays poolable.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PeerBatchDeferred;
+
+impl std::fmt::Display for PeerBatchDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transaction deferred: already packed by a validated peer batch")
+    }
+}
+
+impl std::error::Error for PeerBatchDeferred {}
+
+impl PoolTransactionError for PeerBatchDeferred {
+    fn is_bad_transaction(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
