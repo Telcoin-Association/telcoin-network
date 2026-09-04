@@ -29,6 +29,7 @@ mod worker;
 pub mod error;
 pub mod forks;
 
+pub use self::serde::roaring_container_count;
 pub use canonical_reader::*;
 pub use codec::*;
 pub use committee::*;
