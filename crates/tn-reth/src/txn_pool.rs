@@ -10,7 +10,9 @@
 //!   task would take down the whole node. The task subscribes to the raw receiver rather than
 //!   `canonical_state_stream()` (whose wrapper silently swallows broadcast lag) so it can observe
 //!   `Lagged`, mark every pool sender dirty, and reload canonical account state in bounded chunks,
-//!   discarding transactions mined in the lost rounds (issue #1236).
+//!   discarding transactions mined in the lost rounds (issue #1236). A retry interval re-arms the
+//!   residual reload between notifications, so a large dirty set drains at the retry cadence even
+//!   when notification traffic goes quiet (issue #1304).
 //! - The pool's pending base fee always comes from the shared per-worker [`BaseFeeContainer`] (the
 //!   gas accumulator's fee for the current epoch). Canonical tip headers never set it: at an epoch
 //!   boundary the tip is the previous epoch's closing block, whose header carries the old epoch's
@@ -27,7 +29,7 @@
 //!   out of the pending set.
 
 use alloy::primitives::map::AddressSet;
-use futures::StreamExt as _;
+use futures::{stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
@@ -50,11 +52,16 @@ use reth_transaction_pool::{
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{sync::Arc, time::Instant};
+use std::{
+    pin::pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tn_types::{
     gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
     TaskSpawner, TransactionSigned, TxHash, U256,
 };
+use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, info, trace, warn};
 
@@ -70,8 +77,45 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 ///
 /// Lag means the loop is already behind, so recovery must not stall it further: each
 /// iteration reloads at most this many dirty senders and carries the rest to the next
-/// iteration, which arrives at consensus-round rate.
+/// reload event, which is the next notification or the [`RELOAD_RETRY_INTERVAL`] tick,
+/// whichever comes first.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// Interval at which the maintenance loop re-arms the residual dirty-sender reload between
+/// canonical-state notifications.
+///
+/// After a `Lagged` event the broadcast ring still holds up to its capacity in buffered
+/// `Commit`s, so the first reload chunks drain back-to-back. The residual beyond that used
+/// to advance only when the next notification arrived: consensus-round cadence at best, and
+/// a post-spike lull (exactly what follows the volume spike that builds a large dirty set)
+/// stalls it entirely. Re-arming on this interval drains the residual at one chunk per
+/// interval instead, about 30 s at the theoretical ~30,000-dirty-sender maximum, independent
+/// of notification traffic; the interval is a deliberate throttle on recovery DB pressure.
+/// This adapts reth's `maintain_transaction_pool`, which re-arms its `reload_accounts_fut`
+/// on every loop iteration; here the re-arm is paced by an explicit interval (issue #1304).
+const RELOAD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One input to the pool maintenance loop (see [`WorkerTxPool::maintain_pool`]).
+enum MaintenanceEvent {
+    /// A canonical-state broadcast item: a notification, or `Lagged` when the subscriber
+    /// fell behind.
+    Update(Result<CanonStateNotification, BroadcastStreamRecvError>),
+    /// The reload retry interval fired: reload one residual dirty-sender chunk, if any.
+    RetryTick,
+    /// The canonical-state stream closed; the loop ends and the critical task reports it.
+    Closed,
+}
+
+impl MaintenanceEvent {
+    /// True when the canonical-state stream has closed and the maintenance loop must end.
+    fn is_closed(&self) -> bool {
+        match self {
+            MaintenanceEvent::Update(_) => false,
+            MaintenanceEvent::RetryTick => false,
+            MaintenanceEvent::Closed => true,
+        }
+    }
+}
 
 /// Generate a new pooled transaction from an eth transaction and id.
 ///
@@ -227,57 +271,99 @@ impl WorkerTxPool {
     /// `Stream` shape but surfaces `Lagged` as an error item, so the task can mark every
     /// pool sender dirty and reload canonical account state in bounded chunks, mirroring
     /// reth's `maintain_transaction_pool` drift recovery.
+    ///
+    /// The loop body lives in [`Self::maintain_pool`] so tests can drive it with a
+    /// synthetic stream and paused time.
     fn spawn_maintenance_task(
         &self,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
     ) {
-        let mut state_stream =
-            BroadcastStream::new(blockchain_provider.subscribe_to_canonical_state());
+        let state_stream = BroadcastStream::new(blockchain_provider.subscribe_to_canonical_state());
         let txn_pool_clone = self.clone();
         // Update the txn pool as the canonical tip changes.
         task_spawner.spawn_critical_task("canonical txn pool", async move {
-            let mut dirty_addresses = AddressSet::default();
-            while let Some(update) = state_stream.next().await {
-                let newly_dirty = update
+            txn_pool_clone
+                .maintain_pool(state_stream, RELOAD_RETRY_INTERVAL, MAX_RELOAD_ACCOUNTS)
+                .await
+        });
+    }
+
+    /// Drive pool maintenance until `state_stream` closes.
+    ///
+    /// Applies every canonical-state notification, marks all pool senders dirty on
+    /// `Lagged`, and reloads dirty senders in chunks of `max_reload`. A `retry_interval`
+    /// tick re-arms the reload between notifications, so a residual dirty set drains at
+    /// the retry cadence even when notification traffic goes quiet after the volume spike that
+    /// built it (issue #1304). A tick with no dirty senders is a no-op.
+    ///
+    /// The chunk reload is awaited inline, so a tick can never start a second reload while
+    /// one is in flight; ticks that would fire during a reload are pushed back a full
+    /// `retry_interval` ([`MissedTickBehavior::Delay`]).
+    async fn maintain_pool(
+        self,
+        state_stream: impl Stream<Item = Result<CanonStateNotification, BroadcastStreamRecvError>>
+            + Send,
+        retry_interval: Duration,
+        max_reload: usize,
+    ) -> Result<(), TaskError> {
+        let mut interval = tokio::time::interval(retry_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let ticks = stream::unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some((MaintenanceEvent::RetryTick, interval))
+        });
+        // `select` polls `ticks` forever, so the merged stream alone would never end. The
+        // chained `Closed` sentinel plus `take_while` end it when `state_stream` closes,
+        // preserving the shutdown semantics of the plain notification loop.
+        let updates = state_stream
+            .map(MaintenanceEvent::Update)
+            .chain(stream::once(std::future::ready(MaintenanceEvent::Closed)));
+        let mut events = pin!(stream::select(updates, ticks)
+            .take_while(|event| std::future::ready(!event.is_closed())));
+        let mut dirty_addresses = AddressSet::default();
+        while let Some(event) = events.next().await {
+            let newly_dirty = match event {
+                MaintenanceEvent::Update(update) => update
                     .map(|notification| {
-                        txn_pool_clone.apply_canon_notification(notification);
+                        self.apply_canon_notification(notification);
                         AddressSet::default()
                     })
                     .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
-                        txn_pool_clone.mark_drifted(missed)
-                    });
-                let to_reload: AddressSet =
-                    dirty_addresses.into_iter().chain(newly_dirty).collect();
-                dirty_addresses = if to_reload.is_empty() {
-                    to_reload
-                } else {
-                    // The reload is synchronous MDBX I/O. Run it on the blocking pool so it
-                    // never occupies one of the async worker threads this runtime also uses
-                    // for consensus and networking (reth offloads the same work:
-                    // `maintain_transaction_pool` runs under `spawn_blocking_task`).
-                    let pool = txn_pool_clone.clone();
-                    let retained = to_reload.clone();
-                    tokio::task::spawn_blocking(move || {
-                        pool.reload_dirty_accounts(to_reload, MAX_RELOAD_ACCOUNTS)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        // the blocking task was dropped or panicked: keep every sender
-                        // dirty so the next notification retries the reload
-                        warn!(
-                            target: "txpool",
-                            ?error,
-                            "dirty-account reload task failed; retrying next round"
-                        );
-                        retained
-                    })
-                };
-            }
-            Err(TaskError::from_message(
-                "canonical txn pool task ended because state_stream closed",
-            ))
-        });
+                        self.mark_drifted(missed)
+                    }),
+                MaintenanceEvent::RetryTick => AddressSet::default(),
+                // `take_while` ends the stream at `Closed`, so this arm never runs; a
+                // plain value keeps the match total (no panic in a critical task).
+                MaintenanceEvent::Closed => AddressSet::default(),
+            };
+            let to_reload: AddressSet = dirty_addresses.into_iter().chain(newly_dirty).collect();
+            dirty_addresses = if to_reload.is_empty() {
+                to_reload
+            } else {
+                // The reload is synchronous MDBX I/O. Run it on the blocking pool so it
+                // never occupies one of the async worker threads this runtime also uses
+                // for consensus and networking (reth offloads the same work:
+                // `maintain_transaction_pool` runs under `spawn_blocking_task`).
+                let pool = self.clone();
+                let retained = to_reload.clone();
+                tokio::task::spawn_blocking(move || {
+                    pool.reload_dirty_accounts(to_reload, max_reload)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    // the blocking task was dropped or panicked: keep every sender
+                    // dirty so the next reload event retries the reload
+                    warn!(
+                        target: "txpool",
+                        ?error,
+                        "dirty-account reload task failed; retrying on the next reload event"
+                    );
+                    retained
+                })
+            };
+        }
+        Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
     }
 
     /// Apply one canonical-state notification to the pool.
@@ -928,6 +1014,181 @@ mod tests {
         assert_eq!(after_two.len(), 1);
         let after_three = pool.reload_dirty_accounts(after_two, 1);
         assert!(after_three.is_empty());
+    }
+
+    /// Issue #1304: residual dirty senders beyond the per-event reload bound must drain on
+    /// the retry interval alone. The synthetic stream delivers one `Lagged` marker and then
+    /// goes silent (the post-spike lull), so any progress past the first chunk can come
+    /// only from the re-armed reload, never from a notification.
+    //
+    // The three issue #1304 tests run on real time. With `start_paused`, the `RethEnv`
+    // harness keeps `spawn_blocking` tasks alive for its whole life
+    // (`TaskSpawner::spawn_reth_task` wraps `Handle::block_on`), and tokio inhibits
+    // paused-clock auto-advance while a blocking task is in flight, so every timer
+    // waits forever.
+    #[tokio::test]
+    async fn test_residual_dirty_senders_drain_between_notifications() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut factories: Vec<TransactionFactory> =
+            (0..3).map(|_| TransactionFactory::new_random()).collect();
+        let genesis =
+            test_genesis().extend_accounts(factories.iter().map(|factory| {
+                (factory.address(), GenesisAccount::default().with_balance(U256::MAX))
+            }));
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let encoded_txs: Vec<Vec<u8>> = factories
+            .iter_mut()
+            .map(|factory| {
+                factory
+                    .create_eip1559(
+                        chain.clone(),
+                        Some(21_000),
+                        7,
+                        Some(Address::ZERO),
+                        U256::from(100),
+                        Bytes::new(),
+                    )
+                    .encoded_2718()
+            })
+            .collect();
+        let outcomes = futures::future::join_all(encoded_txs.iter().map(|encoded| {
+            let recovered = recover_raw_transaction(encoded).unwrap();
+            pool.add_recovered_transaction_external(recovered)
+        }))
+        .await;
+        outcomes.into_iter().for_each(|outcome| {
+            outcome.unwrap();
+        });
+        assert_eq!(pool.pool_size().pending, 3);
+
+        // commit a canonical block that mines all three transactions; with no maintenance
+        // task subscribed, the pool never sees the notification . . . the lag scenario
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, encoded_txs).unwrap();
+        let state = pool.1.latest().unwrap();
+        factories.iter().for_each(|factory| {
+            let account = WorkerTxPool::load_changed_account(&state, factory.address()).unwrap();
+            assert_eq!(account.nonce, 1, "test block must mine every transaction");
+        });
+        // negative control: the pool is drifted, the mined transactions are still pending
+        assert_eq!(pool.pool_size().pending, 3);
+
+        // one Lagged marker, then a silent stream: the loop reloads one sender on the
+        // marker (chunk size 1) and must drain the residual two on retry ticks alone
+        let updates: Vec<Result<CanonStateNotification, BroadcastStreamRecvError>> =
+            vec![Err(BroadcastStreamRecvError::Lagged(1))];
+        let state_stream = stream::iter(updates).chain(stream::pending());
+        let maintenance =
+            tokio::spawn(pool.clone().maintain_pool(state_stream, Duration::from_millis(100), 1));
+
+        let mut poll = pin!(stream::iter(0..600u32)
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                pool.pool_size().pending
+            })
+            .skip_while(|pending| std::future::ready(*pending != 0)));
+        let drained = tokio::time::timeout(Duration::from_secs(60), poll.next())
+            .await
+            .expect("drain poll must finish within its wall-clock deadline");
+        assert_eq!(drained, Some(0), "residual dirty senders must drain on retry ticks alone");
+        assert!(!maintenance.is_finished(), "a silent stream must keep the maintenance loop alive");
+        maintenance.abort();
+        // join the aborted task so test teardown cannot race the maintenance loop
+        let _ = maintenance.await;
+    }
+
+    /// The retry ticks alone must not keep the maintenance loop alive: when the
+    /// canonical-state stream closes, the loop ends and the critical task reports the
+    /// closure, exactly as the plain notification loop did before issue #1304.
+    #[tokio::test]
+    async fn test_maintenance_loop_ends_when_state_stream_closes() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let updates: Vec<Result<CanonStateNotification, BroadcastStreamRecvError>> = Vec::new();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.maintain_pool(stream::iter(updates), Duration::from_millis(100), 1),
+        )
+        .await
+        .expect("maintenance loop must end when the canonical-state stream closes");
+        assert!(
+            format!("{ended:?}").contains("state_stream closed"),
+            "unexpected loop exit: {ended:?}"
+        );
+    }
+
+    /// A live `Commit` notification still drives the pool through the merged-stream loop:
+    /// a maintenance loop subscribed to the real canonical-state broadcast removes the
+    /// mined transaction, proving the notification arm survived the issue #1304
+    /// restructuring.
+    #[tokio::test]
+    async fn test_maintenance_loop_applies_canonical_notifications() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let tx = tx_factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let hash = *tx.hash();
+        let encoded = tx.encoded_2718();
+        let recovered = recover_raw_transaction(&encoded).unwrap();
+        pool.add_recovered_transaction_external(recovered).await.unwrap();
+        assert_eq!(pool.pool_size().pending, 1);
+
+        // subscribe before the commit so the notification reaches the loop
+        let state_stream = BroadcastStream::new(pool.1.subscribe_to_canonical_state());
+        let maintenance = tokio::spawn(pool.clone().maintain_pool(
+            state_stream,
+            Duration::from_millis(100),
+            MAX_RELOAD_ACCOUNTS,
+        ));
+
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded]).unwrap();
+
+        let mut poll = pin!(stream::iter(0..600u32)
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                pool.pool_size().pending
+            })
+            .skip_while(|pending| std::future::ready(*pending != 0)));
+        let applied = tokio::time::timeout(Duration::from_secs(60), poll.next())
+            .await
+            .expect("apply poll must finish within its wall-clock deadline");
+        assert_eq!(applied, Some(0), "the maintenance loop must apply the Commit notification");
+        assert!(pool.get(&hash).is_none());
+        maintenance.abort();
+        // join the aborted task so test teardown cannot race the maintenance loop
+        let _ = maintenance.await;
     }
 
     #[tokio::test]
