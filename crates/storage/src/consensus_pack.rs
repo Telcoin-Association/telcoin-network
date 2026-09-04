@@ -118,9 +118,6 @@ enum PackMessage {
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
     FlushData(oneshot::Sender<Result<(), PackError>>),
-    /// Reconcile the physical data file down to its logical length (drop mmap capacity padding) so
-    /// a separate file handle reading to EOF observes exactly the written bytes.
-    ReconcileDataLen(oneshot::Sender<Result<(), PackError>>),
     /// Read the logical data length (`end`) of the pack — the number of real record bytes,
     /// ignoring the mmap capacity padding. A consumer copying the raw file bounds its read to
     /// this so it never captures the trailing zero padding (or a later append).
@@ -191,9 +188,6 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
             }
             PackMessage::FlushData(tx) => {
                 let _ = tx.send(inner.flush_data());
-            }
-            PackMessage::ReconcileDataLen(tx) => {
-                let _ = tx.send(inner.reconcile_data_len());
             }
             PackMessage::DataFileLen(tx) => {
                 let _ = tx.send(inner.data.file_len());
@@ -500,14 +494,6 @@ impl ConsensusPack {
     pub async fn flush_data(&self) -> Result<(), PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::FlushData(tx)).await;
-        rx.await.map_err(|_| PackError::ReceiveFailed)?
-    }
-
-    /// Reconcile the on-disk data file down to its logical length (dropping any mmap capacity
-    /// padding) so a separate handle reading the file to EOF observes exactly the written bytes.
-    pub async fn reconcile_data_len(&self) -> Result<(), PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::ReconcileDataLen(tx)).await;
         rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
@@ -1401,19 +1387,6 @@ impl Inner {
     fn flush_data(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    /// Prepare the on-disk data file for an external reader: flush pending writes (the buffered
-    /// backend's write buffer / the mmap dirty pages), then reconcile the physical length down to
-    /// the logical `end`, dropping any mmap capacity padding — so a separate file handle reading to
-    /// EOF sees exactly `[0, end)`. No-op for a read-only pack, whose file was already reconciled
-    /// when its writer closed.
-    fn reconcile_data_len(&mut self) -> Result<(), PackError> {
-        if !self.data.read_only() {
-            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
-            self.data.reconcile_len().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
         Ok(())
     }
@@ -4104,80 +4077,6 @@ pub(crate) mod test {
         let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
         let output = pack.get_consensus_output(1).await.expect("read output through static open");
         assert_eq!(output.number(), 1, "static read must return the output saved after the heal");
-    }
-
-    /// A live (persisted-but-not-dropped) pack's `data` file is physically padded to its mmap
-    /// capacity. A raw read-to-EOF `std::fs::copy` would carry that trailing zero padding and the
-    /// importer's record walk would fail its CRC on the zeros (the e2e "crc32 mismatch").
-    /// `reconcile_data_len` truncates the file to its logical length so a read-to-EOF copy
-    /// round-trips through `stream_import`. (Both the state export and `get_epoch_stream` now
-    /// instead bound their read to `data_file_len` — see
-    /// `test_bounded_copy_of_padded_pack_stream_imports`; `reconcile_data_len` is retained only
-    /// pending its removal.)
-    #[tokio::test]
-    async fn test_reconcile_before_copy_lets_raw_copy_stream_import() {
-        let temp_dir = TempDir::with_prefix("test_cp_reconcile_copy").expect("temp dir");
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let previous_epoch = test_previous_epoch(&committee);
-        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
-
-        // Append a few outputs and persist WITHOUT dropping: the pack stays live, so its data file
-        // keeps the mmap capacity padding (persist msyncs but does not truncate).
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open pack");
-        let num_outputs = 3usize;
-        let mut outputs = Vec::new();
-        let mut parent = ConsensusHeader::default().digest();
-        for i in 0..num_outputs {
-            let output = make_test_output(&committee, i % 4, chain.clone(), i as u64 + 1, parent);
-            parent = output.digest().into();
-            outputs.push(output.clone());
-            pack.save_consensus_output(output).await.unwrap();
-        }
-        pack.persist().await.expect("persist");
-        let padded_len = std::fs::metadata(&data_path).expect("metadata").len();
-
-        // Reconcile (what `get_epoch_stream` does before serving a sealed epoch to EOF): truncate
-        // the padding away so the on-disk file is exactly its logical length.
-        pack.reconcile_data_len().await.expect("reconcile");
-        let reconciled_len = std::fs::metadata(&data_path).expect("metadata").len();
-        assert!(
-            reconciled_len < padded_len,
-            "reconcile must shrink the padded file ({padded_len}) to its logical length \
-             ({reconciled_len})"
-        );
-
-        // A raw copy of the reconciled file — exactly what the export does for `consensus_data` —
-        // must stream_import cleanly, with no trailing padding for the record walk to choke on.
-        let bundle_dir = TempDir::with_prefix("test_cp_reconcile_bundle").expect("temp dir");
-        let copy_dst = bundle_dir.path().join("consensus_data");
-        std::fs::copy(&data_path, &copy_dst).expect("copy reconciled data");
-        let dst_dir = TempDir::with_prefix("test_cp_reconcile_dst").expect("temp dir");
-        let stream = tokio::fs::File::open(&copy_dst).await.expect("open copy");
-        let imported = ConsensusPack::stream_import(
-            dst_dir.path(),
-            stream,
-            0,
-            &previous_epoch,
-            num_outputs as u64,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("raw copy of a reconciled pack must stream_import");
-        wait_for(
-            async || imported.get_consensus_output(num_outputs as u64).await.is_ok(),
-            "last stream-imported output to be readable",
-        )
-        .await;
-        for i in 0..num_outputs {
-            let got = imported.get_consensus_output(i as u64 + 1).await.unwrap();
-            compare_outputs(&got, &outputs[i]);
-        }
-        drop(imported);
-        drop(pack);
     }
 
     /// The export copies the pack's `data` file bounded to its logical length (`data_file_len`),

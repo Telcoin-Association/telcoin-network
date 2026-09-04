@@ -40,7 +40,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use memmap2::{Mmap, MmapMut};
@@ -172,15 +172,12 @@ pub struct MmapDataFile {
     seek_pos: u64,
     read_only: bool,
     remove_on_drop: bool,
-    /// Set by [`Self::try_clone`] after it truncates the file to `end`; the next write re-maps
-    /// first. `AtomicBool` (not `Cell`) so the file stays `Sync`, letting a pack hold it
-    /// behind a `Send + Sync` trait object.
-    remap_needed: AtomicBool,
     /// High-water offset already `msync`'d to the backing store. The `WriteMode::Append` sync fast
     /// path flushes only the newly-written tail `[flushed_end, end)` instead of re-scanning the
     /// whole mapping each sync. Only meaningful for append (in-place `Random` writes can land
     /// below this offset, so that mode always flushes the full `[0, end)` range). `AtomicU64`
-    /// for the same `Sync`-through-`&self`-`sync_all` reason as `remap_needed`.
+    /// (not `Cell`) so the file stays `Sync` behind `&self` (e.g. the `&self` `sync_all`), letting
+    /// a pack hold it behind a `Send + Sync` trait object.
     flushed_end: AtomicU64,
     opts: MmapFileOptions,
 }
@@ -245,7 +242,6 @@ impl MmapDataFile {
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
-            remap_needed: AtomicBool::new(false),
             // Existing content is already durable on disk, so the sync fast path starts here.
             flushed_end: AtomicU64::new(orig_len),
             opts,
@@ -401,14 +397,6 @@ impl MmapDataFile {
 
     /// Ensure a writable mapping large enough for `[0, needed)`, growing (reopen-larger) if needed.
     fn ensure_capacity(&mut self, needed: u64) -> io::Result<()> {
-        if self.remap_needed.load(Ordering::Relaxed) {
-            // `try_clone` truncated the physical file to `end` and left a stale over-length map;
-            // reflect the real physical size so the growth math is correct, then force a fresh map
-            // below (writes always append, so `needed > end == capacity` and we take the grow
-            // path).
-            self.capacity = self.end;
-            self.remap_needed.store(false, Ordering::Relaxed);
-        }
         if needed <= self.capacity {
             return Ok(());
         }
@@ -455,7 +443,6 @@ impl MmapDataFile {
         }
         self.remap(len)?;
         self.end = len;
-        self.remap_needed.store(false, Ordering::Relaxed);
         // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
         // is still flushed (bytes still present under `len` stay durable).
         let fe = self.flushed_end.load(Ordering::Relaxed).min(len);
@@ -476,8 +463,8 @@ impl MmapDataFile {
     /// into the padding; readers must stop at `end` instead
     /// ([`PackIter`](crate::archive::pack_iter)
     /// via [`raw_iter`](crate::archive::pack::Pack::raw_iter) does). An external byte consumer that
-    /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must instead
-    /// physically truncate the file first with [`reconcile_to_end`](Self::reconcile_to_end).
+    /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must bound its
+    /// own read to `end`; the physical padding is only ever removed on a clean close (`Drop`).
     pub fn try_clone(&self) -> io::Result<(File, u64)> {
         if !self.read_only && self.end > 0 {
             if let Backing::Rw(map) = &self.backing {
@@ -488,30 +475,6 @@ impl MmapDataFile {
             self.flushed_end.store(self.end, Ordering::Relaxed);
         }
         Ok((self.file.try_clone()?, self.end))
-    }
-
-    /// Reconcile the physical file to exactly the logical `end`: flush `[0, end)`, then truncate
-    /// away the capacity padding so a consumer that reads the raw bytes to EOF (a
-    /// `std::fs::copy` of the file, a read-to-EOF network stream) sees exactly the written
-    /// bytes.
-    ///
-    /// `File::set_len` takes `&self`; the existing map still spans the old capacity but
-    /// `[end, capacity)` is never touched (our own reads are bounded by `end`), and the next write
-    /// re-maps first (see `remap_needed` / [`ensure_capacity`](Self::ensure_capacity)). Intended
-    /// for sealed packs (state export, full-epoch serve), so the next-append remap it arms is
-    /// not on a hot path.
-    pub fn reconcile_to_end(&self) -> io::Result<()> {
-        if !self.read_only {
-            if self.end > 0 {
-                if let Backing::Rw(map) = &self.backing {
-                    map.flush_range(0, self.end as usize)?;
-                }
-                self.flushed_end.store(self.end, Ordering::Relaxed);
-            }
-            self.file.set_len(self.end)?;
-            self.remap_needed.store(true, Ordering::Relaxed);
-        }
-        Ok(())
     }
 
     /// `msync` the dirty region to the backing store. For [`WriteMode::Append`] this is only the
@@ -1011,22 +974,6 @@ mod tests {
         let mut rest = Vec::new();
         clone.read_to_end(&mut rest).expect("read padding");
         assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
-
-        // reconcile_to_end truncates the physical file to the logical end (the export/serve path).
-        df.reconcile_to_end().expect("reconcile");
-        assert_eq!(
-            std::fs::metadata(&path).expect("metadata").len(),
-            data.len() as u64,
-            "reconcile_to_end truncates the padding away"
-        );
-
-        // Appending after reconcile still works (re-maps first).
-        df.write_all(&pattern(50)).expect("append after reconcile");
-        assert_eq!(df.len(), 250);
-        df.seek(SeekFrom::Start(200)).expect("seek");
-        let mut tail = vec![0u8; 50];
-        df.read_exact(&mut tail).expect("read tail");
-        assert_eq!(tail, pattern(50));
     }
 
     #[test]

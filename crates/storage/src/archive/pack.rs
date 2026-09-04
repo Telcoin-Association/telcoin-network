@@ -63,13 +63,6 @@ where
         self.inner.data_file.set_read_bound(logical_end);
     }
 
-    /// Reconcile the physical data file down to its logical length, dropping any capacity padding
-    /// the mmap backend leaves past `end` (the mapping must be >= the file). Afterwards a separate
-    /// handle reading the file to EOF observes exactly `[0, end)` with no trailing zero-padding.
-    pub fn reconcile_len(&self) -> io::Result<()> {
-        self.inner.reconcile_len()
-    }
-
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
         self.inner.fetch(pos)
@@ -245,13 +238,6 @@ where
     /// Length of the Pack file.
     fn file_len(&self) -> u64 {
         self.data_file.len()
-    }
-
-    /// Reconcile the physical file to the logical length (flush `[0, end)`, then truncate any
-    /// capacity padding, exactly as a clean close does) so an external consumer that reads the raw
-    /// bytes to EOF sees exactly the written bytes.
-    fn reconcile_len(&self) -> io::Result<()> {
-        self.data_file.reconcile_to_end()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
