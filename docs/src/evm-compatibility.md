@@ -120,7 +120,7 @@ TN repurposes several Ethereum block header fields to carry consensus-layer meta
 | -------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
 | `nonce`                    | PoW mining nonce             | Epoch and consensus round, packed as `(epoch << 32) \| round`                              |
 | `difficulty`               | Network difficulty           | Worker ID and batch index, packed as `(batch_index << 16) \| worker_id`                    |
-| `mix_hash`                 | PoW mix digest               | Consensus output digest XOR'd with batch digest. If no batches, just the output digest     |
+| `mix_hash`                 | PoW mix digest               | Fork-gated (see [Deriving the `mix_hash` field](#deriving-the-mix_hash-field)): before the PREVRANDAO fork epoch, consensus output digest XOR'd with batch digest (just the output digest if no batches); from it, a keccak over the epoch seed chain value |
 | `ommers_hash`              | Uncle block hash             | Digest of the consensus `Batch` executed to produce this block. `B256::ZERO` if no batches |
 | `parent_beacon_block_root` | Beacon chain parent root     | Digest of the `ConsensusHeader` that committed the transactions                            |
 | `extra_data`               | Arbitrary miner data         | Committee-shuffle seed (the epoch seed chain value) at epoch boundaries, empty bytes otherwise |
@@ -162,6 +162,34 @@ nonce = (epoch << 32) | round
 
 * **Upper 32 bits**: epoch number
 * **Lower 32 bits**: consensus round number
+
+#### Deriving the `mix_hash` Field
+
+`mix_hash` (exposed to contracts as `PREVRANDAO`, EIP-4399) is fork-gated on the epoch of
+the committing leader, which is recoverable from the upper 32 bits of the block's `nonce`:
+
+* **Before the PREVRANDAO fork epoch** (`PREVRANDAO_FORK_EPOCH` in `tn-types` `forks.rs`):
+  the consensus output digest XOR'd with the batch digest; just the output digest when the
+  output carried no batches (the epoch-closing block).
+* **From the fork epoch on**:
+
+  ```
+  mix_hash = keccak256("TN_PREVRANDAO_V1" || seed || consensus_block_number || batch_index)
+  ```
+
+  where `seed` is the 32-byte epoch seed chain value as of the committing consensus output (the chain folds one seed signature per commit, so the value advances every commit; the closing commit's value is the one
+  published as `extra_data` on the epoch's closing block), and the two integers are
+  little-endian u64s. The fork activates only once the seed-signature fork is also active
+  (the gate is a fail-closed conjunction of the two).
+
+Indexers reproducing `mix_hash` from consensus data must branch on the block's epoch, not
+on node version or wall-clock time.
+
+Note on bias: the seeded derivation removes payload grinding (every input is pinned by the
+committed order, so the leader cannot generate candidate values by re-cutting its
+proposal), but the committing leader can still compute every `PREVRANDAO` its commit will
+produce before broadcasting and withhold the proposal (one propose-or-withhold choice per
+commit). Contracts that need unbiasable randomness must not rely on `PREVRANDAO` alone.
 
 ### Summary
 

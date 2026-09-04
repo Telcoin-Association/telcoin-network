@@ -297,6 +297,12 @@ impl ConsensusOutput {
     /// consensus header digest XOR `batch_digest`. The empty epoch-closing block passes
     /// [`B256::ZERO`], which reduces the XOR to the bare consensus header digest, exactly
     /// the value the engine used for that path.
+    ///
+    /// Accepted residual: every input is known to the committing leader before it
+    /// broadcasts, so the leader can compute each `PREVRANDAO` its commit will produce and
+    /// withhold the proposal if it dislikes them . . . one propose-or-withhold choice per
+    /// commit, with no re-cutting of the payload to generate alternatives. Contracts that
+    /// need unbiasable randomness must not use `PREVRANDAO` alone.
     pub fn prev_randao(&self, batch_index: usize, batch_digest: B256) -> B256 {
         if crate::forks::prevrandao_seed_active(self.leader().epoch()) {
             seeded_prev_randao(self.committee_shuffle_seed(), self.number(), batch_index)
@@ -723,5 +729,78 @@ mod tests {
             let header: B256 = output.digest().into();
             assert_eq!(empty, header, "a zero batch digest must reduce to the header digest");
         }
+    }
+
+    /// Build an output whose committing leader sits at `epoch`, so the fork-gated dispatch
+    /// can be pinned at exact grid points instead of the fixture default of epoch 0.
+    fn output_with_leader_epoch(
+        epoch: crate::Epoch,
+        number: u64,
+        digests: Vec<BlockHash>,
+    ) -> ConsensusOutput {
+        let leader = crate::HeaderBuilder::default().epoch(epoch).build();
+        ConsensusOutput::new(
+            CommittedSubDag::new_with_headers_for_test(vec![leader]),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            digests.into(),
+            Vec::new(),
+        )
+    }
+
+    /// Fork-boundary keeper: both grid points derive from the fork constant, so the arming
+    /// PR that lowers [`crate::forks::PREVRANDAO_FORK_EPOCH`] retargets this test with no
+    /// edit. On adiri the epoch below the fork must replay the legacy XOR byte-identically
+    /// and the fork epoch itself must fire the seeded derivation (`>=`, not `>`); every
+    /// other build must take the seeded arm at every epoch. This is the dispatch-level
+    /// companion to the predicate grids in `forks.rs`: it pins which bytes
+    /// [`ConsensusOutput::prev_randao`] actually emits on each side of the boundary.
+    #[test]
+    fn prev_randao_flips_arms_exactly_at_the_fork_epoch() {
+        // Anti-vacuity tripwire: an ambient fork-epoch override would silently move the
+        // effective fork point and re-aim the grid below at the wrong arm. Fail loudly
+        // instead; the overrides are OnceLock-latched, so a process that wants them unset
+        // must never have exported them.
+        #[cfg(feature = "test-utils")]
+        {
+            assert!(
+                crate::forks::prevrandao_fork_epoch_override().is_none(),
+                "this test requires a process without TN_PREVRANDAO_FORK_EPOCH set",
+            );
+            assert!(
+                crate::forks::seed_signature_fork_epoch_override().is_none(),
+                "this test requires a process without TN_SEED_SIGNATURE_FORK_EPOCH set",
+            );
+        }
+        let digest = BlockHash::repeat_byte(0x55);
+        #[cfg(feature = "adiri")]
+        {
+            let pre =
+                output_with_leader_epoch(crate::forks::PREVRANDAO_FORK_EPOCH - 1, 5, vec![digest]);
+            let header: B256 = pre.digest().into();
+            assert_eq!(
+                pre.prev_randao(0, digest),
+                header ^ digest,
+                "adiri must replay the legacy XOR byte-identically below the fork epoch",
+            );
+            let post =
+                output_with_leader_epoch(crate::forks::PREVRANDAO_FORK_EPOCH, 5, vec![digest]);
+            assert_eq!(
+                post.prev_randao(0, digest),
+                seeded_prev_randao(post.committee_shuffle_seed(), 5, 0),
+                "the seeded derivation must fire at the fork epoch itself (`>=`, not `>`)",
+            );
+        }
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            let output = output_with_leader_epoch(epoch, 5, vec![digest]);
+            assert_eq!(
+                output.prev_randao(0, digest),
+                seeded_prev_randao(output.committee_shuffle_seed(), 5, 0),
+                "non-adiri builds carry no pre-fork history and must take the seeded arm \
+                 at epoch {epoch}",
+            );
+        });
     }
 }

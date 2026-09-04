@@ -60,6 +60,14 @@ pub struct TNPayload {
     /// The value comes from the worker's block.
     pub gas_limit: u64,
     /// The mix hash used for prev_randao.
+    ///
+    /// Fork-gated by `prevrandao_seed_active` for the committing leader's epoch: the legacy
+    /// `output_digest ^ batch_digest` before the PREVRANDAO fork, the domain-separated
+    /// keccak over the epoch seed chain value, consensus block number, and batch index from
+    /// it (`ConsensusOutput::prev_randao`, #1247). Post-fork the value is immune to payload
+    /// grinding, but the committing leader still sees every value its commit will produce
+    /// before broadcasting and keeps one propose-or-withhold choice per commit; contracts
+    /// that need unbiasable randomness must not use `PREVRANDAO` alone.
     pub mix_hash: B256,
     /// Randomness digest carried only by the payload that closes the epoch.
     ///
