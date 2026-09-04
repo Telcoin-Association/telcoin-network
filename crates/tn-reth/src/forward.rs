@@ -54,7 +54,14 @@ use crate::{
 };
 use alloy::{
     providers::{Provider as _, RootProvider},
-    transports::{RpcError, TransportErrorKind},
+    rpc::{
+        client::RpcClient,
+        json_rpc::{RequestPacket, ResponsePacket},
+    },
+    transports::{
+        http::Client, utils::guess_local_url, RpcError, TransportError, TransportErrorKind,
+        TransportFut, TransportResult,
+    },
 };
 use futures::{future::OptionFuture, StreamExt};
 use std::{
@@ -116,6 +123,28 @@ const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// a gas-full batch occupies its permit for seconds even when every endpoint answers promptly,
 /// and a tighter cap would shed batches an unstressed node could have delivered.
 const MAX_CONCURRENT_FORWARDS: usize = 64;
+
+/// Bounds how many bytes of one validator RPC response body the forwarder will buffer.
+///
+/// The dial target is chosen by a committee member (issue #1092), so the response is as
+/// remote-controlled as the endpoint: alloy's stock HTTP transport buffers the entire body
+/// before parsing, on success and error statuses alike, and [`FORWARD_SEND_TIMEOUT`] bounds
+/// only how long that read may take, not how much it may hold (issue #1275). A
+/// `send_raw_transaction` verdict is a few hundred bytes, so 64 KiB is orders of magnitude of
+/// headroom, and with every permit taken the response buffers hold at most
+/// [`MAX_CONCURRENT_FORWARDS`] x 64 KiB = 4 MiB instead of whatever a byzantine endpoint
+/// cares to stream inside the timeout.
+const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Bounds how many bytes of remote-controlled text a [`Disposition`] reason may carry.
+///
+/// Reasons reach `warn!` logs (a confirmed rejection and a rejection override both print them
+/// under the default filter) and the held-rejection mirror that lives for the rest of a walk,
+/// so an unclamped reason turns each forwarded transaction into a log write and a retained
+/// allocation of the remote server's choosing (issue #1275). Clamped once, at classification,
+/// so every sink downstream inherits the bound. 256 bytes keeps every legitimate reth
+/// rejection message intact.
+const MAX_REASON_BYTES: usize = 256;
 
 /// JSON-RPC error codes reth reserves for conditions that are validator-local or indeterminate,
 /// never cleanly a verdict on the transaction: `-32003` is a full pool (`TxPoolOverflow`) plus
@@ -537,7 +566,7 @@ impl WorkerRpcForwarder {
                                     .ok()
                             })
                             .map(|parsed| {
-                                let provider = RootProvider::new_http(parsed);
+                                let provider = capped_provider(parsed);
                                 cache.providers.insert(url.clone(), provider.clone());
                                 provider
                             })
@@ -1153,8 +1182,141 @@ enum ForwardOutcome {
     NoEndpointReached,
 }
 
+/// The forwarder's HTTP transport: alloy's reqwest transport with a response-size cap.
+///
+/// Mirrors the service `alloy_transport_http::Http<Client>` provides, with one difference: the
+/// body is pulled chunk by chunk and refused the moment it exceeds
+/// [`MAX_FORWARD_RESPONSE_BYTES`], where the stock transport buffers the entire body before
+/// any parse (issue #1275). reqwest's `Client` has no response-size knob of its own, so the
+/// bound has to live at this layer. An oversized body surfaces as a transport error, which
+/// [`classify_error`] maps to [`Disposition::Unreachable`]: the endpoint is demoted like any
+/// other endpoint that produced no verdict.
+#[derive(Clone, Debug)]
+struct CappedHttp {
+    /// The HTTP client, alloy's own re-exported `reqwest::Client`, so the TLS backend is
+    /// exactly what `RootProvider::new_http` would have used.
+    client: Client,
+    /// The advertised endpoint this transport dials.
+    url: Url,
+}
+
+impl CappedHttp {
+    /// One JSON-RPC round trip with the response read capped.
+    ///
+    /// Follows the stock reqwest transport step for step - post the request, keep the body
+    /// regardless of status so a JSON-RPC verdict in an error-status body still classifies,
+    /// map non-success statuses to HTTP errors, then deserialize - except the body arrives
+    /// through [`collect_capped`].
+    async fn send_capped(self, req: RequestPacket) -> TransportResult<ResponsePacket> {
+        use futures::TryStreamExt as _;
+        let resp = self
+            .client
+            .post(self.url)
+            .json(&req)
+            .headers(req.headers())
+            .send()
+            .await
+            .map_err(TransportErrorKind::custom)?;
+        let status = resp.status();
+        let chunks = futures::stream::try_unfold(resp, |mut resp| async move {
+            resp.chunk().await.map(|next| next.map(|bytes| (bytes.to_vec(), resp)))
+        })
+        .map_err(TransportErrorKind::custom);
+        let body = collect_capped(chunks).await?;
+        match status.is_success() {
+            true => serde_json::from_slice(&body)
+                .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body))),
+            false => Err(TransportErrorKind::http_error(
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+            )),
+        }
+    }
+}
+
+/// The tower plumbing that lets [`CappedHttp`] stand where alloy's stock HTTP transport
+/// stands. `poll_ready` is always ready for the same reason the stock transport's is:
+/// reqwest applies its own backpressure internally.
+impl tower::Service<RequestPacket> for CappedHttp {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
+        Box::pin(self.clone().send_capped(req))
+    }
+}
+
+/// Build the provider the forwarder dials one advertised endpoint with.
+///
+/// Drop-in for `RootProvider::new_http(url)`, routed through [`CappedHttp`] so every response
+/// read is bounded by [`MAX_FORWARD_RESPONSE_BYTES`].
+fn capped_provider(url: Url) -> RootProvider {
+    let is_local = guess_local_url(url.as_str());
+    RootProvider::new(RpcClient::new(CappedHttp { client: Client::new(), url }, is_local))
+}
+
+/// Accumulate a response body from `chunks`, refusing it once it exceeds
+/// [`MAX_FORWARD_RESPONSE_BYTES`].
+///
+/// The refusal aborts the fold, which drops the stream, which abandons the connection: an
+/// oversized body is not just absent from the result, it stops being read.
+async fn collect_capped(
+    chunks: impl futures::Stream<Item = TransportResult<Vec<u8>>>,
+) -> TransportResult<Vec<u8>> {
+    use futures::TryStreamExt as _;
+    chunks
+        .try_fold(Vec::<u8>::new(), |buf, chunk| async move {
+            let total = buf.len().saturating_add(chunk.len());
+            (total <= MAX_FORWARD_RESPONSE_BYTES)
+                // Append in place: rebuilding the accumulator per chunk would be quadratic in
+                // chunk count, and the chunking is remote-controlled too.
+                .then(|| {
+                    let mut buf = buf;
+                    buf.extend_from_slice(&chunk);
+                    buf
+                })
+                .ok_or_else(|| {
+                    TransportErrorKind::custom_str(&format!(
+                        "response body exceeds the {MAX_FORWARD_RESPONSE_BYTES}-byte forward cap"
+                    ))
+                })
+        })
+        .await
+}
+
+/// Clamp one remote-controlled reason string to [`MAX_REASON_BYTES`].
+///
+/// The cut lands on a `char` boundary at or below the cap, and a clamped reason says how much
+/// it dropped, so a truncated log line reads as truncated instead of as the whole message.
+fn clamp_reason(message: String) -> String {
+    match message.len() <= MAX_REASON_BYTES {
+        true => message,
+        false => {
+            let cut = (0..=MAX_REASON_BYTES)
+                .rev()
+                .find(|idx| message.is_char_boundary(*idx))
+                .unwrap_or(0);
+            let kept = message.get(..cut).unwrap_or_default();
+            format!("{kept} [truncated {} of {} bytes]", message.len() - cut, message.len())
+        }
+    }
+}
+
 /// Classify a failed `send_raw_transaction` by whether the server returned a JSON-RPC error (a
 /// verdict about the transaction) or the transport failed (an endpoint problem).
+///
+/// Every reason built here is clamped to [`MAX_REASON_BYTES`]: several of them embed
+/// remote-controlled bytes (a JSON-RPC error message, an HTTP error's response body), and this
+/// is the one choke point every log site and the held-rejection mirror sit downstream of
+/// (issue #1275).
 fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
     match err {
         // The server returned a JSON-RPC verdict: classify it by code and message.
@@ -1163,19 +1325,26 @@ fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
         }
         // Local faults: the request could not even be built or used. They say nothing about
         // the endpoint, so try the next validator without demoting this one.
-        RpcError::SerError(err) => Disposition::TryNext(err.to_string()),
-        RpcError::LocalUsageError(err) => Disposition::TryNext(err.to_string()),
+        RpcError::SerError(err) => Disposition::TryNext(clamp_reason(err.to_string())),
+        RpcError::LocalUsageError(err) => Disposition::TryNext(clamp_reason(err.to_string())),
         // No usable verdict from the remote side: a transport failure, a response that does
         // not parse, an empty response, or a capability the endpoint lacks. All demote.
-        RpcError::Transport(err) => Disposition::Unreachable(err.to_string()),
-        RpcError::DeserError { err, .. } => Disposition::Unreachable(err.to_string()),
+        RpcError::Transport(err) => Disposition::Unreachable(clamp_reason(err.to_string())),
+        RpcError::DeserError { err, .. } => Disposition::Unreachable(clamp_reason(err.to_string())),
         RpcError::NullResp => Disposition::Unreachable("null response".to_string()),
-        RpcError::UnsupportedFeature(feature) => Disposition::Unreachable(feature.to_string()),
+        RpcError::UnsupportedFeature(feature) => {
+            Disposition::Unreachable(clamp_reason(feature.to_string()))
+        }
     }
 }
 
 /// Classify a server-side JSON-RPC rejection of a forwarded transaction.
+///
+/// The message is remote-controlled, so it is clamped before it can reach a log or the held
+/// rejection (issue #1275). Clamping before the needle checks below is safe for honest
+/// servers: every message the needles match is far shorter than the cap.
 fn classify_server_error(code: i64, message: String) -> Disposition {
+    let message = clamp_reason(message);
     let lowered = message.to_ascii_lowercase();
     match () {
         // A full pool or an internal error is validator-local; another validator may accept it.
@@ -1202,6 +1371,129 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tn_types::{BlsKeypair, TaskManager};
+
+    /// A reason at the cap passes through untouched.
+    #[test]
+    fn clamp_reason_keeps_short_reasons() {
+        let reason = "a".repeat(MAX_REASON_BYTES);
+        assert_eq!(clamp_reason(reason.clone()), reason);
+    }
+
+    /// An oversized reason is cut on a `char` boundary and says how much it dropped.
+    #[test]
+    fn clamp_reason_truncates_on_a_char_boundary() {
+        // Multi-byte scalars straddle the cap, so a byte-index cut would split one.
+        let reason = format!("{}XYZW", "\u{1d54f}".repeat(MAX_REASON_BYTES / 4));
+        let clamped = clamp_reason(reason.clone());
+        let kept = clamped.split(" [truncated").next().unwrap_or_default();
+        assert!(kept.len() <= MAX_REASON_BYTES);
+        assert!(reason.starts_with(kept));
+        assert!(clamped.contains("[truncated 4 of"));
+    }
+
+    /// A remote rejection message reaches the `Rejected` reason bounded, not verbatim.
+    #[test]
+    fn classify_server_error_bounds_remote_reasons() {
+        let huge = "x".repeat(1024 * 1024);
+        let reason = match classify_server_error(3, huge) {
+            Disposition::Rejected(reason) => reason,
+            Disposition::Delivered | Disposition::TryNext(_) | Disposition::Unreachable(_) => {
+                String::new()
+            }
+        };
+        assert!(!reason.is_empty());
+        assert!(reason.len() <= MAX_REASON_BYTES + 64, "reason kept {} bytes", reason.len());
+    }
+
+    /// An HTTP-error transport reason, whose `Display` embeds the response body, is bounded.
+    #[test]
+    fn classify_error_bounds_transport_reasons() {
+        let err = TransportErrorKind::http_error(500, "x".repeat(1024 * 1024));
+        let reason = match classify_error(err) {
+            Disposition::Unreachable(reason) => reason,
+            Disposition::Delivered | Disposition::Rejected(_) | Disposition::TryNext(_) => {
+                String::new()
+            }
+        };
+        assert!(!reason.is_empty());
+        assert!(reason.len() <= MAX_REASON_BYTES + 64, "reason kept {} bytes", reason.len());
+    }
+
+    /// Chunks up to the cap accumulate; the first chunk that would push past it aborts.
+    #[tokio::test]
+    async fn collect_capped_bounds_the_body() {
+        let chunk = || Ok::<_, TransportError>(vec![0u8; 16 * 1024]);
+        let under = futures::stream::iter((0..4).map(|_| chunk()));
+        let body = collect_capped(under).await;
+        assert_eq!(body.map(|body| body.len()).unwrap_or(0), MAX_FORWARD_RESPONSE_BYTES);
+
+        let over = futures::stream::iter((0..5).map(|_| chunk()));
+        assert!(collect_capped(over).await.is_err());
+    }
+
+    /// Serve one canned HTTP response on a loopback socket, then drain the connection.
+    ///
+    /// Draining until the client hangs up (instead of closing right after the write) keeps
+    /// the socket alive while reqwest finishes sending the request, so the test never races
+    /// a reset against the response read.
+    async fn serve_one_response(response: String) -> eyre::Result<Url> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let served = async {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut socket, _) = listener.accept().await?;
+                let (mut reader, mut writer) = socket.split();
+                writer.write_all(response.as_bytes()).await?;
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await
+            };
+            served.await.ok();
+        });
+        Ok(format!("http://{addr}/").parse()?)
+    }
+
+    /// Wrap a JSON-RPC body in a minimal HTTP/1.1 response.
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The capped transport is a working JSON-RPC transport for responses under the cap.
+    #[tokio::test]
+    async fn capped_provider_round_trips_a_small_response() -> eyre::Result<()> {
+        let body = r#"{"jsonrpc":"2.0","id":0,"result":"0x10"}"#;
+        let url = serve_one_response(http_response("200 OK", body)).await?;
+        let number = capped_provider(url).get_block_number().await?;
+        assert_eq!(number, 0x10);
+        Ok(())
+    }
+
+    /// A JSON-RPC error object in a small response still classifies: the cap changes the
+    /// outcome only for oversized bodies, not for verdicts.
+    #[tokio::test]
+    async fn capped_provider_preserves_rpc_error_verdicts() -> eyre::Result<()> {
+        let body = r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"already known"}}"#;
+        let url = serve_one_response(http_response("200 OK", body)).await?;
+        let disposition =
+            capped_provider(url).get_block_number().await.map_or_else(classify_error, |number| {
+                Disposition::TryNext(format!("unexpected success: {number}"))
+            });
+        assert_eq!(disposition, Disposition::Delivered);
+        Ok(())
+    }
+
+    /// A response past the cap is refused as a transport error instead of buffered whole.
+    #[tokio::test]
+    async fn capped_provider_refuses_an_oversized_response() -> eyre::Result<()> {
+        let body = "x".repeat(MAX_FORWARD_RESPONSE_BYTES + 1);
+        let url = serve_one_response(http_response("200 OK", &body)).await?;
+        let outcome = capped_provider(url).get_block_number().await;
+        let reason = outcome.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(reason.contains("forward cap"), "unexpected outcome: {reason}");
+        Ok(())
+    }
 
     /// A forwarder under the shipped default: only public hosts may be dialed.
     fn test_forwarder() -> WorkerRpcForwarder {
@@ -1361,8 +1653,7 @@ mod tests {
             .iter()
             .zip(endpoints)
             .map(|(key, url)| {
-                url.parse()
-                    .map(|parsed: Url| (*key, (parsed.to_string(), RootProvider::new_http(parsed))))
+                url.parse().map(|parsed: Url| (*key, (parsed.to_string(), capped_provider(parsed))))
             })
             .collect();
         providers.map(|providers| (keys, providers)).map_err(Into::into)
