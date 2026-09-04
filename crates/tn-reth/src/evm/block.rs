@@ -95,7 +95,7 @@
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    metrics::{gas_spent, EpochCloseGas},
+    metrics::{gas_spent, record_region_seats, EpochCloseGas, RegionSeatReport},
     system_calls::{
         decode_worker_fee_configs, log_registry_event,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
@@ -1699,6 +1699,16 @@ fn assemble_new_committee(
         active_validators
     };
 
+    // (#1327) snapshot each validator's region before the draw consumes the pool: the tally after
+    // the trim reports which regions the seated committee came from. `None` on the flat arm, which
+    // has no region tally to publish.
+    let pool_regions = region_aware.then(|| {
+        validators_for_shuffle
+            .iter()
+            .map(|validator| (validator.validatorAddress, validator.region))
+            .collect::<Vec<_>>()
+    });
+
     let mut new_committee = if region_aware {
         // region-aware draw sequence (#1279), live only for fork-active seated epochs
         let ordered = region_aware_order(validators_for_shuffle, rng);
@@ -1724,9 +1734,18 @@ fn assemble_new_committee(
 
     // truncate only ever shrinks, so a length mismatch here means the eligible pool was undersized.
     let committee_len = new_committee.len();
-    (committee_len == new_committee_size).then_some(new_committee).ok_or(
-        TnRethError::UndersizedCommittee { expected: new_committee_size, got: committee_len },
-    )
+    (committee_len == new_committee_size)
+        .then_some(new_committee)
+        .ok_or(TnRethError::UndersizedCommittee {
+            expected: new_committee_size,
+            got: committee_len,
+        })
+        // (#1327) publish the per-region tally only for a committee that passed the length check
+        .inspect(|committee| {
+            pool_regions
+                .iter()
+                .for_each(|pool| record_region_seats(&RegionSeatReport::tally(pool, committee)));
+        })
 }
 
 /// In-place Fisher-Yates shuffle, drawing `rng` once per element past the first.
@@ -1768,6 +1787,29 @@ fn fisher_yates<T>(items: &mut [T], rng: &mut StdRng) {
 /// seats") is vacuously satisfied: the round-robin only ends short of the target when every
 /// assigned group is exhausted, so no assigned validator can remain after step 6. A pool that is
 /// still short surfaces as [`TnRethError::UndersizedCommittee`] in the caller.
+///
+/// # Threat model (#1327)
+///
+/// A region is a governance attestation with a scheduling reward attached. `setValidatorRegion`
+/// is `onlyOwner`, so a validator cannot write its own region, but the location it claims to
+/// governance is off-chain and nothing in the protocol can verify where a validator runs. Step 5
+/// turns that claim into a hard guarantee, not a preference: round one seats exactly one validator
+/// from every assigned region. With `R` assigned regions, committee size `C`, and pool size `N`:
+///
+/// - a validator alone in its region is seated with probability 1 whenever `R <= C`;
+/// - a validator in a region of `k` members is seated in round one with probability `1/k`;
+/// - under the flat shuffle every validator is seated with probability `C/N`.
+///
+/// For a pool of 12 and a committee of 4, four regions of three give everyone the flat 1/3, while
+/// one singleton next to eleven validators in one region gives the singleton 1 and each of the
+/// others 3/11. A guaranteed seat is also a guaranteed proposer and voter slot, so a Byzantine
+/// budget that assumes random committee membership is weaker for that validator.
+///
+/// Sparse-region assignments deserve the most scrutiny before governance writes them. The only
+/// remedy today is `setValidatorRegion(addr, 0)`, which removes the advantage at the next epoch
+/// close; there is no governance-callable slash. `record_region_seats` publishes the per-region
+/// pool and seat counts at every region-aware close and flags singleton regions, so the advantage
+/// is at least observable.
 fn region_aware_order(
     pool: Vec<ConsensusRegistry::ValidatorInfo>,
     rng: &mut StdRng,
@@ -2066,6 +2108,87 @@ mod tests {
             committee.contains(&Address::with_last_byte(1))
                 && committee.contains(&Address::with_last_byte(2)),
             "both assigned validators must be seated before the unassigned pool fills",
+        );
+    }
+
+    /// The region-aware arm must publish the per-region tally (#1327) once the committee passes
+    /// its length check, and the flat arm must publish nothing. Four regions of three with a
+    /// target of four seat one validator per region, so every region reads pool 3, seated 1.
+    #[test]
+    fn assemble_region_aware_publishes_per_region_seat_tally() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let build_pool = || -> Vec<ConsensusRegistry::ValidatorInfo> {
+            (1u8..=12)
+                .map(|last_byte| {
+                    regional_validator(
+                        last_byte,
+                        ValidatorStatus::Active,
+                        ((last_byte - 1) % 4) + 1,
+                    )
+                })
+                .collect()
+        };
+        // every `(region, value)` pair a gauge series in the snapshot carries
+        let region_gauges = |snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+                             name: &str|
+         -> Vec<(String, f64)> {
+            let mut pairs: Vec<(String, f64)> = snapshot
+                .iter()
+                .filter(|(key, ..)| key.key().name() == name)
+                .filter_map(|(key, _, _, value)| {
+                    let region = key
+                        .key()
+                        .labels()
+                        .find(|label| label.key() == "region")?
+                        .value()
+                        .to_string();
+                    match value {
+                        DebugValue::Gauge(g) => Some((region, g.0)),
+                        DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+                    }
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let mut rng = StdRng::from_seed([9u8; 32]);
+            assert!(assemble_new_committee(4, build_pool(), true, &mut rng).is_ok());
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        let seated = |region: &str| (region.to_string(), 1.0);
+        let pooled = |region: &str| (region.to_string(), 3.0);
+        assert_eq!(
+            region_gauges(&snapshot, "tn_reth.epoch_close_region_seated"),
+            vec![seated("1"), seated("2"), seated("3"), seated("4")],
+        );
+        assert_eq!(
+            region_gauges(&snapshot, "tn_reth.epoch_close_region_pool"),
+            vec![pooled("1"), pooled("2"), pooled("3"), pooled("4")],
+        );
+
+        let flat_recorder = DebuggingRecorder::new();
+        let flat_snapshotter = flat_recorder.snapshotter();
+        metrics::with_local_recorder(&flat_recorder, || {
+            let mut rng = StdRng::from_seed([9u8; 32]);
+            assert!(assemble_new_committee(4, build_pool(), false, &mut rng).is_ok());
+        });
+        let flat_snapshot = flat_snapshotter.snapshot().into_vec();
+
+        assert!(
+            region_gauges(&flat_snapshot, "tn_reth.epoch_close_region_seated").is_empty()
+                && region_gauges(&flat_snapshot, "tn_reth.epoch_close_region_pool").is_empty(),
+            "the flat arm has no region tally to publish",
         );
     }
 

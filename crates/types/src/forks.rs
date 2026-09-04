@@ -541,6 +541,15 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 /// running the gate-capable build, because a nonzero region diverges the draw sequence between
 /// armed and unarmed nodes at the next epoch close.
 ///
+/// Arming the gate also arms an incentive (#1327). A region assignment is a governance attestation
+/// with a scheduling reward attached: the protocol cannot verify where a validator runs, and round
+/// one of the region-aware draw seats one validator from every assigned region, so a validator
+/// alone in its claimed region holds a guaranteed seat where the flat shuffle gave it `C/N`.
+/// Sparse-region assignments deserve the most scrutiny before they are written on-chain. The
+/// seat-probability analysis lives on tn-reth's `region_aware_order`; the engine logs and publishes
+/// per-region pool and seat counts at every region-aware close (`record_region_seats`) so the
+/// advantage is observable, and the only remedy today is `setValidatorRegion(addr, 0)`.
+///
 /// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
 /// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
 /// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time

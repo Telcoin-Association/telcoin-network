@@ -35,6 +35,12 @@
 //! the block's `gas_used`. See [`record_epoch_close_gas`] and `crates/tn-reth/README.md` for the
 //! dashboard and alert queries they are meant to be read with, and for what they do not cover.
 //!
+//! Three more gauges report what a region-aware committee draw (#1279) seated:
+//! [`EPOCH_CLOSE_REGION_POOL`] and [`EPOCH_CLOSE_REGION_SEATED`] (both labelled by `region`) and
+//! [`EPOCH_CLOSE_SINGLETON_REGIONS`]. A region assignment is a governance attestation with a
+//! guaranteed seat attached (#1327), and nothing else makes that advantage visible. See
+//! [`record_region_seats`].
+//!
 //! # Two mechanisms in one module
 //!
 //! The counters use the `reth_metrics::Metrics` derive; the epoch-close gauges use the
@@ -58,8 +64,13 @@
 //! process start.
 
 use reth_metrics::{metrics::Counter, Metrics};
-use std::sync::LazyLock;
-use tracing::warn;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::LazyLock,
+};
+use tn_types::Address;
+use tracing::{info, warn};
 
 use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 
@@ -501,6 +512,157 @@ pub(crate) fn record_epoch_close_gas(gas: &EpochCloseGas) {
     }
 }
 
+/// Eligible validators declaring each region at a region-aware epoch close, labelled by `region`.
+///
+/// The `region` label is the on-chain `u8` region id, so the series count is bounded by 256 and
+/// does not grow with the chain. Region `0` (unassigned) is published too, so a dashboard sees the
+/// whole pool the draw ran over.
+const EPOCH_CLOSE_REGION_POOL: &str = "tn_reth.epoch_close_region_pool";
+
+/// Committee seats each region won at a region-aware epoch close, labelled by `region`.
+const EPOCH_CLOSE_REGION_SEATED: &str = "tn_reth.epoch_close_region_seated";
+
+/// Assigned regions with exactly one eligible validator at a region-aware epoch close.
+///
+/// Each such region holds a guaranteed round-one seat (#1327), so a nonzero value is the signal an
+/// operator asks governance to verify a region claim on.
+const EPOCH_CLOSE_SINGLETON_REGIONS: &str = "tn_reth.epoch_close_singleton_regions";
+
+/// One region's share of a region-aware committee draw (#1327).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RegionSeats {
+    /// Eligible validators carrying this region id in the pool the draw ran over.
+    pool: usize,
+    /// Validators from this region seated in the trimmed committee.
+    seated: usize,
+}
+
+impl RegionSeats {
+    /// Count one more pool member, seated or not.
+    fn plus(self, seated: bool) -> Self {
+        Self {
+            pool: self.pool.saturating_add(1),
+            seated: self.seated.saturating_add(usize::from(seated)),
+        }
+    }
+
+    /// Eligible validators carrying this region id.
+    pub(crate) const fn pool(self) -> usize {
+        self.pool
+    }
+
+    /// Validators from this region the committee seated.
+    pub(crate) const fn seated(self) -> usize {
+        self.seated
+    }
+}
+
+/// Per-region pool and seat counts for one region-aware committee draw (#1327), in ascending
+/// region id order.
+///
+/// Built by tn-reth's `assemble_new_committee` once the drawn committee is trimmed and
+/// length-checked, and published by [`record_region_seats`]. Region `0` (unassigned) is tallied
+/// like any other so the whole pool is visible, but only an assigned region can hold a guaranteed
+/// seat, so [`Self::singleton_regions`] skips it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegionSeatReport(BTreeMap<u8, RegionSeats>);
+
+impl RegionSeatReport {
+    /// Tally `pool` (every `(address, region)` the draw ran over) against `committee` (the trimmed
+    /// result).
+    ///
+    /// The committee is a prefix of the pool's ordering, so every seated address is in the pool;
+    /// an address that is not counts toward no region.
+    pub(crate) fn tally(pool: &[(Address, u8)], committee: &[Address]) -> Self {
+        let seated: BTreeSet<&Address> = committee.iter().collect();
+        Self(pool.iter().fold(BTreeMap::new(), |mut counts, (address, region)| {
+            let seats =
+                counts.get(region).copied().unwrap_or_default().plus(seated.contains(address));
+            counts.insert(*region, seats);
+            counts
+        }))
+    }
+
+    /// Assigned (nonzero) regions with exactly one eligible validator: each holds a guaranteed
+    /// round-one seat, the advantage #1327 documents.
+    pub(crate) fn singleton_regions(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0
+            .iter()
+            .filter(|(region, seats)| **region != 0 && seats.pool == 1)
+            .map(|(region, _)| *region)
+    }
+
+    /// Every region's counts, in ascending region id order.
+    fn iter(&self) -> impl Iterator<Item = (u8, RegionSeats)> + '_ {
+        self.0.iter().map(|(region, seats)| (*region, *seats))
+    }
+}
+
+impl fmt::Display for RegionSeatReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parts: Vec<String> = self
+            .iter()
+            .map(|(region, seats)| {
+                format!("region {region}: {} in pool, {} seated", seats.pool, seats.seated)
+            })
+            .collect();
+        f.write_str(&parts.join("; "))
+    }
+}
+
+/// A count as a gauge value: exact below 2^32 and saturating above (a validator pool cannot reach
+/// that), with no `as` cast so the conversion cannot silently wrap.
+fn gauge_value(count: usize) -> f64 {
+    u32::try_from(count).map_or(f64::from(u32::MAX), f64::from)
+}
+
+/// Publish which regions a region-aware committee draw seated, and flag singleton regions.
+///
+/// Called once per region-aware epoch close from `assemble_new_committee`, after the trimmed
+/// committee has passed its length check, so a fatal undersized draw publishes nothing. Every node
+/// executes the closing block, so the series is fleet-wide, and a replayed close is still a true
+/// observation of that epoch's draw.
+///
+/// The `info` line carries the whole per-region tally. The `warn` fires only when an assigned
+/// region has a single eligible validator, because that validator holds a guaranteed seat (#1327)
+/// and the region claim is the thing governance should verify. The flat pre-fork arm publishes
+/// nothing: there is no region tally to report, and an absent series reads as "no region-aware
+/// draw yet" rather than as an empty pool.
+pub(crate) fn record_region_seats(report: &RegionSeatReport) {
+    let singleton_regions: Vec<u8> = report.singleton_regions().collect();
+    info!(target: "engine", %report, ?singleton_regions, "region-aware committee drawn");
+    if !singleton_regions.is_empty() {
+        warn!(
+            target: "engine",
+            ?singleton_regions,
+            "an assigned region with a single eligible validator holds a guaranteed committee \
+             seat; the region claim is an off-chain attestation governance should verify (#1327)",
+        );
+    }
+
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_REGION_POOL,
+        "Eligible validators declaring each region at a region-aware epoch close"
+    );
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_REGION_SEATED,
+        "Committee seats each region won at a region-aware epoch close"
+    );
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_SINGLETON_REGIONS,
+        "Assigned regions with exactly one eligible validator, each holding a guaranteed seat"
+    );
+
+    report.iter().for_each(|(region, seats)| {
+        let label = region.to_string();
+        metrics::gauge!(EPOCH_CLOSE_REGION_POOL, "region" => label.clone())
+            .set(gauge_value(seats.pool()));
+        metrics::gauge!(EPOCH_CLOSE_REGION_SEATED, "region" => label)
+            .set(gauge_value(seats.seated()));
+    });
+    metrics::gauge!(EPOCH_CLOSE_SINGLETON_REGIONS).set(gauge_value(singleton_regions.len()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +893,81 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || record_epoch_close_gas(&gas));
         snapshotter.snapshot()
+    }
+
+    /// Read one gauge out of a snapshot by name and one exact `label = value` pair.
+    fn labelled_gauge<D>(
+        snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, D, DebugValue)],
+        name: &str,
+        label: &str,
+        value: &str,
+    ) -> Option<f64> {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == name
+                    && key.key().labels().any(|l| l.key() == label && l.value() == value)
+            })
+            .and_then(|(.., value)| match value {
+                DebugValue::Gauge(g) => Some(g.0),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+    }
+
+    /// Address with the given last byte, for region tallies.
+    fn addr(last_byte: u8) -> Address {
+        Address::with_last_byte(last_byte)
+    }
+
+    /// Three region-1 validators, one region-2 validator, and one unassigned validator, with one
+    /// seat from each region: every region's pool and seat counts must be exact, and only the
+    /// assigned singleton (region 2) is flagged, never the unassigned one.
+    #[test]
+    fn region_seat_report_tallies_each_region_and_flags_assigned_singletons_only() {
+        let pool = [(addr(1), 1), (addr(2), 1), (addr(3), 1), (addr(4), 2), (addr(5), 0)];
+        let committee = [addr(4), addr(1), addr(5)];
+
+        let report = RegionSeatReport::tally(&pool, &committee);
+
+        let counts: Vec<(u8, usize, usize)> =
+            report.iter().map(|(region, seats)| (region, seats.pool(), seats.seated())).collect();
+        assert_eq!(counts, vec![(0, 1, 1), (1, 3, 1), (2, 1, 1)]);
+        assert_eq!(
+            report.singleton_regions().collect::<Vec<_>>(),
+            vec![2],
+            "region 0 has one member but no guarantee, so only region 2 is flagged",
+        );
+        assert_eq!(
+            report.to_string(),
+            "region 0: 1 in pool, 1 seated; region 1: 3 in pool, 1 seated; region 2: 1 in pool, \
+             1 seated",
+        );
+    }
+
+    /// [`record_region_seats`] must publish one labelled pool gauge and one labelled seat gauge
+    /// per region plus the singleton count, each reading the tally's exact figure, and no series
+    /// for a region absent from the pool.
+    #[test]
+    fn record_region_seats_publishes_labelled_gauges_per_region() {
+        let pool = [(addr(1), 1), (addr(2), 1), (addr(3), 1), (addr(4), 2), (addr(5), 0)];
+        let report = RegionSeatReport::tally(&pool, &[addr(4), addr(1), addr(5)]);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || record_region_seats(&report));
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_POOL, "region", "1"), Some(3.0));
+        assert_eq!(labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_SEATED, "region", "1"), Some(1.0));
+        assert_eq!(labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_POOL, "region", "2"), Some(1.0));
+        assert_eq!(labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_SEATED, "region", "2"), Some(1.0));
+        assert_eq!(labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_POOL, "region", "0"), Some(1.0));
+        assert_eq!(gauge(&snapshot, EPOCH_CLOSE_SINGLETON_REGIONS, None), Some(1.0));
+        assert_eq!(
+            labelled_gauge(&snapshot, EPOCH_CLOSE_REGION_POOL, "region", "3"),
+            None,
+            "a region absent from the pool publishes no series",
+        );
     }
 
     /// A successful call's spend is its `gas_used` plus the refund it earned.
