@@ -600,10 +600,15 @@ mod tests {
             idx.sync().expect("sync");
         }
 
-        // Simulate a torn final record: append a few stray (sub-record) bytes.
-        let before = fs::metadata(&file).expect("metadata").len();
+        // Simulate a torn final record. The clean close appended an 8-byte sentinel; strip it first
+        // (as a reopened writer would) so the stray bytes land at the logical end, then append a
+        // few stray (sub-record) bytes.
+        let before =
+            fs::metadata(&file).expect("metadata").len() - crate::archive::data_file::SENTINEL_LEN;
         {
-            let mut f = fs::OpenOptions::new().append(true).open(&file).expect("open append");
+            let mut f = fs::OpenOptions::new().write(true).open(&file).expect("open rw");
+            f.set_len(before).expect("strip clean-close sentinel");
+            f.seek(SeekFrom::End(0)).expect("seek end");
             f.write_all(&[0xAB, 0xCD, 0xEF]).expect("write torn bytes");
             f.sync_all().expect("sync");
         }

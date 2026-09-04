@@ -21,9 +21,20 @@
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
 //! while actively appending (`end` is the logical data length). The physical file is reconciled to
 //! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
-//! `PackIter`/`raw_iter`, which read to EOF) and `Drop` (clean close) both truncate to `end` —
-//! while our own reads are bounded by `end` and never see the padding. After a crash the file may
-//! be left padded; the pack's CRC + `recover_pack` path truncates it back to the last good record.
+//! `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close) truncates
+//! to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are bounded by
+//! `end` and never see the padding.
+//!
+//! ## Clean-close sentinel
+//!
+//! On clean close `Drop` appends an 8-byte sentinel at physical EOF (`crc32(end)` followed by the
+//! `crc32` of those four bytes; see `clean_close_sentinel`). A reopen validates it against the
+//! physical size, and on a match strips it back to `end` and knows the file was sealed. A missing
+//! or invalid sentinel means the file was **not** closed cleanly (most likely still padded after a
+//! crash); [`Self::opened_unclean`] surfaces that, the logical end is left at physical EOF, and the
+//! pack's CRC + `recover_pack` path truncates it back to the last good record. The self-referential
+//! second CRC is what stops trailing zero padding from masquerading as a clean close
+//! (`crc32(0x00000000) != 0`).
 //!
 //! ## Durability
 //!
@@ -39,6 +50,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -157,6 +169,52 @@ enum Backing {
     Empty,
 }
 
+/// Width of the clean-close sentinel appended at physical EOF by [`MmapDataFile`]'s `Drop`.
+pub(crate) const SENTINEL_LEN: u64 = 8;
+
+/// Build the 8-byte clean-close sentinel for a file whose logical data length is `end`.
+///
+/// Layout (little-endian): bytes `[0..4]` are `crc32(end)`, bytes `[4..8]` are the `crc32` of those
+/// first four bytes. The self-referential second CRC is what stops trailing zero padding from
+/// masquerading as a clean close: `crc32(0x00000000) != 0`, so an all-zero tail never satisfies it.
+fn clean_close_sentinel(end: u64) -> [u8; 8] {
+    let mut sentinel = [0_u8; 8];
+    let len_crc = crc32fast::hash(&end.to_le_bytes());
+    sentinel[0..4].copy_from_slice(&len_crc.to_le_bytes());
+    let crc_of_crc = crc32fast::hash(&sentinel[0..4]);
+    sentinel[4..8].copy_from_slice(&crc_of_crc.to_le_bytes());
+    sentinel
+}
+
+/// True iff `tail` is a valid clean-close sentinel for a file whose logical data length is
+/// `data_len`. Because the sentinel is fully determined by `data_len`, an exact match confirms both
+/// that the first CRC equals `crc32(data_len)` (ties the marker to the actual file size, so a
+/// torn/padded tail that happens to be self-consistent still fails) and that the trailing CRC
+/// equals `crc32` of the first four bytes (self-consistency / zero-padding guard).
+fn sentinel_matches(tail: &[u8; 8], data_len: u64) -> bool {
+    *tail == clean_close_sentinel(data_len)
+}
+
+/// Given the physical size `disk_len` of `file`, return `(logical_end, opened_unclean)` by checking
+/// for a clean-close sentinel at physical EOF. A valid sentinel means the file was sealed and the
+/// logical data ends [`SENTINEL_LEN`] bytes before EOF; a missing/invalid sentinel means the file
+/// was not cleanly closed (most likely still padded), so the logical end is left at the physical
+/// size for the heal path. A 0-length file is fresh/empty, not unclean.
+fn detect_sentinel(file: &File, disk_len: u64) -> io::Result<(u64, bool)> {
+    if disk_len == 0 {
+        return Ok((0, false));
+    }
+    if disk_len >= SENTINEL_LEN {
+        let mut tail = [0_u8; 8];
+        file.read_exact_at(&mut tail, disk_len - SENTINEL_LEN)?;
+        if sentinel_matches(&tail, disk_len - SENTINEL_LEN) {
+            return Ok((disk_len - SENTINEL_LEN, false));
+        }
+    }
+    // Too short to hold a sentinel, or the tail is not a valid one: not cleanly sealed.
+    Ok((disk_len, true))
+}
+
 /// An mmap-backed, append-only data file — the storage behind every
 /// [`Pack`](crate::archive::pack::Pack).
 #[derive(Debug)]
@@ -179,6 +237,10 @@ pub struct MmapDataFile {
     /// (not `Cell`) so the file stays `Sync` behind `&self` (e.g. the `&self` `sync_all`), letting
     /// a pack hold it behind a `Send + Sync` trait object.
     flushed_end: AtomicU64,
+    /// True when this handle was opened from a file with no valid clean-close sentinel — the file
+    /// was not sealed by a clean `Drop` and is most likely still padded, so the pack's heal path
+    /// should run. Set once at open; a fresh (0-length) file is not considered unclean.
+    opened_unclean: bool,
     opts: MmapFileOptions,
 }
 
@@ -207,16 +269,25 @@ impl MmapDataFile {
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let orig_len = file.metadata()?.len();
 
+        // A clean `Drop` appends an 8-byte sentinel at physical EOF (see `clean_close_sentinel`).
+        // Detect it here: a valid sentinel means the file was sealed, so the logical data ends 8
+        // bytes before physical EOF; a missing/invalid sentinel means the file was not closed
+        // cleanly (most likely still padded), which `opened_unclean` surfaces so the pack's heal
+        // path runs — the logical end is left at physical EOF for that scan.
+        let (logical_end, opened_unclean) = detect_sentinel(&file, orig_len)?;
+
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
         // until the first write, so a crash before any data keeps it 0-length (and it reopens as
-        // empty). Existing content is mapped as-is; any trailing padding a crashed writer left is
-        // handled by the pack's heal path.
+        // empty). Existing content (including a clean file's trailing sentinel, which sits in the
+        // `[end, capacity)` padding region and is overwritten by the next append) is mapped as-is;
+        // any trailing padding a crashed writer left is handled by the pack's heal path.
         let (backing, capacity) = if orig_len == 0 {
             (Backing::Empty, 0)
         } else if read_only {
             // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
-            // clean-closed (its `Drop` truncated the mmap capacity padding away, so physical ==
-            // logical) and has no live writer. A writer that later shrinks the file under this
+            // clean-closed (its `Drop` truncated the mmap capacity padding away and appended the
+            // clean-close sentinel, validated above; `opened_unclean` flags a file that was not)
+            // and has no live writer. A writer that later shrinks the file under this
             // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
             // error path catches. The pack upholds this: `get_static` serves the live epoch from
             // the writer handle (never a read-only map of it), and `open_static` runs
@@ -237,13 +308,14 @@ impl MmapDataFile {
             file,
             path: path.to_owned(),
             backing,
-            end: orig_len,
+            end: logical_end,
             capacity,
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
             // Existing content is already durable on disk, so the sync fast path starts here.
-            flushed_end: AtomicU64::new(orig_len),
+            flushed_end: AtomicU64::new(logical_end),
+            opened_unclean,
             opts,
         };
         df.advise_backing();
@@ -263,6 +335,14 @@ impl MmapDataFile {
     /// Logical length (bytes of real data) — also the position a new record is appended at.
     pub fn len(&self) -> u64 {
         self.end
+    }
+
+    /// True when this file was opened without a valid clean-close sentinel — it was not sealed by a
+    /// clean shutdown and is most likely still padded. Callers (e.g. the pack heal path) use this
+    /// to decide whether a recovery scan is needed. Always `false` for a freshly created
+    /// (0-length) file.
+    pub fn opened_unclean(&self) -> bool {
+        self.opened_unclean
     }
 
     /// Clamp a read-only handle's read bound down to `logical_end` (the caller's index-attested
@@ -549,26 +629,33 @@ impl MmapDataFile {
     /// reads.
     pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
         let disk_len = self.file.metadata()?.len();
-        if disk_len == self.capacity {
-            self.end = disk_len;
-            return Ok(());
+        // A cleanly-closed writer leaves a sentinel past its logical data; strip it so `end` is the
+        // logical length (physical == logical + sentinel). A mid-append writer has no valid
+        // sentinel and `end` stays at the padded physical size — pair with
+        // `set_read_bound`.
+        let (logical_end, opened_unclean) = detect_sentinel(&self.file, disk_len)?;
+        if disk_len != self.capacity {
+            self.backing = Backing::Empty;
+            if disk_len > 0 {
+                self.backing = if self.read_only {
+                    // SAFETY: read-only refresh is only sound while the underlying file is sealed
+                    // (a cleanly-closed writer, physical == logical + sentinel,
+                    // no live writer). Following a mid-append writer would
+                    // adopt its padded physical size and SIGBUS on a later
+                    // truncation; pair with `set_read_bound` (see the read-only branch of
+                    // `open_with`).
+                    Backing::Ro(unsafe { Mmap::map(&self.file)? })
+                } else {
+                    // SAFETY: single-writer model — this handle is the sole writer for its
+                    // lifetime.
+                    Backing::Rw(unsafe { MmapMut::map_mut(&self.file)? })
+                };
+            }
+            self.capacity = disk_len;
+            self.advise_backing();
         }
-        self.backing = Backing::Empty;
-        if disk_len > 0 {
-            self.backing = if self.read_only {
-                // SAFETY: read-only refresh is only sound while the underlying file is sealed (a
-                // cleanly-closed writer, physical == logical, no live writer). Following a
-                // mid-append writer would adopt its padded physical size and SIGBUS on a later
-                // truncation; pair with `set_read_bound` (see the read-only branch of `open_with`).
-                Backing::Ro(unsafe { Mmap::map(&self.file)? })
-            } else {
-                // SAFETY: single-writer model — this handle is the sole writer for its lifetime.
-                Backing::Rw(unsafe { MmapMut::map_mut(&self.file)? })
-            };
-        }
-        self.capacity = disk_len;
-        self.end = disk_len;
-        self.advise_backing();
+        self.end = logical_end;
+        self.opened_unclean = opened_unclean;
         Ok(())
     }
 
@@ -707,8 +794,10 @@ impl Drop for MmapDataFile {
         if self.read_only {
             return;
         }
-        // Clean close: msync, then truncate away the padding and fsync so the on-disk file is
-        // exactly `end` bytes and durable — a reopen sees exactly the written bytes.
+        // Clean close: msync, truncate away the padding, then append an 8-byte clean-close sentinel
+        // and fsync so the on-disk file is exactly `end` data bytes plus the sentinel and durable —
+        // a reopen validates the sentinel, strips it back to `end`, and knows the file was sealed.
+        // A 0-length file is left empty (nothing to seal).
         if let Err(e) = self.flush_dirty(true) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to msync on drop: {e}");
@@ -718,6 +807,16 @@ impl Drop for MmapDataFile {
         if let Err(e) = self.file.set_len(self.end) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to truncate on drop: {e}");
+            }
+        }
+        if self.end > 0 {
+            let sentinel = clean_close_sentinel(self.end);
+            if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
+                if !std::thread::panicking() {
+                    tracing::error!(
+                        "MmapDataFile: failed to write clean-close sentinel on drop: {e}"
+                    );
+                }
             }
         }
         if let Err(e) = self.file.sync_all() {
@@ -913,8 +1012,8 @@ mod tests {
             df.seek(SeekFrom::Start(40)).expect("seek");
             assert_eq!(df.read(&mut [0u8; 8]).expect("read past end"), 0);
         }
-        // Physical file is exactly the truncated length after a clean close.
-        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 40);
+        // Physical file is the truncated length plus the clean-close sentinel.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 40 + SENTINEL_LEN);
     }
 
     #[test]
@@ -925,9 +1024,9 @@ mod tests {
         {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
             df.write_all(&data).expect("write");
-        } // clean close: truncates padding + fsync
-          // No padding after a clean close.
-        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 250);
+        } // clean close: truncates padding, appends sentinel, fsync
+          // After a clean close the physical file is the logical data plus the 8-byte sentinel.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 250 + SENTINEL_LEN);
         // Reopen read-write and read back.
         {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("reopen rw");
@@ -944,6 +1043,106 @@ mod tests {
             df.read_exact(&mut buf).expect("read");
             assert_eq!(buf, data);
         }
+    }
+
+    #[test]
+    fn clean_close_writes_and_strips_sentinel() {
+        let tmp = TempDir::with_prefix("mmap_df_sentinel").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(120);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+        } // clean close: truncate to `end`, append the sentinel, fsync
+          // Physical file is the logical data plus the 8-byte sentinel, whose bytes are exactly
+          // `clean_close_sentinel(end)`.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), data.len() as u64 + SENTINEL_LEN);
+        let raw = std::fs::read(&path).expect("read raw");
+        assert_eq!(&raw[data.len()..], &clean_close_sentinel(data.len() as u64));
+
+        // Reopen: the sentinel is validated and stripped, `len()` is the logical data, and the file
+        // is reported as cleanly closed.
+        let df = MmapDataFile::open(&path, false).expect("reopen");
+        assert_eq!(df.len(), data.len() as u64);
+        assert!(!df.opened_unclean(), "a sealed file must not be flagged unclean");
+    }
+
+    #[test]
+    fn missing_sentinel_flags_unclean_and_keeps_padding() {
+        let tmp = TempDir::with_prefix("mmap_df_padded").expect("temp dir");
+        let path = tmp.path().join("data");
+        // A crashed writer leaves the logical data followed by zero padding and no sentinel.
+        let data = pattern(80);
+        let mut raw = data.clone();
+        raw.extend(std::iter::repeat_n(0u8, 40));
+        std::fs::write(&path, &raw).expect("write padded file");
+
+        let df = MmapDataFile::open(&path, false).expect("open padded");
+        assert!(df.opened_unclean(), "a file with no valid sentinel must be flagged unclean");
+        // The logical end is left at physical EOF for the heal path (zero padding never masquerades
+        // as a clean close: crc32(0x00000000) != 0).
+        assert_eq!(df.len(), raw.len() as u64);
+    }
+
+    #[test]
+    fn self_consistent_sentinel_for_wrong_length_is_rejected() {
+        let tmp = TempDir::with_prefix("mmap_df_nearmiss").expect("temp dir");
+        let path = tmp.path().join("data");
+        // Craft a tail that IS a valid sentinel — but for the wrong logical length. It satisfies
+        // the self-consistency check (`last4 == crc32(first4)`) yet fails the length
+        // tie-in, so the file must still read as unclean.
+        let data = pattern(100);
+        let mut raw = data.clone();
+        raw.extend_from_slice(&clean_close_sentinel(999)); // encodes len 999, not 100
+        std::fs::write(&path, &raw).expect("write near-miss file");
+
+        let df = MmapDataFile::open(&path, false).expect("open near-miss");
+        assert!(df.opened_unclean(), "a sentinel for the wrong length must not count as sealed");
+        assert_eq!(df.len(), raw.len() as u64);
+    }
+
+    #[test]
+    fn reopen_append_overwrites_sentinel_and_reseals() {
+        let tmp = TempDir::with_prefix("mmap_df_reappend").expect("temp dir");
+        let path = tmp.path().join("data");
+        let first = pattern(60);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&first).expect("write");
+        }
+        // Reopen (strips the sentinel), append more, clean close again.
+        let second = pattern(30);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("reopen rw");
+            assert!(!df.opened_unclean());
+            assert_eq!(df.len(), first.len() as u64);
+            df.seek(SeekFrom::End(0)).expect("seek end");
+            df.write_all(&second).expect("append");
+        }
+        // A fresh sentinel now seals the combined data; the old one was overwritten by the append.
+        let total = (first.len() + second.len()) as u64;
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), total + SENTINEL_LEN);
+        let mut df = MmapDataFile::open(&path, false).expect("final reopen");
+        assert!(!df.opened_unclean());
+        assert_eq!(df.len(), total);
+        let mut buf = vec![0u8; total as usize];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..first.len()], &first[..]);
+        assert_eq!(&buf[first.len()..], &second[..]);
+    }
+
+    #[test]
+    fn empty_clean_close_writes_no_sentinel() {
+        let tmp = TempDir::with_prefix("mmap_df_empty").expect("temp dir");
+        let path = tmp.path().join("data");
+        {
+            let _df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            // No writes: a fresh 0-length file has nothing to seal.
+        }
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 0, "empty file stays 0 bytes");
+        let df = MmapDataFile::open(&path, false).expect("reopen empty");
+        assert_eq!(df.len(), 0);
+        assert!(!df.opened_unclean(), "a fresh/empty file is not unclean");
     }
 
     #[test]
@@ -1068,8 +1267,8 @@ mod tests {
         drop(w);
         assert_eq!(
             std::fs::metadata(&path).expect("metadata").len(),
-            50,
-            "clean close truncates padding"
+            50 + SENTINEL_LEN,
+            "clean close truncates padding and appends the sentinel"
         );
         ro.seek(SeekFrom::Start(0)).expect("seek");
         let mut buf = vec![0u8; 50];

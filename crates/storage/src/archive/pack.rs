@@ -954,9 +954,10 @@ mod tests {
             .create(false)
             .open(tmp_path.path().join("pack_test_one"))
             .unwrap();
-        // The pack was cleanly closed (Drop truncated to the logical end), so the physical file
-        // length is the logical end to bound the iterator at.
-        let end = data_file.metadata().unwrap().len();
+        // The pack was cleanly closed, so the physical file is the logical data plus an 8-byte
+        // clean-close sentinel; strip the sentinel to get the logical end to bound the iterator at
+        // (the real reopen path does this in `MmapDataFile::open`).
+        let end = data_file.metadata().unwrap().len() - crate::archive::data_file::SENTINEL_LEN;
         let mut iter = PackIter::open(data_file, 0, end).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
@@ -1075,7 +1076,10 @@ mod tests {
             let _pack: TestPack =
                 Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
         }
-        let pos = fs::metadata(&path).expect("metadata").len();
+        // The clean close appended an 8-byte sentinel past the header; strip it so the crafted
+        // record lands at the logical end (right after the header) rather than after the sentinel.
+        let pos =
+            fs::metadata(&path).expect("metadata").len() - crate::archive::data_file::SENTINEL_LEN;
 
         let payload = vec![0u8; (MAX_RECORD_SIZE as usize) + 1];
         let mut compressed = Vec::new();
@@ -1094,6 +1098,8 @@ mod tests {
         let crc = hasher.finalize();
 
         let mut file = OpenOptions::new().append(true).open(&path).expect("open for append");
+        // Drop the clean-close sentinel so the appended record starts at `pos` (the logical end).
+        file.set_len(pos).expect("truncate sentinel");
         file.write_all(&val_size_bytes).expect("write val_size");
         file.write_all(&compressed).expect("write compressed");
         file.write_all(&crc.to_le_bytes()).expect("write crc");

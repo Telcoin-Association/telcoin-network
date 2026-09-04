@@ -2804,13 +2804,18 @@ pub(crate) mod test {
         assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
         drop(pack);
 
-        // Make sure we can stream the file to create another pack file.
+        // Make sure we can stream the file to create another pack file. Production bounds the
+        // export to the logical length (`data_file_len()`), so the clean-close sentinel is
+        // never streamed; mirror that here by capping the raw-file stream at the logical
+        // length.
         {
+            use tokio::io::AsyncReadExt as _;
             let temp_dir2 = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
+            let data_file = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            let logical_len = std::fs::metadata(&data_file).expect("meta").len()
+                - crate::archive::data_file::SENTINEL_LEN;
             let stream =
-                tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
-                    .await
-                    .expect("log file");
+                tokio::fs::File::open(&data_file).await.expect("log file").take(logical_len);
             let pack = ConsensusPack::stream_import(
                 temp_dir2.path(),
                 stream,
@@ -2860,7 +2865,9 @@ pub(crate) mod test {
             .open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
             .expect("log file");
         let stream_len = stream.seek(SeekFrom::End(0)).expect("stream length");
-        stream.set_len(stream_len - 1).unwrap(); // Truncate last byte which will damage last record.
+        // Strip the 8-byte clean-close sentinel and one more byte so the truncation damages the
+        // last record (not just the sentinel).
+        stream.set_len(stream_len - crate::archive::data_file::SENTINEL_LEN - 1).unwrap();
         drop(stream);
         // Reopen in append and load some more data.
         let pack =
@@ -2968,13 +2975,15 @@ pub(crate) mod test {
         compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
         drop(pack);
 
-        // Stream into a new pack (peer epoch sync path) and read back.
+        // Stream into a new pack (peer epoch sync path) and read back. Bound to the logical length
+        // (as production's export does) so the clean-close sentinel is not streamed.
+        use tokio::io::AsyncReadExt as _;
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack_dup2").expect("temp dir");
-        let stream = tokio::fs::File::open(
-            temp_dir.path().join(format!("epoch-{SHARED_BATCH_EPOCH}")).join(Inner::DATA_NAME),
-        )
-        .await
-        .expect("log file");
+        let data_file =
+            temp_dir.path().join(format!("epoch-{SHARED_BATCH_EPOCH}")).join(Inner::DATA_NAME);
+        let logical_len = std::fs::metadata(&data_file).expect("meta").len()
+            - crate::archive::data_file::SENTINEL_LEN;
+        let stream = tokio::fs::File::open(&data_file).await.expect("log file").take(logical_len);
         let pack = ConsensusPack::stream_import(
             temp_dir2.path(),
             stream,
@@ -3594,7 +3603,8 @@ pub(crate) mod test {
         {
             let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
             let len = f.metadata().expect("meta").len();
-            f.set_len(len - 1).expect("truncate");
+            // Strip the clean-close sentinel and one more byte so the last record is truly damaged.
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN - 1).expect("truncate");
         }
 
         // Open append: heals (truncates the damaged record) but we do NOT save afterward.
@@ -3836,9 +3846,12 @@ pub(crate) mod test {
         }
 
         // The log is truncated back to the end of output 1; outputs 2 and 3 are dropped.
+        // Recovery truncates the logical data to output 1's end; the clean close then re-appends
+        // the 8-byte sentinel, so the physical file is `output1_end + SENTINEL_LEN`.
         let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
         assert_eq!(
-            recovered_len, output1_end,
+            recovered_len,
+            output1_end + crate::archive::data_file::SENTINEL_LEN,
             "recovery must truncate the torn tail back to the last complete output before the tear"
         );
         let pack = ConsensusPack::open_static(temp_dir.path(), 0)
@@ -4456,10 +4469,12 @@ pub(crate) mod test {
         }
 
         // recover_pack dropped the torn output 3 and re-stamped the tracked length to the last
-        // complete output, so the log ends exactly at output 2 again.
+        // complete output, so the logical data ends at output 2; the clean close then re-appends
+        // the 8-byte sentinel.
         let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
         assert_eq!(
-            recovered_len, output2_end,
+            recovered_len,
+            output2_end + crate::archive::data_file::SENTINEL_LEN,
             "recovery must trim the torn tail back to the last complete output"
         );
 
@@ -4540,8 +4555,8 @@ pub(crate) mod test {
         }
         assert_eq!(
             std::fs::metadata(&data_path).expect("metadata").len(),
-            DATA_HEADER_BYTES as u64,
-            "setup must produce a header-only data file"
+            DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN,
+            "setup must produce a header-only data file (plus the clean-close sentinel)"
         );
 
         {
