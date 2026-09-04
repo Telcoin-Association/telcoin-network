@@ -517,6 +517,120 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose committee is drawn by the region-aware shuffle (#1279).
+///
+/// One behavior moves at this boundary, inside tn-reth's epoch-close committee assembly: the
+/// ordering step of `assemble_new_committee` switches from the flat Fisher-Yates draw sequence to
+/// the region-aware sequence documented in tn-contracts `design.md` ("Region-Aware Committee
+/// Shuffle"): per-region Fisher-Yates, a shuffled region visit order, round-robin selection across
+/// regions, then the region-0 pool. The RNG draw order is consensus-critical (the draws decide
+/// which validators survive the truncation to committee size), so the switch requires every node
+/// to flip at the same epoch boundary; committees seated below this epoch keep the flat draws, so
+/// pre-fork history replays byte-identically on a gate-capable build.
+///
+/// The gate ([`region_shuffle_active`]) reads the epoch the assembled committee will SERVE, which
+/// is the concluding epoch plus one (the same `concluding + 1` keying the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary), never node-local committee state, so the
+/// production and replay paths always agree.
+///
+/// While every validator's on-chain `region` is 0 (the storage default; `setValidatorRegion` is
+/// the only writer), the region-aware sequence degenerates to exactly the flat draws, so an armed
+/// fork changes nothing until governance assigns a region. The safety constraint runs the other
+/// way: governance must not assign a nonzero region until this fork epoch has begun on a fleet
+/// running the gate-capable build, because a nonzero region diverges the draw sequence between
+/// armed and unarmed nodes at the next epoch close.
+///
+/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
+/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
+/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
+/// constant that differs between binaries has no other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// (safe indefinitely while dormant, and output-identical even when active until a region is
+/// assigned), then land the epoch-setting PR fleet-wide before the fork epoch begins, then let
+/// governance assign regions once the boundary has passed.
+///
+/// Non-adiri builds (mainnet) have no dormant period: the region-aware sequence is active from
+/// genesis and this constant does not exist there.
+pub const REGION_SHUFFLE_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Whether the committee serving `epoch` is drawn by the region-aware shuffle (#1279).
+///
+/// Gates only the ordering step of tn-reth's `assemble_new_committee`. Callers MUST pass the
+/// epoch the assembled committee will serve (the concluding epoch plus one), never the running
+/// node's `Committee::epoch()` or other node-local state, so replayed epoch closes reproduce
+/// their historical committees.
+///
+/// Adiri builds activate at [`REGION_SHUFFLE_FORK_EPOCH`]; all other builds are active from
+/// genesis (mainnet never carries flat-shuffle history). Under `test-utils`, an explicit
+/// `TN_REGION_SHUFFLE_FORK_EPOCH` override takes precedence over both (see
+/// [`region_shuffle_fork_epoch_override`]), so a test states the fork point it means rather than
+/// inheriting whichever one its feature set happens to select.
+#[inline]
+pub fn region_shuffle_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        region_shuffle_fork_epoch_override()
+            .map_or_else(|| region_shuffle_build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        region_shuffle_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time fork point for the region-shuffle fork, with no test override
+/// applied.
+///
+/// Spelled out in full rather than sharing the other build gates because the forks arm
+/// independently and must never be tied to one constant.
+///
+/// Unchanged from [`REGION_SHUFFLE_FORK_EPOCH`]'s documented contract: adiri (testnet, which
+/// carries flat-shuffle committees in its history) stays dormant until the constant is lowered,
+/// and every other build is active from genesis. The genesis default rests on the same assumption
+/// the multi-workers gate states: no non-adiri network holds history produced by the flat
+/// sequence, so no such build ever has to reproduce it. A non-adiri deployment that predates
+/// #1279 would need its own dormant period here instead.
+#[inline]
+const fn region_shuffle_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "REGION_SHUFFLE_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
+                  the gate the future epoch-setting PR relies on, and this expectation flags \
+                  itself for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= REGION_SHUFFLE_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective region-shuffle fork epoch, read once from
+/// `TN_REGION_SHUFFLE_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// genesis").
+///
+/// An environment variable rather than a process-global setter because e2e tests drive real node
+/// processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static would
+/// silently reach only the in-process tests, and the multi-node tests that actually exercise
+/// epoch close would keep inheriting the build default.
+///
+/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
+/// constant and cannot be repointed at runtime by its environment. An unparseable value is
+/// ignored rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn region_shuffle_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_REGION_SHUFFLE_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +855,72 @@ mod tests {
             assert_eq!(
                 multi_workers_fork_active(epoch),
                 multi_workers_build_fork_active(epoch),
+                "an unset override must not shift the gate at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Pin the region-shuffle gate to the rollout contract this build actually implements.
+    ///
+    /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
+    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// `adiri`. Every other build, including the default one that produces both the shipped node
+    /// binary and the e2e binary, is active from genesis, so epoch 1 already draws committees
+    /// region-aware there (output-identical to flat until a validator carries a nonzero region).
+    ///
+    /// Asserts against [`region_shuffle_build_fork_active`], the override-free decision, so the
+    /// result does not depend on whether `test-utils` was unified into this build. The grid is
+    /// derived from the constant, and the pre-fork samples filter to epochs strictly below it,
+    /// so arming the fork to any value (0 included) does not require editing this test.
+    #[test]
+    fn region_shuffle_build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                region_shuffle_build_fork_active(epoch),
+                "non-adiri builds carry no flat-shuffle history and are active from genesis; \
+                 epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, REGION_SHUFFLE_FORK_EPOCH / 2, REGION_SHUFFLE_FORK_EPOCH.saturating_sub(1)]
+                .into_iter()
+                .filter(|epoch| *epoch < REGION_SHUFFLE_FORK_EPOCH)
+                .for_each(|epoch| {
+                    assert!(
+                        !region_shuffle_build_fork_active(epoch),
+                        "adiri stays dormant before REGION_SHUFFLE_FORK_EPOCH; epoch {epoch} \
+                         must be pre-fork",
+                    );
+                });
+            [REGION_SHUFFLE_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    region_shuffle_build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
+        }
+    }
+
+    /// With no `TN_REGION_SHUFFLE_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn region_shuffle_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            region_shuffle_fork_epoch_override().is_none(),
+            "this test requires a process without TN_REGION_SHUFFLE_FORK_EPOCH set; the override \
+             is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert_eq!(
+                region_shuffle_active(epoch),
+                region_shuffle_build_fork_active(epoch),
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });
