@@ -95,7 +95,7 @@
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    metrics::{gas_spent, record_region_seats, EpochCloseGas, RegionSeatReport},
+    metrics::{gas_spent, EpochCloseGas},
     system_calls::{
         decode_worker_fee_configs, log_registry_event,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
@@ -1055,13 +1055,6 @@ where
     /// verbatim as the `StdRng` seed, so every node derives the same RNG
     /// stream. The downstream draw order is consensus-critical: the draws decide which
     /// validators survive the truncation to committee size.
-    ///
-    /// The draw sequence itself is fork-gated (#1279, `region_shuffle_active`): committees seated
-    /// from `REGION_SHUFFLE_FORK_EPOCH` onward are drawn region-aware, earlier ones keep the flat
-    /// historical draws. The gate is keyed on the epoch the committee will serve (the concluding
-    /// epoch plus one, from the block's own nonce), the same `concluding + 1` keying the
-    /// `CONSENSUS_REGISTRY_FORK_EPOCH` boundary in `finish`, so the production and replay paths
-    /// derive an identical verdict from an identical `ctx`.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
@@ -1077,12 +1070,7 @@ where
         // used as deterministic randomness
         let mut rng = StdRng::from_seed(seed);
 
-        // `deconstruct_nonce(nonce).0` is the epoch this block concludes; the assembled
-        // committee serves the next one, and that seated epoch keys the region-shuffle gate
-        let seated_epoch = tn_types::deconstruct_nonce(self.ctx.nonce).0.saturating_add(1);
-        let region_aware = tn_types::forks::region_shuffle_active(seated_epoch);
-
-        assemble_new_committee(new_committee_size, all_active_validators, region_aware, &mut rng)
+        assemble_new_committee(new_committee_size, all_active_validators, &mut rng)
     }
 
     /// Read the committee-eligible validator pool from the consensus registry.
@@ -1643,14 +1631,8 @@ where
 ///
 /// Given `randomness`-seeded `rng`, this partitions the pool into active and pending-exit
 /// validators, folds in randomly chosen pending-exit validators only when the active set is short
-/// of `new_committee_size`, orders the merged pool (the flat Fisher-Yates draws when
-/// `region_aware` is false, the [`region_aware_order`] sequence when it is true), and trims the
-/// result to the target size.
-///
-/// `region_aware` is the [`tn_types::forks::region_shuffle_active`] verdict for the epoch the
-/// committee will serve (#1279). Pre-fork epochs and dormant builds pass `false` and keep the
-/// historical flat draws; the pool assembly, the trim, and the undersized check are shared by
-/// both arms, so the fork moves only the ordering step.
+/// of `new_committee_size`, runs an in-place Fisher-Yates shuffle, and trims the result to the
+/// target size.
 ///
 /// [`Vec::truncate`] caps the length at `new_committee_size` but is a silent no-op when the
 /// assembled pool is already smaller, so a pool below the target would otherwise flow through as an
@@ -1661,13 +1643,12 @@ where
 /// on-chain.
 ///
 /// Split out of [`TNBlockExecutor::shuffle_new_committee`] as a pure function so the
-/// assembly/trim/validate logic is unit-testable without a live EVM state. The legacy RNG draw
-/// sequence is preserved verbatim from the historical implementation, so pre-fork committees stay
-/// byte-identical to the chain's replayed history.
+/// assembly/trim/validate logic is unit-testable without a live EVM state. The RNG draw sequence is
+/// preserved verbatim from the historical implementation, so committees stay byte-identical to the
+/// chain's replayed history.
 fn assemble_new_committee(
     new_committee_size: usize,
     eligible_pool: Vec<ConsensusRegistry::ValidatorInfo>,
-    region_aware: bool,
     rng: &mut StdRng,
 ) -> TnRethResult<Vec<Address>> {
     // a zero target would sail through the final length check below (`0 == 0`) and forward
@@ -1699,33 +1680,18 @@ fn assemble_new_committee(
         active_validators
     };
 
-    // (#1327) snapshot each validator's region before the draw consumes the pool: the tally after
-    // the trim reports which regions the seated committee came from. `None` on the flat arm, which
-    // has no region tally to publish.
-    let pool_regions = region_aware.then(|| {
-        validators_for_shuffle
-            .iter()
-            .map(|validator| (validator.validatorAddress, validator.region))
-            .collect::<Vec<_>>()
+    // simple Fisher-Yates shuffle; the draw order is consensus-critical, so it is preserved
+    // verbatim as a `for_each` over the same reversed range rather than rewritten in a way that
+    // would reorder the RNG draws.
+    (1..validators_for_shuffle.len()).rev().for_each(|i| {
+        let j = rng.random_range(0..=i);
+        validators_for_shuffle.swap(i, j);
     });
 
-    let mut new_committee = if region_aware {
-        // region-aware draw sequence (#1279), live only for fork-active seated epochs
-        let ordered = region_aware_order(validators_for_shuffle, rng);
+    debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
 
-        debug!(target: "engine",  "validators post-shuffle (region-aware) {:?}", ordered);
-
-        ordered
-    } else {
-        // simple Fisher-Yates shuffle; the draw order is consensus-critical, so it is preserved
-        // verbatim (see `fisher_yates`) rather than rewritten in a way that would reorder the
-        // RNG draws.
-        fisher_yates(&mut validators_for_shuffle, rng);
-
-        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
-
-        validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>()
-    };
+    let mut new_committee =
+        validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
 
     // trim the shuffled committee to maintain correct size
     new_committee.truncate(new_committee_size);
@@ -1734,124 +1700,9 @@ fn assemble_new_committee(
 
     // truncate only ever shrinks, so a length mismatch here means the eligible pool was undersized.
     let committee_len = new_committee.len();
-    (committee_len == new_committee_size)
-        .then_some(new_committee)
-        .ok_or(TnRethError::UndersizedCommittee {
-            expected: new_committee_size,
-            got: committee_len,
-        })
-        // (#1327) publish the per-region tally only for a committee that passed the length check
-        .inspect(|committee| {
-            pool_regions
-                .iter()
-                .for_each(|pool| record_region_seats(&RegionSeatReport::tally(pool, committee)));
-        })
-}
-
-/// In-place Fisher-Yates shuffle, drawing `rng` once per element past the first.
-///
-/// The draw order is consensus-critical, so the body is preserved verbatim from the historical
-/// shuffle (a `for_each` over the same reversed range) rather than rewritten in a way that would
-/// reorder the RNG draws. The legacy flat arm of [`assemble_new_committee`] and every shuffle
-/// inside [`region_aware_order`] route through this one helper, so the two paths cannot drift.
-fn fisher_yates<T>(items: &mut [T], rng: &mut StdRng) {
-    (1..items.len()).rev().for_each(|i| {
-        let j = rng.random_range(0..=i);
-        items.swap(i, j);
-    });
-}
-
-/// Order the merged committee pool region-aware (#1279), per the "Region-Aware Committee Shuffle"
-/// section of tn-contracts `design.md`.
-///
-/// The canonical fork-path draw sequence, in order:
-/// 1. partition the pool into assigned region groups (nonzero GSMA region, grouped by id) and the
-///    unassigned pool (region 0), both preserving pool order; no draws;
-/// 2. Fisher-Yates each assigned group, in ascending region id order (intra-region fairness);
-/// 3. Fisher-Yates the unassigned pool;
-/// 4. Fisher-Yates the region visit order (the list of assigned region ids);
-/// 5. round-robin: one validator per region per round, regions in visit order; no draws. The full
-///    sequence is emitted rather than stopped at the target size, and the caller's shared truncate
-///    takes the committee prefix;
-/// 6. the shuffled unassigned pool follows the round-robin sequence, filling any seats the assigned
-///    groups could not.
-///
-/// When every validator carries region 0 (the on-chain storage default; `setValidatorRegion` is
-/// the only writer), steps 2 and 4 shuffle nothing and step 3 shuffles the whole pool: the draw
-/// sequence and the output order are then identical to the legacy flat shuffle, so an armed fork
-/// changes nothing until governance assigns a region. This also covers the pre-registry-fork
-/// legacy ABI read (`read_committee_eligible_pool_legacy`), which decodes the byte-identical
-/// struct layout with `region` 0 absent any governance write.
-///
-/// design.md's final step ("if still not full, additional assigned validators fill remaining
-/// seats") is vacuously satisfied: the round-robin only ends short of the target when every
-/// assigned group is exhausted, so no assigned validator can remain after step 6. A pool that is
-/// still short surfaces as [`TnRethError::UndersizedCommittee`] in the caller.
-///
-/// # Threat model (#1327)
-///
-/// A region is a governance attestation with a scheduling reward attached. `setValidatorRegion`
-/// is `onlyOwner`, so a validator cannot write its own region, but the location it claims to
-/// governance is off-chain and nothing in the protocol can verify where a validator runs. Step 5
-/// turns that claim into a hard guarantee, not a preference: round one seats exactly one validator
-/// from every assigned region. With `R` assigned regions, committee size `C`, and pool size `N`:
-///
-/// - a validator alone in its region is seated with probability 1 whenever `R <= C`;
-/// - a validator in a region of `k` members is seated in round one with probability `1/k`;
-/// - under the flat shuffle every validator is seated with probability `C/N`.
-///
-/// For a pool of 12 and a committee of 4, four regions of three give everyone the flat 1/3, while
-/// one singleton next to eleven validators in one region gives the singleton 1 and each of the
-/// others 3/11. A guaranteed seat is also a guaranteed proposer and voter slot, so a Byzantine
-/// budget that assumes random committee membership is weaker for that validator.
-///
-/// Sparse-region assignments deserve the most scrutiny before governance writes them. The only
-/// remedy today is `setValidatorRegion(addr, 0)`, which removes the advantage at the next epoch
-/// close; there is no governance-callable slash. `record_region_seats` publishes the per-region
-/// pool and seat counts at every region-aware close and flags singleton regions, so the advantage
-/// is at least observable.
-fn region_aware_order(
-    pool: Vec<ConsensusRegistry::ValidatorInfo>,
-    rng: &mut StdRng,
-) -> Vec<Address> {
-    // step 1: fold-partition; each group and the unassigned pool keep the incoming pool order
-    let (mut unassigned, mut region_groups) = pool.into_iter().fold(
-        (Vec::new(), BTreeMap::<u8, Vec<ConsensusRegistry::ValidatorInfo>>::new()),
-        |(mut unassigned, mut groups), validator| {
-            if validator.region == 0 {
-                unassigned.push(validator);
-            } else {
-                groups.entry(validator.region).or_default().push(validator);
-            }
-            (unassigned, groups)
-        },
-    );
-
-    // step 2: ascending region id (`BTreeMap` iteration order) pins the draw sequence
-    region_groups.values_mut().for_each(|group| fisher_yates(group, rng));
-
-    // step 3
-    fisher_yates(&mut unassigned, rng);
-
-    // step 4
-    let mut visit_order: Vec<u8> = region_groups.keys().copied().collect();
-    fisher_yates(&mut visit_order, rng);
-
-    // steps 5 and 6: `get(round)` is total, so exhausted groups drop out of later rounds
-    let max_rounds = region_groups.values().map(Vec::len).max().unwrap_or(0);
-    // a shared borrow the inner `move` closure copies, keeping the map available every round
-    let groups = &region_groups;
-    (0..max_rounds)
-        .flat_map(|round| {
-            visit_order.iter().filter_map(move |region| {
-                groups
-                    .get(region)
-                    .and_then(|group| group.get(round))
-                    .map(|validator| validator.validatorAddress)
-            })
-        })
-        .chain(unassigned.iter().map(|validator| validator.validatorAddress))
-        .collect()
+    (committee_len == new_committee_size).then_some(new_committee).ok_or(
+        TnRethError::UndersizedCommittee { expected: new_committee_size, got: committee_len },
+    )
 }
 
 /// Unit tests for the deterministic committee-assembly logic.
@@ -1902,7 +1753,7 @@ mod tests {
             vec![validator(1, ValidatorStatus::Active), validator(2, ValidatorStatus::Active)];
         let mut rng = StdRng::from_seed([7u8; 32]);
 
-        let result = assemble_new_committee(5, pool, false, &mut rng);
+        let result = assemble_new_committee(5, pool, &mut rng);
 
         assert!(matches!(result, Err(TnRethError::UndersizedCommittee { expected: 5, got: 2 })));
     }
@@ -1926,7 +1777,7 @@ mod tests {
             .collect();
         let mut rng = StdRng::from_seed([7u8; 32]);
 
-        let committee = assemble_new_committee(3, pool, false, &mut rng).ok();
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
 
         assert!(committee
             .is_some_and(|c| c.len() == 3 && c.iter().all(|address| pool_addrs.contains(address))));
@@ -1943,7 +1794,7 @@ mod tests {
         ];
         let mut rng = StdRng::from_seed([7u8; 32]);
 
-        let result = assemble_new_committee(3, pool, false, &mut rng);
+        let result = assemble_new_committee(3, pool, &mut rng);
 
         assert!(matches!(&result, Ok(committee) if committee.len() == 3));
     }
@@ -1966,7 +1817,7 @@ mod tests {
         ];
         let mut rng = StdRng::from_seed([42u8; 32]);
 
-        let committee = assemble_new_committee(3, pool, false, &mut rng).ok();
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
 
         // Golden order for seed [42; 32]; regenerate only when the shuffle algorithm changes on
         // purpose. All three addresses are from the active set, proving pending-exit is ignored.
@@ -1978,233 +1829,6 @@ mod tests {
                 Address::with_last_byte(3),
             ])
         );
-    }
-
-    /// Build a [`ConsensusRegistry::ValidatorInfo`] with an explicit GSMA region for the
-    /// region-aware assembly tests. Delegates to [`validator`] for every other field.
-    fn regional_validator(
-        last_byte: u8,
-        status: ValidatorStatus,
-        region: u8,
-    ) -> ConsensusRegistry::ValidatorInfo {
-        ConsensusRegistry::ValidatorInfo { region, ..validator(last_byte, status) }
-    }
-
-    /// With every validator on region 0 the region-aware arm must reproduce the legacy flat
-    /// shuffle draw-for-draw: same seed, identical committee in identical order. This is the
-    /// property that makes an armed fork a no-op until governance assigns a region.
-    #[test]
-    fn assemble_region_aware_degrades_to_flat_when_no_regions_assigned() {
-        let build_pool = || -> Vec<ConsensusRegistry::ValidatorInfo> {
-            (1u8..=7).map(|last_byte| validator(last_byte, ValidatorStatus::Active)).collect()
-        };
-        let mut rng_flat = StdRng::from_seed([13u8; 32]);
-        let mut rng_region = StdRng::from_seed([13u8; 32]);
-
-        let flat = assemble_new_committee(5, build_pool(), false, &mut rng_flat).ok();
-        let regioned = assemble_new_committee(5, build_pool(), true, &mut rng_region).ok();
-
-        assert!(flat.as_ref().is_some_and(|committee| committee.len() == 5));
-        assert_eq!(flat, regioned, "an all-region-0 pool must order identically on both arms");
-    }
-
-    /// Four assigned regions with three validators each, target size four: round one of the
-    /// round-robin must seat exactly one validator from each region, and the same seed must
-    /// reproduce the same committee (the draw sequence is deterministic).
-    #[test]
-    fn assemble_region_aware_seats_one_validator_per_region_in_round_one() {
-        // addresses 1..=12; address `b` carries region ((b - 1) % 4) + 1, three per region
-        let build_pool = || -> Vec<ConsensusRegistry::ValidatorInfo> {
-            (1u8..=12)
-                .map(|last_byte| {
-                    regional_validator(
-                        last_byte,
-                        ValidatorStatus::Active,
-                        ((last_byte - 1) % 4) + 1,
-                    )
-                })
-                .collect()
-        };
-        let region_of: BTreeMap<Address, u8> =
-            build_pool().into_iter().map(|info| (info.validatorAddress, info.region)).collect();
-        let mut rng = StdRng::from_seed([9u8; 32]);
-
-        let committee = assemble_new_committee(4, build_pool(), true, &mut rng).unwrap_or_default();
-
-        let seated_regions: std::collections::BTreeSet<u8> =
-            committee.iter().filter_map(|address| region_of.get(address).copied()).collect();
-        assert_eq!(committee.len(), 4);
-        assert_eq!(
-            seated_regions,
-            std::collections::BTreeSet::from([1, 2, 3, 4]),
-            "round one must seat one validator from each assigned region",
-        );
-
-        let mut rng_repeat = StdRng::from_seed([9u8; 32]);
-        assert_eq!(
-            Some(committee),
-            assemble_new_committee(4, build_pool(), true, &mut rng_repeat).ok(),
-            "the same seed must reproduce the same committee",
-        );
-    }
-
-    /// Four assigned regions with three validators each, target size six: the second round-robin
-    /// round tops up two regions, so the per-region seat counts must be exactly {2, 2, 1, 1}.
-    #[test]
-    fn assemble_region_aware_second_round_tops_up_regions_evenly() {
-        let build_pool = || -> Vec<ConsensusRegistry::ValidatorInfo> {
-            (1u8..=12)
-                .map(|last_byte| {
-                    regional_validator(
-                        last_byte,
-                        ValidatorStatus::Active,
-                        ((last_byte - 1) % 4) + 1,
-                    )
-                })
-                .collect()
-        };
-        let region_of: BTreeMap<Address, u8> =
-            build_pool().into_iter().map(|info| (info.validatorAddress, info.region)).collect();
-        let mut rng = StdRng::from_seed([9u8; 32]);
-
-        let committee = assemble_new_committee(6, build_pool(), true, &mut rng).unwrap_or_default();
-
-        let per_region_counts = committee
-            .iter()
-            .filter_map(|address| region_of.get(address).copied())
-            .fold(BTreeMap::<u8, usize>::new(), |mut counts, region| {
-                *counts.entry(region).or_default() += 1;
-                counts
-            });
-        let mut counts: Vec<usize> = per_region_counts.into_values().collect();
-        counts.sort_unstable();
-        assert_eq!(committee.len(), 6);
-        assert_eq!(
-            counts,
-            vec![1, 1, 2, 2],
-            "six seats over four regions must round-robin to two seats in exactly two regions",
-        );
-    }
-
-    /// Two assigned validators plus four unassigned (region 0), target size five: the round-robin
-    /// seats both assigned validators, then the unassigned pool fills the remaining seats to the
-    /// exact target size.
-    #[test]
-    fn assemble_region_aware_fills_from_unassigned_after_round_robin() {
-        let pool = vec![
-            regional_validator(1, ValidatorStatus::Active, 1),
-            regional_validator(2, ValidatorStatus::Active, 2),
-            validator(3, ValidatorStatus::Active),
-            validator(4, ValidatorStatus::Active),
-            validator(5, ValidatorStatus::Active),
-            validator(6, ValidatorStatus::Active),
-        ];
-        let mut rng = StdRng::from_seed([21u8; 32]);
-
-        let committee = assemble_new_committee(5, pool, true, &mut rng).unwrap_or_default();
-
-        assert_eq!(committee.len(), 5);
-        assert!(
-            committee.contains(&Address::with_last_byte(1))
-                && committee.contains(&Address::with_last_byte(2)),
-            "both assigned validators must be seated before the unassigned pool fills",
-        );
-    }
-
-    /// The region-aware arm must publish the per-region tally (#1327) once the committee passes
-    /// its length check, and the flat arm must publish nothing. Four regions of three with a
-    /// target of four seat one validator per region, so every region reads pool 3, seated 1.
-    #[test]
-    fn assemble_region_aware_publishes_per_region_seat_tally() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-        let build_pool = || -> Vec<ConsensusRegistry::ValidatorInfo> {
-            (1u8..=12)
-                .map(|last_byte| {
-                    regional_validator(
-                        last_byte,
-                        ValidatorStatus::Active,
-                        ((last_byte - 1) % 4) + 1,
-                    )
-                })
-                .collect()
-        };
-        // every `(region, value)` pair a gauge series in the snapshot carries
-        let region_gauges = |snapshot: &[(
-            metrics_util::CompositeKey,
-            Option<metrics::Unit>,
-            Option<metrics::SharedString>,
-            DebugValue,
-        )],
-                             name: &str|
-         -> Vec<(String, f64)> {
-            let mut pairs: Vec<(String, f64)> = snapshot
-                .iter()
-                .filter(|(key, ..)| key.key().name() == name)
-                .filter_map(|(key, _, _, value)| {
-                    let region = key
-                        .key()
-                        .labels()
-                        .find(|label| label.key() == "region")?
-                        .value()
-                        .to_string();
-                    match value {
-                        DebugValue::Gauge(g) => Some((region, g.0)),
-                        DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
-                    }
-                })
-                .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            pairs
-        };
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || {
-            let mut rng = StdRng::from_seed([9u8; 32]);
-            assert!(assemble_new_committee(4, build_pool(), true, &mut rng).is_ok());
-        });
-        let snapshot = snapshotter.snapshot().into_vec();
-
-        let seated = |region: &str| (region.to_string(), 1.0);
-        let pooled = |region: &str| (region.to_string(), 3.0);
-        assert_eq!(
-            region_gauges(&snapshot, "tn_reth.epoch_close_region_seated"),
-            vec![seated("1"), seated("2"), seated("3"), seated("4")],
-        );
-        assert_eq!(
-            region_gauges(&snapshot, "tn_reth.epoch_close_region_pool"),
-            vec![pooled("1"), pooled("2"), pooled("3"), pooled("4")],
-        );
-
-        let flat_recorder = DebuggingRecorder::new();
-        let flat_snapshotter = flat_recorder.snapshotter();
-        metrics::with_local_recorder(&flat_recorder, || {
-            let mut rng = StdRng::from_seed([9u8; 32]);
-            assert!(assemble_new_committee(4, build_pool(), false, &mut rng).is_ok());
-        });
-        let flat_snapshot = flat_snapshotter.snapshot().into_vec();
-
-        assert!(
-            region_gauges(&flat_snapshot, "tn_reth.epoch_close_region_seated").is_empty()
-                && region_gauges(&flat_snapshot, "tn_reth.epoch_close_region_pool").is_empty(),
-            "the flat arm has no region tally to publish",
-        );
-    }
-
-    /// The region-aware arm keeps the undersized-pool guard: a pool below the target size must
-    /// surface [`TnRethError::UndersizedCommittee`] with the exact counts.
-    #[test]
-    fn assemble_region_aware_rejects_undersized_pool() {
-        let pool = vec![
-            regional_validator(1, ValidatorStatus::Active, 3),
-            validator(2, ValidatorStatus::Active),
-        ];
-        let mut rng = StdRng::from_seed([7u8; 32]);
-
-        let result = assemble_new_committee(5, pool, true, &mut rng);
-
-        assert!(matches!(result, Err(TnRethError::UndersizedCommittee { expected: 5, got: 2 })));
     }
 
     /// The `ConsensusRegistry` fork must fail closed over an unexpected pre-fork deployment.

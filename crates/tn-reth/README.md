@@ -201,23 +201,6 @@ count, both inherit the same 100M ceiling (contract reads share the system-call 
 `SYSTEM_CALL_GAS_LIMIT` doc), and neither is instrumented. A boundary can still fail on a call
 these gauges never showed.
 
-### Region-aware draw
-
-Once the region-aware committee shuffle is active (`REGION_SHUFFLE_FORK_EPOCH`, #1279), a region
-assignment is a governance attestation with a guaranteed seat attached: round one of the draw seats
-one validator from every assigned region, so a validator alone in its claimed region is always
-seated, and nothing in the protocol can verify where a validator runs (#1327, threat model on
-`region_aware_order`). These gauges make that advantage visible at every region-aware close:
-
-| Metric | Type | Meaning |
-|---|---|---|
-| `tn_reth_epoch_close_region_pool{region="…"}` | gauge | Eligible validators declaring each region in the pool the draw ran over. `region` is the on-chain `u8` id, so the series count is bounded by 256; region `0` (unassigned) is published too. |
-| `tn_reth_epoch_close_region_seated{region="…"}` | gauge | Committee seats each region won in the trimmed committee. |
-| `tn_reth_epoch_close_singleton_regions` | gauge | Assigned regions with exactly one eligible validator. Each holds a guaranteed seat; a nonzero value is the cue to ask governance to verify that region claim, and the close also logs a `warn` naming the regions. |
-
-The flat pre-fork arm publishes none of these, so an absent series means "no region-aware draw
-yet", not an empty pool. The only remedy for a false claim today is `setValidatorRegion(addr, 0)`.
-
 ## ConsensusRegistry fork gate (adiri)
 
 `apply_consensus_registry_fork` (`src/evm/block.rs`) swaps the deployed registry bytecode in place
