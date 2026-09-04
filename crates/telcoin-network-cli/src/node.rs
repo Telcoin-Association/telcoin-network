@@ -120,7 +120,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives. Adiri builds carry epoch-gated forks;
         // every other build has the seed-signature (#1032) and multi-worker committee (#554)
-        // wire formats plus the seeded PREVRANDAO derivation (#1247) active from genesis.
+        // wire formats plus the seeded PREVRANDAO derivation (#1247) and the region-aware
+        // committee shuffle (#1279) active from genesis.
         #[cfg(feature = "adiri")]
         info!(
             target: "cli",
@@ -128,12 +129,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
+            region_shuffle_fork_epoch = tn_types::forks::REGION_SHUFFLE_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature, multi_workers, and prevrandao_seed active from genesis"
+            "fork schedule: seed_signature, multi_workers, prevrandao_seed, and region_shuffle active from genesis"
         );
 
         // Raise the fd limit of the process.
