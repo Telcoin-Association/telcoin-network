@@ -5,7 +5,7 @@
 use crate::error::ExecutionError;
 use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -306,39 +306,12 @@ impl ExecutionNodeInner {
     ) -> eyre::Result<Vec<SealedHeader>> {
         let last_block_number = self.reth_env.last_block_number()?;
         debug!(target: "epoch-manager", ?last_block_number, "restoring last executed output blocks");
-        let mut result = Vec::with_capacity(number as usize);
-        if number > 0 {
-            let mut block_num = last_block_number;
-            let mut last_nonce;
-            if let Some(header) = self.reth_env.sealed_header_by_number(block_num)? {
-                last_nonce = header.nonce;
-                result.push(header);
-            } else {
-                return Err(eyre::Error::msg(format!("Unable to read block {block_num}")));
-            }
-            let mut blocks = 1;
-            while blocks < number {
-                if block_num == 0 {
-                    break;
-                }
-                block_num -= 1;
-                if let Some(header) = self.reth_env.sealed_header_by_number(block_num)? {
-                    // Do this check so we only track the "finalized" blocks not all the extra
-                    // batches.  Note that the nonce will be the same for all batches in the same
-                    // consensus output but will change for each output (composed of epoch and
-                    // round).
-                    if header.nonce != last_nonce {
-                        last_nonce = header.nonce;
-                        result.push(header);
-                        blocks += 1;
-                    }
-                } else {
-                    return Err(eyre::Error::msg(format!("Unable to read block {block_num}")));
-                }
-            }
-        }
-        result.reverse();
-        Ok(result)
+        collect_last_output_blocks(
+            |block_num| self.reth_env.sealed_header_by_number(block_num).map_err(Into::into),
+            last_block_number,
+            number,
+            self.reth_env.real_header_floor(),
+        )
     }
 
     /// Return an database provider.
@@ -490,4 +463,152 @@ fn decode_committee_keys(
             })
         })
         .collect()
+}
+
+/// Walk headers backward from `tip`, keeping the last block of each consensus output, and never
+/// reading below `scan_floor`.
+///
+/// Every block of one consensus output carries the same header nonce, and the nonce changes at
+/// each output, so a nonce change marks an output's final block. The walk collects up to `number`
+/// of them (returned oldest first) and stops early at `scan_floor`: `0` (genesis) on a
+/// normally-synced node, [`RethEnv::real_header_floor`] on a snapshot-restored datadir. The floor
+/// is what keeps the walk inside real history: below it the datadir holds scaffold dummy headers
+/// whose nonce is always `0`, so the nonce-change condition could never fire again and the walk
+/// would read every header down to block 0 (O(chain-height) synchronous reads inside the startup
+/// path), then hand the caller a synthetic header (issue #1321). The header AT `scan_floor` is
+/// real and stays eligible for collection.
+fn collect_last_output_blocks(
+    read_header: impl Fn(u64) -> eyre::Result<Option<SealedHeader>>,
+    tip: u64,
+    number: u64,
+    scan_floor: u64,
+) -> eyre::Result<Vec<SealedHeader>> {
+    let read = |block_num: u64| {
+        read_header(block_num).and_then(|header| {
+            header.ok_or_else(|| eyre::Error::msg(format!("Unable to read block {block_num}")))
+        })
+    };
+    let want = usize::try_from(number).unwrap_or(usize::MAX);
+    let collected = (number > 0)
+        .then(|| {
+            let tip_header = read(tip)?;
+            let last_nonce = tip_header.nonce;
+            let outcome = (scan_floor..tip).rev().try_fold(
+                (vec![tip_header], last_nonce),
+                |(heads, last_nonce), block_num| {
+                    if heads.len() >= want {
+                        ControlFlow::Break(Ok(heads))
+                    } else {
+                        read(block_num).map_or_else(
+                            |err| ControlFlow::Break(Err(err)),
+                            |header| {
+                                // Only track each output's "finalized" block, not all the extra
+                                // batches: the nonce is shared by every batch of one consensus
+                                // output and changes at the next output (composed of epoch and
+                                // round).
+                                let step = if header.nonce == last_nonce {
+                                    (heads, last_nonce)
+                                } else {
+                                    let nonce = header.nonce;
+                                    (
+                                        heads.into_iter().chain(std::iter::once(header)).collect(),
+                                        nonce,
+                                    )
+                                };
+                                ControlFlow::Continue(step)
+                            },
+                        )
+                    }
+                },
+            );
+            match outcome {
+                ControlFlow::Continue((heads, _)) => Ok(heads),
+                ControlFlow::Break(result) => result,
+            }
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(collected.into_iter().rev().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A synthetic chain reader: real headers in `real_floor..=tip` where each consensus output
+    /// spans `span` blocks (nonce = 1 + output index, never colliding with the dummy nonce),
+    /// scaffold dummies (zero nonce, like `ExecHeader::default()`) below `real_floor`. `reads`
+    /// counts every header fetch.
+    fn reader(
+        tip: u64,
+        real_floor: u64,
+        span: u64,
+        reads: &Cell<u64>,
+    ) -> impl Fn(u64) -> eyre::Result<Option<SealedHeader>> + '_ {
+        move |number| {
+            reads.set(reads.get() + 1);
+            let nonce =
+                number.checked_sub(real_floor).map_or(0u64, |offset| 1 + offset / span.max(1));
+            Ok((number <= tip).then(|| {
+                SealedHeader::new(
+                    ExecHeader { number, nonce: nonce.into(), ..Default::default() },
+                    B256::ZERO,
+                )
+            }))
+        }
+    }
+
+    /// Regression test for issue #1321: when the real-header window holds fewer distinct nonces
+    /// than requested, the walk must stop at the floor: never read the dummy region below it and
+    /// never push a synthetic (dummy) header into the result.
+    #[test]
+    fn scan_stops_at_restored_floor_and_excludes_dummies() -> eyre::Result<()> {
+        let reads = Cell::new(0u64);
+        // 10_000-block chain, real headers only in 9_745..=10_000, 8 blocks per output => 32
+        // distinct nonces in the window, fewer than the 50 requested
+        let (tip, floor) = (10_000u64, 9_745u64);
+        let result = collect_last_output_blocks(reader(tip, floor, 8, &reads), tip, 50, floor)?;
+
+        // every read stayed inside real history (the window itself, at most)
+        assert!(reads.get() <= tip - floor + 1, "walk read below the floor: {} reads", reads.get());
+        // no synthetic header escaped: every returned block is at or above the floor
+        assert!(result.iter().all(|h| h.number >= floor), "dummy header in result");
+        // the walk still collected the real output heads (one per distinct nonce in the window)
+        assert_eq!(result.len(), 32);
+        let ordered = result.iter().zip(result.iter().skip(1)).all(|(a, b)| a.number < b.number);
+        assert!(ordered, "result is not oldest-first");
+        Ok(())
+    }
+
+    /// Baseline: with no restore floor the walk behaves as before: it collects `number` output
+    /// heads (newest is the tip), one per nonce change, oldest first.
+    #[test]
+    fn scan_collects_output_heads_without_floor() -> eyre::Result<()> {
+        let reads = Cell::new(0u64);
+        // whole chain real, 4 blocks per output
+        let tip = 100u64;
+        let result = collect_last_output_blocks(reader(tip, 0, 4, &reads), tip, 5, 0)?;
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result.last().map(|h| h.number), Some(tip));
+        let distinct = result.iter().zip(result.iter().skip(1)).all(|(a, b)| a.nonce != b.nonce);
+        assert!(distinct, "collected two blocks of the same consensus output");
+        Ok(())
+    }
+
+    /// A walk that reaches genesis on a short, normally-synced chain stops there: the pre-#1321
+    /// termination, preserved by `scan_floor == 0`.
+    #[test]
+    fn scan_stops_at_genesis_on_short_chain() -> eyre::Result<()> {
+        let reads = Cell::new(0u64);
+        let tip = 6u64;
+        let result = collect_last_output_blocks(reader(tip, 0, 2, &reads), tip, 50, 0)?;
+
+        // blocks 0..=6 at 2 blocks per output hold 4 distinct nonces; the walk reads each block
+        // exactly once, terminates at genesis, and keeps one head per output
+        assert_eq!(reads.get(), tip + 1);
+        assert_eq!(result.len(), 4);
+        Ok(())
+    }
 }
