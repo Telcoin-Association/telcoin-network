@@ -2229,3 +2229,24 @@ async fn test_put_record_rate_limit_never_applies_to_local_peer() {
         .for_each(|_| assert!(!peer_manager.put_record_rate_limited(local)));
     assert!(!peer_manager.put_record_windows.contains_key(&local));
 }
+
+#[tokio::test]
+async fn test_put_record_window_swept_at_heartbeat() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let stale = PeerId::random();
+    let fresh = PeerId::random();
+
+    peer_manager.put_record_rate_limited(stale);
+    peer_manager.put_record_rate_limited(fresh);
+
+    // back-date one window past the interval, as if its source's disconnect-time eviction was
+    // missed
+    peer_manager.put_record_windows.get_mut(&stale).expect("window exists").started =
+        std::time::Instant::now() - PUT_RECORD_RATE_WINDOW;
+
+    peer_manager.heartbeat();
+
+    // the expired window is swept; the live one is kept
+    assert!(!peer_manager.put_record_windows.contains_key(&stale));
+    assert!(peer_manager.put_record_windows.contains_key(&fresh));
+}
