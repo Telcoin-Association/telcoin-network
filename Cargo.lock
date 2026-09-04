@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -11665,11 +11666,14 @@ dependencies = [
 name = "tn-config"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm-siv",
  "backoff",
  "bs58",
  "eyre",
+ "hex",
  "humantime-serde",
+ "libc",
  "libp2p",
  "pbkdf2",
  "rand 0.9.2",
@@ -11682,6 +11686,7 @@ dependencies = [
  "tn-network-types",
  "tn-types",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -12099,6 +12104,7 @@ dependencies = [
 name = "tn-worker-gateway"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "axum",
  "clap",
  "eyre",
