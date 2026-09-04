@@ -977,4 +977,66 @@ mod tests {
         )
         .is_ok());
     }
+
+    /// The advisory's `KeyConfig`-level regression test: formatting a whole config must not
+    /// leak the BLS private key or the network secrets derived from it. This guards drift in
+    /// upstream `libp2p-identity`'s redacting `Debug` impls and any future secret-bearing
+    /// field on `KeyConfigInner`, which the `BlsKeypair`-only test in tn-types cannot see.
+    #[test]
+    fn debug_does_not_leak_key_material() {
+        let keypair = random_keypair();
+        let bls_private = keypair.to_bytes();
+        let config = KeyConfig::new_with_testing_key(keypair);
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("[REDACTED]"), "BLS private half must be redacted: {rendered}");
+
+        let assert_secret_absent = |bytes: &[u8], what: &str| {
+            assert!(!rendered.contains(&hex::encode(bytes)), "{what} leaked as hex");
+            assert!(
+                !rendered.contains(&bs58::encode(bytes).into_string()),
+                "{what} leaked as bs58"
+            );
+            assert!(
+                !rendered.contains(&format!("{bytes:?}")),
+                "{what} leaked as a byte-array debug"
+            );
+        };
+        // Both byte orders: `to_bytes()` is the big-endian serialized scalar, while blst's
+        // internal `blst_scalar` (what a re-derived impl would print) is little-endian.
+        let reversed: Vec<u8> = bls_private.iter().rev().copied().collect();
+        assert_secret_absent(&bls_private, "bls private key");
+        assert_secret_absent(&reversed, "bls private key (reversed)");
+
+        let ed25519_secret = |net: &NetworkKeypair| {
+            let ed25519: libp2p::identity::ed25519::Keypair =
+                net.clone().try_into().expect("network keypairs are ed25519");
+            libp2p::identity::ed25519::SecretKey::from(ed25519)
+        };
+        assert_secret_absent(
+            ed25519_secret(config.primary_network_keypair()).as_ref(),
+            "primary network secret",
+        );
+        assert_secret_absent(
+            ed25519_secret(config.worker_network_keypair()).as_ref(),
+            "worker network secret",
+        );
+
+        // Positive anchors: the network fields must actually render their public halves,
+        // otherwise the negative checks above pass vacuously once `KeyConfigInner`'s Debug
+        // stops printing the network keypairs at all.
+        let ed25519_public_rendered = |net: &NetworkKeypair| {
+            let ed25519: libp2p::identity::ed25519::Keypair =
+                net.clone().try_into().expect("network keypairs are ed25519");
+            format!("{:?}", ed25519.public().to_bytes())
+        };
+        assert!(
+            rendered.contains(&ed25519_public_rendered(config.primary_network_keypair())),
+            "primary network public key should still be shown: {rendered}"
+        );
+        assert!(
+            rendered.contains(&ed25519_public_rendered(config.worker_network_keypair())),
+            "worker network public key should still be shown: {rendered}"
+        );
+    }
 }
