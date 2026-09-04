@@ -65,6 +65,15 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, global = true, default_value_t = false)]
     pub enable_state_export: bool,
 
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259).
+    ///
+    /// Opt-in telemetry: when set, execution keeps a bounded rolling window of recently
+    /// executed transaction hashes and reports (a counter and a rate-bounded warning) batches
+    /// that re-pack transactions first packed by another producer's batch. A node that does
+    /// not opt in builds no window and hashes nothing.
+    #[arg(long, global = true, default_value_t = false)]
+    pub enable_repack_monitor: bool,
+
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
     ///
@@ -119,20 +128,21 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives. Adiri builds carry epoch-gated forks;
-        // every other build has both the seed-signature (#1032) and multi-worker committee (#554)
-        // wire formats active from genesis.
+        // every other build has the seed-signature (#1032) and multi-worker committee (#554)
+        // wire formats plus the region-aware committee shuffle (#1279) active from genesis.
         #[cfg(feature = "adiri")]
         info!(
             target: "cli",
             consensus_registry_fork_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH,
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
+            region_shuffle_fork_epoch = tn_types::forks::REGION_SHUFFLE_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature and multi_workers active from genesis"
+            "fork schedule: seed_signature, multi_workers, and region_shuffle active from genesis"
         );
 
         // Raise the fd limit of the process.
@@ -203,6 +213,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             observer: _, // Used above
             metrics,
             enable_state_export,
+            enable_repack_monitor,
             instance,
             with_unused_ports,
             reth,
@@ -229,6 +240,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             metrics,
             healthcheck,
             enable_state_export,
+            enable_repack_monitor,
             reth_db,
             exex_fns: vec![],
         };

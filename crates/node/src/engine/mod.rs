@@ -22,6 +22,7 @@ use tn_reth::{
 use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
     EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
@@ -54,6 +55,10 @@ pub struct TnBuilder {
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259) when set.
+    ///
+    /// Default off: a node that does not opt in builds no window and hashes nothing.
+    pub enable_repack_monitor: bool,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
     /// Registered ExEx install functions.
@@ -138,10 +143,13 @@ impl ExecutionNode {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown, gas_accumulator, engine_update_tx).await
+        guard
+            .start_engine(rx_output, rx_shutdown, gas_accumulator, repack_monitor, engine_update_tx)
+            .await
     }
 
     /// Initialize the worker's transaction pool and public RPC.
