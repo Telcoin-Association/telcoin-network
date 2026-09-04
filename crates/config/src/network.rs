@@ -153,6 +153,17 @@ pub struct LibP2pConfig {
     /// Must be < `kad_record_ttl`, otherwise records expire before they are
     /// refreshed.
     pub kad_publication_interval: Duration,
+    /// How often this node replicates every stored record (its own and others') to the
+    /// `replication_factor` closest peers.
+    ///
+    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
+    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
+    /// so the value is a deliberate choice rather than an inherited libp2p default; the
+    /// default matches the libp2p default (1h).
+    ///
+    /// Must be nonzero and < `kad_record_ttl`, otherwise replication either spins the
+    /// event loop or lets other publishers' records expire before they are re-replicated.
+    pub kad_replication_interval: Duration,
     /// The chain id, used to namespace every libp2p wire protocol and gossip
     /// topic so nodes on different chains never negotiate a connection or share
     /// a gossip mesh.
@@ -200,6 +211,7 @@ impl Default for LibP2pConfig {
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            kad_replication_interval: Duration::from_secs(60 * 60),
             // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
             chain_id: 0,
         }
@@ -571,6 +583,10 @@ mod tests {
             parsed.libp2p_config.kad_publication_interval,
             default.libp2p_config.kad_publication_interval
         );
+        assert_eq!(
+            parsed.libp2p_config.kad_replication_interval,
+            default.libp2p_config.kad_replication_interval
+        );
         assert_eq!(parsed.peer_config.target_num_peers, default.peer_config.target_num_peers);
         assert_eq!(
             parsed.sync_config.max_skip_rounds_for_missing_certs,
@@ -629,6 +645,7 @@ hostname: "my-validator"
         // missing new fields fall back to defaults
         assert_eq!(parsed.libp2p_config.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.libp2p_config.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.libp2p_config.kad_replication_interval, default.kad_replication_interval);
 
         // entirely-missing sub-sections also default
         assert_eq!(parsed.peer_config.target_num_peers, PeerConfig::default().target_num_peers);
@@ -653,6 +670,10 @@ hostname: "my-validator"
             mapping.remove(&serde_yaml::Value::String("kad_publication_interval".into())).is_some(),
             "kad_publication_interval must be present in the default serialization"
         );
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_replication_interval".into())).is_some(),
+            "kad_replication_interval must be present in the default serialization"
+        );
         let legacy = serde_yaml::to_string(&value).expect("serialize stripped value");
 
         let parsed: LibP2pConfig =
@@ -660,6 +681,7 @@ hostname: "my-validator"
 
         assert_eq!(parsed.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.kad_replication_interval, default.kad_replication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
     }

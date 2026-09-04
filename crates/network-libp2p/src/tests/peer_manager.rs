@@ -2179,16 +2179,40 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
 }
 
 #[tokio::test]
-async fn test_put_record_rate_limit_trips_after_threshold() {
+async fn test_put_record_rate_limit_sheds_after_threshold() {
     let mut peer_manager = create_test_peer_manager(None);
     let source = PeerId::random();
 
     // the first window's worth of records are accepted
-    (0..MAX_PUT_RECORDS_PER_WINDOW)
-        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(source)));
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed)
+    });
 
-    // the next record in the same window trips the limit
-    assert!(peer_manager.put_record_rate_limited(source));
+    // the next record in the same window is shed without a penalty
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+}
+
+#[tokio::test]
+async fn test_put_record_rate_limit_penalizes_flood_once_per_window() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // messages 1..=30 are allowed, 31..=512 are shed without a penalty
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|i| {
+        let expected = if i < MAX_PUT_RECORDS_PER_WINDOW {
+            PutRecordRate::Allowed
+        } else {
+            PutRecordRate::Shed
+        };
+        assert_eq!(peer_manager.put_record_rate_limited(source), expected, "message {}", i + 1);
+    });
+
+    // the message past the penalty threshold floods, exactly once
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+
+    // further messages in the same window are shed, not re-penalized
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
 }
 
 #[tokio::test]
@@ -2199,12 +2223,31 @@ async fn test_put_record_window_resets_after_interval() {
     (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
         peer_manager.put_record_rate_limited(source);
     });
-    assert!(peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
 
     // age the window past the interval; the next record starts a fresh window and is accepted
     peer_manager.put_record_windows.get_mut(&source).expect("window exists").started =
         std::time::Instant::now() - PUT_RECORD_RATE_WINDOW;
-    assert!(!peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+}
+
+#[tokio::test]
+async fn test_put_record_window_reset_clears_penalized() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // drive the source past the penalty threshold so the window is marked penalized
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    assert!(peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
+
+    // age the window past the interval; the fresh window is clean and can flood again
+    peer_manager.put_record_windows.get_mut(&source).expect("window exists").started =
+        std::time::Instant::now() - PUT_RECORD_RATE_WINDOW;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(!peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
 }
 
 #[tokio::test]
@@ -2212,7 +2255,7 @@ async fn test_put_record_window_evicted_on_disconnect() {
     let mut peer_manager = create_test_peer_manager(None);
     let source = register_peer(&mut peer_manager, None);
 
-    assert!(!peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
     assert!(peer_manager.put_record_windows.contains_key(&source));
 
     peer_manager.register_disconnected(&source);
@@ -2225,7 +2268,48 @@ async fn test_put_record_rate_limit_never_applies_to_local_peer() {
     let local = peer_manager.local_peer_id;
 
     // the local id is exempt no matter how many records arrive, and never allocates a window
-    (0..=MAX_PUT_RECORDS_PER_WINDOW)
-        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(local)));
+    (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(local), PutRecordRate::Allowed)
+    });
     assert!(!peer_manager.put_record_windows.contains_key(&local));
+}
+
+#[tokio::test]
+async fn test_put_record_rate_limit_metric_counts_shed_and_flood() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        let source = PeerId::random();
+        // allowed through 30, shed 31..=512, flood on 513
+        (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+            peer_manager.put_record_rate_limited(source);
+        });
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let count_for = |outcome: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_network.put_records_rate_limited_total"
+                    && key.key().labels().any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(c) => *c,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                    panic!("rate-limit metric must be a counter")
+                }
+            })
+            .unwrap_or_else(|| panic!("no rate-limit counter for outcome {outcome}"))
+    };
+
+    // messages 31..=512 are shed; message 513 floods exactly once
+    let expected_shed = u64::try_from(PUT_RECORD_PENALTY_THRESHOLD - MAX_PUT_RECORDS_PER_WINDOW)
+        .expect("shed count fits in u64");
+    assert_eq!(count_for("shed"), expected_shed);
+    assert_eq!(count_for("flood"), 1);
 }

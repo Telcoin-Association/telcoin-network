@@ -3,7 +3,10 @@
 //! Both the primary and worker networks instantiate the same types, so every series
 //! carries a `network` label ({`primary`, `worker`}) set at construction.
 
-use crate::{peers::Penalty, types::NetworkType};
+use crate::{
+    peers::{Penalty, PutRecordRate},
+    types::NetworkType,
+};
 use reth_metrics::{
     metrics::{Counter, Gauge},
     Metrics,
@@ -182,6 +185,28 @@ impl PeerManagerMetrics {
     pub(crate) fn record_peer_banned(&self) {
         self.handles.peers_banned_total.increment(1);
     }
+
+    /// Record the outcome of the per-source inbound kad `PutRecord` rate limiter.
+    ///
+    /// `Allowed` records nothing. `Shed` and `Flooding` bump the counter with the outcome
+    /// labels {`shed`, `flood`}: `shed` counts records dropped without a penalty; `flood`
+    /// counts the once-per-window penalty escalations. Operators watch `shed` to see honest
+    /// shedding build up before it reaches the penalty threshold.
+    pub(crate) fn record_put_record_rate_limited(&self, rate: &PutRecordRate) {
+        let outcome = match rate {
+            PutRecordRate::Allowed => None,
+            PutRecordRate::Shed => Some("shed"),
+            PutRecordRate::Flooding => Some("flood"),
+        };
+        outcome.into_iter().for_each(|outcome| {
+            metrics::counter!(
+                "tn_network.put_records_rate_limited_total",
+                "network" => self.network,
+                "outcome" => outcome,
+            )
+            .increment(1);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +235,7 @@ mod tests {
             peers.record_external_addr_confirmed();
             peers.record_penalty(&Penalty::Severe);
             peers.record_peer_banned();
+            peers.record_put_record_rate_limited(&PutRecordRate::Shed);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -236,6 +262,10 @@ mod tests {
 
         let (key, _, _, _) = find("tn_network.connections_established_total");
         assert!(key.key().labels().any(|l| l.key() == "direction" && l.value() == "in"));
+
+        let (key, _, _, value) = find("tn_network.put_records_rate_limited_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key.key().labels().any(|l| l.key() == "outcome" && l.value() == "shed"));
 
         find("tn_network.px_disconnects_pending");
         find("tn_network.outbound_requests_pending");
