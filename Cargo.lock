@@ -11671,6 +11671,7 @@ dependencies = [
  "backoff",
  "bs58",
  "eyre",
+ "hex",
  "humantime-serde",
  "libc",
  "libp2p",
