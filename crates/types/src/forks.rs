@@ -851,6 +851,20 @@ pub const GOVERNANCE_SAFE_FORK_CANONICAL_SUITE: [(&str, Address, B256); 13] = [
     ),
 ];
 
+/// The canonical address of the named [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] row, or `None`
+/// when the suite carries no such contract.
+///
+/// Row order in the table is load-bearing — `tn-reth` zips it against the vendored bytecode
+/// list, so the two must stay positionally aligned — which makes an index the wrong handle for
+/// callers that mean one *specific* contract. They resolve it by name here, the same way the
+/// fork's installer keys its per-contract special cases (pre-fork pins, the SafeL2 threshold
+/// seed) off the row name.
+pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
+    GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+        .iter()
+        .find_map(|(row, address, _)| (row == &name).then_some(*address))
+}
+
 #[cfg(feature = "adiri")]
 /// First epoch that begins with the canonical Safe v1.4.1 suite installed and the governance
 /// Safe migrated onto `SafeL2`.

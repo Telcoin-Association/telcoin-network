@@ -1249,7 +1249,9 @@ mod tests {
     async fn test_governance_safe_fork_migrates_proxy_to_safe_l2() -> eyre::Result<()> {
         use reth_provider::StateProvider as _;
         use tn_config::GOVERNANCE_SAFE_ADDRESS;
-        use tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE;
+        use tn_types::forks::{
+            governance_safe_fork_canonical_address, GOVERNANCE_SAFE_FORK_CANONICAL_SUITE,
+        };
 
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let genesis_header = chain.sealed_genesis_header();
@@ -1260,10 +1262,17 @@ mod tests {
         // storage survives the migration byte-identically
         let owner_slot: B256 =
             "0x0fe3dc9300fae4e3f10c2aa6fd7984ca49afa61ba70631199528bcaa11f4ddaa".parse()?;
+        // by name, not by index: the table's row order is coupled to `tn-reth`'s vendored
+        // bytecode list, so a future reordering must not silently repoint these at other
+        // contracts
+        let suite_address = |name: &str| {
+            governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
         let (safe_l1, safe_l2, fallback_handler) = (
-            GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[0].1,
-            GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[1].1,
-            GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[3].1,
+            suite_address("Safe"),
+            suite_address("SafeL2"),
+            suite_address("CompatibilityFallbackHandler"),
         );
         let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
 

@@ -2334,9 +2334,16 @@ mod tests {
         // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
         let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
 
+        // by name, not by index: the table's row order is coupled to the vendored bytecode
+        // list above, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+
         // --- case 1: swap target (the recompiled Safe singleton) off its pre-fork pin ---
         let mut genesis = tn_types::test_genesis();
-        let safe_singleton = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[0].1;
+        let safe_singleton = suite_address("Safe");
         genesis
             .alloc
             .get_mut(&safe_singleton)
@@ -2360,7 +2367,7 @@ mod tests {
 
         // --- case 2: etch target (the canonical SafeL2 address) already carries code ---
         let mut genesis = tn_types::test_genesis();
-        let safe_l2 = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[1].1;
+        let safe_l2 = suite_address("SafeL2");
         genesis.alloc.insert(safe_l2, GenesisAccount::default().with_code(Some(stand_in_code)));
 
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
