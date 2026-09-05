@@ -55,6 +55,13 @@ where
         self.inner.file_len()
     }
 
+    /// True when the backing data file was opened without a valid clean-close sentinel — it was not
+    /// sealed by a clean shutdown and is most likely still padded/torn, so a consistency check
+    /// should treat the pack as needing recovery.
+    pub fn opened_unclean(&self) -> bool {
+        self.inner.opened_unclean()
+    }
+
     /// Clamp a read-only pack's read bound down to `logical_end` (the index-attested record end),
     /// so reads never touch bytes above the committed data even if the underlying file were
     /// physically padded. Defense-in-depth against the read-only-mmap SIGBUS window; no-op on a
@@ -238,6 +245,12 @@ where
     /// Length of the Pack file.
     fn file_len(&self) -> u64 {
         self.data_file.len()
+    }
+
+    /// True when the data file was opened without a valid clean-close sentinel (not cleanly
+    /// sealed).
+    fn opened_unclean(&self) -> bool {
+        self.data_file.opened_unclean()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.

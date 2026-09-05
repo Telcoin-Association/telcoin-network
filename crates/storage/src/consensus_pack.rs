@@ -607,12 +607,31 @@ impl Inner {
     const BATCH_HASH_NAME: &str = "bhash";
 
     /// Determine if the pack and indexes appear to have been closed cleanly.
+    ///
+    /// The primary, definitive test is the clean-close sentinel: every backing file (the data log,
+    /// the position index, and both digest indexes) must have been sealed by a clean shutdown
+    /// (`!opened_unclean()`). A missing sentinel on any of them means that file was not cleanly
+    /// closed (most likely padded/torn after a crash) and the pack must be recovered. This catches
+    /// cases the length checks alone miss — e.g. a crash that left a file exactly at capacity,
+    /// where physical == logical == the index markers yet the tail record may be torn.
+    ///
+    /// The length comparisons below remain as a secondary cross-file integrity check: even a sealed
+    /// pack is only consistent if the data length agrees with what both digest indexes and the
+    /// position index attest.
     fn files_consistent(
         data: &Pack<PackRecord>,
         consensus_pos_idx: &mut PositionIndex<IndexPositions>,
         consensus_digests: &HdxIndex,
         batch_digests: &HdxIndex,
     ) -> bool {
+        // Primary gate: any file that was not cleanly sealed forces recovery.
+        if data.opened_unclean()
+            || consensus_pos_idx.opened_unclean()
+            || consensus_digests.opened_unclean()
+            || batch_digests.opened_unclean()
+        {
+            return false;
+        }
         let pack_len = data.file_len();
         let consensus_final = consensus_digests.data_file_length();
         let batch_final = batch_digests.data_file_length();
@@ -871,43 +890,14 @@ impl Inner {
         Ok((consensus_digests, batch_digests))
     }
 
-    /// True when the data file ends inside its own first record and no consensus output is
-    /// indexed, i.e. the pack carries a torn [`EpochMeta`] with nothing reachable behind it.
-    ///
-    /// Two independent witnesses, because neither is sufficient alone:
-    ///
-    /// * [`Pack::record_size`] validates the size prefix and the record crc without decompressing,
-    ///   so `UnexpectedEof` there means the first record is not fully on disk. That is distinct
-    ///   from a complete record failing its crc or its decode, and because the data file is a
-    ///   sequential append-only log, a file that stops inside record zero cannot hold a record
-    ///   after it.
-    /// * The size prefix is covered by the record crc, but that crc can only be checked once the
-    ///   whole claimed extent is read; a flipped bit that inflates the extent past EOF yields
-    ///   `UnexpectedEof` *before* the crc is reached, so it is indistinguishable from a real tear
-    ///   on a pack that holds data.  The position index settles the destructive path: every
-    ///   consensus read resolves through it, so an empty one means no output was ever committed
-    ///   here. Residual gap (tracked separately): when the position index is *non-empty*, a
-    ///   past-EOF-inflated meta prefix still mimics a tear and fails the open with `EpochLoad`,
-    ///   bricking the epoch at startup on a single fault.  A proper fix is an independent checksum
-    ///   on the size prefix -- an on-disk format change deferred to its own PR.
-    fn first_record_is_dataless_tear(
-        data: &mut Pack<PackRecord>,
-        consensus_pos_idx: &PositionIndex<IndexPositions>,
-    ) -> bool {
-        let ends_inside_first_record = matches!(
-            data.record_size(DATA_HEADER_BYTES as u64),
-            Err(FetchError::IO(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
-        );
-        ends_inside_first_record && consensus_pos_idx.is_empty()
-    }
-
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
     ///
     /// A data file holding record bytes must begin with a readable [`EpochMeta`] matching this
-    /// epoch.  An unreadable first record fails the open rather than appending a second meta,
-    /// except for the one window that is provably dataless -- a tear inside the meta itself with
-    /// nothing indexed behind it -- which truncates back to the header and rewrites the meta.
+    /// epoch.  An unreadable first record fails the open (an invalid pack) rather than repairing
+    /// it: the meta is fsync'd the instant it is written, so a valid pack always has a durable
+    /// meta and a torn/missing meta is not a recoverable state. A header-only file (no meta
+    /// yet) is initialized by writing and committing the meta.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
@@ -931,12 +921,10 @@ impl Inner {
             genesis_consensus: previous_epoch.final_consensus,
         };
 
-        // Opened ahead of the meta check: the torn-record heal below needs the position index as
-        // an independent witness of whether any consensus output was ever committed here.
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
 
-        // Set on every branch that writes a fresh meta at the data header.  Either way the pack
-        // is byte-for-byte a freshly created one, so it needs the same index initialization.
+        // Set by the header-only branch, which writes a fresh meta at the data header.  The pack is
+        // then byte-for-byte a freshly created one, so it needs the same index initialization.
         let mut wrote_fresh_meta = false;
 
         // Discriminate a missing meta by length, not by fetch error kind: fetch reports a read
@@ -955,60 +943,42 @@ impl Inner {
                     }
                 }
                 Err(e) => {
-                    // A complete-but-corrupt first record keeps failing the open: recovery
-                    // (`recover_pack`) only trims the torn tail, and records behind the meta stay
-                    // addressable through the indexes, so discarding them here would be silent data
-                    // loss.  Only the provably dataless tear self-heals, matching the header-only
-                    // branch below.
-                    if !Self::first_record_is_dataless_tear(&mut data, &consensus_pos_idx) {
-                        return Err(PackError::EpochLoad(format!(
-                            "epoch {epoch} pack {} ({pack_len} bytes): first record (the epoch \
-                             meta) is unreadable: {e}. The pack cannot be opened by any path. \
-                             Inspect it with `telcoin-network db validate {}`; if it holds no \
-                             output worth recovering, stop the node and remove that one \
-                             `epoch-{epoch}` directory so the epoch is rebuilt on restart. Do NOT \
-                             delete the chain-data directories (`db`, `static_files`, \
-                             `consensus-db`)",
-                            pack_file.display(),
-                            base_dir.display(),
-                        )));
-                    }
-                    // The old meta is unreadable, so it cannot be compared against: the
-                    // rewritten one is whatever this caller supplied.  Log the committee it is
-                    // being rebuilt from so a drifted epoch-start snapshot is traceable.
-                    tracing::warn!(
-                        target: "consensus_pack",
-                        epoch,
-                        path = ?pack_file,
-                        len = pack_len,
-                        committee_size = epoch_meta.committee.size(),
-                        start_consensus_number,
-                        "first pack record (the epoch meta) is torn and nothing is indexed \
-                         behind it; truncating to the data header and rewriting the meta from \
-                         the caller's previous_epoch + committee"
-                    );
-                    data.truncate(DATA_HEADER_BYTES as u64)
-                        .map_err(|e| PackError::IO(Arc::new(e)))?;
-                    data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
-                        .map_err(|e| PackError::Append(e.to_string()))?;
-                    wrote_fresh_meta = true;
+                    // A data file holding record bytes must begin with a readable meta. An
+                    // unreadable first record is an invalid pack: recovery (`recover_pack`) only
+                    // trims the torn tail, and any records behind the meta stay addressable through
+                    // the indexes, so nothing here can safely repair it. The meta is fsync'd the
+                    // moment it is written (below and in `stream_import`), so a torn meta is not a
+                    // normal state -- fail rather than rewrite it.
+                    return Err(PackError::EpochLoad(format!(
+                        "epoch {epoch} pack {} ({pack_len} bytes): first record (the epoch \
+                         meta) is unreadable: {e}. The pack cannot be opened by any path. \
+                         Inspect it with `telcoin-network db validate {}`; if it holds no \
+                         output worth recovering, stop the node and remove that one \
+                         `epoch-{epoch}` directory so the epoch is rebuilt on restart. Do NOT \
+                         delete the chain-data directories (`db`, `static_files`, \
+                         `consensus-db`)",
+                        pack_file.display(),
+                        base_dir.display(),
+                    )));
                 }
             }
         } else {
             // Header-only file: brand new, or a crash landed between the header write and the
-            // meta append.  Either way appending the meta initializes the pack.
+            // meta append.  Either way appending the meta initializes the pack. Commit immediately
+            // so the header+meta prefix is durable before we return: a valid pack always has a
+            // durable meta, which is what lets the torn-meta path above fail instead of repair.
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
+            data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             wrote_fresh_meta = true;
         }
         let (mut consensus_digests, mut batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), false)?;
         if !have_pack || wrote_fresh_meta {
-            // If this is a new DB then update the file lengths in indexes after create.  A pack
-            // whose meta was just rewritten at the data header counts as new: the indexes still
-            // carry the length from before the damage, and leaving that stale would make
-            // recovery truncate the meta we just wrote back down to it whenever the rewritten
-            // meta is the longer one -- returning a live pack with a torn first record.
+            // A new DB, or a header-only file that just had its meta written, needs the index file
+            // lengths initialized to the current data length. A header-only reopen counts as new:
+            // the indexes may carry a stale length, and leaving that would make recovery truncate
+            // the meta we just wrote back down to it -- returning a live pack with a torn meta.
             let len = data.file_len();
             consensus_digests.set_data_file_length(len);
             batch_digests.set_data_file_length(len);
@@ -1148,6 +1118,10 @@ impl Inner {
         verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
+        // Commit the meta immediately so the header+meta prefix is durable: a valid pack always has
+        // a durable meta, so a crash mid-import leaves a readable meta (or a header-only file that
+        // reinitializes), never a torn meta that open would reject.
+        data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let (consensus_digests, batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), false)?;
@@ -3649,6 +3623,46 @@ pub(crate) mod test {
         pack.persist().await.expect("persist");
     }
 
+    /// The clean-close sentinel is the *definitive* consistency gate: a pack whose lengths all
+    /// still agree (physical == logical == index markers) but which lost its data-file sentinel
+    /// is treated as inconsistent. `open_static` refuses it (CorruptPack); `open_append_exists`
+    /// recovers it.
+    #[tokio::test]
+    async fn test_missing_sentinel_forces_recovery_even_when_lengths_agree() {
+        let temp_dir = TempDir::with_prefix("test_missing_sentinel").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Strip exactly the 8-byte clean-close sentinel from the data file. The physical length is
+        // now the logical length, which equals the index markers, so the length-based checks still
+        // pass — only the missing sentinel signals that the file was not cleanly closed.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let len = f.metadata().expect("meta").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+
+        // Read-only door: a pack that was not cleanly sealed is rejected rather than served.
+        match ConsensusPack::open_static(temp_dir.path(), 0) {
+            Err(super::PackError::CorruptPack(_)) => {}
+            other => panic!("open_static must reject an unsealed pack, got {other:?}"),
+        }
+
+        // Write door: the same unsealed pack recovers (rebuilds from the WAL) and reads back.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+            .expect("open_append_exists must recover an unsealed pack");
+        for i in 1..=3 {
+            assert!(
+                pack.get_consensus_output(i).await.is_ok(),
+                "output {i} must read back after recovery"
+            );
+        }
+    }
+
     /// Recovery rebuilds BOTH indexes purely from the data-log WAL: after the position and digest
     /// indexes are lost (the "don't sync indexes" regime taken to its limit), reopening replays the
     /// log so every output is again reachable by number and by digest, and the pack is consistent.
@@ -4026,23 +4040,19 @@ pub(crate) mod test {
     }
 
     /// A pack whose first record is torn (a crash mid meta append left only part of the size
-    /// prefix) with nothing indexed behind it is the one recoverable window: `open_append`
-    /// truncates back to the data header and rewrites the meta, exactly as the header-only
-    /// branch does one instant earlier.  Nothing reachable is lost -- the meta is rebuilt from
-    /// `previous_epoch` + `committee`.
+    /// prefix), even with nothing indexed behind it, is an invalid pack: `open_append` rejects it
+    /// rather than truncating and rewriting the meta.  The meta is fsync'd the instant it is
+    /// written, so a torn meta is not a normal state; the operator removes the epoch dir and it
+    /// rebuilds.
     #[tokio::test]
-    async fn test_open_append_heals_dataless_torn_first_record() {
+    async fn test_open_append_rejects_dataless_torn_first_record() {
         let temp_dir = TempDir::with_prefix("test_cp_torn_meta").expect("temp dir");
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
 
-        // Open + persist a clean meta-only pack, then DROP it so `Drop` truncates the mmap capacity
-        // padding away and the on-disk file is exactly its logical length — the same basis
-        // `healed_len` is measured on below. (A live pack is physically padded to `capacity`; the
-        // file is reconciled to `end` only at `try_clone`/`Drop`, so measuring while the pack is
-        // alive would read the transient padding, not the logical meta-only length.)
+        // Open + persist a clean meta-only pack, then DROP it so the on-disk file is exactly its
+        // logical length before we tear it.
         let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
         {
             let pack = ConsensusPack::open_append(
@@ -4053,7 +4063,6 @@ pub(crate) mod test {
             .expect("open pack");
             pack.persist().await.expect("persist");
         }
-        let clean_len = std::fs::metadata(&data_path).expect("metadata").len();
 
         // Tear the meta record mid size-prefix: record bytes exist past the header, but the
         // first record cannot be read and no output was ever committed behind it.
@@ -4063,33 +4072,20 @@ pub(crate) mod test {
             f.set_len(torn_len).expect("truncate");
         }
 
-        {
-            let pack = ConsensusPack::open_append(
-                temp_dir.path(),
-                previous_epoch.clone(),
-                committee.clone(),
-            )
-            .expect("torn meta with no data behind it must heal");
-            // The healed pack is writable: the rewritten meta put it back in service.
-            let parent = ConsensusHeader::default().digest();
-            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
-            pack.save_consensus_output(output).await.unwrap();
-            pack.persist().await.expect("persist after heal");
-        }
-
-        // The torn bytes were dropped rather than appended after, so the meta sits at the data
-        // header again and the pack grew past its clean meta-only length by the saved output.
-        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        let result =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
         assert!(
-            healed_len > clean_len,
-            "healed pack ({healed_len}) must hold the meta plus the new output (clean meta-only \
-             was {clean_len})"
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "a torn meta must be rejected, got {result:?}"
         );
 
-        // Both read-only doors agree the recovered pack is sound.
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
-        let output = pack.get_consensus_output(1).await.expect("read output through static open");
-        assert_eq!(output.number(), 1, "static read must return the output saved after the heal");
+        // No repair happened: the meta was not rewritten, so reopening still fails the same way
+        // (the old heal would have made this second open succeed).
+        let again = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(again, Err(super::PackError::EpochLoad(_))),
+            "a torn meta must stay invalid across reopens (no repair), got {again:?}"
+        );
     }
 
     /// The export copies the pack's `data` file bounded to its logical length (`data_file_len`),
@@ -4304,74 +4300,11 @@ pub(crate) mod test {
         assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
     }
 
-    /// The heal rebuilds the pack from its data header, so the digest indexes must be
-    /// reinitialized with it.  Left carrying the length from before the tear, recovery would
-    /// truncate the meta just written back down to that stale length whenever the rewritten
-    /// meta is the longer one, leaving the pack torn again and re-healing on every restart.
-    /// `recover_pack` re-stamps `set_data_file_length` after replay, so the `open_static` gate
-    /// below (which runs `files_consistent`) only opens once the tracked length matches the log.
-    #[tokio::test]
-    async fn test_heal_reinitializes_index_lengths_for_a_longer_meta() {
-        let temp_dir = TempDir::with_prefix("test_cp_heal_longer_meta").expect("temp dir");
-        let small = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(NonZeroUsize::new(4).expect("nonzero"))
-            .build();
-        let small_committee = small.committee();
-        let prev_small = test_previous_epoch(&small_committee);
-
-        {
-            let pack = ConsensusPack::open_append(
-                temp_dir.path(),
-                prev_small.clone(),
-                small_committee.clone(),
-            )
-            .expect("open pack");
-            pack.persist().await.expect("persist");
-        }
-
-        // Tear the meta, leaving the digest indexes synced to the pre-tear length.
-        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
-        let small_len = std::fs::metadata(&data_path).expect("metadata").len();
-        {
-            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
-            f.set_len(DATA_HEADER_BYTES as u64 + 2).expect("truncate");
-        }
-
-        // Reopen with a larger committee so the rewritten meta is longer than the stale length.
-        let big = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(NonZeroUsize::new(10).expect("nonzero"))
-            .build();
-        let big_committee = big.committee();
-        let prev_big = test_previous_epoch(&big_committee);
-        {
-            let pack = ConsensusPack::open_append(
-                temp_dir.path(),
-                prev_big.clone(),
-                big_committee.clone(),
-            )
-            .expect("heal with a longer meta");
-            pack.persist().await.expect("persist after heal");
-        }
-
-        // The healed pack must hold the whole new meta, not a copy truncated to the old length.
-        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
-        assert!(
-            healed_len > small_len,
-            "healed pack ({healed_len}) was cut back to the stale index length ({small_len})"
-        );
-
-        // open_static both runs files_consistent and re-reads the meta, so it is the gate that
-        // catches a meta left torn by a stale-length truncate.
-        ConsensusPack::open_static(temp_dir.path(), 0)
-            .expect("healed pack must open read-only with a readable meta");
-    }
-
-    /// Same stale-index hazard as above, but landing in the header-only branch: the data file
-    /// is rolled back to exactly `DATA_HEADER_BYTES` while the digest indexes keep their larger
-    /// pre-damage length.  That branch writes a fresh meta too, so it needs the same index
-    /// reinitialization -- without `recover_pack` re-stamping `set_data_file_length`, recovery
-    /// cuts the new meta down to the stale length and hands back a live pack whose first record
-    /// is torn.
+    /// The header-only branch reinitializes the digest index lengths: the data file is rolled back
+    /// to exactly `DATA_HEADER_BYTES` while the digest indexes keep their larger pre-damage length.
+    /// That branch writes a fresh meta, so it needs the index length reinitialized -- without
+    /// `recover_pack` re-stamping `set_data_file_length`, recovery cuts the new meta down to the
+    /// stale length and hands back a live pack whose first record is torn.
     #[tokio::test]
     async fn test_header_only_reinitializes_index_lengths_for_a_longer_meta() {
         let temp_dir = TempDir::with_prefix("test_cp_header_only_longer").expect("temp dir");
@@ -4986,6 +4919,23 @@ pub(crate) mod test {
         path
     }
 
+    /// Read a cleanly-closed pack's data file and return its **logical** (served) bytes — the whole
+    /// file minus the trailing 8-byte clean-close sentinel a clean close appends. Serving/export is
+    /// bounded to exactly this range, so this is the byte-for-byte view a pre-fork peer receives;
+    /// the on-disk sentinel is never served. The frozen `GOLDEN_LEGACY_PACK_HEX` fixture is the
+    /// wire format, so byte-identity assertions compare against this logical view.
+    #[cfg(feature = "adiri")]
+    fn read_logical_data_file(dir: &std::path::Path) -> Vec<u8> {
+        let path = dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME);
+        let mut whole = std::fs::read(&path).expect("read data file");
+        let logical = whole
+            .len()
+            .checked_sub(crate::archive::data_file::SENTINEL_LEN as usize)
+            .expect("a cleanly-closed pack must carry the clean-close sentinel");
+        whole.truncate(logical);
+        whole
+    }
+
     /// Deterministic BLS keypair for fixture slot `slot`.
     ///
     /// A fixed scalar rather than a seeded rng, so the derived public key — and with it the
@@ -5165,8 +5115,9 @@ pub(crate) mod test {
         }
         pack.persist().await.expect("persist fixture pack");
         drop(pack);
-        std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
-            .expect("read fixture data file")
+        // Return the logical (served) bytes — the frozen fixture is the wire format, without the
+        // on-disk clean-close sentinel.
+        read_logical_data_file(dir)
     }
 
     /// Materialize a complete pack directory (data file plus sidecar indexes) in `dir` FROM the
@@ -5196,9 +5147,7 @@ pub(crate) mod test {
         .expect("stream import of the frozen pre-fork pack");
         pack.persist().await.expect("persist imported pack");
         drop(pack);
-        let on_disk =
-            std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
-                .expect("read imported data file");
+        let on_disk = read_logical_data_file(dir);
         assert_eq!(
             tn_types::hex::encode(&on_disk),
             GOLDEN_LEGACY_PACK_HEX,
@@ -5332,7 +5281,7 @@ pub(crate) mod test {
     #[tokio::test]
     async fn test_golden_legacy_pack_opens_append_exists() {
         let bare = TempDir::with_prefix("golden_legacy_warm_bare").expect("temp dir");
-        let data_file = write_golden_legacy_data_file(bare.path());
+        write_golden_legacy_data_file(bare.path());
         {
             let pack = ConsensusPack::open_append_exists(bare.path(), LEGACY_PACK_EPOCH)
                 .expect("warm restart against a bare frozen pre-fork data file");
@@ -5342,7 +5291,7 @@ pub(crate) mod test {
             pack.persist().await.expect("persist");
         }
         assert_eq!(
-            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            tn_types::hex::encode(read_logical_data_file(bare.path())),
             GOLDEN_LEGACY_PACK_HEX,
             "opening a pre-fork pack for append rewrote or truncated it"
         );
@@ -5403,10 +5352,7 @@ pub(crate) mod test {
         pack.persist().await.expect("persist after serving");
         drop(pack);
 
-        let on_disk = std::fs::read(
-            dir.path().join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME),
-        )
-        .expect("reread the imported data file");
+        let on_disk = read_logical_data_file(dir.path());
         assert_eq!(
             tn_types::hex::encode(&on_disk),
             GOLDEN_LEGACY_PACK_HEX,
@@ -5446,7 +5392,7 @@ pub(crate) mod test {
             "open_append grew a pre-fork pack, so it appended a duplicate EpochMeta"
         );
         assert_eq!(
-            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            tn_types::hex::encode(read_logical_data_file(dir.path())),
             GOLDEN_LEGACY_PACK_HEX,
             "open_append rewrote the frozen pre-fork bytes"
         );

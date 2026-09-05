@@ -434,6 +434,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.len() == 0
     }
 
+    /// True when either backing file (the hdx bucket file or the odx overflow log) was opened
+    /// without a valid clean-close sentinel — the index is trustworthy only if both were sealed by
+    /// a clean shutdown, so a consistency check should treat it as needing rebuild if either is
+    /// unclean. An empty (0-length) odx reports clean, which is correct — there is nothing to
+    /// seal.
+    pub fn opened_unclean(&self) -> bool {
+        self.hdx_file.opened_unclean() || self.odx_file.opened_unclean()
+    }
+
     /// Set the data_file_length field. This tracks information about another file but does not
     /// affect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {

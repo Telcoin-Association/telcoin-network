@@ -204,6 +204,13 @@ impl<T: PosIndexValue> PositionIndex<T> {
         self.len() == 0
     }
 
+    /// True when the backing pdx file was opened without a valid clean-close sentinel — it was not
+    /// sealed by a clean shutdown, so a consistency check should treat the index as needing
+    /// rebuild.
+    pub fn opened_unclean(&self) -> bool {
+        self.pdx_file.opened_unclean()
+    }
+
     /// Return an iterator over file positions with up to len items.
     pub fn iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };
