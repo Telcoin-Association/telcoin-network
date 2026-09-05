@@ -14,8 +14,9 @@ pub struct WorkerFixture {
 }
 
 impl WorkerFixture {
-    pub fn keypair(&self) -> &NetworkKeypair {
-        self.key_config.worker_network_keypair()
+    /// The derived network keypair for this fixture's worker id.
+    pub fn keypair(&self) -> NetworkKeypair {
+        self.key_config.worker_network_keypair(self.id)
     }
 
     pub fn generate(key_config: KeyConfig, id: WorkerId) -> Self {

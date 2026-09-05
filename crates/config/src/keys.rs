@@ -23,7 +23,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
     construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
-    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer,
+    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer, WorkerId,
 };
 use zeroize::Zeroizing;
 
@@ -215,8 +215,9 @@ struct KeyConfigInner {
     primary_keypair: BlsKeypair,
     // Derived from the primary_keypair.
     primary_network_keypair: NetworkKeypair,
-    // Derived from the primary_keypair.
-    worker_network_keypair: NetworkKeypair,
+    // Seed string for worker network keypairs. Per-worker keypairs are derived on demand from
+    // the primary_keypair and this seed; see `KeyConfig::worker_network_keypair`.
+    worker_network_seed: String,
 }
 
 /// Basic implementation of a key manager.  This version will read a BLS key
@@ -225,7 +226,7 @@ struct KeyConfigInner {
 /// It should NOT expose the BLS private key, even though it is currently read
 /// from a file this will not always be the case and all code needing signatures
 /// MUST go through KeyConfig.
-/// NOTE: The two network keys (primary and worker) are derived from the BLS key
+/// NOTE: The network keys (primary and per-worker) are derived from the BLS key
 /// and are exposed to other code.  This is required to work with libp2p which
 /// wants the actual private key.  This method of deriving the key is an attempt
 /// to provide some protection to the key- even though it will exist in memory it
@@ -363,12 +364,11 @@ impl KeyConfig {
         };
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, &primary_seed);
-        let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, &worker_seed);
         Ok(Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: worker_seed,
             }),
         })
     }
@@ -429,7 +429,6 @@ impl KeyConfig {
         let worker_seed = "worker network keypair";
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, primary_seed);
-        let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, worker_seed);
         // Make sure we have the validator dir, owner-only.
         // Don't error out if path exists.
         create_keys_dir(&tn_datadir.node_keys_path())?;
@@ -458,7 +457,7 @@ impl KeyConfig {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: worker_seed.to_string(),
             }),
         })
     }
@@ -467,13 +466,11 @@ impl KeyConfig {
     pub fn new_with_testing_key(primary_keypair: BlsKeypair) -> Self {
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, "primary network keypair");
-        let worker_network_keypair =
-            Self::generate_network_keypair(&primary_keypair, "worker network keypair");
         Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: "worker network keypair".to_string(),
             }),
         }
     }
@@ -494,15 +491,30 @@ impl KeyConfig {
         self.primary_network_keypair().public().clone().into()
     }
 
-    /// Provide the keypair (with private key) for the worker network.
+    /// Provide the keypair (with private key) for the network of `worker_id`.
     /// Allows building the libp2p worker network.
-    pub fn worker_network_keypair(&self) -> &NetworkKeypair {
-        &self.inner.worker_network_keypair
+    ///
+    /// Worker 0 derives from the stored seed exactly as before per-worker swarms existed. This
+    /// keeps worker 0's PeerId stable for deployed nodes: that network identity is advertised
+    /// on-chain and cached in peers' kad stores, so it must not change. Worker ids above 0
+    /// append the id to the seed to get a distinct keypair per swarm.
+    pub fn worker_network_keypair(&self, worker_id: WorkerId) -> NetworkKeypair {
+        if worker_id == 0 {
+            Self::generate_network_keypair(
+                &self.inner.primary_keypair,
+                &self.inner.worker_network_seed,
+            )
+        } else {
+            Self::generate_network_keypair(
+                &self.inner.primary_keypair,
+                &format!("{} {worker_id}", self.inner.worker_network_seed),
+            )
+        }
     }
 
-    /// The [NetworkPublicKey] for the worker network.
-    pub fn worker_network_public_key(&self) -> NetworkPublicKey {
-        self.worker_network_keypair().public().into()
+    /// The [NetworkPublicKey] for the network of `worker_id`.
+    pub fn worker_network_public_key(&self, worker_id: WorkerId) -> NetworkPublicKey {
+        self.worker_network_keypair(worker_id).public().into()
     }
 
     /// Creates a proof that the authority account address is owned by the
@@ -1017,14 +1029,18 @@ mod tests {
             ed25519_secret(config.primary_network_keypair()).as_ref(),
             "primary network secret",
         );
+        // Per-worker network keypairs are derived on demand from the primary key and the stored
+        // seed (#555), so `KeyConfigInner` stores no worker keypair. Worker 0 is the legacy
+        // derivation; check it in case a future field caches derived keypairs.
         assert_secret_absent(
-            ed25519_secret(config.worker_network_keypair()).as_ref(),
+            ed25519_secret(&config.worker_network_keypair(0)).as_ref(),
             "worker network secret",
         );
 
-        // Positive anchors: the network fields must actually render their public halves,
+        // Positive anchor: the primary network field must actually render its public half,
         // otherwise the negative checks above pass vacuously once `KeyConfigInner`'s Debug
-        // stops printing the network keypairs at all.
+        // stops printing the network keypair at all. The worker side has no anchor: only the
+        // worker seed string is stored, never a worker keypair.
         let ed25519_public_rendered = |net: &NetworkKeypair| {
             let ed25519: libp2p::identity::ed25519::Keypair =
                 net.clone().try_into().expect("network keypairs are ed25519");
@@ -1034,9 +1050,21 @@ mod tests {
             rendered.contains(&ed25519_public_rendered(config.primary_network_keypair())),
             "primary network public key should still be shown: {rendered}"
         );
-        assert!(
-            rendered.contains(&ed25519_public_rendered(config.worker_network_keypair())),
-            "worker network public key should still be shown: {rendered}"
-        );
+    }
+
+    /// Worker 0 must keep the legacy bare-seed derivation (its PeerId is advertised on-chain),
+    /// worker 1 must get a distinct keypair, and derivation must be deterministic per id.
+    #[test]
+    fn test_worker_network_keypair_per_id_derivation() {
+        let kc = KeyConfig::new_with_testing_key(random_keypair());
+        let legacy: NetworkPublicKey = KeyConfig::generate_network_keypair(
+            &kc.inner.primary_keypair,
+            "worker network keypair",
+        )
+        .public()
+        .into();
+        assert_eq!(kc.worker_network_public_key(0), legacy);
+        assert_ne!(kc.worker_network_public_key(1), kc.worker_network_public_key(0));
+        assert_eq!(kc.worker_network_public_key(1), kc.worker_network_public_key(1));
     }
 }

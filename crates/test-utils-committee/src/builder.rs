@@ -9,7 +9,7 @@ use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
     BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, NetworkKeypair, P2pNode,
-    TimestampSec, DEFAULT_WORKER_PORT,
+    TimestampSec, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -167,7 +167,7 @@ where
             let worker_nodes: Vec<P2pNode> = (0..self.number_of_workers.get())
                 .map(|worker_id| {
                     let key = if worker_id == 0 {
-                        key_config.worker_network_public_key()
+                        key_config.worker_network_public_key(DEFAULT_WORKER_ID)
                     } else {
                         NetworkKeypair::generate_ed25519().public().into()
                     };

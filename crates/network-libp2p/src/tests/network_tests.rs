@@ -723,7 +723,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         config_2.network_config(),
         tx2,
         config_2.key_config().clone(),
-        config_2.key_config().worker_network_keypair().clone(),
+        config_2.key_config().worker_network_keypair(DEFAULT_WORKER_ID),
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
@@ -753,7 +753,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
     primary
         .add_explicit_peer(
             worker_bls,
-            config_2.key_config().worker_network_public_key(),
+            config_2.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
             worker_addr,
         )
         .await?;
@@ -853,7 +853,7 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
         config_2.network_config(),
         tx2,
         config_2.key_config().clone(),
-        config_2.key_config().worker_network_keypair().clone(),
+        config_2.key_config().worker_network_keypair(DEFAULT_WORKER_ID),
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
@@ -878,7 +878,7 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     primary
         .add_explicit_peer(
             worker_bls,
-            config_2.key_config().worker_network_public_key(),
+            config_2.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
             worker_addr,
         )
         .await?;
