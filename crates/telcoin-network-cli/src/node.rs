@@ -127,9 +127,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
-        // across the fleet before a fork epoch arrives. Adiri builds carry epoch-gated forks;
-        // every other build has the seed-signature (#1032) and multi-worker committee (#554)
-        // wire formats plus the region-aware committee shuffle (#1279) active from genesis.
+        // across the fleet before a fork epoch arrives; several fork constants document this log
+        // as their only in-protocol detection for a mismatched binary. Every epoch-gated adiri
+        // constant belongs in the adiri line, and every fork belongs in the non-adiri sentence
+        // (there is no non-adiri PREVRANDAO constant to log: that build's gate is a hardcoded
+        // `true`, active from genesis like the rest).
         #[cfg(feature = "adiri")]
         info!(
             target: "cli",
@@ -137,12 +139,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             region_shuffle_fork_epoch = tn_types::forks::REGION_SHUFFLE_FORK_EPOCH,
+            prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
+            leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature, multi_workers, and region_shuffle active from genesis"
+            "fork schedule: seed_signature, multi_workers, region_shuffle, prevrandao, and \
+             leader_seeded_ordering active from genesis"
         );
 
         // Raise the fd limit of the process.

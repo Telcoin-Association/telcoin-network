@@ -460,11 +460,14 @@ where
         let worker_id = DEFAULT_WORKER_ID;
         // The worker's shared base-fee container and a u64 snapshot of its current value. The
         // pool receives the live container so its pending fee tracks the accumulator across
-        // epoch boundaries (issue #1262), and the RPC server keeps a handle from it
-        // (`eth_feeHistory` answers its next-block entry). The snapshot serves the batch
-        // validator and the every-epoch setter below (base fee is constant within an epoch).
+        // epoch boundaries (issue #1262). The snapshot serves the batch validator and the
+        // every-epoch setter below (base fee is constant within an epoch).
         let base_fee_container = gas_accumulator.base_fee(worker_id);
         let base_fee = base_fee_container.base_fee();
+        // The worker's per-query base-fee handle: the RPC server keeps it and resolves
+        // `eth_feeHistory`'s next-block entry through the accumulator on every quote, so
+        // the quote survives worker-count changes (#1282).
+        let worker_base_fee = gas_accumulator.worker_base_fee(worker_id);
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -487,6 +490,7 @@ where
                         network_handle.clone(),
                         engine_to_primary,
                         base_fee_container,
+                        worker_base_fee,
                     )
                     .await?;
             } else {
