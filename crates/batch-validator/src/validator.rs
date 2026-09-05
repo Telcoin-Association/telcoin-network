@@ -1,11 +1,13 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
+use tn_reth::{
+    recover_raw_transaction, recover_signed_transaction, RethEnv, TxPool as _, WorkerTxPool,
+};
 use tn_types::{
     batch_allowlisted_tx_type, max_batch_gas, max_batch_size, BatchValidation,
     BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
-    Typed2718 as _, WorkerId,
+    TxHash, Typed2718 as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -37,6 +39,10 @@ impl BatchValidation for BatchValidator {
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
+    ///
+    /// On success (and only on success) the batch's transaction hashes are recorded in the
+    /// worker pool's deferral window, so this node's batch builder skips them while the peer
+    /// batch is in flight (issue #1329). A node without a pool (an observer) records nothing.
     fn validate_batch(&self, sealed_batch: SealedBatch) -> BatchValidationResult<()> {
         // ensure digest matches batch
         let (batch, digest) = sealed_batch.split();
@@ -79,6 +85,16 @@ impl BatchValidation for BatchValidator {
 
         // validate base fee- all batches for a worker and epoch have the same base fee.
         self.validate_basefee(batch.base_fee_per_gas)?;
+
+        // the batch is valid: remember its transactions so this node's own builder does not pack
+        // a copy of something a peer is already proposing (issue #1329). Recording happens only
+        // after every check passes, so an invalid batch never defers anything, and the deferral
+        // expires on its own (see `PEER_BATCH_DEFER_TTL`) if the peer batch is abandoned.
+        if let Some(pool) = &self.tx_pool {
+            let hashes: Vec<TxHash> = decoded_txs.iter().map(|tx| *tx.hash()).collect();
+            pool.record_peer_batch(&hashes);
+        }
+
         Ok(())
     }
 

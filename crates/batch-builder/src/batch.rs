@@ -31,6 +31,11 @@ pub struct BatchBuilderOutput {
     /// minus the just-mined cost, so parked insufficient-funds transactions are not spuriously
     /// promoted (see `build_batch`).
     pub(crate) changed_accounts: Vec<ChangedAccount>,
+    /// The number of transactions skipped because a validated peer batch already carries them.
+    ///
+    /// Reported as a metric so an operator can see how much duplicate work the deferral window
+    /// avoids (issue #1329).
+    pub(crate) peer_deferred: usize,
 }
 
 /// Construct an TN batch using the best transactions from the pool.
@@ -71,18 +76,36 @@ pub fn build_batch<P: TxPool>(
     let mut unsupported_transactions = Vec::new();
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
     let mut sender_costs: HashMap<Address, U256> = HashMap::new();
+    let mut peer_deferred: usize = 0;
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
+        // a validated peer batch may already carry this transaction: that peer is proposing it
+        // right now, so packing a copy here only spends batch space, bandwidth and a vote round
+        // before execution skips the copy for free (issue #1329)
+        let deferred_by_peer = pool.is_peer_deferred(pool_tx.hash());
+
         // ensure block has capacity (in gas) for this transaction
-        if total_possible_gas + pool_tx.gas_limit() > gas_limit {
-            // the tx could exceed max gas limit for the block
-            // marking as invalid within the context of the `BestTransactions` pulled in this
-            // current iteration  all dependents for this transaction are now considered invalid
-            // before continuing loop
-            best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
-            debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
+        let exceeds_gas_limit = total_possible_gas + pool_tx.gas_limit() > gas_limit;
+
+        // either guard skips the transaction:
+        // - the tx could exceed max gas limit for the block
+        // - the tx is already in flight inside a peer's batch
+        //
+        // marking as invalid within the context of the `BestTransactions` pulled in this
+        // current iteration  all dependents for this transaction are now considered invalid
+        // before continuing loop. For the deferral that is deliberate: a later nonce from the
+        // same sender would land nonce-gapped and only be skipped at execution.
+        if deferred_by_peer || exceeds_gas_limit {
+            if deferred_by_peer {
+                best_txs.peer_deferred(&pool_tx);
+                peer_deferred = peer_deferred.saturating_add(1);
+                debug!(target: "worker::batch_builder", ?pool_tx, "deferring tx already packed by a validated peer batch");
+            } else {
+                best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
+            }
             continue;
         }
 
@@ -195,7 +218,7 @@ pub fn build_batch<P: TxPool>(
         .collect();
 
     // return output
-    BatchBuilderOutput { batch, mined_transactions, changed_accounts }
+    BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred }
 }
 
 #[cfg(test)]
@@ -206,6 +229,64 @@ mod tests {
     use std::sync::Arc;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{test_genesis, BatchBuilderArgs, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
+
+    /// A transaction a validated peer batch already carries must not be packed again here: the
+    /// duplicate costs batch space, bandwidth and a vote round, and execution skips it for free
+    /// (issue #1329). The sender's later nonces must be skipped in the same build too, because a
+    /// nonce-gapped copy would only be caught at execution.
+    #[test]
+    fn peer_batched_transactions_are_deferred_with_their_successors() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut factory_a = TransactionFactory::new();
+        let mut factory_b = TransactionFactory::new_random();
+
+        // sender A submits nonces 0 and 1, sender B submits nonce 0
+        let a_nonce_0 = factory_a.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            None,
+            U256::from(1),
+            Bytes::new(),
+        );
+        let a_nonce_1 = factory_a.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            None,
+            U256::from(1),
+            Bytes::new(),
+        );
+        let b_nonce_0 = factory_b.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            None,
+            U256::from(1),
+            Bytes::new(),
+        );
+
+        let hash_a0 = *tn_reth::recover_raw_transaction(&a_nonce_0).expect("tx a0").hash();
+        let hash_a1 = *tn_reth::recover_raw_transaction(&a_nonce_1).expect("tx a1").hash();
+        let hash_b0 = *tn_reth::recover_raw_transaction(&b_nonce_0).expect("tx b0").hash();
+
+        let pool = TestPool::new(&[a_nonce_0.clone(), a_nonce_1, b_nonce_0.clone()]);
+
+        // a peer's validated batch carries A's first transaction
+        pool.record_peer_batch(&[hash_a0]);
+
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
+        let BatchBuilderOutput { batch, mined_transactions, peer_deferred, .. } =
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        // only B's transaction is packed
+        assert_eq!(batch.transactions, vec![b_nonce_0]);
+        assert_eq!(mined_transactions, vec![hash_b0]);
+        // neither A's deferred transaction nor its nonce-gapped successor is mined
+        assert!(!mined_transactions.contains(&hash_a0));
+        assert!(!mined_transactions.contains(&hash_a1));
+        assert_eq!(peer_deferred, 1);
+    }
 
     /// The optimistic `changed_accounts` update must carry the sender's real balance, not an
     /// inflated `U256::MAX`. An inflated balance lets the pool promote a sender's parked
