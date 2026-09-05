@@ -18,7 +18,8 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
+    repack_monitor::RepackMonitor,
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusHeaderDigest,
     ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
     B256,
@@ -54,6 +55,7 @@ impl ExecutionNodeInner {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
@@ -70,6 +72,7 @@ impl ExecutionNodeInner {
             rx_shutdown,
             self.reth_env.get_task_spawner().clone(),
             gas_accumulator,
+            repack_monitor,
             engine_update_tx,
         );
 
@@ -135,13 +138,16 @@ impl ExecutionNodeInner {
     /// for instance call for worker id 0, then 1, etc.
     ///
     /// The pool receives the shared [`BaseFeeContainer`] so canonical updates always charge
-    /// the current epoch's fee (issue #1262).
+    /// the current epoch's fee (issue #1262). The RPC server keeps the [`WorkerBaseFee`]
+    /// handle so `eth_feeHistory` resolves the worker's current fee on every quote, surviving
+    /// worker-count changes (issue #1282).
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
+        worker_base_fee: WorkerBaseFee,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
@@ -166,7 +172,7 @@ impl ExecutionNodeInner {
         let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
-            base_fee,
+            worker_base_fee,
             tn_ext.into_rpc(),
         )?;
 

@@ -21,6 +21,7 @@ mod genesis;
 mod helpers;
 mod notifier;
 mod primary;
+pub mod repack_monitor;
 mod serde;
 mod sync;
 mod task_manager;

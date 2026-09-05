@@ -54,16 +54,21 @@ use crate::{
 };
 use alloy::{
     providers::{Provider as _, RootProvider},
-    transports::{RpcError, TransportErrorKind},
+    rpc::{
+        client::RpcClient,
+        json_rpc::{RequestPacket, ResponsePacket},
+    },
+    transports::{
+        http::Client, utils::guess_local_url, RpcError, TransportError, TransportErrorKind,
+        TransportFut, TransportResult,
+    },
 };
 use futures::{future::OptionFuture, StreamExt};
+use rand::{seq::SliceRandom as _, Rng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
@@ -116,6 +121,28 @@ const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// a gas-full batch occupies its permit for seconds even when every endpoint answers promptly,
 /// and a tighter cap would shed batches an unstressed node could have delivered.
 const MAX_CONCURRENT_FORWARDS: usize = 64;
+
+/// Bounds how many bytes of one validator RPC response body the forwarder will buffer.
+///
+/// The dial target is chosen by a committee member (issue #1092), so the response is as
+/// remote-controlled as the endpoint: alloy's stock HTTP transport buffers the entire body
+/// before parsing, on success and error statuses alike, and [`FORWARD_SEND_TIMEOUT`] bounds
+/// only how long that read may take, not how much it may hold (issue #1275). A
+/// `send_raw_transaction` verdict is a few hundred bytes, so 64 KiB is orders of magnitude of
+/// headroom, and with every permit taken the response buffers hold at most
+/// [`MAX_CONCURRENT_FORWARDS`] x 64 KiB = 4 MiB instead of whatever a byzantine endpoint
+/// cares to stream inside the timeout.
+const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Bounds how many bytes of remote-controlled text a [`Disposition`] reason may carry.
+///
+/// Reasons reach `warn!` logs (a confirmed rejection and a rejection override both print them
+/// under the default filter) and the held-rejection mirror that lives for the rest of a walk,
+/// so an unclamped reason turns each forwarded transaction into a log write and a retained
+/// allocation of the remote server's choosing (issue #1275). Clamped once, at classification,
+/// so every sink downstream inherits the bound. 256 bytes keeps every legitimate reth
+/// rejection message intact.
+const MAX_REASON_BYTES: usize = 256;
 
 /// JSON-RPC error codes reth reserves for conditions that are validator-local or indeterminate,
 /// never cleanly a verdict on the transaction: `-32003` is a full pool (`TxPoolOverflow`) plus
@@ -427,13 +454,6 @@ pub struct WorkerRpcForwarder {
     /// otherwise in no pool and no table. `None` means there is no pool to return them to
     /// (tests); undelivered transactions are then dropped as before, with the same warnings.
     requeue_pool: Option<WorkerTxPool>,
-    /// Rotation counter for the fallback dial order.
-    ///
-    /// Starts at a random per-process value and advances once per spawned forward: see
-    /// [`rotated_fallbacks`] for why the order must differ per node and per forward. Shared
-    /// through the `Arc` by every clone of this forwarder, so the rotation is node-wide like
-    /// the forward cap.
-    fallback_rotation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WorkerRpcForwarder {
@@ -461,11 +481,6 @@ impl WorkerRpcForwarder {
             cache: Arc::new(Mutex::new(EndpointCache::default())),
             forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
             requeue_pool,
-            // Random, not zero: observers restarted together must not share one rotation
-            // phase, and no committee key can buy a fixed position in the order (issue
-            // #1173). This seeds fairness, not secrecy: predicting it moves no trust
-            // boundary.
-            fallback_rotation: Arc::new(AtomicU64::new(rand::random())),
         }
     }
 
@@ -537,7 +552,7 @@ impl WorkerRpcForwarder {
                                     .ok()
                             })
                             .map(|parsed| {
-                                let provider = RootProvider::new_http(parsed);
+                                let provider = capped_provider(parsed);
                                 cache.providers.insert(url.clone(), provider.clone());
                                 provider
                             })
@@ -564,13 +579,13 @@ impl WorkerRpcForwarder {
         providers: BTreeMap<BlsPublicKey, (String, RootProvider)>,
     ) {
         // Fallback order: every usable endpoint, so a transaction whose owning validator has
-        // not advertised (or is unreachable) can still reach the committee. Rotated per
-        // forward, so the redirect load of a downed owner spreads across the committee
-        // instead of landing on the lowest-keyed validator every time (issue #1173).
-        let fallbacks = rotated_fallbacks(
-            providers.keys().cloned().collect(),
-            self.fallback_rotation.fetch_add(1, Ordering::Relaxed),
-        );
+        // not advertised (or is unreachable) can still reach the committee. Shuffled afresh
+        // per forward, so the redirect load of a downed owner spreads across the committee
+        // and no choice of committee key buys a position anywhere in the walk (issues #1173,
+        // #1277). Per forward, not per transaction: every transaction of one forward walks
+        // the same order, so one account's transactions stay on one fallback validator
+        // within a batch (nonce-gap hygiene), matching the owner routing below.
+        let fallbacks = shuffled_fallbacks(providers.keys().cloned().collect(), &mut rand::rng());
         let cache = Arc::clone(&self.cache);
         let requeue_pool = self.requeue_pool.clone();
 
@@ -883,33 +898,23 @@ fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
     (!remaining.is_zero()).then(|| remaining.min(FORWARD_TX_BUDGET))
 }
 
-/// The fallback dial order for one spawned forward: `fallbacks` rotated left by `counter`,
-/// reduced modulo the list length.
+/// The fallback dial order for one spawned forward: `fallbacks` shuffled uniformly with `rng`.
 ///
-/// Without rotation the order is the raw byte sort of the committee's BLS public keys, the
-/// same on every observer. Every observer then redirects a downed owner's transactions to the
-/// same lowest-keyed reachable validator at the same time, and a validator can grind its BLS
-/// keypair offline so its key sorts first and that position becomes permanent (issue #1173).
-/// The counter starts at a per-process random value, so observers walk different orders and a
-/// ground key buys nothing, and it advances once per spawned forward, so one observer also
-/// spreads consecutive batches. Owner-first routing is unchanged: the owner is dialed ahead
+/// Without a shuffle the order derives from the raw byte sort of the committee's BLS public
+/// keys, which a validator can grind offline. A key that sorts first bought a permanent first
+/// claim on every fallback-routed transaction (issue #1173), and under the per-forward
+/// rotation that replaced the raw sort the relative order was still the key sort, so a ground
+/// key could sit directly behind a chosen predecessor and inherit its redirects whenever that
+/// predecessor was down (issue #1277). Ranking every entry by a fresh random draw per forward
+/// leaves no order structure to grind: first position and every successor are uniform per
+/// forward. Forwarding is a local networking choice on this observer, not a consensus input,
+/// so the nondeterminism is safe. Owner-first routing is unchanged: the owner is dialed ahead
 /// of this list (see [`WorkerRpcForwarder::spawn_forward`]).
-fn rotated_fallbacks(fallbacks: Vec<BlsPublicKey>, counter: u64) -> Vec<BlsPublicKey> {
-    let count = fallbacks.len();
-    let start = rotation_start(counter, count);
-    fallbacks.iter().cycle().skip(start).take(count).cloned().collect()
-}
-
-/// Starting offset into a fallback list of `fallback_count` entries: `counter` reduced modulo
-/// the length. Total for every input: an empty list gets offset zero rather than a division
-/// by zero, and a length past `u64` (impossible on any real target) also degrades to zero
-/// rather than truncating.
-fn rotation_start(counter: u64, fallback_count: usize) -> usize {
-    u64::try_from(fallback_count)
-        .ok()
-        .filter(|count| *count > 0)
-        .and_then(|count| usize::try_from(counter % count).ok())
-        .unwrap_or_default()
+fn shuffled_fallbacks(mut fallbacks: Vec<BlsPublicKey>, rng: &mut impl Rng) -> Vec<BlsPublicKey> {
+    // Fisher-Yates, in place: uniform over all permutations, O(n), and it reuses the caller's
+    // allocation rather than staging the list through a map.
+    fallbacks.shuffle(rng);
+    fallbacks
 }
 
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
@@ -1153,8 +1158,141 @@ enum ForwardOutcome {
     NoEndpointReached,
 }
 
+/// The forwarder's HTTP transport: alloy's reqwest transport with a response-size cap.
+///
+/// Mirrors the service `alloy_transport_http::Http<Client>` provides, with one difference: the
+/// body is pulled chunk by chunk and refused the moment it exceeds
+/// [`MAX_FORWARD_RESPONSE_BYTES`], where the stock transport buffers the entire body before
+/// any parse (issue #1275). reqwest's `Client` has no response-size knob of its own, so the
+/// bound has to live at this layer. An oversized body surfaces as a transport error, which
+/// [`classify_error`] maps to [`Disposition::Unreachable`]: the endpoint is demoted like any
+/// other endpoint that produced no verdict.
+#[derive(Clone, Debug)]
+struct CappedHttp {
+    /// The HTTP client, alloy's own re-exported `reqwest::Client`, so the TLS backend is
+    /// exactly what `RootProvider::new_http` would have used.
+    client: Client,
+    /// The advertised endpoint this transport dials.
+    url: Url,
+}
+
+impl CappedHttp {
+    /// One JSON-RPC round trip with the response read capped.
+    ///
+    /// Follows the stock reqwest transport step for step - post the request, keep the body
+    /// regardless of status so a JSON-RPC verdict in an error-status body still classifies,
+    /// map non-success statuses to HTTP errors, then deserialize - except the body arrives
+    /// through [`collect_capped`].
+    async fn send_capped(self, req: RequestPacket) -> TransportResult<ResponsePacket> {
+        use futures::TryStreamExt as _;
+        let resp = self
+            .client
+            .post(self.url)
+            .json(&req)
+            .headers(req.headers())
+            .send()
+            .await
+            .map_err(TransportErrorKind::custom)?;
+        let status = resp.status();
+        let chunks = futures::stream::try_unfold(resp, |mut resp| async move {
+            resp.chunk().await.map(|next| next.map(|bytes| (bytes.to_vec(), resp)))
+        })
+        .map_err(TransportErrorKind::custom);
+        let body = collect_capped(chunks).await?;
+        match status.is_success() {
+            true => serde_json::from_slice(&body)
+                .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body))),
+            false => Err(TransportErrorKind::http_error(
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+            )),
+        }
+    }
+}
+
+/// The tower plumbing that lets [`CappedHttp`] stand where alloy's stock HTTP transport
+/// stands. `poll_ready` is always ready for the same reason the stock transport's is:
+/// reqwest applies its own backpressure internally.
+impl tower::Service<RequestPacket> for CappedHttp {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
+        Box::pin(self.clone().send_capped(req))
+    }
+}
+
+/// Build the provider the forwarder dials one advertised endpoint with.
+///
+/// Drop-in for `RootProvider::new_http(url)`, routed through [`CappedHttp`] so every response
+/// read is bounded by [`MAX_FORWARD_RESPONSE_BYTES`].
+fn capped_provider(url: Url) -> RootProvider {
+    let is_local = guess_local_url(url.as_str());
+    RootProvider::new(RpcClient::new(CappedHttp { client: Client::new(), url }, is_local))
+}
+
+/// Accumulate a response body from `chunks`, refusing it once it exceeds
+/// [`MAX_FORWARD_RESPONSE_BYTES`].
+///
+/// The refusal aborts the fold, which drops the stream, which abandons the connection: an
+/// oversized body is not just absent from the result, it stops being read.
+async fn collect_capped(
+    chunks: impl futures::Stream<Item = TransportResult<Vec<u8>>>,
+) -> TransportResult<Vec<u8>> {
+    use futures::TryStreamExt as _;
+    chunks
+        .try_fold(Vec::<u8>::new(), |buf, chunk| async move {
+            let total = buf.len().saturating_add(chunk.len());
+            (total <= MAX_FORWARD_RESPONSE_BYTES)
+                // Append in place: rebuilding the accumulator per chunk would be quadratic in
+                // chunk count, and the chunking is remote-controlled too.
+                .then(|| {
+                    let mut buf = buf;
+                    buf.extend_from_slice(&chunk);
+                    buf
+                })
+                .ok_or_else(|| {
+                    TransportErrorKind::custom_str(&format!(
+                        "response body exceeds the {MAX_FORWARD_RESPONSE_BYTES}-byte forward cap"
+                    ))
+                })
+        })
+        .await
+}
+
+/// Clamp one remote-controlled reason string to [`MAX_REASON_BYTES`].
+///
+/// The cut lands on a `char` boundary at or below the cap, and a clamped reason says how much
+/// it dropped, so a truncated log line reads as truncated instead of as the whole message.
+fn clamp_reason(message: String) -> String {
+    match message.len() <= MAX_REASON_BYTES {
+        true => message,
+        false => {
+            let cut = (0..=MAX_REASON_BYTES)
+                .rev()
+                .find(|idx| message.is_char_boundary(*idx))
+                .unwrap_or(0);
+            let kept = message.get(..cut).unwrap_or_default();
+            format!("{kept} [truncated {} of {} bytes]", message.len() - cut, message.len())
+        }
+    }
+}
+
 /// Classify a failed `send_raw_transaction` by whether the server returned a JSON-RPC error (a
 /// verdict about the transaction) or the transport failed (an endpoint problem).
+///
+/// Every reason built here is clamped to [`MAX_REASON_BYTES`]: several of them embed
+/// remote-controlled bytes (a JSON-RPC error message, an HTTP error's response body), and this
+/// is the one choke point every log site and the held-rejection mirror sit downstream of
+/// (issue #1275).
 fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
     match err {
         // The server returned a JSON-RPC verdict: classify it by code and message.
@@ -1163,19 +1301,26 @@ fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
         }
         // Local faults: the request could not even be built or used. They say nothing about
         // the endpoint, so try the next validator without demoting this one.
-        RpcError::SerError(err) => Disposition::TryNext(err.to_string()),
-        RpcError::LocalUsageError(err) => Disposition::TryNext(err.to_string()),
+        RpcError::SerError(err) => Disposition::TryNext(clamp_reason(err.to_string())),
+        RpcError::LocalUsageError(err) => Disposition::TryNext(clamp_reason(err.to_string())),
         // No usable verdict from the remote side: a transport failure, a response that does
         // not parse, an empty response, or a capability the endpoint lacks. All demote.
-        RpcError::Transport(err) => Disposition::Unreachable(err.to_string()),
-        RpcError::DeserError { err, .. } => Disposition::Unreachable(err.to_string()),
+        RpcError::Transport(err) => Disposition::Unreachable(clamp_reason(err.to_string())),
+        RpcError::DeserError { err, .. } => Disposition::Unreachable(clamp_reason(err.to_string())),
         RpcError::NullResp => Disposition::Unreachable("null response".to_string()),
-        RpcError::UnsupportedFeature(feature) => Disposition::Unreachable(feature.to_string()),
+        RpcError::UnsupportedFeature(feature) => {
+            Disposition::Unreachable(clamp_reason(feature.to_string()))
+        }
     }
 }
 
 /// Classify a server-side JSON-RPC rejection of a forwarded transaction.
+///
+/// The message is remote-controlled, so it is clamped before it can reach a log or the held
+/// rejection (issue #1275). Clamping before the needle checks below is safe for honest
+/// servers: every message the needles match is far shorter than the cap.
 fn classify_server_error(code: i64, message: String) -> Disposition {
+    let message = clamp_reason(message);
     let lowered = message.to_ascii_lowercase();
     match () {
         // A full pool or an internal error is validator-local; another validator may accept it.
@@ -1202,6 +1347,129 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tn_types::{BlsKeypair, TaskManager};
+
+    /// A reason at the cap passes through untouched.
+    #[test]
+    fn clamp_reason_keeps_short_reasons() {
+        let reason = "a".repeat(MAX_REASON_BYTES);
+        assert_eq!(clamp_reason(reason.clone()), reason);
+    }
+
+    /// An oversized reason is cut on a `char` boundary and says how much it dropped.
+    #[test]
+    fn clamp_reason_truncates_on_a_char_boundary() {
+        // Multi-byte scalars straddle the cap, so a byte-index cut would split one.
+        let reason = format!("{}XYZW", "\u{1d54f}".repeat(MAX_REASON_BYTES / 4));
+        let clamped = clamp_reason(reason.clone());
+        let kept = clamped.split(" [truncated").next().unwrap_or_default();
+        assert!(kept.len() <= MAX_REASON_BYTES);
+        assert!(reason.starts_with(kept));
+        assert!(clamped.contains("[truncated 4 of"));
+    }
+
+    /// A remote rejection message reaches the `Rejected` reason bounded, not verbatim.
+    #[test]
+    fn classify_server_error_bounds_remote_reasons() {
+        let huge = "x".repeat(1024 * 1024);
+        let reason = match classify_server_error(3, huge) {
+            Disposition::Rejected(reason) => reason,
+            Disposition::Delivered | Disposition::TryNext(_) | Disposition::Unreachable(_) => {
+                String::new()
+            }
+        };
+        assert!(!reason.is_empty());
+        assert!(reason.len() <= MAX_REASON_BYTES + 64, "reason kept {} bytes", reason.len());
+    }
+
+    /// An HTTP-error transport reason, whose `Display` embeds the response body, is bounded.
+    #[test]
+    fn classify_error_bounds_transport_reasons() {
+        let err = TransportErrorKind::http_error(500, "x".repeat(1024 * 1024));
+        let reason = match classify_error(err) {
+            Disposition::Unreachable(reason) => reason,
+            Disposition::Delivered | Disposition::Rejected(_) | Disposition::TryNext(_) => {
+                String::new()
+            }
+        };
+        assert!(!reason.is_empty());
+        assert!(reason.len() <= MAX_REASON_BYTES + 64, "reason kept {} bytes", reason.len());
+    }
+
+    /// Chunks up to the cap accumulate; the first chunk that would push past it aborts.
+    #[tokio::test]
+    async fn collect_capped_bounds_the_body() {
+        let chunk = || Ok::<_, TransportError>(vec![0u8; 16 * 1024]);
+        let under = futures::stream::iter((0..4).map(|_| chunk()));
+        let body = collect_capped(under).await;
+        assert_eq!(body.map(|body| body.len()).unwrap_or(0), MAX_FORWARD_RESPONSE_BYTES);
+
+        let over = futures::stream::iter((0..5).map(|_| chunk()));
+        assert!(collect_capped(over).await.is_err());
+    }
+
+    /// Serve one canned HTTP response on a loopback socket, then drain the connection.
+    ///
+    /// Draining until the client hangs up (instead of closing right after the write) keeps
+    /// the socket alive while reqwest finishes sending the request, so the test never races
+    /// a reset against the response read.
+    async fn serve_one_response(response: String) -> eyre::Result<Url> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let served = async {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut socket, _) = listener.accept().await?;
+                let (mut reader, mut writer) = socket.split();
+                writer.write_all(response.as_bytes()).await?;
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await
+            };
+            served.await.ok();
+        });
+        Ok(format!("http://{addr}/").parse()?)
+    }
+
+    /// Wrap a JSON-RPC body in a minimal HTTP/1.1 response.
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The capped transport is a working JSON-RPC transport for responses under the cap.
+    #[tokio::test]
+    async fn capped_provider_round_trips_a_small_response() -> eyre::Result<()> {
+        let body = r#"{"jsonrpc":"2.0","id":0,"result":"0x10"}"#;
+        let url = serve_one_response(http_response("200 OK", body)).await?;
+        let number = capped_provider(url).get_block_number().await?;
+        assert_eq!(number, 0x10);
+        Ok(())
+    }
+
+    /// A JSON-RPC error object in a small response still classifies: the cap changes the
+    /// outcome only for oversized bodies, not for verdicts.
+    #[tokio::test]
+    async fn capped_provider_preserves_rpc_error_verdicts() -> eyre::Result<()> {
+        let body = r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"already known"}}"#;
+        let url = serve_one_response(http_response("200 OK", body)).await?;
+        let disposition =
+            capped_provider(url).get_block_number().await.map_or_else(classify_error, |number| {
+                Disposition::TryNext(format!("unexpected success: {number}"))
+            });
+        assert_eq!(disposition, Disposition::Delivered);
+        Ok(())
+    }
+
+    /// A response past the cap is refused as a transport error instead of buffered whole.
+    #[tokio::test]
+    async fn capped_provider_refuses_an_oversized_response() -> eyre::Result<()> {
+        let body = "x".repeat(MAX_FORWARD_RESPONSE_BYTES + 1);
+        let url = serve_one_response(http_response("200 OK", &body)).await?;
+        let outcome = capped_provider(url).get_block_number().await;
+        let reason = outcome.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(reason.contains("forward cap"), "unexpected outcome: {reason}");
+        Ok(())
+    }
 
     /// A forwarder under the shipped default: only public hosts may be dialed.
     fn test_forwarder() -> WorkerRpcForwarder {
@@ -1361,8 +1629,7 @@ mod tests {
             .iter()
             .zip(endpoints)
             .map(|(key, url)| {
-                url.parse()
-                    .map(|parsed: Url| (*key, (parsed.to_string(), RootProvider::new_http(parsed))))
+                url.parse().map(|parsed: Url| (*key, (parsed.to_string(), capped_provider(parsed))))
             })
             .collect();
         providers.map(|providers| (keys, providers)).map_err(Into::into)
@@ -2175,95 +2442,85 @@ mod tests {
         Ok(())
     }
 
-    /// The rotation offset is the counter reduced modulo the list length, total for every
-    /// input a caller can produce.
+    /// The shuffle is a permutation: no entry is ever dropped or duplicated, and the order
+    /// actually moves. Deliberately not an exact-order assertion - rand documents `StdRng`'s
+    /// and the shuffle's algorithms as free to change in any release.
     #[test]
-    fn rotation_start_wraps_and_is_total() {
-        assert_eq!(rotation_start(0, 3), 0);
-        assert_eq!(rotation_start(5, 3), 2);
-        assert_eq!(rotation_start(u64::MAX, 3), 0);
-        assert_eq!(rotation_start(7, 1), 0);
-        // An empty list has no offset to pick: zero, not a division by zero.
-        assert_eq!(rotation_start(9, 0), 0);
+    fn shuffled_fallbacks_permutes_without_losing_entries() {
+        let keys: Vec<_> = (1..=8).map(test_key).collect();
+        let expected: BTreeSet<_> = keys.iter().copied().collect();
+        let mut rng = StdRng::seed_from_u64(1277);
+        let shuffles: Vec<_> =
+            (0..64).map(|_| shuffled_fallbacks(keys.clone(), &mut rng)).collect();
+        shuffles.iter().for_each(|shuffled| {
+            assert_eq!(shuffled.len(), keys.len(), "a shuffle changed the fallback count");
+            assert_eq!(
+                shuffled.iter().copied().collect::<BTreeSet<_>>(),
+                expected,
+                "a shuffle dropped or duplicated a fallback"
+            );
+        });
+        assert!(
+            shuffles.iter().any(|shuffled| *shuffled != keys),
+            "64 shuffles of 8 keys never left input order"
+        );
+        assert!(shuffled_fallbacks(Vec::new(), &mut rng).is_empty());
     }
 
-    /// Rotation permutes the fallback list without dropping or duplicating an entry, and a
-    /// full cycle of counters returns to the identity order.
-    #[test]
-    fn rotated_fallbacks_rotates_left_without_losing_entries() {
-        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 0), vec![a, b, c]);
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 1), vec![b, c, a]);
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 2), vec![c, a, b]);
-        // The cycle closes: three fallbacks, counter three, identity again.
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 3), vec![a, b, c]);
-        assert_eq!(rotated_fallbacks(Vec::new(), 7), Vec::new());
-    }
-
-    /// Consecutive forwards dial a different first fallback: the rotation counter, not the
-    /// key sort, picks where the fallback walk starts, and it advances once per spawned
-    /// forward.
+    /// The fallback dialed first varies across forwards: the shuffle, not the key sort,
+    /// picks where each forward's walk starts.
     ///
-    /// Three counting endpoints, transactions that recover no owner, and the counter pinned
-    /// at zero: four single-transaction batches must land on endpoint one, two, three, then
-    /// one again. Without rotation all four land on the lowest-keyed endpoint.
+    /// Three counting endpoints and 64 single-transaction forwards whose transaction
+    /// recovers no owner. Each forward shuffles afresh, and its one delivery lands on its
+    /// first fallback, so together the dials must reach every endpoint. Without the
+    /// shuffle all 64 land on one endpoint (the lowest-keyed one under the raw sort; one
+    /// fixed per-process pick under the #1173 rotation's random phase). A uniform shuffle
+    /// leaves some endpoint undialed with chance 3 * (2/3)^64, under 2e-11: not a pinned
+    /// counter's certainty, but far below any infrastructure failure rate, and each
+    /// forward holds one instant local dial, so no timing budget couples in either.
     #[tokio::test]
-    async fn spawned_forwards_rotate_the_first_fallback_dialed() -> eyre::Result<()> {
+    async fn spawned_forwards_spread_first_dials_across_fallbacks() -> eyre::Result<()> {
         let (url_one, hits_one) = counting_ok_endpoint()?;
         let (url_two, hits_two) = counting_ok_endpoint()?;
         let (url_three, hits_three) = counting_ok_endpoint()?;
         let manager = TaskManager::default();
         // `AllowPrivate`: the fixture endpoints are loopback sockets, which the shipped
-        // default policy would refuse before the rotation under test was ever reached.
+        // default policy would refuse before the shuffle under test was ever reached.
         let forwarder =
             WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
-        forwarder.fallback_rotation.store(0, Ordering::Relaxed);
-        // Pair each sorted committee key with one endpoint: `providers` iterates in key
-        // order, so the sorted pairing makes "which endpoint is fallback N" exact.
-        let sorted: Vec<BlsPublicKey> = [test_key(1), test_key(2), test_key(3)]
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let keys = vec![test_key(1), test_key(2), test_key(3)];
         let urls = [url_one, url_two, url_three];
-        let rpcs = sorted
+        let rpcs = keys
             .iter()
             .zip(urls.iter())
             .map(|(key, url)| test_rpc(url).map(|rpc| (*key, rpc)))
             .collect::<eyre::Result<Vec<_>>>()?;
-        let counts = || {
-            [
-                hits_one.load(Ordering::Relaxed),
-                hits_two.load(Ordering::Relaxed),
-                hits_three.load(Ordering::Relaxed),
-            ]
-        };
 
-        // One batch of one unrecoverable transaction, awaited to completion, then the hit
-        // counts must equal `expected`. No owner is recovered, so the first fallback is the
-        // first dial, and the permit drain is what awaits the spawned task: capacity only
-        // returns when the forward finishes.
-        let settle = |expected: [usize; 3]| {
-            let forwarder = &forwarder;
-            let sorted = &sorted;
-            let rpcs = &rpcs;
-            let counts = &counts;
-            async move {
-                assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], sorted.clone(), rpcs.clone()));
-                let drained = timeout(
-                    Duration::from_secs(30),
-                    Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
-                )
-                .await??;
-                drop(drained);
-                assert_eq!(counts(), expected);
-                eyre::Ok(())
-            }
-        };
-        settle([1, 0, 0]).await?;
-        settle([1, 1, 0]).await?;
-        settle([1, 1, 1]).await?;
-        settle([2, 1, 1]).await?;
+        // 64 one-transaction forwards: no owner is recovered from the zeroed bytes, so each
+        // forward's first fallback takes its first (and only) dial. 64 is also
+        // [`MAX_CONCURRENT_FORWARDS`], so even a worst case of all forwards in flight at
+        // once sheds nothing. The permit drain is what awaits the spawned tasks (capacity
+        // only returns when a forward finishes).
+        (0..64).for_each(|_| {
+            assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], keys.clone(), rpcs.clone()));
+        });
+        let drained = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await??;
+        drop(drained);
+
+        let counts = [
+            hits_one.load(Ordering::Relaxed),
+            hits_two.load(Ordering::Relaxed),
+            hits_three.load(Ordering::Relaxed),
+        ];
+        assert_eq!(counts.iter().sum::<usize>(), 64, "every delivery stops at one dial");
+        assert!(
+            counts.iter().all(|count| *count > 0),
+            "an endpoint was never dialed first: {counts:?}"
+        );
         Ok(())
     }
 }

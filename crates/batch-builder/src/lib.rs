@@ -1106,7 +1106,13 @@ mod tests {
             // spawn blocking for payload_builder::blocking_recv
             let owned_ga = gas_accumulator.clone();
             let final_header = tokio::task::spawn_blocking(move || {
-                execute_consensus_output(args, owned_ga, engine_update_tx).expect("output executed")
+                execute_consensus_output(
+                    args,
+                    owned_ga,
+                    tn_types::repack_monitor::RepackMonitor::default(),
+                    engine_update_tx,
+                )
+                .expect("output executed")
             })
             .await
             .unwrap();
