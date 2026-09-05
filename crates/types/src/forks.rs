@@ -859,18 +859,17 @@ pub const GOVERNANCE_SAFE_FORK_CANONICAL_SUITE: [(&str, Address, B256); 13] = [
 /// `tn-reth::evm::block::apply_governance_safe_fork` exactly once (one-shot `==` trigger, the
 /// same shape as [`CONSENSUS_REGISTRY_FORK_EPOCH`]), bringing live adiri's Safe stack to parity
 /// with mainnet genesis:
-/// - **etch** the eleven [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] contracts adiri lacks
-///   (SafeL2 + fallback handler + libraries + both migration helpers + the singleton factory),
-///   each gated on the target address holding no code;
-/// - **swap** the two recompiled deployments — the `Safe` singleton and the `SafeProxyFactory` —
-///   to the canonical bytes, each gated fail-closed on its pre-fork pin
-///   ([`SAFE_SINGLETON_PRE_FORK_CODE_HASH`], [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]),
-///   preserving balance, nonce, and all storage;
-/// - **migrate** the governance Safe proxy: slot 0 (singleton) from the L1 `Safe` to `SafeL2`
-///   and the fallback-handler slot from unset to the canonical
-///   `CompatibilityFallbackHandler`, gated fail-closed on
-///   [`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`] and on slot 0 still holding the L1 singleton.
-///   Owners, threshold, the Safe nonce, and the TEL balance are untouched.
+/// - **etch** the eleven [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] contracts adiri lacks (SafeL2 +
+///   fallback handler + libraries + both migration helpers + the singleton factory), each gated on
+///   the target address holding no code;
+/// - **swap** the two recompiled deployments — the `Safe` singleton and the `SafeProxyFactory` — to
+///   the canonical bytes, each gated fail-closed on its pre-fork pin
+///   ([`SAFE_SINGLETON_PRE_FORK_CODE_HASH`], [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]), preserving
+///   balance, nonce, and all storage;
+/// - **migrate** the governance Safe proxy: slot 0 (singleton) from the L1 `Safe` to `SafeL2` and
+///   the fallback-handler slot from unset to the canonical `CompatibilityFallbackHandler`, gated
+///   fail-closed on [`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`] and on slot 0 still holding the L1
+///   singleton. Owners, threshold, the Safe nonce, and the TEL balance are untouched.
 ///
 /// Why a protocol fork instead of a governance transaction: the sanctioned in-Safe path,
 /// `SafeToL2Migration.migrateToL2`, requires the Safe's storage nonce to be exactly 1 (its

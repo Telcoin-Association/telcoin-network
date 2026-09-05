@@ -1145,19 +1145,19 @@ where
     ///
     /// Brings live adiri's Safe stack to parity with mainnet genesis in one deterministic
     /// commit (see `tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH` for the full runbook):
-    /// - **etch** the eleven canonical v1.4.1 contracts adiri lacks (SafeL2, the fallback
-    ///   handler, the delegatecall libraries, both migration helpers, the singleton factory) —
-    ///   each target must hold no code (a stray balance is preserved; the nonce lands on the
-    ///   EIP-161 contract-account value 1, mirroring mainnet genesis);
-    /// - **swap** the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical
-    ///   bytes — code-only, preserving balance, nonce, and all storage, gated fail-closed on
-    ///   the pinned pre-fork hashes (Safe v1.4.1 storage layout is identical between the
-    ///   recompile and the canonical build, so the preserved slots stay valid);
+    /// - **etch** the eleven canonical v1.4.1 contracts adiri lacks (SafeL2, the fallback handler,
+    ///   the delegatecall libraries, both migration helpers, the singleton factory) — each target
+    ///   must hold no code (a stray balance is preserved; the nonce lands on the EIP-161
+    ///   contract-account value 1, mirroring mainnet genesis);
+    /// - **swap** the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical bytes —
+    ///   code-only, preserving balance, nonce, and all storage, gated fail-closed on the pinned
+    ///   pre-fork hashes (Safe v1.4.1 storage layout is identical between the recompile and the
+    ///   canonical build, so the preserved slots stay valid);
     /// - **migrate** the governance Safe proxy onto SafeL2: slot 0 (singleton) and the
-    ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's
-    ///   pinned code hash AND on slot 0 still holding the L1 singleton. Owners, threshold,
-    ///   the Safe nonce, and the TEL balance are untouched (preserved by omission — only
-    ///   changed slots enter the bundle).
+    ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's pinned
+    ///   code hash AND on slot 0 still holding the L1 singleton. Owners, threshold, the Safe nonce,
+    ///   and the TEL balance are untouched (preserved by omission — only changed slots enter the
+    ///   bundle).
     ///
     /// Fires exactly once, from the epoch-closing block that concludes
     /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` (one-shot `==` trigger in `finish`). No system call
@@ -2311,10 +2311,10 @@ mod tests {
     /// since the pins were taken":
     /// 1. a swap target off its pin — the `Safe` singleton account is overwritten with the
     ///    post-fork registry artifact bytes (any hash other than
-    ///    `SAFE_SINGLETON_PRE_FORK_CODE_HASH`), and the boundary must abort rather than
-    ///    swap over an unknown storage layout;
-    /// 2. an etch target that already carries code — a squatter at the canonical SafeL2
-    ///    address, over which etching would silently bury a deployment.
+    ///    `SAFE_SINGLETON_PRE_FORK_CODE_HASH`), and the boundary must abort rather than swap over
+    ///    an unknown storage layout;
+    /// 2. an etch target that already carries code — a squatter at the canonical SafeL2 address,
+    ///    over which etching would silently bury a deployment.
     ///
     /// (Without the gates both blocks would execute — the etch bytes are position-independent
     /// and the swap is storage-compatible — making this test the discriminating check.)
