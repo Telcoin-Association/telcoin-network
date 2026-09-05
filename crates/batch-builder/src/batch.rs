@@ -98,16 +98,13 @@ pub fn build_batch<P: TxPool>(
         // before continuing loop. For the deferral that is deliberate: a later nonce from the
         // same sender would land nonce-gapped and only be skipped at execution.
         if deferred_by_peer || exceeds_gas_limit {
-            match deferred_by_peer {
-                true => {
-                    best_txs.peer_deferred(&pool_tx);
-                    peer_deferred = peer_deferred.saturating_add(1);
-                    debug!(target: "worker::batch_builder", ?pool_tx, "deferring tx already packed by a validated peer batch");
-                }
-                false => {
-                    best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
-                    debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
-                }
+            if deferred_by_peer {
+                best_txs.peer_deferred(&pool_tx);
+                peer_deferred = peer_deferred.saturating_add(1);
+                debug!(target: "worker::batch_builder", ?pool_tx, "deferring tx already packed by a validated peer batch");
+            } else {
+                best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             }
             continue;
         }

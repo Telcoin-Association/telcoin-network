@@ -230,88 +230,85 @@ impl BatchBuilder {
             // score the sender a fatal penalty, so report no work and send nothing to the worker
             // (issue #1329). The deferral metric above is still recorded: this build is exactly
             // the case an operator watches that metric for.
-            match batch.transactions.is_empty() {
-                true => {
-                    debug!(
-                        target: "worker::batch_builder",
-                        peer_deferred,
-                        "every pending transaction is deferred by a peer batch; sealing nothing"
-                    );
-                    result.send(Ok(BuildOutcome::NothingToSeal)).err().into_iter().for_each(|e| {
-                        error!(target: "worker::batch_builder", ?e, "failed to send no-work outcome to block builder task");
-                    });
-                    Ok(())
+            if batch.transactions.is_empty() {
+                debug!(
+                    target: "worker::batch_builder",
+                    peer_deferred,
+                    "every pending transaction is deferred by a peer batch; sealing nothing"
+                );
+                result.send(Ok(BuildOutcome::NothingToSeal)).err().into_iter().for_each(|e| {
+                    error!(target: "worker::batch_builder", ?e, "failed to send no-work outcome to block builder task");
+                });
+                Ok(())
+            } else {
+                let batch = batch.seal_slow();
+                span.record("batch", batch.digest().to_string());
+
+                // forward to worker and wait for ack that quorum was reached
+                if let Err(e) = to_worker.send((batch, ack)).await {
+                    error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
+                    // try to return error if worker channel closed
+                    let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
+                    return Err(e.into());
                 }
-                false => {
-                    let batch = batch.seal_slow();
-                    span.record("batch", batch.digest().to_string());
 
-                    // forward to worker and wait for ack that quorum was reached
-                    if let Err(e) = to_worker.send((batch, ack)).await {
-                        error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
-                        // try to return error if worker channel closed
-                        let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
-                        return Err(e.into());
-                    }
-
-                    // wait for worker to ack quorum reached then update pool with mined txs
-                    match rx.await {
-                        Ok(res) => {
-                            // measures build + broadcast + quorum, regardless of outcome
-                            metrics.seal_duration_seconds.record(seal_start.elapsed());
-                            match res {
-                                Ok(_) => {
-                                    debug!(target: "worker::batch-builder", ?res, "received ack");
-                                    metrics.batches_sealed_total.increment(1);
-                                    // signal to Self that this task is complete
-                                    if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
-                                        error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
-                                    }
+                // wait for worker to ack quorum reached then update pool with mined txs
+                match rx.await {
+                    Ok(res) => {
+                        // measures build + broadcast + quorum, regardless of outcome
+                        metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        match res {
+                            Ok(_) => {
+                                debug!(target: "worker::batch-builder", ?res, "received ack");
+                                metrics.batches_sealed_total.increment(1);
+                                // signal to Self that this task is complete
+                                if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
+                                    error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                                 }
-                                Err(error) => {
-                                    metrics.record_seal_failure(worker_id, &error);
-                                    let converted = match error {
-                                        BlockSealError::FatalDBFailure => {
-                                            // fatal - return error
-                                            Err(BatchBuilderError::FatalDBFailure)
-                                        }
-                                        // The observer refusal is expected steady state whenever
-                                        // no committee endpoint is reachable, so the per-attempt
-                                        // line stays at debug; the run loop owns the
-                                        // state-change-gated logging and the retry backoff
-                                        // (issue #1145).
-                                        BlockSealError::NotValidator => {
-                                            debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
-                                            Ok(BuildOutcome::Refused)
-                                        }
-                                        BlockSealError::QuorumRejected
-                                        | BlockSealError::AntiQuorum
-                                        | BlockSealError::Timeout
-                                        | BlockSealError::FailedToReport
-                                        | BlockSealError::FailedQuorum => {
-                                            error!(target: "worker::batch_builder", ?error, "error while sealing batch");
-                                            // potentially non-fatal error
-                                            //
-                                            // NOTE: this applies no changes to transaction pool
-                                            Ok(BuildOutcome::Failed)
-                                        }
-                                    };
-
-                                    if let Err(e) = result.send(converted) {
-                                        error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                            }
+                            Err(error) => {
+                                metrics.record_seal_failure(worker_id, &error);
+                                let converted = match error {
+                                    BlockSealError::FatalDBFailure => {
+                                        // fatal - return error
+                                        Err(BatchBuilderError::FatalDBFailure)
                                     }
+                                    // The observer refusal is expected steady state whenever
+                                    // no committee endpoint is reachable, so the per-attempt
+                                    // line stays at debug; the run loop owns the
+                                    // state-change-gated logging and the retry backoff
+                                    // (issue #1145).
+                                    BlockSealError::NotValidator => {
+                                        debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
+                                        Ok(BuildOutcome::Refused)
+                                    }
+                                    BlockSealError::QuorumRejected
+                                    | BlockSealError::AntiQuorum
+                                    | BlockSealError::Timeout
+                                    | BlockSealError::FailedToReport
+                                    | BlockSealError::FailedQuorum => {
+                                        error!(target: "worker::batch_builder", ?error, "error while sealing batch");
+                                        // potentially non-fatal error
+                                        //
+                                        // NOTE: this applies no changes to transaction pool
+                                        Ok(BuildOutcome::Failed)
+                                    }
+                                };
+
+                                if let Err(e) = result.send(converted) {
+                                    error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
-                            if let Err(e) = result.send(Err(e.into())) {
-                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
-                            }
+                    }
+                    Err(e) => {
+                        error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
+                        if let Err(e) = result.send(Err(e.into())) {
+                            error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                         }
                     }
-                    Ok(())
                 }
+                Ok(())
             }
         }.instrument(span_clone));
 
