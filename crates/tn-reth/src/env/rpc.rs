@@ -26,7 +26,7 @@ use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
-use tn_types::gas_accumulator::BaseFeeContainer;
+use tn_types::gas_accumulator::WorkerBaseFee;
 
 use crate::{
     error::TnRethResult,
@@ -77,8 +77,11 @@ impl RethEnv {
     /// Build and return the RPC server for the instance.
     /// This probably needs better abstraction.
     ///
-    /// `base_fee` is this worker's shared epoch base-fee container: the corrected
-    /// `eth_feeHistory` answers its next-block entry from it (`crate::rpc_fee_history`).
+    /// `base_fee` is this worker's per-query epoch base-fee handle: the corrected
+    /// `eth_feeHistory` resolves its next-block entry through it on every request
+    /// (`crate::rpc_fee_history`). A handle rather than a pinned `BaseFeeContainer`
+    /// clone, so the quote tracks the accumulator across worker-count changes
+    /// (issue #1282).
     ///
     /// Errors when the corrected fee-history method or the `--rpc.txfeecap` guard
     /// (`crate::rpc_fee_cap`) cannot replace the stock eth handlers.
@@ -86,7 +89,7 @@ impl RethEnv {
         &self,
         transaction_pool: WorkerTxPool,
         network: WorkerNetwork,
-        base_fee: BaseFeeContainer,
+        base_fee: WorkerBaseFee,
         other: impl Into<Methods>,
     ) -> eyre::Result<RpcServer> {
         let transaction_pool: EthTransactionPool<
@@ -179,8 +182,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{
-        gas_accumulator::BaseFeeContainer, test_genesis, Address, Bytes, Encodable2718 as _,
-        TaskManager, B256, U256,
+        gas_accumulator::{BaseFeeContainer, GasAccumulator},
+        test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, WorkerId, B256, U256,
     };
     use url::Url;
 
@@ -210,7 +213,12 @@ mod tests {
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool.clone(), network, BaseFeeContainer::default(), RpcModule::new(()))
+            .get_rpc_server(
+                pool.clone(),
+                network,
+                GasAccumulator::new(1).worker_base_fee(0),
+                RpcModule::new(()),
+            )
             .expect("rpc server with fee-cap guard");
         (server.methods_by(|name| name.starts_with("eth_send")), pool, chain)
     }
@@ -234,7 +242,12 @@ mod tests {
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool, network, BaseFeeContainer::default(), RpcModule::new(()))
+            .get_rpc_server(
+                pool,
+                network,
+                GasAccumulator::new(1).worker_base_fee(0),
+                RpcModule::new(()),
+            )
             .expect("rpc server");
 
         let disallowed = server.methods_by(|name| {
@@ -458,12 +471,17 @@ mod tests {
             None,
             reth::args::RpcServerArgs::default(),
         )?;
-        // One shared container for the pool and the RPC server, as in production (#1262).
-        let base_fee = BaseFeeContainer::default();
-        let pool = reth_env.init_txn_pool(base_fee.clone())?;
+        // One accumulator feeds the pool's container and the RPC server's handle, as in
+        // production (#1262, #1282).
+        let accumulator = GasAccumulator::new(1);
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(0))?;
         let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
-        let server =
-            reth_env.get_rpc_server(pool, network.clone(), base_fee, RpcModule::new(()))?;
+        let server = reth_env.get_rpc_server(
+            pool,
+            network.clone(),
+            accumulator.worker_base_fee(0),
+            RpcModule::new(()),
+        )?;
         let methods = server.methods_by(|name| name == "eth_syncing");
 
         let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
@@ -507,13 +525,15 @@ mod tests {
         assert_eq!(config.pending_block_kind, PendingBlockKind::None);
     }
 
-    /// Build a temp env whose worker base-fee container holds `epoch_fee` and return the
-    /// production-registered fee-quote intercepts (`eth_feeHistory`, `eth_blobBaseFee`).
+    /// Build a temp env whose RPC server quotes `worker_id`'s base fee from `accumulator`
+    /// and return the production-registered fee-quote intercepts (`eth_feeHistory`,
+    /// `eth_blobBaseFee`).
     ///
     /// [`RethEnv::get_rpc_server`] is the only RPC construction path in the node, so a
     /// call through the returned methods exercises the registered handler, not a copy.
-    fn fee_history_methods(
-        epoch_fee: u64,
+    fn fee_history_methods_for_worker(
+        accumulator: &GasAccumulator,
+        worker_id: WorkerId,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> Methods {
@@ -530,14 +550,30 @@ mod tests {
             reth::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
-        // One shared container for the pool and the RPC server, as in production (#1262).
-        let base_fee = BaseFeeContainer::new(epoch_fee);
-        let pool = reth_env.init_txn_pool(base_fee.clone()).expect("txn pool");
+        // One accumulator feeds the pool's container and the RPC server's handle, as in
+        // production (#1262, #1282).
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(worker_id)).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool, network, base_fee, RpcModule::new(()))
+            .get_rpc_server(
+                pool,
+                network,
+                accumulator.worker_base_fee(worker_id),
+                RpcModule::new(()),
+            )
             .expect("rpc server with corrected fee history");
         server.methods_by(|name| name == "eth_feeHistory" || name == "eth_blobBaseFee")
+    }
+
+    /// [`fee_history_methods_for_worker`] over a one-worker accumulator holding `epoch_fee`.
+    fn fee_history_methods(
+        epoch_fee: u64,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> Methods {
+        let accumulator = GasAccumulator::new(1);
+        accumulator.base_fee(0).set_base_fee(epoch_fee);
+        fee_history_methods_for_worker(&accumulator, 0, task_manager, tmp_dir)
     }
 
     /// The next-block `baseFeePerGas` entry at the tip is the worker's epoch base fee,
@@ -561,6 +597,37 @@ mod tests {
         assert_eq!(history.base_fee_per_gas.last().copied(), Some(u128::from(epoch_fee)));
         let genesis_entry = history.base_fee_per_gas.first().copied().expect("genesis entry");
         assert_ne!(genesis_entry, u128::from(epoch_fee), "only the final entry is corrected");
+    }
+
+    /// Issue #1282 regression: the tip quote tracks the accumulator across a worker-count
+    /// shrink and regrow. The server is built for worker id 1, the count shrinks below it
+    /// and grows back (replacing the slot's container), and the next epoch fee lands in the
+    /// new container. A pinned `BaseFeeContainer` clone would keep quoting the pre-shrink
+    /// fee; the per-query handle reports the live one.
+    #[tokio::test]
+    async fn test_fee_history_quote_tracks_accumulator_across_shrink_and_regrow() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let pre_shrink_fee = 1_111_111_111_u64;
+        accumulator.base_fee(1).set_base_fee(pre_shrink_fee);
+        let methods = fee_history_methods_for_worker(&accumulator, 1, &task_manager, &tmp_dir);
+
+        accumulator.set_num_workers(1);
+        accumulator.set_num_workers(2);
+        let live_fee = 2_222_222_222_u64;
+        accumulator.base_fee(1).set_base_fee(live_fee);
+
+        let history: FeeHistory = methods
+            .call("eth_feeHistory", rpc_params![U64::from(1_u64), "latest"])
+            .await
+            .expect("fee history");
+
+        assert_eq!(
+            history.base_fee_per_gas.last().copied(),
+            Some(u128::from(live_fee)),
+            "the tip quote must come from the slot the accumulator currently owns",
+        );
     }
 
     /// The `pending` tag takes the same corrected path: reth caps it to `latest`, so the
