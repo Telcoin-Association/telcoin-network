@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use crate::{
     archive::{
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,

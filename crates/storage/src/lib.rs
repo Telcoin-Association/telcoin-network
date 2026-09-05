@@ -33,6 +33,9 @@ pub mod mem_db;
 /// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
 #[cfg(test)]
 mod pack_bench;
+/// On-demand raw-KV benchmark: pack files vs MDBX (see `pack_kv_bench.rs`).
+#[cfg(test)]
+mod pack_kv_bench;
 pub mod pack_validate;
 pub mod redb;
 
@@ -475,6 +478,7 @@ mod test {
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear with one item
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
         db.sync_persist(); // Either a no-op or a chance for write ops to catch up.

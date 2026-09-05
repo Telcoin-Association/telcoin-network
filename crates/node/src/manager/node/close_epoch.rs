@@ -568,15 +568,28 @@ where
         // complete file. The consensus pack is only persisted by the *next* epoch's `new_epoch`, so
         // persist it here while epoch N is still the current pack. The bounded records/certs bundle
         // is built through the actor (not copied), so no records-pack flush is needed here. A
-        // persist hiccup must not crash the node, so log and skip the export.
-        // Note, if we are here the epoch has concluded and no more data will be written to the
-        // current epoch pack file.  This why this is safe to do now, it simply means the
-        // file will be flushed before it is copied without depending on the rest of the
-        // epoch close.
+        // persist hiccup must not crash the node, so log and skip the export. The `data_len`
+        // capture below (not a padding-truncate) is what makes the later copy correct, so
+        // this no longer depends on the epoch being quiescent between here and the deferred
+        // copy.
         if let Err(e) = self.consensus_chain.persist_current().await {
             warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
             return Ok(());
         }
+        // Capture the pack's logical data length (`end`) while epoch N is still current. The
+        // completion task bounds its raw copy of the `data` file to this length, so it captures
+        // exactly the written records (`[0, end)`, immutable append-only bytes) and never the mmap
+        // capacity padding past `end` — which a raw read-to-EOF copy would include and which fails
+        // the importer's record-CRC walk. Bounding by length needs no truncation of the live pack
+        // and is immune to any concurrent append (an append only extends past `end`). Skip on
+        // error.
+        let data_len = match self.consensus_chain.current_data_len().await {
+            Ok(len) => len,
+            Err(e) => {
+                warn!(target: "tn::snapshot", epoch, error = %e, "could not read consensus pack length; skipping export");
+                return Ok(());
+            }
+        };
         // The consensus pack is a per-epoch file under the epochs base dir; it is copied into the
         // bundle. The records/certs are written from the actor in the completion task instead.
         let epochs_dir = self.tn_datadir.epochs_db_path();
@@ -637,15 +650,23 @@ where
                         // bundle into place; external tooling watches for the final dir appearing
                         // atomically.
                         Ok(Ok(Some(outcome))) => {
-                            // Safe: the closed epoch's pack is sealed at export time (see the
-                            // persist note above) — no writer appends to a concluded epoch's pack,
-                            // so this reads a complete, immutable file. The pack scales with the
-                            // epoch's consensus throughput, so copy it on the blocking pool
-                            // instead of pinning a runtime worker for the duration; a
-                            // cancelled/panicked blocking task surfaces as the same copy error.
+                            // Copy exactly the pack's logical `data_len` bytes (captured above while
+                            // epoch N was current), not to physical EOF: `[0, data_len)` is the
+                            // immutable, append-only record region, so this never captures the mmap
+                            // capacity padding past `end` (which fails the importer's record-CRC
+                            // walk) and is immune to any concurrent append. `sync_all` makes the
+                            // exported artifact durable. The pack scales with the epoch's consensus
+                            // throughput, so copy it on the blocking pool instead of pinning a
+                            // runtime worker; a cancelled/panicked blocking task surfaces as the
+                            // same copy error.
                             let copy_dst = tmp_dir.join("consensus_data");
-                            let copied = tokio::task::spawn_blocking(move || {
-                                std::fs::copy(&src_consensus, &copy_dst)
+                            let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                                use std::io::Read as _;
+                                let mut src = std::fs::File::open(&src_consensus)?;
+                                let mut dst = std::fs::File::create(&copy_dst)?;
+                                std::io::copy(&mut (&mut src).take(data_len), &mut dst)?;
+                                dst.sync_all()?;
+                                Ok(())
                             })
                             .await
                             .map_err(std::io::Error::other)
@@ -702,14 +723,25 @@ where
                             }
 
                             match std::fs::rename(&tmp_dir, &final_dir) {
-                                Ok(()) => info!(
-                                    target: "tn::snapshot",
-                                    epoch,
-                                    block = outcome.block.number,
-                                    accounts = outcome.stats.account_count,
-                                    path = ?final_dir,
-                                    "exported epoch state + consensus + records + certs"
-                                ),
+                                Ok(()) => {
+                                    // Durably publish the atomic rename: fsync the parent dir so the
+                                    // new directory entry survives a crash (the rename is atomic vs
+                                    // observers, but not durable on its own).
+                                    if let Some(parent) = final_dir.parent().map(Path::to_path_buf) {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            std::fs::File::open(&parent).and_then(|d| d.sync_all())
+                                        })
+                                        .await;
+                                    }
+                                    info!(
+                                        target: "tn::snapshot",
+                                        epoch,
+                                        block = outcome.block.number,
+                                        accounts = outcome.stats.account_count,
+                                        path = ?final_dir,
+                                        "exported epoch state + consensus + records + certs"
+                                    );
+                                }
                                 Err(e) => {
                                     error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
                                     remove_tmp_export(&tmp_dir, epoch).await;

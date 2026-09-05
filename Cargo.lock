@@ -11980,6 +11980,7 @@ dependencies = [
  "crc32fast",
  "dashmap",
  "eyre",
+ "memmap2",
  "ouroboros",
  "page_size",
  "parking_lot",

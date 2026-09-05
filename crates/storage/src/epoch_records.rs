@@ -29,7 +29,7 @@ use tracing::{debug, error};
 use crate::{
     archive::{
         data_file::create_dir_synced,
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -2115,8 +2115,10 @@ mod test {
             .write(true)
             .open(&records_path)
             .expect("open records file");
+        // The clean close appended an 8-byte sentinel past the last record; strip it and one more
+        // byte so the truncation actually damages the final record (not just the sentinel).
         let original_len = f.seek(SeekFrom::End(0)).expect("seek");
-        f.set_len(original_len - 1).expect("truncate -1");
+        f.set_len(original_len - crate::archive::data_file::SENTINEL_LEN - 1).expect("truncate");
         drop(f);
 
         // Reopen should heal: last record is dropped, all others remain readable.
