@@ -29,7 +29,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::archive::{
     data_file::create_dir_synced,
@@ -890,6 +890,67 @@ impl Inner {
         Ok((consensus_digests, batch_digests))
     }
 
+    /// Open all three of an epoch's indexes for append, rebuilding them from the data log if any is
+    /// broken.
+    ///
+    /// The data log is the source of truth and the indexes are always reconstructable from it, so
+    /// an index that exists but will not open (a corrupt header CRC, or a version/uid/geometry/
+    /// hasher mismatch surfaced as a [`LoadHeaderError`]) must not abort the open. On any open
+    /// failure every index is discarded and recreated empty; the caller's [`Self::recover_pack`]
+    /// then replays the data log to repopulate them and truncate any torn tail, yielding a clean,
+    /// self-consistent pack.
+    fn open_indexes_for_append(
+        base_dir: &Path,
+        data_header: &DataHeader,
+    ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
+        match Self::try_open_indexes(base_dir, data_header) {
+            Ok(indexes) => Ok(indexes),
+            Err(e) => {
+                warn!(
+                    target: "consensus::pack",
+                    "epoch pack {} index failed to open ({e}); discarding and rebuilding all \
+                     indexes from the data log",
+                    base_dir.display(),
+                );
+                Self::reset_all_indexes(base_dir, data_header)
+            }
+        }
+    }
+
+    /// Open all three indexes for append, creating any that are missing and returning an error if
+    /// an existing index will not open. The fallible counterpart to
+    /// [`Self::open_indexes_for_append`]'s discard-and-rebuild fallback; also used to reopen the
+    /// freshly emptied indexes after [`Self::reset_all_indexes`] wipes them.
+    fn try_open_indexes(
+        base_dir: &Path,
+        data_header: &DataHeader,
+    ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
+        let consensus_pos_idx = Self::open_pdx_file(base_dir, data_header, false)?;
+        let (consensus_digests, batch_digests) =
+            Self::open_digest_indexes(base_dir, data_header, false)?;
+        Ok((consensus_pos_idx, consensus_digests, batch_digests))
+    }
+
+    /// Discard all three of an epoch's index directories and recreate them empty.
+    ///
+    /// Called when an index will not open. The data log is authoritative, so removing the stale or
+    /// damaged indexes and letting [`Self::recover_pack`] replay the log rebuilds a clean pack. A
+    /// directory that is already absent is not an error (nothing to discard); any other filesystem
+    /// failure propagates.
+    fn reset_all_indexes(
+        base_dir: &Path,
+        data_header: &DataHeader,
+    ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
+        for name in [Self::CONSENSUS_POS_NAME, Self::CONSENSUS_HASH_NAME, Self::BATCH_HASH_NAME] {
+            match std::fs::remove_dir_all(base_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Self::try_open_indexes(base_dir, data_header)
+    }
+
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
     ///
@@ -920,8 +981,6 @@ impl Inner {
             genesis_exec_state: previous_epoch.final_state,
             genesis_consensus: previous_epoch.final_consensus,
         };
-
-        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
 
         // Set by the header-only branch, which writes a fresh meta at the data header.  The pack is
         // then byte-for-byte a freshly created one, so it needs the same index initialization.
@@ -972,8 +1031,11 @@ impl Inner {
             data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             wrote_fresh_meta = true;
         }
-        let (mut consensus_digests, mut batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false)?;
+        // The data file and its epoch meta are now established and durable -- the parts that are
+        // not repairable. Only now open the indexes, rebuilding all of them from the data log if
+        // any is broken, so an index problem can never abort the open.
+        let (consensus_pos_idx, mut consensus_digests, mut batch_digests) =
+            Self::open_indexes_for_append(&base_dir, data.header())?;
         if !have_pack || wrote_fresh_meta {
             // A new DB, or a header-only file that just had its meta written, needs the index file
             // lengths initialized to the current data length. A header-only reopen counts as new:
@@ -1020,9 +1082,11 @@ impl Inner {
                 ))
             })?
             .into_epoch()?;
-        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
-        let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false)?;
+        // The data file and its epoch meta are established. Open the indexes, rebuilding all of
+        // them from the data log if any is broken so an index problem can never abort the
+        // open.
+        let (consensus_pos_idx, consensus_digests, batch_digests) =
+            Self::open_indexes_for_append(&base_dir, data.header())?;
 
         // Rebuild the indexes from the data-log WAL and truncate any torn tail record.
         let (consensus_pos_idx, consensus_digests, batch_digests) = Self::recover_pack(
@@ -3710,6 +3774,114 @@ pub(crate) mod test {
                 );
             }
         }
+    }
+
+    /// Truncate an index file below its header so its next open short-reads and errors, standing in
+    /// for an index that is present on disk but will not open (a corrupt/torn header). Truncation
+    /// is a deterministic open failure for every index type; a zero-length file would instead
+    /// be (re)created empty and never exercise the open-error path, so keep a few bytes.
+    fn break_index_file(path: &std::path::Path) {
+        let f = OpenOptions::new().write(true).open(path).expect("open index file to corrupt");
+        f.set_len(4).expect("truncate index file header");
+    }
+
+    /// After an append open rebuilt the indexes, every output `1..=n` must be reachable again by
+    /// number and by digest through a fresh read-only open — proof the pack is self-consistent.
+    async fn assert_pack_reads_back(temp_dir: &TempDir, n: u64) {
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after rebuild");
+        for i in 1..=n {
+            let out = pack.get_consensus_output(i).await.expect("output by number");
+            assert!(
+                pack.contains_consensus_header(out.consensus_header_hash()).await,
+                "consensus digest for output {i} must be indexed after rebuild"
+            );
+            if let Some(bd) =
+                out.batches().first().and_then(|c| c.batches.first()).map(|b| b.digest())
+            {
+                assert!(
+                    pack.contains_batch(bd).await,
+                    "batch digest for output {i} must be indexed after rebuild"
+                );
+            }
+        }
+    }
+
+    /// Build a pack, break one index file so it will not open, then reopen for append: the open
+    /// must discard all indexes and rebuild them from the (intact) data log rather than
+    /// aborting with an error. `rel_index` is the epoch-relative path of the index file to
+    /// corrupt.
+    async fn assert_corrupt_index_rebuilds_on_append(rel_index: &[&str]) {
+        let temp_dir = TempDir::with_prefix("test_corrupt_index_rebuild").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 5).await;
+
+        // Corrupt the chosen index; the data log stays untouched (it is the source of truth).
+        let mut index_path = temp_dir.path().join("epoch-0");
+        for part in rel_index {
+            index_path = index_path.join(part);
+        }
+        break_index_file(&index_path);
+
+        // Append open must not abort on the broken index — it rebuilds all indexes from the log.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append must rebuild a broken index instead of aborting");
+            pack.persist().await.expect("persist");
+        }
+
+        assert_pack_reads_back(&temp_dir, 5).await;
+    }
+
+    /// A present-but-corrupt *position* index must not abort an append open: it is rebuilt from the
+    /// data log.
+    #[tokio::test]
+    async fn test_open_append_rebuilds_on_corrupt_position_index() {
+        assert_corrupt_index_rebuilds_on_append(&["idx", "index_pos.pdx"]).await;
+    }
+
+    /// A present-but-corrupt *consensus digest* index must not abort an append open: it is rebuilt
+    /// from the data log.
+    #[tokio::test]
+    async fn test_open_append_rebuilds_on_corrupt_consensus_digest_index() {
+        assert_corrupt_index_rebuilds_on_append(&["hash", "index.hdx"]).await;
+    }
+
+    /// A present-but-corrupt *batch digest* index must not abort an append open: it is rebuilt from
+    /// the data log.
+    #[tokio::test]
+    async fn test_open_append_rebuilds_on_corrupt_batch_digest_index() {
+        assert_corrupt_index_rebuilds_on_append(&["bhash", "index.hdx"]).await;
+    }
+
+    /// The `open_append_exists` door (taken on restart for an already-created epoch) also rebuilds
+    /// a broken index from the data log rather than aborting.
+    #[tokio::test]
+    async fn test_open_append_exists_rebuilds_on_corrupt_index() {
+        let temp_dir = TempDir::with_prefix("test_corrupt_index_exists").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+
+        // Break the consensus digest index; the data log is intact.
+        break_index_file(&temp_dir.path().join("epoch-0").join("hash").join("index.hdx"));
+
+        {
+            let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+                .expect("open_append_exists must rebuild a broken index instead of aborting");
+            pack.persist().await.expect("persist");
+        }
+
+        assert_pack_reads_back(&temp_dir, 4).await;
     }
 
     /// A torn *next* output header (a partial record appended after several complete outputs) is
