@@ -41,6 +41,9 @@ pub enum BatchBuilderError {
     /// An operation that requires canonical state did not have it.
     #[error("Missing canonical state.")]
     MissingCanonical,
+    /// A blocking transaction-pool update failed before the next batch could be built.
+    #[error("Blocking transaction-pool update failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 impl From<oneshot::error::RecvError> for BatchBuilderError {

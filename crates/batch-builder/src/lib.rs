@@ -89,7 +89,7 @@ struct RefusalBackoff {
     refusals: u32,
 }
 
-/// Type alias for the blocking task that locks the tx pool and builds the next batch.
+/// Receiver for the async task that awaits a blocking batch build and the worker's seal result.
 type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 
 /// The type that builds blocks for workers to propose.
@@ -100,8 +100,8 @@ type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 ///     - tries to build the next batch when there transactions are available
 #[derive(Debug)]
 pub struct BatchBuilder {
-    /// Single active future that executes consensus output on a blocking thread and then returns
-    /// the result through a oneshot channel.
+    /// Single active task that awaits batch construction on the blocking pool, proposes it, and
+    /// returns the seal result through a oneshot channel.
     pending_task: Option<BuildResult>,
     /// The transaction pool with pending transactions.
     pool: WorkerTxPool,
@@ -210,7 +210,8 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } =
+                batch::spawn_batch_build(build_args, worker_id, base_fee).await?;
             let batch = batch.seal_slow();
             span.record("batch", batch.digest().to_string());
 
@@ -468,14 +469,14 @@ impl BatchBuilder {
                     // update pool to remove mined transactions
                     //
                     // The pool derives its pending fee from the shared per-worker container, so
-                    // a stale `last_canonical_update` — at an epoch boundary, the previous
-                    // epoch's closing block — cannot reprice the pool (issue #1262).
+                    // a stale `last_canonical_update` (at an epoch boundary, the previous
+                    // epoch's closing block) cannot reprice the pool (issue #1262).
                     self.pool.update_canonical_state(
                         &self.last_canonical_update,
                         Some(u128::MAX), // set max fee for blobs
                         mined_transactions,
                         changed_accounts,
-                    );
+                    ).await?;
 
                     // loop again to check for any other pending transactions
                     // and possibly start building the next block
