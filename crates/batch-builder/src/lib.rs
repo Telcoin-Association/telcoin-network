@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(txpool.pending_transactions().len(), 1);
         let done = batch_builder.spawn_execution_task();
         txpool.update_canonical_state(
-            &chain.sealed_genesis_block(),
+            &batch_builder.last_canonical_update,
             None,
             vec![],
             vec![ChangedAccount { address: tx_factory.address(), nonce: 0, balance: U256::ZERO }],
@@ -589,7 +589,7 @@ mod tests {
         // Make the same transaction affordable before the loop consumes the empty result.
         // This also proves that an empty build did not remove it from the pool.
         txpool.update_canonical_state(
-            &chain.sealed_genesis_block(),
+            &batch_builder.last_canonical_update,
             None,
             vec![],
             vec![ChangedAccount {
