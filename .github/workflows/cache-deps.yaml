@@ -213,7 +213,64 @@ jobs:
             -- "$observer_test" --exact
           restore_sources
 
+          # Stall the initial build result to verify the regression's 10-second watchdog.
+          python3 - "$builder_source" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          original = "let done = batch_builder.spawn_execution_task();"
+          replacement = (
+              "let done = std::future::pending::<"
+              "Result<BatchBuilderResult<BuildOutcome>, oneshot::error::RecvError>>();"
+          )
+          if source.count(original) != 1:
+              raise SystemExit("Expected exactly one initial build result to stall")
+          path.write_text(source.replace(original, replacement, 1))
+          PY
+          expect_test_failure "$builder_test"
+          restore_sources
+
           # Rebuild and rerun fixed sources before the cache action's post-job save.
           cargo nextest run --locked --workspace --no-fail-fast --retries 0 \
             -- "${regression_tests[@]}" --exact
           git diff --exit-code -- "$builder_source" "$worker_source" Cargo.lock
+
+      - name: Run full default and adiri suites with a strict 60-second test timeout
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          nextest_config=.config/nextest.toml
+          restore_nextest_config() {
+            git restore --source=HEAD -- "$nextest_config"
+          }
+          trap restore_nextest_config EXIT
+
+          # Keep existing test groups and settings, tightening timeouts for every test.
+          cat >> "$nextest_config" <<'TOML'
+
+          [profile.issue1338-strict]
+          inherits = "default"
+          retries = 0
+
+          [[profile.issue1338-strict.overrides]]
+          filter = "all()"
+          retries = 0
+          slow-timeout = { period = "60s", terminate-after = 1, grace-period = "0s", on-timeout = "fail" }
+          TOML
+          export NEXTEST_PROFILE=issue1338-strict
+
+          # Run the same feature/package lanes as CI, even if the first lane fails.
+          default_status=0
+          ./etc/ci-lanes.sh test-default || default_status=$?
+          adiri_status=0
+          ./etc/ci-lanes.sh test-adiri || adiri_status=$?
+          restore_nextest_config
+          git diff --exit-code -- "$nextest_config" Cargo.lock
+          if [[ "$default_status" -ne 0 || "$adiri_status" -ne 0 ]]; then
+            echo "::error::Full-suite validation failed: default=$default_status, adiri=$adiri_status"
+            exit 1
+          fi
