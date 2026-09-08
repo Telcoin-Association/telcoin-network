@@ -51,10 +51,10 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    forks::multi_workers_fork_active, gas_accumulator::GasAccumulator, BatchValidation,
-    BlsPublicKey, BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader,
-    TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
+    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
+    CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
+    DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -1122,9 +1122,12 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
 
 /// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
 ///
-/// The configured swarm count must match chain state, including after governance changes at an
-/// epoch boundary. A matching single worker is always fine. Above one, the answer depends on the
-/// multi-workers fork ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the
+/// Governance may change the chain count while the process retains its original swarms. A mismatch
+/// only warns while this version starts epoch components for worker zero alone. Once #557 starts
+/// components for every worker, a local shortfall will need recovery before participation.
+/// Above one, the answer depends on the
+/// multi-workers fork ([`tn_types::forks::multi_workers_fork_active`]), evaluated at the epoch
+/// being entered, the
 /// same epoch carried inside the [`Committee`] this count is about to be stamped onto, so the gate
 /// here and the gate the encoder consults cannot disagree:
 ///
@@ -1140,17 +1143,20 @@ fn check_committee_worker_count(
     num_workers: NonZeroUsize,
     configured_workers: usize,
 ) -> eyre::Result<()> {
-    super::check_configured_worker_count(epoch, num_workers.get(), configured_workers)?;
+    super::check_worker_count_fork(epoch, num_workers.get(), configured_workers)?;
+    eyre::ensure!(configured_workers != 0, "epoch entry requires a configured worker zero");
+    if configured_workers != num_workers.get() {
+        warn!(
+            target: "epoch-manager",
+            epoch,
+            configured = configured_workers,
+            on_chain = num_workers.get(),
+            "local worker swarm count disagrees with chain state; continuing with worker 0 epoch \
+             components. Update `node_info.p2p_info.workers` before restarting"
+        );
+    }
     if num_workers.get() == 1 {
         return Ok(());
-    }
-
-    if !multi_workers_fork_active(epoch) {
-        return Err(eyre!(
-            "on-chain WorkerConfigs reports {num_workers} workers but the multi-workers fork \
-             is not active at epoch {epoch}: the pre-fork committee layout cannot hold a worker \
-             count, so this epoch's committee cannot be encoded"
-        ));
     }
 
     warn!(
@@ -1218,11 +1224,20 @@ mod tests {
     #[test]
     fn pre_fork_epoch_entry_rejects_multiple_workers() -> eyre::Result<()> {
         let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
-        let err = check_committee_worker_count(0, count, 2)
-            .err()
-            .ok_or_else(|| eyre::eyre!("expected pre-fork multi-worker rejection"))?;
-        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
-        Ok(())
+        [(count, 2), (count, 1), (NonZeroUsize::MIN, 2)].into_iter().try_for_each(
+            |(on_chain, configured)| -> eyre::Result<()> {
+                let err = check_committee_worker_count(0, on_chain, configured)
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("expected pre-fork multi-worker rejection"))?;
+                let startup_err =
+                    super::super::check_configured_worker_count(0, on_chain.get(), configured)
+                        .err()
+                        .ok_or_else(|| eyre::eyre!("expected pre-fork startup rejection"))?;
+                assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+                assert_eq!(err.to_string(), startup_err.to_string());
+                Ok(())
+            },
+        )
     }
 
     /// Default builds have the multi-worker layout active from genesis, so a count above one is
@@ -1234,24 +1249,24 @@ mod tests {
         check_committee_worker_count(0, count, 2)
     }
 
-    /// A single-worker chain must reject extra local swarms before its early return.
+    /// A governance decrease to one worker leaves surplus swarms without blocking epoch entry.
     #[test]
-    fn single_worker_epoch_entry_rejects_extra_configured_workers() -> eyre::Result<()> {
-        let result = check_committee_worker_count(0, NonZeroUsize::MIN, 3);
-        assert!(result.is_err());
-        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
-        assert!(error.to_string().contains("chain-derived count for epoch 0 is 1"));
-        Ok(())
+    fn single_worker_epoch_entry_allows_extra_configured_workers() -> eyre::Result<()> {
+        check_committee_worker_count(u32::MAX, NonZeroUsize::MIN, 3)
     }
 
-    /// Governance cannot increase the committee count while the process retains fewer swarms.
+    /// Post-fork governance can change the chain count without restarting worker-zero components.
     #[test]
-    fn epoch_entry_rejects_changed_worker_count() -> eyre::Result<()> {
+    fn epoch_entry_allows_changed_worker_count() -> eyre::Result<()> {
         let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
-        let result = check_committee_worker_count(7, count, 1);
-        assert!(result.is_err());
-        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
-        assert!(error.to_string().contains("chain-derived count for epoch 7 is 2"));
-        Ok(())
+        [1, 2, 3]
+            .into_iter()
+            .try_for_each(|configured| check_committee_worker_count(u32::MAX, count, configured))
+    }
+
+    /// Warning-only mismatches never permit an empty local worker configuration.
+    #[test]
+    fn epoch_entry_rejects_missing_worker_zero() {
+        assert!(check_committee_worker_count(0, NonZeroUsize::MIN, 0).is_err());
     }
 }
