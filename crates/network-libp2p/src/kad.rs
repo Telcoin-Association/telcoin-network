@@ -896,8 +896,12 @@ mod test {
         assert_eq!((restarted_0.num_records, restarted_0.num_providers), (1, 1));
         assert_eq!((restarted_1.num_records, restarted_1.num_providers), (1, 1));
 
+        // Persist both namespaces so the deletion checks also exercise the disk fallback.
+        worker_0.db.sync_persist();
         worker_0.remove(&record_0.key);
         worker_0.remove_provider(&provider_0.key, &local_peer_id);
+        // Layered storage requires a persistence barrier before reading a deleted key.
+        worker_0.db.sync_persist();
         assert!(worker_0.get(&record_0.key).is_none());
         assert!(worker_0.providers(&provider_0.key).is_empty());
         assert_eq!(worker_1.get(&record_1.key).map(|record| record.value.clone()), Some(vec![1]));
@@ -1706,7 +1710,10 @@ mod test {
             ),
             "replacing an uncounted envelope must still enforce capacity"
         );
+        // Exercise deletion of an on-disk row, then wait for the queued removal to persist.
+        db.sync_persist();
         worker_1.remove_provider(&unknown_key, &PeerId::random());
+        db.sync_persist();
         assert_eq!(worker_1.num_providers, 1, "removing an uncounted envelope preserves the count");
         assert!(db.get::<KadWorkerProviderRecords>(&unknown_hash)?.is_none());
         Ok(())
