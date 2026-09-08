@@ -32,8 +32,8 @@ use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, SealedHeader,
-    ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, P2pNode,
+    SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
     DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
@@ -72,6 +72,81 @@ const EXEX_EVENT_CAPACITY: usize = 16;
 /// bursts (e.g. restart replay) while a persistently full channel backpressures the epoch
 /// manager's forwarder instead of consuming memory.
 const TO_ENGINE_CAPACITY: usize = 64;
+
+/// Inputs for one worker swarm, validated before any process-lifetime network is spawned.
+struct PreparedWorkerNetwork<Events> {
+    /// Worker identity shared by its key derivation, protocols, and network handle.
+    worker_id: WorkerId,
+    /// This worker's advertised address and optional RPC endpoint.
+    p2p: P2pNode,
+    /// The persistent event stream at the same index as the worker configuration.
+    event_stream: Events,
+}
+
+/// Require local swarm configuration to match the authoritative count for the entering epoch.
+fn check_configured_worker_count(
+    epoch: Epoch,
+    on_chain_workers: usize,
+    configured_workers: usize,
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        configured_workers != 0,
+        "node config `node_info.p2p_info.workers` must configure at least one worker"
+    );
+    eyre::ensure!(
+        configured_workers == on_chain_workers,
+        "node config `node_info.p2p_info.workers` lists {configured_workers} workers but the \
+         chain-derived count for epoch {epoch} is {on_chain_workers}: every validator must run \
+         the worker count the committee carries"
+    );
+    Ok(())
+}
+
+/// Validate every worker and pair its configuration with its persistent event stream.
+///
+/// Runs before either primary or worker swarm construction. Checking the complete layout first
+/// prevents a bad later RPC endpoint, count, or worker id from leaving partially spawned networks.
+fn prepare_worker_networks<Events: Clone>(
+    workers: &[P2pNode],
+    event_streams: &[Events],
+    epoch: Epoch,
+    on_chain_workers: usize,
+) -> eyre::Result<Vec<PreparedWorkerNetwork<Events>>> {
+    let configured = workers.len();
+    eyre::ensure!(
+        configured <= 1 || tn_types::forks::multi_workers_fork_active(epoch),
+        "node config `node_info.p2p_info.workers` lists {configured} workers but the \
+         multi-workers fork is not active at epoch {epoch}: configure exactly one worker"
+    );
+    check_configured_worker_count(epoch, on_chain_workers, configured)?;
+    eyre::ensure!(
+        configured <= usize::from(WorkerId::MAX) + 1,
+        "node config lists {configured} workers, exceeding the WorkerId range"
+    );
+    eyre::ensure!(
+        configured == event_streams.len(),
+        "node config lists {configured} workers but has {} worker event streams",
+        event_streams.len()
+    );
+
+    workers
+        .iter()
+        .zip(event_streams)
+        .zip(0..=WorkerId::MAX)
+        .map(|((p2p, event_stream), worker_id)| {
+            p2p.rpc.as_ref().map(tn_types::RpcInfo::validate).transpose().wrap_err_with(|| {
+                format!(
+                    "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in node config"
+                )
+            })?;
+            Ok(PreparedWorkerNetwork {
+                worker_id,
+                p2p: p2p.clone(),
+                event_stream: event_stream.clone(),
+            })
+        })
+        .collect()
+}
 
 /// The long-running owner that oversees epoch transitions.
 ///
@@ -750,8 +825,13 @@ where
         let reth_env = engine.get_reth_env().await;
         reth_env.heal_finalized_to_persisted_tip()?;
         // retrieve epoch information from canonical tip on startup
-        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
+        let EpochState { epoch, epoch_info, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
+        // Read the raw count independently: fresh genesis has no finalized header, so catchup
+        // leaves the accumulator at its initial size. The accumulator also clamps zero to one.
+        // Both startup validation and epoch entry must use the authoritative closing-block count.
+        let on_chain_workers =
+            read_num_workers_at_epoch_entry(&reth_env, epoch_info.blockHeight).await?;
         // The canonical epoch cross-checks the finalized header catchup pins its reads to.
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
         self.try_restore_state(&engine).await?;
@@ -762,7 +842,8 @@ where
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
-        self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
+        self.spawn_node_networks(node_task_spawner, &network_config, epoch, on_chain_workers)
+            .await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
         // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
@@ -1001,12 +1082,23 @@ where
     /// Each swarm runs as a critical task until node shutdown. The resulting network handles are
     /// stored on the manager for use by every epoch; the worker handles are seeded with the
     /// starting `epoch` and their task spawners are refreshed on each epoch transition.
+    /// The configured worker count must match the raw chain count at the previous epoch's closing
+    /// block (genesis for epoch 0) before any swarm is created. This includes fresh genesis where
+    /// accumulator catchup is a no-op. Worker RPC descriptors and event streams validate together.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
         epoch: Epoch,
+        on_chain_workers: usize,
     ) -> eyre::Result<()> {
+        let workers = prepare_worker_networks(
+            &self.builder.tn_config.node_info.p2p_info.workers,
+            &self.worker_event_streams,
+            epoch,
+            on_chain_workers,
+        )?;
+
         // Reject an invalid peer-score config before it is installed into the process-global,
         // first-write-wins `GLOBAL_SCORE_CONFIG` by the `PeerManager` built below
         // (`init_peer_score_config`). This is the boot-path install funnel, so validating here
@@ -1057,39 +1149,19 @@ where
 
         // create one long-running swarm per configured worker
         // the per-epoch code still drives worker 0 only (#557 loops over worker components)
-        let workers = self.builder.tn_config.node_info.p2p_info.workers.clone();
         self.worker_network_handles = workers
             .into_iter()
-            .zip(self.worker_event_streams.iter())
-            .enumerate()
-            .map(|(idx, (worker_p2p, worker_event_stream))| {
-                let worker_id = u16::try_from(idx)
-                    .map_err(|_| eyre!("worker index {idx} exceeds the WorkerId range"))?;
-
-                // pass through the worker's RPC descriptor so peers can discover this
-                // validator's JSON-RPC endpoint via kademlia. validators that did not
-                // configure RPC leave the descriptor `None`. fail fast on a misconfigured
-                // endpoint rather than advertising something peers will reject.
-                let worker_rpc = worker_p2p.rpc;
-                if let Some(rpc) = &worker_rpc {
-                    rpc.validate().wrap_err_with(|| {
-                        format!(
-                            "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in \
-                             node config"
-                        )
-                    })?;
-                }
-
+            .map(|PreparedWorkerNetwork { worker_id, p2p, event_stream }| {
                 // create long-running network task for this worker
                 let worker_network = ConsensusNetwork::new_for_worker(
                     worker_id,
                     network_config,
-                    worker_event_stream.clone(),
+                    event_stream,
                     self.key_config.clone(),
                     self.consensus_db.clone(),
                     node_task_spawner.clone(),
-                    worker_p2p.network_address,
-                    worker_rpc,
+                    p2p.network_address,
+                    p2p.rpc,
                 )?;
                 let worker_network_handle = worker_network.network_handle();
                 let node_shutdown = self.node_shutdown.subscribe();
@@ -1362,7 +1434,172 @@ fn check_restore_consistency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tn_types::{ExecHeader, B256};
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::{BlsKeypair, ExecHeader, RpcInfo, TnReceiver as _, TnSender as _, B256};
+
+    /// Reproducible keys for checking the identity assigned to each prepared swarm.
+    fn worker_key_config() -> KeyConfig {
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1315)))
+    }
+
+    /// Give each worker a distinct advertised address, derived network key, and RPC endpoint.
+    fn worker_p2p(keys: &KeyConfig, worker_id: WorkerId) -> eyre::Result<P2pNode> {
+        Ok(P2pNode {
+            network_address: format!("/ip4/127.0.0.1/udp/{}/quic-v1", 9000 + u32::from(worker_id))
+                .parse()?,
+            network_key: keys.worker_network_public_key(worker_id),
+            rpc: Some(RpcInfo {
+                http: format!("https://worker-{worker_id}.example.com/").parse()?,
+                ws: None,
+            }),
+        })
+    }
+
+    /// Every prepared swarm keeps the key, endpoint, worker id, and original event stream aligned.
+    #[test]
+    fn prepare_worker_networks_preserves_worker_identity_and_event_streams() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?, worker_p2p(&keys, 2)?];
+        let streams: Vec<QueChannel<WorkerId>> =
+            workers.iter().map(|_| QueChannel::new()).collect();
+        let receivers: Vec<_> = streams.iter().map(QueChannel::subscribe).collect();
+        let prepared = prepare_worker_networks(&workers, &streams, Epoch::MAX, 3)?;
+
+        assert_eq!(prepared.len(), 3);
+        assert_ne!(keys.worker_network_public_key(0), keys.worker_network_public_key(1));
+        prepared.iter().zip(&workers).zip([0, 1, 2]).try_for_each(
+            |((worker, configured), expected_id)| -> eyre::Result<()> {
+                assert_eq!(worker.worker_id, expected_id);
+                assert_eq!(worker.p2p, *configured);
+                assert_eq!(
+                    worker.p2p.network_key,
+                    keys.worker_network_public_key(worker.worker_id)
+                );
+                worker.event_stream.try_send(worker.worker_id)?;
+                Ok(())
+            },
+        )?;
+        receivers.into_iter().zip([0, 1, 2]).try_for_each(
+            |(mut receiver, expected_id)| -> eyre::Result<()> {
+                assert_eq!(receiver.try_recv()?, expected_id);
+                assert!(receiver.try_recv().is_err());
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Both missing and surplus event streams are rejected instead of silently truncating `zip`.
+    #[test]
+    fn prepare_worker_networks_rejects_event_stream_count_mismatch() -> eyre::Result<()> {
+        let workers = [worker_p2p(&worker_key_config(), 0)?];
+        [Vec::new(), vec![(), ()]].into_iter().try_for_each(|streams| -> eyre::Result<()> {
+            let error = prepare_worker_networks(&workers, &streams, 0, 1)
+                .err()
+                .ok_or_else(|| eyre!("expected worker event stream count mismatch"))?;
+            assert!(error.to_string().contains("worker event streams"));
+            Ok(())
+        })
+    }
+
+    /// A bad RPC endpoint on a later worker fails preparation of the entire swarm set.
+    #[test]
+    fn prepare_worker_networks_rejects_later_invalid_rpc() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let worker = worker_p2p(&keys, 1)?;
+        let workers = [
+            worker_p2p(&keys, 0)?,
+            P2pNode {
+                rpc: Some(RpcInfo { http: "ftp://worker-1.example.com/".parse()?, ws: None }),
+                ..worker
+            },
+        ];
+        let error = prepare_worker_networks(&workers, &[(), ()], Epoch::MAX, 2)
+            .err()
+            .ok_or_else(|| eyre!("expected invalid RPC endpoint"))?;
+        assert!(error.to_string().contains("node_info.p2p_info.workers[1].rpc"));
+        Ok(())
+    }
+
+    /// Startup requires the local count to match the raw chain-derived count, in both directions.
+    #[test]
+    fn prepare_worker_networks_rejects_chain_count_mismatch() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
+        let single_worker = workers.get(..1).ok_or_else(|| eyre!("expected worker zero"))?;
+        [(workers.as_slice(), 1), (single_worker, 2)].into_iter().try_for_each(
+            |(configured, chain_count)| -> eyre::Result<()> {
+                let streams = vec![(); configured.len()];
+                let error = prepare_worker_networks(configured, &streams, Epoch::MAX, chain_count)
+                    .err()
+                    .ok_or_else(|| eyre!("expected chain worker count mismatch"))?;
+                assert!(error.to_string().contains("chain-derived count"));
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Raw zero counts must fail even though the gas accumulator clamps a zero resize to one.
+    #[test]
+    fn prepare_worker_networks_rejects_zero_worker_counts() -> eyre::Result<()> {
+        let workers = [worker_p2p(&worker_key_config(), 0)?];
+        let chain_error = prepare_worker_networks(&workers, &[()], 0, 0)
+            .err()
+            .ok_or_else(|| eyre!("expected zero chain count rejection"))?;
+        assert!(chain_error.to_string().contains("chain-derived count for epoch 0 is 0"));
+        let config_error = prepare_worker_networks::<()>(&[], &[], 0, 0)
+            .err()
+            .ok_or_else(|| eyre!("expected empty worker config rejection"))?;
+        assert!(config_error.to_string().contains("at least one worker"));
+        Ok(())
+    }
+
+    /// Fresh multi-worker genesis uses the chain count even before accumulator catchup can run.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn prepare_worker_networks_accepts_multi_worker_genesis() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
+        let prepared = prepare_worker_networks(&workers, &[(), ()], 0, 2)?;
+        assert_eq!(prepared.len(), 2);
+        Ok(())
+    }
+
+    /// The full WorkerId range is accepted, and the next configured worker is rejected.
+    #[test]
+    fn prepare_worker_networks_enforces_worker_id_bound() -> eyre::Result<()> {
+        let max_workers = usize::from(WorkerId::MAX) + 1;
+        let worker = P2pNode { rpc: None, ..worker_p2p(&worker_key_config(), 0)? };
+        let workers = vec![worker; max_workers + 1];
+        let streams = vec![(); max_workers + 1];
+        let prepared = prepare_worker_networks(
+            &workers[..max_workers],
+            &streams[..max_workers],
+            Epoch::MAX,
+            max_workers,
+        )?;
+        assert_eq!(prepared.len(), max_workers);
+        assert_eq!(prepared.last().map(|worker| worker.worker_id), Some(WorkerId::MAX));
+        let error = prepare_worker_networks(&workers, &streams, Epoch::MAX, max_workers + 1)
+            .err()
+            .ok_or_else(|| eyre!("expected WorkerId overflow"))?;
+        assert!(error.to_string().contains("WorkerId range"));
+        Ok(())
+    }
+
+    /// A multi-worker local config cannot start any swarms before the fork activates.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn prepare_worker_networks_rejects_pre_fork_multiple_workers() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
+        let error = prepare_worker_networks(&workers, &[(), ()], 0, 2)
+            .err()
+            .ok_or_else(|| eyre!("expected pre-fork multi-worker rejection"))?;
+        assert!(error.to_string().contains("multi-workers fork is not active"));
+        Ok(())
+    }
 
     /// A tip sealed header at `number` whose nonce encodes `epoch` (upper 32 bits), matching the
     /// payload builder's `nonce = epoch << 32 | round` layout that `deconstruct_nonce` reads back.

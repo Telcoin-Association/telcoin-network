@@ -208,16 +208,27 @@ fn warn_if_key_permissions_are_loose(
 ) {
 }
 
-#[derive(Debug)]
+/// Private key material and derivation inputs shared by a key manager.
 struct KeyConfigInner {
-    // DO NOT expose the private key to other code.  Tests that need this will provide a primary
-    // key. Use the BlsSigner trait for signing for the primary.
+    /// DO NOT expose the private key to other code. Tests provide their own primary key.
+    /// Use the BlsSigner trait for signing for the primary.
     primary_keypair: BlsKeypair,
-    // Derived from the primary_keypair.
+    /// Derived from the primary keypair.
     primary_network_keypair: NetworkKeypair,
-    // Seed string for worker network keypairs. Per-worker keypairs are derived on demand from
-    // the primary_keypair and this seed; see `KeyConfig::worker_network_keypair`.
+    /// Seed string for worker network keypairs. Per-worker keypairs are derived on demand from
+    /// the primary keypair and this seed; see [`KeyConfig::worker_network_keypair`].
     worker_network_seed: String,
+}
+
+impl std::fmt::Debug for KeyConfigInner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyConfigInner")
+            .field("primary_keypair", &self.primary_keypair)
+            .field("primary_network_keypair", &self.primary_network_keypair)
+            .field("worker_network_seed", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Basic implementation of a key manager.  This version will read a BLS key
@@ -1001,7 +1012,22 @@ mod tests {
         let config = KeyConfig::new_with_testing_key(keypair);
         let rendered = format!("{config:?}");
 
-        assert!(rendered.contains("[REDACTED]"), "BLS private half must be redacted: {rendered}");
+        assert!(
+            rendered.contains("private: \"[REDACTED]\""),
+            "BLS private half must be redacted: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("public: {:?}", config.primary_public_key())),
+            "BLS public key should still be shown: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&config.inner.worker_network_seed),
+            "worker network seed must not be shown"
+        );
+        assert!(
+            rendered.contains("worker_network_seed: \"[REDACTED]\""),
+            "worker network seed field must remain present and redacted: {rendered}"
+        );
 
         let assert_secret_absent = |bytes: &[u8], what: &str| {
             assert!(!rendered.contains(&hex::encode(bytes)), "{what} leaked as hex");
@@ -1039,8 +1065,8 @@ mod tests {
 
         // Positive anchor: the primary network field must actually render its public half,
         // otherwise the negative checks above pass vacuously once `KeyConfigInner`'s Debug
-        // stops printing the network keypair at all. The worker side has no anchor: only the
-        // worker seed string is stored, never a worker keypair.
+        // stops printing the network keypair at all. The worker seed's redacted field is
+        // anchored above; no worker keypair is stored.
         let ed25519_public_rendered = |net: &NetworkKeypair| {
             let ed25519: libp2p::identity::ed25519::Keypair =
                 net.clone().try_into().expect("network keypairs are ed25519");

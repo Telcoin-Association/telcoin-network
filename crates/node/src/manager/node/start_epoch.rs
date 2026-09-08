@@ -362,7 +362,11 @@ where
                     .ok_or_else(|| eyre!("on-chain WorkerConfigs reports zero workers"))
             })
             .wrap_err("failed to read the committee worker count from chain")?;
-        check_committee_worker_count(epoch, num_workers)?;
+        check_committee_worker_count(
+            epoch,
+            num_workers,
+            self.builder.tn_config.node_info.p2p_info.num_workers(),
+        )?;
 
         // the network must be live
         let committee = if epoch == 0 {
@@ -1118,19 +1122,25 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
 
 /// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
 ///
-/// A single worker is always fine. Above one, the answer depends on the multi-workers fork
-/// ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the same epoch carried
-/// inside the [`Committee`] this count is about to be stamped onto, so the gate here and the gate
-/// the encoder consults cannot disagree:
+/// The configured swarm count must match chain state, including after governance changes at an
+/// epoch boundary. A matching single worker is always fine. Above one, the answer depends on the
+/// multi-workers fork ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the
+/// same epoch carried inside the [`Committee`] this count is about to be stamped onto, so the gate
+/// here and the gate the encoder consults cannot disagree:
 ///
 /// - pre-fork the legacy committee layout has no field to carry a worker count, so the encoder
 ///   refuses the value. Halting here turns that into a diagnosable epoch-entry failure instead of a
 ///   panic from the first pack write, which is the only thing the node could do about it anyway:
 ///   the count is chain state and cannot be talked down locally.
-/// - post-fork the count is representable and epoch entry proceeds. It still only warns, because
-///   this node version spawns worker [`DEFAULT_WORKER_ID`] alone: header payloads keyed to higher
-///   worker ids validate, but nothing local produces them.
-fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre::Result<()> {
+/// - post-fork the count is representable and epoch entry proceeds. It still warns because this
+///   node version starts epoch components only for worker [`DEFAULT_WORKER_ID`]: header payloads
+///   keyed to higher worker ids validate, but nothing local produces them yet.
+fn check_committee_worker_count(
+    epoch: Epoch,
+    num_workers: NonZeroUsize,
+    configured_workers: usize,
+) -> eyre::Result<()> {
+    super::check_configured_worker_count(epoch, num_workers.get(), configured_workers)?;
     if num_workers.get() == 1 {
         return Ok(());
     }
@@ -1148,7 +1158,8 @@ fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre
         epoch,
         num_workers,
         spawned_worker = DEFAULT_WORKER_ID,
-        "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
+        "committee runs multiple workers but this node version starts epoch components only for \
+         worker {DEFAULT_WORKER_ID}: \
          ids >= 1 are accepted by header validation but not produced locally"
     );
     Ok(())
@@ -1190,11 +1201,10 @@ mod tests {
 
     /// One worker is representable in both committee layouts, so entry never blocks on it.
     #[test]
-    fn single_worker_epoch_entry_is_always_allowed() {
-        for epoch in [0, 1, 407, u32::MAX] {
-            check_committee_worker_count(epoch, NonZeroUsize::MIN)
-                .expect("one worker is representable at every epoch");
-        }
+    fn single_worker_epoch_entry_is_always_allowed() -> eyre::Result<()> {
+        [0, 1, 407, u32::MAX]
+            .into_iter()
+            .try_for_each(|epoch| check_committee_worker_count(epoch, NonZeroUsize::MIN, 1))
     }
 
     /// Pre-fork the legacy committee layout cannot carry a worker count, so entry halts rather than
@@ -1206,18 +1216,42 @@ mod tests {
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
     #[test]
-    fn pre_fork_epoch_entry_rejects_multiple_workers() {
-        let err = check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
-            .expect_err("a pre-fork multi-worker committee cannot be encoded");
+    fn pre_fork_epoch_entry_rejects_multiple_workers() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        let err = check_committee_worker_count(0, count, 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected pre-fork multi-worker rejection"))?;
         assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+        Ok(())
     }
 
     /// Default builds have the multi-worker layout active from genesis, so a count above one is
-    /// representable and entry proceeds (with a warning that this node still spawns one worker).
+    /// representable and entry proceeds (with a warning about worker-0-only epoch components).
     #[cfg(not(feature = "adiri"))]
     #[test]
-    fn post_fork_epoch_entry_allows_multiple_workers() {
-        check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
-            .expect("the post-fork layout holds a worker count");
+    fn post_fork_epoch_entry_allows_multiple_workers() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        check_committee_worker_count(0, count, 2)
+    }
+
+    /// A single-worker chain must reject extra local swarms before its early return.
+    #[test]
+    fn single_worker_epoch_entry_rejects_extra_configured_workers() -> eyre::Result<()> {
+        let result = check_committee_worker_count(0, NonZeroUsize::MIN, 3);
+        assert!(result.is_err());
+        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
+        assert!(error.to_string().contains("chain-derived count for epoch 0 is 1"));
+        Ok(())
+    }
+
+    /// Governance cannot increase the committee count while the process retains fewer swarms.
+    #[test]
+    fn epoch_entry_rejects_changed_worker_count() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        let result = check_committee_worker_count(7, count, 1);
+        assert!(result.is_err());
+        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
+        assert!(error.to_string().contains("chain-derived count for epoch 7 is 2"));
+        Ok(())
     }
 }

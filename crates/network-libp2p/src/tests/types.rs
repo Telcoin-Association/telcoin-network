@@ -178,6 +178,27 @@ fn test_cross_role_replay_rejected() {
     assert!(NodeRecord::decode_and_verify(&bytes, primary_domain, &pubkey).is_none());
 }
 
+/// Sibling workers must reject each other's records even with the same chain and BLS key.
+#[test]
+fn test_cross_worker_replay_rejected() {
+    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let pubkey = key_config.primary_public_key();
+    let worker_0 = RecordDomain::new(2017, NetworkType::Worker(0));
+    let worker_1 = RecordDomain::new(2017, NetworkType::Worker(1));
+    let record = NodeRecord::build(
+        worker_0,
+        key_config.primary_network_public_key(),
+        create_multiaddr(None),
+        None,
+        |data| key_config.request_signature_direct(data),
+    );
+    assert!(record.clone().verify(worker_0, &pubkey).is_some());
+    assert!(record.clone().verify(worker_1, &pubkey).is_none());
+    let bytes = tn_types::encode(&record);
+    assert!(NodeRecord::decode_and_verify(&bytes, worker_0, &pubkey).is_some());
+    assert!(NodeRecord::decode_and_verify(&bytes, worker_1, &pubkey).is_none());
+}
+
 /// GHSA-cc64-wfq5-56ph cross-CHAIN replay: a record signed for one chain
 /// verifies under that chain but is REJECTED under a different chain id (same
 /// role, same BLS key), on both the in-memory and bytes paths.
