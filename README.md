@@ -43,6 +43,13 @@ telcoin-network --datadir DATADIR --bls-passphrase-source ask \
 
 This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
 
+Worker network configuration is checked before any swarm starts. Each entry in
+`node_info.p2p_info.workers` must advertise the network key derived for its worker ID from the
+loaded BLS keystore, and worker network addresses must be distinct. Existing configurations with
+mismatched keys or duplicate addresses now fail startup with an error naming the offending field.
+Restore worker key entries that match the node's BLS keystore and configure a separate network
+address for each worker.
+
 - `--address` is the execution layer address that receives fees
 - `--external-primary-addr` should be set to the node's public IP and port
 

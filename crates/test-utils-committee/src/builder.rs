@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, NetworkKeypair, P2pNode,
-    TimestampSec, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, P2pNode, TimestampSec,
+    WorkerId, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -60,8 +60,7 @@ where
 {
     /// Set the number of workers every authority runs (defaults to one).
     ///
-    /// Worker 0 uses the authority's [KeyConfig] worker network key; every further worker
-    /// gets a fresh network keypair.
+    /// Every worker uses the authority's [KeyConfig] network key for its worker id.
     pub fn number_of_workers(mut self, number_of_workers: NonZeroUsize) -> Self {
         self.number_of_workers = number_of_workers;
         self
@@ -163,14 +162,11 @@ where
                 };
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap()
             };
-            // worker 0 carries the key config's worker key; further workers get fresh keys
-            let worker_nodes: Vec<P2pNode> = (0..self.number_of_workers.get())
+            // Advertise the same derived identity each worker swarm uses to authenticate.
+            let worker_nodes: Vec<P2pNode> = (0..=WorkerId::MAX)
+                .take(self.number_of_workers.get())
                 .map(|worker_id| {
-                    let key = if worker_id == 0 {
-                        key_config.worker_network_public_key(DEFAULT_WORKER_ID)
-                    } else {
-                        NetworkKeypair::generate_ed25519().public().into()
-                    };
+                    let key = key_config.worker_network_public_key(worker_id);
                     (worker_address(), key).into()
                 })
                 .collect();
