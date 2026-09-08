@@ -1149,9 +1149,9 @@ mod tests {
         assert_eq!(pending_pool_len, 7);
     }
 
-    /// Test transactions are mined from the pool.
+    /// Test transactions are mined from the pool after post-quorum maintenance completes.
     #[tokio::test]
-    async fn test_pool_updates_after_txs_mined() {
+    async fn test_pool_updates_after_txs_mined() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let TestTools { mut tx_factory, execution_components, task_manager } =
             get_test_tools(tmp_dir.path());
@@ -1268,12 +1268,16 @@ mod tests {
         let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
         assert_eq!(tx.hash(), &expected_tx_hash);
 
-        // yield to try and give pool a chance to update
-        tokio::task::yield_now().await;
+        // Wait for the acknowledged batch's blocking pool update to remove the mined transactions.
+        tn_test_utils::wait_until(duration, "mined transactions removed from pool", || async {
+            Ok(txpool.pool_size().pending == 0)
+        })
+        .await?;
 
         // assert all transactions mined
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
+        Ok(())
     }
 
     /// Regression test for issue #1262: after a mined batch the pool update must install the

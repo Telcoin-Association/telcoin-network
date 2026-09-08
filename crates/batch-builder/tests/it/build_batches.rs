@@ -27,6 +27,7 @@ use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHand
 use tokio::time::timeout;
 use tracing::debug;
 
+/// Test that a validated batch is stored and its mined transactions leave the pool.
 #[tokio::test]
 async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
@@ -195,6 +196,12 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
 
+    // Await pool maintenance after verifying the mined batch's stored contents.
+    wait_until(timeout, "stored batch's mined transactions removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
+
     // txpool should be empty after mining
     // test_make_batch_no_ack_txs_in_pool_still tests for txs in pool without mining event
     let pending_pool_len = txpool.pool_size().pending;
@@ -210,7 +217,7 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
 /// batch builder. First 3 transactions mined in the first batch. Before a canonical state
 /// change, mine the 4th transaction in the next batch.
 #[tokio::test]
-async fn test_batch_builder_produces_valid_batches() {
+async fn test_batch_builder_produces_valid_batches() -> eyre::Result<()> {
     //
     //=== Execution Layer
     //
@@ -377,13 +384,17 @@ async fn test_batch_builder_produces_valid_batches() {
     let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
     assert_eq!(tx.hash(), &expected_tx_hash);
 
-    // yield to try and give pool a chance to update
-    tokio::task::yield_now().await;
+    // Wait for the acknowledged batch's blocking pool update to remove the mined transactions.
+    wait_until(duration, "mined transactions removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
 
     // assert all transactions mined/removed
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.pending, 0);
     assert_eq!(pool_size.blob, 0);
+    Ok(())
 }
 
 /// Create 4 transactions.
@@ -554,8 +565,11 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
 
-    // yield to try and give pool a chance to update
-    tokio::task::yield_now().await;
+    // Wait for the acknowledged batch's blocking pool update to remove the mined transaction.
+    wait_until(duration, "final mined transaction removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
 
     // assert pool empty
     let pool_size = txpool.pool_size();
