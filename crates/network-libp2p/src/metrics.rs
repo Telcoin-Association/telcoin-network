@@ -190,8 +190,8 @@ impl PeerManagerMetrics {
     ///
     /// `Allowed` records nothing. `Shed` and `Flooding` bump the counter with the outcome
     /// labels {`shed`, `flood`}: `shed` counts records dropped without a penalty; `flood`
-    /// counts the once-per-window penalty escalations. Operators watch `shed` to see honest
-    /// shedding build up before it reaches the penalty threshold.
+    /// counts penalty escalations, including repeated penalties above the hard ceiling.
+    /// Operators watch `shed` to see honest shedding before it reaches the penalty threshold.
     pub(crate) fn record_put_record_rate_limited(&self, rate: &PutRecordRate) {
         let outcome = match rate {
             PutRecordRate::Allowed => None,

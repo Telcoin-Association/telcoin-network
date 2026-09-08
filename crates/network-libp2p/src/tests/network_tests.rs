@@ -2691,6 +2691,7 @@ async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result
     let mut network_config = NetworkConfig::default();
     network_config.libp2p_config_mut().kad_record_ttl = short_ttl;
     network_config.libp2p_config_mut().kad_publication_interval = Duration::from_millis(500);
+    network_config.libp2p_config_mut().kad_replication_interval = Duration::from_millis(500);
 
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(network_config);
@@ -2811,6 +2812,131 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     assert_eq!(store_record.value, peer2_new_record.value);
     assert_eq!(store_record.publisher, peer2_new_record.publisher);
 
+    Ok(())
+}
+
+/// Register a connected source with no committee membership or operator allowlist exemption.
+///
+/// Driving the real swarm event ensures the source has a live score entry before the tests send
+/// records. Merely generating a `PeerId` would let penalties disappear on an untracked peer.
+fn register_untrusted_put_record_source(
+    network: &mut ConsensusNetworkMemoryDB<TestWorkerRequest, TestWorkerResponse>,
+) -> eyre::Result<PeerId> {
+    use libp2p::{
+        core::ConnectedPoint,
+        swarm::{behaviour::ConnectionEstablished, ConnectionId, FromSwarm},
+    };
+
+    let source = PeerId::random();
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    let connection_id = ConnectionId::new_unchecked(0);
+    let manager = &mut network.swarm.behaviour_mut().peer_manager;
+    manager.handle_established_inbound_connection(connection_id, source, &address, &address)?;
+    manager.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+        peer_id: source,
+        connection_id,
+        endpoint: &endpoint,
+        failed_addresses: &[],
+        other_established: 0,
+    }));
+    assert_eq!(manager.peer_score(&source), Some(0.0), "the source must have a tracked score");
+    assert!(!manager.peer_is_important(&source), "the source must not be exempt from penalties");
+    assert!(!manager.peer_banned(&source), "the source must start unbanned");
+    Ok(source)
+}
+
+/// Wiring regression (#1289): shedding never scores a tracked, non-exempt source, while crossing
+/// the penalty threshold applies exactly one Severe penalty until the hard cutoff.
+///
+/// This fails if the `Shed` and `Flooding` arm bodies are transposed or scoring is removed from
+/// `process_kad_put_request`, which classifier-only tests cannot observe.
+#[tokio::test]
+async fn test_kad_put_shed_is_unscored_and_flood_is_penalized() -> eyre::Result<()> {
+    use crate::peers::{MAX_PUT_RECORDS_PER_WINDOW, PUT_RECORD_PENALTY_THRESHOLD};
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = register_untrusted_put_record_source(&mut network)?;
+    // Relay another node's valid signed record. The source remains an ordinary connected peer.
+    let record = peer2.network.get_peer_record();
+    assert_ne!(record.publisher, Some(source));
+
+    (0..MAX_PUT_RECORDS_PER_WINDOW)
+        .try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_some());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), Some(0.0));
+
+    (MAX_PUT_RECORDS_PER_WINDOW..PUT_RECORD_PENALTY_THRESHOLD)
+        .try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_score(&source),
+        Some(0.0),
+        "every shed message through the inclusive penalty threshold must be unscored"
+    );
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+
+    network.process_kad_put_request(source, record.clone())?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_score(&source),
+        Some(-10.0),
+        "the first flood message must apply one Severe penalty"
+    );
+
+    (0..10).try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_score(&source),
+        Some(-10.0),
+        "later shed messages below the hard cutoff must not apply another penalty"
+    );
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+    Ok(())
+}
+
+/// The inclusive hard cutoff still sheds after one Severe penalty. Its next message scores again
+/// and drives the connected, non-exempt source through the real disconnect and temporary-ban path.
+#[tokio::test]
+async fn test_kad_put_hard_cutoff_disconnects_flooding_source() -> eyre::Result<()> {
+    use crate::peers::PUT_RECORD_DISCONNECT_THRESHOLD;
+    use libp2p::swarm::ToSwarm;
+    use std::task::{Context, Poll, Waker};
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = register_untrusted_put_record_source(&mut network)?;
+    let record = peer2.network.get_peer_record();
+
+    (0..PUT_RECORD_DISCONNECT_THRESHOLD)
+        .try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_score(&source),
+        Some(-10.0),
+        "the exact hard cutoff must retain the once-per-window penalty"
+    );
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+
+    network.process_kad_put_request(source, record)?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_score(&source),
+        Some(-20.0),
+        "the first message above the hard cutoff must apply another Severe penalty"
+    );
+    let manager = &mut network.swarm.behaviour_mut().peer_manager;
+    assert!(manager.peer_banned(&source), "the flood must block immediate reconnection");
+
+    // The manager has a connection event followed by the disconnect request. Poll a bounded
+    // number of queued events without running the swarm or relying on wall-clock delays.
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        (0..8).any(|_| matches!(
+            manager.poll(&mut context),
+            Poll::Ready(ToSwarm::GenerateEvent(PeerEvent::DisconnectPeer(peer))) if peer == source
+        )),
+        "the hard cutoff must emit a disconnect request for the flooding source"
+    );
     Ok(())
 }
 
