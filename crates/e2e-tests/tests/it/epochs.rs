@@ -20,10 +20,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_reth::{
-    system_calls::{
-        ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, WORKER_CONFIGS_ADDRESS,
-    },
+    system_calls::{ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethChainSpec,
 };
