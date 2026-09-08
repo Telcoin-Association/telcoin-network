@@ -533,113 +533,128 @@ mod tests {
     /// Drain the pending pool after the build gate but before the spawned task is polled.
     /// The empty result must never reach the worker, and the run loop must defer a newly
     /// affordable transaction until the reset batch delay has elapsed.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn empty_build_after_pending_pool_drain_is_deferred() -> std::io::Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let TestTools { mut tx_factory, execution_components, task_manager } =
-            get_test_tools(tmp_dir.path());
-        let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
-        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
-        let delay = Duration::from_millis(100);
-        let mut batch_builder = BatchBuilder::new(
-            &reth_env,
-            txpool.clone(),
-            to_worker,
-            Address::ZERO,
-            delay,
-            task_manager.get_spawner(),
-            0,
-            MIN_PROTOCOL_BASE_FEE,
-            0,
-        )
-        .map_err(std::io::Error::other)?;
-        let hash = tx_factory
-            .create_and_submit_eip1559_pool_tx(
-                chain.clone(),
-                u128::from(MIN_PROTOCOL_BASE_FEE),
-                Address::ZERO,
-                U256::from(10),
+        // Keep setup, spawned builds and acknowledgement bounded by a running clock.
+        timeout(Duration::from_secs(10), async {
+            let tmp_dir = TempDir::new()?;
+            let TestTools { mut tx_factory, execution_components, task_manager } =
+                get_test_tools(tmp_dir.path());
+            let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
+            let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+            let delay = Duration::from_millis(100);
+            let mut batch_builder = BatchBuilder::new(
+                &reth_env,
                 txpool.clone(),
+                to_worker,
+                Address::ZERO,
+                delay,
+                task_manager.get_spawner(),
+                0,
+                MIN_PROTOCOL_BASE_FEE,
+                0,
             )
-            .await;
+            .map_err(std::io::Error::other)?;
+            let hash = tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    u128::from(MIN_PROTOCOL_BASE_FEE),
+                    Address::ZERO,
+                    U256::from(10),
+                    txpool.clone(),
+                )
+                .await;
 
-        // Match the run loop's gate, then spawn without yielding. This single-threaded
-        // runtime cannot poll the build task before the synchronous canonical update below.
-        assert_eq!(txpool.pending_transactions().len(), 1);
-        let done = batch_builder.spawn_execution_task();
-        txpool.update_canonical_state(
-            &batch_builder.last_canonical_update,
-            None,
-            vec![],
-            vec![ChangedAccount { address: tx_factory.address(), nonce: 0, balance: U256::ZERO }],
-        );
-        assert!(txpool.pending_transactions().is_empty());
+            // Match the run loop's gate, then spawn without yielding. This single-threaded
+            // runtime cannot poll the build task before the synchronous canonical update below.
+            assert_eq!(txpool.pending_transactions().len(), 1);
+            let done = batch_builder.spawn_execution_task();
+            txpool.update_canonical_state(
+                &batch_builder.last_canonical_update,
+                None,
+                vec![],
+                vec![ChangedAccount {
+                    address: tx_factory.address(),
+                    nonce: 0,
+                    balance: U256::ZERO,
+                }],
+            );
+            assert!(txpool.pending_transactions().is_empty());
 
-        let outcome = tokio::select! {
-            outcome = done => outcome
-                .map_err(std::io::Error::other)?
-                .map_err(std::io::Error::other)?,
-            _ = from_batch_builder.recv() => {
-                Err::<BuildOutcome, _>(std::io::Error::other("empty batch reached worker"))?
-            }
-        };
-        assert_matches!(outcome, BuildOutcome::Empty);
-        assert_matches!(
-            from_batch_builder.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        );
+            let outcome = tokio::select! {
+                outcome = done => outcome
+                    .map_err(std::io::Error::other)?
+                    .map_err(std::io::Error::other)?,
+                _ = from_batch_builder.recv() => {
+                    Err::<BuildOutcome, _>(std::io::Error::other("empty batch reached worker"))?
+                }
+            };
+            assert_matches!(outcome, BuildOutcome::Empty);
+            assert_matches!(
+                from_batch_builder.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            );
 
-        // Make the same transaction affordable before the loop consumes the empty result.
-        // This also proves that an empty build did not remove it from the pool.
-        txpool.update_canonical_state(
-            &batch_builder.last_canonical_update,
-            None,
-            vec![],
-            vec![ChangedAccount {
-                address: tx_factory.address(),
-                nonce: 0,
-                balance: U256::from(1_000_000_000_u64),
-            }],
-        );
-        assert_eq!(txpool.pending_transactions().len(), 1);
-        let (result, done) = oneshot::channel();
-        result
-            .send(Ok(outcome))
-            .map_err(|_| std::io::Error::other("build result receiver closed"))?;
-        batch_builder.pending_task = Some(done);
-        let mut builder_task = Box::pin(batch_builder.run());
+            // Make the same transaction affordable before the loop consumes the empty result.
+            // This also proves that an empty build did not remove it from the pool.
+            txpool.update_canonical_state(
+                &batch_builder.last_canonical_update,
+                None,
+                vec![],
+                vec![ChangedAccount {
+                    address: tx_factory.address(),
+                    nonce: 0,
+                    balance: U256::from(1_000_000_000_u64),
+                }],
+            );
+            assert_eq!(txpool.pending_transactions().len(), 1);
+            let (result, done) = oneshot::channel();
+            result
+                .send(Ok(outcome))
+                .map_err(|_| std::io::Error::other("build result receiver closed"))?;
+            batch_builder.pending_task = Some(done);
+            tokio::time::pause();
+            let mut builder_task = Box::pin(batch_builder.run());
 
-        // Register the reset deadline before advancing time. Reth's blocking validation
-        // tasks inhibit paused-clock auto-advance, so move the clock explicitly.
-        assert!(futures_util::poll!(&mut builder_task).is_pending());
-        tokio::time::advance(delay - Duration::from_millis(1)).await;
-        assert!(futures_util::poll!(&mut builder_task).is_pending());
-        assert_matches!(
-            from_batch_builder.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        );
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let (batch, ack) = tokio::select! {
-            result = &mut builder_task => Err(std::io::Error::other(format!(
-                "builder exited before proposing a batch: {result:?}"
-            ))),
-            batch = from_batch_builder.recv() =>
-                batch.ok_or_else(|| std::io::Error::other("worker channel closed")),
-        }?;
-        assert_eq!(batch.batch().transactions().len(), 1);
-        let encoded = batch
-            .batch()
-            .transactions()
-            .first()
-            .ok_or_else(|| std::io::Error::other("missing transaction"))?;
-        assert_eq!(recover_raw_transaction(encoded).map_err(std::io::Error::other)?.hash(), &hash);
-        assert_eq!(txpool.pending_transactions().len(), 1);
+            // Register the reset deadline before advancing time. Reth's blocking validation
+            // tasks inhibit paused-clock auto-advance, so move the clock explicitly.
+            assert!(futures_util::poll!(&mut builder_task).is_pending());
+            tokio::time::advance(delay.saturating_sub(Duration::from_millis(1))).await;
+            assert!(futures_util::poll!(&mut builder_task).is_pending());
+            assert_matches!(
+                from_batch_builder.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            );
+            // Resume before awaiting spawned work so both the interval and watchdog can
+            // progress without depending on exact paused-clock timer boundaries.
+            tokio::time::resume();
+            let (batch, ack) = tokio::select! {
+                result = &mut builder_task => Err(std::io::Error::other(format!(
+                    "builder exited before proposing a batch: {result:?}"
+                ))),
+                batch = from_batch_builder.recv() =>
+                    batch.ok_or_else(|| std::io::Error::other("worker channel closed")),
+            }?;
+            assert_eq!(batch.batch().transactions().len(), 1);
+            let encoded = batch
+                .batch()
+                .transactions()
+                .first()
+                .ok_or_else(|| std::io::Error::other("missing transaction"))?;
+            assert_eq!(
+                recover_raw_transaction(encoded).map_err(std::io::Error::other)?.hash(),
+                &hash
+            );
+            assert_eq!(txpool.pending_transactions().len(), 1);
 
-        // Acknowledge a fatal result to terminate the builder deterministically.
-        ack.send(Err(BlockSealError::FatalDBFailure))
-            .map_err(|_| std::io::Error::other("batch acknowledgement receiver closed"))?;
-        assert_matches!(builder_task.await, Err(BatchBuilderError::FatalDBFailure));
-        Ok(())
+            // Acknowledge a fatal result to terminate the builder deterministically.
+            ack.send(Err(BlockSealError::FatalDBFailure))
+                .map_err(|_| std::io::Error::other("batch acknowledgement receiver closed"))?;
+            assert_matches!(builder_task.await, Err(BatchBuilderError::FatalDBFailure));
+            Ok(())
+        })
+        .await
+        .map_err(|_| std::io::Error::other("empty-build regression exceeded its 10-second limit"))?
     }
 
     #[tokio::test]
