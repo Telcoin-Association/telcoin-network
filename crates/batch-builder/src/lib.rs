@@ -575,11 +575,14 @@ mod tests {
         );
         assert!(txpool.pending_transactions().is_empty());
 
-        let outcome = timeout(Duration::from_secs(1), done)
-            .await
-            .map_err(std::io::Error::other)?
-            .map_err(std::io::Error::other)?
-            .map_err(std::io::Error::other)?;
+        let outcome = tokio::select! {
+            outcome = done => outcome
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)?,
+            _ = from_batch_builder.recv() => {
+                Err::<BuildOutcome, _>(std::io::Error::other("empty batch reached worker"))?
+            }
+        };
         assert_matches!(outcome, BuildOutcome::Empty);
         assert_matches!(
             from_batch_builder.try_recv(),
@@ -604,16 +607,25 @@ mod tests {
             .send(Ok(outcome))
             .map_err(|_| std::io::Error::other("build result receiver closed"))?;
         batch_builder.pending_task = Some(done);
-        let builder_task = tokio::spawn(batch_builder.run());
+        let mut builder_task = Box::pin(batch_builder.run());
 
-        // Virtual time makes the stale-tick and immediate-rebuild assertions deterministic.
-        assert!(timeout(delay - Duration::from_millis(1), from_batch_builder.recv())
-            .await
-            .is_err());
-        let (batch, ack) = timeout(delay, from_batch_builder.recv())
-            .await
-            .map_err(std::io::Error::other)?
-            .ok_or_else(|| std::io::Error::other("worker channel closed"))?;
+        // Register the reset deadline before advancing time. Reth's blocking validation
+        // tasks inhibit paused-clock auto-advance, so move the clock explicitly.
+        assert!(futures_util::poll!(&mut builder_task).is_pending());
+        tokio::time::advance(delay - Duration::from_millis(1)).await;
+        assert!(futures_util::poll!(&mut builder_task).is_pending());
+        assert_matches!(
+            from_batch_builder.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (batch, ack) = tokio::select! {
+            result = &mut builder_task => Err(std::io::Error::other(format!(
+                "builder exited before proposing a batch: {result:?}"
+            ))),
+            batch = from_batch_builder.recv() =>
+                batch.ok_or_else(|| std::io::Error::other("worker channel closed")),
+        }?;
         assert_eq!(batch.batch().transactions().len(), 1);
         let encoded = batch
             .batch()
@@ -623,13 +635,10 @@ mod tests {
         assert_eq!(recover_raw_transaction(encoded).map_err(std::io::Error::other)?.hash(), &hash);
         assert_eq!(txpool.pending_transactions().len(), 1);
 
-        // Acknowledge a fatal result to terminate and join the builder deterministically.
+        // Acknowledge a fatal result to terminate the builder deterministically.
         ack.send(Err(BlockSealError::FatalDBFailure))
             .map_err(|_| std::io::Error::other("batch acknowledgement receiver closed"))?;
-        assert_matches!(
-            builder_task.await.map_err(std::io::Error::other)?,
-            Err(BatchBuilderError::FatalDBFailure)
-        );
+        assert_matches!(builder_task.await, Err(BatchBuilderError::FatalDBFailure));
         Ok(())
     }
 
