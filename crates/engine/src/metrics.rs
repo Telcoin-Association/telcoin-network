@@ -38,6 +38,10 @@ pub(crate) struct EngineMetrics {
     /// Consensus outputs whose durable persist failed after every attempt, rolling back
     /// the speculative in-memory advance and escalating out of the engine task.
     pub(crate) persist_failures_total: Counter,
+    /// Transactions observed in a batch whose first-ordered copy came from a different
+    /// producer's batch inside the detection window (priority-fee poaching indicator,
+    /// issue #1259).
+    pub(crate) cross_producer_repacked_txs_total: Counter,
 }
 
 #[cfg(test)]
@@ -62,6 +66,7 @@ mod tests {
             metrics.empty_outputs_skipped_total.increment(1);
             metrics.persist_provider_fault_retries_total.increment(2);
             metrics.persist_failures_total.increment(1);
+            metrics.cross_producer_repacked_txs_total.increment(4);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -85,5 +90,7 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(2)));
         let (_, _, _, value) = find("tn_engine.persist_failures_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_engine.cross_producer_repacked_txs_total");
+        assert!(matches!(value, DebugValue::Counter(4)));
     }
 }
