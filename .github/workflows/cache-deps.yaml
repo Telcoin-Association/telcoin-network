@@ -136,3 +136,84 @@ jobs:
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+
+      - name: Validate issue 1338 regressions and guard mutations
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          builder_source=crates/batch-builder/src/lib.rs
+          worker_source=crates/consensus/worker/src/worker.rs
+          builder_test=tests::empty_build_after_pending_pool_drain_is_deferred
+          validator_test=batch_provider_tests::validator_empty_seal_is_noop
+          observer_test=batch_provider_tests::observer_empty_seal_is_noop
+          regression_tests=("$builder_test" "$validator_test" "$observer_test")
+
+          restore_sources() {
+            git restore --source=HEAD -- "$builder_source" "$worker_source"
+          }
+          trap restore_sources EXIT
+
+          # Preserve the cached default workspace feature and Cargo profile selection.
+          cargo nextest list --locked --workspace --message-format json \
+            -- "${regression_tests[@]}" --exact > "$RUNNER_TEMP/tn-1338-tests.json"
+          python3 - "$RUNNER_TEMP/tn-1338-tests.json" "${regression_tests[@]}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_text())
+          selected = [
+              name
+              for suite in report["rust-suites"].values()
+              for name, test in suite.get("testcases", {}).items()
+              if test["filter-match"]["status"] == "matches" and not test["ignored"]
+          ]
+          if sorted(selected) != sorted(sys.argv[2:]):
+              raise SystemExit(f"Wrong regression selection: {selected}")
+          print(f"Verified selection of all {len(selected)} regression tests")
+          PY
+          cargo nextest run --locked --workspace --no-fail-fast --retries 0 \
+            -- "${regression_tests[@]}" --exact
+
+          disable_guard() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          guard = sys.argv[2]
+          source = path.read_text()
+          if source.count(guard) != 1:
+              raise SystemExit(f"Expected exactly one guard in {path}")
+          path.write_text(source.replace(guard, "if false {", 1))
+          PY
+          }
+
+          expect_test_failure() {
+            local regression_test="$1"
+            local mutation_status=0
+            cargo nextest run --locked --workspace --no-fail-fast --retries 0 \
+              -- "$regression_test" --exact || mutation_status=$?
+            # nextest reserves 100 for test failures; build and setup errors do not count.
+            if [[ "$mutation_status" -ne 100 ]]; then
+              echo "::error::Mutation for $regression_test returned $mutation_status, expected test failure 100"
+              exit 1
+            fi
+          }
+
+          # Mutate only the new guard conditions, one production file at a time.
+          disable_guard "$builder_source" 'if batch.transactions().is_empty() {'
+          expect_test_failure "$builder_test"
+          restore_sources
+          disable_guard "$worker_source" 'if sealed_batch.batch.transactions.is_empty() {'
+          expect_test_failure "$validator_test"
+          cargo nextest run --locked --workspace --no-fail-fast --retries 0 \
+            -- "$observer_test" --exact
+          restore_sources
+
+          # Rebuild and rerun fixed sources before the cache action's post-job save.
+          cargo nextest run --locked --workspace --no-fail-fast --retries 0 \
+            -- "${regression_tests[@]}" --exact
+          git diff --exit-code -- "$builder_source" "$worker_source" Cargo.lock
