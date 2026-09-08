@@ -587,6 +587,13 @@ impl TxPool for WorkerTxPool {
     }
 
     fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        // An empty set needs no state: acquiring the provider opens an MDBX read
+        // transaction (and, mid-round, collects the in-memory canonical blocks into a
+        // memory overlay). `build_batch` reaches this call with no senders whenever the
+        // pending set drained between the build gate and `best_transactions()`.
+        if addresses.is_empty() {
+            return HashMap::new();
+        }
         // one state provider (one MDBX read transaction + memory overlay) for the whole set;
         // a failure to acquire it reports the documented conservative zero for every address,
         // so it is logged loudly rather than degrading silently
