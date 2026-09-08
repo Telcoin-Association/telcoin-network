@@ -12,7 +12,7 @@ use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -64,6 +64,15 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// `consensus-db/state_exports/epoch-{N}/`.
     #[arg(long, global = true, default_value_t = false)]
     pub enable_state_export: bool,
+
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259).
+    ///
+    /// Opt-in telemetry: when set, execution keeps a bounded rolling window of recently
+    /// executed transaction hashes and reports (a counter and a rate-bounded warning) batches
+    /// that re-pack transactions first packed by another producer's batch. A node that does
+    /// not opt in builds no window and hashes nothing.
+    #[arg(long, global = true, default_value_t = false)]
+    pub enable_repack_monitor: bool,
 
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
@@ -118,22 +127,43 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
-        // across the fleet before a fork epoch arrives. Adiri builds carry epoch-gated forks;
-        // every other build has both the seed-signature (#1032) and multi-worker committee (#554)
-        // wire formats active from genesis.
+        // across the fleet before a fork epoch arrives; several fork constants document this log
+        // as their only in-protocol detection for a mismatched binary. Every epoch-gated adiri
+        // constant belongs in the adiri line, and every fork belongs in the non-adiri sentence
+        // (there is no non-adiri PREVRANDAO constant to log: that build's gate is a hardcoded
+        // `true`, active from genesis like the rest).
         #[cfg(feature = "adiri")]
         info!(
             target: "cli",
             consensus_registry_fork_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH,
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
+            region_shuffle_fork_epoch = tn_types::forks::REGION_SHUFFLE_FORK_EPOCH,
+            prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
+            leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature and multi_workers active from genesis"
+            "fork schedule: seed_signature, multi_workers, region_shuffle, prevrandao, and \
+             leader_seeded_ordering active from genesis"
         );
+
+        // Both lines above report compiled fork points, which a `test-utils` binary does not have
+        // to obey: the e2e harness spawns nodes with all but the leader-seeded fork pinned dormant,
+        // and they log "active from genesis" while executing the legacy derivations. Name the pins
+        // that are actually in force so the startup log stays diffable there too. Empty and
+        // silent in a production binary, where the overrides are compiled out of `tn-types`
+        // entirely.
+        for (var, fork_epoch) in tn_types::forks::fork_epoch_overrides() {
+            warn!(
+                target: "cli",
+                var,
+                fork_epoch,
+                "fork schedule OVERRIDDEN by the environment; this is a test-utils build"
+            );
+        }
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -203,6 +233,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             observer: _, // Used above
             metrics,
             enable_state_export,
+            enable_repack_monitor,
             instance,
             with_unused_ports,
             reth,
@@ -229,6 +260,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             metrics,
             healthcheck,
             enable_state_export,
+            enable_repack_monitor,
             reth_db,
             exex_fns: vec![],
         };

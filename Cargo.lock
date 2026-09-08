@@ -128,6 +128,7 @@ dependencies = [
  "alloy-core",
  "alloy-eips",
  "alloy-genesis",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-provider",
  "alloy-pubsub",
@@ -11671,6 +11672,7 @@ dependencies = [
  "backoff",
  "bs58",
  "eyre",
+ "hex",
  "humantime-serde",
  "libc",
  "libp2p",
@@ -11948,6 +11950,7 @@ dependencies = [
  "tn-worker",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "url",
 ]

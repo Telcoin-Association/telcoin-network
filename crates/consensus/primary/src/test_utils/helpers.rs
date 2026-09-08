@@ -12,14 +12,16 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
+use tn_config::KeyConfig;
 use tn_reth::{
     test_utils::{batch, TransactionFactory},
     RethChainSpec,
 };
 use tn_types::{
-    test_chain_spec_arc, test_genesis, to_intent_message, Address, AuthorityIdentifier, Batch,
-    BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, Committee, Epoch, ExecHeader,
-    Hash as _, HeaderBuilder, HeaderDigest, ProtocolSignature, Round, VotingPower, WorkerId, U256,
+    encode, test_chain_spec_arc, test_genesis, to_intent_message, Address, AuthorityIdentifier,
+    Batch, BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, Committee, DefaultHashFunction,
+    Epoch, EpochDigest, EpochSeedMessage, ExecHeader, Hash as _, HeaderBuilder, HeaderDigest,
+    ProtocolSignature, Round, VotingPower, WorkerId, U256,
 };
 
 pub fn temp_dir() -> TempDir {
@@ -484,8 +486,32 @@ pub fn mock_certificate(
     mock_certificate_with_epoch(committee, origin, round, 0, parents)
 }
 
+/// The deterministic BLS seed signature stamped on the headers built by
+/// [`mock_certificate_with_epoch`].
+///
+/// The signing key is derived from a hash of the author identifier, so distinct authors carry
+/// distinct signatures while the same `(author, epoch, round)` always signs byte-identical
+/// output, mirroring the one-value-per-`(author, epoch, round)` property of the signatures
+/// real proposers produce (see [`EpochSeedMessage::sign`]). The message is anchored to
+/// [`EpochDigest::default`], matching the epoch-0 fixture convention.
+fn fixture_seed_signature(
+    origin: &AuthorityIdentifier,
+    epoch: Epoch,
+    round: Round,
+) -> BlsSignature {
+    let mut hasher = DefaultHashFunction::new();
+    hasher.update(&encode(origin));
+    let keypair = BlsKeypair::generate(&mut StdRng::from_seed(hasher.finalize().into()));
+    EpochSeedMessage::new(epoch, round, EpochDigest::default())
+        .sign(&KeyConfig::new_with_testing_key(keypair))
+}
+
 /// Creates a badly signed certificate from its given round, epoch, origin, and parents,
 /// Note: the certificate is signed by a random key rather than its author
+///
+/// The header carries the deterministic per-author seed signature from
+/// [`fixture_seed_signature`], so the leader-seeded ordering arm (#1260) derives distinct
+/// seeds for distinct fixture leaders instead of collapsing on a shared default signature.
 pub fn mock_certificate_with_epoch(
     committee: &Committee,
     origin: AuthorityIdentifier,
@@ -493,6 +519,7 @@ pub fn mock_certificate_with_epoch(
     epoch: Epoch,
     parents: BTreeSet<HeaderDigest>,
 ) -> (HeaderDigest, Certificate) {
+    let seed_signature = fixture_seed_signature(&origin, epoch, round);
     let header_builder = HeaderBuilder::default();
     let header = header_builder
         .author(origin)
@@ -500,6 +527,7 @@ pub fn mock_certificate_with_epoch(
         .epoch(epoch)
         .parents(parents)
         .payload(fixture_payload(1))
+        .seed_signature(seed_signature)
         .build();
     let certificate = Certificate::new_unsigned_for_test(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
