@@ -21,7 +21,8 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
+    repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
     EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
@@ -54,6 +55,10 @@ pub struct TnBuilder {
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259) when set.
+    ///
+    /// Default off: a node that does not opt in builds no window and hashes nothing.
+    pub enable_repack_monitor: bool,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
     /// Registered ExEx install functions.
@@ -138,10 +143,13 @@ impl ExecutionNode {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown, gas_accumulator, engine_update_tx).await
+        guard
+            .start_engine(rx_output, rx_shutdown, gas_accumulator, repack_monitor, engine_update_tx)
+            .await
     }
 
     /// Initialize the worker's transaction pool and public RPC.
@@ -150,20 +158,29 @@ impl ExecutionNode {
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
-    /// #1262), and the RPC server keeps a handle for `eth_feeHistory`.
+    /// #1262). `worker_base_fee` is the worker's per-query epoch base-fee handle: the RPC
+    /// server keeps it so `eth_feeHistory` resolves the worker's current fee on every quote,
+    /// surviving worker-count changes (#1282).
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
+        worker_base_fee: WorkerBaseFee,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
         guard
-            .initialize_worker_components(worker_id, network_handle, engine_to_primary, base_fee)
+            .initialize_worker_components(
+                worker_id,
+                network_handle,
+                engine_to_primary,
+                base_fee,
+                worker_base_fee,
+            )
             .await
     }
 

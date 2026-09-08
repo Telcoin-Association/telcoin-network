@@ -99,7 +99,7 @@ impl ExecStateExporter {
     ///
     /// Non-blocking: enqueues the request and returns a receiver that resolves to the export result
     /// once the background worker finishes — `Ok(Some(outcome))` on success, or `Ok(None)` if the
-    /// snapshot was intentionally skipped as un-resumable (see [`export_once`]). Drop the receiver
+    /// snapshot was intentionally skipped as un-resumable (see `export_once`). Drop the receiver
     /// for fire-and-forget. Returns an error if the worker's queue is full (an export is already in
     /// flight/queued) or the worker stopped.
     pub fn trigger_export(

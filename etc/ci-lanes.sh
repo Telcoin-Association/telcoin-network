@@ -100,20 +100,21 @@ lane_test_adiri() {
     # above never builds or runs them: the legacy header wire-format pins and the frozen
     # pre-fork committee vectors in tn-types, the consensus-registry fork tests and their
     # determinism oracles in tn-reth, the pre-fork entry-fee pin in tn-node, the frozen
-    # pre-fork consensus-pack fixtures in tn-storage, the pre-fork genesis rejection in
-    # tn-config, and the fork-dispatching mix-hash oracle in tn-engine (its fixtures sit at
-    # epoch 0, so only an adiri build exercises the pre-fork legacy XOR arm). Every crate
-    # that forwards `adiri` and has adiri-gated tests belongs on this line: one left off
-    # silently stops testing its pre-fork lane. With multiple -p flags cargo requires
-    # package-qualified feature names.
+    # pre-fork consensus-pack fixtures in tn-storage, and the pre-fork genesis rejection in
+    # tn-config. tn-engine's integration suite compiles under either feature set, but its
+    # hand-composed mix-hash oracle dispatches on the PREVRANDAO fork gate (#1247), and
+    # only this lane runs the oracle's pre-fork legacy arm. Every crate that forwards
+    # `adiri` and has adiri-gated tests belongs on this line: one left off silently stops
+    # testing its pre-fork lane. With multiple -p flags cargo requires package-qualified
+    # feature names.
     #
     # tn-storage used to be left off here, on the grounds that two of its consensus_pack
-    # tests failed under the adiri features. They pass now, so it is back. tn-engine joined
-    # later (#1310): its basefee-penalty suite hardcoded the post-fork oracle, and this lane
-    # omitting the crate is what kept CI from seeing the adiri failure.
+    # tests failed under the adiri features. They pass now, so it is back. tn-engine
+    # joined for #1247: with the mix-hash oracle dispatching on the fork gate, this lane
+    # is the only one that runs its pre-fork legacy arm.
     run cargo nextest run --locked \
-        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-config -p tn-engine \
-        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-config/adiri,tn-engine/adiri \
+        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config \
+        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri \
         "${run_mode[@]}"
 }
 
