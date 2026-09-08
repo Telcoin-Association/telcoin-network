@@ -14,6 +14,13 @@
 //! namespace gets the corrected and guarded methods, and a transport without the
 //! namespace has no eth methods to correct or guard. The `Result` keeps a future
 //! registration failure from passing silently (issues #1231, #1160).
+//!
+//! Endpoints are derived per worker: [`RethEnv::start_rpc`] shifts the operator's
+//! configured http/ws ports into a per-worker band and suffixes the IPC path with the
+//! worker id, so every worker in one process binds distinct endpoints. Before this
+//! derivation every worker started the one shared `NodeConfig.rpc`: the second worker
+//! unlinked worker 0's IPC socket silently (reth removes the file before it binds) and
+//! a fixed http/ws port failed the node with `AddrInUse` (issue #1287).
 
 use std::sync::Arc;
 
@@ -26,10 +33,10 @@ use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
-use tn_types::gas_accumulator::WorkerBaseFee;
+use tn_types::{gas_accumulator::WorkerBaseFee, WorkerId};
 
 use crate::{
-    error::TnRethResult,
+    error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
     rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
@@ -37,6 +44,151 @@ use crate::{
     worker::WorkerNetwork,
     RethEnv, RpcServer, WorkerTxPool,
 };
+
+/// Port distance between per-worker RPC endpoint bands.
+///
+/// reth's `--instance` shifts `http_port` down by `instance - 1` and `ws_port` up by
+/// `2 * (instance - 1)`, with `instance` capped at 200 (reth v1.11.3,
+/// `NodeConfig::instance`), so instance offsets span at most 199 ports on either side
+/// of the configured default. Striding workers by 200 http ports (and 400 ws ports,
+/// mirroring reth's doubled ws arithmetic) keeps every `(instance, worker)` pair on a
+/// distinct port: an instance offset moves inside a band, a worker offset moves between
+/// bands, and the bands never touch.
+const WORKER_PORT_STRIDE: u32 = 200;
+
+/// The transport a worker port derivation applies to.
+///
+/// Picks the shift direction: http bands stride downward from the operator's port and
+/// ws bands stride upward at twice the distance, the same directions reth's
+/// `--instance` arithmetic uses. Cross-transport distinctness comes from the base
+/// order [`worker_rpc_server_args`] enforces (`ws_port >= http_port` when both
+/// transports are enabled on fixed ports): every derived http port stays at or below
+/// the http base and every derived ws port at or above the ws base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRpcTransport {
+    /// The http listener; bands stride downward.
+    Http,
+    /// The ws listener; bands stride upward at `2 * WORKER_PORT_STRIDE`.
+    Ws,
+}
+
+impl WorkerRpcTransport {
+    /// The transport name carried into [`TnRethError::WorkerRpcPort`].
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Ws => "ws",
+        }
+    }
+}
+
+/// Shift a configured listener port into `worker_id`'s band.
+///
+/// A port of zero is the OS-assigned sentinel (`--with-unused-ports` sets it) and every
+/// bind on port zero already yields a distinct socket, so zero passes through
+/// unchanged. A shifted http port that leaves `1024..=u16::MAX` (the floor is the top
+/// of the privileged range, which a non-root process cannot bind) or a shifted ws port
+/// that leaves `1..=u16::MAX` is an error: failing startup loudly, with the worker and
+/// offset named, beats wrapping into a port another worker or instance owns (issue
+/// #1287's silent-collision class) or dying later in the bind with a bare permission
+/// error.
+fn worker_shifted_port(
+    port: u16,
+    worker_id: WorkerId,
+    transport: WorkerRpcTransport,
+) -> TnRethResult<u16> {
+    if port == 0 {
+        Ok(0)
+    } else {
+        // Max offset is 65_535 * 400, far under `u32::MAX`, so the multiplication
+        // cannot overflow; the checked shift and the floor filter are the only
+        // validity checks needed.
+        let offset = match transport {
+            WorkerRpcTransport::Http => u32::from(worker_id) * WORKER_PORT_STRIDE,
+            WorkerRpcTransport::Ws => u32::from(worker_id) * WORKER_PORT_STRIDE * 2,
+        };
+        let shifted = match transport {
+            WorkerRpcTransport::Http => u32::from(port).checked_sub(offset),
+            WorkerRpcTransport::Ws => u32::from(port).checked_add(offset),
+        };
+        // The downward http band must stop above the privileged range; the upward ws
+        // band can never go below its base, so its floor is the whole valid range.
+        let floor = match transport {
+            WorkerRpcTransport::Http => 1024,
+            WorkerRpcTransport::Ws => 1,
+        };
+        shifted
+            .filter(|shifted| *shifted >= floor)
+            .and_then(|shifted| u16::try_from(shifted).ok())
+            .ok_or(TnRethError::WorkerRpcPort {
+                worker_id,
+                transport: transport.name(),
+                base: port,
+                offset,
+            })
+    }
+}
+
+/// Derive one worker's RPC server args from the operator's configured args.
+///
+/// Worker 0 keeps the operator's values unchanged, so single-worker nodes and existing
+/// tooling see exactly the configured endpoints. A worker above 0 gets:
+///
+/// - `http_port` shifted down by `200 * worker_id` when the http server is enabled;
+/// - `ws_port` shifted up by `400 * worker_id` when the ws server is enabled;
+/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled.
+///
+/// When both http and ws are enabled on fixed (non-zero) ports, the derivation needs
+/// `ws_port >= http_port` (reth's own default layout; equality is the shared http+ws
+/// server): http bands stride down and ws bands stride up, so inverted bases would
+/// let one worker's http band land on another worker's ws band. The first derived
+/// worker refuses startup loudly ([`TnRethError::WorkerRpcPortOrder`]) instead of
+/// colliding at bind time.
+///
+/// A disabled transport keeps its configured value: it never binds, so a port that a
+/// shift would push out of range must not fail startup. Under `--with-unused-ports`
+/// the http/ws ports are zero (OS-assigned, distinct per bind) and the one random
+/// IPC path gets the per-worker suffix, so all derived endpoints stay distinct there
+/// too. reth's `--instance` offsets are already applied to `base` at config build
+/// (`RethConfig::new`), and the worker stride clears the whole instance range
+/// ([`WORKER_PORT_STRIDE`]), so combining the two flags cannot collide either.
+fn worker_rpc_server_args(
+    base: &reth::args::RpcServerArgs,
+    worker_id: WorkerId,
+) -> TnRethResult<reth::args::RpcServerArgs> {
+    let base = base.clone();
+    let inverted_fixed_bases = base.http
+        && base.ws
+        && base.http_port != 0
+        && base.ws_port != 0
+        && base.ws_port < base.http_port;
+    match () {
+        _ if worker_id == 0 => Ok(base),
+        _ if inverted_fixed_bases => Err(TnRethError::WorkerRpcPortOrder {
+            worker_id,
+            http: base.http_port,
+            ws: base.ws_port,
+        }),
+        _ => {
+            let http_port = if base.http {
+                worker_shifted_port(base.http_port, worker_id, WorkerRpcTransport::Http)?
+            } else {
+                base.http_port
+            };
+            let ws_port = if base.ws {
+                worker_shifted_port(base.ws_port, worker_id, WorkerRpcTransport::Ws)?
+            } else {
+                base.ws_port
+            };
+            let ipcpath = if base.ipcdisable {
+                base.ipcpath.clone()
+            } else {
+                format!("{}-w{worker_id}", base.ipcpath)
+            };
+            Ok(reth::args::RpcServerArgs { http_port, ws_port, ipcpath, ..base })
+        }
+    }
+}
 
 /// Apply the operator's [`EthConfig`] values to the `eth` API builder.
 ///
@@ -156,10 +308,29 @@ impl RethEnv {
         Ok(server)
     }
 
-    /// Start running the RPC server for this instance.
-    pub async fn start_rpc(&self, server: &RpcServer) -> TnRethResult<RpcServerHandle> {
-        let server_config = self.node_config().rpc.rpc_server_config();
-        Ok(server_config.start(server).await?)
+    /// Start running the RPC server for one worker.
+    ///
+    /// The server config comes from [`worker_rpc_server_args`], not from the shared
+    /// `NodeConfig.rpc` directly, so every worker in the process binds distinct
+    /// http/ws ports and a distinct IPC path (issue #1287). The endpoints the OS
+    /// actually resolved are logged per worker at `info!`.
+    pub async fn start_rpc(
+        &self,
+        server: &RpcServer,
+        worker_id: WorkerId,
+    ) -> TnRethResult<RpcServerHandle> {
+        let server_config =
+            worker_rpc_server_args(&self.node_config().rpc, worker_id)?.rpc_server_config();
+        let handle = server_config.start(server).await?;
+        tracing::info!(
+            target: "tn::execution",
+            worker_id,
+            http = ?handle.http_local_addr(),
+            ws = ?handle.ws_local_addr(),
+            ipc = ?handle.ipc_endpoint(),
+            "worker rpc endpoints resolved"
+        );
+        Ok(handle)
     }
 }
 
@@ -680,5 +851,234 @@ mod tests {
             methods.call("eth_blobBaseFee", rpc_params![]).await.expect("blob base fee");
 
         assert_eq!(fee, U256::ZERO);
+    }
+
+    /// Worker 0 keeps the operator's configured endpoints byte for byte, so
+    /// single-worker nodes and existing tooling see no change (#1287).
+    #[test]
+    fn test_worker_zero_keeps_operator_rpc_endpoints() {
+        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let derived = worker_rpc_server_args(&base, 0).expect("worker 0 derivation");
+        assert_eq!(derived.http_port, base.http_port);
+        assert_eq!(derived.ws_port, base.ws_port);
+        assert_eq!(derived.ipcpath, base.ipcpath);
+    }
+
+    /// Each worker derives distinct http/ws ports and a distinct IPC path from one
+    /// operator config; the #1287 regression is every worker binding the same
+    /// endpoints.
+    #[test]
+    fn test_worker_endpoints_are_distinct_per_worker() {
+        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        let worker_two = worker_rpc_server_args(&base, 2).expect("worker 2 derivation");
+        assert_eq!(worker_one.http_port, base.http_port - 200);
+        assert_eq!(worker_two.http_port, base.http_port - 400);
+        assert_eq!(worker_one.ws_port, base.ws_port + 400);
+        assert_eq!(worker_two.ws_port, base.ws_port + 800);
+        assert_eq!(worker_one.ipcpath, format!("{}-w1", base.ipcpath));
+        assert_eq!(worker_two.ipcpath, format!("{}-w2", base.ipcpath));
+    }
+
+    /// A worker band cannot collide with any `--instance` offset. Instance arithmetic
+    /// moves http down by at most 199 and ws up by at most 398 (`instance <= 200` in
+    /// reth v1.11.3), and the closest approach between the two schemes is worker 1 of
+    /// instance 1 against worker 0 of instance 200: the worker stride clears it on
+    /// both transports.
+    #[test]
+    fn test_worker_bands_clear_the_instance_range() {
+        // Instance 1 leaves the defaults unchanged, so `base` is instance 1's config.
+        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert!(
+            worker_one.http_port < base.http_port - 199,
+            "worker 1 http band must sit below every instance's http port"
+        );
+        assert!(
+            worker_one.ws_port > base.ws_port + 398,
+            "worker 1 ws band must sit above every instance's ws port"
+        );
+    }
+
+    /// An enabled transport whose shifted port leaves the valid range fails startup
+    /// loudly instead of wrapping into a port another worker or instance owns.
+    #[test]
+    fn test_out_of_range_worker_port_is_a_loud_error() {
+        let low_http =
+            reth::args::RpcServerArgs { http: true, http_port: 100, ..Default::default() };
+        assert!(matches!(
+            worker_rpc_server_args(&low_http, 1),
+            Err(TnRethError::WorkerRpcPort {
+                worker_id: 1,
+                transport: "http",
+                base: 100,
+                offset: 200
+            })
+        ));
+
+        let high_ws =
+            reth::args::RpcServerArgs { ws: true, ws_port: u16::MAX, ..Default::default() };
+        assert!(matches!(
+            worker_rpc_server_args(&high_ws, 1),
+            Err(TnRethError::WorkerRpcPort {
+                worker_id: 1,
+                transport: "ws",
+                base: u16::MAX,
+                offset: 400
+            })
+        ));
+    }
+
+    /// `--with-unused-ports` semantics survive derivation: zero http/ws ports stay
+    /// zero (the OS assigns a distinct port per bind) and the flag's one random IPC
+    /// path still gets the per-worker suffix (#1287: every worker shared it).
+    #[test]
+    fn test_zero_ports_stay_os_assigned_and_ipc_still_suffixes() {
+        let base = reth::args::RpcServerArgs {
+            http: true,
+            ws: true,
+            http_port: 0,
+            ws_port: 0,
+            ..Default::default()
+        };
+        let derived = worker_rpc_server_args(&base, 3).expect("worker 3 derivation");
+        assert_eq!(derived.http_port, 0);
+        assert_eq!(derived.ws_port, 0);
+        assert_eq!(derived.ipcpath, format!("{}-w3", base.ipcpath));
+    }
+
+    /// Inverted transport bases (ws below http on fixed ports) would let one worker's
+    /// http band land on another worker's ws band, so the first derived worker fails
+    /// loudly at derivation time; worker 0 still binds the operator's ports as
+    /// configured, keeping single-worker nodes on inverted bases working.
+    #[test]
+    fn test_inverted_transport_bases_are_a_loud_error() {
+        let base = reth::args::RpcServerArgs {
+            http: true,
+            http_port: 8800,
+            ws: true,
+            ws_port: 8000,
+            ..Default::default()
+        };
+        let worker_zero = worker_rpc_server_args(&base, 0).expect("worker 0 keeps the config");
+        assert_eq!(worker_zero.http_port, 8800);
+        assert_eq!(worker_zero.ws_port, 8000);
+        assert!(matches!(
+            worker_rpc_server_args(&base, 1),
+            Err(TnRethError::WorkerRpcPortOrder { worker_id: 1, http: 8800, ws: 8000 })
+        ));
+    }
+
+    /// Equal http/ws bases are reth's shared http+ws server and stay valid: worker 0
+    /// keeps the combined endpoint, and derived workers split into bands that cannot
+    /// collide (http descends, ws ascends).
+    #[test]
+    fn test_equal_transport_bases_stay_valid() {
+        let base = reth::args::RpcServerArgs {
+            http: true,
+            http_port: 9000,
+            ws: true,
+            ws_port: 9000,
+            ..Default::default()
+        };
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.http_port, 8800);
+        assert_eq!(worker_one.ws_port, 9400);
+    }
+
+    /// A derived http port inside the privileged range (below 1024) fails at
+    /// derivation time with the worker and offset named, not at bind time with a
+    /// bare permission error.
+    #[test]
+    fn test_http_band_below_the_privileged_floor_is_a_loud_error() {
+        let base = reth::args::RpcServerArgs { http: true, http_port: 1100, ..Default::default() };
+        assert!(matches!(
+            worker_rpc_server_args(&base, 1),
+            Err(TnRethError::WorkerRpcPort {
+                worker_id: 1,
+                transport: "http",
+                base: 1100,
+                offset: 200
+            })
+        ));
+    }
+
+    /// A disabled transport keeps its configured value even when a shift would leave
+    /// the range (it never binds, so it must not fail startup), and a disabled IPC
+    /// server keeps its path unsuffixed.
+    #[test]
+    fn test_disabled_transports_keep_their_configured_values() {
+        let base = reth::args::RpcServerArgs {
+            http: false,
+            http_port: 100,
+            ws: false,
+            ws_port: u16::MAX,
+            ipcdisable: true,
+            ..Default::default()
+        };
+        let derived = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert_eq!(derived.http_port, 100);
+        assert_eq!(derived.ws_port, u16::MAX);
+        assert_eq!(derived.ipcpath, base.ipcpath);
+    }
+
+    /// Build and start one worker's RPC server over the env's production registration.
+    ///
+    /// The pool takes `worker_id`'s container from `accumulator` and the server its per-query
+    /// handle, as in production (#1262, #1282).
+    #[cfg(unix)]
+    async fn start_worker_rpc(
+        reth_env: &RethEnv,
+        accumulator: &GasAccumulator,
+        worker_id: WorkerId,
+    ) -> RpcServerHandle {
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(worker_id)).expect("txn pool");
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        let server = reth_env
+            .get_rpc_server(
+                pool,
+                network,
+                accumulator.worker_base_fee(worker_id),
+                RpcModule::new(()),
+            )
+            .expect("rpc server");
+        reth_env.start_rpc(&server, worker_id).await.expect("rpc server starts")
+    }
+
+    /// Two workers on one `RethEnv` bind two live IPC sockets. Before #1287 both
+    /// workers started the same `ipcpath`, and reth unlinks the endpoint path before
+    /// it binds, so the second start silently stole worker 0's socket file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_two_workers_bind_distinct_live_ipc_sockets() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
+        let rpc_args = reth::args::RpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+
+        // Two slots, so each worker's pool and fee handle resolve their own slot (#1282).
+        let accumulator = GasAccumulator::new(2);
+        let handle_zero = start_worker_rpc(&reth_env, &accumulator, 0).await;
+        let handle_one = start_worker_rpc(&reth_env, &accumulator, 1).await;
+
+        let suffixed = format!("{ipcpath}-w1");
+        assert_eq!(handle_zero.ipc_endpoint(), Some(ipcpath.clone()));
+        assert_eq!(handle_one.ipc_endpoint(), Some(suffixed.clone()));
+        // Both socket files exist after the second start: the derived paths differ,
+        // so worker 1's bind unlinked nothing of worker 0's.
+        assert!(
+            std::path::Path::new(&ipcpath).exists(),
+            "worker 0 IPC socket file must survive worker 1's start"
+        );
+        assert!(std::path::Path::new(&suffixed).exists(), "worker 1 IPC socket file must exist");
     }
 }
