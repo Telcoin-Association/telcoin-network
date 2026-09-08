@@ -295,9 +295,18 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         admitted.then_some(()).ok_or(BlockSealError::NotValidator)
     }
 
-    /// Seal and broadcast the current batch.
+    /// Seal and broadcast the current batch, treating empty batches as a successful no-op.
     #[instrument(level = "debug", skip_all, fields(batch_size = sealed_batch.size(), num_txs = sealed_batch.batch.transactions.len()))]
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
+        if sealed_batch.batch.transactions.is_empty() {
+            Ok(())
+        } else {
+            self.seal_non_empty(sealed_batch).await
+        }
+    }
+
+    /// Forward or attest a batch after `seal` has confirmed it contains transactions.
+    async fn seal_non_empty(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let Some(quorum_waiter) = &self.quorum_waiter else {
             // We are not a validator so need to send any transactions out for a CVV to pickup.
             return self.disburse_txns(sealed_batch).await;

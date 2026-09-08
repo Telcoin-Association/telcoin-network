@@ -1,13 +1,92 @@
 //! Unit tests for the worker's batch provider.
-use std::{sync::Arc, time::Duration};
+use futures::FutureExt as _;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
+use tn_network_libp2p::types::NetworkHandle;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
-use tn_storage::{open_db, tables::NodeBatchesCache};
-use tn_types::{
-    error::BlockSealError, test_chain_spec_arc, Batch, Database, NoopTxnForwarder, TaskManager,
+use tn_storage::{
+    mem_db::MemDatabase,
+    open_db,
+    tables::{NodeBatchesCache, OurNodeBatchesCache},
 };
-use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
+use tn_types::{
+    error::BlockSealError, test_chain_spec_arc, Batch, Database, NoopTxnForwarder, SealedBatch,
+    TaskManager, TaskSpawner,
+};
+use tn_worker::{
+    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+    test_utils::TestMakeBlockQuorumWaiter,
+    Worker, WorkerNetworkHandle,
+};
+use tokio::sync::{mpsc, oneshot};
+
+/// Quorum waiter that records calls synchronously and immediately accepts each batch.
+#[derive(Clone, Default)]
+struct RecordingQuorumWaiter {
+    /// Number of batches submitted for quorum verification.
+    calls: Arc<AtomicUsize>,
+}
+
+impl QuorumWaiterTrait for RecordingQuorumWaiter {
+    /// Record the call and resolve quorum without a spawned task or elapsed-time dependency.
+    fn verify_batch(
+        &self,
+        _batch: SealedBatch,
+        _timeout: Duration,
+        _task_spawner: &TaskSpawner,
+    ) -> oneshot::Receiver<Result<(), QuorumWaiterError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+}
+
+/// Empty seals complete immediately without quorum, network, storage, or primary effects.
+fn assert_empty_seal_is_noop(quorum_waiter: Option<RecordingQuorumWaiter>) {
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let (tx, mut rx) = mpsc::channel(1);
+    let batch_provider = Worker::new(
+        0,
+        quorum_waiter.clone(),
+        // Reporting without a registered primary handler would fail the seal.
+        LocalNetwork::new_with_empty_id(),
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
+    );
+    let empty_batch = Batch::default().seal_slow();
+    let digest = empty_batch.digest();
+
+    // A network command would remain pending because the receiver sends no response.
+    assert!(matches!(batch_provider.seal(empty_batch).now_or_never(), Some(Ok(()))));
+    assert!(quorum_waiter.is_none_or(|waiter| waiter.calls.load(Ordering::SeqCst) == 0));
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert!(store.get::<OurNodeBatchesCache>(&digest).is_ok_and(|batch| batch.is_none()));
+    assert!(store.get::<NodeBatchesCache>(&digest).is_ok_and(|batch| batch.is_none()));
+}
+
+/// A committee validator drops an empty batch before seeking quorum or broadcasting it.
+#[tokio::test]
+async fn validator_empty_seal_is_noop() {
+    assert_empty_seal_is_noop(Some(RecordingQuorumWaiter::default()));
+}
+
+/// An observer also drops an empty batch without discovering forwarding endpoints.
+#[tokio::test]
+async fn observer_empty_seal_is_noop() {
+    assert_empty_seal_is_noop(None);
+}
 
 #[tokio::test]
 async fn make_batch() {
