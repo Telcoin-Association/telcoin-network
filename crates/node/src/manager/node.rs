@@ -30,6 +30,7 @@ use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
+    repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, SealedHeader,
     ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
@@ -712,6 +713,18 @@ where
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
 
+        // Cross-producer re-packing telemetry (issue #1259) is opt-in: without the
+        // `--enable-repack-monitor` flag the monitor is the disabled default, builds no
+        // window, and hashes nothing. Logged once at startup so operators can confirm the
+        // setting across the fleet.
+        let repack_monitor =
+            self.builder.enable_repack_monitor.then(RepackMonitor::enabled).unwrap_or_default();
+        info!(
+            target: "engine",
+            enabled = repack_monitor.is_enabled(),
+            "cross-producer transaction re-packing monitor (issue #1259)"
+        );
+
         // create the engine
         let engine = self.create_engine(&node_task_manager, &gas_accumulator)?;
         engine
@@ -719,6 +732,7 @@ where
                 for_engine,
                 self.node_shutdown.subscribe(),
                 gas_accumulator.clone(),
+                repack_monitor,
                 engine_update_tx,
             )
             .await?;

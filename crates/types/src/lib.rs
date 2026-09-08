@@ -21,6 +21,7 @@ mod genesis;
 mod helpers;
 mod notifier;
 mod primary;
+pub mod repack_monitor;
 mod serde;
 mod sync;
 mod task_manager;
@@ -29,6 +30,7 @@ mod worker;
 pub mod error;
 pub mod forks;
 
+pub use self::serde::roaring_container_count;
 pub use canonical_reader::*;
 pub use codec::*;
 pub use committee::*;
