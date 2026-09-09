@@ -400,7 +400,6 @@ where
             return Err(CommitError::ReadOnly);
         }
         self.failed_cause().map_err(CommitError::Failed)?;
-        self.flush().map_err(CommitError::Flush)?;
         self.data_file.sync_all().map_err(CommitError::DataFileSync)?;
         Ok(())
     }
