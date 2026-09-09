@@ -47,6 +47,7 @@ fn every_authority_fixture_matches_advertised_worker_keys() -> Result<(), &'stat
                 );
                 Ok::<(), &'static str>(())
             })
-        })
+        })?;
+        Ok(())
     })
 }
