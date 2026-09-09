@@ -27,6 +27,8 @@ struct SwarmMetricHandles {
     gossip_received_total: Counter,
     /// Gossip messages rejected (failed verification against authorized publishers).
     gossip_rejected_total: Counter,
+    /// Inbound provider announcements dropped by the per-source rate limit.
+    add_provider_rate_limited_total: Counter,
     /// Graceful peer-exchange disconnects awaiting the peer's ack.
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
@@ -65,6 +67,11 @@ impl SwarmMetrics {
     /// Record a gossip message that failed verification.
     pub(crate) fn record_gossip_rejected(&self) {
         self.handles.gossip_rejected_total.increment(1);
+    }
+
+    /// Record an inbound provider announcement dropped before a store write.
+    pub(crate) fn record_add_provider_rate_limited(&self) {
+        self.handles.add_provider_rate_limited_total.increment(1);
     }
 
     /// Update the in-flight request gauges (called once per event-loop iteration).
