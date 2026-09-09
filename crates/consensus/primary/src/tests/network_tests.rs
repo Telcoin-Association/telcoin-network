@@ -4,9 +4,10 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        try_admit_epoch_record, MissingCertificatesRequest, PrimaryNetwork, PrimaryNetworkHandle,
-        RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS,
-        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
+        PrimaryNetworkHandle, RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
+        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -2200,6 +2201,30 @@ fn test_epoch_record_admission_enforces_global_cap() {
         try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
         "dropping in-flight serves must free global concurrency"
     );
+}
+
+/// The shed budget admits exactly [`MAX_CONCURRENT_SHED_TASKS`] concurrent shed
+/// tasks, denies the next, and frees a slot when a shed permit drops (#1308).
+/// Before the fix, `process_inbound_sync_stream` spawned a task per denied
+/// stream, so the cost of refusing work scaled with the arrival rate of refused
+/// work rather than with the cap.
+#[test]
+fn test_shed_admit_enforces_budget_and_frees_on_drop() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+
+    // fill the shed budget
+    let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
+        .map(|_| try_admit_shed(&semaphore).expect("admit below the shed budget"))
+        .collect();
+    assert_eq!(semaphore.available_permits(), 0);
+
+    // at the budget: the next shed spawn is refused (stream dropped, no task)
+    assert!(try_admit_shed(&semaphore).is_none());
+
+    // dropping a shed permit frees its slot for the next denied stream
+    drop(permits);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
+    assert!(try_admit_shed(&semaphore).is_some());
 }
 
 // ============================================================================
