@@ -136,3 +136,41 @@ jobs:
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+
+      - name: Run full default and adiri suites with a strict 60-second test timeout
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          nextest_config=.config/nextest.toml
+          restore_nextest_config() {
+            git restore --source=HEAD -- "$nextest_config"
+          }
+          trap restore_nextest_config EXIT
+
+          # Keep existing test groups and settings, tightening timeouts for every test.
+          cat >> "$nextest_config" <<'TOML'
+
+          [profile.issue1344-strict]
+          inherits = "default"
+          retries = 0
+
+          [[profile.issue1344-strict.overrides]]
+          filter = "all()"
+          retries = 0
+          slow-timeout = { period = "60s", terminate-after = 1, grace-period = "0s", on-timeout = "fail" }
+          TOML
+          export NEXTEST_PROFILE=issue1344-strict
+
+          # Run the same feature/package lanes as CI, even if the first lane fails.
+          default_status=0
+          ./etc/ci-lanes.sh test-default || default_status=$?
+          adiri_status=0
+          ./etc/ci-lanes.sh test-adiri || adiri_status=$?
+          restore_nextest_config
+          git diff --exit-code -- "$nextest_config" Cargo.lock
+          if [[ "$default_status" -ne 0 || "$adiri_status" -ne 0 ]]; then
+            echo "::error::Full-suite validation failed: default=$default_status, adiri=$adiri_status"
+            exit 1
+          fi
