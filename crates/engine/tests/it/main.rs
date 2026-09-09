@@ -2522,7 +2522,7 @@ async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::R
     };
 
     // clones only seed genesis and recover signers; beneficiary value is irrelevant to seeding
-    let all_batches = vec![batch.clone()];
+    let all_batches = [batch.clone()];
     let (genesis, _txs_by_block, _signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
