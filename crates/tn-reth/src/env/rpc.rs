@@ -399,62 +399,158 @@ mod tests {
         assert_eq!(pool.pool_size().pending, 0);
     }
 
-    /// `eth_fillTransaction` prices a bare request from the worker's epoch base fee:
-    /// tip zero and fee cap the container value, not the oracle's suggestion, in both
-    /// the returned `tx` fields and the `raw` encoding. An explicit client tip
-    /// survives and raises the filled cap by itself.
-    #[tokio::test]
-    async fn test_fill_transaction_prices_from_the_epoch_base_fee() {
-        let tmp_dir = TempDir::new().expect("temp dir");
-        let task_manager = TaskManager::default();
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    /// Return the production-registered fill method with independently chosen epoch
+    /// and header fees. Callers seed reth's defaults before constructing `rpc_args`.
+    fn fill_transaction_methods(
+        epoch_fee: u64,
+        header_fee: u64,
+        rpc_args: reth::args::RpcServerArgs,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<Methods> {
+        let mut genesis = test_genesis();
+        genesis.base_fee_per_gas = Some(u128::from(header_fee));
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
-            chain.clone(),
+            chain,
             tmp_dir.path(),
-            &task_manager,
+            task_manager,
             None,
-            reth::args::RpcServerArgs::default(),
-        )
-        .expect("temp chain env");
-        // A fee no other source carries: the genesis header's base fee differs, so a
-        // matching fill proves the container is the source. One shared container for the
-        // pool and the RPC server, as in production (#1262).
-        let base_fee = BaseFeeContainer::new(12_345);
-        let pool = reth_env.init_txn_pool(base_fee.clone()).expect("txn pool");
+            rpc_args,
+        )?;
+        // One shared container for the pool and the RPC server, as in production (#1262).
+        let base_fee = BaseFeeContainer::new(epoch_fee);
+        let pool = reth_env.init_txn_pool(base_fee.clone())?;
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
-        let server = reth_env
+        reth_env
             .get_rpc_server(pool, network, base_fee, RpcModule::new(()))
-            .expect("rpc server with the fill-transaction override");
-        let methods = server.methods_by(|name| name == "eth_fillTransaction");
-        let from = TransactionFactory::new().address();
+            .map(|server| server.methods_by(|name| name == "eth_fillTransaction"))
+    }
 
+    /// Check that a transfer's gas, chain ID, and fees agree with its raw encoding.
+    fn assert_filled_transfer(
+        filled: serde_json::Value,
+        fee_cap: u128,
+        tip: u128,
+    ) -> eyre::Result<()> {
+        assert_eq!(filled.pointer("/tx/gas"), Some(&serde_json::json!("0x5208")));
+        assert_eq!(filled.pointer("/tx/chainId"), Some(&serde_json::json!("0x7e1")));
+        assert_eq!(
+            filled.pointer("/tx/maxPriorityFeePerGas"),
+            Some(&serde_json::json!(format!("{tip:#x}")))
+        );
+        assert_eq!(
+            filled.pointer("/tx/maxFeePerGas"),
+            Some(&serde_json::json!(format!("{fee_cap:#x}")))
+        );
+        let raw: Bytes = serde_json::from_value(filled.get("raw").cloned().unwrap_or_default())?;
+        let decoded = tn_types::TransactionSigned::decode_2718_exact(raw.as_ref())?;
+        assert_eq!(decoded.gas_limit(), 21_000);
+        assert_eq!(decoded.chain_id(), Some(2017));
+        assert_eq!(decoded.max_priority_fee_per_gas(), Some(tip));
+        assert_eq!(decoded.max_fee_per_gas(), fee_cap);
+        Ok(())
+    }
+
+    /// `eth_fillTransaction` fills a zero tip and twice the worker's epoch base fee
+    /// into both `tx` and `raw`. An explicit client tip survives and raises the cap.
+    #[tokio::test]
+    async fn test_fill_transaction_prices_from_the_epoch_base_fee() -> eyre::Result<()> {
+        // Seed process-global RPC defaults before `RpcServerArgs::default()` (#1165).
+        init_reth_defaults();
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        // The header differs, so a matching fill proves the container is the source.
+        let methods = fill_transaction_methods(
+            12_345,
+            7,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
         let bare = alloy::rpc::types::TransactionRequest {
-            from: Some(from),
+            from: Some(TransactionFactory::new().address()),
             to: Some(Address::ZERO.into()),
             value: Some(U256::from(100)),
             ..Default::default()
         };
-        let filled: serde_json::Value = methods
-            .call("eth_fillTransaction", rpc_params![bare.clone()])
-            .await
-            .expect("bare request is filled");
-        assert_eq!(filled["tx"]["maxPriorityFeePerGas"], "0x0");
-        assert_eq!(filled["tx"]["maxFeePerGas"], format!("{:#x}", 12_345));
-        // The raw encoding carries the same corrected fees as the `tx` fields.
-        let raw: Bytes = serde_json::from_value(filled["raw"].clone()).expect("raw bytes decode");
-        let decoded = tn_types::TransactionSigned::decode_2718_exact(raw.as_ref())
-            .expect("raw is a 2718 transaction");
-        assert_eq!(decoded.max_priority_fee_per_gas(), Some(0));
-        assert_eq!(decoded.max_fee_per_gas(), 12_345);
+        let filled: serde_json::Value =
+            methods.call("eth_fillTransaction", rpc_params![bare.clone()]).await?;
+        assert_filled_transfer(filled, 24_690, 0)?;
 
         let with_tip =
             alloy::rpc::types::TransactionRequest { max_priority_fee_per_gas: Some(5), ..bare };
-        let filled: serde_json::Value = methods
-            .call("eth_fillTransaction", rpc_params![with_tip])
-            .await
-            .expect("explicit-tip request is filled");
-        assert_eq!(filled["tx"]["maxPriorityFeePerGas"], "0x5");
-        assert_eq!(filled["tx"]["maxFeePerGas"], format!("{:#x}", 12_350));
+        let filled = methods.call("eth_fillTransaction", rpc_params![with_tip]).await?;
+        assert_filled_transfer(filled, 24_695, 5)
+    }
+
+    /// An unpriced, zero-value request from an unfunded account must estimate gas
+    /// before fee defaults would enable reth's caller-balance gas allowance cap.
+    #[tokio::test]
+    async fn test_fill_transaction_estimates_unfunded_unpriced_request() -> eyre::Result<()> {
+        init_reth_defaults();
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let methods = fill_transaction_methods(
+            7,
+            7,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
+        let request = alloy::rpc::types::TransactionRequest {
+            from: Some(Address::repeat_byte(0x42)),
+            to: Some(Address::ZERO.into()),
+            // Reth replaces a client chain ID before estimating the missing gas.
+            chain_id: Some(1),
+            ..Default::default()
+        };
+        let filled = methods.call("eth_fillTransaction", rpc_params![request]).await?;
+        assert_filled_transfer(filled, 14, 0)
+    }
+
+    /// An unpriced request must estimate successfully when the pending header's fee
+    /// exceeds the current epoch fee, as it can after a downward epoch adjustment.
+    #[tokio::test]
+    async fn test_fill_transaction_estimates_below_pending_header_fee() -> eyre::Result<()> {
+        init_reth_defaults();
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let methods = fill_transaction_methods(
+            7,
+            1_000,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
+        let request = alloy::rpc::types::TransactionRequest {
+            from: Some(TransactionFactory::new().address()),
+            to: Some(Address::ZERO.into()),
+            value: Some(U256::from(100)),
+            ..Default::default()
+        };
+        let filled = methods.call("eth_fillTransaction", rpc_params![request]).await?;
+        assert_filled_transfer(filled, 14, 0)
+    }
+
+    /// HTTP alone must serve the fill override: `methods_by` unions transports, so
+    /// leaving IPC enabled could hide an HTTP registration that omitted it.
+    #[tokio::test]
+    async fn test_http_transport_gets_the_fill_transaction_override() -> eyre::Result<()> {
+        init_reth_defaults();
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let rpc_args =
+            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+        let methods = fill_transaction_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
+        let request = alloy::rpc::types::TransactionRequest {
+            from: Some(TransactionFactory::new().address()),
+            to: Some(Address::ZERO.into()),
+            value: Some(U256::from(100)),
+            ..Default::default()
+        };
+        let filled = methods.call("eth_fillTransaction", rpc_params![request]).await?;
+        assert_filled_transfer(filled, 24_690, 0)
     }
 
     /// Every applied [`EthConfig`] value reaches the [`EthApiBuilder`]: build a builder over

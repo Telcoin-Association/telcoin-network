@@ -37,8 +37,8 @@ use tn_types::{gas_accumulator::BaseFeeContainer, MIN_PROTOCOL_BASE_FEE};
 /// the handlers in place with `TransportRpcModules::add_or_replace_if_module_configured`.
 #[rpc(server, namespace = "eth")]
 pub(crate) trait EpochGasPrice {
-    /// `eth_gasPrice`: the worker's current epoch base fee, floored at the pool's
-    /// admission minimum.
+    /// `eth_gasPrice`: the worker's current epoch base fee, floored at the protocol
+    /// constant that equals the pool's default admission minimum.
     #[method(name = "gasPrice")]
     async fn gas_price(&self) -> RpcResult<U256>;
 
@@ -71,10 +71,11 @@ impl EpochGasPriceServer for GasPriceWithEpochBaseFee {
     async fn gas_price(&self) -> RpcResult<U256> {
         // Keep reth's request-trace parity: operators grep this target.
         tracing::trace!(target: "rpc::eth", "Serving eth_gasPrice");
-        // Floor at the pool's admission minimum: reth rejects any fee cap below
-        // `minimal_protocol_basefee` (7 wei, a config TN keeps), and a
-        // `WorkerFeeConfig::Static` row is not clamped, so a sub-floor governance fee
-        // would otherwise quote a price this node's own pool refuses.
+        // Floor at the protocol constant, which equals the pool's default admission
+        // minimum. A `WorkerFeeConfig::Static` row is not clamped. An operator can
+        // independently raise `--txpool.minimal-protocol-fee`; such a node may refuse
+        // this quote and is outside this handler's default-pool admission guarantee.
+        // Quote the chain fee without headroom: legacy transactions pay the full quote.
         Ok(U256::from(self.base_fee.base_fee().max(MIN_PROTOCOL_BASE_FEE)))
     }
 
@@ -116,7 +117,7 @@ mod tests {
     }
 
     /// A sub-floor governance fee (an unclamped `WorkerFeeConfig::Static` row) quotes
-    /// the pool's admission minimum, not a price the node's own pool would refuse.
+    /// the protocol minimum, which equals the pool's default admission minimum.
     #[tokio::test]
     async fn test_gas_price_floors_at_the_protocol_minimum() {
         let subject = GasPriceWithEpochBaseFee::new(BaseFeeContainer::new(1));
