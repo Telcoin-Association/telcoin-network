@@ -73,8 +73,11 @@ pub struct EpochMeta {
 /// Descriminant type for records in a Consensus Pack file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PackRecord {
+    /// The epoch metadata record; always the first record in a pack.
     EpochMeta(EpochMeta),
+    /// A batch belonging to the most recently written consensus output.
     Batch(Batch),
+    /// A consensus header, followed by the batch records its sub-dag owns.
     Consensus(Box<ConsensusHeader>),
 }
 
@@ -620,13 +623,15 @@ impl ConsensusPack {
         rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
+    /// Durably commit the data file and indexes to disk (an fsync), returning once complete.
     pub async fn persist(&self) -> Result<(), PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
         rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
-    // public handle method (sibling of `persist`, consensus_pack.rs:412):
+    /// Flush buffered data to the page cache (visible to readers) without the fsync durability
+    /// barrier that [`Self::persist`] provides.
     pub async fn flush_data(&self) -> Result<(), PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::FlushData(tx)).await;
@@ -717,6 +722,7 @@ impl ConsensusPack {
     }
 }
 
+/// File name of a pack's data log (the append-only WAL) within its `epoch-{N}` directory.
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 /// Sidecar directory name of the consensus-header digest index (the `hash` hdx/odx).
 pub const CONSENSUS_DIGEST_NAME: &str = Inner::CONSENSUS_HASH_NAME;
@@ -2485,43 +2491,72 @@ impl PosIndexValue for IndexPositions {
     }
 }
 
+/// Errors returned by consensus pack operations.
 #[derive(Debug, Clone)]
 pub enum PackError {
+    /// An underlying I/O error.
     IO(Arc<io::Error>),
+    /// A required batch was not found.
     MissingBatch,
+    /// Failed to load or decode a batch record.
     BatchLoad(String),
+    /// Failed to load or decode the epoch meta record.
     EpochLoad(String),
+    /// Failed to append a record to the data log.
     Append(String),
+    /// Failed to append an entry to an index.
     IndexAppend(String),
+    /// Failed to fetch a record from the data log.
     Fetch(String),
+    /// Failed to open the pack's data file or one of its indexes.
     Open(Arc<OpenError>),
+    /// The operation requires a writable pack but this one is read-only.
     ReadOnly,
+    /// Expected a consensus-header record but found another kind.
     NotConsensus,
+    /// Expected a batch record but found another kind.
     NotBatch,
+    /// Expected the epoch-meta record but found another kind (or none).
     NotEpoch,
+    /// Error reading from a record stream.
     ReadError(String),
+    /// A certificate author is not present in the pack's committee.
     MissingAuthority,
+    /// The consensus headers do not form a valid parent-linked chain.
     InvalidConsensusChain,
+    /// An output carried more batches than its sub-dag references.
     ExtraBatches,
+    /// An output is missing batches that its sub-dag references.
     MissingBatches,
+    /// The pack's epoch meta did not match what was expected for this epoch.
     InvalidEpoch(Epoch, String),
+    /// Failed to send a request to the pack's background task.
     SendFailed,
+    /// Failed to receive a response from the pack's background task.
     ReceiveFailed,
+    /// Failed to durably persist the pack.
     PersistError(String),
+    /// A consensus number was outside the range this pack accepts (got, limit).
     InvalidConsensusNumber(u64, u64),
+    /// The consensus output for this number was already written.
     ConsensusNumberAlreadyAdded,
     /// The pack holds damaged durably-committed data that recovery cannot repair by truncation.
     /// Carries an operator-facing message with the pack path and remediation guidance.
     CorruptPack(String),
+    /// The requested consensus number is below this pack's range.
     ConsensusNumberTooLow,
+    /// The requested consensus number is above this pack's range.
     ConsensusNumberTooHigh,
+    /// A record stream declared more batches for one output than is allowed.
     TooManyBatches(usize),
     /// Data pack file version is too new.
     InvalidVersion(u16, u16),
     /// A streamed consensus header's digest did not match the expected (already-verified) digest.
     /// Signals an unambiguous fork or peer misbehavior on the requested-output receive path.
     UnexpectedConsensusDigest {
+        /// The digest that was expected (already verified out-of-band).
         expected: ConsensusHeaderDigest,
+        /// The digest that was actually received in the stream.
         got: ConsensusHeaderDigest,
     },
 }

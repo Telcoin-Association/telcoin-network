@@ -15,6 +15,8 @@ use crate::mem_db::MemDatabase;
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table};
 use tokio::sync::oneshot::{self, error::TryRecvError};
 
+/// A read-only transaction over a [`LayeredDatabase`]: reads consult the in-memory layer first,
+/// then fall through to the backing database.
 #[derive(Clone)]
 pub struct LayeredDbTx<DB: Database> {
     mem_db: MemDatabase,
@@ -69,6 +71,8 @@ impl<DB: Database> Drop for TxnGuard<DB> {
     }
 }
 
+/// A read-write transaction over a [`LayeredDatabase`]: writes land in the in-memory layer and are
+/// forwarded to the background writer that persists them to the backing database.
 #[derive(Clone)]
 pub struct LayeredDbTxMut<DB: Database> {
     mem_db: MemDatabase,
@@ -390,6 +394,10 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 }
 
 impl<DB: Database> LayeredDatabase<DB> {
+    /// Open a layered database wrapping `db` with an in-memory layer and a background writer.
+    ///
+    /// When `full_memory` is true the in-memory layer retains every insert (the backing DB is a
+    /// durable mirror); otherwise the memory layer only caches and is kept in sync with `db`.
     pub fn open(db: DB, full_memory: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let db_cloned = db.clone();

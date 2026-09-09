@@ -247,7 +247,16 @@ pub enum EpochRecordValidation {
     /// The record was checked against the trusted committee but failed one or more of the anchor
     /// checks. The booleans record which checks passed, for diagnostics. `epoch_matches` is false
     /// when the record is for a different epoch than the one that was requested.
-    Invalid { epoch_matches: bool, parents_match: bool, committee_valid: bool, cert_valid: bool },
+    Invalid {
+        /// True if the record is for the epoch that was requested.
+        epoch_matches: bool,
+        /// True if the record's parent hash matches the trusted anchor.
+        parents_match: bool,
+        /// True if the record is anchored to the locally-trusted committee.
+        committee_valid: bool,
+        /// True if the record carries a valid super-quorum certificate from that committee.
+        cert_valid: bool,
+    },
     /// No locally-trusted anchor is available for the record's epoch (the previous epoch record,
     /// or the genesis committee, is not stored locally), so the record cannot be validated.
     /// Callers should retry once the anchor is available rather than treat the record as invalid.
@@ -1085,7 +1094,9 @@ impl EpochRecordDb {
     }
 }
 
+/// File name of the epoch-records data log within the epoch DB directory.
 pub const RECORDS_NAME: &str = Inner::RECORDS_NAME;
+/// File name of the epoch-certificates data log within the epoch DB directory.
 pub const CERTS_NAME: &str = Inner::CERTS_NAME;
 
 /// Lift a raw index/pack read into the non-collapsing shape: `Ok(Some(v))` on success,
@@ -1472,23 +1483,38 @@ impl Inner {
     }
 }
 
+/// Errors returned by the epoch-records database.
 #[derive(Debug, Clone)]
 pub enum EpochDbError {
+    /// An underlying I/O error.
     IO(Arc<io::Error>),
+    /// Failed to load or decode a record header.
     HeaderLoad(String),
+    /// Failed to append a record to a data log.
     Append(String),
+    /// Failed to append an entry to an index.
     IndexAppend(String),
+    /// Failed to open a data file or one of its indexes.
     Open(Arc<OpenError>),
+    /// A record for this epoch was already saved.
     EpochAlreadySaved,
+    /// Epoch records must be saved in order (expected, got).
     EpochOutOfOrder(Epoch, Epoch),
+    /// No certificate is stored for the epoch.
     MissingCertificate(Epoch),
+    /// No record is stored for the epoch.
     MissingRecord(Epoch),
+    /// Failed to send a request to the database's background task.
     SendFailed,
+    /// Failed to receive a response from the database's background task.
     ReceiveFailed,
+    /// Failed to durably persist the database.
     PersistError(String),
+    /// The epoch-records database is corrupt.
     CorruptDb,
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
+    /// Failed to join a background thread for the database.
     JoinError,
 }
 

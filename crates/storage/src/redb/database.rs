@@ -79,6 +79,7 @@ pub struct ReDB {
 }
 
 impl ReDB {
+    /// Open (creating if absent) the redb database at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<ReDB> {
         let db_path = path.as_ref();
         let db = Arc::new(RwLock::new(ReDatabase::create(db_path)?));
@@ -264,7 +265,9 @@ impl Database for ReDB {
     }
 }
 
-#[self_referencing(pub_extras)]
+/// A self-referencing iterator over a redb table: it owns the read guard and the opened table and
+/// yields decoded `(key, value)` pairs by borrowing from the table it holds.
+#[self_referencing]
 pub struct ReDBIter<'a, K, V>
 where
     K: KeyT,

@@ -86,6 +86,7 @@ pub struct MemDatabase {
 }
 
 impl MemDatabase {
+    /// Create a new, empty in-memory database.
     pub fn new() -> Self {
         let store: Arc<StoreType> = Arc::new(DashMap::new());
         Self { store }
