@@ -17,7 +17,7 @@
 //!   `crate::rpc_gas_price` quote the shared container instead).
 //!
 //! [`FillTransactionWithEpochBaseFee`] estimates a missing gas limit from the original
-//! request, then fills missing fee fields from the worker's shared [`BaseFeeContainer`]
+//! request, then fills missing fee fields through the worker's [`WorkerBaseFee`] handle
 //! and delegates to reth. A missing tip becomes zero (the `eth_maxPriorityFeePerGas`
 //! answer), and a missing fee cap becomes twice the floored epoch base fee plus the tip.
 //! Explicit client fee fields remain unchanged. Correcting the request *before* the
@@ -48,14 +48,14 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::FillTransaction;
-use tn_types::{gas_accumulator::BaseFeeContainer, TransactionSigned, MIN_PROTOCOL_BASE_FEE};
+use tn_types::{gas_accumulator::WorkerBaseFee, TransactionSigned, MIN_PROTOCOL_BASE_FEE};
 
 /// Headroom multiplier for a missing EIP-1559 fee cap.
 ///
 /// Twice the epoch fee tolerates fee increases across epoch boundaries, but does not
 /// guarantee admission after an arbitrary governance change. EIP-1559 charges
 /// `min(max_fee, base_fee + tip)`, so a zero-tip transaction still pays only the base
-/// fee. The pool reserves balance against the cap, so headroom increases the balance
+/// fee. The pool checks balance against the cap, so headroom increases the balance
 /// needed for admission. The legacy `eth_gasPrice` quote has no headroom because its
 /// consumer pays the entire quoted price.
 const FILL_FEE_CAP_HEADROOM: u128 = 2;
@@ -80,14 +80,14 @@ pub(crate) trait EpochFillTransaction {
 pub(crate) struct FillTransactionWithEpochBaseFee<Api> {
     /// The reth `EthApi` this handler delegates to.
     eth_api: Api,
-    /// This worker's shared epoch base fee.
-    base_fee: BaseFeeContainer,
+    /// Per-query resolver for this worker's current epoch base fee (issue #1282).
+    base_fee: WorkerBaseFee,
 }
 
 impl<Api> FillTransactionWithEpochBaseFee<Api> {
     /// Create a new handler from the built `EthApi` and the worker's base-fee
-    /// container.
-    pub(crate) const fn new(eth_api: Api, base_fee: BaseFeeContainer) -> Self {
+    /// handle.
+    pub(crate) const fn new(eth_api: Api, base_fee: WorkerBaseFee) -> Self {
         Self { eth_api, base_fee }
     }
 }

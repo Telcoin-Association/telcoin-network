@@ -15,7 +15,8 @@
 //!   the block beneficiary.
 //!
 //! [`GasPriceWithEpochBaseFee`] replaces both handlers with quotes from the worker's
-//! shared [`BaseFeeContainer`], no delegation:
+//! per-query [`WorkerBaseFee`] handle, no delegation. Resolving the current slot on each
+//! request preserves fee updates across worker-count changes (issue #1282):
 //! - `eth_gasPrice` answers the worker's current epoch base fee: the fee this node's next batch
 //!   actually enforces, tracking whatever governance writes into the worker's `WorkerConfigs` row.
 //!   The container wins over the latest header for the reason `crate::rpc_fee_history` documents:
@@ -29,7 +30,7 @@
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use tn_types::{gas_accumulator::BaseFeeContainer, MIN_PROTOCOL_BASE_FEE};
+use tn_types::{gas_accumulator::WorkerBaseFee, MIN_PROTOCOL_BASE_FEE};
 
 /// The `eth` gas-price oracle methods TN overrides.
 ///
@@ -55,13 +56,13 @@ pub(crate) trait EpochGasPrice {
 /// admission, not ordering, decides inclusion.
 #[derive(Debug, Clone)]
 pub(crate) struct GasPriceWithEpochBaseFee {
-    /// This worker's shared epoch base fee.
-    base_fee: BaseFeeContainer,
+    /// Per-query resolver for this worker's current epoch base fee (issue #1282).
+    base_fee: WorkerBaseFee,
 }
 
 impl GasPriceWithEpochBaseFee {
-    /// Create a new handler over the worker's base-fee container.
-    pub(crate) const fn new(base_fee: BaseFeeContainer) -> Self {
+    /// Create a new handler over the worker's base-fee handle.
+    pub(crate) const fn new(base_fee: WorkerBaseFee) -> Self {
         Self { base_fee }
     }
 }
@@ -91,13 +92,16 @@ impl EpochGasPriceServer for GasPriceWithEpochBaseFee {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tn_types::gas_accumulator::GasAccumulator;
 
     /// `eth_gasPrice` quotes the container's current value, not a snapshot taken at
     /// construction: an epoch-boundary `set_base_fee` reaches the next quote.
     #[tokio::test]
     async fn test_gas_price_tracks_the_container() {
-        let container = BaseFeeContainer::new(7);
-        let subject = GasPriceWithEpochBaseFee::new(container.clone());
+        let accumulator = GasAccumulator::new(1);
+        let container = accumulator.base_fee(0);
+        container.set_base_fee(7);
+        let subject = GasPriceWithEpochBaseFee::new(accumulator.worker_base_fee(0));
 
         assert_eq!(subject.gas_price().await.expect("gas price"), U256::from(7));
 
@@ -112,7 +116,8 @@ mod tests {
     /// `eth_maxPriorityFeePerGas` is a constant zero.
     #[tokio::test]
     async fn test_max_priority_fee_is_zero() {
-        let subject = GasPriceWithEpochBaseFee::new(BaseFeeContainer::new(7));
+        let accumulator = GasAccumulator::new(1);
+        let subject = GasPriceWithEpochBaseFee::new(accumulator.worker_base_fee(0));
         assert_eq!(subject.max_priority_fee_per_gas().await.expect("tip"), U256::ZERO);
     }
 
@@ -120,7 +125,9 @@ mod tests {
     /// the protocol minimum, which equals the pool's default admission minimum.
     #[tokio::test]
     async fn test_gas_price_floors_at_the_protocol_minimum() {
-        let subject = GasPriceWithEpochBaseFee::new(BaseFeeContainer::new(1));
+        let accumulator = GasAccumulator::new(1);
+        accumulator.base_fee(0).set_base_fee(1);
+        let subject = GasPriceWithEpochBaseFee::new(accumulator.worker_base_fee(0));
         assert_eq!(
             subject.gas_price().await.expect("floored gas price"),
             U256::from(MIN_PROTOCOL_BASE_FEE)

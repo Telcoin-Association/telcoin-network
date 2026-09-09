@@ -16,11 +16,14 @@
 use alloy::{primitives::address, sol, sol_types::SolCall};
 use proptest::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
-use reth_revm::primitives::Address;
+use reth_revm::{
+    context::result::{ExecutionResult, HaltReason},
+    primitives::Address,
+};
 use tn_reth::test_utils::precompile_test_utils::{assert_not_success, decode_bool, TestEnv, USER};
 use tn_types::{
     construct_proof_of_possession_message, generate_proof_of_possession_bls_for_test, BlsKeypair,
-    Bytes,
+    Bytes, U256,
 };
 
 sol! {
@@ -259,6 +262,46 @@ proptest! {
         let result = env.exec_to(USER, BLS_G1_PRECOMPILE_ADDRESS, data, VERIFY_GAS);
         assert_not_success(&result);
     }
+}
+
+// ==============================
+// Payability
+// ==============================
+
+/// `blsVerify` is not payable: a value-bearing call fails with a precompile-error halt, the
+/// journaled transfer is rolled back so the caller keeps the wei, and nothing is stranded at the
+/// precompile (which has no outflow path). Registering the address short-circuits the
+/// interpreter, so no compiled `CALLVALUE` guard runs; the dispatcher's own payability gate is
+/// the only thing standing between a value-bearing call and a committed transfer. A zero-value
+/// control with the same calldata proves the gate rejects the attached value, not the call
+/// itself.
+#[test]
+fn test_value_bearing_verify_rejected() {
+    let address = Address::repeat_byte(0x42);
+    let v = vector([7; 32], address);
+    let mut env = TestEnv::new();
+
+    // Zero-value control: the identical calldata verifies.
+    assert!(verify(&mut env, &v.sig, &v.pubkey, &v.message), "zero-value control must verify");
+
+    let user_before = env.get_balance(USER);
+    let result = env.exec_value_to(
+        USER,
+        BLS_G1_PRECOMPILE_ADDRESS,
+        verify_calldata(&v.sig, &v.pubkey, &v.message),
+        VERIFY_GAS,
+        U256::from(1),
+    );
+    // Not just "not success": the rejection must be the precompile-error halt the guard raises,
+    // so a harness-level failure (nonce, balance, gas) cannot satisfy this test by accident.
+    assert!(
+        matches!(&result, Ok(ExecutionResult::Halt { reason: HaltReason::PrecompileError, .. })),
+        "expected the payability guard's precompile-error halt, got {result:?}"
+    );
+    // The halt reverts the journaled transfer: the precompile's balance stays zero and the caller
+    // is made whole (the harness runs with a zero gas price, so balance moves only with value).
+    assert_eq!(env.get_balance(BLS_G1_PRECOMPILE_ADDRESS), U256::ZERO, "no stranded wei");
+    assert_eq!(env.get_balance(USER), user_before, "caller keeps the value");
 }
 
 // ==============================
