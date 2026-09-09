@@ -50,12 +50,15 @@ use reth_transaction_pool::{
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{sync::Arc, time::Instant};
-use tn_types::{
-    gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
-    TaskSpawner, TransactionSigned, TxHash, U256,
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tn_types::{
+    gas_accumulator::BaseFeeContainer, max_batch_size, Address, EnvKzgSettings, Recovered,
+    SealedBlock, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
+};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -72,6 +75,37 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 /// iteration reloads at most this many dirty senders and carries the rest to the next
 /// iteration, which arrives at consensus-round rate.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// A transaction-pool setting incompatible with TN's batch or fee policy.
+#[derive(Debug, PartialEq, Eq)]
+enum TxPoolConfigError {
+    /// A transaction admitted at this byte limit could never fit in a batch.
+    InputLimitExceedsBatch {
+        /// The operator's per-transaction byte limit.
+        configured: usize,
+        /// The batch protocol's byte limit.
+        maximum: usize,
+    },
+    /// TN has no priority fee market and does not support a pool priority fee floor.
+    MinimumPriorityFee,
+}
+
+impl std::fmt::Display for TxPoolConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLimitExceedsBatch { configured, maximum } => write!(
+                f,
+                "--txpool.max-tx-input-bytes {configured} exceeds TN's batch byte limit {maximum}"
+            ),
+            Self::MinimumPriorityFee => write!(
+                f,
+                "--txpool.minimum-priority-fee is unsupported on TN: omit this flag to accept zero-tip transactions"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TxPoolConfigError {}
 
 /// Generate a new pooled transaction from an eth transaction and id.
 ///
@@ -130,7 +164,7 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
-    /// Create a new instance of `Self` and spawn its canonical-state maintenance task.
+    /// Create a pool and spawn canonical-state maintenance and queued-transaction expiry.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -141,6 +175,7 @@ impl WorkerTxPool {
         let this =
             Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
+        this.spawn_expiry_task(task_spawner);
         Ok(this)
     }
 
@@ -156,6 +191,22 @@ impl WorkerTxPool {
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
+        // The batch byte limit is currently identical in every epoch. Non-blob reth
+        // validation measures the full EIP-2718 encoding, just like the batch protocol.
+        let maximum = max_batch_size(0);
+        (node_config.txpool.max_tx_input_bytes <= maximum).then_some(()).ok_or(
+            TxPoolConfigError::InputLimitExceedsBatch {
+                configured: node_config.txpool.max_tx_input_bytes,
+                maximum,
+            },
+        )?;
+        // A configured floor would conflict with TN's zero-tip fee policy (#1340).
+        node_config
+            .txpool
+            .minimum_priority_fee
+            .is_none()
+            .then_some(())
+            .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
@@ -183,6 +234,9 @@ impl WorkerTxPool {
         // RPC boundary (issue #1160).
         .set_tx_fee_cap(node_config.rpc.rpc_tx_fee_cap)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
+        // These limits live on reth's validator, so Pool::eth_pool cannot apply them.
+        .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
+        .with_max_tx_gas_limit(node_config.txpool.max_tx_gas_limit)
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
         .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
@@ -214,6 +268,47 @@ impl WorkerTxPool {
         */
 
         Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee))
+    }
+
+    /// Expire parked transactions even when the canonical chain is idle.
+    ///
+    /// Match reth's queued-lifetime sweep and local-origin exemptions. A zero lifetime
+    /// means expire on the next sweep; clamp only the timer period to avoid a zero-period
+    /// panic or a busy loop. Pending transactions never expire through this task.
+    fn spawn_expiry_task(&self, task_spawner: &TaskSpawner) {
+        let pool = self.clone();
+        let period = self.0.config().max_queued_lifetime.max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        task_spawner.spawn_task("queued txn pool expiry", async move {
+            IntervalStream::new(interval)
+                .for_each(move |_| {
+                    pool.evict_stale_transactions(Instant::now());
+                    futures::future::ready(())
+                })
+                .await;
+            Ok(())
+        });
+    }
+
+    /// Remove expired queued and basefee transactions using the pool's configured lifetime.
+    ///
+    /// Reth timestamps admission with `std::time::Instant`; accepting `now` explicitly
+    /// keeps boundary tests deterministic. Local and private origins retain reth's
+    /// exemption unless `--txpool.nolocals` is set. Blob transactions cannot enter this pool.
+    fn evict_stale_transactions(&self, now: Instant) {
+        let config = self.0.config();
+        let stale = self
+            .0
+            .queued_transactions()
+            .into_iter()
+            .filter(|tx| {
+                (tx.origin.is_external() || config.local_transactions_config.no_exemptions)
+                    && now.saturating_duration_since(tx.timestamp) >= config.max_queued_lifetime
+            })
+            .map(|tx| *tx.hash())
+            .collect();
+        self.0.remove_transactions(stale);
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -672,6 +767,9 @@ pub fn recover_pooled_transaction(
     let pooled = EthPooledTransaction::try_from_consensus(recovered)?;
     Ok(pooled)
 }
+
+#[cfg(test)]
+mod config_tests;
 
 #[cfg(test)]
 mod tests {
