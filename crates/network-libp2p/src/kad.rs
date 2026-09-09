@@ -19,7 +19,7 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{decode, encode, try_decode, BlockHash, Database, DefaultHashFunction};
+use tn_types::{encode, try_decode, BlockHash, Database, DefaultHashFunction};
 use tracing::{error, warn};
 
 /// A record stored in the DHT.
@@ -162,9 +162,9 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
 
 /// Decode a stored provider-record blob, tolerating bytes that no longer decode.
 ///
-/// The provider tables persist `Vec<KadProviderRecord>` values. A schema/version skew
+/// Provider envelopes contain separately encoded `Vec<KadProviderRecord>` values. A schema skew
 /// across a restart, or on-disk corruption, can leave a row whose bytes the current
-/// software can no longer decode. The panicking [`decode`] would turn that single bad
+/// software can no longer decode. The panicking [`tn_types::decode`] would turn that single bad
 /// row into a crash of the whole `ConsensusNetwork` task on the first provider read
 /// after restart, and because the row is never purged the crash recurs on every
 /// restart. This returns `None` (logging a warning) instead, so the caller can skip
@@ -177,6 +177,35 @@ fn decode_providers(key: &BlockHash, raw: &[u8]) -> Option<Vec<KadProviderRecord
             warn!(target: "network-kad", ?error, ?key, "skipping undecodable provider record");
         })
         .ok()
+}
+
+/// Provider row ownership stays readable when its separately encoded payload is corrupt.
+///
+/// The v2 column families discard the old unscoped format. Keeping the discovery key outside
+/// the provider vector lets a worker count and scrub its own malformed or empty payloads without
+/// touching siblings. An undecodable envelope has unknown ownership and is left untouched by
+/// scans; a direct operation on its namespaced key can replace or remove it.
+#[serde_as]
+#[derive(Serialize, Deserialize)]
+struct KadProviderRow {
+    /// Discovery key used to rederive this row's namespaced database hash.
+    #[serde_as(as = "RecordKeySerde")]
+    key: RecordKey,
+    /// Separately encoded provider vector, validated after ownership is established.
+    records: Vec<u8>,
+}
+
+impl KadProviderRow {
+    /// Encode a provider set while preserving independently decodable row ownership.
+    fn encode(key: RecordKey, records: &[KadProviderRecord]) -> Vec<u8> {
+        encode(&Self { key, records: encode(&records) })
+    }
+
+    /// Decode a provider set only when every member belongs to this row's discovery key.
+    fn decode_records(&self, hash: &BlockHash) -> Option<Vec<KadProviderRecord>> {
+        decode_providers(hash, &self.records)
+            .filter(|records| records.iter().all(|record| record.key == self.key))
+    }
 }
 
 /// Minimum spacing between saturated-table provider eviction scans.
@@ -192,7 +221,9 @@ const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
 pub struct KadStore<DB> {
+    /// Shared database containing all swarm namespaces.
     db: DB,
+    /// Discovery key under which this node publishes its provider record.
     node_key: RecordKey,
     /// This node's libp2p peer id.
     ///
@@ -206,9 +237,9 @@ pub struct KadStore<DB> {
     /// basically just here to prevent or mitigate attacks on the Kad store.
     /// Use the same settings as a Kad Memery store.
     config: MemoryStoreConfig,
-    /// Tracks to number of records in DB.
+    /// Number of persisted discovery records owned by this swarm, including expired rows.
     num_records: usize,
-    /// Tracks to number of provider records in DB.
+    /// Number of provider rows with a readable ownership envelope belonging to this swarm.
     num_providers: usize,
     /// Last time the saturated-table provider eviction scan ran, so a full table
     /// cannot be turned into a full-table decode scan per inbound `AddProvider`.
@@ -234,25 +265,18 @@ impl<DB: Database> KadStore<DB> {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
-        let (num_records, num_providers) = match kad_type {
-            NetworkType::Primary => {
-                (db.iter::<KadRecords>().count(), db.iter::<KadProviderRecords>().count())
-            }
-            NetworkType::Worker(_) => (
-                db.iter::<KadWorkerRecords>().count(),
-                db.iter::<KadWorkerProviderRecords>().count(),
-            ),
-        };
-        let store = Self {
+        let mut store = Self {
             db,
             node_key,
             local_peer_id,
             config,
-            num_records,
-            num_providers,
+            num_records: 0,
+            num_providers: 0,
             last_provider_evict: None,
             kad_type,
         };
+        store.num_records = store.owned_records().count();
+        store.num_providers = store.owned_provider_rows().count();
         metrics::describe_counter!(
             "tn_network.kad_provider_write_failures_total",
             metrics::Unit::Count,
@@ -280,44 +304,71 @@ impl<DB: Database> KadStore<DB> {
         .increment(1);
     }
 
+    /// Namespace shared discovery tables by the same role and worker id as `RecordDomain`.
     fn key_to_hash(&self, key: &RecordKey) -> BlockHash {
+        let (role, worker_id): (u8, tn_types::WorkerId) = match self.kad_type {
+            NetworkType::Primary => (0, 0),
+            NetworkType::Worker(id) => (1, id),
+        };
         let mut h = DefaultHashFunction::new();
+        h.update(&[role]);
+        h.update(&worker_id.to_le_bytes());
         h.update(encode(key).as_ref());
         BlockHash::from_slice(h.finalize().as_bytes())
+    }
+
+    /// Whether a persisted discovery key rederives this store's row hash.
+    fn owns(&self, key: &RecordKey, hash: &BlockHash) -> bool {
+        self.key_to_hash(key) == *hash
+    }
+
+    /// Decode a discovery row only when its persisted key matches this store's namespace.
+    fn decode_record(&self, hash: &BlockHash, raw: &[u8]) -> Option<KadRecord> {
+        try_decode::<KadRecord>(raw).ok().filter(|record| self.owns(&record.key, hash))
+    }
+
+    /// Enumerate this swarm's rows, including expired records needed for accounting.
+    fn owned_records(&self) -> impl Iterator<Item = (BlockHash, KadRecord)> + '_ {
+        let rows = match self.kad_type {
+            NetworkType::Primary => self.db.iter::<KadRecords>(),
+            NetworkType::Worker(_) => self.db.iter::<KadWorkerRecords>(),
+        };
+        rows.filter_map(move |(hash, raw)| {
+            self.decode_record(&hash, &raw).map(|record| (hash, record))
+        })
+    }
+
+    /// Read row ownership before inspecting provider payloads from a shared table.
+    fn decode_provider_row(&self, hash: &BlockHash, raw: &[u8]) -> Option<KadProviderRow> {
+        try_decode::<KadProviderRow>(raw).ok().filter(|row| self.owns(&row.key, hash))
+    }
+
+    /// Enumerate only this swarm's provider rows, even when their payloads are malformed.
+    fn owned_provider_rows(&self) -> impl Iterator<Item = (BlockHash, KadProviderRow)> + '_ {
+        let rows = match self.kad_type {
+            NetworkType::Primary => self.db.iter::<KadProviderRecords>(),
+            NetworkType::Worker(_) => self.db.iter::<KadWorkerProviderRecords>(),
+        };
+        rows.filter_map(move |(hash, raw)| {
+            self.decode_provider_row(&hash, &raw).map(|row| (hash, row))
+        })
     }
 
     /// Scan the records table and remove any rows whose expiry has passed.
     /// Returns the number of rows actually removed and updates `num_records`.
     fn evict_expired_records(&mut self) -> usize {
         let now = SystemTime::now();
-        let expired_keys: Vec<BlockHash> = match self.kad_type {
-            NetworkType::Primary => self
-                .db
-                .iter::<KadRecords>()
-                .filter_map(|(k, v)| {
-                    let r: KadRecord = decode(v.as_ref());
-                    r.is_expired(now).then_some(k)
-                })
-                .collect(),
-            NetworkType::Worker(_) => self
-                .db
-                .iter::<KadWorkerRecords>()
-                .filter_map(|(k, v)| {
-                    let r: KadRecord = decode(v.as_ref());
-                    r.is_expired(now).then_some(k)
-                })
-                .collect(),
-        };
-        let mut evicted = 0;
-        for k in &expired_keys {
-            let ok = match self.kad_type {
+        let expired_keys: Vec<BlockHash> = self
+            .owned_records()
+            .filter_map(|(hash, record)| record.is_expired(now).then_some(hash))
+            .collect();
+        let evicted = expired_keys
+            .iter()
+            .filter(|k| match self.kad_type {
                 NetworkType::Primary => self.db.remove::<KadRecords>(k).is_ok(),
                 NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(k).is_ok(),
-            };
-            if ok {
-                evicted += 1;
-            }
-        }
+            })
+            .count();
         self.num_records = self.num_records.saturating_sub(evicted);
         self.update_records_gauge();
         evicted
@@ -327,42 +378,22 @@ impl<DB: Database> KadStore<DB> {
     /// Returns the number of keys removed and updates `num_providers`.
     fn evict_expired_providers(&mut self) -> usize {
         let now = SystemTime::now();
-        let drop_keys: Vec<BlockHash> = match self.kad_type {
-            NetworkType::Primary => self
-                .db
-                .iter::<KadProviderRecords>()
-                .filter_map(|(k, v)| {
-                    // An undecodable row is unusable; treat it as droppable so eviction
-                    // frees the slot and purges it instead of panicking (issue #999).
-                    let should_drop = decode_providers(&k, v.as_ref())
-                        .map(|recs| !recs.is_empty() && recs.iter().all(|r| r.is_expired(now)))
-                        .unwrap_or(true);
-                    should_drop.then_some(k)
-                })
-                .collect(),
-            NetworkType::Worker(_) => self
-                .db
-                .iter::<KadWorkerProviderRecords>()
-                .filter_map(|(k, v)| {
-                    // An undecodable row is unusable; treat it as droppable so eviction
-                    // frees the slot and purges it instead of panicking (issue #999).
-                    let should_drop = decode_providers(&k, v.as_ref())
-                        .map(|recs| !recs.is_empty() && recs.iter().all(|r| r.is_expired(now)))
-                        .unwrap_or(true);
-                    should_drop.then_some(k)
-                })
-                .collect(),
-        };
-        let mut evicted = 0;
-        for k in &drop_keys {
-            let ok = match self.kad_type {
+        let drop_keys: Vec<BlockHash> = self
+            .owned_provider_rows()
+            .filter_map(|(hash, row)| {
+                // Ownership is known even for empty or malformed provider payloads.
+                row.decode_records(&hash)
+                    .is_none_or(|records| records.iter().all(|record| record.is_expired(now)))
+                    .then_some(hash)
+            })
+            .collect();
+        let evicted = drop_keys
+            .iter()
+            .filter(|k| match self.kad_type {
                 NetworkType::Primary => self.db.remove::<KadProviderRecords>(k).is_ok(),
                 NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
-            };
-            if ok {
-                evicted += 1;
-            }
-        }
+            })
+            .count();
         self.num_providers = self.num_providers.saturating_sub(evicted);
         evicted
     }
@@ -372,20 +403,13 @@ impl<DB: Database> KadStore<DB> {
     /// `consensus.rs`. Without this, a schema/version skew or on-disk corruption leaves a
     /// row that panics the whole `ConsensusNetwork` task on the first provider read after
     /// restart, and because the row is never purged the panic recurs on every restart.
-    /// Returns the number of rows removed and keeps `num_providers` in step (issue #999).
+    /// Only rows with a readable ownership envelope are considered; unknown ownership is never
+    /// guessed. Returns the number of rows removed and keeps `num_providers` in step (issue #999).
     pub fn scrub_corrupt_providers(&mut self) -> usize {
-        let corrupt: Vec<BlockHash> = match self.kad_type {
-            NetworkType::Primary => self
-                .db
-                .iter::<KadProviderRecords>()
-                .filter_map(|(k, v)| decode_providers(&k, v.as_ref()).is_none().then_some(k))
-                .collect(),
-            NetworkType::Worker(_) => self
-                .db
-                .iter::<KadWorkerProviderRecords>()
-                .filter_map(|(k, v)| decode_providers(&k, v.as_ref()).is_none().then_some(k))
-                .collect(),
-        };
+        let corrupt: Vec<BlockHash> = self
+            .owned_provider_rows()
+            .filter_map(|(hash, row)| row.decode_records(&hash).is_none().then_some(hash))
+            .collect();
         let evicted = corrupt
             .iter()
             .filter(|k| match self.kad_type {
@@ -428,7 +452,8 @@ impl<DB: Database> KadStore<DB> {
 
 /// Iterator of KAD records.
 pub struct RecordIter<'a> {
-    iter: Box<dyn Iterator<Item = (BlockHash, Vec<u8>)> + 'a>,
+    /// Decoded rows whose hashes match the originating store's namespace.
+    iter: Box<dyn Iterator<Item = (BlockHash, KadRecord)> + 'a>,
 }
 
 impl<'a> std::fmt::Debug for RecordIter<'a> {
@@ -442,14 +467,9 @@ impl<'a> Iterator for RecordIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let now = SystemTime::now();
-        loop {
-            let (_, raw) = self.iter.next()?;
-            let r: KadRecord = decode(raw.as_ref());
-            if r.is_expired(now) {
-                continue;
-            }
-            return Some(Cow::Owned(r.into()));
-        }
+        self.iter
+            .find(|(_, record)| !record.is_expired(now))
+            .map(|(_, record)| Cow::Owned(record.into()))
     }
 }
 
@@ -472,11 +492,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         })
         .ok()?;
         let raw = record?;
-        let r: KadRecord = decode(raw.as_ref());
-        if r.is_expired(SystemTime::now()) {
-            return None;
-        }
-        Some(Cow::Owned(r.into()))
+        try_decode::<KadRecord>(&raw)
+            .ok()
+            .filter(|record| record.key == *k && !record.is_expired(SystemTime::now()))
+            .map(|record| Cow::Owned(record.into()))
     }
 
     fn put(&mut self, r: Record) -> libp2p::kad::store::Result<()> {
@@ -486,28 +505,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
         let key = self.key_to_hash(&r.key);
         let kr: KadRecord = r.into();
-        // Are we adding a new record or replacing an existing?
-        let new_record = match self.kad_type {
+        let stored = match self.kad_type {
             NetworkType::Primary => self.db.get::<KadRecords>(&key),
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
         .map_err(|error| {
             error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
             Error::ValueTooLarge
-        })?
-        .is_none();
-        // We have a new record so go ahead and inc num_records.
-        // Should be safe since a failure to insert indicates a fatal DB condition.
-        if new_record {
+        })?;
+        // Startup excludes unreadable records, so repairing one is an insertion for capacity
+        // accounting. Replacing a readable owned row keeps the existing count.
+        let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
+        if new_record && self.num_records >= self.config.max_records {
+            // Try to free a slot by evicting any records whose TTL has passed.
+            self.evict_expired_records();
             if self.num_records >= self.config.max_records {
-                // Try to free a slot by evicting any records whose TTL has passed.
-                self.evict_expired_records();
-                if self.num_records >= self.config.max_records {
-                    return Err(Error::MaxRecords);
-                }
+                return Err(Error::MaxRecords);
             }
-            self.num_records += 1;
-            self.update_records_gauge();
         }
         match self.kad_type {
             NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encode(&kr)),
@@ -517,34 +531,40 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
             Error::ValueTooLarge
         })?;
+        if new_record {
+            self.num_records += 1;
+            self.update_records_gauge();
+        }
         Ok(())
     }
 
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
+        let row_counted = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .ok()
+        .flatten()
+        .and_then(|raw| self.decode_record(&key, &raw))
+        .is_some();
         if match self.kad_type {
             NetworkType::Primary => self.db.remove::<KadRecords>(&key),
             NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
         }
         .is_ok()
+            && row_counted
         {
-            // Record was removed so dec num_records. Saturate to match the eviction
-            // siblings (`evict_expired_records`): on MDBX `db.remove` returns `Ok` even
-            // when the key was absent, so a `remove` for an uncounted key (a double
-            // `remove`, or one for a row already dropped by eviction) would otherwise
-            // drive this `usize` below zero and wrap to `usize::MAX`, permanently
-            // wedging `put` behind the `num_records >= max_records` cap.
+            // Only readable owned rows contribute to startup accounting. An absent or
+            // malformed row cannot uncount another row even when MDBX removal returns Ok.
+            // Saturation also tolerates a preexisting stale count without wrapping capacity.
             self.num_records = self.num_records.saturating_sub(1);
             self.update_records_gauge();
         }
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        let iter = match self.kad_type {
-            NetworkType::Primary => self.db.iter::<KadRecords>(),
-            NetworkType::Worker(_) => self.db.iter::<KadWorkerRecords>(),
-        };
-        RecordIter { iter }
+        RecordIter { iter: Box::new(self.owned_records()) }
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
@@ -564,7 +584,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             Error::ValueTooLarge
         })?;
 
-        let key = self.key_to_hash(&record.key);
+        let record_key = record.key.clone();
+        let key = self.key_to_hash(&record_key);
         let kr: KadProviderRecord = record.into();
         let stored = match self.kad_type {
             NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
@@ -575,11 +596,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             Error::ValueTooLarge
         })?;
 
-        // A present-but-undecodable row is treated as absent for the merge: the new
-        // provider set overwrites (purges) it instead of the read panicking. Unlike a
-        // genuinely new key it is already counted in `num_providers`, so only a missing
-        // row bumps the gauge (issue #999).
-        let row_exists = stored.is_some();
+        // A readable ownership envelope is counted even when the provider payload is corrupt.
+        // An unreadable envelope was excluded by startup accounting, so its replacement must
+        // pass the capacity check and increment the count like a new key.
+        let stored_row = stored.as_deref().and_then(|raw| self.decode_provider_row(&key, raw));
+        let row_exists = stored_row.is_some();
 
         // The capacity check applies only to a brand-new key, mirroring `put`'s
         // `new_record` gate: an overwrite of an existing, already-counted row cannot
@@ -606,18 +627,16 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .ok_or(Error::MaxProvidedKeys)?;
         }
 
-        let merged = stored
-            .as_deref()
-            .and_then(|raw| decode_providers(&key, raw))
+        let merged = stored_row
+            .and_then(|row| row.decode_records(&key))
             .map(|existing| self.merge_provider(existing, kr.clone()))
             .transpose()?;
         let records: Vec<KadProviderRecord> = merged.unwrap_or_else(|| vec![kr]);
+        let encoded = KadProviderRow::encode(record_key, &records);
 
         match self.kad_type {
-            NetworkType::Primary => self.db.insert::<KadProviderRecords>(&key, &encode(&records)),
-            NetworkType::Worker(_) => {
-                self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
-            }
+            NetworkType::Primary => self.db.insert::<KadProviderRecords>(&key, &encoded),
+            NetworkType::Worker(_) => self.db.insert::<KadWorkerProviderRecords>(&key, &encoded),
         }
         .map_err(|error| {
             error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia provider records");
@@ -647,7 +666,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             })
             .ok()
             .flatten()
-            .and_then(|recs| decode_providers(&hash, &recs))
+            .and_then(|raw| self.decode_provider_row(&hash, &raw))
+            .and_then(|row| row.decode_records(&hash))
             .map(|records| {
                 records.into_iter().filter(|r| !r.is_expired(now)).map(Into::into).collect()
             })
@@ -684,10 +704,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         .ok()
         .flatten();
 
-        if let Some(raw) = stored {
-            // An undecodable row is purged wholesale (it is unusable and would otherwise
-            // panic every read); a decodable row keeps every provider except `p`.
-            let remaining: Vec<KadProviderRecord> = decode_providers(&hash, &raw)
+        if stored.is_some() {
+            let row = stored.as_deref().and_then(|raw| self.decode_provider_row(&hash, raw));
+            let row_counted = row.is_some();
+            // Direct lookup establishes the namespace even if the envelope itself is corrupt.
+            // Preserve the count when removing an unreadable envelope excluded at startup.
+            let remaining: Vec<KadProviderRecord> = row
+                .and_then(|row| row.decode_records(&hash))
                 .map(|records| records.into_iter().filter(|r| r.provider != *p).collect())
                 .unwrap_or_default();
             if remaining.is_empty() {
@@ -696,18 +719,17 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                     NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(&hash),
                 }
                 .is_ok();
-                if removed {
+                if removed && row_counted {
                     // The key holds no providers now (all filtered out, or the row was
                     // purged): drop the count once, saturating to avoid an underflow panic.
                     self.num_providers = self.num_providers.saturating_sub(1);
                 }
             } else {
+                let encoded = KadProviderRow::encode(key.clone(), &remaining);
                 let _ = match self.kad_type {
-                    NetworkType::Primary => {
-                        self.db.insert::<KadProviderRecords>(&hash, &encode(&remaining))
-                    }
+                    NetworkType::Primary => self.db.insert::<KadProviderRecords>(&hash, &encoded),
                     NetworkType::Worker(_) => {
-                        self.db.insert::<KadWorkerProviderRecords>(&hash, &encode(&remaining))
+                        self.db.insert::<KadWorkerProviderRecords>(&hash, &encoded)
                     }
                 }
                 .inspect_err(|error| {
@@ -868,6 +890,141 @@ mod test {
             rec.expires.unwrap().duration_since(now).as_secs(),
             rec_get.expires.unwrap().duration_since(now).as_secs()
         );
+    }
+
+    /// Sibling workers retain separate records, provider sets, startup counts and removals.
+    #[test]
+    fn test_kad_worker_store_isolation() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        // Sharing even the local peer id must not allow `provided()` to cross namespaces.
+        let local_peer_id = PeerId::random();
+        let mut worker_0 =
+            KadStore::new(db.clone(), local_peer_id, &key_config, NetworkType::Worker(0));
+        let mut worker_1 =
+            KadStore::new(db.clone(), local_peer_id, &key_config, NetworkType::Worker(1));
+        let record_0 = Record {
+            key: RecordKey::new(&b"shared-worker-record"),
+            value: vec![0],
+            publisher: None,
+            expires: None,
+        };
+        let record_1 = Record { value: vec![1], ..record_0.clone() };
+        worker_0.put(record_0.clone())?;
+        assert!(worker_1.get(&record_0.key).is_none());
+        worker_1.put(record_1.clone())?;
+        assert_eq!(worker_0.get(&record_0.key).map(|record| record.value.clone()), Some(vec![0]));
+        assert_eq!(worker_1.get(&record_1.key).map(|record| record.value.clone()), Some(vec![1]));
+        assert_eq!(worker_0.records().count(), 1);
+        assert_eq!(worker_1.records().count(), 1);
+
+        let provider_0 = ProviderRecord {
+            key: worker_0.node_key.clone(),
+            provider: local_peer_id,
+            expires: None,
+            addresses: vec!["/ip4/127.0.0.1/tcp/1000".parse()?],
+        };
+        let provider_1 = ProviderRecord {
+            addresses: vec!["/ip4/127.0.0.1/tcp/1001".parse()?],
+            ..provider_0.clone()
+        };
+        worker_0.add_provider(provider_0.clone())?;
+        assert!(worker_1.providers(&provider_0.key).is_empty());
+        worker_1.add_provider(provider_1.clone())?;
+        assert_eq!(worker_0.providers(&provider_0.key), vec![provider_0.clone()]);
+        assert_eq!(worker_1.providers(&provider_1.key), vec![provider_1.clone()]);
+        assert_eq!(
+            worker_0.provided().map(Cow::into_owned).collect::<Vec<_>>(),
+            vec![provider_0.clone()]
+        );
+        assert_eq!(
+            worker_1.provided().map(Cow::into_owned).collect::<Vec<_>>(),
+            vec![provider_1.clone()]
+        );
+
+        let restarted_0 =
+            KadStore::new(db.clone(), local_peer_id, &key_config, NetworkType::Worker(0));
+        let restarted_1 = KadStore::new(db, local_peer_id, &key_config, NetworkType::Worker(1));
+        assert_eq!((restarted_0.num_records, restarted_0.num_providers), (1, 1));
+        assert_eq!((restarted_1.num_records, restarted_1.num_providers), (1, 1));
+
+        // Persist both namespaces so the deletion checks also exercise the disk fallback.
+        worker_0.db.sync_persist();
+        worker_0.remove(&record_0.key);
+        worker_0.remove_provider(&provider_0.key, &local_peer_id);
+        // Layered storage requires a persistence barrier before reading a deleted key.
+        worker_0.db.sync_persist();
+        assert!(worker_0.get(&record_0.key).is_none());
+        assert!(worker_0.providers(&provider_0.key).is_empty());
+        assert_eq!(worker_1.get(&record_1.key).map(|record| record.value.clone()), Some(vec![1]));
+        assert_eq!(worker_1.providers(&provider_1.key), vec![provider_1]);
+        Ok(())
+    }
+
+    /// Repairing or removing a row excluded at startup must preserve record capacity accounting.
+    #[test]
+    fn test_kad_worker_corrupt_record_accounting() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut seed =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        let good_record = test_record(false);
+        seed.put(good_record.clone())?;
+        let corrupt_record = test_record(false);
+        let corrupt_hash = seed.key_to_hash(&corrupt_record.key);
+        db.insert::<KadWorkerRecords>(&corrupt_hash, &vec![0xff])?;
+
+        let mut worker_0 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        worker_0.config.max_records = 1;
+        assert_eq!(worker_0.num_records, 1);
+        assert!(matches!(worker_0.put(corrupt_record.clone()), Err(Error::MaxRecords)));
+        assert_eq!(worker_0.records().count(), 1);
+        assert_eq!(worker_0.num_records, 1);
+        worker_0.remove(&corrupt_record.key);
+        assert_eq!(
+            worker_0.num_records, 1,
+            "removing unreadable data must not uncount a valid row"
+        );
+        assert!(worker_0.get(&good_record.key).is_some());
+        worker_0.remove(&good_record.key);
+        assert_eq!(worker_0.num_records, 0);
+        db.insert::<KadWorkerRecords>(&corrupt_hash, &vec![0xff])?;
+        worker_0.put(corrupt_record.clone())?;
+        assert_eq!(worker_0.num_records, 1, "repairing unreadable data consumes capacity");
+        assert!(worker_0.get(&corrupt_record.key).is_some());
+        assert_eq!(db.iter::<KadWorkerRecords>().count(), 1);
+        Ok(())
+    }
+
+    /// A sibling's eviction must leave the owner's expired rows and counters in step.
+    #[test]
+    fn test_kad_worker_sibling_eviction_preserves_capacity() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut worker_0 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        let mut worker_1 = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(1));
+        worker_0.config.max_records = 1;
+        worker_0.config.max_provided_keys = 1;
+        worker_0.put(test_record(true))?;
+        worker_0.add_provider(expired_provider_under(&fresh_record_key()))?;
+
+        assert_eq!(worker_1.evict_expired_records(), 0);
+        assert_eq!(worker_1.evict_expired_providers(), 0);
+        assert_eq!(worker_0.db.iter::<KadWorkerRecords>().count(), 1);
+        assert_eq!(worker_0.db.iter::<KadWorkerProviderRecords>().count(), 1);
+        let fresh = test_record(false);
+        worker_0.put(fresh.clone())?;
+        worker_0.add_provider(live_provider_under(&fresh.key))?;
+        assert_eq!((worker_0.num_records, worker_0.num_providers), (1, 1));
+        assert!(worker_0.get(&fresh.key).is_some());
+        assert_eq!(worker_0.providers(&fresh.key).len(), 1);
+        assert_eq!((worker_1.num_records, worker_1.num_providers), (0, 0));
+        Ok(())
     }
 
     #[test]
@@ -1448,19 +1605,23 @@ mod test {
         RecordKey::new(&encode(&test_key_config().primary_public_key()))
     }
 
+    /// Corrupt a primary provider payload while keeping its ownership envelope readable.
     fn inject_corrupt_primary_provider<DB: Database>(store: &KadStore<DB>, key: &RecordKey) {
         let hash = store.key_to_hash(key);
+        let row = KadProviderRow { key: key.clone(), records: CORRUPT_PROVIDER_BYTES.to_vec() };
         store
             .db
-            .insert::<KadProviderRecords>(&hash, &CORRUPT_PROVIDER_BYTES.to_vec())
+            .insert::<KadProviderRecords>(&hash, &encode(&row))
             .expect("inject corrupt provider row");
     }
 
+    /// Corrupt a worker provider payload while keeping its ownership envelope readable.
     fn inject_corrupt_worker_provider<DB: Database>(store: &KadStore<DB>, key: &RecordKey) {
         let hash = store.key_to_hash(key);
+        let row = KadProviderRow { key: key.clone(), records: CORRUPT_PROVIDER_BYTES.to_vec() };
         store
             .db
-            .insert::<KadWorkerProviderRecords>(&hash, &CORRUPT_PROVIDER_BYTES.to_vec())
+            .insert::<KadWorkerProviderRecords>(&hash, &encode(&row))
             .expect("inject corrupt worker provider row");
     }
 
@@ -1586,6 +1747,73 @@ mod test {
         assert!(store.providers(&corrupt_key).is_empty(), "worker read skips corrupt row");
         assert_eq!(store.scrub_corrupt_providers(), 1, "worker scrub purges corrupt row");
         assert_eq!(store.num_providers, 0, "worker count reflects the purge");
+    }
+
+    /// Provider scrubbing and expiry respect ownership even for malformed or empty payloads.
+    #[test]
+    fn test_kad_worker_provider_corruption_isolation() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut seed_0 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        let mut seed_1 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(1));
+        let good_key = fresh_record_key();
+        seed_0.add_provider(live_provider_under(&good_key))?;
+        seed_1.add_provider(live_provider_under(&good_key))?;
+        let corrupt_key = fresh_record_key();
+        inject_corrupt_worker_provider(&seed_1, &corrupt_key);
+        let empty_key = fresh_record_key();
+        db.insert::<KadWorkerProviderRecords>(
+            &seed_1.key_to_hash(&empty_key),
+            &KadProviderRow::encode(empty_key.clone(), &[]),
+        )?;
+        let mixed_key = fresh_record_key();
+        db.insert::<KadWorkerProviderRecords>(
+            &seed_1.key_to_hash(&mixed_key),
+            &KadProviderRow::encode(mixed_key.clone(), &[live_provider_under(&good_key).into()]),
+        )?;
+        let unknown_key = fresh_record_key();
+        let unknown_hash = seed_1.key_to_hash(&unknown_key);
+        db.insert::<KadWorkerProviderRecords>(&unknown_hash, &CORRUPT_PROVIDER_BYTES.to_vec())?;
+
+        let mut worker_0 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        let mut worker_1 =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(1));
+        assert_eq!(worker_0.num_providers, 1);
+        assert_eq!(worker_1.num_providers, 4, "unreadable envelopes have no assumed owner");
+        assert!(worker_0.providers(&corrupt_key).is_empty());
+        assert!(worker_1.providers(&mixed_key).is_empty(), "mismatched payload key is rejected");
+        assert!(worker_1.providers(&unknown_key).is_empty());
+        assert_eq!(worker_0.scrub_corrupt_providers(), 0);
+        assert_eq!(worker_0.evict_expired_providers(), 0);
+        assert_eq!(db.iter::<KadWorkerProviderRecords>().count(), 6);
+
+        assert_eq!(worker_1.scrub_corrupt_providers(), 2);
+        assert_eq!(worker_1.evict_expired_providers(), 1, "empty owned payload frees its slot");
+        assert_eq!(worker_1.num_providers, 1);
+        assert_eq!(worker_0.num_providers, 1);
+        assert_eq!(worker_0.providers(&good_key).len(), 1);
+        assert_eq!(worker_1.providers(&good_key).len(), 1);
+        assert!(db.get::<KadWorkerProviderRecords>(&unknown_hash)?.is_some());
+
+        worker_1.config.max_provided_keys = 1;
+        assert!(
+            matches!(
+                worker_1.add_provider(live_provider_under(&unknown_key)),
+                Err(Error::MaxProvidedKeys)
+            ),
+            "replacing an uncounted envelope must still enforce capacity"
+        );
+        // Exercise deletion of an on-disk row, then wait for the queued removal to persist.
+        db.sync_persist();
+        worker_1.remove_provider(&unknown_key, &PeerId::random());
+        db.sync_persist();
+        assert_eq!(worker_1.num_providers, 1, "removing an uncounted envelope preserves the count");
+        assert!(db.get::<KadWorkerProviderRecords>(&unknown_hash)?.is_none());
+        Ok(())
     }
 
     // ---- issue #1185: a provider record's address list is capped ----
