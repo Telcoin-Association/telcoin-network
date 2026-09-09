@@ -4,13 +4,16 @@
 
 Telcoin Network runs a **standard Ethereum Virtual Machine**. There are no custom opcodes, no modified gas costs, and no disabled instructions. Contracts written in Solidity or Vyper deploy and execute identically to Ethereum. Standard tooling, including Hardhat, Foundry, ethers.js, viem, etc., work without modification.
 
-TN supports all standard transaction types:
+TN supports these transaction types:
 
 * Legacy transactions
 * EIP-2930 (access list)
 * EIP-1559 (type 2)
+* EIP-7702 (type 4, set code)
 
 All Ethereum hardfork rules through Prague/Pectra are active.
+
+Set-code transactions carry two extra admission rules. The authorization list must hold between 1 and 1,199 tuples: an empty list is invalid under EIP-7702 itself, and 1,200 tuples owe `21,000 + 25,000 * 1,200 = 30,021,000` in intrinsic gas, more than a batch's 30,000,000 gas limit. Separately, every transaction in a batch must declare `gas_limit >= 21,000 + 25,000 * N` for its `N` tuples, which holds a whole batch to the same 1,199 tuples one transaction may carry. Neither rule can reject a transaction that could otherwise have executed. See [gas-penalty](gas-penalty.md) for the error a sender gets when either fires.
 
 The sections below cover the areas where TN diverges from mainnet Ethereum behavior.
 
@@ -209,7 +212,7 @@ commit). Contracts that need unbiasable randomness must not rely on `PREVRANDAO`
 | -------------------- | ------------------------------------ | ----------------------------- |
 | EVM opcodes          | Standard                             | Standard (identical)          |
 | Gas costs            | Standard                             | Standard (identical)          |
-| Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844 | Legacy, EIP-2930, EIP-1559    |
+| Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702 | Legacy, EIP-2930, EIP-1559, EIP-7702 (1-1,199 authorizations) |
 | Native asset ERC-20  | Requires WETH wrapper                | Requires WTEL wrapper         |
 | Custom precompiles   | None                                 | TEL issuance at `0x7e1`, BLS verify at `0xb151` (both report `0xfe` code) |
 | Base fee destination | Burned                               | Base-fee address (governance) |

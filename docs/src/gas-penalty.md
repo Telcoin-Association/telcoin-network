@@ -210,6 +210,67 @@ Three shapes follow from this:
 The clamp only ever reduces a penalty, and it applies only to authorization gas.
 No non-7702 transaction is affected by it.
 
+## Admission limits for set-code transactions
+
+Two limits decide whether a set-code transaction is accepted at all.
+They are checked before execution, so they are independent of the penalty above.
+Neither can refuse a transaction that could otherwise have run: both reject only transactions the EVM
+would reject anyway, earlier and more cheaply.
+
+A type-0x04 transaction must carry between 1 and 1,199 authorization tuples.
+An empty list is invalid under EIP-7702 itself.
+The upper bound is `(30,000,000 - 21,000) / 25,000`, the tuples that fit inside one batch's 30,000,000 gas
+limit once the 21,000 base cost is paid.
+A list of 1,200 tuples owes `21,000 + 25,000 * 1,200 = 30,021,000` in intrinsic gas before it does any
+work.
+Declare that limit and no batch can carry the transaction, because a batch is capped at 30,000,000 gas of
+declared limits.
+Declare less and it is rejected for insufficient intrinsic gas, by the transaction pool at submission or by
+the EVM at execution.
+Either way it can never execute, which is what makes the bound safe to apply at ingress.
+
+The second limit is a floor on the declared gas limit: every transaction in a batch must declare
+`gas_limit >= 21,000 + 25,000 * N` for its `N` authorization tuples.
+Three tuples require a limit of at least 96,000; a list at the cap requires 29,996,000.
+The floor deliberately sits below the intrinsic gas the EVM actually charges, because it omits calldata,
+access-list and contract-creation costs, which only add to the bill.
+Any transaction the pool admits already clears it, and any limit `eth_estimateGas` returns clears it with
+room to spare.
+
+The floor is there because the per-transaction tuple cap says nothing about a batch.
+Eight transactions sitting exactly at the 1,199-tuple cap encode to roughly 115 KB each, so all eight fit
+inside the 1,000,000-byte batch size limit.
+Declaring 21,000 gas apiece they sum to 168,000 gas, far under the batch gas limit, and carry 9,592
+authorization tuples between them.
+Every one of those tuples costs each validator a secp256k1 recovery nobody paid for: the authorization list
+is recovered in full while the transaction environment is built, before the intrinsic-gas check rejects the
+transaction, and that happens on every execution and every replay.
+With the floor in place the existing batch gas sum does the bounding work.
+`sum(gas_limit) <= 30,000,000` together with `gas_limit >= 21,000 + 25,000 * N` holds a whole batch to 1,199
+tuples, the same number one transaction may carry on its own.
+
+What a sender sees depends on where the transaction was submitted.
+A worker gateway rejects an out-of-range list before forwarding it, with HTTP 400, JSON-RPC error code
+`-32009`, and the message `EIP-7702 authorization list length is outside the accepted range`; the rejection
+is counted on `tn_worker_gateway_rejections_total` under the reason label `invalid_authorization_list`.
+Submitted straight to a validator, the transaction pool answers with code `-32000` and either
+`EIP-7702 authorization list length 1200 exceeds maximum 1199` for an over-cap list or
+`no items in authorization list for EIP7702 transaction` for an empty one.
+A gas limit below the floor never reaches the floor check: the pool's own intrinsic-gas check rejects it
+first, also under `-32000`, with `intrinsic gas too low`.
+A batch that carries a violation of either limit is rejected by the validators that receive it, so ignoring
+these limits costs a batch producer peer reputation rather than getting the transactions certified.
+
+The cap is `max_tx_authorizations` and the floor's two terms are `BASE_TX_GAS` and `PER_EMPTY_ACCOUNT_COST`,
+all in
+[`crates/types/src/worker/sealed_batch.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/types/src/worker/sealed_batch.rs).
+Batches are checked in
+[`crates/batch-validator/src/validator.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/batch-validator/src/validator.rs),
+the gateway screen is in
+[`bin/worker-gateway/src/proxy.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/bin/worker-gateway/src/proxy.rs),
+and the pool screen is `TnPoolValidator` in
+[`crates/tn-reth/src/txn_pool.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/tn-reth/src/txn_pool.rs).
+
 ## What the sender pays
 
 The sender prepays `gas_limit * effective_gas_price`.
@@ -286,6 +347,8 @@ Wallets and indexers can recover the charge without new RPC methods:
 | EIP-7702 authorization exclusion | `crates/tn-reth/src/evm/utils.rs` (`gas_penalty_and_refund`) |
 | EIP-7623 floor clamp | `crates/tn-reth/src/evm/utils.rs` (`effective_auth_intrinsic`) |
 | Refund split and fund destination | `crates/tn-reth/src/evm/handler.rs` (`TNEvmHandler::reimburse_caller`) |
+| Authorization-list bound | `crates/types/src/worker/sealed_batch.rs` (`max_tx_authorizations`), `crates/batch-validator/src/validator.rs` (`validate_authorization_lists`) |
+| Declared-gas floor | `crates/batch-validator/src/validator.rs` (`validate_intrinsic_gas`) |
 
 This page mirrors those files.
 Update this page when those files change.

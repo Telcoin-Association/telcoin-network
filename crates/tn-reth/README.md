@@ -248,7 +248,7 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
   floor is priced from calldata alone, so when revm rewrites `gas.spent()` to the floor the
   authorization gas rode along inside it and must not be excused from the basis twice.
   User-facing documentation (formula, examples, detection recipe for wallets and integrators):
-  [`docs/gas-penalty.md`](../../docs/gas-penalty.md) at the repo root. Keep the two in sync.
+  [`docs/src/gas-penalty.md`](../../docs/src/gas-penalty.md). Keep the two in sync.
 - **`BASEFEE_ADDRESS` is a process-global `OnceLock`** (`src/lib.rs`), written once by
   `set_basefee_address` during `RethEnv::new` (`src/env/mod.rs`). The first write wins; later
   writes are **silently discarded** (the `set` error is intentionally ignored). If it is never
@@ -322,6 +322,24 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
   which serves `net`/`web3` info from TN's libp2p peer count. No engine/auth namespace exists.
   A failure to merge the TN-specific RPC module is logged at `error!` but does not stop the
   server (`src/env/rpc.rs`).
+
+### EIP-7702 authorization-list admission
+
+`TnPoolValidator` (`src/txn_pool.rs`) wraps reth's transaction validator and rejects an EIP-7702
+transaction whose authorization list exceeds `tn_types::max_tx_authorizations` (1,199 today) before the
+inner validator runs, with TN's own `AuthorizationListLengthExceeded` kind; the empty-list case is left to
+reth's `MissingEip7702AuthorizationList`. Against reth v1.11.3 the screen saves zero authority recoveries:
+`recover_authorities` is the last step of `validate_stateful`, after `ensure_intrinsic_gas` charges
+25,000/tuple against the pool's 30,000,000 block gas limit, which already forces `N <= 1199`. It is kept as
+defense in depth against two unpinned drift risks: the pool's implicit bound derives from the **header** gas
+limit while `max_tx_authorizations` derives from `max_batch_gas` (equal today only because genesis sets both
+to 30,000,000), and the ordering guarantee lives entirely in upstream reth's stateless/stateful split.
+
+The screen evaluates the cap at epoch 0, which is exact while the cap is epoch-uniform. A fork that raises
+`max_batch_gas` must loosen this evaluation (largest cap across epochs), never tighten it, or an epoch-0 cap
+would false-reject a now-valid transaction at RPC ingress. The epoch-precise bound, and the per-transaction
+intrinsic-gas floor that makes a batch's declared-gas sum bound aggregate authorization work, live in
+`crates/batch-validator`.
 
 ### Transaction forwarding (observer → committee)
 
@@ -428,7 +446,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/snapshot.rs` | State-pack export (`PinnedStateView`) and verified restore (`SnapshotRestorer`). |
 | `src/system_calls.rs` | `sol!` bindings for `ConsensusRegistry`/`WorkerConfigs`, `SYSTEM_ADDRESS`, registry address, `EpochState`. |
 | `src/traits.rs` | `TelcoinNode` node-type wiring and the fail-loud `TNExecution` shim. |
-| `src/txn_pool.rs` | `WorkerTxPool` wrapper: canonical-state maintenance, blob-tx removal, raw-tx recovery helpers. |
+| `src/txn_pool.rs` | `WorkerTxPool` wrapper: canonical-state maintenance, blob-tx removal, raw-tx recovery helpers; `TnPoolValidator`, the EIP-7702 authorization-list cap screen ahead of reth's validator. |
 | `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`). |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
