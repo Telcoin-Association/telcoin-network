@@ -454,19 +454,27 @@ impl WorkerTxPool {
             blockchain_provider.clone(),
             evm_config.clone(),
         )
-        // Reject EIP-4844 (blob) and EIP-7702 (set-code) transactions at admission. TN never
-        // mines either type: the batch builder strips them and the batch validator rejects any
-        // batch that carries one, so an admitted transaction of either type can never be executed.
-        // For blobs this is also a denial-of-service fix. On a successful add reth writes the blob
-        // sidecar to the on-disk DiskFileBlobStore, but that store uses deferred deletion whose
-        // only unlink runs in reth's maintain_transaction_pool loop. TN drives pool
-        // maintenance itself and never runs that loop, so nothing removes the sidecars at
-        // runtime and a remote unprivileged sender could grow a validator's disk without
-        // bound. Rejecting both unsupported types here, before insertion, closes that
-        // vector and mirrors reth's own node builder for a chain that supports neither
-        // type. See issue #1159.
+        // Type policy is asymmetric: blobs (EIP-4844) are refused at admission, set-code
+        // transactions (EIP-7702) are admitted.
+        //
+        // Blobs are never mineable in TN — the batch builder strips them and the batch
+        // validator rejects any batch that carries one — so an admitted blob transaction
+        // could never execute. Admitting one is also a denial-of-service vector: on a
+        // successful add reth writes the blob sidecar to the on-disk DiskFileBlobStore, but
+        // that store uses deferred deletion whose only unlink runs in reth's
+        // maintain_transaction_pool loop. TN drives pool maintenance itself and never runs
+        // that loop, so nothing removes the sidecars at runtime and a remote unprivileged
+        // sender could grow a validator's disk without bound. Refusing blobs here, before
+        // insertion, closes that vector. See issue #1159.
+        //
+        // EIP-7702 is deliberately NOT refused: TN executes set-code transactions. Type
+        // 0x04 is on the batch allowlist (`tn_types::batch_allowlisted_tx_type` admits
+        // legacy, EIP-2930, EIP-1559, and EIP-7702), so a 7702 transaction admitted here
+        // goes on to be batched, validated, and executed. Its authorization-list intrinsic
+        // is also excluded from the gas over-reservation penalty basis, so an honest 7702
+        // sender pays no penalty. A set-code transaction carries no sidecar, so it has no
+        // analogue of the blob disk-exhaustion vector.
         .no_eip4844()
-        .no_eip7702()
         .kzg_settings(EnvKzgSettings::Default)
         // Apply the operator's `--rpc.txfeecap`. The validator checks it only for
         // transactions it treats as local (`LocalTransactionConfig::is_local`); raw
@@ -1168,12 +1176,17 @@ mod tests {
         assert_eq!(s.queued, 0);
     }
 
-    /// The pool refuses EIP-7702 (set-code) transactions at admission. Prague is active at
-    /// genesis so the transaction is fork-valid, and the sender is funded, so rejection is due
-    /// to the `.no_eip7702()` type gate in [`WorkerTxPool::new`], consistent with TN's existing
-    /// policy of treating EIP-7702 as an unsupported transaction type.
+    /// The pool admits EIP-7702 (set-code) transactions. Prague is active at genesis so the
+    /// transaction is fork-valid, and the sender is funded at genesis so balance can never be
+    /// the reason for the outcome. Admission therefore proves the validator's type gate in
+    /// [`WorkerTxPool::new`] lets type 0x04 through, matching the batch allowlist
+    /// (`tn_types::batch_allowlisted_tx_type`) and TN's execution of set-code transactions.
+    ///
+    /// It also proves the [`TnPoolValidator`] screen admits an in-range authorization list
+    /// (one tuple here) and delegates to the inner validator: rejection at the screen would
+    /// fail the admission assertion below.
     #[tokio::test]
-    async fn test_pool_rejects_eip7702_transaction() {
+    async fn test_pool_accepts_eip7702_transaction() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let mut tx_factory = TransactionFactory::new_random();
@@ -1181,15 +1194,16 @@ mod tests {
 
         let gas_price = reth_env.get_gas_price().unwrap();
         let signed = tx_factory.create_eip7702(chain.chain_id(), None, gas_price);
-        // 7702 carries no sidecar, so the production external ingress accepts the raw tx.
+        let hash = *signed.hash();
+        // 7702 carries no sidecar, so the production external ingress takes the raw txn.
         let result = pool.add_raw_transaction_external(signed).await;
-        assert!(result.is_err());
+        assert!(result.is_ok(), "pool must admit a well-formed EIP-7702 txn: {result:?}");
 
-        // The pool admitted nothing.
+        // Admitted to the pending sub-pool (never the blob sub-pool) and retrievable by hash.
         let s = pool.pool_size();
-        assert_eq!(s.pending, 0);
+        assert_eq!(s.pending, 1);
         assert_eq!(s.blob, 0);
-        assert_eq!(s.queued, 0);
+        assert!(pool.get(&hash).is_some());
     }
 
     /// The unpaid-ECDSA-amplification bound: the pool rejects an EIP-7702 transaction whose

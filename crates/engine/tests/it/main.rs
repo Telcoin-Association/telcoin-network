@@ -3118,6 +3118,7 @@ async fn test_honest_7702_sender_pays_no_penalty() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -3345,6 +3346,7 @@ async fn test_floor_bound_7702_sender_pays_no_penalty() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 

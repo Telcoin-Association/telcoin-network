@@ -285,9 +285,8 @@ mod tests {
     use tn_test_utils::wait_until;
     use tn_types::{
         gas_accumulator::BaseFeeContainer, max_batch_gas, max_tx_authorizations, test_genesis,
-        Address, Batch, Bytes,
-        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE,
-        U256,
+        Address, Batch, Bytes, Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch

@@ -580,7 +580,7 @@ async fn test_batch_builder_packs_eip7702() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 

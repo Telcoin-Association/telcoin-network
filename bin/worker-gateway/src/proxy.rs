@@ -487,7 +487,7 @@ mod tests {
     /// allowlist: EIP-7702 (type 4) is the cheapest such type, needing no
     /// sidecar. Built from a default body and a dummy signature, since
     /// `decode_2718` checks structure, not signature validity.
-    fn eip7702_raw_hex() -> String {
+    fn eip7702_empty_auth_list_raw_hex() -> String {
         let signature = EthSignature::new(U256::from(1), U256::from(1), false);
         let signed = TxEip7702::default().into_signed(signature);
         let encoded = PooledTransaction::Eip7702(signed).encoded_2718();
@@ -534,6 +534,9 @@ mod tests {
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
                 Some((GatewayError::UnsupportedTransactionType, id))
             }
+            Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
+                Some((GatewayError::InvalidAuthorizationList, id))
+            }
             Ok(_) => None,
         }
     }
@@ -553,7 +556,7 @@ mod tests {
             send_raw(r#"["0xdeadbeef"]"#),
             send_raw(r#"["not-hex"]"#),
             // Decodes cleanly, but to a type outside the batch allowlist.
-            send_raw(&format!("[\"{}\"]", eip7702_raw_hex())),
+            send_raw(&format!("[\"{}\"]", eip7702_empty_auth_list_raw_hex())),
             send_raw("[]"),
             send_raw(r#"[123]"#),
             send_raw(r#"[null]"#),
@@ -732,21 +735,25 @@ mod tests {
         assert!(err.is_some());
     }
 
-    /// The previously untested reject arm: a payload that decodes cleanly but
-    /// to a type outside the batch allowlist (legacy / EIP-2930 / EIP-1559)
-    /// must be rejected as unsupported, with its id, not as undecodable. The
-    /// old parse rejected it the same way, so the fixture rides the
-    /// equivalence corpus too.
+    /// A payload that decodes cleanly but is rejected on its merits comes back
+    /// with its id, not as undecodable. Type `0x04` is on the batch allowlist,
+    /// so this empty-authorization-list transaction is refused for its list
+    /// rather than its type: EIP-7702 declares an empty list invalid and reth's
+    /// pool rejects it at admission, so the screen only front-runs a rejection
+    /// the worker would issue anyway. This is the only coverage of the
+    /// predicate's lower bound at the gateway. The reference parse rejects it
+    /// the same way, so the fixture rides the equivalence corpus too.
     #[test]
-    fn decodable_but_disallowed_tx_type_is_rejected_with_its_id() {
+    fn decodable_but_rejected_payload_carries_its_id() {
         let body = format!(
             r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":42}}"#,
-            eip7702_raw_hex()
+            eip7702_empty_auth_list_raw_hex()
         )
         .into_bytes();
 
-        let (err, id) = screen_raw_transaction(&body).expect("disallowed type must be rejected");
-        assert!(matches!(err, GatewayError::UnsupportedTransactionType));
+        let (err, id) =
+            screen_raw_transaction(&body).expect("empty authorization list must be rejected");
+        assert!(matches!(err, GatewayError::InvalidAuthorizationList));
         assert_eq!(id, RequestId::from_id(serde_json::json!(42)));
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
     }
