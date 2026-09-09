@@ -1627,7 +1627,8 @@ mod tests {
                     .ok_or_else(|| eyre!("expected pre-fork multi-worker rejection"))?;
                 assert!(error.to_string().contains("multi-workers fork is not active"));
                 Ok(())
-            })
+            })?;
+        Ok(())
     }
 
     /// A tip sealed header at `number` whose nonce encodes `epoch` (upper 32 bits), matching the
