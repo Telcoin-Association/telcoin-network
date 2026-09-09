@@ -389,6 +389,25 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let bloom: Bloom = bloom_bits.try_into()?;
             (header, bloom)
         };
+        // A cleanly-sealed index always has a CRC-valid first bucket (fresh buckets are CRC'd at
+        // creation; a clean close CRCs every dirty bucket). The bloom sits between the header and
+        // the first bucket, and its size is a compile-time constant NOT recorded on disk
+        // (`BLOOM_SIZE_BYTES` is smaller under the `test-utils` feature), so a build whose bloom
+        // size differs from the one that wrote the file reads the first bucket at the wrong offset
+        // -> a non-CRC-valid bucket. Reject that here (no on-disk format change) so the writable
+        // doors rebuild from the WAL and read-only refuses, rather than silently misreading every
+        // bucket. Gate on a clean seal: an unclean file legitimately has dirty (un-CRC'd) buckets
+        // and is already rebuilt via `opened_unclean()`. This also catches at-rest damage to the
+        // first bucket. Fresh files (`file_end == 0`) were just written above with valid CRCs.
+        if file_end != 0 && !hdx_file.opened_unclean() {
+            let first_bucket_pos = (HEADER_SIZE + BLOOM_SIZE_BYTES) as u64;
+            let first_bucket_valid = hdx_file
+                .slice(first_bucket_pos, Self::BUCKET_SIZE)
+                .is_some_and(|buf| crc_state(buf) == CrcState::Valid);
+            if !first_bucket_valid {
+                return Err(LoadHeaderError::CrcFailed);
+            }
+        }
         let (odx_file, _odx_header) = OdxHeader::open_odx_file_mmap(
             header.version(),
             header.uid(),
@@ -1123,6 +1142,68 @@ mod tests {
             matches!(idx.split_one_bucket(), Err(AppendError::CorruptIndex(_))),
             "split underflow must error, not wrap"
         );
+    }
+
+    /// F2: a cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
+    /// caller rebuilds from the WAL instead of silently misreading buckets. This is exactly the
+    /// shape a bloom-size mismatch produces — the bloom sits between the header and the first
+    /// bucket, and its size is a compile-time constant not recorded on disk, so a build with a
+    /// different `BLOOM_SIZE_BYTES` reads the first bucket at the wrong offset (a non-CRC-valid
+    /// bucket) even though header/uid/version/geometry/pepper all still match. Also covers at-rest
+    /// damage to the first bucket. A valid clean index must still open (no false rejection).
+    #[test]
+    fn open_rejects_clean_index_with_corrupt_first_bucket() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let tmp = TempDir::with_prefix("test_hdx_first_bucket_crc").expect("temp dir");
+        // Build and cleanly close an index: Drop's ordered_sync CRCs every bucket and writes the
+        // clean-close sentinel, so a reopen reads it as cleanly sealed (`opened_unclean()` false).
+        {
+            let mut idx = open_index(tmp.path());
+            for i in 0..100u64 {
+                idx.save(key(i), i).expect("save");
+            }
+        }
+
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let reopen = || {
+            HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+                tmp.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true, /* read-only: surfaces the open guard's error directly (no rebuild layer
+                       * here) */
+            )
+        };
+
+        // Control: the untouched, cleanly-sealed index opens fine — the guard does not false-fire.
+        reopen().expect("a valid clean index must open");
+
+        // Flip one payload byte of the FIRST bucket, leaving the clean-close sentinel (at EOF)
+        // intact so the file still reads as cleanly sealed. `open_index` uses `index.hdx` as the
+        // directory name, so the bucket file is `index.hdx/index.hdx`.
+        let hdx_file = tmp.path().join("index.hdx").join("index.hdx");
+        let first_bucket_payload = (HEADER_SIZE + BLOOM_SIZE_BYTES + 12) as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&hdx_file)
+                .expect("open hdx");
+            f.seek(SeekFrom::Start(first_bucket_payload)).expect("seek");
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).expect("read byte");
+            f.seek(SeekFrom::Start(first_bucket_payload)).expect("seek back");
+            f.write_all(&[b[0] ^ 0xFF]).expect("flip byte");
+            f.sync_all().expect("sync");
+        }
+
+        // The guard detects the non-CRC-valid first bucket on a cleanly-sealed index and rejects,
+        // so the writable doors rebuild and read-only refuses.
+        match reopen() {
+            Err(LoadHeaderError::CrcFailed) => {}
+            other => panic!("expected CrcFailed for a corrupt first bucket, got {other:?}"),
+        }
     }
 
     /// A failed bucket split must roll back, not drop the collected elements: after an injected
