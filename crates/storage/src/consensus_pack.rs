@@ -713,17 +713,19 @@ impl Inner {
         let mut idx: u64 = 0;
         // Byte offset just past the last fully-recovered record (the EpochMeta or a complete
         // output). Anything after it is an incomplete/torn tail and is truncated away at the end.
-        let mut consistent_end = iter.position()?;
+        // Use `logical_position` (advanced only by whole record frames), never the physical
+        // `position`, so the truncation offset can never land mid-record even after a torn read.
+        let mut consistent_end = iter.logical_position();
 
         loop {
-            let header_pos = iter.position()?;
+            let header_pos = iter.logical_position();
             match iter.next() {
                 // Clean EOF on an output boundary: every complete output has been replayed.
                 None => break,
                 // The leading EpochMeta carries no index data (epoch_meta is already loaded and the
                 // pos index is 0-based); skip it, but keep it in the consistent prefix.
                 Some(Ok(PackRecord::EpochMeta(_))) => {
-                    consistent_end = iter.position()?;
+                    consistent_end = iter.logical_position();
                     continue;
                 }
                 Some(Ok(PackRecord::Consensus(consensus_header))) => {
@@ -734,7 +736,7 @@ impl Inner {
                     let expected = Self::expected_batch_count(&consensus_header);
                     let mut torn = false;
                     for _ in 0..expected {
-                        let batch_pos = iter.position()?;
+                        let batch_pos = iter.logical_position();
                         match iter.next() {
                             Some(Ok(PackRecord::Batch(batch))) => {
                                 batch_digests
@@ -763,7 +765,7 @@ impl Inner {
                         }
                         break; // consistent_end still marks the end of the last complete output
                     }
-                    let output_end = iter.position()?;
+                    let output_end = iter.logical_position();
                     consensus_pos_idx
                         .save(idx, IndexPositions::new(header_pos, header_pos, output_end))
                         .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
@@ -1103,6 +1105,19 @@ impl Inner {
                 ))
             })?
             .into_epoch()?;
+        // The meta's own epoch must match the directory it was loaded from. This is bound
+        // implicitly by the data-header uid (`gen_uid(epoch)`, checked in `Pack::open`); assert it
+        // explicitly so a future change to that derivation cannot silently let a mislabeled meta
+        // drive `save_consensus_output`/range checks under the wrong epoch.
+        if epoch_meta.epoch != epoch {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "on-disk epoch meta is for epoch {} but opened as {epoch}",
+                    epoch_meta.epoch
+                ),
+            ));
+        }
         // The data file and its epoch meta are established. Open the indexes, rebuilding all of
         // them from the data log if any is broken so an index problem can never abort the
         // open.
@@ -1144,6 +1159,17 @@ impl Inner {
                 ))
             })?
             .into_epoch()?;
+        // See `open_append_exists`: the meta's epoch is bound implicitly by the data-header uid;
+        // assert it explicitly here too.
+        if epoch_meta.epoch != epoch {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "on-disk epoch meta is for epoch {} but opened as {epoch}",
+                    epoch_meta.epoch
+                ),
+            ));
+        }
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
         let (consensus_digests, batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), true)?;

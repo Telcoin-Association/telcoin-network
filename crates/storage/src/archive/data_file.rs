@@ -627,6 +627,13 @@ impl MmapDataFile {
     /// if the file grew. Intended for following a cleanly-closed writer; a writer that is
     /// mid-append may have the file padded beyond its logical data, so pair with index-bounded
     /// reads.
+    ///
+    /// This re-adopts the current physical length and recomputes `opened_unclean`, so it **clears
+    /// any prior [`Self::set_read_bound`] clamp**: if a caller had clamped this handle below a
+    /// writer's padding and then refreshes against a still-mid-append (unsentineled) writer, `end`
+    /// returns to the padded physical size and the caller must re-clamp before reading. (No
+    /// production path currently refreshes a clamped handle — the only caller is a test — so this
+    /// is a documented precondition, not a live hazard.)
     pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
         let disk_len = self.file.metadata()?.len();
         // A cleanly-closed writer leaves a sentinel past its logical data; strip it so `end` is the

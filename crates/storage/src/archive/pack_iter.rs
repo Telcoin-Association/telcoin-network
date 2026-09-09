@@ -81,9 +81,23 @@ where
         self.version
     }
 
-    /// Return the current position of the data file.
+    /// Physical stream position of the underlying reader (bytes consumed from the file).
+    ///
+    /// NOTE: this is the raw `BufReader` position, which is only equal to the logical record
+    /// boundary [`Self::logical_position`] immediately after a *successful* `next()` (or right
+    /// after open). After a torn/short read it can sit mid-record, past the last complete
+    /// record. Callers that need a byte offset to *truncate* the log to (e.g. recovery) must
+    /// use [`Self::logical_position`], which only advances by whole record frames.
     pub fn position(&mut self) -> io::Result<u64> {
         self.reader.stream_position()
+    }
+
+    /// Byte offset just past the last complete record read (the header + all whole record frames
+    /// consumed so far). Unlike [`Self::position`] this never lands mid-record — it is only
+    /// advanced by the exact on-disk frame size of each fully-read record — so it is the safe
+    /// boundary to truncate a torn log back to.
+    pub fn logical_position(&self) -> u64 {
+        self.pos
     }
 
     /// Sets the current position of the data file.
@@ -183,6 +197,13 @@ where
 
 /// Async Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
+///
+/// Unlike [`PackIter`], this has **no logical-end bound** — it reads to reader EOF and stops only
+/// when the next record's size prefix hits EOF. Callers must therefore feed it exactly the logical
+/// bytes: a sealed file, or a framed/length-bounded network stream (state-sync bounds its copy to
+/// `data_file_len()`). It must **not** be handed a live, capacity-padded mmap data file: the
+/// trailing zero padding would decode as a 0-size record and surface a recoverable padded tail as a
+/// `CrcFailed` error instead of a clean end.
 #[derive(Debug)]
 pub struct AsyncPackIter<V, R>
 where
