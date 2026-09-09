@@ -31,19 +31,22 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use crate::archive::{
-    data_file::create_dir_synced,
-    digest_index::HdxIndex,
-    error::{
-        fetch::FetchError,
-        load_header::LoadHeaderError,
-        open::OpenError::{self, DataFileOpen},
+use crate::{
+    archive::{
+        data_file::create_dir_synced,
+        digest_index::HdxIndex,
+        error::{
+            fetch::FetchError,
+            load_header::LoadHeaderError,
+            open::OpenError::{self, DataFileOpen},
+        },
+        fxhasher::FxHasher,
+        index::Index as _,
+        pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
+        pack_iter::AsyncPackIter,
+        position_index::index::{PosIndexValue, PositionIndex},
     },
-    fxhasher::FxHasher,
-    index::Index as _,
-    pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
-    pack_iter::AsyncPackIter,
-    position_index::index::{PosIndexValue, PositionIndex},
+    pack_validate::CorruptionKind,
 };
 
 /// Current version for new pack files.
@@ -212,6 +215,30 @@ impl Drop for ConsensusPack {
     }
 }
 
+/// Outcome of [`ConsensusPack::repair_epoch`] for one epoch's consensus pack (data + indexes).
+#[derive(Debug)]
+pub enum EpochRepair {
+    /// The epoch opened read-only cleanly; nothing was wrong and nothing was written.
+    Healthy,
+    /// The epoch was damaged in a repairable way and (with `apply`) was repaired and re-sealed.
+    /// The string describes what was done.
+    Repaired(String),
+    /// The epoch is damaged in a repairable way but this was a dry run (`apply == false`); no
+    /// write happened. The string describes what a repair would do.
+    WouldRepair(String),
+    /// The epoch is damaged in a way local repair cannot fix (a torn/corrupt epoch-meta, or
+    /// mid-log data corruption): the data is lost and the epoch must be re-synced from peers.
+    /// Nothing was written. The string is the operator-facing reason.
+    Unrepairable(String),
+}
+
+impl EpochRepair {
+    /// True when this outcome changed the on-disk pack (a real repair was applied).
+    pub fn was_repaired(&self) -> bool {
+        matches!(self, EpochRepair::Repaired(_))
+    }
+}
+
 impl ConsensusPack {
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
@@ -298,6 +325,115 @@ impl ConsensusPack {
             is_static: true,
             version,
         })
+    }
+
+    /// Enumerate the epoch numbers that have an `epoch-{N}` directory under `epochs_dir`, sorted
+    /// ascending. The highest is the current/live epoch (the one a running node holds open for
+    /// append).
+    pub fn epoch_dirs(epochs_dir: &Path) -> io::Result<Vec<Epoch>> {
+        let mut epochs = Vec::new();
+        for entry in std::fs::read_dir(epochs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(n) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("epoch-"))
+                .and_then(|num| num.parse::<Epoch>().ok())
+            {
+                epochs.push(n);
+            }
+        }
+        epochs.sort_unstable();
+        Ok(epochs)
+    }
+
+    /// Assess (and, when `apply`, repair) one epoch's consensus pack **at rest**.
+    ///
+    /// MUST run with the node stopped: with `apply` it opens the pack for append and rewrites it,
+    /// which would corrupt a live node's mapping. A pack [`Self::open_static`] opens cleanly is
+    /// healthy and is left untouched (a read-only open never writes). A pack `open_static` rejects
+    /// is damaged; the data file is classified with
+    /// [`classify_physical_corruption`](crate::pack_validate::classify_physical_corruption) to
+    /// decide whether a truncate-and-rebuild can recover it — a torn trailing record, or a
+    /// physically-sound log whose sidecar indexes are missing/corrupt — or whether the damage
+    /// is a lost epoch-meta / mid-log corruption that only a re-sync can fix.
+    ///
+    /// When repairable and `apply`, [`Self::open_append_exists`] truncates any torn tail and
+    /// rebuilds every index from the data log, and the clean-close drop re-seals the pack; the
+    /// result is then re-checked with `open_static` to confirm the pack is consistent.
+    pub async fn repair_epoch(
+        epochs_dir: &Path,
+        epoch: Epoch,
+        apply: bool,
+    ) -> Result<EpochRepair, PackError> {
+        // Healthy check: a read-only open is side-effect free and proves data + indexes + seal
+        // agree.
+        if let Ok(pack) = Self::open_static(epochs_dir, epoch) {
+            drop(pack);
+            return Ok(EpochRepair::Healthy);
+        }
+
+        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+        let corruption = crate::pack_validate::classify_physical_corruption(&data_file, epoch)?;
+        let plan = match &corruption {
+            // The data log is physically sound; open_static failed on the indexes / seal / a length
+            // disagreement — all of which recover_pack + the index rebuild fix.
+            None => "rebuild indexes and re-seal".to_string(),
+            Some(c) => match &c.kind {
+                CorruptionKind::TornTrailingTail => {
+                    "truncate the torn trailing record and rebuild indexes".to_string()
+                }
+                CorruptionKind::TornMetaEmpty => {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: the epoch-meta record is torn with no outputs behind it; the \
+                         committee cannot be reconstructed locally. Remove `epoch-{epoch}/` and \
+                         re-sync the epoch from peers."
+                    )));
+                }
+                CorruptionKind::CorruptMetaWithData => {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: the epoch-meta is unreadable but complete outputs sit behind \
+                         it (offset {}); those outputs are unreachable and truncation would lose \
+                         them. Re-sync the epoch from peers.",
+                        c.offset
+                    )));
+                }
+                CorruptionKind::MidLogCorruption => {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: mid-log corruption at offset {} with valid records past it; \
+                         durably-committed data is damaged and cannot be recovered by truncation. \
+                         Re-sync the epoch from peers.",
+                        c.offset
+                    )));
+                }
+            },
+        };
+
+        if !apply {
+            return Ok(EpochRepair::WouldRepair(plan));
+        }
+
+        // Apply: the writable open runs recover_pack (truncate torn tail) + open_indexes_for_append
+        // (rebuild indexes); persist + drop re-seals. If recover_pack finds mid-log corruption the
+        // best-effort classifier missed, this surfaces as an error -> Unrepairable.
+        match Self::open_append_exists(epochs_dir, epoch) {
+            Ok(pack) => {
+                pack.persist().await?;
+                drop(pack);
+            }
+            Err(e) => {
+                return Ok(EpochRepair::Unrepairable(format!(
+                    "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}); \
+                     re-sync the epoch from peers."
+                )));
+            }
+        }
+        // Confirm the repaired pack now opens read-only cleanly.
+        Self::open_static(epochs_dir, epoch).map(drop)?;
+        Ok(EpochRepair::Repaired(plan))
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -822,9 +958,11 @@ impl Inner {
     /// directories.
     fn corrupt_pack(base_dir: &Path) -> PackError {
         PackError::CorruptPack(format!(
-            "epoch pack {} is corrupt: durably-committed consensus data is damaged and cannot be \
-             repaired by truncating the log. Inspect it with `telcoin-network db validate {}`. Do \
-             NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+            "epoch pack {} is corrupt. Inspect it with `telcoin-network db validate {}`: if it \
+             reports a truncatable torn tail or an index problem, `telcoin-network db repair` (node \
+             stopped) can repair it; if it reports durably-committed data damaged, that cannot be \
+             repaired by truncation and the epoch must be re-synced from peers. Do NOT delete the \
+             chain-data directories (`db`, `static_files`, `consensus-db`)",
             base_dir.display(),
             base_dir.display(),
         ))
@@ -841,10 +979,10 @@ impl Inner {
     fn corrupt_static_index(base_dir: &Path, epoch: Epoch, cause: &PackError) -> PackError {
         PackError::CorruptPack(format!(
             "epoch {epoch} pack {}: a derived index is damaged and a read-only open cannot rebuild \
-             it ({cause}). The `data` log is the source of truth: run `telcoin-network db validate \
-             {}` to confirm it is intact -- if so the index is regenerated when the epoch is rebuilt \
-             (re-sync/restore it). Do NOT delete the `data` file or the chain-data directories \
-             (`db`, `static_files`, `consensus-db`)",
+             it ({cause}). The `data` log is the source of truth, so run `telcoin-network db repair \
+             --epoch {epoch}` (with the node stopped) to rebuild the index from the log; run \
+             `telcoin-network db validate {}` first to confirm the data is intact. Do NOT delete the \
+             `data` file or the chain-data directories (`db`, `static_files`, `consensus-db`)",
             base_dir.display(),
             base_dir.display(),
         ))
@@ -2509,7 +2647,9 @@ pub(crate) mod test {
 
     use crate::{
         archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
-        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PackRecord, PACK_VERSION},
+        consensus_pack::{
+            max_batches_per_output, ConsensusPack, EpochRepair, Inner, PackRecord, PACK_VERSION,
+        },
         mem_db::MemDatabase,
     };
 
@@ -4023,6 +4163,159 @@ pub(crate) mod test {
             err.is_missing_static_files(),
             "an absent index file must classify as a clean miss, got {err:?}"
         );
+    }
+
+    // ---- db repair: repair_epoch / epoch_dirs ----
+
+    /// A damaged index on a sealed epoch is rebuilt from the data log by
+    /// `repair_epoch(apply=true)`, after which the epoch opens read-only cleanly and all
+    /// outputs read back.
+    #[tokio::test]
+    async fn test_repair_epoch_rebuilds_broken_index() {
+        let temp_dir = TempDir::with_prefix("test_repair_index").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 5).await;
+
+        break_index_file(&temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx"));
+
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        assert!(
+            matches!(outcome, EpochRepair::Repaired(_)),
+            "broken index must repair, got {outcome:?}"
+        );
+        assert_pack_reads_back(&temp_dir, 5).await;
+    }
+
+    /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
+    /// last complete output by `repair_epoch`.
+    #[tokio::test]
+    async fn test_repair_epoch_truncates_torn_tail() {
+        use std::io::Write as _;
+        let temp_dir = TempDir::with_prefix("test_repair_tail").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+
+        let data = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let mut f = OpenOptions::new().append(true).open(&data).expect("open data");
+            f.write_all(&[1, 2, 3, 4, 5]).expect("append stray bytes");
+        }
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_err(),
+            "a torn tail must fail the read-only open"
+        );
+
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        assert!(
+            matches!(outcome, EpochRepair::Repaired(_)),
+            "torn tail must repair, got {outcome:?}"
+        );
+        assert_pack_reads_back(&temp_dir, 4).await;
+    }
+
+    /// Dry run (`apply=false`) reports what it would do and writes nothing; the pack stays damaged.
+    #[tokio::test]
+    async fn test_repair_epoch_dry_run_makes_no_change() {
+        let temp_dir = TempDir::with_prefix("test_repair_dryrun").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+
+        let pdx = temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx");
+        break_index_file(&pdx);
+        let before = std::fs::read(&pdx).expect("read pdx");
+
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
+            .await
+            .expect("dry run must not err");
+        assert!(
+            matches!(outcome, EpochRepair::WouldRepair(_)),
+            "dry run must report WouldRepair, got {outcome:?}"
+        );
+        assert_eq!(std::fs::read(&pdx).expect("reread pdx"), before, "dry run must not write");
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_err(),
+            "dry run must leave the pack damaged"
+        );
+    }
+
+    /// A clean, sealed epoch is `Healthy` and is left byte-for-byte untouched.
+    #[tokio::test]
+    async fn test_repair_epoch_healthy_is_untouched() {
+        let temp_dir = TempDir::with_prefix("test_repair_healthy").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let data = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let before = std::fs::read(&data).expect("read data");
+
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        assert!(matches!(outcome, EpochRepair::Healthy), "clean epoch is Healthy, got {outcome:?}");
+        assert_eq!(std::fs::read(&data).expect("reread data"), before, "healthy epoch untouched");
+    }
+
+    /// A torn epoch-meta with no outputs behind it is `Unrepairable` (the committee can't be
+    /// rebuilt locally) and is left untouched.
+    #[tokio::test]
+    async fn test_repair_epoch_torn_meta_is_unrepairable() {
+        let temp_dir = TempDir::with_prefix("test_repair_torn_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 2).await;
+
+        // Truncate into the meta record: a dataless torn meta.
+        let data = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let f = OpenOptions::new().write(true).open(&data).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64 + 2).expect("truncate into the meta");
+        }
+        let before = std::fs::read(&data).expect("read data");
+
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        assert!(
+            matches!(outcome, EpochRepair::Unrepairable(_)),
+            "a torn meta is unrepairable, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&data).expect("reread data"),
+            before,
+            "unrepairable epoch untouched"
+        );
+    }
+
+    /// `epoch_dirs` lists only `epoch-{N}` directories (not files, not `staging-*`), sorted
+    /// ascending.
+    #[test]
+    fn test_epoch_dirs_enumerates_sorted() {
+        let temp_dir = TempDir::with_prefix("test_epoch_dirs").expect("temp dir");
+        for n in [2u32, 0, 10, 1] {
+            std::fs::create_dir_all(temp_dir.path().join(format!("epoch-{n}"))).expect("mkdir");
+        }
+        std::fs::create_dir_all(temp_dir.path().join("staging-3")).expect("mkdir"); // ignored
+        std::fs::write(temp_dir.path().join("epoch-99"), b"a file, not a dir").expect("write"); // ignored
+        let epochs = ConsensusPack::epoch_dirs(temp_dir.path()).expect("list epochs");
+        assert_eq!(epochs, vec![0, 1, 2, 10]);
     }
 
     /// A torn *next* output header (a partial record appended after several complete outputs) is

@@ -28,7 +28,7 @@ use tn_reth::{
 };
 use tn_storage::{
     consensus::ConsensusChain,
-    consensus_pack::{ConsensusPack, DATA_NAME},
+    consensus_pack::{ConsensusPack, EpochRepair, DATA_NAME},
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
     pack_validate::{classify_physical_corruption, validate_pack_file},
@@ -54,6 +54,10 @@ enum DbSubcommand {
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
     Validate(DbValidateArgs),
+
+    /// Repair consensus epoch packs at rest: truncate a torn data-file tail and rebuild indexes.
+    /// The node MUST be stopped. Dry-run by default; pass `--force` to apply.
+    Repair(DbRepairArgs),
 
     /// Load an EVM state-export pack into a new reth database under the datadir.
     LoadState(DbLoadStateArgs),
@@ -85,6 +89,7 @@ impl DbCommand {
                 println!("{}", db_stats_table(&db)?);
             }
             DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
         }
         Ok(())
@@ -174,6 +179,136 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("epoch-"))
         .and_then(|num| num.parse::<Epoch>().ok())
+}
+
+/// Select which epochs `db repair` targets, given all `epoch-{N}` dirs (sorted ascending) and an
+/// optional `--epoch`. In all-mode (`requested == None`) the current/latest epoch — the one a
+/// running node holds open for append — is skipped and returned as the second element; `--epoch N`
+/// targets exactly N (no skip). The caller validates that a requested epoch exists.
+fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Option<Epoch>) {
+    let current = all.last().copied();
+    match requested {
+        Some(e) => (vec![e], None),
+        None => (all.iter().copied().filter(|e| Some(*e) != current).collect(), current),
+    }
+}
+
+/// Repair consensus epoch pack files at rest.
+///
+/// Truncates a torn `data`-file tail and rebuilds missing/corrupt sidecar indexes from the data log
+/// (the source of truth), then re-seals the pack. Damage that truncation cannot fix — a
+/// torn/corrupt epoch-meta, or mid-log data corruption — is reported (re-sync required), never
+/// touched.
+///
+/// The node MUST be stopped: with `--force` this opens packs for append and rewrites them, which
+/// would corrupt a running node's memory mapping. There is no lock to detect a running node, so the
+/// command is a dry run by default (read-only classification, no writes) and requires `--force` to
+/// apply. In repair-all mode the current/latest epoch (the one a running node holds open for
+/// append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed stopped.
+#[derive(Debug, Args)]
+pub struct DbRepairArgs {
+    /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
+    #[arg(long)]
+    pub epoch: Option<Epoch>,
+
+    /// Apply repairs. Without this the command is a dry run: it reports what it would repair but
+    /// writes nothing. Stop the node before passing `--force`.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbRepairArgs {
+    /// Assess (and, with `--force`, repair) the consensus epoch packs under the datadir.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+
+        // Loud safety banner in both modes (stderr; the report goes to stdout).
+        eprintln!(
+            "WARNING: `db repair` rewrites consensus pack files. The node MUST be stopped first — \
+             there is no lock to detect a running node, and repairing files a running node holds \
+             mapped will corrupt them."
+        );
+        if !self.force {
+            eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
+        }
+
+        let all = ConsensusPack::epoch_dirs(&epochs_dir)
+            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+        if let Some(e) = self.epoch {
+            if !all.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
+        let (targets, skipped_current) = repair_targets(&all, self.epoch);
+        if let Some(cur) = skipped_current {
+            println!(
+                "epoch {cur}: SKIPPED (current/latest epoch) — repair explicitly with \
+                 `--epoch {cur}` once the node is confirmed stopped"
+            );
+        }
+
+        // Both `ConsensusPack::repair_epoch` and `EpochRecordDb::persist` are async; drive them on
+        // a dedicated runtime (mirrors the restore path).
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        runtime.block_on(async {
+            let mut repaired = 0usize;
+            let mut lost = 0usize;
+            for epoch in &targets {
+                match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
+                    Ok(EpochRepair::Healthy) => println!("epoch {epoch}: OK"),
+                    Ok(EpochRepair::Repaired(what)) => {
+                        repaired += 1;
+                        println!("epoch {epoch}: REPAIRED — {what}");
+                    }
+                    Ok(EpochRepair::WouldRepair(what)) => {
+                        repaired += 1;
+                        println!("epoch {epoch}: would repair — {what}");
+                    }
+                    Ok(EpochRepair::Unrepairable(why)) => {
+                        lost += 1;
+                        println!("epoch {epoch}: UNREPAIRABLE — {why}");
+                    }
+                    Err(e) => {
+                        lost += 1;
+                        println!("epoch {epoch}: ERROR — {e}");
+                    }
+                }
+            }
+
+            // The shared epoch-records DB (`epochs.pack`/`epoch_certs.pack`) auto-heals on open;
+            // only touch it under --force.
+            if self.force {
+                match EpochRecordDb::open(epochs_dir.as_path()) {
+                    Ok(db) => {
+                        db.persist()
+                            .await
+                            .map_err(|e| eyre!("failed to persist epoch-records DB: {e}"))?;
+                        drop(db);
+                        println!(
+                            "epoch-records DB: healed (torn tails truncated, indexes rebuilt)"
+                        );
+                    }
+                    Err(e) => println!(
+                        "epoch-records DB: could not open to heal ({e}); re-sync/restore may be \
+                         required"
+                    ),
+                }
+            } else {
+                println!("epoch-records DB: would be opened and auto-healed with `--force`");
+            }
+
+            let verb = if self.force { "repaired" } else { "to repair (dry run)" };
+            println!(
+                "\nsummary: {repaired} epoch(s) {verb}, {lost} unrepairable (data loss / re-sync)."
+            );
+            Ok::<(), eyre::Report>(())
+        })?;
+        Ok(())
+    }
 }
 
 /// Restore an EVM state-export pack into a new reth database under the datadir.
@@ -986,12 +1121,25 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_len_if_exists, static_files_summary_table};
+    use super::{file_len_if_exists, repair_targets, static_files_summary_table};
     use crate::{
         cli::{Cli, Commands},
         NoArgs,
     };
     use std::{collections::HashMap, fs, path::Path};
+
+    #[test]
+    fn repair_targets_skips_current_epoch_in_all_mode() {
+        // All-mode: every epoch except the current/latest, which is returned as skipped.
+        assert_eq!(repair_targets(&[0, 1, 2], None), (vec![0, 1], Some(2)));
+        // Single epoch is the current one: skipped, nothing to repair.
+        assert_eq!(repair_targets(&[5], None), (vec![], Some(5)));
+        // No epochs on disk.
+        assert_eq!(repair_targets(&[], None), (vec![], None));
+        // Explicit --epoch targets exactly that epoch (including the current one), no skip.
+        assert_eq!(repair_targets(&[0, 1, 2], Some(2)), (vec![2], None));
+        assert_eq!(repair_targets(&[0, 1, 2], Some(0)), (vec![0], None));
+    }
 
     #[test]
     fn static_files_summary_table_renders_segment_breakdown() {
