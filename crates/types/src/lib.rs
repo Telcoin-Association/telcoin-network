@@ -118,6 +118,11 @@ pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
 /// The empty list is excluded because EIP-7702 declares an empty
 /// authorization list invalid (revm rejects it at execution; reth's pool
 /// rejects it at admission), so a batch carrying one wastes certified work.
+///
+/// The `u64::try_from(list.len())` conversion cannot fail: core defines
+/// `TryFrom<usize> for u64` as unbounded at every pointer width. `is_ok_and`
+/// keeps the predicate fail-closed anyway, matching the same spelling in
+/// `TnPoolValidator::screen`.
 pub fn batch_allowlisted_authorization_list<T: TransactionTrait>(tx: &T, epoch: Epoch) -> bool {
     !tx.is_eip7702()
         || tx.authorization_list().is_some_and(|list| {

@@ -44,8 +44,7 @@ use reth_provider::{
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
     error::{
-        Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
-        PoolError, PoolTransactionError,
+        Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolTransactionError,
     },
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, CoinbaseTipOrdering,
     EthPooledTransaction, EthTransactionValidator, Pool, PoolSize, PoolTransaction, PoolUpdateKind,
@@ -204,7 +203,8 @@ impl From<WorkerTxPool> for TnEthTransactionPool {
 /// [`max_tx_authorizations`].
 ///
 /// Upstream reth owns [`InvalidPoolTransactionError`] and none of its variants describe an
-/// over-long authorization list ([`Eip7702PoolTransactionError::MissingEip7702AuthorizationList`]
+/// over-long authorization list
+/// ([`MissingEip7702AuthorizationList`](reth_transaction_pool::error::Eip7702PoolTransactionError::MissingEip7702AuthorizationList)
 /// is the inverse case), so this TN type rides in [`InvalidPoolTransactionError::Other`]
 /// instead of borrowing a wrong-semantics upstream kind.
 #[derive(Debug, thiserror::Error)]
@@ -278,8 +278,8 @@ enum Screened<Tx: PoolTransaction> {
 /// transaction at RPC ingress.
 ///
 /// The empty-list case is deliberately NOT rejected here: the inner eth validator already
-/// returns [`Eip7702PoolTransactionError::MissingEip7702AuthorizationList`] for it and
-/// callers may match on that kind.
+/// returns [`MissingEip7702AuthorizationList`](reth_transaction_pool::error::Eip7702PoolTransactionError::MissingEip7702AuthorizationList) for
+/// it and callers may match on that kind.
 #[derive(Debug)]
 pub struct TnPoolValidator<V> {
     /// The wrapped validator, delegated to for every transaction that passes the screen.
@@ -300,8 +300,12 @@ where
 {
     /// Screen one transaction against the authorization-list cap.
     ///
-    /// A non-7702 transaction reports no authorization list and always passes. A list
-    /// length that does not fit `u64` is over any cap and rejects.
+    /// A non-7702 transaction reports no authorization list and always passes. `usize`
+    /// converts to `u64` losslessly on every Rust target (core defines the conversion as
+    /// unbounded at 16-, 32-, and 64-bit pointer widths), so the conversion cannot fail;
+    /// the `Err` arm rejects anyway, keeping the screen fail-closed. Spelling it the other
+    /// way round (`usize::try_from(max)`) would trade an infallible conversion for a
+    /// genuinely fallible one on a hypothetical 32-bit build.
     fn screen(
         &self,
         origin: TransactionOrigin,
@@ -357,6 +361,16 @@ where
     /// This override preserves it: screen every transaction, send the survivors to the
     /// inner batched call, and merge the outcomes back in the original input order, since
     /// callers rely on positional correspondence.
+    ///
+    /// Dormant, not dead. Reth's `EthApi` submits RPC transactions through
+    /// `BatchTxProcessor`, which calls `Pool::add_transactions_with_origins` — and therefore
+    /// this method — for any drained batch of two or more. TN wires that processor up
+    /// (`env/rpc.rs` builds `EthApi::builder(..)` over the TN pool and forwards
+    /// `.max_batch_size(config.max_batch_size)`), but never batches today, because
+    /// `EthConfig::default()` pins `max_batch_size = 1` and reth exposes no CLI flag for it.
+    /// Raising that value is a config change, not a code change, so do not delete this
+    /// override as unreachable. `validate_transactions_merges_outcomes_in_input_order`
+    /// exercises the merge directly to keep it from rotting while unexercised.
     async fn validate_transactions(
         &self,
         transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction), IntoIter: Send>
@@ -393,7 +407,8 @@ where
                 target: "txpool",
                 expected = survivor_hashes.len(),
                 got = inner_outcomes.len(),
-                "inner validator returned a mismatched outcome count; padding with errors"
+                "inner validator returned a mismatched outcome count; unmatched slots take an \
+                 error outcome and surplus outcomes are dropped"
             );
         }
         let mut inner_outcomes = inner_outcomes.into_iter();
@@ -1029,17 +1044,35 @@ impl BestTxns {
     /// Mark a denylisted transaction type — one outside the batch allowlist and not
     /// EIP-4844 — as invalid during batch building.
     ///
-    /// Mirrors [`Self::ignore_eip4844`]: upstream reth owns the pool error enum, so the
-    /// nearest upstream kind ([`Eip7702PoolTransactionError`]) stands in for a type the
-    /// batch allowlist refuses. This is a default-deny path no decodable type reaches
-    /// today (EIP-7702 is allowlisted; EIP-4844 takes [`Self::ignore_eip4844`]), kept
-    /// for future transaction types.
+    /// The batch builder routes two cases here: a decodable type outside
+    /// [`tn_types::batch_allowlisted_tx_type`] (none exists today — [`TransactionSigned`]
+    /// decodes only 0x00/0x01/0x02/0x03/0x04, and 0x03 takes [`Self::ignore_eip4844`]), and
+    /// an EIP-7702 transaction whose authorization list falls outside
+    /// `1..=max_tx_authorizations(epoch)`. Only the second is live, so the rejection carries
+    /// [`AuthorizationListLengthExceeded`] rather than borrowing an upstream kind with the
+    /// opposite meaning:
+    /// [`MissingEip7702AuthorizationList`](reth_transaction_pool::error::Eip7702PoolTransactionError::MissingEip7702AuthorizationList)
+    /// describes an *empty* list, the inverse condition.
+    ///
+    /// Reachable in code and under test — the batch builder calls this for an out-of-bounds
+    /// 7702 list — but not in production: `TnPoolValidator::screen` rejects an over-cap
+    /// list at admission, reth's own validator rejects an empty one, and TN's pool is
+    /// memory-only (the local-transaction backup task in [`WorkerTxPool::new`] is commented
+    /// out), so no such transaction can reach the pool by another route.
+    ///
+    /// The kind is documentation, not behaviour. Reth's `BestTransactions::mark_invalid`
+    /// (`pool/best.rs`) names the parameter `_kind` and its whole body is
+    /// `self.invalid.insert(tx.sender_id())`, which only skips the sender's descendants for
+    /// the rest of this iterator. Eviction from the pool happens separately, through
+    /// [`TxPool::remove_unsupported_txs`] on the hashes the builder collects.
     pub fn ignore_denylist_type(&mut self, pool_tx: &Arc<PoolTxn>) {
+        let len = pool_tx.transaction.authorization_list().map_or(0, |list| list.len());
         self.inner.mark_invalid(
             pool_tx,
-            &InvalidPoolTransactionError::Eip7702(
-                Eip7702PoolTransactionError::MissingEip7702AuthorizationList,
-            ),
+            &InvalidPoolTransactionError::Other(Box::new(AuthorizationListLengthExceeded {
+                len,
+                max: max_tx_authorizations(0),
+            })),
         );
     }
 }
@@ -1262,6 +1295,124 @@ mod tests {
         assert_eq!(s.pending, 0);
         assert_eq!(s.queued, 0);
         assert_eq!(s.blob, 0);
+    }
+
+    /// Marker outcome the mock inner validator returns, so a merged slot that came from the
+    /// inner validator is distinguishable from one [`TnPoolValidator::screen`] produced.
+    #[derive(Debug, thiserror::Error)]
+    #[error("inner validator marker outcome")]
+    struct InnerOutcomeMarker;
+
+    /// Inner validator honoring the one-outcome-per-input-in-order contract, recording what
+    /// it was handed so the test can prove only survivors reached it.
+    #[derive(Debug, Default)]
+    struct RecordingValidator {
+        seen: std::sync::Mutex<Vec<TxHash>>,
+    }
+
+    impl TransactionValidator for RecordingValidator {
+        type Transaction = EthPooledTransaction;
+        type Block = tn_types::Block;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            let hash = *transaction.hash();
+            self.seen.lock().expect("seen lock").push(hash);
+            TransactionValidationOutcome::Error(hash, Box::new(InnerOutcomeMarker))
+        }
+    }
+
+    /// The batched override must return exactly one outcome per input, in input order.
+    /// Reth's `Pool::add_transactions_with_origins` zips the returned vector against the
+    /// input slice (`transaction-pool/src/lib.rs`), so drift in either property silently
+    /// misattributes an outcome to the wrong transaction. Nothing in TN batches today
+    /// (`EthConfig::default()` pins `max_batch_size = 1`), so this direct call is the only
+    /// thing exercising the merge — see the method doc for why the path is kept.
+    ///
+    /// The inputs interleave screen rejections with survivors so a merge that grouped
+    /// rejections, dropped a slot, or offset the survivor stream could not pass.
+    #[tokio::test]
+    async fn validate_transactions_merges_outcomes_in_input_order() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let chain_id = chain.chain_id();
+        let mut tx_factory = TransactionFactory::new_random();
+        let cap = usize::try_from(max_tx_authorizations(0)).expect("cap fits usize");
+
+        let over_cap_a = tx_factory.create_eip7702_with_authorizations(
+            chain_id,
+            1_000_000,
+            7,
+            cap + 1,
+            Bytes::new(),
+        );
+        let in_range_a = tx_factory.create_eip7702(chain_id, None, 7);
+        let over_cap_b = tx_factory.create_eip7702_with_authorizations(
+            chain_id,
+            1_000_000,
+            7,
+            cap + 1,
+            Bytes::new(),
+        );
+        let in_range_b = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+
+        let inputs: Vec<EthPooledTransaction> =
+            [&over_cap_a, &in_range_a, &over_cap_b, &in_range_b]
+                .into_iter()
+                .map(|tx| recover_pooled_transaction(&tx.encoded_2718()).expect("pooled txn"))
+                .collect();
+        let hashes: Vec<TxHash> = inputs.iter().map(|tx| *tx.hash()).collect();
+
+        let validator = TnPoolValidator::new(RecordingValidator::default());
+        let outcomes = validator
+            .validate_transactions(inputs.into_iter().map(|tx| (TransactionOrigin::External, tx)))
+            .await;
+
+        // one outcome per input, positionally aligned with the inputs
+        assert_eq!(outcomes.len(), hashes.len(), "one outcome per input");
+        for (i, (outcome, hash)) in outcomes.iter().zip(&hashes).enumerate() {
+            assert_eq!(outcome.tx_hash(), *hash, "outcome {i} is out of input order");
+        }
+
+        // positions 0 and 2 are screen rejections...
+        for i in [0, 2] {
+            let TransactionValidationOutcome::Invalid(_, InvalidPoolTransactionError::Other(boxed)) =
+                &outcomes[i]
+            else {
+                panic!("input {i} must be rejected by the screen");
+            };
+            assert!(
+                boxed.as_any().downcast_ref::<AuthorizationListLengthExceeded>().is_some(),
+                "input {i} must carry the TN authorization-list cap kind"
+            );
+        }
+        // . . . and 1 and 3 carry the inner validator's own outcome
+        for i in [1, 3] {
+            let TransactionValidationOutcome::Error(_, err) = &outcomes[i] else {
+                panic!("input {i} must carry the inner validator's outcome");
+            };
+            assert!(
+                err.downcast_ref::<InnerOutcomeMarker>().is_some(),
+                "input {i} must come from the inner validator"
+            );
+        }
+
+        // the inner validator saw exactly the survivors, once each, in order: the screen
+        // neither forwarded a rejection nor swallowed a survivor
+        assert_eq!(
+            validator.inner.seen.lock().expect("seen lock").as_slice(),
+            &[hashes[1], hashes[3]],
+            "the inner validator must see exactly the survivors, in order"
+        );
     }
 
     #[tokio::test]

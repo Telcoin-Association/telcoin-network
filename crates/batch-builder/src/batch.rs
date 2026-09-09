@@ -102,6 +102,27 @@ pub fn build_batch<P: TxPool>(
         // decodable type outside the allowlist (no such type exists today).
         // Both feed `remove_unsupported_txs` below so the transaction and its
         // descendants leave the pool
+        //
+        // Reachability: the authorization-list half cannot fire in production.
+        // `max_tx_authorizations` is derived from `max_batch_gas`
+        // ((max_batch_gas - 21_000) / 25_000), so for any N >= cap + 1 the
+        // intrinsic cost 21_000 + 25_000 * N exceeds `max_batch_gas` as an
+        // algebraic identity — the gas-capacity check at the top of this loop
+        // therefore always diverts an over-cap 7702 transaction that declares
+        // executable gas, and that masking survives any future fork that moves
+        // `max_batch_gas` (note the gas arm only skips: it marks the sender
+        // invalid for this iterator and mutates no pool state, so such a
+        // transaction is passed over rather than evicted). One that instead
+        // under-declares its gas never reaches the pool at all: reth's
+        // `ensure_intrinsic_gas`, reth's `ExceedsGasLimit` against TN's
+        // permanently-30,000,000 block gas limit, and `TnPoolValidator::screen`
+        // each reject it at admission. The branch is kept as defense in depth —
+        // it mirrors the batch validator's twin, which IS reachable on
+        // untrusted peer batches — and is exercised on a synthetic pool by
+        // `over_cap_7702_tx_is_skipped_by_the_list_predicate` below. Do not
+        // reorder it above the gas check to "unmask" it: the gas arm is the
+        // cheaper rejection and the correct one for a transaction that cannot
+        // fit the batch at all.
         if !tn_types::batch_allowlisted_tx_type(&tx)
             || !tn_types::batch_allowlisted_authorization_list(&*tx, epoch)
         {
@@ -360,15 +381,27 @@ mod tests {
     /// A type-0x04 transaction whose authorization list exceeds
     /// `max_tx_authorizations(epoch)` must never be packed: the batch validator
     /// rejects a batch carrying one with a Medium peer penalty. The builder must
-    /// skip it and evict it from the pool through `remove_unsupported_txs`.
+    /// skip it and route it to `remove_unsupported_txs`.
+    ///
+    /// This pins the predicate wiring on a synthetic pool state, not a production
+    /// sequence. `TestPool::new` only decodes and recovers — no validator, no
+    /// intrinsic-gas gate, no `TnPoolValidator::screen` — so it can hold a
+    /// transaction no real pool admits: `cap + 1` tuples declaring
+    /// `gas_limit = 1_000_000` against an intrinsic cost of 30,021,000, an
+    /// under-declaration of 29,021,000. Declaring honest gas instead would trip the
+    /// gas-capacity arm before this predicate runs (see the reachability note in
+    /// `build_batch`), so the branch cannot be reached from a genuine pool state at
+    /// all — which is exactly why it is worth pinning here.
     #[test]
-    fn over_cap_7702_tx_is_never_packed_and_leaves_the_pool() {
+    fn over_cap_7702_tx_is_skipped_by_the_list_predicate() {
         let genesis = test_genesis();
         let chain_id = genesis.config.chain_id;
         let mut tx_factory = TransactionFactory::new();
 
         // one tuple past the cap, dummy tuples; the declared gas limit stays under
-        // max_batch_gas(0) so the gas-capacity arm cannot mask the list check
+        // max_batch_gas(0) so the gas-capacity arm cannot mask the list check (it
+        // also under-declares the transaction's own intrinsic gas, which only a
+        // validator-free TestPool would ever hold)
         let cap = usize::try_from(tn_types::max_tx_authorizations(0)).expect("cap fits usize");
         let over_cap = tx_factory.create_eip7702_with_authorizations(
             chain_id,
