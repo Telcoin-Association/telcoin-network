@@ -206,16 +206,25 @@ pub fn max_batch_size(_epoch: Epoch) -> usize {
 
 /// Intrinsic gas of the cheapest transaction (EIP-2 base cost, 21,000).
 ///
+/// Every executable transaction pays at least this much before it does any
+/// work, so it is the floor term in the batch validator's per-transaction
+/// intrinsic-gas check (see [`BatchValidationError::IntrinsicGasTooLow`]).
+///
 /// Local mirror of the protocol constant. tn-types must not grow a revm
 /// dependency, so the value lives here with a pinning unit test instead.
-const BASE_TX_GAS: u64 = 21_000;
+pub const BASE_TX_GAS: u64 = 21_000;
 
 /// Intrinsic gas charged per EIP-7702 authorization tuple (25,000).
+///
+/// Charged from the wire-list length alone, before any tuple is checked for
+/// validity, so it is the per-tuple term in both [`max_tx_authorizations`] and
+/// the batch validator's per-transaction intrinsic-gas check (see
+/// [`BatchValidationError::IntrinsicGasTooLow`]).
 ///
 /// Mirror of `revm_primitives::eip7702::PER_EMPTY_ACCOUNT_COST`. tn-types must
 /// not grow a revm dependency, so the value lives here with a pinning unit
 /// test instead.
-const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
+pub const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
 
 /// Max EIP-7702 authorization-list length a batch transaction may carry at
 /// `_epoch`. Currently (30,000,000 - 21,000) / 25,000 = 1199.
@@ -376,6 +385,41 @@ pub enum BatchValidationError {
         len: usize,
         /// The maximum length allowed at the batch's epoch.
         max: u64,
+        /// Hash of the offending transaction.
+        hash: BlockHash,
+    },
+    /// The batch contains a transaction declaring less gas than the intrinsic
+    /// cost it is guaranteed to owe: `BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * N`
+    /// for `N` EIP-7702 authorization tuples.
+    ///
+    /// Why this matters: [`max_tx_authorizations`] bounds tuples *per
+    /// transaction*, which does not bound a batch. Without a floor, a batch
+    /// producer can pack many transactions of `max_tx_authorizations` tuples
+    /// each, all declaring `gas_limit = 21_000`, and pass every other check --
+    /// every validator then pays one unpaid ECDSA authority recovery per tuple
+    /// (alloy-evm recovers the whole list while building the `TxEnv`, before
+    /// revm's intrinsic-gas gate rejects the transaction), on every execution
+    /// and every replay. Charging the floor makes the existing declared-gas sum
+    /// bound the aggregate:
+    ///
+    /// ```text
+    /// sum(gas_limit_i) <= max_batch_gas  and  gas_limit_i >= 21_000 + 25_000 * N_i
+    ///   =>  25_000 * sum(N_i) <= 30_000_000 - 21_000 * k  =>  sum(N_i) <= 1_199 per batch
+    /// ```
+    ///
+    /// The floor is a deliberate *lower bound* on true intrinsic gas: it omits
+    /// calldata, access-list and contract-creation costs, all of which only add.
+    /// So any transaction reth's pool would admit already declares at least this
+    /// much -- revm's own intrinsic-gas gate is strictly stricter -- and no
+    /// honest producer on any binary version can emit a batch this rejects. Like
+    /// [`Self::InvalidAuthorizationList`], it rejects only garbage that could
+    /// never execute, which is what keeps the peer penalty safe to apply.
+    #[error("Proposed batch contains transaction declaring gas limit {gas_limit} below intrinsic floor {floor}. Tx hash: {hash}")]
+    IntrinsicGasTooLow {
+        /// The gas limit declared by the offending transaction.
+        gas_limit: u64,
+        /// The intrinsic-gas lower bound the transaction failed to declare.
+        floor: u64,
         /// Hash of the offending transaction.
         hash: BlockHash,
     },

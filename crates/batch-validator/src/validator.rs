@@ -5,7 +5,8 @@ use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, Work
 use tn_types::{
     batch_allowlisted_authorization_list, batch_allowlisted_tx_type, max_batch_gas, max_batch_size,
     max_tx_authorizations, BatchValidation, BatchValidationError, BlockHash, Epoch, SealedBatch,
-    TransactionSigned, TransactionTrait as _, Typed2718 as _, WorkerId,
+    TransactionSigned, TransactionTrait as _, Typed2718 as _, WorkerId, BASE_TX_GAS,
+    PER_EMPTY_ACCOUNT_COST,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -75,6 +76,10 @@ impl BatchValidation for BatchValidator {
 
         // validate every EIP-7702 authorization list is within the executable bound
         self.validate_authorization_lists(&decoded_txs, batch.epoch)?;
+
+        // validate every tx declares at least the intrinsic gas it is guaranteed to owe, so the
+        // batch gas sum below bounds aggregate authorization work and not just per-tx work
+        self.validate_intrinsic_gas(&decoded_txs, batch.epoch)?;
 
         // validate gas limit
         // Use the parent timestamp for consistency with the batch builder.
@@ -249,6 +254,55 @@ impl BatchValidator {
                 })
             },
         )
+    }
+
+    /// Validate every transaction declares at least the intrinsic gas it is
+    /// guaranteed to owe: `BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * N` for `N`
+    /// EIP-7702 authorization tuples.
+    ///
+    /// Why a per-transaction floor bounds the whole batch:
+    /// [`max_tx_authorizations`] caps tuples per transaction, which says nothing
+    /// about a batch. Without this check a producer packs many transactions of
+    /// `max_tx_authorizations` tuples each, all declaring `gas_limit = 21_000`,
+    /// and [`Self::validate_batch_gas`] still passes -- while every validator
+    /// pays one unpaid ECDSA authority recovery per tuple, because alloy-evm
+    /// recovers the entire list while building the `TxEnv`, before revm's
+    /// intrinsic-gas gate rejects the transaction, on every execution and every
+    /// replay. With the floor charged, the declared-gas sum bounds the aggregate:
+    ///
+    /// ```text
+    /// sum(gas_limit_i) <= max_batch_gas  and  gas_limit_i >= 21_000 + 25_000 * N_i
+    ///   =>  25_000 * sum(N_i) <= 30_000_000 - 21_000 * k  =>  sum(N_i) <= 1_199 per batch
+    /// ```
+    ///
+    /// The floor is deliberately a *lower* bound on true intrinsic gas: it omits
+    /// calldata, access-list and contract-creation costs, which only add. Any
+    /// transaction reth's pool would admit therefore already clears it -- revm's
+    /// own intrinsic-gas gate is strictly stricter -- so no honest producer on
+    /// any binary version can emit a batch this rejects, and the peer penalty
+    /// can never fire against an honest peer. Do not tighten the floor to
+    /// include calldata: that would trade this property away.
+    ///
+    /// Runs after [`Self::validate_authorization_lists`] so an over-cap list is
+    /// still reported as `InvalidAuthorizationList`, the more specific fault.
+    fn validate_intrinsic_gas(
+        &self,
+        transactions: &[TransactionSigned],
+        _epoch: Epoch,
+    ) -> BatchValidationResult<()> {
+        transactions
+            .iter()
+            .find_map(|tx| {
+                let auths = tx.authorization_list().map_or(0, |list| list.len());
+                let floor =
+                    BASE_TX_GAS.saturating_add(PER_EMPTY_ACCOUNT_COST.saturating_mul(auths as u64));
+                (tx.gas_limit() < floor).then(|| BatchValidationError::IntrinsicGasTooLow {
+                    gas_limit: tx.gas_limit(),
+                    floor,
+                    hash: *tx.hash(),
+                })
+            })
+            .map_or(Ok(()), Err)
     }
 
     /// Helper function for decoding and recovering transactions.
@@ -800,6 +854,148 @@ mod tests {
         batch.transactions = vec![signed_tx.encoded_2718()];
 
         assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+    }
+
+    /// The aggregate bound the per-transaction intrinsic-gas floor buys.
+    ///
+    /// This is the attack the floor closes. `max_tx_authorizations` caps tuples
+    /// per transaction, not per batch, so a Byzantine producer packs several
+    /// EIP-7702 transactions that each sit exactly at the cap while declaring
+    /// only `BASE_TX_GAS`. Every pre-existing check passes -- the batch fits
+    /// `max_batch_size`, each authorization list is within `1..=cap`, and the
+    /// declared gas sum is a few times 21,000, far under `max_batch_gas` -- yet
+    /// each validator pays one unpaid ECDSA authority recovery per packed tuple
+    /// on every execution and replay. The assertions below run those checks
+    /// individually first, so this test pins that the *new* check is the one
+    /// that catches it.
+    ///
+    /// Byte size, not gas, caps the transaction count: each capped transaction
+    /// encodes to ~115 KB, so eight fit under `max_batch_size` (~919 KB) and a
+    /// ninth would not. That is the real shape of the attack -- 8 * 1,199 =
+    /// 9,592 tuples smuggled behind 168,000 declared gas -- which the floor cuts
+    /// to 1,199 for the whole batch. The loop packs whatever fits rather than a
+    /// hard-coded eight so a future encoding change reshapes the fixture instead
+    /// of breaking it.
+    #[tokio::test]
+    async fn test_invalid_batch_aggregate_authorizations_under_declared_gas() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        let cap = usize::try_from(max_tx_authorizations(batch.epoch)).expect("cap fits in usize");
+        let chain_id = validator.reth_env.chainspec().chain_id();
+        let mut tx_factory = TransactionFactory::new_random();
+
+        // pack transactions at the cap, each declaring only the base intrinsic cost,
+        // stopping before the batch byte limit so the size check can never be what fires
+        let mut packed = Vec::new();
+        let mut total_bytes = 0;
+        for _ in 0..9 {
+            let encoded = tx_factory
+                .create_eip7702_with_authorizations(chain_id, BASE_TX_GAS, 7, cap, Bytes::new())
+                .encoded_2718();
+            if total_bytes + encoded.len() > max_batch_size(batch.epoch) {
+                break;
+            }
+            total_bytes += encoded.len();
+            packed.push(encoded);
+        }
+
+        // the aggregate hole needs more than one transaction to exist at all
+        assert!(packed.len() > 1, "expected multiple capped txs to fit, got {}", packed.len());
+        batch.transactions = packed;
+
+        // every pre-existing check admits this batch
+        let decoded = validator
+            .decode_transactions(batch.transactions(), batch.digest())
+            .expect("txs decode correctly");
+        assert_matches!(
+            validator.validate_batch_size_bytes(batch.transactions(), batch.epoch),
+            Ok(())
+        );
+        assert_matches!(validator.validate_authorization_lists(&decoded, batch.epoch), Ok(()));
+        assert_matches!(validator.validate_batch_gas(&decoded, batch.epoch), Ok(()));
+
+        // yet it smuggles in far more tuples than any single transaction may carry
+        let total_tuples = decoded.len() * cap;
+        assert!(
+            total_tuples > cap,
+            "expected the batch to exceed the per-tx cap: {total_tuples} vs {cap}"
+        );
+
+        // only the intrinsic-gas floor rejects it
+        let floor = BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * cap as u64;
+        assert_matches!(
+            validator.validate_batch(batch.seal_slow()),
+            Err(BatchValidationError::IntrinsicGasTooLow { gas_limit, floor: got, hash: _ })
+                if gas_limit == BASE_TX_GAS && got == floor
+        );
+    }
+
+    /// The intrinsic-gas floor is inclusive: a transaction declaring exactly
+    /// `BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * N` is admitted, and one gas less
+    /// is rejected. Pinning both directions keeps the floor from drifting into
+    /// rejecting a transaction revm's own (strictly stricter) intrinsic-gas gate
+    /// would admit, which is what makes the peer penalty safe.
+    #[tokio::test]
+    async fn test_batch_intrinsic_gas_floor_boundary() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        const NUM_AUTHS: usize = 3;
+        let floor = BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * NUM_AUTHS as u64;
+        let chain_id = validator.reth_env.chainspec().chain_id();
+        let mut tx_factory = TransactionFactory::new_random();
+
+        // exactly at the floor: admitted
+        batch.transactions = vec![tx_factory
+            .create_eip7702_with_authorizations(chain_id, floor, 7, NUM_AUTHS, Bytes::new())
+            .encoded_2718()];
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+
+        // one gas below the floor: rejected
+        batch.transactions = vec![tx_factory
+            .create_eip7702_with_authorizations(chain_id, floor - 1, 7, NUM_AUTHS, Bytes::new())
+            .encoded_2718()];
+        assert_matches!(
+            validator.validate_batch(batch.seal_slow()),
+            Err(BatchValidationError::IntrinsicGasTooLow { gas_limit, floor: got, hash: _ })
+                if gas_limit == floor - 1 && got == floor
+        );
+    }
+
+    /// The cheapest executable transaction -- a plain 21,000-gas value transfer
+    /// with no authorization list -- still passes. Its floor is `BASE_TX_GAS`
+    /// alone, and the comparison is inclusive.
+    #[tokio::test]
+    async fn test_valid_batch_minimum_gas_transfer() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        let mut tx_factory = TransactionFactory::new_random();
+        batch.transactions = vec![tx_factory
+            .create_explicit_eip1559(
+                Some(validator.reth_env.chainspec().chain_id()),
+                None,                  // default nonce
+                None,                  // no tip
+                Some(7),               // min basefee
+                Some(BASE_TX_GAS),     // exactly the intrinsic floor
+                Some(Address::ZERO),   // simple transfer
+                Some(U256::from(100)), // send low amount
+                None,                  // no input
+                None,                  // no access list
+            )
+            .encoded_2718()];
+
+        assert_matches!(validator.validate_batch(batch.seal_slow()), Ok(()));
     }
 
     #[tokio::test]
