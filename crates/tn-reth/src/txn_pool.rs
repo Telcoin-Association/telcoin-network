@@ -253,18 +253,29 @@ enum Screened<Tx: PoolTransaction> {
 }
 
 /// Pre-admission wrap around reth's transaction validator that bounds the EIP-7702
-/// authorization-list length before any per-tuple work runs.
+/// authorization-list length before the inner validator runs.
 ///
-/// Reth's `EthTransactionValidator` recovers every authorization tuple's signer during
-/// validation, before the sender has paid any fee, so a padded list buys ~1,200 unpaid ECDSA
-/// recoveries per transaction. This wrap reads the list length first and rejects an over-cap
-/// transaction without calling the inner validator: the length read pre-empts the per-tuple
-/// recovery work.
+/// Reth v1.11.3 already makes an over-cap list unreachable: `recover_authorities` is the last
+/// step of `validate_stateful` (`validate/eth.rs:582`), after the block-gas-limit check
+/// (`eth.rs:386`) and `ensure_intrinsic_gas` (`eth.rs:484`, charging 25,000/tuple at PRAGUE).
+/// With the pool's block gas limit at 30,000,000 those two force `N <= 1199`, so this screen
+/// prevents zero recoveries today and rejects a strict subset of what reth rejects, with a
+/// TN-specific error kind.
+///
+/// It is kept as defense-in-depth against two drift risks, neither of which is pinned by a
+/// test: (1) the pool's implicit bound derives from the *header* gas limit while
+/// [`max_tx_authorizations`] derives from [`tn_types::max_batch_gas`] — equal today only because
+/// genesis sets both to 30,000,000; (2) the ordering guarantee lives entirely in upstream reth's
+/// stateless/stateful split, and a bump that moves `recover_authorities` earlier would make this
+/// screen load-bearing.
 ///
 /// The cap is [`max_tx_authorizations`] at epoch 0: the cap is epoch-uniform today, and the
 /// batch validator enforces the epoch-precise bound. An over-cap transaction can never
 /// execute (see [`max_tx_authorizations`] for the derivation), so the screen rejects only
-/// garbage.
+/// garbage. If a future fork makes the cap epoch-varying, this screen must loosen (use the
+/// largest cap across epochs), never tighten: a fork that *raises* batch gas would otherwise
+/// leave this epoch-0 evaluation on the smaller old cap and false-reject a now-valid
+/// transaction at RPC ingress.
 ///
 /// The empty-list case is deliberately NOT rejected here: the inner eth validator already
 /// returns [`Eip7702PoolTransactionError::MissingEip7702AuthorizationList`] for it and
@@ -322,8 +333,10 @@ where
     type Block = V::Block;
 
     /// Screen, then delegate. The cap check runs before the inner validator, so an over-cap
-    /// transaction costs one length read, never the inner validator's state reads or its
-    /// per-tuple authority recovery.
+    /// transaction costs one length read rather than the inner validator's stateless checks.
+    /// Note this saves no authority recoveries against reth v1.11.3, which rejects the same
+    /// transaction at `ensure_intrinsic_gas` well before it recovers anything — see the
+    /// [`TnPoolValidator`] doc for why the screen is kept anyway.
     async fn validate_transaction(
         &self,
         origin: TransactionOrigin,

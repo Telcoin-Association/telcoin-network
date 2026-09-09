@@ -107,11 +107,13 @@ pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
 /// transaction, `true` iff the list length is in
 /// `1..=max_tx_authorizations(epoch)`.
 ///
-/// One predicate shared by the batch validator, the batch builder, the worker
-/// gateway, and the pool wrap so producers and validators can never disagree
-/// on the bound. See [`max_tx_authorizations`] for the derivation and the
-/// no-false-rejection argument: an over-cap transaction can never execute
-/// inside a batch, so rejecting it refuses only garbage.
+/// One predicate shared by the batch validator, the batch builder, and the
+/// worker gateway. The pool wrap (`TnPoolValidator::screen`) enforces only
+/// the upper half of this bound against the same `max_tx_authorizations`
+/// constant, and delegates the empty-list case to reth's
+/// `MissingEip7702AuthorizationList`. See [`max_tx_authorizations`] for the
+/// derivation and the no-false-rejection argument: an over-cap transaction
+/// can never execute inside a batch, so rejecting it refuses only garbage.
 ///
 /// The empty list is excluded because EIP-7702 declares an empty
 /// authorization list invalid (revm rejects it at execution; reth's pool

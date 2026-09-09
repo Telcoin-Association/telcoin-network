@@ -767,4 +767,33 @@ mod tests {
             "pre-Prague gas params serve 0, disabling the subtraction"
         );
     }
+
+    /// Cross-crate pin for the revm constants tn-types mirrors by hand.
+    ///
+    /// `crates/types/src/worker/sealed_batch.rs` copies `PER_EMPTY_ACCOUNT_COST` and the 21,000
+    /// base stipend because tn-types must not grow a revm dependency. Nothing in tn-types can
+    /// compare those copies to their source, so the binding lives here.
+    #[test]
+    fn tn_types_authorization_cap_tracks_revm_gas_table() {
+        let prague = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        let per_tuple = prague.gas_params.tx_eip7702_per_empty_account_cost();
+        let base_tx_gas = prague.gas_params.tx_base_stipend();
+
+        assert_eq!(per_tuple, PER_EMPTY_ACCOUNT_COST);
+        assert_eq!(per_tuple, tn_types::PER_EMPTY_ACCOUNT_COST);
+        assert_eq!(base_tx_gas, 21_000, "EIP-2 base transaction stipend");
+        assert_eq!(base_tx_gas, tn_types::BASE_TX_GAS);
+
+        for epoch in [0u32, 1, u32::MAX] {
+            assert_eq!(
+                tn_types::max_tx_authorizations(epoch),
+                (tn_types::max_batch_gas(epoch) - base_tx_gas) / per_tuple,
+                "tn_types::max_tx_authorizations({epoch}) is derived from stale mirrors of revm's \
+                 gas table — update BASE_TX_GAS / PER_EMPTY_ACCOUNT_COST in \
+                 crates/types/src/worker/sealed_batch.rs. This is a protocol change: the cap is \
+                 enforced by producers and validators alike, so it needs a coordinated rollout, \
+                 and the 1199 pin in crates/types/src/lib.rs must move too."
+            );
+        }
+    }
 }

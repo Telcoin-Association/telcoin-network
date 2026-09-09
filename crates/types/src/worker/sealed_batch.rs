@@ -210,8 +210,10 @@ pub fn max_batch_size(_epoch: Epoch) -> usize {
 /// work, so it is the floor term in the batch validator's per-transaction
 /// intrinsic-gas check (see [`BatchValidationError::IntrinsicGasTooLow`]).
 ///
-/// Local mirror of the protocol constant. tn-types must not grow a revm
-/// dependency, so the value lives here with a pinning unit test instead.
+/// Local mirror of the protocol constant: tn-types cannot depend on revm, so
+/// the value is pinned to revm's gas table by
+/// `tn_types_authorization_cap_tracks_revm_gas_table` in
+/// `crates/tn-reth/src/evm/utils.rs`.
 pub const BASE_TX_GAS: u64 = 21_000;
 
 /// Intrinsic gas charged per EIP-7702 authorization tuple (25,000).
@@ -221,9 +223,10 @@ pub const BASE_TX_GAS: u64 = 21_000;
 /// the batch validator's per-transaction intrinsic-gas check (see
 /// [`BatchValidationError::IntrinsicGasTooLow`]).
 ///
-/// Mirror of `revm_primitives::eip7702::PER_EMPTY_ACCOUNT_COST`. tn-types must
-/// not grow a revm dependency, so the value lives here with a pinning unit
-/// test instead.
+/// Mirror of `revm_primitives::eip7702::PER_EMPTY_ACCOUNT_COST`: tn-types
+/// cannot depend on revm, so the value is pinned to revm's gas table by
+/// `tn_types_authorization_cap_tracks_revm_gas_table` in
+/// `crates/tn-reth/src/evm/utils.rs`.
 pub const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
 
 /// Max EIP-7702 authorization-list length a batch transaction may carry at
@@ -234,16 +237,21 @@ pub const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
 /// type-0x04 transaction with more than this many tuples must either declare
 /// `gas_limit >= 21_000 + 25_000 * N > max_batch_gas` (so no batch can ever
 /// carry it: the batch validator sums declared gas limits against
-/// [`max_batch_gas`]) or under-declare and be rejected by revm's
-/// intrinsic-gas gate (`CallGasCostMoreThanGasLimit`) before any per-tuple
-/// authority recovery. Either way the transaction can never execute, so every
-/// enforcement site that uses this bound rejects only garbage: no valid
-/// transaction is ever refused.
+/// [`max_batch_gas`]) or under-declare and be rejected — by reth's pool as
+/// `IntrinsicGasTooLow`, or at execution by revm as
+/// `CallGasCostMoreThanGasLimit`. Either way the transaction can never
+/// execute, so every enforcement site that uses this bound rejects only
+/// garbage: no valid transaction is ever refused.
 ///
-/// The DoS this bounds: each tuple costs one unpaid ECDSA recovery at pool
-/// admission (reth recovers authorities during validation). The cap bounds
-/// that work to 1199 recoveries per transaction, and enforcement sites check
-/// the list length BEFORE the recovery runs.
+/// The DoS this bounds: each tuple costs one unpaid ECDSA recovery. Reth's
+/// pool recovers authorities during validation, AFTER its intrinsic-gas
+/// check. alloy-evm recovers every tuple eagerly while building the `TxEnv`,
+/// BEFORE revm's intrinsic-gas gate — so at execution the recoveries are paid
+/// even by a transaction the gate then rejects. This cap bounds that work per
+/// transaction; it does NOT bound it per batch. The per-batch bound is the
+/// batch validator's per-transaction intrinsic-gas floor
+/// ([`BatchValidationError::IntrinsicGasTooLow`]), which makes the
+/// declared-gas sum bound `sum(N_i)`.
 ///
 /// The epoch parameter mirrors [`max_batch_gas`] and auto-tracks a future
 /// fork that raises batch gas. Currently epoch-uniform.
