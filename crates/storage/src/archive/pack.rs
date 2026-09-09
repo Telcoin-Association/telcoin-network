@@ -343,9 +343,15 @@ where
         let result = self.append_inner(value);
         if let Err(err) = &result {
             match err {
-                // These errors all indicate a failed DB that can no longer be inserted too.
+                // A write io error indicates a failed DB that can no longer be inserted to -- with
+                // one exception: `InvalidInput` is `write_value`'s oversize-record rejection, which
+                // fires before any byte is written, so the on-disk log is untouched and the pack is
+                // still healthy (the read path likewise rejects an oversize record without failing
+                // the pack). Do not poison the pack for that caller/value error.
                 AppendError::WriteDataError(io_err) => {
-                    self.failed = Some(Self::copy_io_error(io_err))
+                    if io_err.kind() != io::ErrorKind::InvalidInput {
+                        self.failed = Some(Self::copy_io_error(io_err));
+                    }
                 }
                 // These errors do not indicate a failed DB.
                 AppendError::SerializeValue(_)
@@ -608,6 +614,19 @@ where
             compression_buffer
         }
     };
+
+    // Reject a record whose framed size exceeds the read cap. Every read path refuses a record
+    // larger than `MAX_RECORD_SIZE`, so writing one would produce a record that can never be read
+    // back (and a payload past `u32::MAX` would silently truncate the size prefix below). Fail fast
+    // before any byte is written, so the on-disk log is untouched -- this is a caller/value error,
+    // not a failed-DB state, which is why `append` classifies this `InvalidInput` kind as
+    // non-poisoning.
+    if buffer.len() > MAX_RECORD_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("record framed size {} exceeds the maximum {MAX_RECORD_SIZE}", buffer.len()),
+        ));
+    }
 
     let mut crc32_hasher = crc32fast::Hasher::new();
     // Once we have written to write_buffer, it needs to be rolled back before returning an
@@ -889,6 +908,42 @@ mod tests {
             .append(&TestRec { idx: 3, name: "Value Three".to_string() })
             .expect_err("a read-only pack rejects appends");
         assert_eq!(ro_err.to_string(), "read only");
+    }
+
+    /// F1: a record whose framed size exceeds `MAX_RECORD_SIZE` is rejected on write (it could
+    /// never be read back — the read paths cap at the same size), and because the guard fires
+    /// before any byte is written the pack is NOT poisoned: a later append still succeeds and reads
+    /// back, with no partial bytes from the rejected record.
+    #[test]
+    fn append_rejects_oversized_record_without_poisoning() {
+        let tmp_path = TempDir::with_prefix("test_pack_oversize").expect("temp dir");
+        let path = tmp_path.path().join("pack_oversize");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
+
+        // With no compression the framed size is the encoded size, so a name past the cap pushes
+        // the record over `MAX_RECORD_SIZE`.
+        let oversized = TestRec { idx: 1, name: "x".repeat(MAX_RECORD_SIZE as usize + 1) };
+        let err = db.append(&oversized).expect_err("an oversized record must be rejected on write");
+        assert!(
+            matches!(&err, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::InvalidInput),
+            "expected an InvalidInput rejection, got: {err:?}"
+        );
+
+        // Not poisoned: a normal append and commit still succeed (mirrors the read path rejecting
+        // an oversize record without failing the pack).
+        db.append(&TestRec { idx: 2, name: "ok".to_string() }).expect("pack must not be poisoned");
+        db.commit().expect("commit must succeed");
+
+        // Only the good record was written; the rejected one left no partial bytes behind.
+        drop(db);
+        let db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("reopen pack");
+        let recs: Vec<TestRec> =
+            db.raw_iter().expect("raw iter").map(|r| r.expect("decode")).collect();
+        assert_eq!(recs.len(), 1, "only the non-oversized record should be present");
+        assert_eq!(recs[0].idx, 2);
+        assert_eq!(recs[0].name, "ok");
     }
 
     fn archive_pack_(compression: PackCompression) {
