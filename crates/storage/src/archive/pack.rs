@@ -86,6 +86,21 @@ where
         self.inner.record_size(pos)
     }
 
+    /// True iff the record-length-prefix region at `pos` has been written — any of the up-to-4
+    /// prefix bytes within the logical data `[pos, min(pos + 4, len()))` is non-zero.
+    ///
+    /// A real record's length prefix is non-zero, whereas freshly-grown mmap capacity padding reads
+    /// as zeros; a partially-written or torn prefix still has a non-zero leading byte. So this
+    /// distinguishes "a record (even a torn one) was written here" — which a caller must not
+    /// silently overwrite — from unwritten zero padding or an empty tail. Bounded by the logical
+    /// end, so a cleanly-sealed file with nothing at `pos` (`pos >= len()`) returns false, and a
+    /// crash-grown, zero-padded file with no record written past `pos` also returns false.
+    pub(crate) fn record_present_at(&self, pos: u64) -> bool {
+        let avail = self.inner.data_file.len().saturating_sub(pos).min(4) as usize;
+        avail != 0
+            && self.inner.data_file.slice(pos, avail).is_some_and(|b| b.iter().any(|&x| x != 0))
+    }
+
     /// Return a refernce to the pack files header.
     pub fn header(&self) -> &DataHeader {
         &self.inner.header

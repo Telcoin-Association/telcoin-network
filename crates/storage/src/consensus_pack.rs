@@ -967,7 +967,7 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = create_dir_synced(&base_dir);
+        create_dir_synced(&base_dir)?;
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
@@ -986,11 +986,16 @@ impl Inner {
         // then byte-for-byte a freshly created one, so it needs the same index initialization.
         let mut wrote_fresh_meta = false;
 
-        // Discriminate a missing meta by length, not by fetch error kind: fetch reports a read
-        // at EOF as an io error, the same class as a torn or corrupt record, so record bytes
-        // past the header mean the first record must load as a matching meta.
+        // Detect a present meta by the first record's 4-byte length prefix, NOT by the file length.
+        // A crash between the header write and the first meta append leaves an unclean file grown
+        // to its mmap capacity and zero-padded: `file_len()` (physical) would then exceed
+        // the header even though no meta was ever written, and a plain length check
+        // mistakes that padding for a torn meta and fatally rejects a pack that only needs
+        // its meta initialized. A real record's length prefix is non-zero and
+        // `record_present_at` reads it within the logical bounds, so a cleanly-sealed
+        // header-only file (end == header) reports "no meta" too.
         let pack_len = data.file_len();
-        if pack_len > DATA_HEADER_BYTES as u64 {
+        if data.record_present_at(DATA_HEADER_BYTES as u64) {
             match data.fetch(DATA_HEADER_BYTES as u64) {
                 Ok(record) => {
                     let meta = record.into_epoch()?;
@@ -1022,10 +1027,15 @@ impl Inner {
                 }
             }
         } else {
-            // Header-only file: brand new, or a crash landed between the header write and the
-            // meta append.  Either way appending the meta initializes the pack. Commit immediately
+            // Header-only file: brand new, or a crash landed between the header write and the meta
+            // append.  A crash can leave the file grown to its mmap capacity and zero-padded past
+            // the header, so roll the logical end back to exactly the header first -- the meta must
+            // be the first record at DATA_HEADER_BYTES, never after the padding. Commit immediately
             // so the header+meta prefix is durable before we return: a valid pack always has a
             // durable meta, which is what lets the torn-meta path above fail instead of repair.
+            if pack_len > DATA_HEADER_BYTES as u64 {
+                data.truncate(DATA_HEADER_BYTES as u64)?;
+            }
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
             data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
@@ -1060,6 +1070,17 @@ impl Inner {
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let pack_file = base_dir.join(Self::DATA_NAME);
+
+        // This door opens an epoch that must already exist; it must not create anything. A
+        // read-write `Pack::open` would create the data file if it were missing (leaving a stray
+        // empty file and a misleading "meta unreadable" error), so fail up front with a
+        // NotFound-classified error that `PackError::is_missing_static_files` recognizes as a clean
+        // miss.
+        if !std::fs::exists(&pack_file).unwrap_or(false) {
+            return Err(PackError::Open(Arc::new(DataFileOpen(LoadHeaderError::IO(
+                io::Error::new(io::ErrorKind::NotFound, pack_file.display().to_string()),
+            )))));
+        }
 
         let mut data = Pack::<PackRecord>::open(
             &pack_file,
@@ -1163,7 +1184,7 @@ impl Inner {
         timeout: Duration,
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = create_dir_synced(&base_dir);
+        create_dir_synced(&base_dir)?;
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
@@ -4422,6 +4443,68 @@ pub(crate) mod test {
         let scan = report.index_scan.expect("scanned");
         assert!(scan.consensus.dirty >= 1, "a zeroed bucket must report dirty: {scan:?}");
         assert_eq!(report.verdict, Verdict::Invalid);
+    }
+
+    /// A crash between the data-header write and the first epoch-meta append leaves the file grown
+    /// to its mmap capacity and zero-padded, with no clean-close sentinel and no meta record.
+    /// `open_append` must treat that as header-only and (re)initialize the meta — dropping the
+    /// padding so the meta lands at `DATA_HEADER_BYTES` — rather than mistaking the zero padding
+    /// for a torn meta and failing fatally (which would strand a fresh node on first boot).
+    #[tokio::test]
+    async fn test_open_append_reinitializes_meta_after_crash_before_meta_write() {
+        let temp_dir = TempDir::with_prefix("test_cp_crash_before_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Seed a valid epoch-0 data header by cleanly creating (and closing) a real pack.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("seed pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Reconstruct the exact on-disk state a crash-before-meta leaves: the 32-byte header
+        // followed by zero padding (the grown mmap capacity), with no clean-close sentinel and no
+        // meta record. Keeping only the header discards the meta the seed pack wrote.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut padded =
+            std::fs::read(&data_path).expect("read seed data")[..DATA_HEADER_BYTES].to_vec();
+        padded.resize(DATA_HEADER_BYTES + 4096, 0);
+        std::fs::write(&data_path, &padded).expect("write padded header-only file");
+
+        // Must not fail: the padding is not a torn meta. The meta is reinitialized and the pack is
+        // usable again.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open_append must reinitialize the meta, not reject the padding");
+            let output = make_test_output(
+                &committee,
+                0,
+                chain.clone(),
+                1,
+                ConsensusHeader::default().digest(),
+            );
+            pack.save_consensus_output(output).await.expect("save output after reinit");
+            pack.persist().await.expect("persist");
+        }
+
+        // The reinitialized pack is consistent and serves the output through the read-only door.
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after reinit");
+        assert!(
+            pack.get_consensus_output(1).await.is_ok(),
+            "output must read back after the meta was reinitialized"
+        );
     }
 
     /// The heal above must stay narrow.  A first record whose size prefix has been corrupted to
