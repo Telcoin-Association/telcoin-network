@@ -22,11 +22,11 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tn_config::PeerConfig;
 use tn_types::BlsPublicKey;
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
 
 #[cfg(test)]
@@ -35,6 +35,12 @@ mod peer_manager;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum tracked sources in each inbound kad rate-window map.
+///
+/// Entries survive disconnects until their budgets expire. At capacity, untracked sources are
+/// denied until heartbeat expiry frees a slot, preserving live budgets under identity churn.
+const MAX_RATE_WINDOWS: usize = 1024;
 
 /// Maximum inbound kad `PutRecord` messages accepted from a single source per
 /// [`PUT_RECORD_RATE_WINDOW`] before records from the source are shed.
@@ -95,11 +101,32 @@ struct PutRecordWindow {
 pub(crate) enum PutRecordRate {
     /// Under the shed threshold: process the record.
     Allowed,
-    /// Over the shed threshold: drop the record without penalizing the source.
+    /// Per-source budget or tracking capacity exhausted: drop without penalizing the source.
     Shed,
     /// First crossing of the penalty threshold, or any message past the repeated-penalty
     /// ceiling: drop the record and penalize the source.
     Flooding,
+}
+
+/// Length of the sliding window over which inbound `AddProvider` messages from one
+/// provider are counted.
+const ADD_PROVIDER_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum inbound `AddProvider` messages honored per provider per
+/// [`ADD_PROVIDER_RATE_WINDOW`]. Each swarm advertises its single provider key at startup
+/// and republishes it every 12 hours by default, with no per-epoch re-announcement. Honest
+/// traffic peaks at one message per peer per minute. Five admissions leave headroom for
+/// startup colliding with a republish, reconnect churn, and timer jitter.
+const MAX_ADD_PROVIDERS_PER_WINDOW: usize = 5;
+
+/// An exact sliding window of one provider's admitted inbound `AddProvider` messages.
+///
+/// At most [`MAX_ADD_PROVIDERS_PER_WINDOW`] timestamps are retained, in arrival order.
+/// Each admission expires separately after [`ADD_PROVIDER_RATE_WINDOW`], preventing a
+/// fixed-window boundary from admitting a second burst while the first is still live.
+struct AddProviderWindow {
+    /// Admission times still charged to the provider's current sliding budget.
+    admitted: VecDeque<Instant>,
 }
 
 /// The type to manage peers.
@@ -186,10 +213,21 @@ pub(crate) struct PeerManager {
     /// Bounds the expensive BLS verify plus kad store write in `process_kad_put_request` to
     /// [`MAX_PUT_RECORDS_PER_WINDOW`] per [`PUT_RECORD_RATE_WINDOW`] per source, independent of
     /// ban state, so a valid but unbanned self-signed record flood cannot starve the network
-    /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Over-limit windows
-    /// survive disconnects until expiry, preventing reconnects from resetting the count.
-    /// Heartbeat maintenance removes expired windows even if the source never returns.
+    /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Entries survive
+    /// disconnects, expire on heartbeat, and never exceed [`MAX_RATE_WINDOWS`].
     put_record_windows: HashMap<PeerId, PutRecordWindow>,
+    /// Per-provider sliding windows bounding the inbound `AddProvider` write rate.
+    ///
+    /// `process_kad_add_provider` (consensus.rs) does a row read, BCS decode,
+    /// merge, re-encode, insert, and a physical MDBX commit per inbound message
+    /// on the network task, and repeating `AddProvider` for a key the peer
+    /// already provides skips the store's capacity gate, so one unbanned peer
+    /// could otherwise drive that work at line rate and starve the task that
+    /// also relays consensus gossip. The key is the authenticated provider id
+    /// (libp2p-kad proves `provider == source`). Entries survive disconnects,
+    /// expire on heartbeat, and never exceed [`MAX_RATE_WINDOWS`]. Companion to the
+    /// store-side eviction throttle in `KadStore::add_provider`. See issue #1001.
+    add_provider_windows: HashMap<PeerId, AddProviderWindow>,
     /// Prometheus metrics for peer lifecycle events.
     pub(super) metrics: PeerManagerMetrics,
 }
@@ -229,6 +267,7 @@ impl PeerManager {
             temporarily_banned,
             discovery_peers: Default::default(),
             put_record_windows: Default::default(),
+            add_provider_windows: Default::default(),
             metrics,
         }
     }
@@ -393,10 +432,6 @@ impl PeerManager {
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
-        let now = Instant::now();
-        self.put_record_windows
-            .retain(|_, window| now.duration_since(window.started) < PUT_RECORD_RATE_WINDOW);
-
         // update peers
         let actions = self.peers.heartbeat_maintenance();
         for (peer_id, action) in actions {
@@ -427,8 +462,27 @@ impl PeerManager {
         // update timestamps
         self.unban_temp_banned_peers();
 
+        // Release expired rate budgets independently of connection lifetime.
+        self.prune_rate_windows();
+
         // manage discovery peers
         self.discovery_heartbeat();
+    }
+
+    /// Remove fully lapsed inbound kad budgets so disconnected identities cannot accumulate.
+    ///
+    /// A sliding AddProvider window remains live until its newest admission expires. Pruning
+    /// only on heartbeat bounds cleanup work even when untracked sources flood a full map.
+    fn prune_rate_windows(&mut self) {
+        let now = Instant::now();
+        self.put_record_windows
+            .retain(|_, window| now.duration_since(window.started) < PUT_RECORD_RATE_WINDOW);
+        self.add_provider_windows.retain(|_, window| {
+            window
+                .admitted
+                .back()
+                .is_some_and(|admitted| now.duration_since(*admitted) < ADD_PROVIDER_RATE_WINDOW)
+        });
     }
 
     /// Temporarily ban `peer_id` in the bounded reconnection-timeout cache.
@@ -544,6 +598,38 @@ impl PeerManager {
         self.peers.connected_or_dialing_peers()
     }
 
+    /// Record an inbound `AddProvider` from `provider` and report whether it
+    /// exceeds the per-provider window budget.
+    ///
+    /// Returns `true` when the message is over budget or an untracked provider cannot fit
+    /// within [`MAX_RATE_WINDOWS`], so the caller should drop and penalize it. The local peer
+    /// id is exempt. Admissions expire individually after [`ADD_PROVIDER_RATE_WINDOW`],
+    /// and rejected messages neither extend the window nor allocate admission timestamps.
+    pub(crate) fn add_provider_rate_limited(&mut self, provider: PeerId) -> bool {
+        if self.is_local_peer(&provider) {
+            false
+        } else if self.add_provider_windows.len() >= MAX_RATE_WINDOWS
+            && !self.add_provider_windows.contains_key(&provider)
+        {
+            true
+        } else {
+            let now = Instant::now();
+            let window = self
+                .add_provider_windows
+                .entry(provider)
+                .or_insert_with(|| AddProviderWindow { admitted: VecDeque::new() });
+            window
+                .admitted
+                .retain(|admitted| now.duration_since(*admitted) < ADD_PROVIDER_RATE_WINDOW);
+            if window.admitted.len() >= MAX_ADD_PROVIDERS_PER_WINDOW {
+                true
+            } else {
+                window.admitted.push_back(now);
+                false
+            }
+        }
+    }
+
     /// Process a penalty from the application layer.
     ///
     /// The application layer reports issues from peers that are processed here.
@@ -657,18 +743,9 @@ impl PeerManager {
     /// Some peers are disconnected with the intention to ban that peer.
     /// This method registers the peer as disconnected and ensures the list of banned/disconnected
     /// peers doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned
-    /// peers is reached.
+    /// peers is reached. Inbound kad budgets survive disconnects until they expire, preventing
+    /// reconnection from restoring a peer's allowance.
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
-        // Preserve an active over-limit window across reconnects; heartbeat expires it.
-        let now = Instant::now();
-        let retain_window = self.put_record_windows.get(peer_id).is_some_and(|window| {
-            window.count > MAX_PUT_RECORDS_PER_WINDOW
-                && now.duration_since(window.started) < PUT_RECORD_RATE_WINDOW
-        });
-        if !retain_window {
-            self.put_record_windows.remove(peer_id);
-        }
-
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
         debug!(target: "peer-manager", ?action, ?pruned_peers, ?peer_id, "register disconnected");
@@ -975,11 +1052,17 @@ impl PeerManager {
     /// signature verify and store write; only a source past
     /// [`PUT_RECORD_PENALTY_THRESHOLD`] is flagged for a penalty, once per window below
     /// [`PUT_RECORD_DISCONNECT_THRESHOLD`] and on every message above that ceiling.
-    /// The local node's own id is never limited. Mirrors the inbound-stream rate limiter in
-    /// the stream behaviour. Shed and flood outcomes each bump the rate-limit metric.
+    /// Untracked sources are shed without a penalty when [`MAX_RATE_WINDOWS`] is full.
+    /// The local node's own id is never limited, and live budgets survive disconnects.
+    /// Shed and flood outcomes each bump the rate-limit metric.
     pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> PutRecordRate {
         if self.is_local_peer(&source) {
             PutRecordRate::Allowed
+        } else if self.put_record_windows.len() >= MAX_RATE_WINDOWS
+            && !self.put_record_windows.contains_key(&source)
+        {
+            self.metrics.record_put_record_rate_limited(&PutRecordRate::Shed);
+            PutRecordRate::Shed
         } else {
             let now = Instant::now();
             let window = self.put_record_windows.entry(source).or_insert(PutRecordWindow {

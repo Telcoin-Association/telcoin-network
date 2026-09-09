@@ -42,6 +42,7 @@ metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
