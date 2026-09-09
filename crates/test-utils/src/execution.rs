@@ -92,16 +92,8 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()));
     // create engine node
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
-    let builder = TnBuilder {
-        node_config,
-        tn_config,
-        metrics: None,
-        healthcheck,
-        enable_state_export: false,
-        enable_repack_monitor: false,
-        reth_db,
-        exex_fns: vec![],
-    };
+    let mut builder = TnBuilder::new(node_config, tn_config, reth_db);
+    builder.healthcheck = healthcheck;
 
     Ok((builder, ext))
 }
