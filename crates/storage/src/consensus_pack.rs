@@ -830,6 +830,26 @@ impl Inner {
         ))
     }
 
+    /// A [`PackError::CorruptPack`] for a *read-only* open (a sealed past epoch) whose derived
+    /// index is damaged at rest -- a corrupt header, a torn/misaligned tail, or a
+    /// geometry/uid/hasher mismatch. A read-only door cannot rebuild an index in place, so this
+    /// is terminal; but unlike a torn data log the `data` file is the authoritative source and
+    /// is likely intact, so the message steers the operator to `db validate` (to confirm the
+    /// data) rather than implying data loss, and warns off deleting the data / chain-data
+    /// directories. Distinct from [`Self::corrupt_pack`] so the terse `LoadHeaderError` (e.g.
+    /// "invalid index bucket geometry") never reaches the operator.
+    fn corrupt_static_index(base_dir: &Path, epoch: Epoch, cause: &PackError) -> PackError {
+        PackError::CorruptPack(format!(
+            "epoch {epoch} pack {}: a derived index is damaged and a read-only open cannot rebuild \
+             it ({cause}). The `data` log is the source of truth: run `telcoin-network db validate \
+             {}` to confirm it is intact -- if so the index is regenerated when the epoch is rebuilt \
+             (re-sync/restore it). Do NOT delete the `data` file or the chain-data directories \
+             (`db`, `static_files`, `consensus-db`)",
+            base_dir.display(),
+            base_dir.display(),
+        ))
+    }
+
     /// After recovery hits a damaged record *within acked data*, decide whether the rest of the log
     /// is a clean torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn
     /// tail yields only unreadable garbage until EOF; if any later record still decodes then valid
@@ -905,7 +925,7 @@ impl Inner {
         base_dir: &Path,
         data_header: &DataHeader,
     ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
-        match Self::try_open_indexes(base_dir, data_header) {
+        match Self::try_open_indexes(base_dir, data_header, false) {
             Ok(indexes) => Ok(indexes),
             Err(e) => {
                 warn!(
@@ -919,18 +939,38 @@ impl Inner {
         }
     }
 
-    /// Open all three indexes for append, creating any that are missing and returning an error if
-    /// an existing index will not open. The fallible counterpart to
-    /// [`Self::open_indexes_for_append`]'s discard-and-rebuild fallback; also used to reopen the
-    /// freshly emptied indexes after [`Self::reset_all_indexes`] wipes them.
+    /// Open all three indexes, creating any that are missing when writable and returning an error
+    /// if an existing index will not open. The fallible counterpart to
+    /// [`Self::open_indexes_for_append`]'s discard-and-rebuild fallback (also used to reopen the
+    /// freshly emptied indexes after [`Self::reset_all_indexes`] wipes them) and to
+    /// [`Self::open_indexes_static`]'s read-only door.
     fn try_open_indexes(
         base_dir: &Path,
         data_header: &DataHeader,
+        read_only: bool,
     ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
-        let consensus_pos_idx = Self::open_pdx_file(base_dir, data_header, false)?;
+        let consensus_pos_idx = Self::open_pdx_file(base_dir, data_header, read_only)?;
         let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(base_dir, data_header, false)?;
+            Self::open_digest_indexes(base_dir, data_header, read_only)?;
         Ok((consensus_pos_idx, consensus_digests, batch_digests))
+    }
+
+    /// Open all three of a *sealed* epoch's indexes read-only. A read-only door cannot rebuild an
+    /// index (see the `open_static` contract), so a damaged one is terminal -- but it is surfaced
+    /// with the actionable [`Self::corrupt_static_index`] remediation rather than a bare
+    /// `LoadHeaderError`. A genuinely *absent* index file keeps its `NotFound` classification (a
+    /// clean miss) so [`PackError::is_missing_static_files`] still holds for the staging-window
+    /// race.
+    fn open_indexes_static(
+        base_dir: &Path,
+        epoch: Epoch,
+        data_header: &DataHeader,
+    ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
+        match Self::try_open_indexes(base_dir, data_header, true) {
+            Ok(indexes) => Ok(indexes),
+            Err(e) if e.is_missing_static_files() => Err(e),
+            Err(e) => Err(Self::corrupt_static_index(base_dir, epoch, &e)),
+        }
     }
 
     /// Discard all three of an epoch's index directories and recreate them empty.
@@ -950,7 +990,7 @@ impl Inner {
                 Err(e) => return Err(e.into()),
             }
         }
-        Self::try_open_indexes(base_dir, data_header)
+        Self::try_open_indexes(base_dir, data_header, false)
     }
 
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
@@ -1170,9 +1210,11 @@ impl Inner {
                 ),
             ));
         }
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
-        let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), true)?;
+        // Read-only: a damaged index is terminal (this door cannot rebuild it), but surface the
+        // actionable remediation instead of a bare LoadHeaderError; a missing index stays a clean
+        // miss.
+        let (mut consensus_pos_idx, consensus_digests, batch_digests) =
+            Self::open_indexes_static(&base_dir, epoch, data.header())?;
 
         if !Self::files_consistent(
             &data,
@@ -3929,6 +3971,58 @@ pub(crate) mod test {
         }
 
         assert_pack_reads_back(&temp_dir, 4).await;
+    }
+
+    /// A read-only `open_static` of a sealed epoch whose position index is damaged at rest must
+    /// surface the actionable `corrupt_static_index` remediation (a real error, not a clean miss) —
+    /// the read-only door cannot rebuild the index, but the operator must not see the bare
+    /// `LoadHeaderError`.
+    #[tokio::test]
+    async fn test_open_static_corrupt_index_reports_actionable_error() {
+        let temp_dir = TempDir::with_prefix("test_static_corrupt_index").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 5).await;
+
+        // Corrupt the sealed epoch's position index; the data log is intact.
+        break_index_file(&temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx"));
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("a damaged index must fail a read-only open");
+        assert!(
+            matches!(err, super::PackError::CorruptPack(_)),
+            "a damaged read-only index must surface the CorruptPack remediation, got {err:?}"
+        );
+        assert!(
+            !err.is_missing_static_files(),
+            "a damaged (present) index is a real error, not a clean miss: {err:?}"
+        );
+    }
+
+    /// Removing a sealed epoch's index directory entirely keeps the clean-miss classification
+    /// (`is_missing_static_files`), so the import-staging-window race still resolves to "absent" —
+    /// only a *damaged* (present-but-unreadable) index becomes the hard `CorruptPack` error above.
+    #[tokio::test]
+    async fn test_open_static_missing_index_is_a_clean_miss() {
+        let temp_dir = TempDir::with_prefix("test_static_missing_index").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Remove the position index directory entirely (a genuinely absent index file).
+        std::fs::remove_dir_all(temp_dir.path().join("epoch-0").join("idx"))
+            .expect("remove idx dir");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("a missing index must still fail the read-only open");
+        assert!(
+            err.is_missing_static_files(),
+            "an absent index file must classify as a clean miss, got {err:?}"
+        );
     }
 
     /// A torn *next* output header (a partial record appended after several complete outputs) is
