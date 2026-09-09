@@ -225,5 +225,6 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 15. **Trailing-CRC "dirty" (zero) sentinel in `crc.rs`.** A zeroed trailing CRC is a deliberate
     "written but not yet CRC'd" marker (`crc_state` distinguishes Dirty from Corrupt), not a missing
     checksum.
-16. **Mysten-derived / `#![allow(missing_docs)]` and `eyre`-everywhere error style.** Pre-existing
-    conventions for this crate; not the target of this documentation pass.
+16. **`eyre`-everywhere error style (`StoreResult<T> = eyre::Result<T>`).** Returning `eyre` errors
+    (rather than a bespoke error enum per module) is an intentional, pre-existing convention for this
+    crate; not a "define a proper error type" finding.

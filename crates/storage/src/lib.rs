@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
-#![allow(missing_docs)]
-
 mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -17,6 +15,7 @@ use tables::{
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
 pub mod certificate_pack;
+/// The `CompositeDatabase` backend that splits the workload into epoch/kad/cache sub-databases.
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
@@ -26,7 +25,9 @@ mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
+/// `LayeredDatabase`: a write-through in-memory layer plus a shared write-txn guard over a backend.
 pub mod layered_db;
+/// The reth MDBX key/value backend (the default `Database` backend).
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;

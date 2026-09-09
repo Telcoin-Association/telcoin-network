@@ -13,6 +13,7 @@ use tn_types::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
 
 use super::wraps::{KeyWrap, ValWrap};
 
+/// A read-only transaction over a [`ReDB`] database, wrapping a redb [`ReadTransaction`].
 #[derive(Debug)]
 pub struct ReDbTx {
     tx: ReadTransaction,
@@ -25,6 +26,7 @@ impl DbTx for ReDbTx {
     }
 }
 
+/// A read-write transaction over a [`ReDB`] database, wrapping a redb [`WriteTransaction`].
 pub struct ReDbTxMut {
     tx: WriteTransaction,
 }

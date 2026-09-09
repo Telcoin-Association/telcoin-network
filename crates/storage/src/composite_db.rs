@@ -17,8 +17,11 @@ struct Inner<DB: Database> {
 /// Per-layer [`LayeredDbStats`] for each database in a [`CompositeDatabase`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompositeDbStats {
+    /// Stats for the epoch sub-database (persisted, layered).
     pub epoch: LayeredDbStats,
+    /// Stats for the kad sub-database (persisted, layered).
     pub kad: LayeredDbStats,
+    /// Stats for the cache sub-database (non-persisted, layered).
     pub cache: LayeredDbStats,
 }
 
@@ -29,6 +32,9 @@ pub struct CompositeDatabase<DB: Database> {
 }
 
 impl<DB: Database> CompositeDatabase<DB> {
+    /// Open a composite DB over three backends, wrapping each in a [`LayeredDatabase`].
+    ///
+    /// The epoch and kad DBs are opened as persisting layers; the cache DB is not persisted.
     pub fn open(epoch_db: DB, kad_db: DB, cache_db: DB) -> Self {
         let epoch_db = LayeredDatabase::open(epoch_db, true);
         let kad_db = LayeredDatabase::open(kad_db, true);

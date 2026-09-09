@@ -20,6 +20,7 @@ fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Valu
     Ok(None)
 }
 
+/// Read-only transaction over a [`MemDatabase`]; holds a clone of the shared table store.
 #[derive(Clone, Debug)]
 pub struct MemDbTx {
     store: StoreType,
@@ -31,6 +32,8 @@ impl DbTx for MemDbTx {
     }
 }
 
+/// Read-write transaction over a [`MemDatabase`]; writes apply directly to the shared store
+/// (no rollback, so `commit` is a no-op).
 #[derive(Clone, Debug)]
 pub struct MemDbTxMut {
     store: StoreType,

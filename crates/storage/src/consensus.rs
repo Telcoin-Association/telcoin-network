@@ -1395,19 +1395,34 @@ impl ConsensusChainWriter for ConsensusChain {
     }
 }
 
+/// Errors returned by [`ConsensusChain`] operations (open, save, stream import, epoch handoff).
 #[derive(Debug)]
 pub enum ConsensusChainError {
+    /// An underlying pack file operation failed; wraps the [`PackError`].
     PackError(PackError),
+    /// No current (writable) epoch is set on the chain.
     NoCurrentEpoch,
+    /// An I/O error occurred; wraps the [`std::io::Error`].
     IO(std::io::Error),
+    /// The current epoch does not contain the latest consensus header.
     EpochMismatch,
+    /// The current committee epoch and the previous epoch record are out of sync.
     PrevCommitteeEpochMismatch,
+    /// A CRC check failed while reading a record.
     CrcError,
+    /// An epoch record database operation failed; wraps the [`EpochDbError`].
     EpochDbError(EpochDbError),
+    /// The imported pack file contained no consensus output.
     EmptyImport,
+    /// The final consensus output in the imported pack file was invalid.
     InvalidImport,
+    /// The chain lacks the complete data needed to stream a pack file to a peer.
     StreamUnavailable,
+    /// Tried to save an output whose epoch does not match the current pack epoch
+    /// (fields: `pack_epoch`, `epoch`).
     InvalidPackEpoch(Epoch, Epoch),
+    /// The pack file is static (sealed) and the requested consensus number is missing,
+    /// so the output cannot be saved (field: consensus `number`).
     CantSaveAndNotAvailable(u64),
     /// A consensus output arrived with a number at or below the latest saved consensus number
     /// (fields: `latest`, `number`). Consensus numbers must strictly increase, so this means the
