@@ -13,14 +13,14 @@ use serde_with::{serde_as, DeserializeAs, SerializeAs};
 use std::{
     borrow::Cow,
     fmt, iter,
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
 use tn_types::{encode, try_decode, BlockHash, Database, DefaultHashFunction};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -208,6 +208,15 @@ impl KadProviderRow {
     }
 }
 
+/// Minimum spacing between saturated-table provider eviction scans.
+///
+/// Provider records carry a 48h TTL, so once `num_providers` reaches
+/// `max_provided_keys` nothing expires and each new-key `add_provider` would
+/// otherwise trigger a full O(`max_provided_keys`) decode scan that frees
+/// nothing (GHSA-5475-xf29-3rv8). Throttling the scan to at most once per this
+/// interval bounds that cost without losing any eviction a 48h TTL could yield.
+const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
@@ -232,6 +241,10 @@ pub struct KadStore<DB> {
     num_records: usize,
     /// Number of provider rows with a readable ownership envelope belonging to this swarm.
     num_providers: usize,
+    /// Last time the saturated-table provider eviction scan ran, so a full table
+    /// cannot be turned into a full-table decode scan per inbound `AddProvider`.
+    /// `None` until the first scan. See [`PROVIDER_EVICT_INTERVAL`].
+    last_provider_evict: Option<Instant>,
     /// Index used for database retrieval with multiple KAD tables.
     kad_type: NetworkType,
 }
@@ -259,10 +272,16 @@ impl<DB: Database> KadStore<DB> {
             config,
             num_records: 0,
             num_providers: 0,
+            last_provider_evict: None,
             kad_type,
         };
         store.num_records = store.owned_records().count();
         store.num_providers = store.owned_provider_rows().count();
+        metrics::describe_counter!(
+            "tn_network.kad_provider_write_failures_total",
+            metrics::Unit::Count,
+            "Database insert failures while storing Kademlia provider records"
+        );
         store.update_records_gauge();
         store
     }
@@ -274,6 +293,15 @@ impl<DB: Database> KadStore<DB> {
             "network" => crate::metrics::network_label(&self.kad_type),
         )
         .set(self.num_records as f64);
+    }
+
+    /// Count a failed provider-table insert using the bounded network label.
+    fn record_provider_write_failure(&self) {
+        metrics::counter!(
+            "tn_network.kad_provider_write_failures_total",
+            "network" => crate::metrics::network_label(&self.kad_type),
+        )
+        .increment(1);
     }
 
     /// Namespace shared discovery tables by the same role and worker id as `RecordDomain`.
@@ -456,9 +484,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
         let key = self.key_to_hash(k);
         let record = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadRecords>(&key).ok()?,
-            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key).ok()?,
-        };
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record");
+        })
+        .ok()?;
         let raw = record?;
         try_decode::<KadRecord>(&raw)
             .ok()
@@ -477,7 +509,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Primary => self.db.get::<KadRecords>(&key),
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
-        .map_err(|_| Error::ValueTooLarge)?;
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
+            Error::ValueTooLarge
+        })?;
         // Startup excludes unreadable records, so repairing one is an insertion for capacity
         // accounting. Replacing a readable owned row keeps the existing count.
         let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
@@ -489,15 +524,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             }
         }
         match self.kad_type {
-            NetworkType::Primary => self
-                .db
-                .insert::<KadRecords>(&key, &encode(&kr))
-                .map_err(|_| Error::ValueTooLarge)?,
-            NetworkType::Worker(_) => self
-                .db
-                .insert::<KadWorkerRecords>(&key, &encode(&kr))
-                .map_err(|_| Error::ValueTooLarge)?,
+            NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encode(&kr)),
+            NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encode(&kr)),
         }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
+            Error::ValueTooLarge
+        })?;
         if new_record {
             self.num_records += 1;
             self.update_records_gauge();
@@ -558,8 +591,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
             NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
         }
-        .ok()
-        .flatten();
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before insert");
+            Error::ValueTooLarge
+        })?;
 
         // A readable ownership envelope is counted even when the provider payload is corrupt.
         // An unreadable envelope was excluded by startup accounting, so its replacement must
@@ -573,11 +608,20 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // its own self-provide) must succeed even when byzantine peers have
         // saturated the table with other keys (issue #1195).
         if !row_exists {
-            if self.num_providers >= self.config.max_provided_keys {
-                // Try to free a slot by evicting fully-expired provider key groups.
+            // Try to free a slot by evicting fully-expired provider key groups, but
+            // at most once per `PROVIDER_EVICT_INTERVAL`: with a 48h provider TTL a
+            // saturated table expires nothing, so scanning per message would be a
+            // full-table decode scan that frees nothing (GHSA-5475-xf29-3rv8). The
+            // timestamp is stamped before the scan so the throttle also covers a
+            // scan that does free rows.
+            if self.num_providers >= self.config.max_provided_keys
+                && self.last_provider_evict.is_none_or(|t| t.elapsed() >= PROVIDER_EVICT_INTERVAL)
+            {
+                self.last_provider_evict = Some(Instant::now());
                 self.evict_expired_providers();
             }
-            // Re-check after the eviction attempt; still full is a hard error.
+            // Re-check after the (possibly throttled) eviction attempt; still full is
+            // a hard error.
             (self.num_providers < self.config.max_provided_keys)
                 .then_some(())
                 .ok_or(Error::MaxProvidedKeys)?;
@@ -591,15 +635,14 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         let encoded = KadProviderRow::encode(record_key, &records);
 
         match self.kad_type {
-            NetworkType::Primary => self
-                .db
-                .insert::<KadProviderRecords>(&key, &encoded)
-                .map_err(|_| Error::ValueTooLarge)?,
-            NetworkType::Worker(_) => self
-                .db
-                .insert::<KadWorkerProviderRecords>(&key, &encoded)
-                .map_err(|_| Error::ValueTooLarge)?,
+            NetworkType::Primary => self.db.insert::<KadProviderRecords>(&key, &encoded),
+            NetworkType::Worker(_) => self.db.insert::<KadWorkerProviderRecords>(&key, &encoded),
         }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia provider records");
+            self.record_provider_write_failure();
+            Error::ValueTooLarge
+        })?;
         if !row_exists {
             // A brand-new key: bump the counter. An overwrite (including of a purged
             // corrupt row) leaves the count unchanged.
@@ -618,6 +661,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // Read-only path: an undecodable row is skipped (returns nothing) rather than
         // panicking. The startup scrub and the mutating paths do the actual purge.
         stored
+            .inspect_err(|error| {
+                error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records");
+            })
             .ok()
             .flatten()
             .and_then(|raw| self.decode_provider_row(&hash, &raw))
@@ -652,6 +698,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Primary => self.db.get::<KadProviderRecords>(&hash),
             NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&hash),
         }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before removal");
+        })
         .ok()
         .flatten();
 
@@ -682,7 +731,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                     NetworkType::Worker(_) => {
                         self.db.insert::<KadWorkerProviderRecords>(&hash, &encoded)
                     }
-                };
+                }
+                .inspect_err(|error| {
+                    error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to update Kademlia provider records after removal");
+                    self.record_provider_write_failure();
+                });
             }
         }
     }
@@ -1344,6 +1397,50 @@ mod test {
         let fresh_key = fresh_record_key();
         kad_store.add_provider(live_provider_under(&fresh_key)).expect("eviction must make room");
         assert_eq!(kad_store.num_providers, 1, "only the fresh row should remain");
+        assert_eq!(kad_store.providers(&fresh_key).len(), 1, "fresh provider retained");
+    }
+
+    /// A saturated provider table must not run the full-table eviction scan more
+    /// than once per `PROVIDER_EVICT_INTERVAL`. Provider records carry a 48h TTL,
+    /// so a full table expires nothing and an unthrottled scan would run on every
+    /// inbound `AddProvider` for a new key (GHSA-5475-xf29-3rv8). The throttle is
+    /// driven directly through `last_provider_evict`.
+    #[test]
+    fn test_kad_add_provider_throttles_eviction_scan() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        kad_store.config.max_provided_keys = 4;
+
+        // Saturate the table with already-expired provider groups.
+        (0..4).for_each(|_| {
+            kad_store
+                .add_provider(expired_provider_under(&fresh_record_key()))
+                .expect("add expired provider");
+        });
+        assert_eq!(kad_store.num_providers, 4);
+
+        // Simulate a scan that just ran: a brand-new key within the interval must
+        // NOT trigger a second scan, so the expired rows are not reclaimed and the
+        // insert is rejected.
+        kad_store.last_provider_evict = Some(Instant::now());
+        assert!(matches!(
+            kad_store.add_provider(live_provider_under(&fresh_record_key())),
+            Err(Error::MaxProvidedKeys)
+        ));
+        assert_eq!(
+            kad_store.num_providers, 4,
+            "a throttled scan must not reclaim the expired rows"
+        );
+
+        // Once the interval has elapsed the scan runs, reclaims the expired groups,
+        // and the new key is admitted.
+        kad_store.last_provider_evict =
+            Instant::now().checked_sub(PROVIDER_EVICT_INTERVAL + Duration::from_secs(1));
+        let fresh_key = fresh_record_key();
+        kad_store.add_provider(live_provider_under(&fresh_key)).expect("scan must make room");
+        assert_eq!(kad_store.num_providers, 1, "only the fresh row remains after the scan");
         assert_eq!(kad_store.providers(&fresh_key).len(), 1, "fresh provider retained");
     }
 

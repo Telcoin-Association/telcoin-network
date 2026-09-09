@@ -3070,7 +3070,7 @@ async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
 /// `process_kad_add_provider` (storing unconditionally, i.e. today's behaviour)
 /// makes the banned-provider assertion fail, pinning the gate.
 #[tokio::test]
-async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
+async fn test_add_provider_rejects_banned_provider() {
     use libp2p::kad;
 
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -3087,7 +3087,7 @@ async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
         addresses: vec![],
     };
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
-    network.process_kad_add_provider(Some(honest_record.clone()))?;
+    network.process_kad_add_provider(Some(honest_record.clone()));
     assert_eq!(
         network.swarm.behaviour_mut().kademlia.store_mut().providers(&honest_record.key).len(),
         1,
@@ -3111,7 +3111,7 @@ async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
         expires: None,
         addresses: vec![],
     };
-    network.process_kad_add_provider(Some(attacker_record.clone()))?;
+    network.process_kad_add_provider(Some(attacker_record.clone()));
     assert!(
         network
             .swarm
@@ -3122,8 +3122,61 @@ async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
             .is_empty(),
         "banned provider record is not stored (issue #1001)",
     );
+}
 
-    Ok(())
+/// The sixth provider announcement is dropped before storage and counted once.
+///
+/// Distinct keys make an accidental over-budget write observable even though
+/// repeated announcements for the same key would replace the existing provider.
+#[tokio::test]
+async fn test_add_provider_rate_limit_counts_drops_before_storage() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
+        let provider = PeerId::random();
+
+        (0_u8..5).for_each(|key| {
+            let record = kad::ProviderRecord {
+                key: kad::RecordKey::new(&[key]),
+                provider,
+                expires: None,
+                addresses: vec![],
+            };
+            network.process_kad_add_provider(Some(record.clone()));
+            assert_eq!(
+                network.swarm.behaviour_mut().kademlia.store_mut().providers(&record.key).len(),
+                1,
+            );
+        });
+
+        let rejected = kad::ProviderRecord {
+            key: kad::RecordKey::new(&b"over-budget"),
+            provider,
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(rejected.clone()));
+        assert!(network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .providers(&rejected.key)
+            .is_empty());
+    });
+
+    assert!(snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
+        key.key().name() == "tn_network.add_provider_rate_limited_total"
+            && key
+                .key()
+                .labels()
+                .any(|label| label.key() == "network" && label.value() == "primary")
+            && matches!(value, DebugValue::Counter(1))
+    }));
 }
 
 /// A signed record advertising an RPC endpoint with a well-formed URL but the

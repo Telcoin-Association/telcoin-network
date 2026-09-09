@@ -1552,6 +1552,74 @@
         "overrides": []
       },
       "options": {}
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "AddProvider Rate Limit Drops /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 102
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tn_network_add_provider_rate_limited_total{network=~\"$network\"}[5m])",
+          "refId": "A",
+          "legendFormat": "{{network}} dropped"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Inbound provider announcements dropped before storage because the source exhausted its five-message sliding 60s budget or the retained-window map is full."
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Kad Provider Write Failures /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 102
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tn_network_kad_provider_write_failures_total{network=~\"$network\"}[5m])",
+          "refId": "A",
+          "legendFormat": "{{network}} write failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Provider database insert failures, such as MDBX capacity or I/O errors. Expected provider-table capacity and input-size rejections are excluded. Original database causes are logged at error level."
     }
   ],
   "refresh": "30s",
