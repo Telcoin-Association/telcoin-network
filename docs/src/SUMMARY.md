@@ -7,6 +7,7 @@
   * [Transaction lifecycle](architecture/transaction-lifecycle.md)
   * [Consensus Layer](architecture/consensus-layer.md)
 * [Getting Started](getting-started/README.md)
+  * [Bootstrap Peers](getting-started/bootstrap-peers.md)
   * [Reading Blockchain Data](getting-started/reading-blockchain-data/README.md)
     * [cURL requests](getting-started/reading-blockchain-data/curl-requests.md)
     * [Programmatic Requests](getting-started/reading-blockchain-data/programmatic-requests/README.md)

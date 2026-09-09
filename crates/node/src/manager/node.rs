@@ -827,6 +827,8 @@ where
         // #765). Genesis is the single source of truth; this one value is read by the
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        self.bootstrap_servers = network_config
+            .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         self.spawn_node_networks(node_task_spawner, &network_config, epoch, on_chain_workers)
             .await?;
