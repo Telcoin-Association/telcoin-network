@@ -26,7 +26,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, T
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
-use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
+use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
@@ -40,7 +40,7 @@ use tn_types::{
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
 pub(crate) use tn_types::gas_accumulator::worker_id_from_header;
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 mod close_epoch;
@@ -873,6 +873,13 @@ where
             self.node_shutdown.clone(),
         );
 
+        seed_node_mode_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.node_mode(),
+            &self.key_config.primary_public_key(),
+        )
+        .await;
+
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed
         // only by the in-memory `epoch_record_watch`, so a record that a previous process
         // persisted at epoch close but never got a vote quorum for would otherwise stay
@@ -1431,11 +1438,93 @@ fn check_restore_consistency(
     Ok(())
 }
 
+/// Seed the mode watch once at startup, before metrics and the epoch loop read it.
+///
+/// A stored record closes an epoch, so its `next_committee` determines the initial role.
+/// Empty storage leaves the watch untouched, including its notification state. Membership is
+/// optimistic: only the epoch loop may demote a validator to `CvvInactive`. Keep this outside
+/// that loop so a later epoch does not overwrite a demotion.
+async fn seed_node_mode_on_startup(
+    db: &EpochRecordDb,
+    node_mode: &watch::Sender<NodeMode>,
+    public_key: &BlsPublicKey,
+) {
+    let record = db.latest_record().await;
+    node_mode.send_if_modified(|mode| {
+        record.is_some_and(|record| {
+            *mode = if record.next_committee.contains(public_key) {
+                NodeMode::CvvActive
+            } else {
+                NodeMode::Observer
+            };
+            true
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use tn_types::{BlsKeypair, ExecHeader, RpcInfo, TnReceiver as _, TnSender as _, B256};
+    use tempfile::TempDir;
+    use tn_types::{
+        BlsKeypair, EpochRecord, ExecHeader, RpcInfo, TnReceiver as _, TnSender as _, B256,
+    };
+
+    /// Startup follows the latest record's next committee for both retiring and joining keys.
+    #[tokio::test]
+    async fn startup_node_mode_uses_latest_next_committee() -> eyre::Result<()> {
+        let temp_dir = TempDir::with_prefix("startup_node_mode_rotation")?;
+        let db = EpochRecordDb::open(temp_dir.path())?;
+        let mut rng = StdRng::seed_from_u64(1350);
+        let retiring_key = *BlsKeypair::generate(&mut rng).public();
+        let joining_key = *BlsKeypair::generate(&mut rng).public();
+        let previous = EpochRecord {
+            committee: vec![retiring_key],
+            next_committee: vec![retiring_key],
+            ..Default::default()
+        };
+        let latest = EpochRecord {
+            epoch: 1,
+            committee: vec![retiring_key],
+            next_committee: vec![joining_key],
+            parent_hash: previous.digest(),
+            ..Default::default()
+        };
+        db.save_record(previous).await?;
+        db.save_record(latest).await?;
+        db.persist().await?;
+
+        let (retiring_mode, retiring_rx) = watch::channel(NodeMode::CvvActive);
+        seed_node_mode_on_startup(&db, &retiring_mode, &retiring_key).await;
+        assert!(matches!(*retiring_rx.borrow(), NodeMode::Observer));
+        assert!(retiring_rx.has_changed()?);
+
+        let (joining_mode, joining_rx) = watch::channel(NodeMode::Observer);
+        seed_node_mode_on_startup(&db, &joining_mode, &joining_key).await;
+        assert!(matches!(*joining_rx.borrow(), NodeMode::CvvActive));
+        assert!(joining_rx.has_changed()?);
+        Ok(())
+    }
+
+    /// Cold genesis preserves both the default and an explicitly configured observer watch.
+    #[tokio::test]
+    async fn startup_node_mode_preserves_empty_store() -> eyre::Result<()> {
+        let temp_dir = TempDir::with_prefix("startup_node_mode_empty")?;
+        let db = EpochRecordDb::open(temp_dir.path())?;
+        let public_key = worker_key_config().primary_public_key();
+
+        let (default_mode, default_rx) = watch::channel(NodeMode::default());
+        seed_node_mode_on_startup(&db, &default_mode, &public_key).await;
+        assert!(matches!(*default_rx.borrow(), NodeMode::CvvActive));
+        assert!(!default_rx.has_changed()?);
+
+        let (observer_mode, observer_rx) = watch::channel(NodeMode::Observer);
+        seed_node_mode_on_startup(&db, &observer_mode, &public_key).await;
+        assert!(matches!(*observer_rx.borrow(), NodeMode::Observer));
+        assert!(!observer_rx.has_changed()?);
+        Ok(())
+    }
 
     /// Reproducible keys for checking the identity assigned to each prepared swarm.
     fn worker_key_config() -> KeyConfig {
