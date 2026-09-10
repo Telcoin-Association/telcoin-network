@@ -86,6 +86,19 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// consensus database (`KadStore::add_provider`, issue #1185).
 pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
 
+/// How an inbound, already-verified node record compares with the copy in the local store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordFreshness {
+    /// Strictly newer timestamp, or no stored copy: store it.
+    Newer,
+    /// Same timestamp and same bytes: a republish, re-store it to refresh its expiry.
+    Identical,
+    /// Older timestamp, or the same timestamp with different bytes: keep the stored copy.
+    Older,
+    /// One of the two copies does not decode: keep the stored copy.
+    Undecodable,
+}
+
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
 ///
@@ -614,8 +627,13 @@ where
 
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
+    /// The DHT key of this node's own record: the raw bytes of its primary BLS public key.
+    fn own_record_key(&self) -> kad::RecordKey {
+        kad::RecordKey::new(&self.key_config.primary_public_key())
+    }
+
     fn get_peer_record(&self) -> kad::Record {
-        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        let key = self.own_record_key();
         // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
         // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
         // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
@@ -687,6 +705,29 @@ where
         }
     }
 
+    /// Re-sign this node's own [NodeRecord] with a fresh timestamp and republish it.
+    ///
+    /// libp2p's `PutRecordJob` re-puts the bytes held in the local store every
+    /// `kad_publication_interval`. The record is signed once at construction, so without
+    /// this refresh every republish carries the same timestamp as the copy peers already
+    /// hold; a receiver's freshness check then ignores it and the remote copy lapses after
+    /// `kad_record_ttl` unless a new connection pushes the record again. Rebuilding the
+    /// record ahead of each publication keeps every republish strictly newer;
+    /// `provide_our_data` replaces the local copy (still `expires: None`) and starts the
+    /// publication query.
+    fn refresh_own_record(&mut self) {
+        let refreshed = self
+            .node_record
+            .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
+        self.node_record = refreshed;
+        debug!(
+            target: "network-kad",
+            timestamp = self.node_record.info().timestamp,
+            "refreshed own node record"
+        );
+        self.provide_our_data();
+    }
+
     /// Push our [NodeRecord] directly to a newly-connected peer.
     ///
     /// Used on first-time connections so the remote peer can resolve our BLS key
@@ -720,8 +761,18 @@ where
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
 
+        // Re-sign the own record on the publication cadence so republished bytes are strictly
+        // newer than what peers hold. The immediate first tick is skipped: the boot-time
+        // `provide_our_data` above already published the freshly built record. Floored at one
+        // second so a misconfigured zero interval cannot spin the loop.
+        let refresh_period = self.config.kad_publication_interval.max(Duration::from_secs(1));
+        let mut own_record_refresh =
+            tokio::time::interval_at(tokio::time::Instant::now() + refresh_period, refresh_period);
+        own_record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = own_record_refresh.tick() => self.refresh_own_record(),
                 event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
                     error!(target: "network", ?e, "network event error");
                     if let NetworkError::AllListenersClosed = e {
@@ -2048,28 +2099,45 @@ where
         } else if let Some((key, value)) = self.peer_record_valid(&record) {
             // verify record signature and ensure publisher matches record's network key
 
+            // Never overwrite this node's own record from an inbound put. The local copy is
+            // stored with `expires: None` so libp2p keeps republishing it; a replicated copy
+            // returning from a peer carries a finite `expires` that would make the own record
+            // lapse from the read path after `kad_record_ttl`. Only this node can sign a newer
+            // version of it, so there is nothing to learn from the push. Log only; no penalty.
+            if record.key == self.own_record_key() {
+                trace!(target: "network-kad", ?source, "ignoring inbound put for our own record");
+                return Ok(());
+            }
+
             // store latest node records
-            if self.is_newer_record(&record) {
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .put(record)
-                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
-                trace!(target: "network-kad", "Got record {key} {value:?}");
-                // a peer pushing its own record over its own connection (source == the record's
-                // network identity) also confirms its identity so a live non-committee connection
-                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
-                // committee-gated (issue #827).
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_self_advertised_peer(source, key, value.info);
-            } else {
-                // A peer republishing a slightly stale (but signature-valid) record is
-                // expected after restarts and benign — the local store keeps the newer
-                // version. Log only; no penalty.
-                trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+            match self.record_freshness(&record) {
+                RecordFreshness::Newer | RecordFreshness::Identical => {
+                    // An identical re-put is a refresh: the inbound record carries a fresh
+                    // `expires` (libp2p computes it from `kad_record_ttl` on receipt), so
+                    // re-writing the row extends the stored copy's lifetime instead of letting
+                    // it lapse between the publisher's republishes.
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .put(record)
+                        .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
+                    trace!(target: "network-kad", "Got record {key} {value:?}");
+                    // a peer pushing its own record over its own connection (source == the
+                    // record's network identity) also confirms its identity so a live
+                    // non-committee connection (e.g. an nvv in the gossip mesh) is retained;
+                    // relayed and non-self records stay committee-gated (issue #827).
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .add_self_advertised_peer(source, key, value.info);
+                }
+                RecordFreshness::Older | RecordFreshness::Undecodable => {
+                    // A peer republishing a slightly stale (but signature-valid) record is
+                    // expected after restarts and benign — the local store keeps the newer
+                    // version. Log only; no penalty.
+                    trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+                }
             }
         } else {
             warn!(target: "network-kad", "Received invalid peer record!");
@@ -2139,25 +2207,31 @@ where
     /// Check the local kad store to compare record timestamps.
     ///
     /// This method compares timestamps for verified records to ensure the latest record
-    /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
-    /// It is the caller's responsibility to ensure records are verified and valid.
-    fn is_newer_record(&mut self, record: &kad::Record) -> bool {
+    /// is stored (prevents replay attacks). A record whose key is absent from the local
+    /// store (or whose stored copy has expired) is `Newer`. It is the caller's
+    /// responsibility to ensure records are verified and valid.
+    fn record_freshness(&mut self, record: &kad::Record) -> RecordFreshness {
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
 
-        if let Some(existing) = store.get(&record.key) {
-            match (
-                NodeRecord::try_decode_compat(&existing.value),
-                NodeRecord::try_decode_compat(&record.value),
-            ) {
-                (Some(existing_record), Some(new_record)) => {
-                    // return true if the new record is newer
-                    existing_record.info.timestamp < new_record.info.timestamp
+        let Some(existing) = store.get(&record.key) else {
+            return RecordFreshness::Newer;
+        };
+        match (
+            NodeRecord::try_decode_compat(&existing.value),
+            NodeRecord::try_decode_compat(&record.value),
+        ) {
+            (Some(existing_record), Some(new_record)) => {
+                if existing_record.info.timestamp < new_record.info.timestamp {
+                    RecordFreshness::Newer
+                } else if existing_record.info.timestamp == new_record.info.timestamp
+                    && existing.value == record.value
+                {
+                    RecordFreshness::Identical
+                } else {
+                    RecordFreshness::Older
                 }
-                _ => false,
             }
-        } else {
-            // return true if record is not in local store
-            true
+            _ => RecordFreshness::Undecodable,
         }
     }
 

@@ -963,6 +963,22 @@ impl NodeRecord {
         Self { info, signature }
     }
 
+    /// Re-sign this record's [NetworkInfo] with a fresh `timestamp` for `domain`.
+    ///
+    /// Every other field is carried over unchanged. Used for the node's own record so
+    /// that each republish carries a strictly newer timestamp than the copy peers
+    /// already hold: receivers keep the newest timestamp per key and treat an older
+    /// one as stale.
+    pub fn refresh<F>(&self, domain: RecordDomain, signer: F) -> NodeRecord
+    where
+        F: FnOnce(&[u8]) -> BlsSignature,
+    {
+        let info = NetworkInfo { timestamp: now(), ..self.info.clone() };
+        let data = Self::signing_bytes(domain, &info);
+        let signature = signer(&data);
+        Self { info, signature }
+    }
+
     /// Verify the record's signature against `domain` and `pubkey`.
     ///
     /// Fails if the record was signed for a different `(chain, role)` network,

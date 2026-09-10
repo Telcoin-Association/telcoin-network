@@ -2814,6 +2814,224 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Sentry roadmap PR 3: the own record is re-signed with a strictly newer timestamp, the
+/// re-signed bytes replace the local store's copy, and that copy keeps `expires: None`.
+#[tokio::test]
+async fn test_refresh_own_record_advances_timestamp() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let chain_id = peer1.config.network_config().libp2p_config().chain_id;
+    let domain = RecordDomain::new(chain_id, NetworkType::Primary);
+    let pubkey = peer1.config.key_config().primary_public_key();
+
+    // publish the boot-time record, then age it so the refresh is observable without sleeping
+    network.provide_our_data();
+    let stale_timestamp = network.node_record.info().timestamp - 10_000;
+    network.node_record.info.timestamp = stale_timestamp;
+    let key = network.get_peer_record().key;
+
+    network.refresh_own_record();
+
+    let refreshed = network.node_record.clone();
+    assert!(
+        refreshed.info().timestamp > stale_timestamp,
+        "refresh must advance the record timestamp"
+    );
+    assert_eq!(refreshed.info().multiaddrs, network.node_record.info().multiaddrs);
+    assert!(
+        refreshed.clone().verify(domain, &pubkey).is_some(),
+        "refreshed record must be signed for this node's domain"
+    );
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&key)
+        .expect("own record in local kad store");
+    assert_eq!(stored.value, encode(&refreshed), "store holds the refreshed bytes");
+    assert!(stored.expires.is_none(), "own record keeps expires: None across a refresh");
+    Ok(())
+}
+
+/// Sentry roadmap PR 3: a republished own record reaches a connected peer with a strictly
+/// newer timestamp than the copy the first-connect push delivered.
+#[tokio::test]
+async fn test_republished_own_record_is_newer_at_peer() -> eyre::Result<()> {
+    let mut network_config = NetworkConfig::default();
+    network_config.libp2p_config_mut().kad_publication_interval = Duration::from_secs(1);
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(network_config);
+
+    let NetworkPeer {
+        config: config_1, network_handle: peer1_handle, network: peer1_network, ..
+    } = peer1;
+    let NetworkPeer {
+        config: config_2, network_handle: peer2_handle, network: peer2_network, ..
+    } = peer2;
+
+    let peer1_bls = config_1.key_config().primary_public_key();
+    let peer2_bls = config_2.key_config().primary_public_key();
+    let peer2_net = config_2.primary_networkkey();
+    let peer2_addr = config_2.primary_address();
+
+    let peer1_task = tokio::spawn(async move { peer1_network.run().await });
+    let peer2_task = tokio::spawn(async move { peer2_network.run().await });
+
+    peer1_handle.start_listening(config_1.primary_address()).await?;
+    peer2_handle.start_listening(peer2_addr.clone()).await?;
+
+    peer1_handle.add_trusted_peer_and_dial(peer2_bls, peer2_net, peer2_addr).await?;
+    wait_for_peer_discovery(&peer1_handle, peer2_bls, Duration::from_secs(5)).await?;
+
+    let stored_timestamp = |handle: &NetworkHandle<TestWorkerRequest, TestWorkerResponse>| {
+        let handle = handle.clone();
+        async move {
+            let record = handle.kad_store_get(peer1_bls).await?;
+            Ok::<_, eyre::Report>(record.and_then(|r| {
+                NodeRecord::try_decode_compat(&r.value).map(|record| record.info().timestamp)
+            }))
+        }
+    };
+
+    // the first-connect push lands peer1's record on peer2
+    wait_until(Duration::from_secs(5), "peer2 receives peer1's kad record", || async {
+        Ok(stored_timestamp(&peer2_handle).await?.is_some())
+    })
+    .await?;
+    let first = stored_timestamp(&peer2_handle).await?.expect("peer2 holds peer1's record");
+
+    // the refresh runs on the publication cadence; peer2 must end up with a newer copy
+    wait_until(Duration::from_secs(10), "peer2 receives a refreshed copy", || async {
+        Ok(stored_timestamp(&peer2_handle).await?.is_some_and(|ts| ts > first))
+    })
+    .await?;
+
+    peer1_task.abort();
+    peer2_task.abort();
+    let _ = peer1_task.await;
+    let _ = peer2_task.await;
+    drop(_task_manager);
+    Ok(())
+}
+
+/// Sentry roadmap PR 3: a byte-identical re-put of a stored record refreshes the stored
+/// copy's expiry instead of being dropped as stale.
+#[tokio::test]
+async fn test_identical_republish_refreshes_expiry() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let mut record = peer2.network.get_peer_record();
+
+    // first arrival: libp2p stamps a short expiry on the inbound record
+    record.expires = Some(std::time::Instant::now() + Duration::from_secs(5));
+    network.process_kad_put_request(source, record.clone())?;
+    let first = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .expect("peer2 record stored")
+        .expires
+        .expect("stored copy of a peer record carries an expiry");
+
+    // identical bytes arrive again (republish or replication) with a later expiry
+    record.expires = Some(std::time::Instant::now() + Duration::from_secs(60 * 60));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .expect("peer2 record still stored");
+    let second = stored.expires.expect("stored copy still carries an expiry");
+    assert_eq!(stored.value, record.value, "identical bytes are kept");
+    assert!(
+        second > first + Duration::from_secs(30 * 60),
+        "identical re-put must extend the stored expiry"
+    );
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&source),
+        "a republish carries no penalty"
+    );
+    Ok(())
+}
+
+/// Sentry roadmap PR 3: an older, signature-valid copy of a stored record is still ignored
+/// and carries no penalty.
+#[tokio::test]
+async fn test_older_kad_record_not_stored() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let newer = peer2.network.get_peer_record();
+    network.process_kad_put_request(source, newer.clone())?;
+
+    // a valid peer2 record with an older timestamp, signed over the domain-scoped payload
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+    let mut older_info = peer2.network.node_record.info.clone();
+    older_info.timestamp = now() - 10_000;
+    let signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &older_info));
+    let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
+    peer2.network.node_record = NodeRecord { info: older_info, signature };
+    let older = peer2.network.get_peer_record();
+    assert_ne!(older.value, newer.value);
+
+    network.process_kad_put_request(source, older)?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&newer.key)
+        .expect("peer2 record still stored");
+    assert_eq!(stored.value, newer.value, "the newer copy is kept");
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&source),
+        "a stale republish carries no penalty"
+    );
+    Ok(())
+}
+
+/// Sentry roadmap PR 3: a replicated copy of this node's own record coming back from a
+/// peer (finite `expires`) never overwrites the local copy, which must keep `expires: None`
+/// so libp2p keeps republishing it (see `test_local_record_has_no_expiry`).
+#[tokio::test]
+async fn test_inbound_put_never_overwrites_own_record() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    network.provide_our_data();
+    let own = network.get_peer_record();
+
+    let mut replicated = own.clone();
+    replicated.expires = Some(std::time::Instant::now() + Duration::from_secs(60));
+    let source = *peer2.network.swarm.local_peer_id();
+    network.process_kad_put_request(source, replicated)?;
+
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&own.key)
+        .expect("own record still stored");
+    assert_eq!(stored.value, own.value);
+    assert!(stored.expires.is_none(), "own record keeps expires: None after a replicated copy");
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&source),
+        "replicating our record carries no penalty"
+    );
+    Ok(())
+}
+
 /// A validator that advertises an [`RpcInfo`] on its worker [`NodeRecord`] is
 /// discoverable from a new node that joins the network and runs
 /// `find_authorities`. The new node's `get_all_validator_rpcs` exposes exactly
