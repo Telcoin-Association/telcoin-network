@@ -54,7 +54,7 @@ fn transaction(
         U256::ZERO,
         input,
     );
-    recover_raw_transaction(&signed.encoded_2718())
+    recover_pooled_transaction(&signed.encoded_2718())
 }
 
 /// A parsed byte limit reaches the validator, including the exact encoded-size boundary.
@@ -171,12 +171,12 @@ async fn lifetime_expires_parked_transactions_only() -> eyre::Result<()> {
     info.pending_basefee = 50;
     pool.0.set_block_info(info);
     let pending = transaction(&mut factory, 21_000, 100, Bytes::new())?;
-    let pending_hash = pool.0.add_transaction(TransactionOrigin::External, pending).await?;
+    let pending_hash = pool.0.add_transaction(TransactionOrigin::External, pending).await?.hash;
     factory.set_nonce(2);
     let queued = transaction(&mut factory, 21_000, 100, Bytes::new())?;
-    let queued_hash = pool.0.add_transaction(TransactionOrigin::External, queued).await?;
+    let queued_hash = pool.0.add_transaction(TransactionOrigin::External, queued).await?.hash;
     let basefee = transaction(&mut underpriced, 21_000, 7, Bytes::new())?;
-    let basefee_hash = pool.0.add_transaction(TransactionOrigin::External, basefee).await?;
+    let basefee_hash = pool.0.add_transaction(TransactionOrigin::External, basefee).await?.hash;
     assert_eq!(pool.pool_size().pending, 1);
     assert_eq!(pool.pool_size().queued, 1);
     assert_eq!(pool.pool_size().basefee, 1);
@@ -218,7 +218,7 @@ async fn lifetime_honors_local_exemptions() -> eyre::Result<()> {
         };
         let (_env, pool) = configured_pool(&[factory.address()], &directory, &tasks, args)?;
         let tx = transaction(&mut factory, 21_000, 100, Bytes::new())?;
-        let hash = pool.0.add_transaction(origin, tx).await?;
+        let hash = pool.0.add_transaction(origin, tx).await?.hash;
         assert_eq!(pool.pool_size().queued, 1);
         let pooled = pool.get(&hash).ok_or_else(|| eyre::eyre!("queued transaction missing"))?;
         pool.evict_stale_transactions(pooled.timestamp + Duration::from_secs(60));
