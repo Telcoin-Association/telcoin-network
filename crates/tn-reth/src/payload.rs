@@ -124,9 +124,13 @@ impl TNPayload {
         }
     }
 
-    /// PrevRandao is used by TN to provide a source for randomness on-chain.
+    /// The block's `PREVRANDAO` ([EIP-4399]), stored as the executed block's `mix_hash`.
     ///
-    /// This is used as the executed block's "mix_hash".
+    /// Derived by [`ConsensusOutput::prev_randao`]. Contract-visible, and grinding-resistant
+    /// from the PREVRANDAO fork epoch onward, but NOT unbiasable: the committing leader can
+    /// compute the value before broadcasting and withhold the commit. Contracts needing
+    /// unbiasable randomness must not use this value alone.
+    ///
     /// [EIP-4399]: https://eips.ethereum.org/EIPS/eip-4399
     pub(crate) fn prev_randao(&self) -> B256 {
         self.mix_hash

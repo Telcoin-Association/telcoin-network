@@ -2,7 +2,7 @@
 
 use crate::{build_batch, BatchBuilderOutput};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -37,7 +37,7 @@ const TEST_PEER_BATCH_TTL: Duration = Duration::from_secs(3600);
 pub(crate) struct TestPool {
     transactions: Vec<Arc<PoolTxn>>,
     by_id: BTreeMap<PoolTxnId, Arc<PoolTxn>>,
-    /// Per-sender balances returned by [`TxPool::get_account_balance`]. A sender that is absent
+    /// Per-sender balances returned by [`TxPool::get_account_balances`]. A sender that is absent
     /// here reports [`U256::MAX`], preserving the behavior of tests that do not exercise balance.
     balances: BTreeMap<Address, U256>,
     /// Transactions seen inside a validated peer batch, deferred by the builder (issue #1329).
@@ -69,8 +69,11 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
         self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
     }
-    fn get_account_balance(&self, address: Address) -> U256 {
-        self.balances.get(&address).copied().unwrap_or(U256::MAX)
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        addresses
+            .iter()
+            .map(|address| (*address, self.balances.get(address).copied().unwrap_or(U256::MAX)))
+            .collect()
     }
     fn record_peer_batch(&self, hashes: &[TxHash]) {
         self.peer_batch_txs.record(hashes)
@@ -81,7 +84,7 @@ impl TxPool for TestPool {
 }
 
 impl TestPool {
-    /// Override the balance [`TxPool::get_account_balance`] reports for `address`.
+    /// Override the balance [`TxPool::get_account_balances`] reports for `address`.
     #[cfg(test)]
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {
         self.balances.insert(address, balance);
