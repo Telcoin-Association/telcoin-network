@@ -991,6 +991,21 @@ where
         result
     }
 
+    /// Gracefully close storage handles that would otherwise block a tokio worker on `Drop`.
+    ///
+    /// `ConsensusChain::close().await` shuts the pack/epoch/latest background threads down via the
+    /// async path (oneshot) instead of the blocking `handle.join()` in their `Drop` impls. Call
+    /// this after [`Self::run`] returns — by then `wait_for_task_shutdown()` has dropped the
+    /// task-held clones, so this holds the last reference and the close actually runs (see
+    /// `Arc::try_unwrap` in `ConsensusChain::close`). If a straggler clone outlives this,
+    /// `close()` is a harmless no-op and that clone's own `Drop` performs the join — no worse
+    /// than not calling this.
+    pub(crate) async fn shutdown(self) {
+        self.consensus_chain.close().await;
+        // Remaining fields (consensus_db, reth_db, network handles, …) drop here; none use the
+        // thread-backed-pack blocking-join pattern, so their `Drop` does not stall the worker.
+    }
+
     /// Spawn the process-lifetime primary and worker [`ConsensusNetwork`] swarms.
     ///
     /// Each swarm runs as a critical task until node shutdown. The resulting network handles are

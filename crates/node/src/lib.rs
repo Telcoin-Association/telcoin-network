@@ -61,6 +61,11 @@ where
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
         }
+        // Async-close consensus storage so its background-thread joins don't block this tokio
+        // worker on `Drop` (the runtime is still alive here, inside `block_on`). `run()`
+        // has already persisted and awaited task shutdown, so `epoch_manager` now holds the
+        // last reference.
+        epoch_manager.shutdown().await;
         result
     })
 }
