@@ -5,7 +5,7 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
-    kad::KadStore,
+    kad::{node_record_key, KadStore},
     metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
@@ -615,7 +615,7 @@ where
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
-        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        let key = node_record_key(&self.key_config.primary_public_key());
         // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
         // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
         // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
