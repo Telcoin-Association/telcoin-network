@@ -121,6 +121,7 @@ enum PackMessage {
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
     Shutdown,
+    AsyncShutdown(oneshot::Sender<()>),
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
     FlushData(oneshot::Sender<Result<(), PackError>>),
@@ -144,6 +145,9 @@ pub struct ConsensusPack {
 
 fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
     // When this returns None then the channel is consumed and closed, so exit the thread.
+    // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
+    // below.
+    let mut async_confirm: Option<oneshot::Sender<()>> = None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             PackMessage::ConsensusOutput(output, tx) => {
@@ -188,8 +192,11 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
             PackMessage::LatestConsensusHeader(tx) => {
                 let _ = tx.send(inner.latest_consensus_header());
             }
-            PackMessage::Shutdown => {
-                let _ = inner.persist();
+            PackMessage::Shutdown => break,
+            PackMessage::AsyncShutdown(tx) => {
+                // Confirm AFTER the clean-close below (not here) so `close().await` returns only
+                // once the pack is fully sealed: data committed, indexes synced, sentinels written.
+                async_confirm = Some(tx);
                 break;
             }
             PackMessage::FlushData(tx) => {
@@ -199,6 +206,13 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
                 let _ = tx.send(inner.data.file_len());
             }
         }
+    }
+    // Clean-close: dropping `inner` commits the data, ordered-syncs the indexes, and writes the
+    // clean-close sentinels. Do it before confirming an async shutdown; it also runs for the sync
+    // `Shutdown` and channel-closed paths (the sync `Drop`'s `join()` waits on this return).
+    drop(inner);
+    if let Some(tx) = async_confirm {
+        let _ = tx.send(());
     }
 }
 
@@ -718,6 +732,24 @@ impl ConsensusPack {
             r
         } else {
             Err(PackError::SendFailed)
+        }
+    }
+
+    /// Take ownership and close async so we Drop does not get a chance to block any threads.
+    /// Note, will only close if this is the last reference to this pack.
+    /// Essentially this an async drop.
+    pub async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed...
+                // This check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(PackMessage::AsyncShutdown(tx)).await.is_ok() {
+                // Lets do an async wait for confirmition vs a sync join() on the thread.
+                let _ = rx.await;
+            }
         }
     }
 }
@@ -4300,6 +4332,41 @@ pub(crate) mod test {
             );
         }
         assert!(pack.get_consensus_output(5).await.is_err(), "no phantom 5th output");
+    }
+
+    /// `ConsensusPack::close` is an async drop: it must fully SEAL the pack (commit the data, sync
+    /// the indexes, write the clean-close sentinels) before returning — not merely persist the
+    /// data. Proof: `open_static` requires a consistent, cleanly-sealed pack (it never
+    /// rebuilds), so its success right after `close().await` means the seal completed.
+    #[tokio::test]
+    async fn test_pack_close_seals_cleanly() {
+        let temp_dir = TempDir::with_prefix("test_cp_close_seals").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..4u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            pack.save_consensus_output(output).await.expect("save");
+        }
+        // Async-close (sole reference) instead of dropping.
+        pack.close().await;
+
+        // Cleanly sealed: open_static succeeds (no rebuild) and every output reads back.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after close");
+        for i in 1..=4u64 {
+            assert!(
+                pack.get_consensus_output(i).await.is_ok(),
+                "output {i} reads back after close"
+            );
+        }
     }
 
     /// A read-only `open_static` of a sealed epoch whose position index is damaged at rest must

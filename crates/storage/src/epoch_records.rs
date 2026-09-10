@@ -90,6 +90,9 @@ enum EpochDbMessage {
     /// Flush all pending writes to disk.
     Persist(oneshot::Sender<Result<(), EpochDbError>>),
     Shutdown,
+    /// Async shutdown: clean-close the DB, then confirm on the channel (an async drop, so callers
+    /// avoid the blocking thread join in `Drop`).
+    AsyncShutdown(oneshot::Sender<()>),
 }
 
 /// Handle to the epoch records database.
@@ -119,6 +122,9 @@ fn run_db_loop(
     mut rx: Receiver<EpochDbMessage>,
     tx_error: watch::Sender<Option<EpochDbError>>,
 ) {
+    // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
+    // below.
+    let mut async_confirm: Option<oneshot::Sender<()>> = None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             // The four save arms latch first-error-wins: two queued saves can fail with no
@@ -212,11 +218,21 @@ fn run_db_loop(
                 let flushed = inner.persist();
                 let _ = tx.send(pending.map_or(flushed, Err));
             }
-            EpochDbMessage::Shutdown => {
-                let _ = inner.persist();
+            EpochDbMessage::Shutdown => break,
+            EpochDbMessage::AsyncShutdown(tx) => {
+                // Confirm AFTER the clean-close below so `close().await` returns only once the DB
+                // is fully sealed.
+                async_confirm = Some(tx);
                 break;
             }
         }
+    }
+    // Clean-close: dropping `inner` commits/seals the epochs + certs packs. Do it before confirming
+    // an async shutdown; it also runs for the sync `Shutdown` and channel-closed paths (the sync
+    // `Drop`'s `join()` waits on this return).
+    drop(inner);
+    if let Some(tx) = async_confirm {
+        let _ = tx.send(());
     }
 }
 
@@ -832,6 +848,23 @@ impl EpochRecordDb {
             Some(e) => e.clone(),
             None => EpochDbError::ReceiveFailed,
         })?
+    }
+
+    /// Take ownership and clean-close the DB asynchronously, so `Drop` does not block a thread on a
+    /// `join()`. Only closes if this is the last reference; awaits confirmation that the background
+    /// thread sealed the packs. Essentially an async drop (mirrors [`ConsensusPack::close`]).
+    pub async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed; this check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(EpochDbMessage::AsyncShutdown(tx)).await.is_ok() {
+                // Async wait for the clean-close confirmation instead of a sync `join()`.
+                let _ = rx.await;
+            }
+        }
     }
 
     /// Retrieve the committee keys for `epoch` if available.
@@ -2196,6 +2229,34 @@ mod test {
         let mut f = OpenOptions::new().read(true).open(&records_path).expect("open records file");
         let healed_len = f.seek(SeekFrom::End(0)).expect("seek");
         assert_eq!(extended_len, healed_len, "garbage bytes should be removed on reopen");
+    }
+
+    /// `EpochRecordDb::close` is an async drop: it must seal the epochs + certs packs before
+    /// returning, so a reopen finds every record without needing a rebuild.
+    #[tokio::test]
+    async fn test_epoch_record_db_close_seals() {
+        let temp_dir = TempDir::with_prefix("test_epoch_db_close").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        let mut records = Vec::new();
+        for epoch in 0..5u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert).await.expect("save");
+            records.push(record);
+        }
+        // Async-close (sole reference) instead of dropping.
+        db.close().await;
+
+        // Reopen and confirm every record survived the close.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
+        for record in &records {
+            let back = db.record_by_epoch(record.epoch).await.expect("record by epoch after close");
+            assert_eq!(back.digest(), record.digest());
+        }
     }
 
     /// Generate a deterministic test BLS public key from a seed.

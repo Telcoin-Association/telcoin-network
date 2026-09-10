@@ -87,6 +87,9 @@ enum LatestConsensusCommand {
     Persist(oneshot::Sender<()>),
     /// Persist then shutdown the background thread.
     Shutdown,
+    /// Persist then shutdown the background thread.
+    /// Notify async when done (avoid blocking any tokio tasks waiting on join()).
+    AsyncShutdown(oneshot::Sender<()>),
 }
 
 impl LatestConsensus {
@@ -192,6 +195,12 @@ impl LatestConsensus {
                         sync_all_with_log(&slot2);
                         break;
                     }
+                    LatestConsensusCommand::AsyncShutdown(tx) => {
+                        sync_all_with_log(&slot1);
+                        sync_all_with_log(&slot2);
+                        let _ = tx.send(());
+                        break;
+                    }
                 }
             }
         });
@@ -279,6 +288,24 @@ impl LatestConsensus {
     /// Return the current number.
     fn number(&self) -> u64 {
         self.state.lock().number
+    }
+
+    /// Take ownership and close async so we Drop does not get a chance to block any threads.
+    /// Note, will only close if this is the last reference to this object.
+    /// Essentially this an async drop.
+    async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed...
+                // This check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(LatestConsensusCommand::AsyncShutdown(tx)).await.is_ok() {
+                // Lets do an async wait for confirmition vs a sync join() on the thread.
+                let _ = rx.await;
+            }
+        }
     }
 
     /// Return the current slot value (for testing).
@@ -1100,6 +1127,35 @@ impl ConsensusChain {
         Ok(())
     }
 
+    /// Async-close every background thread this chain owns — the current epoch pack, the cached
+    /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
+    /// instead of letting each object's `Drop` run a blocking thread `join()` on the caller's
+    /// thread (which would stall the async runtime).
+    ///
+    /// Reliable only when this is the LAST `ConsensusChain` reference: each `Arc::try_unwrap`
+    /// succeeds only then, so any object still shared by another clone is left for its own `Drop`
+    /// to close. Intended for graceful shutdown, after all task-held clones have been dropped.
+    pub async fn close(self) {
+        let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
+        if let Ok(pack) = Arc::try_unwrap(current_pack) {
+            pack.into_inner().close().await;
+        }
+        if let Ok(packs) = Arc::try_unwrap(recent_packs) {
+            for pack in packs.into_inner() {
+                pack.close().await;
+            }
+        }
+        if let Ok(staged) = Arc::try_unwrap(staging) {
+            if let Some(staged) = staged.into_inner() {
+                staged.pack.close().await;
+            }
+        }
+        latest_consensus.close().await;
+        if let Ok(epochs) = Arc::try_unwrap(epochs) {
+            epochs.close().await;
+        }
+    }
+
     /// The logical data length (`end`) of the current epoch's pack: the number of real record
     /// bytes, excluding the mmap capacity padding past `end`. The state export copies the pack's
     /// `data` file and must bound its read to this length so it captures exactly the written
@@ -1712,6 +1768,45 @@ mod test {
             consensus_chain.get_consensus_output_current(4).await.is_err(),
             "wrong-epoch output must not be persisted to the epoch-0 pack"
         );
+    }
+
+    /// `ConsensusChain::close` async-closes every background thread it owns (packs,
+    /// latest-consensus slot writer, epoch DB) without a blocking `Drop` join, and seals them:
+    /// a reopen from the same path finds every saved output.
+    #[tokio::test]
+    async fn test_consensus_chain_close_seals() {
+        let temp_dir = TempDir::with_prefix("test_chain_close").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain_spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain_spec.clone(), i + 1, parent);
+            parent = output.digest().into();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        // Async-close the whole chain (sole reference) instead of dropping.
+        consensus_chain.close().await;
+
+        // Reopen from the same path and confirm the outputs survived the close.
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        for i in 1..=3u64 {
+            assert!(
+                reopened.get_consensus_output_current(i).await.is_ok(),
+                "output {i} reads back after chain close"
+            );
+        }
+        reopened.close().await;
     }
 
     /// A non-increasing consensus number is a hard error, never a silent `Ok(0)` skip.
