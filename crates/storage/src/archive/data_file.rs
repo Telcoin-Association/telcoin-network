@@ -533,6 +533,36 @@ impl MmapDataFile {
         Ok(())
     }
 
+    /// Roll the logical end back to `new_len`, zeroing the abandoned region `[new_len, end)` in the
+    /// mapping, WITHOUT physically truncating or re-`mmap`ping the file.
+    ///
+    /// Unlike [`Self::set_len`] this keeps the current capacity (no `ftruncate`, no remap), so it
+    /// opens no read-only-mmap SIGBUS window and is cheap. The abandoned bytes become ordinary
+    /// capacity padding: every read/slice/iterator is bounded to `end`, a clean close truncates the
+    /// padding away, and recovery bounds it out via the index-attested length. Zeroing keeps the
+    /// "capacity padding reads as zeros" invariant intact in memory (the zeros sit past `end`, so
+    /// they are not force-flushed — recovery correctness does not depend on them).
+    ///
+    /// Used to atomically undo a partial append (see the consensus pack's save rollback). `new_len`
+    /// must be `<= end`; a value at or beyond `end` is ignored (use [`Self::ensure_len`] to grow).
+    /// No-op on a read-only handle.
+    pub fn rewind_to(&mut self, new_len: u64) {
+        if self.read_only || new_len >= self.end {
+            return;
+        }
+        if let Backing::Rw(map) = &mut self.backing {
+            map[new_len as usize..self.end as usize].fill(0);
+        }
+        self.end = new_len;
+        // The tail is gone; clamp the append watermark so a later write is flushed, and pull a
+        // past-end read cursor back (mirrors `set_len`).
+        let fe = self.flushed_end.load(Ordering::Relaxed).min(new_len);
+        self.flushed_end.store(fe, Ordering::Relaxed);
+        if self.seek_pos > new_len {
+            self.seek_pos = new_len;
+        }
+    }
+
     /// Clone the underlying file handle, flushing `[0, end)` first so the cloned handle's read
     /// syscalls observe the current mmap writes. Returns the clone together with the logical `end`
     /// at the moment of the call.
@@ -1136,6 +1166,41 @@ mod tests {
         df.read_exact(&mut buf).expect("read");
         assert_eq!(&buf[..first.len()], &first[..]);
         assert_eq!(&buf[first.len()..], &second[..]);
+    }
+
+    #[test]
+    fn rewind_to_rolls_back_logical_end_without_physical_truncate() {
+        let tmp = TempDir::with_prefix("mmap_df_rewind").expect("temp dir");
+        let path = tmp.path().join("data");
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&pattern(200)).expect("write");
+        assert_eq!(df.len(), 200);
+        let phys_before = std::fs::metadata(&path).expect("meta").len();
+
+        // Roll the logical end back to 80 — no physical truncate (capacity/padding unchanged).
+        df.rewind_to(80);
+        assert_eq!(df.len(), 80, "logical end moved back");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            phys_before,
+            "rewind_to must not physically truncate the file"
+        );
+        assert!(df.slice(80, 10).is_none(), "reads are bounded to the rewound end");
+
+        // A subsequent (shorter) append lands exactly at the rewound end.
+        df.seek(SeekFrom::End(0)).expect("seek end");
+        df.write_all(&pattern(20)).expect("append after rewind");
+        assert_eq!(df.len(), 100);
+        drop(df); // clean close truncates the padding and seals
+
+        // Reopen: exactly [first 80 kept bytes][20 appended bytes]; no stale tail from [80, 200).
+        let mut df = MmapDataFile::open(&path, false).expect("reopen");
+        assert!(!df.opened_unclean());
+        assert_eq!(df.len(), 100);
+        let mut buf = vec![0u8; 100];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..80], &pattern(80)[..], "kept prefix survives");
+        assert_eq!(&buf[80..], &pattern(20)[..], "append landed at the rewound end");
     }
 
     #[test]

@@ -248,6 +248,19 @@ impl<T: PosIndexValue> PositionIndex<T> {
         let pos = PDX_HEADER_SIZE as u64;
         self.pdx_file.set_len(pos)
     }
+
+    /// Roll the index's logical end back to exactly `len` whole entries, dropping any beyond it, by
+    /// moving the pdx's logical write pointer ([`MmapDataFile::rewind_to`]) — NOT a physical
+    /// truncate/remap, so it opens no read-only-mmap SIGBUS window (matching the data log's save
+    /// rollback). The abandoned entries become capacity padding that a clean close truncates away
+    /// and a crash rebuild (from the WAL) discards. A no-op when `len >= self.len()`.
+    pub fn rewind_to_len(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+        let pos = PDX_HEADER_SIZE as u64 + (len as u64 * T::buffer_len() as u64);
+        self.pdx_file.rewind_to(pos);
+    }
 }
 
 impl<T: PosIndexValue> Index<u64, T> for PositionIndex<T> {

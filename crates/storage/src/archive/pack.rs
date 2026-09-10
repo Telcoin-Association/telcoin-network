@@ -182,6 +182,13 @@ where
         self.inner.truncate(new_len)
     }
 
+    /// Roll the log's logical end back to `new_len`, zeroing the abandoned region, WITHOUT a
+    /// physical truncate/remap (see [`MmapDataFile::rewind_to`]). Used to atomically undo a partial
+    /// append without opening a read-only-mmap SIGBUS window; a later append lands at `new_len`.
+    pub fn rewind_to(&mut self, new_len: u64) {
+        self.inner.data_file.rewind_to(new_len);
+    }
+
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.

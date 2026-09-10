@@ -740,6 +740,11 @@ struct Inner {
     consensus_digests: HdxIndex,
     batch_digests: HdxIndex,
     epoch_meta: EpochMeta,
+    /// Test-only: when set, the next `save_consensus_output` appends and indexes the output fully,
+    /// then returns an error before `Ok`, so the atomic-rollback path can be exercised at its
+    /// worst case (data appended, indexes advanced).
+    #[cfg(test)]
+    fail_save_after_append: bool,
 }
 
 impl Inner {
@@ -1249,7 +1254,15 @@ impl Inner {
             consensus_digests,
             batch_digests,
         )?;
-        Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
+        Ok(Self {
+            data,
+            consensus_digests,
+            consensus_pos_idx,
+            batch_digests,
+            epoch_meta,
+            #[cfg(test)]
+            fail_save_after_append: false,
+        })
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
@@ -1316,7 +1329,15 @@ impl Inner {
             consensus_digests,
             batch_digests,
         )?;
-        Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
+        Ok(Self {
+            data,
+            consensus_digests,
+            consensus_pos_idx,
+            batch_digests,
+            epoch_meta,
+            #[cfg(test)]
+            fail_save_after_append: false,
+        })
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
@@ -1383,7 +1404,15 @@ impl Inner {
             "a sealed pack's physical length must equal the index-attested length"
         );
         data.set_read_bound(attested);
-        Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
+        Ok(Self {
+            data,
+            consensus_digests,
+            consensus_pos_idx,
+            batch_digests,
+            epoch_meta,
+            #[cfg(test)]
+            fail_save_after_append: false,
+        })
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -1431,8 +1460,15 @@ impl Inner {
         } else {
             HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
         };
-        let mut pack =
-            Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
+        let mut pack = Self {
+            data,
+            consensus_pos_idx,
+            consensus_digests,
+            batch_digests,
+            epoch_meta,
+            #[cfg(test)]
+            fail_save_after_append: false,
+        };
         loop {
             // The header's parent link is verified INSIDE the decoder via
             // `HeaderExpectation::Parent` — early (before batches) on the v1 header-first path — so
@@ -1506,6 +1542,10 @@ impl Inner {
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
     /// Returns the number of bytes the encoded ConsensusOutput takes in the pack file.
+    ///
+    /// Atomic: the append + index updates either all land, or the data log is rolled back to
+    /// exactly its pre-save state, so a failed save never leaves an orphan record for an
+    /// in-process retry to duplicate (a duplicate a later WAL rebuild would mis-sequence).
     fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
@@ -1534,6 +1574,26 @@ impl Inner {
                 consensus_number,
             ));
         }
+        // Snapshot the exact pre-append state so any mid-save error rolls back to it atomically.
+        let data_start = self.data.file_len();
+        let pos_idx_start = self.consensus_pos_idx.len();
+        match self.append_output_records(consensus, consensus_idx) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                self.rollback_output(data_start, pos_idx_start);
+                Err(e)
+            }
+        }
+    }
+
+    /// Append one output's records (header + batches) and index them. Split from
+    /// [`Self::save_consensus_output`] so a mid-way error can be rolled back atomically by
+    /// [`Self::rollback_output`]. v1 (header-first) writes the header, then its batches.
+    fn append_output_records(
+        &mut self,
+        consensus: &ConsensusOutput,
+        consensus_idx: u64,
+    ) -> Result<u64, PackError> {
         let first_batch_pos =
             if self.version() == 0 { self.save_consensus_batches(consensus)? } else { None };
         // Now save the consensus header.
@@ -1556,7 +1616,34 @@ impl Inner {
         self.consensus_digests.set_data_file_length(len);
         self.batch_digests.set_data_file_length(len);
 
+        // Test-only: exercise the rollback at its worst case (everything appended and indexed).
+        #[cfg(test)]
+        if self.fail_save_after_append {
+            self.fail_save_after_append = false;
+            return Err(PackError::IndexAppend("injected mid-save failure".to_string()));
+        }
+
         Ok(len.saturating_sub(batch_pos))
+    }
+
+    /// Roll the data log and the index state that `files_consistent` trusts back to the snapshot
+    /// captured before a failed [`Self::append_output_records`], making the save atomic.
+    ///
+    /// The data log's logical end is moved back with [`Pack::rewind_to`] (zeroing the abandoned
+    /// region, no physical truncate/remap → no read-only-mmap SIGBUS window), so a retry or the
+    /// next output appends exactly at `data_start`. The position index is rolled back to
+    /// `pos_idx_start` (normally a no-op — index saves are atomic and there is no fallible step
+    /// after the pos-index save today), and the digest length markers are re-pointed at
+    /// `data_start` so `files_consistent` still holds. Digest bucket entries / bloom bits added
+    /// by the failed save are intentionally left: reads mask a position past the rewound end
+    /// via the `pos < data.file_len()` guards and re-verify the digest, a deterministic retry
+    /// overwrites them, and recovery rebuilds every index from the WAL (the crate's "indexes
+    /// are derived" model).
+    fn rollback_output(&mut self, data_start: u64, pos_idx_start: usize) {
+        self.data.rewind_to(data_start);
+        self.consensus_pos_idx.rewind_to_len(pos_idx_start);
+        self.consensus_digests.set_data_file_length(data_start);
+        self.batch_digests.set_data_file_length(data_start);
     }
 
     /// True if consensus header by digest is found by digest.
@@ -4146,6 +4233,73 @@ pub(crate) mod test {
         }
 
         assert_pack_reads_back(&temp_dir, 4).await;
+    }
+
+    /// C1: a mid-save failure rolls the data log and position index back to exactly the pre-save
+    /// state (no orphan records), so a retry re-saves the output cleanly with no duplicate and
+    /// every output still reads back by number and digest.
+    #[tokio::test]
+    async fn test_save_consensus_output_rolls_back_on_failure() {
+        let temp_dir = TempDir::with_prefix("test_cp_save_rollback").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Build 3 outputs directly on the Inner so we can drive the test-only failure injector.
+        let mut inner =
+            Inner::open_append(temp_dir.path(), &previous_epoch, committee.clone(), PACK_VERSION)
+                .expect("open append");
+        let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            inner.save_consensus_output(&output).expect("save");
+            outputs.push(output);
+        }
+        assert_eq!(inner.consensus_pos_idx.len(), 3);
+        let data_len_before = inner.data.file_len();
+
+        // Output 4, saved with the injector armed: fully appended + indexed, then errors.
+        let output4 = make_test_output(&committee, 3, chain.clone(), 4, parent);
+        inner.fail_save_after_append = true;
+        let err = inner.save_consensus_output(&output4).expect_err("injected mid-save failure");
+        assert!(matches!(err, super::PackError::IndexAppend(_)), "got {err:?}");
+
+        // Atomic rollback: the data log and the position index are back to the pre-save state.
+        assert_eq!(inner.data.file_len(), data_len_before, "data log rolled back");
+        assert_eq!(inner.consensus_pos_idx.len(), 3, "position index rolled back");
+
+        // Retry the same output: it saves cleanly (the injector already cleared itself).
+        inner.save_consensus_output(&output4).expect("retry saves");
+        assert_eq!(inner.consensus_pos_idx.len(), 4, "output 4 now saved exactly once");
+
+        // Exactly four Consensus records on the log — no duplicate from the rolled-back attempt.
+        let consensus_records = inner
+            .data
+            .raw_iter()
+            .expect("raw iter")
+            .filter(|r| matches!(r, Ok(PackRecord::Consensus(_))))
+            .count();
+        assert_eq!(consensus_records, 4, "no duplicate consensus record");
+
+        inner.persist().expect("persist");
+        drop(inner); // clean close
+
+        // Every output reads back by number and by digest through the read-only door.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        for (i, output) in outputs.iter().chain(std::iter::once(&output4)).enumerate() {
+            let number = i as u64 + 1;
+            let got = pack.get_consensus_output(number).await.expect("output by number");
+            assert_eq!(got.number(), number);
+            assert!(
+                pack.contains_consensus_header(output.consensus_header_hash()).await,
+                "output {number} header must be indexed"
+            );
+        }
+        assert!(pack.get_consensus_output(5).await.is_err(), "no phantom 5th output");
     }
 
     /// A read-only `open_static` of a sealed epoch whose position index is damaged at rest must
