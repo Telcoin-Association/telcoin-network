@@ -229,7 +229,10 @@ async fn lifetime_honors_local_exemptions() -> eyre::Result<()> {
 }
 
 /// A zero lifetime expires on a timer without canonical notifications or wall-clock sleeps.
-#[tokio::test(start_paused = true)]
+///
+/// Reth's validation services are long-lived blocking tasks, which inhibit Tokio's paused
+/// clock auto-advance. Keep time running so both expiry and the failure timeout can fire.
+#[tokio::test]
 async fn lifetime_timer_runs_on_an_idle_chain() -> eyre::Result<()> {
     let directory = TempDir::new()?;
     let tasks = TaskManager::default();
@@ -242,12 +245,14 @@ async fn lifetime_timer_runs_on_an_idle_chain() -> eyre::Result<()> {
         &["tn", "--txpool.lifetime", "0"],
     )?;
     let tx = transaction(&mut factory, 21_000, 100, Bytes::new())?;
-    let events = pool.0.add_transaction_and_subscribe(TransactionOrigin::External, tx).await?;
-    let discarded =
-        events.filter(|event| futures::future::ready(matches!(event, TransactionEvent::Discarded)));
-    tokio::pin!(discarded);
-    let event = tokio::time::timeout(Duration::from_secs(1), discarded.next()).await?;
-    assert!(matches!(event, Some(TransactionEvent::Discarded)));
-    assert_eq!(pool.pool_size().queued, 0);
-    Ok(())
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let events = pool.0.add_transaction_and_subscribe(TransactionOrigin::External, tx).await?;
+        let discarded = events
+            .filter(|event| futures::future::ready(matches!(event, TransactionEvent::Discarded)));
+        tokio::pin!(discarded);
+        assert!(matches!(discarded.next().await, Some(TransactionEvent::Discarded)));
+        assert_eq!(pool.pool_size().queued, 0);
+        Ok::<_, eyre::Report>(())
+    })
+    .await?
 }
