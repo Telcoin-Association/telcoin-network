@@ -2529,6 +2529,35 @@ mod tests {
         Ok(())
     }
 
+    /// `real_header_floor` derives the guaranteed-real header bound from the floor marker:
+    /// no marker => 0 (every header is real down to genesis), marker `B` =>
+    /// `max(1, B - (BLOCKHASH_ANCESTORS - 1))`, the bound backward header walks must not cross
+    /// on a restored datadir (issue #1321). The mature-chain (non-clamped) arm is exercised here
+    /// with a hand-written marker; the clamped arm is covered by the scaffold test below.
+    #[tokio::test]
+    async fn real_header_floor_derives_from_the_floor_marker() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let dir = TempDir::new()?;
+        let tm = TaskManager::new("Real Header Floor");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dir.path())?;
+        let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+        assert_eq!(
+            env.real_header_floor(),
+            0,
+            "a normally-synced datadir must let backward walks reach genesis"
+        );
+        drop(env);
+
+        // a mature restored chain: the marker sits far above the lookback window, so the bound
+        // is `B - (BLOCKHASH_ANCESTORS - 1)`, not the genesis clamp
+        std::fs::write(RethEnv::restored_state_floor_path(&reth_config.0), "100000\n")?;
+        let (reth_config, db) = temp_config_and_db(chain, dir.path())?;
+        let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+        assert_eq!(env.real_header_floor(), 100_000 - (BLOCKHASH_ANCESTORS - 1));
+
+        Ok(())
+    }
+
     /// The scaffold persists the restored-state floor marker as the snapshot's FINAL block `B` —
     /// not the window's first block, because window headers below `B` resolve by hash yet carry
     /// no state — before any chain data commits, and a fresh env over the datadir refuses pinned
@@ -2563,6 +2592,15 @@ mod tests {
 
         let (reth_config, db) = temp_config_and_db(chain, dst_dir.path())?;
         let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+
+        // the real-header bound derives from the marker: max(1, B - (BLOCKHASH_ANCESTORS - 1)),
+        // here clamped to block 1 (B = 5 sits inside the lookback). Backward header walks stop
+        // there instead of reading scaffold dummies (issue #1321)
+        assert_eq!(
+            env.real_header_floor(),
+            1,
+            "a restored env must bound backward header walks at the guaranteed-real floor"
+        );
 
         // below the floor: refused up front, before the (unresolvable) pin hash matters
         let phantom =
