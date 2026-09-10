@@ -42,6 +42,7 @@ sha2 = "0.10.8"
 zeroize = "1.8.2"
 
 [dev-dependencies]
+hex = { workspace = true }
 tempfile = { workspace = true }
 # Lets the key-permission tests run under a deliberately permissive umask, so they fail if the
 # writer ever regresses to relying on the ambient umask for restrictiveness.

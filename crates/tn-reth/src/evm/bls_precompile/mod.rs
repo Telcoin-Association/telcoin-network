@@ -16,7 +16,10 @@
 //!
 //! Mirrors [`tel_precompile`](super::tel_precompile): a [`DynPrecompile`] registered via
 //! [`add_bls_precompile`] and dispatched by 4-byte selector. The ABI matches `IBlsG1`, so
-//! `ConsensusRegistry`'s `blsVerify` staticcall resolves to this precompile.
+//! `ConsensusRegistry`'s `blsVerify` staticcall resolves to this precompile. Like the TEL
+//! dispatcher, the entrypoint enforces payability itself: registering the address short-circuits
+//! the interpreter, so no compiled `CALLVALUE` guard ever runs, and no selector here is payable,
+//! so nonzero attached value is rejected before dispatch (see [`bls_precompile`]).
 //!
 //! | Selector | Behavior |
 //! |----------|----------|
@@ -39,7 +42,7 @@ use alloy::{
 };
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
-use tn_types::{bls_verify_secure, Address, BlsPublicKey, BlsSignature, Bytes};
+use tn_types::{bls_verify_secure, Address, BlsPublicKey, BlsSignature, Bytes, U256};
 
 /// Canonical address of the BLS verification precompile: `0x…b151`.
 ///
@@ -112,6 +115,13 @@ fn bls_verify_gas_cost(message_len: usize) -> Option<u64> {
 ///
 /// Called from the EVM factory alongside `add_telcoin_precompile`, so the precompile is present for
 /// all execution including pre-genesis registry construction.
+///
+/// Registered with [`DynPrecompile::new_stateful`] deliberately, and that choice is load-bearing
+/// for the payability gate: reth's engine-tree precompile cache keys entries on calldata alone,
+/// and only `new_stateful` (`is_pure() == false`) keeps this address out of that cache. The
+/// result now depends on [`PrecompileInput::value`], so a cached zero-value `Ok` must never be
+/// replayed for a value-bearing call with identical calldata; do not "optimize" this to
+/// [`DynPrecompile::new`].
 pub fn add_bls_precompile(map: &mut PrecompilesMap) {
     map.apply_precompile(&BLS_G1_PRECOMPILE_ADDRESS, move |_| {
         Some(DynPrecompile::new_stateful(PrecompileId::Custom("bls_g1".into()), move |input| {
@@ -120,9 +130,39 @@ pub fn add_bls_precompile(map: &mut PrecompilesMap) {
     });
 }
 
-/// Precompile entrypoint. Delegates to [`dispatch`]; the precompile is stateless, so it never
-/// touches the EVM internals carried by [`PrecompileInput`].
+/// The error reported when nonzero call value is attached to a call. No selector of this
+/// precompile is payable. The text mirrors the TEL dispatcher's gate; the string itself is
+/// diagnostic only, since on-chain both precompiles surface the rejection as the same bare
+/// precompile-error halt.
+const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
+
+/// Precompile entrypoint. Rejects nonzero call value, then delegates to [`dispatch`]; beyond the
+/// attached `value` it inspects for that gate, the precompile is stateless and never touches the
+/// EVM internals carried by [`PrecompileInput`].
+///
+/// # Payability
+///
+/// Registering this address short-circuits the interpreter, so the `CALLVALUE` guard a compiled
+/// non-payable dispatcher would run never executes; revm journals the caller-to-target balance
+/// transfer before the precompile runs and commits it when the call succeeds. Without this gate a
+/// value-bearing `blsVerify` call would both return its verification result and strand the
+/// attached wei at [`BLS_G1_PRECOMPILE_ADDRESS`]: nothing reads or pays out that account's
+/// balance, and unlike the TEL precompile there is not even a governance `burn` to destroy stray
+/// value. `blsVerify` is pure, so the payable list is empty and any nonzero value is refused with
+/// [`NON_PAYABLE_CALL_VALUE`], the same fail-safe classification as the TEL dispatcher: a
+/// selector added later rejects value unless explicitly made payable. Inside a `DELEGATECALL`
+/// frame `value` is the calling frame's apparent `msg.value` and nothing is transferred; a
+/// `CALLCODE` frame transfers its explicit value operand from the executing contract to itself
+/// (net zero), so neither indirect path can land wei here. Rejecting both still mirrors a
+/// compiled non-payable dispatcher, whose `CALLVALUE` check fires in those frames too; what
+/// matches Solidity is when the check fires, not how it reports. Like every error from
+/// [`dispatch`], the rejection surfaces as a precompile-error halt that consumes the forwarded
+/// gas, not a data-carrying Solidity revert.
 fn bls_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
+    // No selector is payable: refuse attached value before dispatch. See "Payability" above.
+    (input.value == U256::ZERO)
+        .then_some(())
+        .ok_or_else(|| PrecompileError::Other(NON_PAYABLE_CALL_VALUE.into()))?;
     dispatch(input.data, input.gas)
 }
 
