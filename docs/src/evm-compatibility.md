@@ -85,7 +85,7 @@ These are the protocol's own compressed encodings — the identical bytes valida
 
 * Returns ABI-encoded `true`/`false`. Malformed points, wrong lengths, and failed verifications all return `false` — the precompile never reverts on bad cryptographic input, matching `BlsG1.blsVerify`'s boolean contract.
 * Callable from `STATICCALL` (it is a pure view): `ConsensusRegistry` reaches it that way to verify validator proof-of-possession on staking.
-* **Gas:** 150,000 base plus 12 per 32-byte word of the message (rounded up).
+* **Gas:** 150,000 base plus 12 gas per 32-byte word of the ABI-encoded arguments (signature, pubkey, and message together), charged before the arguments are decoded.
 
 ### Fee Distribution
 
