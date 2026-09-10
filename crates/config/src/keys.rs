@@ -13,6 +13,9 @@ use crate::{
     TelcoinDirs, BLS_KEYFILE, BLS_WRAPPED_KEYFILE, PRIMARY_NETWORK_SEED_FILE,
     WORKER_NETWORK_SEED_FILE,
 };
+// A dependency only for its `zeroize` feature, which clears the expanded AES round-key
+// schedule (invertible back to the wrapping key) when the cipher objects below drop.
+use aes as _;
 use aes_gcm_siv::{aead::Aead as _, Aes256GcmSiv, Key, KeyInit, Nonce};
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::StdRng, Rng as _, SeedableRng};
@@ -20,8 +23,9 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
     construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
-    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer,
+    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer, WorkerId,
 };
+use zeroize::Zeroizing;
 
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
 /// internal hashing algorithm used. HMAC-SHA-256 is widely supported and is recommended by NIST.
@@ -204,15 +208,27 @@ fn warn_if_key_permissions_are_loose(
 ) {
 }
 
-#[derive(Debug)]
+/// Private key material and derivation inputs shared by a key manager.
 struct KeyConfigInner {
-    // DO NOT expose the private key to other code.  Tests that need this will provide a primary
-    // key. Use the BlsSigner trait for signing for the primary.
+    /// DO NOT expose the private key to other code. Tests provide their own primary key.
+    /// Use the BlsSigner trait for signing for the primary.
     primary_keypair: BlsKeypair,
-    // Derived from the primary_keypair.
+    /// Derived from the primary keypair.
     primary_network_keypair: NetworkKeypair,
-    // Derived from the primary_keypair.
-    worker_network_keypair: NetworkKeypair,
+    /// Seed string for worker network keypairs. Per-worker keypairs are derived on demand from
+    /// the primary keypair and this seed; see [`KeyConfig::worker_network_keypair`].
+    worker_network_seed: String,
+}
+
+impl std::fmt::Debug for KeyConfigInner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyConfigInner")
+            .field("primary_keypair", &self.primary_keypair)
+            .field("primary_network_keypair", &self.primary_network_keypair)
+            .field("worker_network_seed", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Basic implementation of a key manager.  This version will read a BLS key
@@ -221,7 +237,7 @@ struct KeyConfigInner {
 /// It should NOT expose the BLS private key, even though it is currently read
 /// from a file this will not always be the case and all code needing signatures
 /// MUST go through KeyConfig.
-/// NOTE: The two network keys (primary and worker) are derived from the BLS key
+/// NOTE: The network keys (primary and per-worker) are derived from the BLS key
 /// and are exposed to other code.  This is required to work with libp2p which
 /// wants the actual private key.  This method of deriving the key is an attempt
 /// to provide some protection to the key- even though it will exist in memory it
@@ -233,9 +249,12 @@ pub struct KeyConfig {
 
 impl KeyConfig {
     /// Derive the 32-byte AES wrapping key from `passphrase` via PBKDF2-HMAC-SHA256.
-    fn derive_wrapping_key(passphrase: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
-        let mut wrapping_key = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, rounds, &mut wrapping_key);
+    ///
+    /// Returned in a [`Zeroizing`] so the derived key is cleared when the caller drops it
+    /// rather than being left in freed memory for a core dump or swap page to pick up.
+    fn derive_wrapping_key(passphrase: &str, salt: &[u8], rounds: u32) -> Zeroizing<[u8; 32]> {
+        let mut wrapping_key = Zeroizing::new([0_u8; 32]);
+        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, rounds, wrapping_key.as_mut());
         wrapping_key
     }
 
@@ -251,11 +270,15 @@ impl KeyConfig {
         let mut nonce_bytes = [0_u8; NONCE_LEN];
         rand::rng().fill(&mut nonce_bytes);
         let wrapping_key = Self::derive_wrapping_key(passphrase, &salt, rounds);
-        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key);
+        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key[..]);
         let cipher = Aes256GcmSiv::new(key);
         let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits
+
+        // The raw scalar is only needed as AEAD input; hold it in a `Zeroizing` so the copy
+        // `to_bytes` hands back does not outlive the encrypt call in freed memory.
+        let key_bytes = Zeroizing::new(primary_keypair.to_bytes());
         let ciphertext = cipher
-            .encrypt(nonce, &primary_keypair.to_bytes()[..])
+            .encrypt(nonce, &key_bytes[..])
             .map_err(|e| eyre::eyre!("Could not encrypt BLS key: {e}"))?;
         Ok(bs58::encode([&salt[..], &nonce_bytes[..], &ciphertext[..]].concat()).into_string())
     }
@@ -272,9 +295,11 @@ impl KeyConfig {
         rounds: u32,
     ) -> Option<BlsKeypair> {
         let wrapping_key = Self::derive_wrapping_key(passphrase, salt, rounds);
-        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key);
+        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key[..]);
         let cipher = Aes256GcmSiv::new(key);
-        let plaintext = cipher.decrypt(Nonce::from_slice(nonce), ciphertext).ok()?;
+        // This is the BLS private key in the clear. `BlsKeypair` (via blst's `#[zeroize(drop)]`)
+        // clears the parsed copy, so wrap the transient decrypt buffer to close the same gap.
+        let plaintext = Zeroizing::new(cipher.decrypt(Nonce::from_slice(nonce), ciphertext).ok()?);
         BlsKeypair::from_bytes(&plaintext).ok()
     }
 
@@ -332,14 +357,17 @@ impl KeyConfig {
         // a pre-passphrase deployment is still the BLS private key on disk - point at it.
         let stale_cleartext = passphrase.is_some().then(|| keys_dir.join(BLS_KEYFILE));
         warn_if_key_permissions_are_loose(&keys_dir, &keyfile, stale_cleartext.as_deref());
-        let contents = std::fs::read_to_string(&keyfile)?;
+        // In the no-passphrase branch `contents` and `bytes` hold the raw private key (Base58
+        // and decoded), so both are wrapped in `Zeroizing` rather than left in freed memory.
+        // The wrapped branch carries only AEAD-protected bytes; clearing those too is free.
+        let contents = Zeroizing::new(std::fs::read_to_string(&keyfile)?);
         let primary_seed =
             std::fs::read_to_string(tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE))
                 .unwrap_or_else(|_| "primary network keypair".to_string());
         let worker_seed =
             std::fs::read_to_string(tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE))
                 .unwrap_or_else(|_| "worker network keypair".to_string());
-        let bytes = bs58::decode(contents.as_str().trim()).into_vec()?;
+        let bytes = Zeroizing::new(bs58::decode(contents.as_str().trim()).into_vec()?);
         let primary_keypair = if let Some(passphrase) = passphrase {
             Self::unwrap_bls_key(&bytes, &passphrase)?
         } else {
@@ -347,12 +375,11 @@ impl KeyConfig {
         };
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, &primary_seed);
-        let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, &worker_seed);
         Ok(Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: worker_seed,
             }),
         })
     }
@@ -413,7 +440,6 @@ impl KeyConfig {
         let worker_seed = "worker network keypair";
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, primary_seed);
-        let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, worker_seed);
         // Make sure we have the validator dir, owner-only.
         // Don't error out if path exists.
         create_keys_dir(&tn_datadir.node_keys_path())?;
@@ -421,7 +447,11 @@ impl KeyConfig {
             let contents = Self::wrap_bls_key(&primary_keypair, &passphrase, rounds)?;
             write_secret_file(&tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), &contents)?;
         } else {
-            let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
+            // This path persists the key in cleartext by design. Wrap the scalar copy and its
+            // Base58 encoding so these two buffers are cleared on drop (stack temporaries made
+            // inside `to_bytes` itself are beyond the caller's reach).
+            let key_bytes = Zeroizing::new(primary_keypair.to_bytes());
+            let contents = Zeroizing::new(bs58::encode(&key_bytes[..]).into_string());
             write_secret_file(&tn_datadir.node_keys_path().join(BLS_KEYFILE), &contents)?;
         }
         // The seed files hold fixed public strings rather than secrets, but there is no reason
@@ -438,7 +468,7 @@ impl KeyConfig {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: worker_seed.to_string(),
             }),
         })
     }
@@ -447,13 +477,11 @@ impl KeyConfig {
     pub fn new_with_testing_key(primary_keypair: BlsKeypair) -> Self {
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, "primary network keypair");
-        let worker_network_keypair =
-            Self::generate_network_keypair(&primary_keypair, "worker network keypair");
         Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
                 primary_network_keypair,
-                worker_network_keypair,
+                worker_network_seed: "worker network keypair".to_string(),
             }),
         }
     }
@@ -474,15 +502,30 @@ impl KeyConfig {
         self.primary_network_keypair().public().clone().into()
     }
 
-    /// Provide the keypair (with private key) for the worker network.
+    /// Provide the keypair (with private key) for the network of `worker_id`.
     /// Allows building the libp2p worker network.
-    pub fn worker_network_keypair(&self) -> &NetworkKeypair {
-        &self.inner.worker_network_keypair
+    ///
+    /// Worker 0 derives from the stored seed exactly as before per-worker swarms existed. This
+    /// keeps worker 0's PeerId stable for deployed nodes: that network identity is advertised
+    /// on-chain and cached in peers' kad stores, so it must not change. Worker ids above 0
+    /// append the id to the seed to get a distinct keypair per swarm.
+    pub fn worker_network_keypair(&self, worker_id: WorkerId) -> NetworkKeypair {
+        if worker_id == 0 {
+            Self::generate_network_keypair(
+                &self.inner.primary_keypair,
+                &self.inner.worker_network_seed,
+            )
+        } else {
+            Self::generate_network_keypair(
+                &self.inner.primary_keypair,
+                &format!("{} {worker_id}", self.inner.worker_network_seed),
+            )
+        }
     }
 
-    /// The [NetworkPublicKey] for the worker network.
-    pub fn worker_network_public_key(&self) -> NetworkPublicKey {
-        self.worker_network_keypair().public().into()
+    /// The [NetworkPublicKey] for the network of `worker_id`.
+    pub fn worker_network_public_key(&self, worker_id: WorkerId) -> NetworkPublicKey {
+        self.worker_network_keypair(worker_id).public().into()
     }
 
     /// Creates a proof that the authority account address is owned by the
@@ -537,11 +580,52 @@ mod tests {
         let mut nonce_bytes = [0_u8; NONCE_LEN];
         rand::rng().fill(&mut nonce_bytes);
         let wrapping_key = KeyConfig::derive_wrapping_key(passphrase, &salt, rounds);
-        let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&wrapping_key));
+        let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&wrapping_key[..]));
+        // Mirror the production `wrap_bls_key`: hold the raw scalar copy in a `Zeroizing` so
+        // this buffer is cleared when it drops.
+        let key_bytes = Zeroizing::new(keypair.to_bytes());
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), &keypair.to_bytes()[..])
+            .encrypt(Nonce::from_slice(&nonce_bytes), &key_bytes[..])
             .expect("test_only encrypt");
         bs58::encode([&salt[..], &nonce_bytes[..], &ciphertext[..]].concat()).into_string()
+    }
+
+    /// Pin the wrapping key's type so a refactor cannot silently drop back to a bare
+    /// `[u8; 32]` that is left in freed memory on drop.
+    ///
+    /// Zeroization itself is not observable from safe Rust (reading the freed page is UB and
+    /// the optimizer is free to elide a plain overwrite), so this asserts on the type that
+    /// carries the guarantee rather than on the cleared bytes.
+    #[test]
+    fn wrapping_key_is_zeroizing() {
+        let salt = [0_u8; SALT_LEN];
+        let wrapping_key: Zeroizing<[u8; 32]> =
+            KeyConfig::derive_wrapping_key("passphrase", &salt, TEST_ONLY_INSECURE_ROUNDS);
+
+        // Deriving twice with the same inputs is stable, so the wrapper does not disturb PBKDF2.
+        let again = KeyConfig::derive_wrapping_key("passphrase", &salt, TEST_ONLY_INSECURE_ROUNDS);
+        assert_eq!(*wrapping_key, *again);
+        assert_ne!(*wrapping_key, [0_u8; 32], "derivation should produce key material");
+    }
+
+    /// Pin the PBKDF2-HMAC-SHA256 derivation to fixed known-answer vectors (computed with an
+    /// independent PBKDF2 implementation). This pins the construction, the hash (SHA-256),
+    /// the 32-byte output length, and the passphrase encoding; the production round count is
+    /// pinned separately by `test_bls_passphrase_production_rounds`. The 1-round vector pins
+    /// the base construction; the 10-round vector pins the iteration composition.
+    #[test]
+    fn derive_wrapping_key_known_answer() {
+        let salt: [u8; SALT_LEN] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let expected_one_round: [u8; 32] = [
+            233, 222, 218, 7, 33, 111, 58, 49, 75, 89, 219, 116, 1, 54, 137, 62, 204, 147, 55, 220,
+            243, 124, 64, 73, 24, 247, 110, 231, 235, 135, 209, 242,
+        ];
+        let expected_ten_rounds: [u8; 32] = [
+            47, 15, 188, 110, 71, 239, 224, 19, 18, 208, 6, 195, 178, 52, 200, 65, 76, 146, 210,
+            47, 214, 0, 174, 192, 253, 114, 25, 128, 200, 216, 197, 237,
+        ];
+        assert_eq!(*KeyConfig::derive_wrapping_key("passphrase", &salt, 1), expected_one_round);
+        assert_eq!(*KeyConfig::derive_wrapping_key("passphrase", &salt, 10), expected_ten_rounds);
     }
 
     /// Run `f` with the process umask set to 0, restoring it afterwards.
@@ -915,5 +999,98 @@ mod tests {
             Some("not_passphrase".to_string())
         )
         .is_ok());
+    }
+
+    /// The advisory's `KeyConfig`-level regression test: formatting a whole config must not
+    /// leak the BLS private key or the network secrets derived from it. This guards drift in
+    /// upstream `libp2p-identity`'s redacting `Debug` impls and any future secret-bearing
+    /// field on `KeyConfigInner`, which the `BlsKeypair`-only test in tn-types cannot see.
+    #[test]
+    fn debug_does_not_leak_key_material() {
+        let keypair = random_keypair();
+        let bls_private = keypair.to_bytes();
+        let config = KeyConfig::new_with_testing_key(keypair);
+        let rendered = format!("{config:?}");
+
+        assert!(
+            rendered.contains("private: \"[REDACTED]\""),
+            "BLS private half must be redacted: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("public: {:?}", config.primary_public_key())),
+            "BLS public key should still be shown: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&config.inner.worker_network_seed),
+            "worker network seed must not be shown"
+        );
+        assert!(
+            rendered.contains("worker_network_seed: \"[REDACTED]\""),
+            "worker network seed field must remain present and redacted: {rendered}"
+        );
+
+        let assert_secret_absent = |bytes: &[u8], what: &str| {
+            assert!(!rendered.contains(&hex::encode(bytes)), "{what} leaked as hex");
+            assert!(
+                !rendered.contains(&bs58::encode(bytes).into_string()),
+                "{what} leaked as bs58"
+            );
+            assert!(
+                !rendered.contains(&format!("{bytes:?}")),
+                "{what} leaked as a byte-array debug"
+            );
+        };
+        // Both byte orders: `to_bytes()` is the big-endian serialized scalar, while blst's
+        // internal `blst_scalar` (what a re-derived impl would print) is little-endian.
+        let reversed: Vec<u8> = bls_private.iter().rev().copied().collect();
+        assert_secret_absent(&bls_private, "bls private key");
+        assert_secret_absent(&reversed, "bls private key (reversed)");
+
+        let ed25519_secret = |net: &NetworkKeypair| {
+            let ed25519: libp2p::identity::ed25519::Keypair =
+                net.clone().try_into().expect("network keypairs are ed25519");
+            libp2p::identity::ed25519::SecretKey::from(ed25519)
+        };
+        assert_secret_absent(
+            ed25519_secret(config.primary_network_keypair()).as_ref(),
+            "primary network secret",
+        );
+        // Per-worker network keypairs are derived on demand from the primary key and the stored
+        // seed (#555), so `KeyConfigInner` stores no worker keypair. Worker 0 is the legacy
+        // derivation; check it in case a future field caches derived keypairs.
+        assert_secret_absent(
+            ed25519_secret(&config.worker_network_keypair(0)).as_ref(),
+            "worker network secret",
+        );
+
+        // Positive anchor: the primary network field must actually render its public half,
+        // otherwise the negative checks above pass vacuously once `KeyConfigInner`'s Debug
+        // stops printing the network keypair at all. The worker seed's redacted field is
+        // anchored above; no worker keypair is stored.
+        let ed25519_public_rendered = |net: &NetworkKeypair| {
+            let ed25519: libp2p::identity::ed25519::Keypair =
+                net.clone().try_into().expect("network keypairs are ed25519");
+            format!("{:?}", ed25519.public().to_bytes())
+        };
+        assert!(
+            rendered.contains(&ed25519_public_rendered(config.primary_network_keypair())),
+            "primary network public key should still be shown: {rendered}"
+        );
+    }
+
+    /// Worker 0 must keep the legacy bare-seed derivation (its PeerId is advertised on-chain),
+    /// worker 1 must get a distinct keypair, and derivation must be deterministic per id.
+    #[test]
+    fn test_worker_network_keypair_per_id_derivation() {
+        let kc = KeyConfig::new_with_testing_key(random_keypair());
+        let legacy: NetworkPublicKey = KeyConfig::generate_network_keypair(
+            &kc.inner.primary_keypair,
+            "worker network keypair",
+        )
+        .public()
+        .into();
+        assert_eq!(kc.worker_network_public_key(0), legacy);
+        assert_ne!(kc.worker_network_public_key(1), kc.worker_network_public_key(0));
+        assert_eq!(kc.worker_network_public_key(1), kc.worker_network_public_key(1));
     }
 }

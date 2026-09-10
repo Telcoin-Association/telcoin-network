@@ -231,7 +231,8 @@ where
             authority_id: public_key.into(),
             execution_address: self.builder.tn_config.node_info.execution_address,
             primary_network_key: self.key_config.primary_network_public_key(),
-            worker_network_key: self.key_config.worker_network_public_key(),
+            // the node record only advertises worker 0 for now (#557)
+            worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
             primary_external_address: self
                 .builder
                 .tn_config
@@ -361,7 +362,11 @@ where
                     .ok_or_else(|| eyre!("on-chain WorkerConfigs reports zero workers"))
             })
             .wrap_err("failed to read the committee worker count from chain")?;
-        check_committee_worker_count(epoch, num_workers)?;
+        check_committee_worker_count(
+            epoch,
+            num_workers,
+            self.builder.tn_config.node_info.p2p_info.num_workers(),
+        )?;
 
         // the network must be live
         let committee = if epoch == 0 {
@@ -434,10 +439,10 @@ where
 
     /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].
     ///
-    /// Only worker id [`tn_types::DEFAULT_WORKER_ID`] is supported. The shared
-    /// [`WorkerNetworkHandle`] on the [`EpochManager`] is re-pointed at this epoch's task
-    /// spawner and epoch number before anything else, so batch reporting runs under the
-    /// epoch-scoped lifetime.
+    /// Only worker id [`tn_types::DEFAULT_WORKER_ID`] is driven for now (#557 adds the loop).
+    /// That worker's [`WorkerNetworkHandle`] on the [`EpochManager`] is re-pointed at this
+    /// epoch's task spawner and epoch number before anything else, so batch reporting runs
+    /// under the epoch-scoped lifetime.
     ///
     /// The engine's worker components are initialized on the initial epoch, and also whenever
     /// the engine reports no workers yet — the latter covers the case where the first epoch
@@ -459,18 +464,21 @@ where
         let worker_id = DEFAULT_WORKER_ID;
         // The worker's shared base-fee container and a u64 snapshot of its current value. The
         // pool receives the live container so its pending fee tracks the accumulator across
-        // epoch boundaries (issue #1262), and the RPC server keeps a handle from it
-        // (`eth_feeHistory` answers its next-block entry). The snapshot serves the batch
-        // validator and the every-epoch setter below (base fee is constant within an epoch).
+        // epoch boundaries (issue #1262). The snapshot serves the batch validator and the
+        // every-epoch setter below (base fee is constant within an epoch).
         let base_fee_container = gas_accumulator.base_fee(worker_id);
         let base_fee = base_fee_container.base_fee();
+        // The worker's per-query base-fee handle: the RPC server keeps it and resolves
+        // `eth_feeHistory`'s next-block entry through the accumulator on every quote, so
+        // the quote survives worker-count changes (#1282).
+        let worker_base_fee = gas_accumulator.worker_base_fee(worker_id);
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
             let network_handle = self
-                .worker_network_handle
-                .as_mut()
-                .ok_or_eyre("worker network handle missing from epoch manager")?;
+                .worker_network_handles
+                .get_mut(usize::from(worker_id))
+                .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?;
 
             network_handle.update_task_spawner(epoch_task_spawner.clone());
             network_handle.update_epoch(consensus_config.committee().epoch());
@@ -486,6 +494,7 @@ where
                         network_handle.clone(),
                         engine_to_primary,
                         base_fee_container,
+                        worker_base_fee,
                     )
                     .await?;
             } else {
@@ -519,9 +528,9 @@ where
         });
 
         let network_handle = self
-            .worker_network_handle
-            .as_ref()
-            .ok_or_eyre("worker network handle missing from epoch manager")?
+            .worker_network_handles
+            .get(usize::from(worker_id))
+            .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?
             .clone();
 
         let validator = engine
@@ -800,7 +809,11 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the worker network handler
-        let rx_event_stream = self.worker_event_stream.subscribe();
+        let rx_event_stream = self
+            .worker_event_streams
+            .get(usize::from(*worker_id))
+            .ok_or_else(|| eyre!("no event stream for worker {worker_id}"))?
+            .subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         let committee_keys: HashSet<BlsPublicKey> = consensus_config
@@ -814,9 +827,10 @@ where
             .committee()
             .bootstrap_servers()
             .iter()
-            // worker 0 always exists (the non-empty list invariant is enforced at deserialize), so
-            // this `filter_map` cannot drop a peer
-            .filter_map(|(k, v)| v.worker(DEFAULT_WORKER_ID).cloned().map(|worker| (*k, worker)))
+            // worker 0 always exists (the non-empty list invariant is enforced at deserialize).
+            // for higher ids a missing entry drops the peer, which is correct: a peer that runs
+            // fewer workers has no swarm for this id
+            .filter_map(|(k, v)| v.worker(*worker_id).cloned().map(|worker| (*k, worker)))
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
@@ -832,17 +846,24 @@ where
 
         // start listening if the network needs to be initialized
         if initial_epoch {
-            let worker_address = Self::parse_listener_address_for_swarm(
-                "WORKER_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config
-                    .worker_address(DEFAULT_WORKER_ID)
-                    .ok_or_eyre("no worker network address in node info")?,
-            )?;
+            let configured_address = consensus_config
+                .worker_address(*worker_id)
+                .ok_or_else(|| eyre!("no network address for worker {worker_id} in node info"))?;
+            // the env override applies to worker 0 only: one env var cannot name N distinct
+            // listeners, so higher ids always bind their configured address
+            let worker_address = if *worker_id == DEFAULT_WORKER_ID {
+                Self::parse_listener_address_for_swarm(
+                    "WORKER_LISTENER_MULTIADDR",
+                    consensus_config.primary_networkkey(),
+                    configured_address,
+                )?
+            } else {
+                configured_address
+            };
             network_handle.inner_handle().start_listening(worker_address).await?;
         }
 
-        let worker_address = consensus_config.worker_address(DEFAULT_WORKER_ID);
+        let worker_address = consensus_config.worker_address(*worker_id);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -871,10 +892,8 @@ where
         // later epoch unless the subscription is explicitly dropped. Skipping alone would also
         // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
         // the committee that was current when the node last subscribed.
-        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(
-            consensus_config.chain_id(),
-            DEFAULT_WORKER_ID,
-        );
+        let batch_topic =
+            tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id(), *worker_id);
         let mode = self.consensus_bus.current_node_mode();
         if should_subscribe_batch_topic(mode) {
             debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");
@@ -1103,19 +1122,25 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
 
 /// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
 ///
-/// A single worker is always fine. Above one, the answer depends on the multi-workers fork
-/// ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the same epoch carried
-/// inside the [`Committee`] this count is about to be stamped onto, so the gate here and the gate
-/// the encoder consults cannot disagree:
+/// The configured swarm count must match chain state, including after governance changes at an
+/// epoch boundary. A matching single worker is always fine. Above one, the answer depends on the
+/// multi-workers fork ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the
+/// same epoch carried inside the [`Committee`] this count is about to be stamped onto, so the gate
+/// here and the gate the encoder consults cannot disagree:
 ///
 /// - pre-fork the legacy committee layout has no field to carry a worker count, so the encoder
 ///   refuses the value. Halting here turns that into a diagnosable epoch-entry failure instead of a
 ///   panic from the first pack write, which is the only thing the node could do about it anyway:
 ///   the count is chain state and cannot be talked down locally.
-/// - post-fork the count is representable and epoch entry proceeds. It still only warns, because
-///   this node version spawns worker [`DEFAULT_WORKER_ID`] alone: header payloads keyed to higher
-///   worker ids validate, but nothing local produces them.
-fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre::Result<()> {
+/// - post-fork the count is representable and epoch entry proceeds. It still warns because this
+///   node version starts epoch components only for worker [`DEFAULT_WORKER_ID`]: header payloads
+///   keyed to higher worker ids validate, but nothing local produces them yet.
+fn check_committee_worker_count(
+    epoch: Epoch,
+    num_workers: NonZeroUsize,
+    configured_workers: usize,
+) -> eyre::Result<()> {
+    super::check_configured_worker_count(epoch, num_workers.get(), configured_workers)?;
     if num_workers.get() == 1 {
         return Ok(());
     }
@@ -1133,7 +1158,8 @@ fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre
         epoch,
         num_workers,
         spawned_worker = DEFAULT_WORKER_ID,
-        "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
+        "committee runs multiple workers but this node version starts epoch components only for \
+         worker {DEFAULT_WORKER_ID}: \
          ids >= 1 are accepted by header validation but not produced locally"
     );
     Ok(())
@@ -1175,11 +1201,10 @@ mod tests {
 
     /// One worker is representable in both committee layouts, so entry never blocks on it.
     #[test]
-    fn single_worker_epoch_entry_is_always_allowed() {
-        for epoch in [0, 1, 407, u32::MAX] {
-            check_committee_worker_count(epoch, NonZeroUsize::MIN)
-                .expect("one worker is representable at every epoch");
-        }
+    fn single_worker_epoch_entry_is_always_allowed() -> eyre::Result<()> {
+        [0, 1, 407, u32::MAX]
+            .into_iter()
+            .try_for_each(|epoch| check_committee_worker_count(epoch, NonZeroUsize::MIN, 1))
     }
 
     /// Pre-fork the legacy committee layout cannot carry a worker count, so entry halts rather than
@@ -1191,18 +1216,42 @@ mod tests {
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
     #[test]
-    fn pre_fork_epoch_entry_rejects_multiple_workers() {
-        let err = check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
-            .expect_err("a pre-fork multi-worker committee cannot be encoded");
+    fn pre_fork_epoch_entry_rejects_multiple_workers() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        let err = check_committee_worker_count(0, count, 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected pre-fork multi-worker rejection"))?;
         assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+        Ok(())
     }
 
     /// Default builds have the multi-worker layout active from genesis, so a count above one is
-    /// representable and entry proceeds (with a warning that this node still spawns one worker).
+    /// representable and entry proceeds (with a warning about worker-0-only epoch components).
     #[cfg(not(feature = "adiri"))]
     #[test]
-    fn post_fork_epoch_entry_allows_multiple_workers() {
-        check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
-            .expect("the post-fork layout holds a worker count");
+    fn post_fork_epoch_entry_allows_multiple_workers() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        check_committee_worker_count(0, count, 2)
+    }
+
+    /// A single-worker chain must reject extra local swarms before its early return.
+    #[test]
+    fn single_worker_epoch_entry_rejects_extra_configured_workers() -> eyre::Result<()> {
+        let result = check_committee_worker_count(0, NonZeroUsize::MIN, 3);
+        assert!(result.is_err());
+        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
+        assert!(error.to_string().contains("chain-derived count for epoch 0 is 1"));
+        Ok(())
+    }
+
+    /// Governance cannot increase the committee count while the process retains fewer swarms.
+    #[test]
+    fn epoch_entry_rejects_changed_worker_count() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        let result = check_committee_worker_count(7, count, 1);
+        assert!(result.is_err());
+        let error = result.err().ok_or_else(|| eyre::eyre!("expected worker count mismatch"))?;
+        assert!(error.to_string().contains("chain-derived count for epoch 7 is 2"));
+        Ok(())
     }
 }

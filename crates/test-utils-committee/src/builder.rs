@@ -9,7 +9,7 @@ use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
     BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, NetworkKeypair, P2pNode,
-    TimestampSec, DEFAULT_WORKER_PORT,
+    TimestampSec, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -61,7 +61,7 @@ where
     /// Set the number of workers every authority runs (defaults to one).
     ///
     /// Worker 0 uses the authority's [KeyConfig] worker network key; every further worker
-    /// gets a fresh network keypair, since [KeyConfig] holds a single worker key.
+    /// gets a fresh network keypair.
     pub fn number_of_workers(mut self, number_of_workers: NonZeroUsize) -> Self {
         self.number_of_workers = number_of_workers;
         self
@@ -133,12 +133,12 @@ where
     DB: Database,
     F: Fn() -> DB,
 {
+    /// Build the committee and each authority's worker-zero fixture.
     pub fn build(mut self) -> CommitteeFixture<DB> {
         let committee_size = self.committee_size.get();
         let network_config = self.network_config.unwrap_or_default();
 
         let mut rng = StdRng::from_rng(&mut self.rng);
-        let mut committee_info = Vec::with_capacity(committee_size);
         #[allow(clippy::mutable_key_type)]
         let mut authorities = BTreeMap::new();
         let mut bootstrap_servers = BTreeMap::new();
@@ -167,7 +167,7 @@ where
             let worker_nodes: Vec<P2pNode> = (0..self.number_of_workers.get())
                 .map(|worker_id| {
                     let key = if worker_id == 0 {
-                        key_config.worker_network_public_key()
+                        key_config.worker_network_public_key(DEFAULT_WORKER_ID)
                     } else {
                         NetworkKeypair::generate_ed25519().public().into()
                     };
@@ -190,18 +190,19 @@ where
                 (primary_keypair, key_config, authority.clone()),
             );
         }
-        // Reset the authority ids so they are in sort order.  Some tests require this.
-        for (i, (_, (primary_keypair, key_config, authority))) in authorities.iter_mut().enumerate()
-        {
-            let worker = WorkerFixture::generate(key_config.clone(), i as u16);
-            committee_info.push((
-                primary_keypair.copy(),
-                key_config.clone(),
-                authority.clone(),
-                worker,
-                network_config.clone(),
-            ));
-        }
+        // Every authority fixture represents its own worker 0, independent of authority order.
+        let committee_info: Vec<_> = authorities
+            .values()
+            .map(|(primary_keypair, key_config, authority)| {
+                (
+                    primary_keypair.copy(),
+                    key_config.clone(),
+                    authority.clone(),
+                    WorkerFixture::generate(key_config.clone(), DEFAULT_WORKER_ID),
+                    network_config.clone(),
+                )
+            })
+            .collect();
         // Make the committee so we can give it the AuthorityFixtures below.
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),

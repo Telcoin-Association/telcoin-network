@@ -383,6 +383,12 @@ impl GasAccumulator {
 
     /// Return the shared [`BaseFeeContainer`] for `worker_id`. Mutations are visible to all
     /// holders of the returned clone.
+    ///
+    /// The clone pins the slot's *current* container: [`GasAccumulator::set_num_workers`]
+    /// replaces the container when the count shrinks and later regrows past `worker_id`, and
+    /// the pinned clone stops seeing fee updates (issue #1282). Holders that outlive an epoch
+    /// boundary (the RPC server) take a [`WorkerBaseFee`] from
+    /// [`GasAccumulator::worker_base_fee`] instead.
     pub fn base_fee(&self, worker_id: WorkerId) -> BaseFeeContainer {
         let inner = self.inner.read();
         inner
@@ -397,6 +403,16 @@ impl GasAccumulator {
             })
             .base_fee
             .clone()
+    }
+
+    /// Return a [`WorkerBaseFee`] handle that resolves `worker_id`'s base fee per read.
+    ///
+    /// Unlike the container clone from [`GasAccumulator::base_fee`], the handle survives a
+    /// worker-count shrink and regrow: every read looks up the slot the accumulator currently
+    /// owns, so long-lived holders always see the fee the epoch schedule
+    /// (`EpochBaseFees::apply` in `tn-node`) last wrote (issue #1282).
+    pub fn worker_base_fee(&self, worker_id: WorkerId) -> WorkerBaseFee {
+        WorkerBaseFee { accumulator: self.clone(), worker_id }
     }
 
     /// Return the number of workers in the accumulator.
@@ -446,6 +462,36 @@ impl GasAccumulator {
     /// Use the authority's identifier to return an execution address for beneficiary address.
     pub fn get_authority_address(&self, authority_id: &AuthorityIdentifier) -> Option<Address> {
         self.rewards_counter.get_authority_address(authority_id)
+    }
+}
+
+/// A per-read resolver for one worker's current epoch base fee.
+///
+/// [`GasAccumulator::set_num_workers`] truncates slots on a shrink and rebuilds them with
+/// fresh default containers on a regrow, so a long-held [`BaseFeeContainer`] clone for a
+/// worker id >= 1 can end up pointing at a container the epoch schedule no longer writes to
+/// (issue #1282). This handle holds the accumulator itself and resolves the slot on every
+/// read, so it always reports the fee of the container the accumulator currently owns.
+///
+/// A read while the slot is truncated answers the slot's rebirth value
+/// ([`MIN_PROTOCOL_BASE_FEE`], what a regrown slot holds until the epoch schedule writes it):
+/// the holder is a still-running RPC server, and a fee quote must not halt the node the way
+/// [`GasAccumulator::inc_block`] does by design.
+#[derive(Clone, Debug)]
+pub struct WorkerBaseFee {
+    /// The accumulator owning the per-worker slots this handle reads through.
+    accumulator: GasAccumulator,
+    /// The worker whose slot every read resolves.
+    worker_id: WorkerId,
+}
+
+impl WorkerBaseFee {
+    /// Return the worker's current epoch base fee from the slot the accumulator holds now.
+    pub fn base_fee(&self) -> u64 {
+        let inner = self.accumulator.inner.read();
+        inner
+            .get(usize::from(self.worker_id))
+            .map_or(MIN_PROTOCOL_BASE_FEE, |accumulated| accumulated.base_fee.base_fee())
     }
 }
 
@@ -643,6 +689,58 @@ mod tests {
         let base = 1_000_000_000_000_000u64;
         let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
         assert_eq!(result, base + base / 8);
+    }
+
+    /// Pin the issue #1282 hazard: a held [`BaseFeeContainer`] clone stops seeing fee
+    /// updates after a worker-count shrink and regrow replaces the slot's container, while a
+    /// [`WorkerBaseFee`] handle resolves the slot per read and reports the live value.
+    #[test]
+    fn held_container_clone_goes_stale_after_shrink_and_regrow() {
+        let accumulator = GasAccumulator::new(2);
+        let held_clone = accumulator.base_fee(1);
+        let handle = accumulator.worker_base_fee(1);
+
+        accumulator.set_num_workers(1);
+        accumulator.set_num_workers(2);
+        let live_fee = MIN_PROTOCOL_BASE_FEE + 777;
+        accumulator.base_fee(1).set_base_fee(live_fee);
+
+        assert_eq!(
+            held_clone.base_fee(),
+            MIN_PROTOCOL_BASE_FEE,
+            "the held clone still points at the truncated slot's container"
+        );
+        assert_eq!(handle.base_fee(), live_fee, "the handle reads the regrown slot's container");
+    }
+
+    /// A [`WorkerBaseFee`] read while its slot is truncated answers the slot's rebirth value
+    /// (`MIN_PROTOCOL_BASE_FEE`) instead of panicking: the holder is a still-running RPC
+    /// server.
+    #[test]
+    fn worker_base_fee_answers_rebirth_default_while_truncated() {
+        let accumulator = GasAccumulator::new(2);
+        accumulator.base_fee(1).set_base_fee(MIN_PROTOCOL_BASE_FEE + 5);
+        let handle = accumulator.worker_base_fee(1);
+
+        accumulator.set_num_workers(1);
+
+        assert_eq!(handle.base_fee(), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    /// Grows are index-stable: an existing slot keeps its container, so both the held clone
+    /// and the handle keep reporting the live fee across a pure grow.
+    #[test]
+    fn worker_base_fee_and_clone_agree_across_a_pure_grow() {
+        let accumulator = GasAccumulator::new(1);
+        let fee = MIN_PROTOCOL_BASE_FEE + 42;
+        accumulator.base_fee(0).set_base_fee(fee);
+        let held_clone = accumulator.base_fee(0);
+        let handle = accumulator.worker_base_fee(0);
+
+        accumulator.set_num_workers(3);
+
+        assert_eq!(held_clone.base_fee(), fee);
+        assert_eq!(handle.base_fee(), fee);
     }
 
     /// Mutation guard for the `.min(SAFE_MAX_BASE_FEE)` clamp: with the clamp removed, alloy's
