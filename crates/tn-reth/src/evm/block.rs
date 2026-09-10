@@ -92,6 +92,11 @@
 //! replay caveat and the `block.body.withdrawals` reconstruction follow-up). The RNG draw order
 //! inside the shuffle is consensus-critical: any refactor that reorders the draws selects a
 //! different committee.
+//!
+//! From the PREVRANDAO fork epoch onward the same epoch seed chain value also feeds each block's
+//! `mix_hash` (the EVM's `PREVRANDAO`, derived per block by `ConsensusOutput::prev_randao`). It
+//! carries the same accepted last-actor bias: the committing leader can compute it before
+//! broadcasting, so it is not unbiasable randomness.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -1618,6 +1623,10 @@ where
             withdrawals_root,
             logs_bloom,
             timestamp,
+            // fork-gated upstream (`ConsensusOutput::prev_randao`, #1247): legacy
+            // `output_digest ^ batch_digest` pre-fork, seed-chain keccak post-fork. The
+            // committing leader keeps one propose-or-withhold choice per commit either way,
+            // so this opcode alone is not unbiasable randomness.
             mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce,
             base_fee_per_gas: Some(evm_env.block_env.basefee()),

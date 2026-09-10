@@ -293,6 +293,10 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// pinned by the committed order and the digest-pinned seed chain, so payload construction
 /// cannot generate new candidates.
 ///
+/// This narrows grinding to the single propose-or-withhold choice the committing leader
+/// always has; it does not make `PREVRANDAO` unbiasable. See
+/// [`EpochSeedChainValue`](crate::EpochSeedChainValue) on accepted last-actor bias.
+///
 /// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
 /// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
 /// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting
@@ -309,6 +313,12 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 ///
 /// The full fork schedule is logged at startup so operators can diff it across the fleet; a
 /// compile-time constant that differs between binaries has no other in-protocol detection.
+///
+/// Accepted residual (#1247): the seed chain closes payload grinding, but the committing
+/// leader can still compute every `PREVRANDAO` its commit will produce before broadcasting
+/// and withhold the proposal if it dislikes them . . . one propose-or-withhold choice per
+/// commit. This fork promotes that bias into an opcode contracts can read; contracts that
+/// need unbiasable randomness must not use `PREVRANDAO` alone.
 #[cfg(feature = "adiri")]
 pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
 
@@ -798,6 +808,38 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+/// Every `test-utils` fork-epoch override actually in force in this process, for the startup
+/// fork-schedule log (#1086).
+///
+/// Callable from any build so the CLI logs the effective schedule without having to know whether
+/// `tn-types`' `test-utils` was unified into the binary it is compiled into. Always empty in a
+/// production binary, where the overrides are compiled out and no environment variable can
+/// repoint a fork; empty in a `test-utils` build too when nothing is exported. Without this the
+/// startup line reports the compiled constants only, and a `test-utils` binary whose forks its
+/// harness pinned elsewhere (the e2e harness holds all but the leader-seeded fork dormant) logs
+/// "active from genesis" while executing the legacy derivations — the shape of a `mix_hash`
+/// mismatch that is otherwise invisible in the logs.
+///
+/// Only variables that parsed are listed, so an entry means "pinned here", absence means "using
+/// this build's own fork point". Values latch on first read like the individual overrides do.
+pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
+    #[cfg(feature = "test-utils")]
+    {
+        [
+            ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
+            ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
+            ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+            ("TN_REGION_SHUFFLE_FORK_EPOCH", region_shuffle_fork_epoch_override()),
+            ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
+        ]
+        .into_iter()
+        .filter_map(|(var, fork_epoch)| fork_epoch.map(|fork_epoch| (var, fork_epoch)))
+        .collect()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1003,175 @@ mod tests {
                 prevrandao_fork_point_active(epoch),
                 prevrandao_build_fork_active(epoch),
                 "an unset override must not shift the fork point at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Sentinel selecting the child of
+    /// [`prevrandao_stays_legacy_while_seed_fork_is_dormant`], independent of the fork overrides
+    /// so a lane-exported override cannot be mistaken for a child spawn.
+    #[cfg(feature = "test-utils")]
+    const TN_TEST_PREVRANDAO_CONJUNCT_CHILD: &str = "TN_TEST_PREVRANDAO_CONJUNCT_CHILD";
+
+    /// The fail-closed conjunction of [`prevrandao_seed_active`]: epochs where the seed
+    /// fork is dormant stay on the legacy arm regardless of the PREVRANDAO fork point.
+    ///
+    /// Pins the seed fork to "never fires" and the PREVRANDAO fork point to "active from
+    /// genesis", the exact ordering the conjunct exists for. If the gate ever consulted the
+    /// fork point alone, every seed-dormant epoch would promote the forkable legacy
+    /// leader-aggregate seed into `PREVRANDAO`; this test observes that ordering directly
+    /// instead of relying on the compile-time `>=` assertion between the two constants.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn prevrandao_stays_legacy_while_seed_fork_is_dormant() -> std::io::Result<()> {
+        // Both overrides latch in process-wide `OnceLock`s. Set them in the child environment
+        // before any read, keeping the parent process's unset-override tests independent.
+        let exe = std::env::current_exe()?;
+        let fn_name = "child_prevrandao_seed_conjunct_blocks";
+        let name = module_path!()
+            .split_once("::")
+            .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"));
+        let output = std::process::Command::new(exe)
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .env(TN_TEST_PREVRANDAO_CONJUNCT_CHILD, "1")
+            .env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string())
+            .env("TN_PREVRANDAO_FORK_EPOCH", "0")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}",
+            output.status,
+        );
+        Ok(())
+    }
+
+    /// Child of [`prevrandao_stays_legacy_while_seed_fork_is_dormant`], with the seed fork
+    /// dormant and the PREVRANDAO fork point active from genesis so only the seed conjunct
+    /// can keep the public gate closed.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    #[ignore = "spawned by prevrandao_stays_legacy_while_seed_fork_is_dormant with a controlled env"]
+    fn child_prevrandao_seed_conjunct_blocks() {
+        assert!(
+            std::env::var_os(TN_TEST_PREVRANDAO_CONJUNCT_CHILD).is_some(),
+            "this child runs only under prevrandao_stays_legacy_while_seed_fork_is_dormant, \
+             which pins both fork overrides in the spawn env",
+        );
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(u32::MAX),
+            "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
+             spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        assert_eq!(
+            prevrandao_fork_epoch_override(),
+            Some(0),
+            "this child requires TN_PREVRANDAO_FORK_EPOCH=0 latched from its spawn env; \
+             the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        // The seed gate is `>=`, so `u32::MAX` itself fires it: the dormant grid stops one
+        // below. Every epoch on it has the fork point active (anti-vacuity: the conjunction
+        // is actually being exercised) yet must stay on the legacy arm.
+        [0, 1, 2, u32::MAX - 1].into_iter().for_each(|epoch| {
+            assert!(
+                prevrandao_fork_point_active(epoch),
+                "anti-vacuity: the pinned fork point must be active at epoch {epoch}",
+            );
+            assert!(
+                !seed_signature_active(epoch),
+                "the seed fork must be dormant at epoch {epoch} under the never-fires pin",
+            );
+            assert!(
+                !prevrandao_seed_active(epoch),
+                "seed-dormant epoch {epoch} must stay on the legacy arm even with the \
+                 PREVRANDAO fork point active: the gate fails closed",
+            );
+        });
+    }
+
+    /// [`fork_epoch_overrides`] reports exactly the pins in force, and nothing else.
+    ///
+    /// Runs in every feature set: without `test-utils` the list is unconditionally empty, and with
+    /// it the list is empty in a process that exported nothing. That second case is why the
+    /// startup log can print an entry and mean it — the same reason every
+    /// `*_override_is_inert_when_unset` test needs a variable-free process, and the same loud
+    /// failure if one latched first.
+    ///
+    /// The `pinned` list below must name every fork that has a `test-utils` override; a fork added
+    /// to [`fork_epoch_overrides`] but not here fails the length assert only in a process that
+    /// exports it.
+    #[test]
+    fn fork_epoch_overrides_lists_only_the_pins_in_force() {
+        #[cfg(not(feature = "test-utils"))]
+        assert!(
+            fork_epoch_overrides().is_empty(),
+            "a build without test-utils compiles the overrides out and can never report one",
+        );
+        #[cfg(feature = "test-utils")]
+        {
+            let reported = fork_epoch_overrides();
+            let pinned = [
+                ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
+                ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
+                ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+                ("TN_REGION_SHUFFLE_FORK_EPOCH", region_shuffle_fork_epoch_override()),
+                (
+                    "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
+                    leader_seeded_ordering_fork_epoch_override(),
+                ),
+            ];
+            pinned.into_iter().for_each(|(var, fork_epoch)| {
+                assert_eq!(
+                    reported.iter().find(|(name, _)| *name == var).map(|(_, epoch)| *epoch),
+                    fork_epoch,
+                    "{var} must be reported exactly when it is pinned, at the pinned value",
+                );
+            });
+            assert_eq!(
+                reported.len(),
+                pinned.iter().filter(|(_, fork_epoch)| fork_epoch.is_some()).count(),
+                "no fork may be reported that is not pinned: {reported:?}",
+            );
+        }
+    }
+
+    /// Seed-dormant epochs never take the seeded arm: the observable half of the fail-closed
+    /// conjunct documented on [`prevrandao_seed_active`].
+    ///
+    /// This pins the outcome, not the conjunct in isolation. Catching a deleted
+    /// `seed_signature_active(epoch) &&` needs an epoch where the fork point is active while the
+    /// seed fork is not, and no such epoch exists here: the const assert above forces
+    /// `PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH`, so every seed-dormant epoch is
+    /// fork-point-dormant too — asserted below so the limitation stays visible rather than
+    /// implied. The ordering assert is what enforces the contract for the shipped constants; the
+    /// runtime conjunct is the backstop for an override-driven schedule, and it is observable
+    /// only in a process that sets `TN_PREVRANDAO_FORK_EPOCH` below the seed fork.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn prevrandao_seed_active_stays_legacy_on_seed_dormant_epochs() {
+        // `saturating_sub` rather than `- 1` so a rollout that ever put the seed fork at genesis
+        // fails through the assertion message below instead of an underflow panic here.
+        [0, 1, SEED_SIGNATURE_FORK_EPOCH.saturating_sub(1)].into_iter().for_each(|epoch| {
+            assert!(
+                !seed_signature_active(epoch),
+                "epoch {epoch} must be seed-dormant for this test to mean anything",
+            );
+            assert!(
+                !prevrandao_seed_active(epoch),
+                "epoch {epoch} is seed-dormant, so the PREVRANDAO gate must stay closed \
+                 regardless of the fork point",
+            );
+            // the vacuity this test cannot escape, stated rather than left for a reader to
+            // rediscover: both conjuncts are false here, so either one alone would satisfy the
+            // assertion above
+            assert!(
+                !prevrandao_fork_point_active(epoch),
+                "epoch {epoch} is expected to be fork-point-dormant as well; if a schedule ever \
+                 makes it active here, this test becomes a live check of the seed conjunct and \
+                 this assertion is what should be deleted",
             );
         });
     }
