@@ -487,9 +487,12 @@ impl ConsensusChain {
             // Should get cleared in the normal course but this is
             // stopgap just in case.
             if staging_epoch < epoch {
-                self.clear_staging();
+                self.clear_staging().await;
             }
         }
+        // `old_pack` is the last handle to the just-replaced previous-epoch pack; async-close it so
+        // its background-thread join does not block a tokio worker on the way out.
+        old_pack.close().await;
         Ok(())
     }
 
@@ -576,7 +579,11 @@ impl ConsensusChain {
                 // open_append cannot observe the transient window where epoch-{N} is unlinked.
                 let _install = self.pack_install.lock().await;
                 let replace_current = self.current_pack.lock().epoch() == epoch;
-                drop(pack);
+                // Async-close the imported pack (the only handle) before the remove+rename:
+                // `close()` returns only after the inner `MmapDataFile`s drop (FDs
+                // released), same as the old blocking `Drop::join`, but without
+                // stalling a tokio worker.
+                pack.close().await;
                 // Make sure we don't have any cruft in the final dir.
                 if std::fs::exists(&base_dir).unwrap_or_default() {
                     // If this exists it is incomplete (see check at start of function).
@@ -591,7 +598,23 @@ impl ConsensusChain {
                 // leave a stale entry behind for other callers — any entry cached during
                 // the race is purged here. Readers after this point fall through and
                 // see the new on-disk pack.
-                self.recent_packs.lock().retain(|p| p.epoch() != epoch);
+                let evicted: Vec<ConsensusPack> = {
+                    let mut recents = self.recent_packs.lock();
+                    let mut kept = VecDeque::with_capacity(recents.len());
+                    let mut evicted = Vec::new();
+                    while let Some(p) = recents.pop_front() {
+                        if p.epoch() == epoch {
+                            evicted.push(p);
+                        } else {
+                            kept.push_back(p);
+                        }
+                    }
+                    *recents = kept;
+                    evicted
+                };
+                for p in evicted {
+                    p.close().await;
+                }
                 rename_err?;
                 // Make the epoch-{N} directory entry durable in base_path: this commits both
                 // the remove of any stale dir and the renamed-in import before we treat the
@@ -600,7 +623,11 @@ impl ConsensusChain {
                 fsync_directory(&self.base_path)?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
-                    *self.current_pack.lock() = ConsensusPack::open_static(&self.base_path, epoch)?;
+                    // Swap the old pack out under the lock, then async-close it after the guard
+                    // drops.
+                    let new_static = ConsensusPack::open_static(&self.base_path, epoch)?;
+                    let old = std::mem::replace(&mut *self.current_pack.lock(), new_static);
+                    old.close().await;
                 }
                 Ok(())
             }
@@ -755,11 +782,14 @@ impl ConsensusChain {
     }
 
     /// Drop the staging pack and remove its directory. Safe to call when none is staged.
-    pub fn clear_staging(&self) {
+    ///
+    /// Closes the staging pack with `close().await` so its background-thread join does not block a
+    /// tokio worker, then removes the staging directory.
+    pub async fn clear_staging(&self) {
         let staged = self.staging.lock().take();
         if let Some(staged) = staged {
             let epoch = staged.pack.epoch();
-            drop(staged);
+            staged.pack.close().await;
             let _ = std::fs::remove_dir_all(self.base_path.join(format!("staging-{epoch}")));
         }
     }
@@ -1287,17 +1317,24 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack);
         }
-        {
+        // Evict the oldest entry OUT of the lock scope: a `parking_lot` guard cannot be held across
+        // the `.await` below, and if the evicted pack is the last handle its `close()` must not run
+        // a blocking `Drop::join` on a tokio worker (let alone while holding the cache
+        // lock).
+        let evicted = {
             let mut recents = self.recent_packs.lock();
-            for p in recents.iter() {
-                if p.epoch() == epoch {
-                    return Ok(p.clone());
-                }
+            if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
+                return Ok(p.clone());
             }
             // Evict before the open+push below so the cache stays capped at PACK_CACHE_SIZE.
             if recents.len() >= Self::PACK_CACHE_SIZE {
-                let _ = recents.pop_front();
+                recents.pop_front()
+            } else {
+                None
             }
+        };
+        if let Some(old) = evicted {
+            old.close().await;
         }
         let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
         self.recent_packs.lock().push_back(pack.clone());
@@ -2235,8 +2272,8 @@ mod test {
         let staging_path = dst_dir.path().join("staging-0");
         assert!(std::fs::exists(&staging_path).unwrap_or(false), "staging dir should exist");
 
-        // clear_staging drops the pack and removes the dir.
-        dest.clear_staging();
+        // clear_staging closes the pack and removes the dir.
+        dest.clear_staging().await;
         assert_eq!(dest.staging_final(), None);
         assert!(dest.staging_consensus_output(1).await.is_none());
         assert!(
@@ -2346,7 +2383,7 @@ mod test {
 
         // After clearing staging, the previously staging-served numbers are gone again, but the
         // live pack's own numbers remain.
-        dest.clear_staging();
+        dest.clear_staging().await;
         assert!(
             dest.consensus_output_by_number(k + 1).await.is_err(),
             "after clear_staging, numbers past k are no longer available"
