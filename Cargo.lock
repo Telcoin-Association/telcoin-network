@@ -11821,6 +11821,7 @@ dependencies = [
  "jsonrpsee",
  "metrics",
  "metrics-util",
+ "parking_lot",
  "rand 0.9.2",
  "reth-metrics",
  "roaring 0.10.12",

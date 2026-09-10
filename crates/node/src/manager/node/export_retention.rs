@@ -1,12 +1,7 @@
 //! Serialized publication and bounded retention of completed state exports.
 
-use std::{
-    cmp::Reverse,
-    fs, io,
-    num::NonZeroUsize,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{cmp::Reverse, fs, io, num::NonZeroUsize, path::PathBuf, sync::Arc};
 use tn_types::Epoch;
 use tracing::{info, warn};
 
@@ -47,10 +42,7 @@ impl StateExportRetention {
     pub(super) async fn prune(&self) {
         let retention = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _guard = retention
-                .gate
-                .lock()
-                .map_err(|_| io::Error::other("state-export retention lock poisoned"))?;
+            let _guard = retention.gate.lock();
             retention.completed_epochs().map(|epochs| retention.prune_completed(epochs))
         })
         .await
@@ -72,10 +64,7 @@ impl StateExportRetention {
     ) -> io::Result<PublishOutcome> {
         let retention = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = retention
-                .gate
-                .lock()
-                .map_err(|_| io::Error::other("state-export retention lock poisoned"))?;
+            let _guard = retention.gate.lock();
             let mut completed = retention.completed_epochs()?;
             if retention.keep.is_some_and(|keep| {
                 completed.iter().filter(|completed_epoch| **completed_epoch > epoch).count()
