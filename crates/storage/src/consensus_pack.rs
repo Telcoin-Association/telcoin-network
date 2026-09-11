@@ -29,7 +29,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     archive::{
@@ -868,6 +868,15 @@ impl Inner {
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
         let base_dir = base_dir.as_ref();
+        // Recovery replays the whole data-file WAL, so it can take time proportional to pack size.
+        // Log the start (and the completion below) so a slow recovery is observable rather than a
+        // silent stall at startup.
+        let recover_start = std::time::Instant::now();
+        info!(
+            target: "consensus_pack",
+            dir = %base_dir.display(),
+            "pack opened unclean or inconsistent; replaying data-file WAL to recover"
+        );
         // Highest record end either index attests as durably indexed: the digest index's
         // `data_file_length` (the commit marker written last on an index sync) and the position
         // index's last `output_end`. Indexes sync on a clean close, not on every `persist()`, so
@@ -990,6 +999,14 @@ impl Inner {
         let len = data.file_len();
         consensus_digests.set_data_file_length(len);
         batch_digests.set_data_file_length(len);
+        info!(
+            target: "consensus_pack",
+            dir = %base_dir.display(),
+            records = idx,
+            recovered_end = consistent_end,
+            elapsed_ms = recover_start.elapsed().as_millis() as u64,
+            "pack WAL recovery complete"
+        );
         Ok((consensus_pos_idx, consensus_digests, batch_digests))
     }
 
@@ -4569,6 +4586,70 @@ pub(crate) mod test {
             std::fs::read(&data).expect("reread data"),
             before,
             "unrepairable epoch untouched"
+        );
+    }
+
+    /// Mid-log corruption — a damaged byte with valid records still behind it — is `Unrepairable`
+    /// at the `repair_epoch` level in BOTH dry-run and apply modes (truncation would drop
+    /// durably-committed outputs), and the pack is left byte-for-byte untouched. This is the
+    /// `repair_epoch`-level companion to `test_recover_mid_log_corruption_errors`, which asserts
+    /// the same damage errors at the lower `open_append`/`recover_pack` level.
+    #[tokio::test]
+    async fn test_repair_epoch_mid_log_is_unrepairable() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let temp_dir = TempDir::with_prefix("test_repair_mid_log").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Flip a byte inside output 2's header, a few bytes past the 4-byte record size prefix so
+        // the framing stays intact and output 2's batches + output 3 still decode AFTER the
+        // damage — the signature of mid-log corruption (valid records past the tear) rather
+        // than a torn tail.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let data = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&data).expect("open data");
+            f.seek(SeekFrom::Start(boundary + 20)).expect("seek");
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).expect("read");
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(boundary + 20)).expect("seek back");
+            f.write_all(&byte).expect("write");
+        }
+        // Force `repair_epoch` past its read-only `open_static` "healthy" short-circuit into the
+        // physical-corruption classifier: drop the digest indexes so the open fails. (A sealed
+        // pack's interior bit-flip is otherwise silent to `open_static`, which trusts the seal +
+        // indexes; it surfaces only at read time / via `db validate`.) This models damaged indexes
+        // sitting atop mid-log-corrupt data — repair must refuse, not rebuild indexes over the
+        // corruption.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(temp_dir.path().join("epoch-0").join(name))
+                .expect("remove digest dir");
+        }
+        let before = std::fs::read(&data).expect("read data");
+
+        // Dry run and apply both classify Unrepairable (the mid-log arm returns before the
+        // apply/dry-run split) and neither may touch the file.
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("dry run");
+        assert!(
+            matches!(dry, EpochRepair::Unrepairable(_)),
+            "mid-log dry run must be Unrepairable, got {dry:?}"
+        );
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("apply");
+        assert!(
+            matches!(applied, EpochRepair::Unrepairable(_)),
+            "mid-log apply must be Unrepairable, got {applied:?}"
+        );
+        assert_eq!(
+            std::fs::read(&data).expect("reread data"),
+            before,
+            "an unrepairable mid-log pack must be left untouched"
         );
     }
 

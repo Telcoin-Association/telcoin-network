@@ -274,8 +274,11 @@ pub struct PackValidationReport {
     pub first_consensus_number: Option<u64>,
     /// Consensus number of the last header in the file, if any.
     pub last_consensus_number: Option<u64>,
-    /// Every issue found, in file order.
+    /// Every issue found, in file order (capped at [`MAX_ISSUES`]; see `dropped_issues`).
     pub issues: Vec<PackIssue>,
+    /// Count of issues found beyond [`MAX_ISSUES`] and therefore not retained in `issues` (a
+    /// memory bound for hostile/pathological packs). Zero in the normal case.
+    pub dropped_issues: u64,
     /// Bucket-CRC scan of the sidecar digest indexes, if the `hash`/`bhash` dirs were present next
     /// to the data file. `None` for a bare-data-file validation (data-log integrity only).
     pub index_scan: Option<IndexBucketScan>,
@@ -290,6 +293,34 @@ impl PackValidationReport {
             .iter()
             .filter(|i| matches!(i, PackIssue::MissingBatch { class: c, .. } if *c == class))
             .count()
+    }
+}
+
+/// Upper bound on individual [`PackIssue`]s retained by [`validate_pack_file`]. A pathological or
+/// crafted pack can yield an issue per record; retaining them all is unbounded memory. Past this
+/// many, further issues are counted (`dropped_issues`) but not stored — the verdict is already
+/// `Invalid` and the summary + first rows suffice to diagnose.
+const MAX_ISSUES: usize = 100_000;
+
+/// A `Vec<PackIssue>` that stops growing at [`MAX_ISSUES`], counting further pushes instead of
+/// storing them, so validating a hostile pack cannot exhaust memory on the issue list.
+#[derive(Default)]
+struct BoundedIssues {
+    issues: Vec<PackIssue>,
+    dropped: u64,
+}
+
+impl BoundedIssues {
+    fn push(&mut self, issue: PackIssue) {
+        if self.issues.len() < MAX_ISSUES {
+            self.issues.push(issue);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.issues.is_empty()
     }
 }
 
@@ -317,7 +348,7 @@ pub fn validate_pack_file(
         Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
 
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
-    let mut issues = Vec::new();
+    let mut issues = BoundedIssues::default();
 
     let mut iter = pack.raw_iter().map_err(|e| PackError::ReadError(e.to_string()))?;
 
@@ -520,7 +551,7 @@ fn verify_v0_data(
     epoch: Epoch,
     mut expected_parent: Option<ConsensusHeaderDigest>,
     start_consensus_number: u64,
-    mut issues: Vec<PackIssue>,
+    mut issues: BoundedIssues,
 ) -> Result<PackValidationReport, PackError> {
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
@@ -644,7 +675,7 @@ fn verify_v1_data(
     epoch: Epoch,
     mut expected_parent: Option<ConsensusHeaderDigest>,
     start_consensus_number: u64,
-    mut issues: Vec<PackIssue>,
+    mut issues: BoundedIssues,
 ) -> Result<PackValidationReport, PackError> {
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
@@ -736,7 +767,7 @@ fn verify_v1_data(
 /// Mirrors the per-header batch checks `verify_v0_data` performs inline, plus the v1-only ordering
 /// check. `MissingBatch` is recorded with a placeholder [`BatchClass::Absent`]; the final class is
 /// resolved in [`finalize_report`] once every digest in the file is known.
-fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mut Vec<PackIssue>) {
+fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mut BoundedIssues) {
     let number = header.number;
     let collected_set: HashSet<BlockHash> = collected.iter().copied().collect();
 
@@ -791,10 +822,10 @@ fn finalize_report(
     consensus_count: u64,
     first_consensus_number: Option<u64>,
     last_consensus_number: Option<u64>,
-    mut issues: Vec<PackIssue>,
+    mut issues: BoundedIssues,
     all_batch_digests: &HashSet<BlockHash>,
 ) -> PackValidationReport {
-    for issue in issues.iter_mut() {
+    for issue in issues.issues.iter_mut() {
         if let PackIssue::MissingBatch { digest, class, .. } = issue {
             *class = if all_batch_digests.contains(digest) {
                 BatchClass::Misordered
@@ -805,6 +836,7 @@ fn finalize_report(
     }
 
     let verdict = if issues.is_empty() { Verdict::Valid } else { Verdict::Invalid };
+    let BoundedIssues { issues, dropped } = issues;
     PackValidationReport {
         epoch,
         start_consensus_number,
@@ -813,6 +845,7 @@ fn finalize_report(
         first_consensus_number,
         last_consensus_number,
         issues,
+        dropped_issues: dropped,
         // Filled in by `validate_pack_file` after the data-stream walk (the builder only sees the
         // stream); the verdict is refined there too if the index scan is not clean.
         index_scan: None,
@@ -882,7 +915,16 @@ impl Display for PackValidationReport {
             }
         }
         writeln!(f)?;
-        writeln!(f, "issues: {} total", self.issues.len())?;
+        if self.dropped_issues > 0 {
+            writeln!(
+                f,
+                "issues: {} retained (+{} suppressed to bound memory)",
+                self.issues.len(),
+                self.dropped_issues
+            )?;
+        } else {
+            writeln!(f, "issues: {} total", self.issues.len())?;
+        }
         writeln!(f, "  chain breaks:           {chain_breaks}")?;
         writeln!(
             f,

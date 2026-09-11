@@ -287,17 +287,20 @@ impl DbRepairArgs {
         let runtime =
             tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
         runtime.block_on(async {
-            let mut repaired = 0usize;
+            // Counts both applied repairs (`--force` → `Repaired`) and dry-run findings
+            // (`WouldRepair`); the two variants are mutually exclusive per invocation, and the
+            // summary verb below reflects which one actually ran.
+            let mut actionable = 0usize;
             let mut lost = 0usize;
             for epoch in &targets {
                 match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
                     Ok(EpochRepair::Healthy) => println!("epoch {epoch}: OK"),
                     Ok(EpochRepair::Repaired(what)) => {
-                        repaired += 1;
+                        actionable += 1;
                         println!("epoch {epoch}: REPAIRED — {what}");
                     }
                     Ok(EpochRepair::WouldRepair(what)) => {
-                        repaired += 1;
+                        actionable += 1;
                         println!("epoch {epoch}: would repair — {what}");
                     }
                     Ok(EpochRepair::Unrepairable(why)) => {
@@ -335,7 +338,7 @@ impl DbRepairArgs {
 
             let verb = if self.force { "repaired" } else { "to repair (dry run)" };
             println!(
-                "\nsummary: {repaired} epoch(s) {verb}, {lost} unrepairable (data loss / re-sync)."
+                "\nsummary: {actionable} epoch(s) {verb}, {lost} unrepairable (data loss / re-sync)."
             );
             Ok::<(), eyre::Report>(())
         })?;

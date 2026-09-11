@@ -1089,8 +1089,15 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
-        self.consensus_chain.persist_current().await?;
+        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error —
+        // `wait_for_task_shutdown()` drops the task-held `consensus_chain` clones, which is what
+        // lets `shutdown()`'s `close().await` hold the last reference and run off-worker.
+        // Surfacing the persist error before draining (a bare `?`) would leave a straggler
+        // clone whose blocking `Drop` then stalls a tokio worker. Persist error still takes
+        // precedence over `result`.
+        let persist_result = self.consensus_chain.persist_current().await;
         node_task_manager.wait_for_task_shutdown().await;
+        persist_result?;
 
         result
     }
