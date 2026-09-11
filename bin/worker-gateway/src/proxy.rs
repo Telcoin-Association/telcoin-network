@@ -483,10 +483,12 @@ mod tests {
     /// well-formed, non-blob raw transaction that must be forwarded untouched.
     const EIP155_LEGACY_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
 
-    /// The hex of a genuine, decodable transaction of a type outside the batch
-    /// allowlist: EIP-7702 (type 4) is the cheapest such type, needing no
-    /// sidecar. Built from a default body and a dummy signature, since
-    /// `decode_2718` checks structure, not signature validity.
+    /// The hex of a genuine, decodable EIP-7702 (type 4) transaction whose
+    /// authorization list is empty. Type 4 is on the batch allowlist, so this
+    /// fixture is rejected for its list, not its type: the empty list fails
+    /// `batch_allowlisted_authorization_list`'s lower bound. Built from a
+    /// default body and a dummy signature, since `decode_2718` checks
+    /// structure, not signature validity.
     fn eip7702_empty_auth_list_raw_hex() -> String {
         let signature = EthSignature::new(U256::from(1), U256::from(1), false);
         let signed = TxEip7702::default().into_signed(signature);
@@ -555,7 +557,7 @@ mod tests {
             send_raw(&valid),
             send_raw(r#"["0xdeadbeef"]"#),
             send_raw(r#"["not-hex"]"#),
-            // Decodes cleanly, but to a type outside the batch allowlist.
+            // Decodes cleanly, but to an empty EIP-7702 authorization list.
             send_raw(&format!("[\"{}\"]", eip7702_empty_auth_list_raw_hex())),
             send_raw("[]"),
             send_raw(r#"[123]"#),
