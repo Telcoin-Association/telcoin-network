@@ -637,7 +637,7 @@ mod tests {
     use tn_types::DefaultHashFunction;
 
     use super::*;
-    use crate::archive::pack::PackCompression;
+    use crate::archive::{data_file::SENTINEL_LEN, pack::PackCompression};
 
     /// Deterministic 32-byte key from an integer.
     fn key_of(i: u64) -> [u8; 32] {
@@ -796,7 +796,12 @@ mod tests {
             idx.sync().expect("sync");
         }
         let before = std::fs::metadata(&file).expect("meta").len();
-        assert!(before.is_multiple_of(PAGE_SIZE as u64), "clean close leaves whole pages");
+        // MmapDataFile appends an 8-byte clean-close sentinel on drop, so the physical size is
+        // page_count * PAGE_SIZE + SENTINEL_LEN, not a bare multiple of PAGE_SIZE.
+        assert!(
+            (before - SENTINEL_LEN).is_multiple_of(PAGE_SIZE as u64),
+            "clean close leaves whole pages (excluding sentinel): before={before}"
+        );
 
         // Simulate a torn tail: append a few sub-page bytes past the committed pages.
         {
