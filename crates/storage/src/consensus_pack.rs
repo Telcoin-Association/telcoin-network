@@ -389,7 +389,7 @@ impl ConsensusPack {
         // Healthy check: a read-only open is side-effect free and proves data + indexes + seal
         // agree.
         if let Ok(pack) = Self::open_static(epochs_dir, epoch) {
-            drop(pack);
+            pack.close().await;
             return Ok(EpochRepair::Healthy);
         }
 
@@ -439,7 +439,8 @@ impl ConsensusPack {
         match Self::open_append_exists(epochs_dir, epoch) {
             Ok(pack) => {
                 pack.persist().await?;
-                drop(pack);
+                // Async-close (sole handle) so the background-thread join does not block a worker.
+                pack.close().await;
             }
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(

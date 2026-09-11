@@ -781,7 +781,12 @@ impl ConsensusChain {
             let _ = std::fs::remove_dir_all(&staging_base);
             return Err(e);
         }
-        *self.staging.lock() = Some(StagingPack { pack, final_number });
+        // Install the new staging pack; if one was somehow still installed, async-close it outside
+        // the lock rather than dropping it (blocking-join) under the guard.
+        let previous = self.staging.lock().replace(StagingPack { pack, final_number });
+        if let Some(previous) = previous {
+            previous.pack.close().await;
+        }
         Ok(())
     }
 

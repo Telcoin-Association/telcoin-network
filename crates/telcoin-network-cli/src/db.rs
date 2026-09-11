@@ -287,7 +287,7 @@ impl DbRepairArgs {
                         db.persist()
                             .await
                             .map_err(|e| eyre!("failed to persist epoch-records DB: {e}"))?;
-                        drop(db);
+                        db.close().await;
                         println!(
                             "epoch-records DB: healed (torn tails truncated, indexes rebuilt)"
                         );
@@ -762,7 +762,7 @@ fn restore_consensus_and_records(
         verify_and_save_epoch_records(&db, genesis_committee.bls_keys(), &records, &cert_by_hash)
             .await?;
         db.persist().await.map_err(|e| eyre!("failed to persist epoch records: {e}"))?;
-        drop(db);
+        db.close().await;
 
         // 2. Rebuild the closed epoch's consensus pack. Epoch 0 would need a pre-epoch-0 genesis
         //    descriptor that a data-only bundle doesn't carry, so the pack cannot be rebuilt and a
@@ -802,7 +802,7 @@ fn restore_consensus_and_records(
         // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
         // final consensus header before declaring success.
         let tip = pack.latest_consensus_header().await;
-        drop(pack);
+        pack.close().await;
         // Read-back failure and tip mismatch are different diagnoses and get different messages: a
         // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
         // could not be read at all. Both roll the epoch dir back, matching the import error path
