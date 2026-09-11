@@ -178,6 +178,16 @@ impl<const KSIZE: usize> Node<KSIZE> {
         Self::set_entry_count(buf, n + 1);
     }
 
+    /// Remove the entry at leaf slot `i` by shifting the tail one position left.
+    pub(crate) fn leaf_delete(buf: &mut [u8], i: usize) {
+        let n = Self::entry_count(buf);
+        let ks = Self::LEAF_KEYS_OFF;
+        buf.copy_within(ks + (i + 1) * KSIZE..ks + n * KSIZE, ks + i * KSIZE);
+        let vs = Self::LEAF_VALUES_OFF;
+        buf.copy_within(vs + (i + 1) * VALUE_SIZE..vs + n * VALUE_SIZE, vs + i * VALUE_SIZE);
+        Self::set_entry_count(buf, n - 1);
+    }
+
     /// Split a full leaf into `left` (rewritten in place) and `right` (fully written, minus the
     /// prev/next links which the caller fixes), inserting `(key, val)` at sorted slot `at`.
     /// Returns the separator key = right leaf's first key.  `right` may be any scratch buffer.

@@ -501,6 +501,40 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         Ok(())
     }
 
+    // ---- removal ----
+
+    fn remove_kv(&mut self, key: &[u8]) -> Result<bool, AppendError> {
+        let mut pno = self.header.root_page;
+        for _ in 0..MAX_DEPTH {
+            let buf = self.page(pno).map_err(fetch_to_append)?;
+            if Node::<KSIZE>::is_leaf(buf) {
+                match Node::<KSIZE>::leaf_search(buf, key) {
+                    Err(_) => return Ok(false),
+                    Ok(i) => {
+                        let buf = self.page_mut(pno).map_err(fetch_to_append)?;
+                        Node::<KSIZE>::leaf_delete(buf, i);
+                        zero_crc(buf);
+                        self.header.values -= 1;
+                        self.synced = false;
+                        return Ok(true);
+                    }
+                }
+            }
+            let ci = Node::<KSIZE>::internal_child_index(buf, key);
+            pno = Node::<KSIZE>::internal_child(buf, ci);
+        }
+        Err(AppendError::SerializeValue("btree descent exceeded max depth".to_string()))
+    }
+
+    /// Remove `key` from the index. Returns `true` if the key was present and removed, `false` if
+    /// not found. No node merging is performed — underflowing leaves are left sparse.
+    pub fn remove(&mut self, key: [u8; KSIZE]) -> Result<bool, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.remove_kv(&key)
+    }
+
     // ---- durability (lazy CRC + msync, header-last commit) ----
 
     /// CRC every dirty (zero-CRC) data page in one pass. Page 0 (the header) is written separately.
@@ -573,6 +607,11 @@ impl BtreeIndex<32> {
     /// Load the file position for a `B256` digest (see [`Index::load`]).
     pub fn load_digest(&mut self, key: B256) -> Result<u64, FetchError> {
         self.load(key.0)
+    }
+
+    /// Remove a `B256` digest key (see [`BtreeIndex::remove`]).
+    pub fn remove_digest(&mut self, key: B256) -> Result<bool, AppendError> {
+        self.remove(key.0)
     }
 }
 
@@ -811,6 +850,57 @@ mod tests {
             BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
         assert_eq!(ro.len(), 500);
         assert!(matches!(ro.rebuild_from(entries.iter().copied()), Err(AppendError::ReadOnly)));
+    }
+
+    #[test]
+    fn test_archive_btx_remove() {
+        let tmp = TempDir::with_prefix("test_archive_btx_remove").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+        for i in 0..100u64 {
+            idx.save(key_of(i), i).expect("save");
+        }
+        assert_eq!(idx.len(), 100);
+
+        // Remove an existing key.
+        assert!(idx.remove(key_of(42)).expect("remove"), "expected true for present key");
+        assert_eq!(idx.len(), 99);
+        assert!(matches!(idx.load(key_of(42)), Err(FetchError::NotFound)), "42 should be gone");
+
+        // Remove again: not found.
+        assert!(!idx.remove(key_of(42)).expect("remove again"), "expected false for absent key");
+        assert_eq!(idx.len(), 99);
+
+        // Remove a key that was never inserted.
+        assert!(
+            !idx.remove(key_of(999)).expect("remove missing"),
+            "expected false for never-inserted key"
+        );
+
+        // Remaining keys are intact.
+        for i in 0..100u64 {
+            if i == 42 {
+                continue;
+            }
+            assert_eq!(idx.load(key_of(i)).expect("load"), i);
+        }
+
+        // Remove on read-only index is rejected.
+        idx.sync().expect("sync");
+        drop(idx);
+        let mut ro: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+        assert!(matches!(ro.remove(key_of(0)), Err(AppendError::ReadOnly)));
+
+        // remove_digest adapter.
+        drop(ro);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+        assert!(idx.remove_digest(B256::from(key_of(7))).expect("remove_digest"));
+        assert_eq!(idx.len(), 98);
     }
 
     #[test]
