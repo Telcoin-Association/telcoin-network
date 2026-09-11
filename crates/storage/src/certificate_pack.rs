@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use crate::{
     archive::{
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -265,6 +265,7 @@ impl CertificatePack {
     }
 }
 
+/// Base filename of the certificate pack's data file (`"cert_data"`) within an epoch directory.
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 
 #[derive(Debug)]
@@ -361,18 +362,34 @@ impl Inner {
     }
 }
 
+/// Error type for [`CertificatePack`] operations, surfaced by the background pack loop.
 #[derive(Debug, Clone)]
 pub enum PackError {
+    /// An underlying I/O error touching the pack's files.
     IO(Arc<io::Error>),
+    /// Appending a certificate to the data file failed; holds the source error's text.
     Append(String),
+    /// Recording a saved certificate's offset in the digest index failed; holds the source
+    /// error's text.
     IndexAppend(String),
+    /// Opening (or creating) the pack's data file or digest index failed.
     Open(Arc<OpenError>),
+    /// Reading/fetching a certificate back from the data file failed; holds the source error's
+    /// text.
     ReadError(String),
+    /// The channel to the background pack thread is closed, so the message could not be sent.
     SendFailed,
+    /// The bounded channel to the background pack thread is full
+    /// ([`try_save`](CertificatePack::try_save) only).
     SendFull,
+    /// The background pack thread's reply was dropped before it could be received.
     ReceiveFailed,
+    /// Flushing the data file and/or syncing the index to disk failed; holds the source error's
+    /// text.
     PersistError(String),
+    /// The pack file was detected to be corrupt.
     CorruptPack,
+    /// The background pack thread failed to join on shutdown.
     JoinFailed,
 }
 

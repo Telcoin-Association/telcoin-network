@@ -95,8 +95,11 @@ pub struct MdbxDatabase {
     inner: Environment,
 }
 
+/// Number of bytes in one megabyte, for expressing MDBX geometry sizes.
 pub const MEGABYTE: usize = 1024 * 1024;
+/// Number of bytes in one gigabyte, for expressing MDBX geometry sizes.
 pub const GIGABYTE: usize = MEGABYTE * 1024;
+/// Number of bytes in one terabyte, for expressing MDBX geometry sizes.
 pub const TERABYTE: usize = GIGABYTE * 1024;
 
 /// Returns the default page size that can be used in this OS.
@@ -329,6 +332,8 @@ impl Database for MdbxDatabase {
     }
 }
 
+/// Forward cursor iterator over a table, yielding decoded `(key, value)` pairs in ascending
+/// key order.
 #[derive(Debug)]
 pub struct MdbxIter<K, V>
 where
@@ -356,6 +361,8 @@ where
     }
 }
 
+/// Reverse cursor iterator over a table, yielding decoded `(key, value)` pairs in descending
+/// key order (starts at the last record, then walks backwards).
 #[derive(Debug)]
 pub struct MdbxRevIter<K, V>
 where

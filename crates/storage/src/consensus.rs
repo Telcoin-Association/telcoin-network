@@ -68,11 +68,20 @@ struct LatestConsensus {
 impl Drop for LatestConsensus {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
-            // exit.
+            // If we are the last reference then shutdown thread and wait for it to persist and
+            // exit. Reaching this with a live handle means close() was NOT used: a correct
+            // close().await already took the handle, so the block below is skipped. Drop is the
+            // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(), performing sync Drop now...");
                 if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
                     let _ = handle.join();
+                } else {
+                    // Full bounded channel — skip the join / detach. Durability
+                    // still holds: the detached thread clean-closes when the last Sender drops;
+                    // only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "consensus_chain", "Failed to send shutdown message to LatestConsensus (should be using close())");
                 }
             }
         }
@@ -87,6 +96,9 @@ enum LatestConsensusCommand {
     Persist(oneshot::Sender<()>),
     /// Persist then shutdown the background thread.
     Shutdown,
+    /// Persist then shutdown the background thread.
+    /// Notify async when done (avoid blocking any tokio tasks waiting on join()).
+    AsyncShutdown(oneshot::Sender<()>),
 }
 
 impl LatestConsensus {
@@ -163,6 +175,9 @@ impl LatestConsensus {
                 }
             }
             while let Some(com) = rx.blocking_recv() {
+                // Note, that code called in this thread should NEVER panic since that will orphan
+                // the slot file. This is acceptable since panic should never occur
+                // in properly written code.
                 match com {
                     LatestConsensusCommand::Update(old_epoch, epoch, number, slot) => {
                         let f = match slot {
@@ -190,6 +205,12 @@ impl LatestConsensus {
                     LatestConsensusCommand::Shutdown => {
                         sync_all_with_log(&slot1);
                         sync_all_with_log(&slot2);
+                        break;
+                    }
+                    LatestConsensusCommand::AsyncShutdown(tx) => {
+                        sync_all_with_log(&slot1);
+                        sync_all_with_log(&slot2);
+                        let _ = tx.send(());
                         break;
                     }
                 }
@@ -281,6 +302,24 @@ impl LatestConsensus {
         self.state.lock().number
     }
 
+    /// Take ownership and close async so we Drop does not get a chance to block any threads.
+    /// Note, will only close if this is the last reference to this object.
+    /// Essentially this an async drop.
+    async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed...
+                // This check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(LatestConsensusCommand::AsyncShutdown(tx)).await.is_ok() {
+                // Lets do an async wait for confirmition vs a sync join() on the thread.
+                let _ = rx.await;
+            }
+        }
+    }
+
     /// Return the current slot value (for testing).
     #[cfg(test)]
     fn current_slot(&self) -> ConsensusSlot {
@@ -355,7 +394,7 @@ impl ConsensusChain {
         } else {
             // If we are running already then we should have a pack for the latest epoch so it is
             // Ok to error out here if it is missing. Open it in append mode (not static): this
-            // runs trunc_and_heal to repair a torn write from a hard crash mid-epoch, and leaves
+            // runs recover_pack to repair a torn write from a hard crash mid-epoch, and leaves
             // the pack writable so the node can resume saving outputs for this epoch without
             // waiting for new_epoch to flip a read-only pack to append.
             Arc::new(Mutex::new(ConsensusPack::open_append_exists(
@@ -368,7 +407,7 @@ impl ConsensusChain {
         let pack_install = Arc::new(tokio::sync::Mutex::new(()));
         // Any staging dirs left from a previous run are stale; start clean. The staging pack only
         // ever holds transient, re-fetchable catch-up data.
-        Self::remove_all_staging_dirs(&base_path);
+        Self::remove_all_staging_and_import_dirs(&base_path);
         let staging = Arc::new(Mutex::new(None));
         Ok(Self {
             base_path,
@@ -453,16 +492,24 @@ impl ConsensusChain {
         old_pack.persist().await?;
         let epoch = committee.epoch();
         let pack = ConsensusPack::open_append(&self.base_path, previous_epoch, committee)?;
-        pack.persist().await?; // Surface any open errors.
+        if let Err(e) = pack.persist().await {
+            // Surface any open errors — async-close the just-opened pack (the only handle) instead
+            // of letting its blocking `Drop` join the background thread on this tokio worker.
+            pack.close().await;
+            return Err(e.into());
+        }
         *self.current_pack.lock() = pack;
         if let Some(staging_epoch) = self.staging_epoch() {
             // If we have moved past the staging pack then clear it.
             // Should get cleared in the normal course but this is
             // stopgap just in case.
             if staging_epoch < epoch {
-                self.clear_staging();
+                self.clear_staging().await;
             }
         }
+        // `old_pack` is the last handle to the just-replaced previous-epoch pack; async-close it so
+        // its background-thread join does not block a tokio worker on the way out.
+        old_pack.close().await;
         Ok(())
     }
 
@@ -524,23 +571,30 @@ impl ConsensusChain {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
-                pack.persist().await?;
-                match pack.latest_consensus_header().await? {
-                    Some(last_header) => {
-                        // The chain was verified as it was streamed.  So if the final block matches
-                        // the expected final_consensus then the entire pack
-                        // file should be valid.
-                        if epoch_record.final_consensus.number != last_header.number
-                            || epoch_final_hash != last_header.digest()
+                // Validate the imported pack; on ANY failure async-close it (the only handle)
+                // instead of leaving it to the blocking `Drop` join on this tokio
+                // worker. The chain was verified as it was streamed, so a final
+                // block matching the expected `final_consensus` means the entire
+                // pack file is valid.
+                let outcome: Result<(), ConsensusChainError> = async {
+                    pack.persist().await?;
+                    match pack.latest_consensus_header().await? {
+                        Some(h)
+                            if epoch_record.final_consensus.number == h.number
+                                && epoch_final_hash == h.digest() =>
                         {
-                            // Invalid final consensus header...
-                            return Err(ConsensusChainError::InvalidImport);
+                            Ok(())
                         }
-                    }
-                    None => {
+                        // Invalid final consensus header...
+                        Some(_) => Err(ConsensusChainError::InvalidImport),
                         // Missing a final consensus header...
-                        return Err(ConsensusChainError::EmptyImport);
+                        None => Err(ConsensusChainError::EmptyImport),
                     }
+                }
+                .await;
+                if let Err(e) = outcome {
+                    pack.close().await;
+                    return Err(e);
                 }
                 // Acquire the install lock only now — after the (multi-second) network
                 // download has finished writing into the temp import dir. It must NOT wrap
@@ -549,7 +603,11 @@ impl ConsensusChain {
                 // open_append cannot observe the transient window where epoch-{N} is unlinked.
                 let _install = self.pack_install.lock().await;
                 let replace_current = self.current_pack.lock().epoch() == epoch;
-                drop(pack);
+                // Async-close the imported pack (the only handle) before the remove+rename:
+                // `close()` returns only after the inner `MmapDataFile`s drop (FDs
+                // released), same as the old blocking `Drop::join`, but without
+                // stalling a tokio worker.
+                pack.close().await;
                 // Make sure we don't have any cruft in the final dir.
                 if std::fs::exists(&base_dir).unwrap_or_default() {
                     // If this exists it is incomplete (see check at start of function).
@@ -564,7 +622,23 @@ impl ConsensusChain {
                 // leave a stale entry behind for other callers — any entry cached during
                 // the race is purged here. Readers after this point fall through and
                 // see the new on-disk pack.
-                self.recent_packs.lock().retain(|p| p.epoch() != epoch);
+                let evicted: Vec<ConsensusPack> = {
+                    let mut recents = self.recent_packs.lock();
+                    let mut kept = VecDeque::with_capacity(recents.len());
+                    let mut evicted = Vec::new();
+                    while let Some(p) = recents.pop_front() {
+                        if p.epoch() == epoch {
+                            evicted.push(p);
+                        } else {
+                            kept.push_back(p);
+                        }
+                    }
+                    *recents = kept;
+                    evicted
+                };
+                for p in evicted {
+                    p.close().await;
+                }
                 rename_err?;
                 // Make the epoch-{N} directory entry durable in base_path: this commits both
                 // the remove of any stale dir and the renamed-in import before we treat the
@@ -573,7 +647,11 @@ impl ConsensusChain {
                 fsync_directory(&self.base_path)?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
-                    *self.current_pack.lock() = ConsensusPack::open_static(&self.base_path, epoch)?;
+                    // Swap the old pack out under the lock, then async-close it after the guard
+                    // drops.
+                    let new_static = ConsensusPack::open_static(&self.base_path, epoch)?;
+                    let old = std::mem::replace(&mut *self.current_pack.lock(), new_static);
+                    old.close().await;
                 }
                 Ok(())
             }
@@ -581,12 +659,13 @@ impl ConsensusChain {
         }
     }
 
-    /// Return a stream reader for the log file of epoch.
-    /// Verifies the epoch pack is complete or will return an error.
+    /// Return a stream reader for the data file of `epoch` together with its logical length.
+    /// Verifies the epoch pack is complete or returns an error. The caller streams exactly `[0,
+    /// data_len)`.
     pub async fn get_epoch_stream(
         &self,
         epoch: Epoch,
-    ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
+    ) -> Result<(Box<dyn ReadStream>, u64), ConsensusChainError> {
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
                 match pack.latest_consensus_header().await? {
@@ -595,13 +674,17 @@ impl ConsensusChain {
                         if epoch_record.final_consensus.number == last_header.number
                             && epoch_final_hash == last_header.digest()
                         {
+                            // Return the logical data length so the caller streams exactly
+                            // `[0, data_len)` and never the mmap capacity padding the physical file
+                            // may carry past `end`. A sealed epoch was clean-closed (physical ==
+                            // logical) and `open_static` already rejects an inconsistent file, so
+                            // this bound is belt-and-suspenders — but it lets the pack own its own
+                            // length instead of a network-triggered truncate of the served file.
+                            let data_len = pack.data_file_len().await?;
                             drop(pack);
-                            // Remove the other open file.
-                            // Should not matter a "complete" pack file should not be changed or
-                            // moved again.
                             let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                             let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
-                            Ok(Box::new(stream))
+                            Ok((Box::new(stream), data_len))
                         } else {
                             Err(ConsensusChainError::StreamUnavailable)
                         }
@@ -642,11 +725,16 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*` directories under `base_path` (stale from a prior run).
-    fn remove_all_staging_dirs(base_path: &Path) {
+    /// Remove any leftover `staging-*` or `import-*` directories under `base_path` (stale from a
+    /// prior run).
+    fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
-                if entry.file_name().to_str().is_some_and(|n| n.starts_with("staging-")) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("staging-") || n.starts_with("import-"))
+                {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -684,23 +772,38 @@ impl ConsensusChain {
             timeout,
         )
         .await?;
-        pack.persist().await?;
-        // The chain was verified link-by-link as it streamed; confirm the prefix ends exactly at
-        // the requested final consensus so the staged data is trustworthy.
-        match pack.latest_consensus_header().await? {
-            Some(last)
-                if last.number == final_number
-                    && last.digest() == epoch_record.final_consensus.hash => {}
-            Some(_) => {
-                let _ = std::fs::remove_dir_all(&staging_base);
-                return Err(ConsensusChainError::InvalidImport);
-            }
-            None => {
-                let _ = std::fs::remove_dir_all(&staging_base);
-                return Err(ConsensusChainError::EmptyImport);
+        // Validate the streamed prefix; on ANY failure async-close the pack (the only handle)
+        // instead of the blocking `Drop` join on this tokio worker, then drop the staging
+        // dir. The chain was verified link-by-link as it streamed; confirm the prefix ends
+        // exactly at the requested final consensus so the staged data is trustworthy.
+        let outcome: Result<(), ConsensusChainError> = async {
+            pack.persist().await?;
+            match pack.latest_consensus_header().await? {
+                Some(last)
+                    if last.number == final_number
+                        && last.digest() == epoch_record.final_consensus.hash =>
+                {
+                    Ok(())
+                }
+                // Invalid final consensus header...
+                Some(_) => Err(ConsensusChainError::InvalidImport),
+                // Missing a final consensus header...
+                None => Err(ConsensusChainError::EmptyImport),
             }
         }
-        *self.staging.lock() = Some(StagingPack { pack, final_number });
+        .await;
+        if let Err(e) = outcome {
+            // Close first (releases the pack's FDs and stops its thread) then remove the dir.
+            pack.close().await;
+            let _ = std::fs::remove_dir_all(&staging_base);
+            return Err(e);
+        }
+        // Install the new staging pack; if one was somehow still installed, async-close it outside
+        // the lock rather than dropping it (blocking-join) under the guard.
+        let previous = self.staging.lock().replace(StagingPack { pack, final_number });
+        if let Some(previous) = previous {
+            previous.pack.close().await;
+        }
         Ok(())
     }
 
@@ -723,11 +826,14 @@ impl ConsensusChain {
     }
 
     /// Drop the staging pack and remove its directory. Safe to call when none is staged.
-    pub fn clear_staging(&self) {
+    ///
+    /// Closes the staging pack with `close().await` so its background-thread join does not block a
+    /// tokio worker, then removes the staging directory.
+    pub async fn clear_staging(&self) {
         let staged = self.staging.lock().take();
         if let Some(staged) = staged {
             let epoch = staged.pack.epoch();
-            drop(staged);
+            staged.pack.close().await;
             let _ = std::fs::remove_dir_all(self.base_path.join(format!("staging-{epoch}")));
         }
     }
@@ -1095,6 +1201,45 @@ impl ConsensusChain {
         Ok(())
     }
 
+    /// Async-close every background thread this chain owns — the current epoch pack, the cached
+    /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
+    /// instead of letting each object's `Drop` run a blocking thread `join()` on the caller's
+    /// thread (which would stall the async runtime).
+    ///
+    /// Reliable only when this is the LAST `ConsensusChain` reference: each `Arc::try_unwrap`
+    /// succeeds only then, so any object still shared by another clone is left for its own `Drop`
+    /// to close. Intended for graceful shutdown, after all task-held clones have been dropped.
+    pub async fn close(self) {
+        let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
+        if let Ok(pack) = Arc::try_unwrap(current_pack) {
+            pack.into_inner().close().await;
+        }
+        if let Ok(packs) = Arc::try_unwrap(recent_packs) {
+            for pack in packs.into_inner() {
+                pack.close().await;
+            }
+        }
+        if let Ok(staged) = Arc::try_unwrap(staging) {
+            if let Some(staged) = staged.into_inner() {
+                staged.pack.close().await;
+            }
+        }
+        latest_consensus.close().await;
+        if let Ok(epochs) = Arc::try_unwrap(epochs) {
+            epochs.close().await;
+        }
+    }
+
+    /// The logical data length (`end`) of the current epoch's pack: the number of real record
+    /// bytes, excluding the mmap capacity padding past `end`. The state export copies the pack's
+    /// `data` file and must bound its read to this length so it captures exactly the written
+    /// records (`[0, end)`, immutable append-only bytes) and never the trailing padding — a raw
+    /// read-to-EOF copy would otherwise include the padding and fail the importer's record-CRC
+    /// walk. Bounding by length needs no truncation and is immune to any concurrent append.
+    pub async fn current_data_len(&self) -> Result<u64, ConsensusChainError> {
+        Ok(self.current_pack().data_file_len().await?)
+    }
+
     /// Return the latest consensus header for `epoch` by reading directly from the pack index,
     /// bypassing the slot files (LatestConsensus). This is always consistent with
     /// read_last_committed and should be used during startup recovery.
@@ -1216,21 +1361,46 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack);
         }
-        {
+        // Evict the oldest entry OUT of the lock scope: a `parking_lot` guard cannot be held across
+        // the `.await` below, and if the evicted pack is the last handle its `close()` must not run
+        // a blocking `Drop::join` on a tokio worker (let alone while holding the cache
+        // lock).
+        let evicted = {
             let mut recents = self.recent_packs.lock();
-            for p in recents.iter() {
-                if p.epoch() == epoch {
-                    return Ok(p.clone());
-                }
+            if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
+                return Ok(p.clone());
             }
             // Evict before the open+push below so the cache stays capped at PACK_CACHE_SIZE.
             if recents.len() >= Self::PACK_CACHE_SIZE {
-                let _ = recents.pop_front();
+                recents.pop_front()
+            } else {
+                None
             }
+        };
+        if let Some(old) = evicted {
+            old.close().await;
         }
         let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
-        self.recent_packs.lock().push_back(pack.clone());
-        Ok(pack)
+        // Final check after grabbing the lock again that another task did not also create the pack.
+        // Decide under the brief lock, then release it BEFORE any `.await` — a `parking_lot` guard
+        // must not be held across `close()` (same rule as the eviction block above), and the
+        // redundant pack's `close()` must not run under the cache lock. Unlikely to trigger but
+        // possible.
+        let existing = {
+            let mut recents = self.recent_packs.lock();
+            if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
+                Some(p.clone())
+            } else {
+                recents.push_back(pack.clone());
+                None
+            }
+        };
+        if let Some(p) = existing {
+            pack.close().await; // close the redundant open outside the lock
+            Ok(p)
+        } else {
+            Ok(pack)
+        }
     }
 
     /// Open the sealed static pack for `epoch` if its files exist on disk.
@@ -1341,7 +1511,7 @@ impl ConsensusChainReader for ConsensusChain {
             .map_err(Into::into)
     }
 
-    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<Box<dyn ReadStream>> {
+    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<(Box<dyn ReadStream>, u64)> {
         ConsensusChain::get_epoch_stream(self, epoch).await.map_err(Into::into)
     }
 
@@ -1380,19 +1550,34 @@ impl ConsensusChainWriter for ConsensusChain {
     }
 }
 
+/// Errors returned by [`ConsensusChain`] operations (open, save, stream import, epoch handoff).
 #[derive(Debug)]
 pub enum ConsensusChainError {
+    /// An underlying pack file operation failed; wraps the [`PackError`].
     PackError(PackError),
+    /// No current (writable) epoch is set on the chain.
     NoCurrentEpoch,
+    /// An I/O error occurred; wraps the [`std::io::Error`].
     IO(std::io::Error),
+    /// The current epoch does not contain the latest consensus header.
     EpochMismatch,
+    /// The current committee epoch and the previous epoch record are out of sync.
     PrevCommitteeEpochMismatch,
+    /// A CRC check failed while reading a record.
     CrcError,
+    /// An epoch record database operation failed; wraps the [`EpochDbError`].
     EpochDbError(EpochDbError),
+    /// The imported pack file contained no consensus output.
     EmptyImport,
+    /// The final consensus output in the imported pack file was invalid.
     InvalidImport,
+    /// The chain lacks the complete data needed to stream a pack file to a peer.
     StreamUnavailable,
+    /// Tried to save an output whose epoch does not match the current pack epoch
+    /// (fields: `pack_epoch`, `epoch`).
     InvalidPackEpoch(Epoch, Epoch),
+    /// The pack file is static (sealed) and the requested consensus number is missing,
+    /// so the output cannot be saved (field: consensus `number`).
     CantSaveAndNotAvailable(u64),
     /// A consensus output arrived with a number at or below the latest saved consensus number
     /// (fields: `latest`, `number`). Consensus numbers must strictly increase, so this means the
@@ -1684,6 +1869,45 @@ mod test {
         );
     }
 
+    /// `ConsensusChain::close` async-closes every background thread it owns (packs,
+    /// latest-consensus slot writer, epoch DB) without a blocking `Drop` join, and seals them:
+    /// a reopen from the same path finds every saved output.
+    #[tokio::test]
+    async fn test_consensus_chain_close_seals() {
+        let temp_dir = TempDir::with_prefix("test_chain_close").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain_spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain_spec.clone(), i + 1, parent);
+            parent = output.digest().into();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        // Async-close the whole chain (sole reference) instead of dropping.
+        consensus_chain.close().await;
+
+        // Reopen from the same path and confirm the outputs survived the close.
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        for i in 1..=3u64 {
+            assert!(
+                reopened.get_consensus_output_current(i).await.is_ok(),
+                "output {i} reads back after chain close"
+            );
+        }
+        reopened.close().await;
+    }
+
     /// A non-increasing consensus number is a hard error, never a silent `Ok(0)` skip.
     ///
     /// Reverting `save_consensus_output` to the silent skip lets a node whose startup resume
@@ -1778,9 +2002,10 @@ mod test {
         let consensus_chain2 =
             ConsensusChain::new(temp_dir2.path().to_owned(), committee.clone()).unwrap();
         consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
-        let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2
-            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
             .await
             .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
@@ -1797,7 +2022,7 @@ mod test {
     /// A node that crashes mid-epoch can leave the pack's data file longer than its indexes
     /// (a torn write). On restart `ConsensusChain::new` must heal that pack rather than fail to
     /// open, otherwise the node cannot restart. This opens the latest epoch with
-    /// `open_append_exists` (which runs `trunc_and_heal`); the old `open_static` path returned
+    /// `open_append_exists` (which runs `recover_pack`); the old `open_static` path returned
     /// `CorruptPack` here.
     #[tokio::test]
     async fn test_new_heals_torn_write_on_restart() {
@@ -2109,14 +2334,82 @@ mod test {
         let staging_path = dst_dir.path().join("staging-0");
         assert!(std::fs::exists(&staging_path).unwrap_or(false), "staging dir should exist");
 
-        // clear_staging drops the pack and removes the dir.
-        dest.clear_staging();
+        // clear_staging closes the pack and removes the dir.
+        dest.clear_staging().await;
         assert_eq!(dest.staging_final(), None);
         assert!(dest.staging_consensus_output(1).await.is_none());
         assert!(
             !std::fs::exists(&staging_path).unwrap_or(true),
             "staging dir should be removed after clear_staging"
         );
+    }
+
+    /// A partial import whose streamed prefix does not end at the expected `final_consensus` must
+    /// be rejected with `InvalidImport`. This exercises the error path where the imported pack
+    /// is the only handle: it must be async-`close()`d (not left to a blocking `Drop` join on
+    /// the worker) and its staging dir removed. The call must return promptly — a hang here
+    /// would mean `close()` deadlocked — and leave nothing staged.
+    #[tokio::test]
+    async fn test_import_partial_to_staging_invalid_rejects_and_cleans_up() {
+        use tokio::io::AsyncReadExt as _;
+
+        let src_dir = TempDir::with_prefix("test_staging_invalid_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(src_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let num_outputs = 20u64;
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            source.save_consensus_output(output).await.unwrap();
+        }
+
+        // Build a valid prefix up to `k`, but claim the WRONG final hash (zero) for it. The
+        // stream's internal link-by-link chain is fine, so stream_import succeeds — only
+        // the final-hash check in import_partial_to_staging fails, taking the
+        // `InvalidImport` error path.
+        let k = 12u64;
+        let (stream, len) = source.get_partial_epoch_stream(0, k).await.expect("partial stream");
+        let limited = stream.take(len);
+        let mut bad_record = previous_epoch.clone();
+        bad_record.final_consensus = ConsensusNumHash::new(k, Default::default());
+
+        let dst_dir = TempDir::with_prefix("test_staging_invalid_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let err = dest
+            .import_partial_to_staging(
+                limited,
+                &bad_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("mismatched final hash must be rejected");
+        assert!(
+            matches!(err, ConsensusChainError::InvalidImport),
+            "expected InvalidImport, got {err:?}"
+        );
+        // Nothing staged, and the staging dir was cleaned up after the pack was closed.
+        assert_eq!(dest.staging_final(), None, "a rejected import must not leave a staged pack");
+        assert!(
+            !std::fs::exists(dst_dir.path().join("staging-0")).unwrap_or(true),
+            "rejected import must remove its staging dir"
+        );
+        // The chain is still usable (the error path did not poison a lock or leave the dest
+        // wedged).
+        assert!(dest.get_consensus_output_current(1).await.is_err());
     }
 
     /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for
@@ -2220,7 +2513,7 @@ mod test {
 
         // After clearing staging, the previously staging-served numbers are gone again, but the
         // live pack's own numbers remain.
-        dest.clear_staging();
+        dest.clear_staging().await;
         assert!(
             dest.consensus_output_by_number(k + 1).await.is_err(),
             "after clear_staging, numbers past k are no longer available"
@@ -2492,7 +2785,8 @@ mod test {
             let target = Arc::new(
                 ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap(),
             );
-            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+            use tokio::io::AsyncReadExt as _;
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
 
             // Hammer `new_epoch` for the whole duration of the single concurrent
             // `stream_import` below, clearing the cached pack before each call so it actually
@@ -2520,7 +2814,12 @@ mod test {
             };
 
             let import_result = target
-                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .stream_import(
+                    stream.take(len),
+                    &epoch_record,
+                    &previous_epoch,
+                    Duration::from_secs(5),
+                )
                 .await;
             done.store(true, Ordering::Relaxed);
             let new_epoch_result = new_epoch_task.await.expect("new_epoch task panicked");
@@ -2590,9 +2889,15 @@ mod test {
             let target =
                 ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
             // Import epoch 0 from the source: the target's current pack becomes a static pack.
-            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+            use tokio::io::AsyncReadExt as _;
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
             target
-                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .stream_import(
+                    stream.take(len),
+                    &epoch_record,
+                    &previous_epoch,
+                    Duration::from_secs(5),
+                )
                 .await
                 .expect("stream import");
             // Replay the imported outputs the way an executing observer would; this advances

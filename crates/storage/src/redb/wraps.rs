@@ -5,6 +5,9 @@ use std::{fmt::Debug, marker::PhantomData};
 
 use tn_types::{decode, decode_key, encode, encode_key, KeyT, ValueT};
 
+/// Zero-sized marker type that adapts a telcoin `KeyT` to redb's `Key`/`Value`
+/// traits, encoding/decoding via `encode_key`/`decode_key` and ordering keys by
+/// raw byte comparison.
 #[derive(Debug)]
 pub struct KeyWrap<K: KeyT>(PhantomData<K>);
 impl<K: KeyT> Key for KeyWrap<K> {
@@ -51,6 +54,8 @@ impl<K: KeyT> Value for KeyWrap<K> {
     }
 }
 
+/// Zero-sized marker type that adapts a telcoin `ValueT` to redb's `Value`
+/// trait, encoding/decoding stored values via `encode`/`decode`.
 #[derive(Debug)]
 pub struct ValWrap<V: ValueT>(PhantomData<V>);
 impl<V: ValueT> Value for ValWrap<V> {

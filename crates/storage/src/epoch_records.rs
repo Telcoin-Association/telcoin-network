@@ -24,12 +24,12 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::{
         data_file::create_dir_synced,
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -90,6 +90,9 @@ enum EpochDbMessage {
     /// Flush all pending writes to disk.
     Persist(oneshot::Sender<Result<(), EpochDbError>>),
     Shutdown,
+    /// Async shutdown: clean-close the DB, then confirm on the channel (an async drop, so callers
+    /// avoid the blocking thread join in `Drop`).
+    AsyncShutdown(oneshot::Sender<()>),
 }
 
 /// Handle to the epoch records database.
@@ -119,6 +122,11 @@ fn run_db_loop(
     mut rx: Receiver<EpochDbMessage>,
     tx_error: watch::Sender<Option<EpochDbError>>,
 ) {
+    // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
+    // below.
+    let mut async_confirm: Option<oneshot::Sender<()>> = None;
+    // Note, that code called in this thread should NEVER panic since that will orphan the db
+    // files. This is acceptable since panic should never occur in properly written Inner code.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             // The four save arms latch first-error-wins: two queued saves can fail with no
@@ -212,20 +220,40 @@ fn run_db_loop(
                 let flushed = inner.persist();
                 let _ = tx.send(pending.map_or(flushed, Err));
             }
-            EpochDbMessage::Shutdown => {
-                let _ = inner.persist();
+            EpochDbMessage::Shutdown => break,
+            EpochDbMessage::AsyncShutdown(tx) => {
+                // Confirm AFTER the clean-close below so `close().await` returns only once the DB
+                // is fully sealed.
+                async_confirm = Some(tx);
                 break;
             }
         }
+    }
+    // Clean-close: dropping `inner` commits/seals the epochs + certs packs. Do it before confirming
+    // an async shutdown; it also runs for the sync `Shutdown` and channel-closed paths (the sync
+    // `Drop`'s `join()` waits on this return).
+    drop(inner);
+    if let Some(tx) = async_confirm {
+        let _ = tx.send(());
     }
 }
 
 impl Drop for EpochRecordDb {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
+            // Reaching this with a live handle means close() was NOT used: a correct close().await
+            // already took the handle, so the block below is skipped. Drop is the safety net; the
+            // proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "epoch-db", "EpochRecordDb dropped without calling close(), performing sync Drop now...");
                 if self.tx.try_send(EpochDbMessage::Shutdown).is_ok() {
                     let _ = handle.join();
+                } else {
+                    // Full bounded channel — skip the join / detach. Durability
+                    // still holds: the detached thread clean-closes when the last Sender drops;
+                    // only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "epoch-db", "Failed to send shutdown message to EpochRecordDb (should be using close())");
                 }
             }
         }
@@ -247,7 +275,16 @@ pub enum EpochRecordValidation {
     /// The record was checked against the trusted committee but failed one or more of the anchor
     /// checks. The booleans record which checks passed, for diagnostics. `epoch_matches` is false
     /// when the record is for a different epoch than the one that was requested.
-    Invalid { epoch_matches: bool, parents_match: bool, committee_valid: bool, cert_valid: bool },
+    Invalid {
+        /// True if the record is for the epoch that was requested.
+        epoch_matches: bool,
+        /// True if the record's parent hash matches the trusted anchor.
+        parents_match: bool,
+        /// True if the record is anchored to the locally-trusted committee.
+        committee_valid: bool,
+        /// True if the record carries a valid super-quorum certificate from that committee.
+        cert_valid: bool,
+    },
     /// No locally-trusted anchor is available for the record's epoch (the previous epoch record,
     /// or the genesis committee, is not stored locally), so the record cannot be validated.
     /// Callers should retry once the anchor is available rather than treat the record as invalid.
@@ -825,6 +862,23 @@ impl EpochRecordDb {
         })?
     }
 
+    /// Take ownership and clean-close the DB asynchronously, so `Drop` does not block a thread on a
+    /// `join()`. Only closes if this is the last reference; awaits confirmation that the background
+    /// thread sealed the packs. Essentially an async drop (mirrors [`ConsensusPack::close`]).
+    pub async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed; this check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(EpochDbMessage::AsyncShutdown(tx)).await.is_ok() {
+                // Async wait for the clean-close confirmation instead of a sync `join()`.
+                let _ = rx.await;
+            }
+        }
+    }
+
     /// Retrieve the committee keys for `epoch` if available.
     /// Tries the exact epoch first; falls back to the previous epoch's `next_committee`.
     /// Returns as a [`BTreeSet`] to enforce a stable order.
@@ -1085,7 +1139,9 @@ impl EpochRecordDb {
     }
 }
 
+/// File name of the epoch-records data log within the epoch DB directory.
 pub const RECORDS_NAME: &str = Inner::RECORDS_NAME;
+/// File name of the epoch-certificates data log within the epoch DB directory.
 pub const CERTS_NAME: &str = Inner::CERTS_NAME;
 
 /// Lift a raw index/pack read into the non-collapsing shape: `Ok(Some(v))` on success,
@@ -1472,23 +1528,38 @@ impl Inner {
     }
 }
 
+/// Errors returned by the epoch-records database.
 #[derive(Debug, Clone)]
 pub enum EpochDbError {
+    /// An underlying I/O error.
     IO(Arc<io::Error>),
+    /// Failed to load or decode a record header.
     HeaderLoad(String),
+    /// Failed to append a record to a data log.
     Append(String),
+    /// Failed to append an entry to an index.
     IndexAppend(String),
+    /// Failed to open a data file or one of its indexes.
     Open(Arc<OpenError>),
+    /// A record for this epoch was already saved.
     EpochAlreadySaved,
+    /// Epoch records must be saved in order (expected, got).
     EpochOutOfOrder(Epoch, Epoch),
+    /// No certificate is stored for the epoch.
     MissingCertificate(Epoch),
+    /// No record is stored for the epoch.
     MissingRecord(Epoch),
+    /// Failed to send a request to the database's background task.
     SendFailed,
+    /// Failed to receive a response from the database's background task.
     ReceiveFailed,
+    /// Failed to durably persist the database.
     PersistError(String),
+    /// The epoch-records database is corrupt.
     CorruptDb,
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
+    /// Failed to join a background thread for the database.
     JoinError,
 }
 
@@ -2115,8 +2186,10 @@ mod test {
             .write(true)
             .open(&records_path)
             .expect("open records file");
+        // The clean close appended an 8-byte sentinel past the last record; strip it and one more
+        // byte so the truncation actually damages the final record (not just the sentinel).
         let original_len = f.seek(SeekFrom::End(0)).expect("seek");
-        f.set_len(original_len - 1).expect("truncate -1");
+        f.set_len(original_len - crate::archive::data_file::SENTINEL_LEN - 1).expect("truncate");
         drop(f);
 
         // Reopen should heal: last record is dropped, all others remain readable.
@@ -2168,6 +2241,34 @@ mod test {
         let mut f = OpenOptions::new().read(true).open(&records_path).expect("open records file");
         let healed_len = f.seek(SeekFrom::End(0)).expect("seek");
         assert_eq!(extended_len, healed_len, "garbage bytes should be removed on reopen");
+    }
+
+    /// `EpochRecordDb::close` is an async drop: it must seal the epochs + certs packs before
+    /// returning, so a reopen finds every record without needing a rebuild.
+    #[tokio::test]
+    async fn test_epoch_record_db_close_seals() {
+        let temp_dir = TempDir::with_prefix("test_epoch_db_close").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        let mut records = Vec::new();
+        for epoch in 0..5u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert).await.expect("save");
+            records.push(record);
+        }
+        // Async-close (sole reference) instead of dropping.
+        db.close().await;
+
+        // Reopen and confirm every record survived the close.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
+        for record in &records {
+            let back = db.record_by_epoch(record.epoch).await.expect("record by epoch after close");
+            assert_eq!(back.digest(), record.digest());
+        }
     }
 
     /// Generate a deterministic test BLS public key from a seed.
