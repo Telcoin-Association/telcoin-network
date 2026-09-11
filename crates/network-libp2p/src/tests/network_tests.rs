@@ -2756,6 +2756,140 @@ async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result
     Ok(())
 }
 
+/// Periodic signing publishes newer records to an already connected peer without reconnecting.
+#[tokio::test]
+async fn test_own_record_refresh_reaches_peer() -> eyre::Result<()> {
+    let mut config = NetworkConfig::default();
+    config.libp2p_config_mut().kad_publication_interval = Duration::from_secs(1);
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(config);
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let peer2_addr = peer2.config.primary_address();
+    let peer2_net = peer2.config.primary_networkkey();
+    let initial_timestamp = peer2.network.node_record.info.timestamp;
+    let peer1_addr = peer1.config.primary_address();
+    let handle1 = peer1.network_handle;
+    let handle2 = peer2.network_handle;
+    let task1 = tokio::spawn(peer1.network.run());
+    let task2 = tokio::spawn(peer2.network.run());
+
+    let result = async {
+        handle1.start_listening(peer1_addr).await?;
+        handle2.start_listening(peer2_addr.clone()).await?;
+        handle1.add_trusted_peer_and_dial(peer2_bls, peer2_net, peer2_addr).await?;
+        wait_until(Duration::from_secs(10), "first re-signed record reaches peer", || async {
+            Ok(handle1.kad_store_get(peer2_bls).await?.is_some_and(|record| {
+                NodeRecord::try_decode_compat(&record.value)
+                    .is_some_and(|value| value.info.timestamp > initial_timestamp)
+            }))
+        })
+        .await?;
+        let first = handle1.kad_store_get(peer2_bls).await?.ok_or_else(|| eyre!("first record"))?;
+        let first_value = NodeRecord::try_decode_compat(&first.value)
+            .ok_or_else(|| eyre!("first node record"))?;
+        wait_until(Duration::from_secs(10), "second re-signed record reaches peer", || async {
+            Ok(handle1.kad_store_get(peer2_bls).await?.is_some_and(|record| {
+                NodeRecord::try_decode_compat(&record.value)
+                    .is_some_and(|value| value.info.timestamp > first_value.info.timestamp)
+            }))
+        })
+        .await?;
+        let own = handle2.kad_store_get(peer2_bls).await?.ok_or_else(|| eyre!("own record"))?;
+        assert!(own.expires.is_none(), "periodic signing must preserve local non-expiry");
+        eyre::Ok(())
+    }
+    .await;
+
+    task1.abort();
+    task2.abort();
+    let _ = tokio::join!(task1, task2);
+    result
+}
+
+/// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
+#[tokio::test]
+async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let mut record = peer2.network.get_peer_record();
+    let instant = std::time::Instant::now();
+    record.expires = Some(instant + Duration::from_secs(60));
+    network.process_kad_put_request(source, record.clone())?;
+    let first_expiry = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .and_then(|stored| stored.expires)
+        .ok_or_else(|| eyre!("initial expiry"))?;
+
+    assert_eq!(network.record_freshness(&record), RecordFreshness::Identical);
+    record.expires = Some(instant + Duration::from_secs(120));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .ok_or_else(|| eyre!("refreshed record"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+    Ok(())
+}
+
+/// Older and equal-timestamp conflicting records neither replace stored bytes nor penalize peers.
+#[tokio::test]
+async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let current = peer2.network.get_peer_record();
+    network.process_kad_put_request(source, current.clone())?;
+    let score = network.swarm.behaviour().peer_manager.peer_score(&source);
+    assert!(score.is_some(), "publisher must be tracked for the score assertion");
+
+    [true, false].into_iter().try_for_each(|older| -> eyre::Result<()> {
+        let mut info = peer2.network.node_record.info.clone();
+        if older {
+            info.timestamp = info.timestamp.saturating_sub(1);
+        } else {
+            info.multiaddrs.push("/ip4/127.0.0.1/udp/54321/quic-v1".parse()?);
+        }
+        let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+        let bytes =
+            encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+        let signature = peer2.config.key_config().request_signature_direct(&bytes);
+        let candidate = kad::Record {
+            value: encode(&NodeRecord { info, signature }),
+            expires: Some(std::time::Instant::now() + Duration::from_secs(120)),
+            ..current.clone()
+        };
+        assert!(network.peer_record_valid(&candidate).is_some());
+        assert_eq!(network.record_freshness(&candidate), RecordFreshness::Older);
+        network.process_kad_put_request(source, candidate)?;
+        let stored = network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&current.key)
+            .ok_or_else(|| eyre!("current record"))?
+            .into_owned();
+        assert_eq!(stored.value, current.value);
+        assert!(stored.expires.is_none(), "stale input must not update expiry");
+        assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), score);
+        Ok(())
+    })
+}
+
+/// A newer signed record replaces a previously stored record for the same publisher.
 #[tokio::test]
 async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let TestTypes { peer1, mut peer2, .. } =

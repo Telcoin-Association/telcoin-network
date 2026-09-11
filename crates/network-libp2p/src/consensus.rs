@@ -86,6 +86,19 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// consensus database (`KadStore::add_provider`, issue #1185).
 pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
 
+/// Freshness of a validated incoming record relative to the locally stored value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordFreshness {
+    /// No record is stored, or the incoming timestamp is strictly newer.
+    Newer,
+    /// Both timestamps and the complete signed values match.
+    Identical,
+    /// The timestamp is older, or equal with a different signed value.
+    Older,
+    /// A stored or incoming value cannot be decoded for comparison.
+    Undecodable,
+}
+
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
 ///
@@ -300,6 +313,8 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Configured external address retained for periodic record signing.
+    external_addr: Multiaddr,
     /// The `(chain, role)` domain this node signs and verifies records for.
     ///
     /// Folded into every [NodeRecord] signature so a record signed for one
@@ -566,7 +581,7 @@ where
         let pending_goodbyes = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(
             record_domain,
-            external_addr,
+            external_addr.clone(),
             &key_config,
             network_pubkey,
             rpc,
@@ -588,6 +603,7 @@ where
             key_config,
             task_spawner,
             node_record,
+            external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
@@ -610,6 +626,22 @@ where
         NodeRecord::build(domain, network_pubkey, external_addr, rpc, |data| {
             key_config.request_signature_direct(data)
         })
+    }
+
+    /// Re-sign our configured network information and publish it with a fresh timestamp.
+    ///
+    /// `provide_our_data` replaces the local store entry before publishing, so subsequent
+    /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
+    /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
+    fn refresh_own_record(&mut self) {
+        self.node_record = Self::create_node_record(
+            self.record_domain,
+            self.external_addr.clone(),
+            &self.key_config,
+            self.node_record.info.pubkey.clone(),
+            self.node_record.info.rpc.clone(),
+        );
+        self.provide_our_data();
     }
 
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
@@ -720,8 +752,17 @@ where
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
 
+        // Startup already published our record. Refresh only after the first full interval,
+        // and skip missed ticks to avoid a burst of signing and publication after a stall.
+        let mut record_refresh = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.config.kad_publication_interval,
+            self.config.kad_publication_interval,
+        );
+        record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = record_refresh.tick() => self.refresh_own_record(),
                 event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
                     error!(target: "network", ?e, "network event error");
                     if let NetworkError::AllListenersClosed = e {
@@ -2048,28 +2089,32 @@ where
         } else if let Some((key, value)) = self.peer_record_valid(&record) {
             // verify record signature and ensure publisher matches record's network key
 
-            // store latest node records
-            if self.is_newer_record(&record) {
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .put(record)
-                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
-                trace!(target: "network-kad", "Got record {key} {value:?}");
-                // a peer pushing its own record over its own connection (source == the record's
-                // network identity) also confirms its identity so a live non-committee connection
-                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
-                // committee-gated (issue #827).
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_self_advertised_peer(source, key, value.info);
-            } else {
-                // A peer republishing a slightly stale (but signature-valid) record is
-                // expected after restarts and benign — the local store keeps the newer
-                // version. Log only; no penalty.
-                trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+            // Store newer records and refresh the expiry of byte-identical republishes.
+            match self.record_freshness(&record) {
+                RecordFreshness::Newer | RecordFreshness::Identical => {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .put(record)
+                        .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
+                    trace!(target: "network-kad", "Got record {key} {value:?}");
+                    // a peer pushing its own record over its own connection (source == the record's
+                    // network identity) also confirms its identity so a live non-committee
+                    // connection (e.g. an nvv in the gossip mesh) is retained;
+                    // relayed and non-self records stay committee-gated (issue
+                    // #827).
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .add_self_advertised_peer(source, key, value.info);
+                }
+                RecordFreshness::Older | RecordFreshness::Undecodable => {
+                    // A peer republishing a slightly stale (but signature-valid) record is
+                    // expected after restarts and benign. The local store keeps the newer
+                    // version. Log only; no penalty.
+                    trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+                }
             }
         } else {
             warn!(target: "network-kad", "Received invalid peer record!");
@@ -2138,27 +2183,27 @@ where
 
     /// Check the local kad store to compare record timestamps.
     ///
-    /// This method compares timestamps for verified records to ensure the latest record
-    /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
+    /// Compare timestamps and signed bytes so identical republishes can refresh expiry without
+    /// replacing a newer record or admitting conflicting values with the same timestamp.
     /// It is the caller's responsibility to ensure records are verified and valid.
-    fn is_newer_record(&mut self, record: &kad::Record) -> bool {
+    fn record_freshness(&mut self, record: &kad::Record) -> RecordFreshness {
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
 
-        if let Some(existing) = store.get(&record.key) {
-            match (
-                NodeRecord::try_decode_compat(&existing.value),
-                NodeRecord::try_decode_compat(&record.value),
-            ) {
-                (Some(existing_record), Some(new_record)) => {
-                    // return true if the new record is newer
-                    existing_record.info.timestamp < new_record.info.timestamp
-                }
-                _ => false,
-            }
-        } else {
-            // return true if record is not in local store
-            true
-        }
+        store.get(&record.key).map_or(RecordFreshness::Newer, |existing| {
+            NodeRecord::try_decode_compat(&existing.value)
+                .zip(NodeRecord::try_decode_compat(&record.value))
+                .map_or(RecordFreshness::Undecodable, |(stored, incoming)| {
+                    match incoming.info.timestamp.cmp(&stored.info.timestamp) {
+                        std::cmp::Ordering::Greater => RecordFreshness::Newer,
+                        std::cmp::Ordering::Equal if existing.value == record.value => {
+                            RecordFreshness::Identical
+                        }
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                            RecordFreshness::Older
+                        }
+                    }
+                })
+        })
     }
 
     /// Logic to process a kad record query result.
