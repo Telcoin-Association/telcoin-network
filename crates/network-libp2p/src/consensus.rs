@@ -1147,11 +1147,11 @@ where
                         }
                         // Resolve the author's BLS identity too. The message is already
                         // authenticated, but deep validation in the application layer (the
-                        // worker's batch checks) runs after this `Accept`, and an
-                        // author-content fault it surfaces must be charged to the author,
-                        // not the forwarder (see issue #819). On a restricted topic
-                        // acceptance guarantees the author resolved; on an open topic it may
-                        // be `None`, in which case the consumer skips the author penalty.
+                        // worker's batch checks) runs after this `Accept`, and an author-content
+                        // fault it surfaces must be charged to the author, not the forwarder
+                        // (see issue #819). The `Option` reflects the two fallible lookups it is
+                        // built from, `message.source` and the `peer_to_bls` index, not any
+                        // topic policy; on `None` the consumer skips the author penalty.
                         let author = message
                             .source
                             .as_ref()
