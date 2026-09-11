@@ -480,7 +480,12 @@ impl ConsensusChain {
         old_pack.persist().await?;
         let epoch = committee.epoch();
         let pack = ConsensusPack::open_append(&self.base_path, previous_epoch, committee)?;
-        pack.persist().await?; // Surface any open errors.
+        if let Err(e) = pack.persist().await {
+            // Surface any open errors — async-close the just-opened pack (the only handle) instead
+            // of letting its blocking `Drop` join the background thread on this tokio worker.
+            pack.close().await;
+            return Err(e.into());
+        }
         *self.current_pack.lock() = pack;
         if let Some(staging_epoch) = self.staging_epoch() {
             // If we have moved past the staging pack then clear it.
@@ -554,23 +559,30 @@ impl ConsensusChain {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
-                pack.persist().await?;
-                match pack.latest_consensus_header().await? {
-                    Some(last_header) => {
-                        // The chain was verified as it was streamed.  So if the final block matches
-                        // the expected final_consensus then the entire pack
-                        // file should be valid.
-                        if epoch_record.final_consensus.number != last_header.number
-                            || epoch_final_hash != last_header.digest()
+                // Validate the imported pack; on ANY failure async-close it (the only handle)
+                // instead of leaving it to the blocking `Drop` join on this tokio
+                // worker. The chain was verified as it was streamed, so a final
+                // block matching the expected `final_consensus` means the entire
+                // pack file is valid.
+                let outcome: Result<(), ConsensusChainError> = async {
+                    pack.persist().await?;
+                    match pack.latest_consensus_header().await? {
+                        Some(h)
+                            if epoch_record.final_consensus.number == h.number
+                                && epoch_final_hash == h.digest() =>
                         {
-                            // Invalid final consensus header...
-                            return Err(ConsensusChainError::InvalidImport);
+                            Ok(())
                         }
-                    }
-                    None => {
+                        // Invalid final consensus header...
+                        Some(_) => Err(ConsensusChainError::InvalidImport),
                         // Missing a final consensus header...
-                        return Err(ConsensusChainError::EmptyImport);
+                        None => Err(ConsensusChainError::EmptyImport),
                     }
+                }
+                .await;
+                if let Err(e) = outcome {
+                    pack.close().await;
+                    return Err(e);
                 }
                 // Acquire the install lock only now — after the (multi-second) network
                 // download has finished writing into the temp import dir. It must NOT wrap
@@ -743,21 +755,31 @@ impl ConsensusChain {
             timeout,
         )
         .await?;
-        pack.persist().await?;
-        // The chain was verified link-by-link as it streamed; confirm the prefix ends exactly at
-        // the requested final consensus so the staged data is trustworthy.
-        match pack.latest_consensus_header().await? {
-            Some(last)
-                if last.number == final_number
-                    && last.digest() == epoch_record.final_consensus.hash => {}
-            Some(_) => {
-                let _ = std::fs::remove_dir_all(&staging_base);
-                return Err(ConsensusChainError::InvalidImport);
+        // Validate the streamed prefix; on ANY failure async-close the pack (the only handle)
+        // instead of the blocking `Drop` join on this tokio worker, then drop the staging
+        // dir. The chain was verified link-by-link as it streamed; confirm the prefix ends
+        // exactly at the requested final consensus so the staged data is trustworthy.
+        let outcome: Result<(), ConsensusChainError> = async {
+            pack.persist().await?;
+            match pack.latest_consensus_header().await? {
+                Some(last)
+                    if last.number == final_number
+                        && last.digest() == epoch_record.final_consensus.hash =>
+                {
+                    Ok(())
+                }
+                // Invalid final consensus header...
+                Some(_) => Err(ConsensusChainError::InvalidImport),
+                // Missing a final consensus header...
+                None => Err(ConsensusChainError::EmptyImport),
             }
-            None => {
-                let _ = std::fs::remove_dir_all(&staging_base);
-                return Err(ConsensusChainError::EmptyImport);
-            }
+        }
+        .await;
+        if let Err(e) = outcome {
+            // Close first (releases the pack's FDs and stops its thread) then remove the dir.
+            pack.close().await;
+            let _ = std::fs::remove_dir_all(&staging_base);
+            return Err(e);
         }
         *self.staging.lock() = Some(StagingPack { pack, final_number });
         Ok(())
@@ -2280,6 +2302,74 @@ mod test {
             !std::fs::exists(&staging_path).unwrap_or(true),
             "staging dir should be removed after clear_staging"
         );
+    }
+
+    /// A partial import whose streamed prefix does not end at the expected `final_consensus` must
+    /// be rejected with `InvalidImport`. This exercises the error path where the imported pack
+    /// is the only handle: it must be async-`close()`d (not left to a blocking `Drop` join on
+    /// the worker) and its staging dir removed. The call must return promptly — a hang here
+    /// would mean `close()` deadlocked — and leave nothing staged.
+    #[tokio::test]
+    async fn test_import_partial_to_staging_invalid_rejects_and_cleans_up() {
+        use tokio::io::AsyncReadExt as _;
+
+        let src_dir = TempDir::with_prefix("test_staging_invalid_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(src_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let num_outputs = 20u64;
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            source.save_consensus_output(output).await.unwrap();
+        }
+
+        // Build a valid prefix up to `k`, but claim the WRONG final hash (zero) for it. The
+        // stream's internal link-by-link chain is fine, so stream_import succeeds — only
+        // the final-hash check in import_partial_to_staging fails, taking the
+        // `InvalidImport` error path.
+        let k = 12u64;
+        let (stream, len) = source.get_partial_epoch_stream(0, k).await.expect("partial stream");
+        let limited = stream.take(len);
+        let mut bad_record = previous_epoch.clone();
+        bad_record.final_consensus = ConsensusNumHash::new(k, Default::default());
+
+        let dst_dir = TempDir::with_prefix("test_staging_invalid_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let err = dest
+            .import_partial_to_staging(
+                limited,
+                &bad_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("mismatched final hash must be rejected");
+        assert!(
+            matches!(err, ConsensusChainError::InvalidImport),
+            "expected InvalidImport, got {err:?}"
+        );
+        // Nothing staged, and the staging dir was cleaned up after the pack was closed.
+        assert_eq!(dest.staging_final(), None, "a rejected import must not leave a staged pack");
+        assert!(
+            !std::fs::exists(dst_dir.path().join("staging-0")).unwrap_or(true),
+            "rejected import must remove its staging dir"
+        );
+        // The chain is still usable (the error path did not poison a lock or leave the dest
+        // wedged).
+        assert!(dest.get_consensus_output_current(1).await.is_err());
     }
 
     /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for
