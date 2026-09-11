@@ -152,9 +152,9 @@ where
     )
     .await?;
 
-    // a partial transfer caps the reader at the prefix length; a full transfer
-    // resolved `cap` to `u64::MAX`, which never bounds the read, so this streams to
-    // EOF.
+    // `cap` bounds the reader to the pack's logical length in both cases — a full transfer to
+    // `[0, data_len)`, a partial prefix to `[0, end)` — so `take(cap)` stops the stream there and
+    // the trailing mmap capacity padding is never sent.
     write_pack_data_frames(&mut epoch_stream.take(cap), stream, buffer_timeout).await?;
     Ok(())
 }

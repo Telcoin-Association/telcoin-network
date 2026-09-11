@@ -53,6 +53,8 @@ enum DbSubcommand {
     Stats,
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
+    /// Read-only (never mutates). Validate the CURRENT/latest epoch only with the node STOPPED —
+    /// see the arg help.
     Validate(DbValidateArgs),
 
     /// Repair consensus epoch packs at rest: truncate a torn data-file tail and rebuild indexes.
@@ -97,6 +99,13 @@ impl DbCommand {
 }
 
 /// Validate a consensus epoch pack file.
+///
+/// Read-only: this never mutates the pack. It opens the `data` stream read-only via mmap, so
+/// validating the CURRENT/latest epoch — the one a running node holds open for append — is unsafe:
+/// the node truncates that file on epoch-close and remaps it on growth, and a concurrent truncate
+/// can crash this command with a SIGBUS (node data is never harmed). There is no lock to detect a
+/// running node, so validate the current epoch only with the node STOPPED. Sealed past epochs are
+/// always safe to validate live.
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
     /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
@@ -117,6 +126,10 @@ impl DbValidateArgs {
     /// Validate the pack and print the report to stdout.
     fn execute(&self) -> eyre::Result<()> {
         let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
+
+        // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
+        // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
+        warn_if_current_epoch(&data_file, epoch);
 
         // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
         // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
@@ -171,6 +184,25 @@ fn resolve_data_file_and_epoch(
     };
 
     Ok((data_file, epoch))
+}
+
+/// Best-effort warning when `data_file` is the CURRENT/latest epoch's pack — the one a running node
+/// holds open for append. `db validate` maps it read-only, so a node truncating (on epoch-close) or
+/// growing it concurrently can SIGBUS this process. Only fires for the standard
+/// `<epochs>/epoch-NN/data` layout (so the sibling epochs can be listed); a bare path elsewhere
+/// falls back to the arg-help caveat. Never refuses — validation is read-only and is a valid
+/// operation once the node is stopped.
+fn warn_if_current_epoch(data_file: &Path, epoch: Epoch) {
+    let Some(epochs_dir) = data_file.parent().and_then(Path::parent) else { return };
+    let Ok(all) = ConsensusPack::epoch_dirs(epochs_dir) else { return };
+    if all.last().copied() == Some(epoch) {
+        eprintln!(
+            "WARNING: epoch {epoch} is the current/latest epoch — a running node holds this pack \
+             open for append. `db validate` maps it read-only; if the node truncates or grows the \
+             file concurrently this command can crash (SIGBUS). Validate the current epoch only with \
+             the node STOPPED. (Node data is not modified either way.)"
+        );
+    }
 }
 
 /// Parse an epoch out of an `epoch-NN` directory name.

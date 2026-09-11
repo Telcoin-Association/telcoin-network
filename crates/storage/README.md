@@ -47,8 +47,11 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
 
 - **Growth & transient padding.** mmap cannot write past EOF, so the physical file is sized *ahead*
   of the data (geometric growth). While appending, `capacity >= end` where `end` is the logical data
-  length; the region `[end, capacity)` is zero padding. **All reads are bounded to `end`,** so the
-  padding is never observed as data.
+  length; the region `[end, capacity)` is zero padding. On a cleanly-closed file `end` excludes the
+  padding, so ordinary reads (bounded to `end`) never observe it as data. The documented exceptions
+  are the recovery/validation scan on an `opened_unclean` file — where `end` is left at physical EOF
+  and the padding is deliberately read (as CRC-failing records) to find the trim point — and
+  `AsyncPackIter` (intentional-design item 12).
 - **Clean-close sentinel.** On a clean `Drop` the file is truncated to `end` and an 8-byte sentinel
   (`crc32(end)` ‖ `crc32` of those 4 bytes) is appended and fsync'd. On reopen the sentinel is
   validated against the physical size and stripped; a missing/invalid sentinel means the file was
