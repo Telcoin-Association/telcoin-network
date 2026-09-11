@@ -44,9 +44,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 mod close_epoch;
+mod export_retention;
 mod run_epoch;
 mod start_epoch;
 pub use close_epoch::build_epoch_record;
+use export_retention::StateExportRetention;
 use run_epoch::retry_provider_faults;
 pub(crate) use run_epoch::RunEpochMode;
 
@@ -246,6 +248,9 @@ pub(crate) struct EpochManager<P, DB> {
     /// Background execution-state exporter. `Some` only when `--enable-state-export` is set;
     /// exports each epoch's final state at the epoch boundary. Stops on drop.
     exec_state_exporter: Option<ExecStateExporter>,
+
+    /// Shared publication and retention state for exports across epoch completion tasks.
+    state_export_retention: StateExportRetention,
 
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
@@ -723,14 +728,20 @@ where
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
             builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
+        let export_root = tn_datadir.consensus_db_path().join("state_exports");
+        let state_export_retention =
+            StateExportRetention::new(export_root.clone(), builder.state_export_keep());
 
         // With export enabled, clean up any orphaned temp export dirs left by a crashed/interrupted
         // prior run. Safe here (startup) because no export is in flight; the per-epoch export path
         // only ever clears its own epoch's temp, so it can never delete an in-flight one.
         if exec_state_exporter.is_some() {
-            close_epoch::sweep_stale_tmp_exports(
-                &tn_datadir.consensus_db_path().join("state_exports"),
-            );
+            tokio::task::spawn_blocking(move || close_epoch::sweep_stale_tmp_exports(&export_root))
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(target: "tn::snapshot", %error, "stale export cleanup task failed");
+                });
+            state_export_retention.prune().await;
         }
 
         Ok(Self {
@@ -752,6 +763,7 @@ where
             bootstrap_servers,
             version_str,
             exec_state_exporter,
+            state_export_retention,
             metrics: EpochMetrics::default(),
         })
     }

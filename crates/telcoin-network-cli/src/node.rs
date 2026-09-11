@@ -6,7 +6,9 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, thread::available_parallelism,
+};
 use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
@@ -62,8 +64,19 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
 
     /// Export each epoch's final execution state to a snapshot pack under
     /// `consensus-db/state_exports/epoch-{N}/`.
+    ///
+    /// Each epoch writes a full execution-state copy. Retention is unlimited by default and can
+    /// fill the data volume; use --state-export-keep N to limit the number of completed bundles.
     #[arg(long, global = true, default_value_t = false)]
     pub enable_state_export: bool,
+
+    /// Keep the newest N completed state-export bundles (N must be at least 1).
+    ///
+    /// Only applies with --enable-state-export. Unset keeps all bundles. Each epoch exports the
+    /// full execution state, so unlimited retention can fill the data volume. This limits bundle
+    /// count, not bytes. Use N >= 2 to retain a previous bundle during overlapping exports.
+    #[arg(long, global = true, value_name = "N")]
+    state_export_keep: Option<NonZeroUsize>,
 
     /// Watch executed batches for cross-producer transaction re-packing (issue #1259).
     ///
@@ -233,6 +246,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             observer: _, // Used above
             metrics,
             enable_state_export,
+            state_export_keep,
             enable_repack_monitor,
             instance,
             with_unused_ports,
@@ -254,16 +268,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder = TnBuilder {
-            node_config,
-            tn_config,
-            metrics,
-            healthcheck,
-            enable_state_export,
-            enable_repack_monitor,
-            reth_db,
-            exex_fns: vec![],
-        };
+        let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
+            .with_state_export_keep(state_export_keep);
+        builder.metrics = metrics;
+        builder.healthcheck = healthcheck;
+        builder.enable_state_export = enable_state_export;
+        builder.enable_repack_monitor = enable_repack_monitor;
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
@@ -340,6 +350,39 @@ mod tests {
         assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
         let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
         assert!(matches!(absent, Ok(None)));
+    }
+
+    /// Retention defaults to unlimited, accepts positive counts, and rejects zero.
+    ///
+    /// A retention setting alone does not enable exports.
+    #[test]
+    fn state_export_keep_parses_optional_nonzero_limit() -> Result<(), clap::Error> {
+        let command = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(command.state_export_keep, None);
+        assert!(!command.enable_state_export);
+
+        let parsed = NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", "0"])
+            .map(|command| command.state_export_keep)
+            .map_err(|error| error.kind());
+        assert_eq!(parsed, Err(ErrorKind::ValueValidation));
+
+        [("1", 1), ("2", 2), ("10", 10)].into_iter().try_for_each(|(raw, expected)| {
+            let command =
+                NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", raw])?;
+            assert_eq!(command.state_export_keep.map(NonZeroUsize::get), Some(expected));
+            assert!(!command.enable_state_export);
+            Ok::<(), clap::Error>(())
+        })?;
+
+        let enabled = NodeCommand::<NoArgs>::try_parse_from([
+            "node",
+            "--enable-state-export",
+            "--state-export-keep",
+            "2",
+        ])?;
+        assert_eq!(enabled.state_export_keep.map(NonZeroUsize::get), Some(2));
+        assert!(enabled.enable_state_export);
+        Ok(())
     }
 
     /// A faucet build configured with the canonical mainnet genesis must refuse to start.
