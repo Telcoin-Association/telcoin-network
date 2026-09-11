@@ -24,7 +24,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::{
@@ -125,6 +125,8 @@ fn run_db_loop(
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
+    // Note, that code called in this thread should NEVER panic since that will orphan the db
+    // files. This is acceptable since panic should never occur in properly written Inner code.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             // The four save arms latch first-error-wins: two queued saves can fail with no
@@ -239,9 +241,19 @@ fn run_db_loop(
 impl Drop for EpochRecordDb {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
+            // Reaching this with a live handle means close() was NOT used: a correct close().await
+            // already took the handle, so the block below is skipped. Drop is the safety net; the
+            // proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "epoch-db", "EpochRecordDb dropped without calling close(), performing sync Drop now...");
                 if self.tx.try_send(EpochDbMessage::Shutdown).is_ok() {
                     let _ = handle.join();
+                } else {
+                    // Full bounded channel — skip the join / detach. Durability
+                    // still holds: the detached thread clean-closes when the last Sender drops;
+                    // only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "epoch-db", "Failed to send shutdown message to EpochRecordDb (should be using close())");
                 }
             }
         }

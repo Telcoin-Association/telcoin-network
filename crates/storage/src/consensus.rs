@@ -68,11 +68,20 @@ struct LatestConsensus {
 impl Drop for LatestConsensus {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
-            // exit.
+            // If we are the last reference then shutdown thread and wait for it to persist and
+            // exit. Reaching this with a live handle means close() was NOT used: a correct
+            // close().await already took the handle, so the block below is skipped. Drop is the
+            // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(), performing sync Drop now...");
                 if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
                     let _ = handle.join();
+                } else {
+                    // Full bounded channel — skip the join / detach. Durability
+                    // still holds: the detached thread clean-closes when the last Sender drops;
+                    // only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "consensus_chain", "Failed to send shutdown message to LatestConsensus (should be using close())");
                 }
             }
         }
@@ -166,6 +175,9 @@ impl LatestConsensus {
                 }
             }
             while let Some(com) = rx.blocking_recv() {
+                // Note, that code called in this thread should NEVER panic since that will orphan
+                // the slot file. This is acceptable since panic should never occur
+                // in properly written code.
                 match com {
                     LatestConsensusCommand::Update(old_epoch, epoch, number, slot) => {
                         let f = match slot {
@@ -395,7 +407,7 @@ impl ConsensusChain {
         let pack_install = Arc::new(tokio::sync::Mutex::new(()));
         // Any staging dirs left from a previous run are stale; start clean. The staging pack only
         // ever holds transient, re-fetchable catch-up data.
-        Self::remove_all_staging_dirs(&base_path);
+        Self::remove_all_staging_and_import_dirs(&base_path);
         let staging = Arc::new(Mutex::new(None));
         Ok(Self {
             base_path,
@@ -713,11 +725,16 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*` directories under `base_path` (stale from a prior run).
-    fn remove_all_staging_dirs(base_path: &Path) {
+    /// Remove any leftover `staging-*` or `import-*` directories under `base_path` (stale from a
+    /// prior run).
+    fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
-                if entry.file_name().to_str().is_some_and(|n| n.starts_with("staging-")) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("staging-") || n.starts_with("import-"))
+                {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -1364,8 +1381,26 @@ impl ConsensusChain {
             old.close().await;
         }
         let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
-        self.recent_packs.lock().push_back(pack.clone());
-        Ok(pack)
+        // Final check after grabbing the lock again that another task did not also create the pack.
+        // Decide under the brief lock, then release it BEFORE any `.await` — a `parking_lot` guard
+        // must not be held across `close()` (same rule as the eviction block above), and the
+        // redundant pack's `close()` must not run under the cache lock. Unlikely to trigger but
+        // possible.
+        let existing = {
+            let mut recents = self.recent_packs.lock();
+            if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
+                Some(p.clone())
+            } else {
+                recents.push_back(pack.clone());
+                None
+            }
+        };
+        if let Some(p) = existing {
+            pack.close().await; // close the redundant open outside the lock
+            Ok(p)
+        } else {
+            Ok(pack)
+        }
     }
 
     /// Open the sealed static pack for `epoch` if its files exist on disk.

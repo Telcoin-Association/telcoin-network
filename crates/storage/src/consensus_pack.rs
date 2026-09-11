@@ -147,6 +147,8 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
     // When this returns None then the channel is consumed and closed, so exit the thread.
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
+    // Note, that code called in this thread should NEVER panic since that will orphan the pack
+    // file. This is acceptable since panic should never occur in properly written Inner code.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
@@ -220,12 +222,21 @@ impl Drop for ConsensusPack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
             // If we are the last ConsensusPack then shutdown thread and wait for it to persist and
-            // exit.
+            // exit. Reaching this with a live handle means close() was NOT used: a correct
+            // close().await already took the handle, so the block below is skipped. Drop is the
+            // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(), performing sync Drop now...");
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {
                     if let Err(e) = handle.join() {
                         error!(target: "consensus_pack", ?e, "Failed to join consensus pack thread");
                     }
+                } else {
+                    // Full bounded channel — skip the join / detach. Durability
+                    // still holds: the detached thread clean-closes when the last Sender drops;
+                    // only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
                 }
             }
         }
