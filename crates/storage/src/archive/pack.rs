@@ -488,7 +488,9 @@ where
     /// This iterator will not see any data in the write cache.
     fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
         let dat_file = { self.data_file.try_clone()? };
-        PackIter::open(dat_file, self.uid_idx)
+        // Our own header already passed the version gate on open, so requesting exactly its
+        // version re-accepts this file without loosening the iterator's check.
+        PackIter::open(dat_file, self.uid_idx, self.header.version())
     }
 }
 
@@ -892,7 +894,7 @@ mod tests {
             .create(false)
             .open(tmp_path.path().join("pack_test_one"))
             .unwrap();
-        let mut iter = PackIter::open(data_file, 0).unwrap().map(|r| r.unwrap());
+        let mut iter = PackIter::open(data_file, 0, 0).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
         assert_eq!(v.name, "Value One");
@@ -1076,7 +1078,7 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, 0).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1092,7 +1094,7 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0, 0).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1123,7 +1125,7 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, 0).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -1137,7 +1139,7 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0, 0).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -1160,5 +1162,77 @@ mod tests {
         // A valid in-range request still works.
         let len = pack.file_len();
         assert!(pack.read_bytes(0, len).is_ok());
+    }
+
+    /// [`PackIter::open`] must reject a file whose header is stamped with a NEWER version than
+    /// the reader requests ([`LoadHeaderError::InvalidVersion`]) and accept files stamped at or
+    /// below the requested version, mirroring the `open_data_file` gate.
+    #[test]
+    fn test_pack_iter_rejects_newer_version() {
+        let tmp_path = TempDir::with_prefix("test_pack_iter_version").expect("temp dir");
+        let path = tmp_path.path().join("pack_versioned");
+        {
+            // Stamp the file header one version ahead of what the first reader below requests.
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::None, 1).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
+            pack.commit().expect("commit");
+        }
+
+        // A reader requesting an OLDER version must reject the newer file.
+        let file = File::open(&path).expect("open file");
+        match PackIter::<TestRec, _>::open(file, 0, 0) {
+            Err(LoadHeaderError::InvalidVersion) => {}
+            other => panic!("expected InvalidVersion, got {other:?}"),
+        }
+
+        // A reader requesting an EQUAL version accepts the file and reads it.
+        let file = File::open(&path).expect("open file");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, 1).expect("equal version accepted");
+        assert_eq!(iter.next().expect("one record").expect("record reads").idx, 1);
+
+        // A reader requesting a NEWER version accepts the older file.
+        let file = File::open(&path).expect("open file");
+        let mut iter =
+            PackIter::<TestRec, _>::open(file, 0, 2).expect("newer reader accepts older file");
+        assert_eq!(iter.next().expect("one record").expect("record reads").idx, 1);
+    }
+
+    /// Async twin of [`test_pack_iter_rejects_newer_version`]: [`AsyncPackIter::open`] feeds the
+    /// peer-facing stream import, so it must enforce the same newer-rejected / older-accepted
+    /// version gate.
+    #[tokio::test]
+    async fn test_async_pack_iter_rejects_newer_version() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let tmp_path = TempDir::with_prefix("test_async_pack_iter_version").expect("temp dir");
+        let path = tmp_path.path().join("pack_versioned");
+        {
+            // Stamp the file header one version ahead of what the first reader below requests.
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::None, 1).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
+            pack.commit().expect("commit");
+        }
+
+        // A reader requesting an OLDER version must reject the newer file.
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        match AsyncPackIter::<TestRec, _>::open(file, 0, 0).await {
+            Err(LoadHeaderError::InvalidVersion) => {}
+            other => panic!("expected InvalidVersion, got {other:?}"),
+        }
+
+        // A reader requesting an EQUAL version accepts the file and reads it.
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter =
+            AsyncPackIter::<TestRec, _>::open(file, 0, 1).await.expect("equal version accepted");
+        assert_eq!(iter.next().await.expect("one record").expect("record reads").idx, 1);
+
+        // A reader requesting a NEWER version accepts the older file.
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0, 2)
+            .await
+            .expect("newer reader accepts older file");
+        assert_eq!(iter.next().await.expect("one record").expect("record reads").idx, 1);
     }
 }
