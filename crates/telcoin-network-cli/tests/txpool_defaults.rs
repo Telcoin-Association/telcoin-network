@@ -80,3 +80,34 @@ fn explicit_other_value_is_honored() {
 fn tn_default_differs_from_reth_default() {
     assert_ne!(TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
 }
+
+/// Preserve operator policy through the node command's flattened arguments (#1340).
+///
+/// Admission, expiry and unsupported-policy rejection are exercised against the production
+/// pool constructor in tn-reth's `txn_pool::config_tests`.
+#[test]
+fn operator_pool_flags_survive_node_parsing() {
+    let resolved = Cli::<NoArgs>::try_parse_args_from([
+        "tn",
+        "node",
+        "--txpool.max-tx-input-bytes",
+        "256",
+        "--txpool.max-tx-gas",
+        "21000",
+        "--txpool.minimum-priority-fee",
+        "1",
+        "--txpool.lifetime",
+        "60",
+    ])
+    .ok()
+    .and_then(|cli| match cli.command {
+        Commands::Node(node) => Some((
+            node.reth.txpool.max_tx_input_bytes,
+            node.reth.txpool.max_tx_gas_limit,
+            node.reth.txpool.minimum_priority_fee,
+            node.reth.txpool.max_queued_lifetime,
+        )),
+        Commands::Db(_) | Commands::Genesis(_) | Commands::Keytool(_) => None,
+    });
+    assert_eq!(resolved, Some((256, Some(21_000), Some(1), std::time::Duration::from_secs(60))));
+}

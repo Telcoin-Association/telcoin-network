@@ -76,7 +76,14 @@ pub struct RethCommand {
     #[clap(flatten)]
     pub rpc: RpcServerArgs,
 
-    /// All txpool related arguments with --txpool prefix
+    /// Transaction-pool arguments with the `--txpool` prefix.
+    ///
+    /// TN applies the per-transaction byte and gas limits at admission. The byte limit
+    /// must fit within the batch protocol's byte limit. Queued and basefee transactions
+    /// expire according to `--txpool.lifetime`, with reth's local-origin exemptions unless
+    /// `--txpool.nolocals` is set. A zero lifetime expires at the next timer sweep.
+    /// `--txpool.minimum-priority-fee` is unsupported and rejected at pool startup, since
+    /// TN's fee policy permits zero-tip transactions.
     #[clap(flatten)]
     pub txpool: TxPoolArgs,
 
