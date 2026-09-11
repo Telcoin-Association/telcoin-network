@@ -261,7 +261,8 @@ replay, and read-only/RPC EVMs alike:
 - **BLS G1 verify precompile at `0x…b151`** (`BLS_G1_PRECOMPILE_ADDRESS`,
   `src/evm/bls_precompile/mod.rs`): `blsVerify(bytes,bytes,bytes)` verifies a 48-byte compressed
   G1 signature under a 96-byte compressed G2 pubkey using the same `blst` (`min_sig`) path the
-  consensus layer signs with, for a flat 150,000 gas. `ConsensusRegistry` staticcalls it for
+  consensus layer signs with, for 150,000 gas plus 12 gas per 32-byte word of the ABI-encoded
+  arguments, charged before the arguments are decoded. `ConsensusRegistry` staticcalls it for
   proof-of-possession checks; the message is otherwise opaque.
 - Both precompile accounts carry a single `0xfe` (INVALID) byte of genesis code
   (`PRECOMPILE_GENESIS_BYTECODE`, `src/system_calls.rs`) so they are never state-pruned and any

@@ -83,21 +83,44 @@ struct PreparedWorkerNetwork<Events> {
     event_stream: Events,
 }
 
-/// Require local swarm configuration to match the authoritative count for the entering epoch.
-fn check_configured_worker_count(
+/// Reject multi-worker layouts before the fork, before checking local capacity at either entry
+/// point.
+fn check_worker_count_fork(
     epoch: Epoch,
     on_chain_workers: usize,
     configured_workers: usize,
 ) -> eyre::Result<()> {
     eyre::ensure!(
+        (configured_workers <= 1 && on_chain_workers <= 1)
+            || tn_types::forks::multi_workers_fork_active(epoch),
+        "multi-workers fork is not active at epoch {epoch}: local config lists \
+         {configured_workers} workers and chain state reports {on_chain_workers}; the pre-fork \
+         committee layout requires exactly one worker"
+    );
+    Ok(())
+}
+
+/// Require enough local swarms at startup, allowing operators to provision a future worker
+/// increase.
+fn check_configured_worker_count(
+    epoch: Epoch,
+    on_chain_workers: usize,
+    configured_workers: usize,
+) -> eyre::Result<()> {
+    check_worker_count_fork(epoch, on_chain_workers, configured_workers)?;
+    eyre::ensure!(
         configured_workers != 0,
         "node config `node_info.p2p_info.workers` must configure at least one worker"
     );
     eyre::ensure!(
-        configured_workers == on_chain_workers,
+        on_chain_workers != 0,
+        "chain-derived count for epoch {epoch} is 0: at least one worker is required"
+    );
+    eyre::ensure!(
+        configured_workers >= on_chain_workers,
         "node config `node_info.p2p_info.workers` lists {configured_workers} workers but the \
-         chain-derived count for epoch {epoch} is {on_chain_workers}: every validator must run \
-         the worker count the committee carries"
+         chain-derived count for epoch {epoch} is {on_chain_workers}: configure at least the \
+         worker count the committee carries"
     );
     Ok(())
 }
@@ -113,11 +136,6 @@ fn prepare_worker_networks<Events: Clone>(
     on_chain_workers: usize,
 ) -> eyre::Result<Vec<PreparedWorkerNetwork<Events>>> {
     let configured = workers.len();
-    eyre::ensure!(
-        configured <= 1 || tn_types::forks::multi_workers_fork_active(epoch),
-        "node config `node_info.p2p_info.workers` lists {configured} workers but the \
-         multi-workers fork is not active at epoch {epoch}: configure exactly one worker"
-    );
     check_configured_worker_count(epoch, on_chain_workers, configured)?;
     eyre::ensure!(
         configured <= usize::from(WorkerId::MAX) + 1,
@@ -1082,9 +1100,10 @@ where
     /// Each swarm runs as a critical task until node shutdown. The resulting network handles are
     /// stored on the manager for use by every epoch; the worker handles are seeded with the
     /// starting `epoch` and their task spawners are refreshed on each epoch transition.
-    /// The configured worker count must match the raw chain count at the previous epoch's closing
-    /// block (genesis for epoch 0) before any swarm is created. This includes fresh genesis where
-    /// accumulator catchup is a no-op. Worker RPC descriptors and event streams validate together.
+    /// The configured worker count must be at least the raw chain count at the previous epoch's
+    /// closing block (genesis for epoch 0) before any swarm is created. This includes fresh genesis
+    /// where accumulator catchup is a no-op. Worker RPC descriptors and event streams validate
+    /// together.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
@@ -1521,22 +1540,26 @@ mod tests {
         Ok(())
     }
 
-    /// Startup requires the local count to match the raw chain-derived count, in both directions.
+    /// Startup still rejects a local shortfall against the raw chain-derived count.
     #[test]
-    fn prepare_worker_networks_rejects_chain_count_mismatch() -> eyre::Result<()> {
+    fn prepare_worker_networks_rejects_chain_count_shortfall() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?];
+        let error = prepare_worker_networks(&workers, &[()], Epoch::MAX, 2)
+            .err()
+            .ok_or_else(|| eyre!("expected chain worker count shortfall"))?;
+        assert!(error.to_string().contains("configure at least"));
+        Ok(())
+    }
+
+    /// Operators can provision spare swarms before governance increases the committee count.
+    #[test]
+    fn prepare_worker_networks_accepts_surplus_workers() -> eyre::Result<()> {
         let keys = worker_key_config();
         let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
-        let single_worker = workers.get(..1).ok_or_else(|| eyre!("expected worker zero"))?;
-        [(workers.as_slice(), 1), (single_worker, 2)].into_iter().try_for_each(
-            |(configured, chain_count)| -> eyre::Result<()> {
-                let streams = vec![(); configured.len()];
-                let error = prepare_worker_networks(configured, &streams, Epoch::MAX, chain_count)
-                    .err()
-                    .ok_or_else(|| eyre!("expected chain worker count mismatch"))?;
-                assert!(error.to_string().contains("chain-derived count"));
-                Ok(())
-            },
-        )?;
+        let prepared = prepare_worker_networks(&workers, &[(), ()], Epoch::MAX, 1)?;
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.last().map(|worker| worker.worker_id), Some(1));
         Ok(())
     }
 
@@ -1594,10 +1617,17 @@ mod tests {
     fn prepare_worker_networks_rejects_pre_fork_multiple_workers() -> eyre::Result<()> {
         let keys = worker_key_config();
         let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
-        let error = prepare_worker_networks(&workers, &[(), ()], 0, 2)
-            .err()
-            .ok_or_else(|| eyre!("expected pre-fork multi-worker rejection"))?;
-        assert!(error.to_string().contains("multi-workers fork is not active"));
+        let single_worker = workers.get(..1).ok_or_else(|| eyre!("expected worker zero"))?;
+        [(workers.as_slice(), 2), (workers.as_slice(), 1), (single_worker, 2)]
+            .into_iter()
+            .try_for_each(|(configured, chain_count)| -> eyre::Result<()> {
+                let streams = vec![(); configured.len()];
+                let error = prepare_worker_networks(configured, &streams, 0, chain_count)
+                    .err()
+                    .ok_or_else(|| eyre!("expected pre-fork multi-worker rejection"))?;
+                assert!(error.to_string().contains("multi-workers fork is not active"));
+                Ok(())
+            })?;
         Ok(())
     }
 
