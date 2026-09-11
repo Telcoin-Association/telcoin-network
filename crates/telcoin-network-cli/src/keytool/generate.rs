@@ -192,8 +192,8 @@ impl KeygenArgs {
 
         info!(target: "tn::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
-        // network keypair for workers (the key config holds worker 0's key)
-        let network_publickey = key_config.worker_network_public_key();
+        // network keypair for workers (keytool still generates a single worker entry)
+        let network_publickey = key_config.worker_network_public_key(DEFAULT_WORKER_ID);
         let worker = node_info
             .p2p_info
             .worker_mut(DEFAULT_WORKER_ID)

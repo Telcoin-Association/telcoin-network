@@ -2,17 +2,14 @@
 
 use crate::{build_batch, BatchBuilderOutput};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tn_reth::{
     new_pool_txn, BestTransactions, InvalidPoolTransactionError, PoolTxn, PoolTxnId,
     SenderIdentifiers, TxPool,
 };
-use tn_types::{
-    Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash,
-    MIN_PROTOCOL_BASE_FEE, U256,
-};
+use tn_types::{Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, U256};
 
 /// Attempt to update batch with accurate header information.
 ///
@@ -33,7 +30,7 @@ pub fn execute_test_batch(test_batch: &mut Batch) {
 pub(crate) struct TestPool {
     transactions: Vec<Arc<PoolTxn>>,
     by_id: BTreeMap<PoolTxnId, Arc<PoolTxn>>,
-    /// Per-sender balances returned by [`TxPool::get_account_balance`]. A sender that is absent
+    /// Per-sender balances returned by [`TxPool::get_account_balances`]. A sender that is absent
     /// here reports [`U256::MAX`], preserving the behavior of tests that do not exercise balance.
     balances: BTreeMap<Address, U256>,
 }
@@ -41,9 +38,6 @@ pub(crate) struct TestPool {
 impl TxPool for TestPool {
     fn best_transactions(&self) -> tn_reth::BestTxns {
         tn_reth::BestTxns::new_for_test(self.best_transactions_int())
-    }
-    fn get_pending_base_fee(&self) -> u64 {
-        MIN_PROTOCOL_BASE_FEE
     }
     fn remove_eip4844_txs(&mut self, _blobs: Vec<TxHash>) {
         // remove EIP-4844 transactions from the transactions vec and btreemap
@@ -55,13 +49,16 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
         self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
     }
-    fn get_account_balance(&self, address: Address) -> U256 {
-        self.balances.get(&address).copied().unwrap_or(U256::MAX)
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        addresses
+            .iter()
+            .map(|address| (*address, self.balances.get(address).copied().unwrap_or(U256::MAX)))
+            .collect()
     }
 }
 
 impl TestPool {
-    /// Override the balance [`TxPool::get_account_balance`] reports for `address`.
+    /// Override the balance [`TxPool::get_account_balances`] reports for `address`.
     #[cfg(test)]
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {
         self.balances.insert(address, balance);

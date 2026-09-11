@@ -10,7 +10,7 @@ use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
 use std::path::{Path, PathBuf};
-use tn_config::TelcoinDirs as _;
+use tn_config::{create_keys_dir, TelcoinDirs as _};
 use tracing::warn;
 
 /// Generate keypairs and node info to go with them and save them to a file.
@@ -106,8 +106,10 @@ impl KeyArgs {
 
         // create the dir if it doesn't exist or is empty
         if self.is_key_dir_empty(rpath) {
-            // authority dir
-            std::fs::create_dir_all(rpath).wrap_err_with(|| {
+            // authority dir, owner-only: this runs before `KeyConfig::generate_and_save`, so a
+            // plain `create_dir_all` here would leave the fresh directory world-traversable
+            // and turn the library's 0700 into a no-op
+            create_keys_dir(rpath).wrap_err_with(|| {
                 format!("Could not create authority key directory {}", rpath.display())
             })?;
         } else if !force {
@@ -177,6 +179,111 @@ mod tests {
             ConfigFmt::YAML,
         )
         .expect("config loaded yaml okay");
+    }
+
+    /// A pre-existing loose empty key directory must be tightened even when generation
+    /// aborts before any key is written (here: an invalid worker RPC scheme fails the run
+    /// after `init_path` and before `KeyConfig::generate_and_save`).
+    ///
+    /// This is the leg where the CLI-side `create_keys_dir` call is load-bearing on its own:
+    /// the library key writer never runs, so nothing downstream can repair the mode. The
+    /// seed is an explicit 0755 chmod, so the check does not depend on the ambient umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keytool_generate_tightens_key_dir_when_generation_aborts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::{KeyConfig, TelcoinDirs as _};
+
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let temp_path = tempdir.path();
+        let keys_dir = temp_path.to_path_buf().node_keys_path();
+        std::fs::create_dir_all(&keys_dir).expect("pre-create keys dir");
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen keys dir");
+
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+            "--rpc-http",
+            "ftp://127.0.0.1:8545",
+        ])
+        .expect("cli parsed");
+        let run = tn.run(Some("abort_mode_test".to_string()), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        });
+        assert!(run.is_err(), "an invalid worker RPC scheme must abort key generation");
+        assert!(
+            !KeyConfig::keys_exist(&temp_path.to_path_buf()),
+            "no keys may be written on the aborted run"
+        );
+
+        let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "aborted generate left the keys dir accessible beyond its owner: {:o}",
+            mode & 0o7777
+        );
+    }
+
+    /// The key directory produced by the real `keytool generate` flow must be owner-only.
+    ///
+    /// Regression test: `init_path` used to pre-create the directory with `create_dir_all`
+    /// (0755 at the usual umask) before `KeyConfig::generate_and_save` ran, which turned the
+    /// library's owner-only directory mode into a no-op for every fresh CLI install. The
+    /// pre-created case seeds an explicit 0755 (an older build's layout, or a packaging
+    /// script's mkdir), so the check does not depend on the ambient umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keytool_generate_key_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::TelcoinDirs as _;
+
+        [true, false].into_iter().for_each(|pre_create_loose| {
+            let tempdir = tempfile::TempDir::new().expect("tempdir created");
+            let temp_path = tempdir.path();
+            let keys_dir = temp_path.to_path_buf().node_keys_path();
+            if pre_create_loose {
+                std::fs::create_dir_all(&keys_dir).expect("pre-create keys dir");
+                std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("loosen keys dir");
+            }
+
+            let tn = Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--workers",
+                "1",
+                "--datadir",
+                temp_path.to_str().expect("tempdir path clean"),
+                "--address",
+                "0",
+            ])
+            .expect("cli parsed");
+            tn.run(Some("key_dir_mode_test".to_string()), |_, _, _, _, _| {
+                tokio::spawn(async { Ok(()) })
+            })
+            .expect("generate keys command");
+
+            let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "node-keys dir is accessible beyond its owner \
+                 (pre_create_loose = {pre_create_loose}): {:o}",
+                mode & 0o7777
+            );
+        });
     }
 
     /// Test that export-staking-args reads node-info.yaml and produces correct byte lengths.

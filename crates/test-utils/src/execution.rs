@@ -98,6 +98,7 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         metrics: None,
         healthcheck,
         enable_state_export: false,
+        enable_repack_monitor: false,
         reth_db,
         exex_fns: vec![],
     };

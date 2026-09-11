@@ -590,10 +590,12 @@ mod test {
     /// runtime bytecode.
     ///
     /// The genesis ceremony (`RethEnv::create_consensus_registry_genesis_accounts`) splices
-    /// `deployedBytecode.object` of `CONSENSUS_REGISTRY_JSON` into the registry account; the
-    /// node's system calls unconditionally speak that artifact's ABI. A stale committed code
-    /// blob means a mainnet node can neither start epoch 0 (`getCommitteeBlsPubkeys`) nor
-    /// close an epoch (`getValidatorsInfo`/`getNextCommitteeSize`) - issue #1063.
+    /// the tmp-chain DEPLOYED registry code into the registry account: the artifact's
+    /// `deployedBytecode.object` with the constructor-patched immutables at the artifact's
+    /// `immutableReferences` sites (issue #1278). The node's system calls unconditionally
+    /// speak that artifact's ABI. A stale committed code blob means a mainnet node can
+    /// neither start epoch 0 (`getCommitteeBlsPubkeys`) nor close an epoch
+    /// (`getValidatorsInfo`/`getNextCommitteeSize`) - issue #1063.
     #[test]
     fn mainnet_genesis_registry_code_matches_current_artifact() {
         let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
@@ -615,14 +617,59 @@ mod test {
             .and_then(|account| account.code.clone())
             .expect("mainnet genesis must allocate code for the ConsensusRegistry account");
 
+        // The genesis ceremony splices the DEPLOYED tmp-chain code (issue #1278): identical to
+        // the artifact's compile-time code except at the immutable sites, where forge ships
+        // zeros and the constructor patched real values. Compare accordingly: byte-equal
+        // outside `deployedBytecode.immutableReferences`, non-zero inside.
+        let sites: Vec<(usize, usize)> = artifact
+            .pointer("/deployedBytecode/immutableReferences")
+            .and_then(serde_json::Value::as_object)
+            .map(|refs| {
+                refs.values()
+                    .filter_map(serde_json::Value::as_array)
+                    .flatten()
+                    .filter_map(|site| {
+                        site.get("start")
+                            .and_then(serde_json::Value::as_u64)
+                            .zip(site.get("length").and_then(serde_json::Value::as_u64))
+                            .map(|(start, length)| (start as usize, length as usize))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Fail loud on artifact schema drift: with zero parsed sites the comparison below
+        // degrades to byte-equality, which a still-zeroed genesis satisfies (issue #1278).
         assert!(
-            actual == expected,
+            !sites.is_empty(),
+            "registry artifact must list immutable sites (the Solady EIP712 cache); a missing \
+             or renamed immutableReferences key would make this gate vacuous"
+        );
+        let inside_site =
+            |i: usize| sites.iter().any(|(start, length)| i >= *start && i < start + length);
+        let matches_outside_immutables = actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected.iter())
+                .enumerate()
+                .all(|(i, (spliced, compiled))| inside_site(i) || spliced == compiled);
+        assert!(
+            matches_outside_immutables,
             "chain-configs/mainnet/genesis.yaml seeds the ConsensusRegistry with {} bytes of \
              runtime code but the current tn-contracts artifact deploys {} bytes; the node's \
              system calls speak the current ABI, so a mainnet node cannot start or close an \
              epoch (issue #1063) - {REGENERATION_LEVER}",
             actual.len(),
             expected.len(),
+        );
+        assert!(
+            sites.iter().all(|(start, length)| {
+                actual
+                    .get(*start..start + length)
+                    .is_some_and(|segment| segment.iter().any(|byte| *byte != 0))
+            }),
+            "chain-configs/mainnet/genesis.yaml ships an ALL-ZERO EIP712 immutable in the \
+             ConsensusRegistry code: the ceremony spliced compile-time bytecode instead of the \
+             deployed tmp-chain code (issue #1278) - {REGENERATION_LEVER}"
         );
     }
 

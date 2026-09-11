@@ -250,8 +250,9 @@ mod tests {
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_test_utils::wait_until;
     use tn_types::{
-        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
-        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::BaseFeeContainer, max_batch_gas, test_genesis, Address, Batch, Bytes,
+        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Return the next valid sealed batch
@@ -318,7 +319,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
-        let tx_pool = reth_env.init_txn_pool().unwrap();
+        let tx_pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         let validator =
             BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
         let valid_batch = next_valid_sealed_batch(chain);

@@ -223,11 +223,6 @@ impl HdxHeader {
         self.bucket_size
     }
 
-    /// Load factor converted to a f32.
-    fn load_factor(&self) -> f32 {
-        self.load_factor as f32 / u16::MAX as f32
-    }
-
     /// File version number.
     fn version(&self) -> u16 {
         self.version
@@ -256,7 +251,7 @@ impl HdxHeader {
 /// A hash digest index (256-bit digest -> u64 record position) that is memory-mapped only and
 /// reads/writes hash buckets directly through the mapping with no in-memory bucket caches.
 ///
-/// It is format compatable with the older direct IO version.
+/// It is format compatible with the older direct IO version.
 #[derive(Debug)]
 pub struct HdxIndex<
     const KSIZE: usize = 32,
@@ -271,11 +266,19 @@ pub struct HdxIndex<
     // We require an mmap backed file so use it directly.
     odx_file: MmapDataFile,
     capacity: u64,
+    /// Precomputed `values` count at which a bucket split is due (`capacity * load_factor`), kept
+    /// in lockstep with `capacity` so the per-insert check in `expand_buckets` is a plain u64
+    /// compare instead of u128 math.
+    expand_at_capacity: u64,
     hasher_builder: S,
     read_only: bool,
     synced: bool,
     bloom: Bloom,
     _index_dir: PathBuf,
+    /// Test-only: when set, the next bucket split fails mid-way (after both buckets are zeroed) to
+    /// exercise the rollback in [`Self::split_one_bucket`].
+    #[cfg(test)]
+    fail_next_split: bool,
 }
 
 /// Counts from [`HdxIndex::bucket_crc_scan`] over the main buckets: how many are dirty
@@ -386,6 +389,25 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let bloom: Bloom = bloom_bits.try_into()?;
             (header, bloom)
         };
+        // A cleanly-sealed index always has a CRC-valid first bucket (fresh buckets are CRC'd at
+        // creation; a clean close CRCs every dirty bucket). The bloom sits between the header and
+        // the first bucket, and its size is a compile-time constant NOT recorded on disk
+        // (`BLOOM_SIZE_BYTES` is smaller under the `test-utils` feature), so a build whose bloom
+        // size differs from the one that wrote the file reads the first bucket at the wrong offset
+        // -> a non-CRC-valid bucket. Reject that here (no on-disk format change) so the writable
+        // doors rebuild from the WAL and read-only refuses, rather than silently misreading every
+        // bucket. Gate on a clean seal: an unclean file legitimately has dirty (un-CRC'd) buckets
+        // and is already rebuilt via `opened_unclean()`. This also catches at-rest damage to the
+        // first bucket. Fresh files (`file_end == 0`) were just written above with valid CRCs.
+        if file_end != 0 && !hdx_file.opened_unclean() {
+            let first_bucket_pos = (HEADER_SIZE + BLOOM_SIZE_BYTES) as u64;
+            let first_bucket_valid = hdx_file
+                .slice(first_bucket_pos, Self::BUCKET_SIZE)
+                .is_some_and(|buf| crc_state(buf) == CrcState::Valid);
+            if !first_bucket_valid {
+                return Err(LoadHeaderError::CrcFailed);
+            }
+        }
         let (odx_file, _odx_header) = OdxHeader::open_odx_file_mmap(
             header.version(),
             header.uid(),
@@ -396,18 +418,29 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Don't want buckets and modulus to be the same, so +1.
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets as u64 * header.bucket_elements() as u64;
+        let expand_at_capacity = Self::expand_threshold(capacity, header.load_factor);
         Ok(Self {
             header,
             modulus,
             hdx_file,
             odx_file,
             capacity,
+            expand_at_capacity,
             hasher_builder,
             read_only,
             synced: true,
             bloom,
             _index_dir: dir.to_owned(),
+            #[cfg(test)]
+            fail_next_split: false,
         })
+    }
+
+    /// Test-only failure injector: make the next bucket split fail mid-way (both buckets zeroed,
+    /// nothing re-inserted) so [`Self::split_one_bucket`]'s rollback can be exercised.
+    #[cfg(test)]
+    fn fail_next_split_for_test(&mut self) {
+        self.fail_next_split = true;
     }
 
     /// Number of keys hashed in this index.
@@ -418,6 +451,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// True if there are no keys stored in this index.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// True when either backing file (the hdx bucket file or the odx overflow log) was opened
+    /// without a valid clean-close sentinel — the index is trustworthy only if both were sealed by
+    /// a clean shutdown, so a consistency check should treat it as needing rebuild if either is
+    /// unclean. An empty (0-length) odx reports clean, which is correct — there is nothing to
+    /// seal.
+    pub fn opened_unclean(&self) -> bool {
+        self.hdx_file.opened_unclean() || self.odx_file.opened_unclean()
     }
 
     /// Set the data_file_length field. This tracks information about another file but does not
@@ -474,29 +516,48 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         u64::from_le_bytes(b)
     }
 
-    /// Number of elements currently stored in a bucket buffer.
-    fn bucket_elements(buf: &[u8]) -> usize {
+    /// Number of elements stored in a bucket buffer, validated against the bucket geometry.
+    ///
+    /// The count is a raw `u32` from `buf[8..12]` on the CRC-free read path, so it is untrusted. A
+    /// bucket physically holds at most [`Self::BUCKET_ELEMENTS`]; a larger value is corruption, and
+    /// consuming it unchecked would slice past the fixed-size buffer and panic. Returns `None` on
+    /// an out-of-range count so callers can surface a clean error instead of crashing.
+    fn bucket_elements(buf: &[u8]) -> Option<usize> {
         let mut b = [0_u8; 4];
         b.copy_from_slice(&buf[8..12]);
-        u32::from_le_bytes(b) as usize
+        let n = u32::from_le_bytes(b) as usize;
+        (n <= Self::BUCKET_ELEMENTS).then_some(n)
     }
 
     /// Scan a single bucket buffer for `key`, returning its stored record position if present.
-    fn scan_bucket(buf: &[u8], key: &[u8]) -> Option<u64> {
-        for i in 0..Self::bucket_elements(buf) {
+    /// Errors (rather than panics) if the on-disk element count is out of range for the bucket
+    /// geometry.
+    fn scan_bucket(buf: &[u8], key: &[u8]) -> Result<Option<u64>, FetchError> {
+        let elements = Self::bucket_elements(buf).ok_or_else(|| {
+            FetchError::CorruptIndex("bucket element count exceeds bucket capacity".to_string())
+        })?;
+        for i in 0..elements {
             let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
             if &buf[pos..pos + KSIZE] == key {
                 let mut p = [0_u8; 8];
                 p.copy_from_slice(&buf[pos + KSIZE..pos + KSIZE + 8]);
-                return Some(u64::from_le_bytes(p));
+                return Ok(Some(u64::from_le_bytes(p)));
             }
         }
-        None
+        Ok(None)
     }
 
-    /// Push every not-yet-seen `(digest, position)` element of a bucket buffer into `out`.
-    fn collect_from_buffer(buf: &[u8], out: &mut Vec<(B256, u64)>, seen: &mut BTreeSet<B256>) {
-        for i in 0..Self::bucket_elements(buf) {
+    /// Push every not-yet-seen `(digest, position)` element of a bucket buffer into `out`. Errors
+    /// (rather than panics) if the on-disk element count is out of range for the bucket geometry.
+    fn collect_from_buffer(
+        buf: &[u8],
+        out: &mut Vec<(B256, u64)>,
+        seen: &mut BTreeSet<B256>,
+    ) -> Result<(), AppendError> {
+        let elements = Self::bucket_elements(buf).ok_or_else(|| {
+            AppendError::CorruptIndex("bucket element count exceeds bucket capacity".to_string())
+        })?;
+        for i in 0..elements {
             let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
             let hash = B256::from_slice(&buf[pos..pos + KSIZE]);
             if seen.insert(hash) {
@@ -505,6 +566,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 out.push((hash, u64::from_le_bytes(p)));
             }
         }
+        Ok(())
     }
 
     /// Look up `key`, reading bucket bytes zero-copy from the mappings (main bucket in the hdx,
@@ -514,29 +576,44 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                if let Some(pos) = Self::scan_bucket(buf, key) {
+                if let Some(pos) = Self::scan_bucket(buf, key)? {
                     return Ok(Some(pos));
                 }
                 Self::read_overflow_pos(buf)
             }
-            None => return Ok(None),
+            // A bucket `< buckets()` is always mapped in a sound index; a short hdx (e.g. an
+            // unclean shutdown or bit rot) is corruption, not a missing key. Surface it
+            // distinctly so `load` does not fold it into `NotFound`.
+            None => {
+                return Err(FetchError::CorruptIndex(format!(
+                    "hdx mapping does not cover bucket {bucket}"
+                )))
+            }
         };
-        // Follow the append-only overflow chain, one zero-copy slice per hop.
+        // Follow the append-only overflow chain, one zero-copy slice per hop. Each pointer must
+        // point strictly backwards into an already-written odx record; seed the bound with the odx
+        // length so the FIRST hop (read from a possibly-corrupt main bucket) is validated the same
+        // as later hops -- an unvalidated first hop could otherwise index arbitrary bytes.
+        let mut upper_bound = self.odx_file.len();
         while overflow_pos > 0 {
+            if overflow_pos >= upper_bound {
+                return Err(FetchError::CorruptIndex(format!(
+                    "overflow pointer {overflow_pos} is not strictly backwards (bound {upper_bound})"
+                )));
+            }
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
                 Some(buf) => buf,
-                None => return Err(FetchError::CrcFailed),
+                None => {
+                    return Err(FetchError::CorruptIndex(format!(
+                        "odx mapping does not cover overflow record at {overflow_pos}"
+                    )))
+                }
             };
-            if let Some(pos) = Self::scan_bucket(buf, key) {
+            if let Some(pos) = Self::scan_bucket(buf, key)? {
                 return Ok(Some(pos));
             }
-            let next = Self::read_overflow_pos(buf);
-            // A non-terminal link must point strictly backwards (the log is append-only); anything
-            // else is corruption, so bail rather than loop forever.
-            if next != 0 && next >= overflow_pos {
-                return Err(FetchError::CrcFailed);
-            }
-            overflow_pos = next;
+            upper_bound = overflow_pos;
+            overflow_pos = Self::read_overflow_pos(buf);
         }
         Ok(None)
     }
@@ -550,22 +627,38 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                Self::collect_from_buffer(buf, &mut out, &mut seen);
+                Self::collect_from_buffer(buf, &mut out, &mut seen)?;
                 Self::read_overflow_pos(buf)
             }
-            None => return Ok(out),
+            // The split bucket is `< buckets()`, so it must be mapped; a `None` here is a short/
+            // corrupt hdx. Surface it rather than silently redistributing an empty bucket (which
+            // would drop the bucket's elements).
+            None => {
+                return Err(AppendError::CorruptIndex(format!(
+                    "hdx mapping does not cover bucket {bucket}"
+                )))
+            }
         };
+        // Validate each overflow pointer before slicing, seeding the bound with the odx length so
+        // the first hop (from a possibly-corrupt main bucket) is validated the same as later hops.
+        let mut upper_bound = self.odx_file.len();
         while overflow_pos > 0 {
+            if overflow_pos >= upper_bound {
+                return Err(AppendError::CorruptIndex(format!(
+                    "overflow pointer {overflow_pos} is not strictly backwards (bound {upper_bound})"
+                )));
+            }
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
                 Some(buf) => buf,
-                None => return Err(AppendError::CrcError),
+                None => {
+                    return Err(AppendError::CorruptIndex(format!(
+                        "odx mapping does not cover overflow record at {overflow_pos}"
+                    )))
+                }
             };
-            Self::collect_from_buffer(buf, &mut out, &mut seen);
-            let next = Self::read_overflow_pos(buf);
-            if next != 0 && next >= overflow_pos {
-                return Err(AppendError::CrcError);
-            }
-            overflow_pos = next;
+            Self::collect_from_buffer(buf, &mut out, &mut seen)?;
+            upper_bound = overflow_pos;
+            overflow_pos = Self::read_overflow_pos(buf);
         }
         Ok(out)
     }
@@ -633,11 +726,26 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         Ok(())
     }
 
+    /// The `values` count at which a bucket split is due (`capacity * load_factor`), precomputed to
+    /// a u64 so the per-insert check in [`Self::expand_buckets`] is a plain compare, not u128 math.
+    ///
+    /// `load_factor` is the fraction `stored / u16::MAX`, so the real threshold is
+    /// `capacity * load_factor / u16::MAX`. `div_ceil` preserves the exact
+    /// `values * u16::MAX >= capacity * load_factor` boundary (an integer `values >= ceil(x)` is
+    /// equivalent to `values * u16::MAX >= capacity * load_factor`), and the f32 route's 24-bit
+    /// mantissa rounding above ~16M entries is gone. The result is `<= capacity <= u64::MAX`, so
+    /// the `as u64` is lossless; `u128` keeps the `u64 * u16` product from overflowing.
+    fn expand_threshold(capacity: u64, load_factor: u16) -> u64 {
+        (u128::from(capacity) * u128::from(load_factor)).div_ceil(u128::from(u16::MAX)) as u64
+    }
+
     /// Add buckets to expand capacity: while the load factor is exceeded, split one bucket.
     fn expand_buckets(&mut self) -> Result<(), AppendError> {
-        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
+        while self.header.values >= self.expand_at_capacity {
             self.split_one_bucket()?;
             self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
+            self.expand_at_capacity =
+                Self::expand_threshold(self.capacity, self.header.load_factor);
         }
         Ok(())
     }
@@ -647,24 +755,69 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// written at the current file end (which the random-write mmap extends).
     fn split_one_bucket(&mut self) -> Result<(), AppendError> {
         let old_modulus = self.modulus;
-        // The bucket being split.
-        let split_bucket = (self.buckets() - (old_modulus / 2)) as u64;
+        let old_buckets = self.buckets();
+        // The bucket being split. `checked_sub` so a broken invariant surfaces as corruption rather
+        // than wrapping (release builds) to a huge index whose `slice_mut` returns `None` and is
+        // misreported as a spurious `ReadOnly`.
+        let split_bucket = self.buckets().checked_sub(old_modulus / 2).ok_or_else(|| {
+            AppendError::CorruptIndex(format!(
+                "split-bucket underflow: buckets {} < modulus/2 {}",
+                self.buckets(),
+                old_modulus / 2
+            ))
+        })? as u64;
+        let split_pos = self.bucket_pos(split_bucket);
+
+        // Gather the split bucket's elements (shared borrows) BEFORE any mutation, then snapshot
+        // the bucket's raw bytes, so a failure part-way through the redistribute can fully
+        // restore the pre-split state instead of dropping the collected digests. Without
+        // the restore the index would serve false negatives for them (the mapping is not
+        // the durability source, so nothing rebuilds it) until the next restart. `collect`
+        // reads `bucket_pos(split_bucket)` + the odx chain — neither depends on the bucket
+        // count / modulus — so it is safe here.
+        let elements = self.collect_bucket_elements(split_bucket)?;
+        let original = match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
+            Some(buf) => buf.to_vec(),
+            None => return Err(AppendError::ReadOnly),
+        };
+
+        if let Err(e) = self.redistribute_split(split_bucket, split_pos, elements) {
+            // Restore the pre-split state: the bucket/modulus counters revert, and rewriting the
+            // split bucket's original bytes restores its overflow pointer — the odx is append-only,
+            // so the failed re-inserts only *appended* records and the original chain is intact, so
+            // every original element is reachable again. The new bucket, the `ensure_len` growth,
+            // and any orphan odx records are inert once `buckets` is reverted (the new
+            // bucket is beyond the count; orphans are unreferenced). `values` is
+            // untouched (redistribute uses `inc_values=false`). The triggering `save`
+            // still errors out (`expand_buckets` propagates this), so the record writer
+            // manages the failure with the index no worse than before.
+            self.modulus = old_modulus;
+            self.header.buckets = old_buckets;
+            if let Some(buf) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+                buf.copy_from_slice(&original);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The mutating half of a bucket split: allocate the new bucket, clear the split/new pair, and
+    /// redistribute `elements` across them. Separated from [`Self::split_one_bucket`] so a failure
+    /// here can be rolled back to the snapshot that caller took. On success the split bucket and
+    /// the appended `new_bucket` hold the rehashed elements; on error the mapping is left
+    /// mid-split and the caller restores it.
+    fn redistribute_split(
+        &mut self,
+        split_bucket: u64,
+        split_pos: u64,
+        elements: Vec<(B256, u64)>,
+    ) -> Result<(), AppendError> {
         self.inc_buckets();
         // The newly created bucket that some of split_bucket's items may move into.
         let new_bucket = self.buckets() as u64 - 1;
         // Don't want buckets and modulus to be the same, so +1.
         self.modulus = (self.buckets() + 1).next_power_of_two();
-        let split_pos = self.bucket_pos(split_bucket);
         let new_pos = self.bucket_pos(new_bucket);
-
-        // Gather the split bucket's elements (shared borrows) BEFORE clearing either bucket, then
-        // redistribute into two freshly-zeroed buckets — mirroring the original `HdxIndex` split,
-        // which builds fresh buffers. The split bucket must be cleared too: if it kept its old
-        // contents, the elements that move to `new_bucket` would linger here as stale duplicates,
-        // and a later re-split would re-collect them, hash them into a third bucket, and trip the
-        // guard below (they are never consulted by lookups, so the only visible symptom is that
-        // panic plus unbounded overflow-chain growth).
-        let elements = self.collect_bucket_elements(split_bucket)?;
 
         // Clear both buckets before redistributing. The split bucket is already within the logical
         // end, so zero it in place. The new bucket lies at/after the current end (buckets are
@@ -683,6 +836,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             buffer.fill(0);
         } else {
             return Err(AppendError::ReadOnly);
+        }
+
+        // Test-only: simulate a mid-split failure with both buckets already zeroed (the worst case
+        // for element loss) so the caller's rollback is exercised.
+        #[cfg(test)]
+        if self.fail_next_split {
+            self.fail_next_split = false;
+            return Err(AppendError::CrcError);
         }
 
         for (hash, rec_pos) in elements {
@@ -710,9 +871,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.save_to_bucket_inner(key, record_pos, bucket_pos)
     }
 
-    /// Read-modify-write body of [`Self::save_to_bucket`], operating on a caller-owned `scratch`
-    /// buffer (never `self.scratch`, to avoid a `&mut self` + `&mut self.scratch` overlap). On any
-    /// error the on-disk bucket is left untouched.
+    /// Read-modify-write body of [`Self::save_to_bucket`]: rewrites the bucket in place through the
+    /// mapping, then zeroes its trailer to mark it dirty for the bulk CRC at `sync()`. On any error
+    /// the on-disk bucket is left untouched.
     fn save_to_bucket_inner(
         &mut self,
         key: &[u8],
@@ -876,10 +1037,223 @@ mod tests {
 
     use super::*;
 
+    /// Concrete default instantiation, so associated consts/fns (`BUCKET_SIZE`, `scan_bucket`, …)
+    /// resolve without spelling out the const-generic parameters at every use.
+    type Idx = HdxIndex<32, BuildHasherDefault<FxHasher>>;
+
     fn key(i: u64) -> B256 {
         let mut hasher = DefaultHashFunction::new();
         hasher.update(&format!("idx-{i}").into_bytes());
         B256::from_slice(hasher.finalize().as_bytes())
+    }
+
+    fn open_index(tmp: &Path) -> HdxIndex {
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        HdxIndex::open_hdx_file(
+            tmp.join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("hdx mmap")
+    }
+
+    /// The CRC-free read path must reject an out-of-range on-disk element count with an error,
+    /// never slice past the fixed bucket buffer and panic.
+    #[test]
+    fn test_scan_bucket_rejects_oversized_element_count() {
+        let mut buf = vec![0u8; Idx::BUCKET_SIZE];
+        let k = key(1);
+        buf[8..12].copy_from_slice(&(Idx::BUCKET_ELEMENTS as u32 + 1).to_le_bytes());
+        assert!(matches!(Idx::scan_bucket(&buf, k.as_slice()), Err(FetchError::CorruptIndex(_))));
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        assert!(matches!(
+            Idx::collect_from_buffer(&buf, &mut out, &mut seen),
+            Err(AppendError::CorruptIndex(_))
+        ));
+        // The maximum u32 must be rejected too (not merely wrapped or truncated).
+        buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(Idx::scan_bucket(&buf, k.as_slice()), Err(FetchError::CorruptIndex(_))));
+    }
+
+    /// A corrupt element count reached through a real `load` errors instead of wedging on a panic.
+    #[test]
+    fn test_load_rejects_corrupt_element_count() {
+        let tmp = TempDir::with_prefix("test_hdx_corrupt_count").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        let k = key(7);
+        idx.save(k, 42).expect("save");
+        assert_eq!(idx.load(k).expect("load"), 42);
+        let bucket = idx.hash_to_bucket(k.as_slice());
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice");
+        buf[8..12].copy_from_slice(&(Idx::BUCKET_ELEMENTS as u32 + 5).to_le_bytes());
+        assert!(
+            matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
+            "a corrupt element count must error, not panic"
+        );
+    }
+
+    /// The first overflow-chain hop (read from a possibly-corrupt main bucket) must be validated:
+    /// a forward/garbage pointer errors rather than indexing arbitrary bytes or looping.
+    #[test]
+    fn test_find_rejects_unvalidated_first_overflow_hop() {
+        let tmp = TempDir::with_prefix("test_hdx_overflow_ptr").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        let k = key(3);
+        idx.save(k, 9).expect("save");
+        let bucket = idx.hash_to_bucket(k.as_slice());
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice");
+        // Point the first overflow hop forward, past any written odx record.
+        buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        // Look up an absent key so the scan falls through to the (corrupt) overflow pointer.
+        let absent = key(987_654);
+        assert!(matches!(
+            idx.find_in_bucket(bucket, absent.as_slice()),
+            Err(FetchError::CorruptIndex(_))
+        ));
+    }
+
+    /// A bucket the mapping does not cover (short/corrupt hdx) must be a distinct error, not folded
+    /// into `NotFound` — otherwise corruption is indistinguishable from a missing key.
+    #[test]
+    fn test_find_out_of_range_mapping_is_corrupt_not_notfound() {
+        let tmp = TempDir::with_prefix("test_hdx_short_map").expect("temp dir");
+        let idx = open_index(tmp.path());
+        let res = idx.find_in_bucket(u32::MAX as u64, key(1).as_slice());
+        assert!(
+            matches!(res, Err(FetchError::CorruptIndex(_))),
+            "out-of-range mapping must be CorruptIndex, got {res:?}"
+        );
+        assert!(!matches!(res, Err(FetchError::NotFound)));
+    }
+
+    /// A broken split invariant must surface as corruption via `checked_sub`, not wrap to a huge
+    /// index misreported as a spurious `ReadOnly`.
+    #[test]
+    fn test_split_bucket_underflow_is_corrupt_index() {
+        let tmp = TempDir::with_prefix("test_hdx_split_underflow").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        // Force modulus/2 > buckets() so the split-bucket subtraction underflows.
+        idx.modulus = idx.buckets().saturating_mul(4) + 4;
+        assert!(
+            matches!(idx.split_one_bucket(), Err(AppendError::CorruptIndex(_))),
+            "split underflow must error, not wrap"
+        );
+    }
+
+    /// F2: a cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
+    /// caller rebuilds from the WAL instead of silently misreading buckets. This is exactly the
+    /// shape a bloom-size mismatch produces — the bloom sits between the header and the first
+    /// bucket, and its size is a compile-time constant not recorded on disk, so a build with a
+    /// different `BLOOM_SIZE_BYTES` reads the first bucket at the wrong offset (a non-CRC-valid
+    /// bucket) even though header/uid/version/geometry/pepper all still match. Also covers at-rest
+    /// damage to the first bucket. A valid clean index must still open (no false rejection).
+    #[test]
+    fn open_rejects_clean_index_with_corrupt_first_bucket() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let tmp = TempDir::with_prefix("test_hdx_first_bucket_crc").expect("temp dir");
+        // Build and cleanly close an index: Drop's ordered_sync CRCs every bucket and writes the
+        // clean-close sentinel, so a reopen reads it as cleanly sealed (`opened_unclean()` false).
+        {
+            let mut idx = open_index(tmp.path());
+            for i in 0..100u64 {
+                idx.save(key(i), i).expect("save");
+            }
+        }
+
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let reopen = || {
+            HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+                tmp.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true, /* read-only: surfaces the open guard's error directly (no rebuild layer
+                       * here) */
+            )
+        };
+
+        // Control: the untouched, cleanly-sealed index opens fine — the guard does not false-fire.
+        reopen().expect("a valid clean index must open");
+
+        // Flip one payload byte of the FIRST bucket, leaving the clean-close sentinel (at EOF)
+        // intact so the file still reads as cleanly sealed. `open_index` uses `index.hdx` as the
+        // directory name, so the bucket file is `index.hdx/index.hdx`.
+        let hdx_file = tmp.path().join("index.hdx").join("index.hdx");
+        let first_bucket_payload = (HEADER_SIZE + BLOOM_SIZE_BYTES + 12) as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&hdx_file)
+                .expect("open hdx");
+            f.seek(SeekFrom::Start(first_bucket_payload)).expect("seek");
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).expect("read byte");
+            f.seek(SeekFrom::Start(first_bucket_payload)).expect("seek back");
+            f.write_all(&[b[0] ^ 0xFF]).expect("flip byte");
+            f.sync_all().expect("sync");
+        }
+
+        // The guard detects the non-CRC-valid first bucket on a cleanly-sealed index and rejects,
+        // so the writable doors rebuild and read-only refuses.
+        match reopen() {
+            Err(LoadHeaderError::CrcFailed) => {}
+            other => panic!("expected CrcFailed for a corrupt first bucket, got {other:?}"),
+        }
+    }
+
+    /// A failed bucket split must roll back, not drop the collected elements: after an injected
+    /// mid-split failure the split bucket's keys still load (without the rollback they would be
+    /// lost in-process until a restart rebuilt the index from the WAL), and the save that
+    /// triggered the split errors out so the record writer can manage it.
+    #[test]
+    fn test_failed_split_rolls_back_and_preserves_elements() {
+        let tmp = TempDir::with_prefix("test_hdx_split_rollback").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+
+        // The first split splits `buckets - modulus/2`. Collect several keys that hash there so the
+        // split bucket is non-empty — its elements are exactly what a broken split would drop.
+        let split_bucket = idx.buckets() as u64 - (idx.modulus as u64) / 2;
+        let mut targets = Vec::new();
+        let mut i = 0u64;
+        while targets.len() < 5 {
+            let k = key(i);
+            if idx.hash_to_bucket(k.as_slice()) == split_bucket {
+                targets.push((k, i));
+            }
+            i += 1;
+        }
+        for (k, pos) in &targets {
+            idx.save(*k, *pos).expect("save target");
+            assert_eq!(idx.load(*k).expect("load before split"), *pos);
+        }
+
+        // Force the next save to trigger a split, and make that split fail after both buckets are
+        // zeroed (nothing re-inserted) — the worst case for element loss.
+        idx.expand_at_capacity = idx.header.values;
+        idx.fail_next_split_for_test();
+        let trigger = key(1_000_000);
+        assert!(
+            matches!(idx.save(trigger, 42), Err(AppendError::CrcError)),
+            "the save that triggers a failed split must error out"
+        );
+
+        // Rollback preserved every split-bucket key; the triggering key was never inserted.
+        for (k, pos) in &targets {
+            assert_eq!(idx.load(*k).expect("a split-bucket key must survive a failed split"), *pos);
+        }
+        assert!(matches!(idx.load(trigger), Err(FetchError::NotFound)));
+
+        // Retry now the injector is cleared: the split succeeds and every key is present.
+        idx.save(trigger, 42).expect("retry after the transient split failure");
+        for (k, pos) in &targets {
+            assert_eq!(idx.load(*k).expect("load after a successful split"), *pos);
+        }
+        assert_eq!(idx.load(trigger).expect("trigger loads after retry"), 42);
     }
 
     /// Full lifecycle on the memory-mapped, cache-free index: fill (forcing bucket splits, i.e.

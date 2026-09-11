@@ -394,7 +394,17 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 
 `eth`, `net`, `web3`, `debug`, `trace`, `rpc`
 
-The `admin` and `txpool` modules are not available at this time.
+`--http.api all` (and `--ws.api all`) enables `eth`, `net`, `web3`, `rpc`. The `debug` and
+`trace` modules are expensive to serve on an archive node and are never part of `all`: name
+them explicitly (for example `--http.api eth,debug,trace`) to enable them, which logs a
+warning at startup. A selection whose first entry is `all` (for example `all,debug`) parses
+as plain `all` and the rest of the list is ignored, so list every module by name instead.
+
+The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the same module set as
+`all`.
+
+The `admin` and `txpool` modules are not available at this time; they are dropped from any
+selection with a warning.
 
 ### Transaction pool
 

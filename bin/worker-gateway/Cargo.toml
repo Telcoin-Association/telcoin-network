@@ -57,6 +57,9 @@ tn-types = { workspace = true }
 socket2 = { workspace = true }
 
 [dev-dependencies]
+# `TxEip7702` for the screen tests' disallowed-type fixture; every other
+# transaction type the tests build comes through `tn-types` re-exports.
+alloy = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -33,7 +33,10 @@ use reth_provider::{
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::GasAccumulator, Address, SealedHeader, TaskManager, TaskSpawner};
+use tn_types::{
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, SealedHeader, TaskManager, TaskSpawner,
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -299,6 +302,30 @@ impl RethEnv {
             })
     }
 
+    /// Return the lowest block number whose header is guaranteed REAL on this datadir.
+    ///
+    /// `0` on a normally-synced node: every persisted header is real down to genesis. On a
+    /// snapshot-restored datadir, real headers exist only inside the restore window; every block
+    /// below it is a scaffold dummy (`ExecHeader::default()` with a zero hash and zero nonce,
+    /// `SnapshotRestorer::import_chain_scaffold` in `snapshot.rs`). Backward header walks must
+    /// stop here instead of genesis: below this bound the dummy nonces never change, so a walk
+    /// keyed on nonce changes (`last_executed_output_blocks` in `tn-node`) would read every
+    /// header down to block 0 (O(chain-height) reads inside startup) and hand its caller a
+    /// synthetic header (issue #1321).
+    ///
+    /// Only the snapshot block `B` is persisted (the floor marker), not the window start, so the
+    /// bound is derived: the restore admits a window only if it starts at or below
+    /// `max(1, B - (BLOCKHASH_ANCESTORS - 1))` (`import_chain_scaffold`), making that expression
+    /// the lowest block guaranteed real. The actual window may reach one block lower; stopping
+    /// at the guarantee merely trims the walk by that block, while trusting an unpersisted
+    /// window start could admit a dummy read.
+    pub fn real_header_floor(&self) -> u64 {
+        use tn_storage::exec_state_pack::BLOCKHASH_ANCESTORS;
+        self.inner
+            .restored_state_floor
+            .map_or(0, |b| b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1))
+    }
+
     /// Initialize the provider factory and related components
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
@@ -360,12 +387,16 @@ impl RethEnv {
     }
 
     /// Initialize a new transaction pool for worker.
-    pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
+    ///
+    /// The `base_fee` container supplies the pool's pending base fee for the worker's current
+    /// epoch (issue #1262).
+    pub fn init_txn_pool(&self, base_fee: BaseFeeContainer) -> eyre::Result<WorkerTxPool> {
         WorkerTxPool::new(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
+            base_fee,
         )
     }
 
@@ -375,12 +406,16 @@ impl RethEnv {
     /// whose maintenance task missed `Commit` notifications, and reproducing that state
     /// deterministically requires committing canonical blocks while no task is subscribed.
     #[cfg(test)]
-    pub(crate) fn init_txn_pool_without_maintenance(&self) -> eyre::Result<WorkerTxPool> {
+    pub(crate) fn init_txn_pool_without_maintenance(
+        &self,
+        base_fee: BaseFeeContainer,
+    ) -> eyre::Result<WorkerTxPool> {
         WorkerTxPool::build(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
+            base_fee,
         )
     }
 

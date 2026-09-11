@@ -101,16 +101,20 @@ lane_test_adiri() {
     # pre-fork committee vectors in tn-types, the consensus-registry fork tests and their
     # determinism oracles in tn-reth, the pre-fork entry-fee pin in tn-node, the frozen
     # pre-fork consensus-pack fixtures in tn-storage, and the pre-fork genesis rejection in
-    # tn-config. Every crate that forwards `adiri` and has adiri-gated tests belongs on
-    # this line: one left off silently stops testing its pre-fork lane. With multiple -p
-    # flags cargo requires package-qualified feature names.
+    # tn-config. tn-engine's integration suite compiles under either feature set, but its
+    # hand-composed mix-hash oracle dispatches on the PREVRANDAO fork gate (#1247), and
+    # only this lane runs the oracle's pre-fork legacy arm. Every crate that forwards
+    # `adiri` and has adiri-gated tests belongs on this line: one left off silently stops
+    # testing its pre-fork lane. With multiple -p flags cargo requires package-qualified
+    # feature names.
     #
     # tn-storage used to be left off here, on the grounds that two of its consensus_pack
-    # tests failed under the adiri features. They pass now (777/777 across all five
-    # packages), so it is back, and this lane is the same set the workflow already ran.
+    # tests failed under the adiri features. They pass now, so it is back. tn-engine
+    # joined for #1247: with the mix-hash oracle dispatching on the fork gate, this lane
+    # is the only one that runs its pre-fork legacy arm.
     run cargo nextest run --locked \
-        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-config \
-        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-config/adiri \
+        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config \
+        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri \
         "${run_mode[@]}"
 }
 

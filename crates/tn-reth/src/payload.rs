@@ -60,6 +60,14 @@ pub struct TNPayload {
     /// The value comes from the worker's block.
     pub gas_limit: u64,
     /// The mix hash used for prev_randao.
+    ///
+    /// Fork-gated by `prevrandao_seed_active` for the committing leader's epoch: the legacy
+    /// `output_digest ^ batch_digest` before the PREVRANDAO fork, the domain-separated
+    /// keccak over the epoch seed chain value, consensus block number, and batch index from
+    /// it (`ConsensusOutput::prev_randao`, #1247). Post-fork the value is immune to payload
+    /// grinding, but the committing leader still sees every value its commit will produce
+    /// before broadcasting and keeps one propose-or-withhold choice per commit; contracts
+    /// that need unbiasable randomness must not use `PREVRANDAO` alone.
     pub mix_hash: B256,
     /// Randomness digest carried only by the payload that closes the epoch.
     ///
@@ -124,9 +132,13 @@ impl TNPayload {
         }
     }
 
-    /// PrevRandao is used by TN to provide a source for randomness on-chain.
+    /// The block's `PREVRANDAO` ([EIP-4399]), stored as the executed block's `mix_hash`.
     ///
-    /// This is used as the executed block's "mix_hash".
+    /// Derived by [`ConsensusOutput::prev_randao`]. Contract-visible, and grinding-resistant
+    /// from the PREVRANDAO fork epoch onward, but NOT unbiasable: the committing leader can
+    /// compute the value before broadcasting and withhold the commit. Contracts needing
+    /// unbiasable randomness must not use this value alone.
+    ///
     /// [EIP-4399]: https://eips.ethereum.org/EIPS/eip-4399
     pub(crate) fn prev_randao(&self) -> B256 {
         self.mix_hash

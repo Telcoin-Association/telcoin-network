@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
-#![allow(missing_docs)]
-
 mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -17,6 +15,7 @@ use tables::{
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
 pub mod certificate_pack;
+/// The `CompositeDatabase` backend that splits the workload into epoch/kad/cache sub-databases.
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
@@ -26,7 +25,9 @@ mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
+/// `LayeredDatabase`: a write-through in-memory layer plus a shared write-txn guard over a backend.
 pub mod layered_db;
+/// The reth MDBX key/value backend (the default `Database` backend).
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
@@ -38,15 +39,16 @@ mod pack_bench;
 #[cfg(test)]
 mod pack_kv_bench;
 pub mod pack_validate;
+/// The `redb`-backed database implementation (the default persistent consensus store).
 pub mod redb;
 
 pub use tn_types::error::StoreError;
 
 use crate::composite_db::CompositeDatabase;
 
+/// Key type for the proposer's last-proposed-header table.
 pub type ProposerKey = u32;
-// A type alias marking the "payload" tokens sent by workers to their primary as batch
-// acknowledgements
+/// A "payload" token sent by workers to their primary as a batch acknowledgement.
 pub type PayloadToken = u8;
 
 /// Convenience type to propagate store errors.
@@ -69,14 +71,19 @@ const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
 const CONSENSUS_OUTPUT_CACHE_CF: &str = "consensus_output_cache";
 
-const KAD_RECORD_CF: &str = "kad_record";
-const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
-const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
-const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
+/// Discovery records with role and worker id in their row hashes.
+const KAD_RECORD_CF: &str = "kad_record_v2";
+/// Provider rows with a separately decodable ownership key.
+const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record_v2";
+/// Worker discovery records isolated by worker id.
+const KAD_WORKER_RECORD_CF: &str = "kad_worker_record_v2";
+/// Worker provider rows isolated by worker id and ownership key.
+const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record_v2";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;$hint:expr;<$K:ty, $V:ty>),*) => {
             $(
+                #[doc = concat!("The `", stringify!($table), "` database table (see `tn_types::Table`).")]
                 #[derive(Debug)]
                 pub struct $table {}
                 impl tn_types::Table for $table {
@@ -90,6 +97,7 @@ macro_rules! tables {
     };
 }
 
+/// Database table type definitions used by the consensus and network stores.
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
@@ -121,8 +129,10 @@ pub mod tables {
 }
 
 // mdbx is the default, if redb is set then is used (so priority is mdbx -> redb)
+/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
 #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
 pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
+/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
 #[cfg(feature = "redb")]
 pub type DatabaseType = CompositeDatabase<ReDB>;
 

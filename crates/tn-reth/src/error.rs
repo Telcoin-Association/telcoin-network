@@ -4,6 +4,7 @@ use alloy::primitives::Bytes;
 use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
+use tn_types::WorkerId;
 
 /// Result alias for [`TnRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
@@ -80,6 +81,48 @@ pub enum TnRethError {
         expected: usize,
         /// The number of validators actually assembled after the shuffle and truncate.
         got: usize,
+    },
+    /// Deriving a worker's RPC listener port left the valid port range.
+    ///
+    /// Worker `worker_id`'s band offset applied to the operator's configured port went
+    /// below 1 or above `u16::MAX`. Failing startup loudly here replaces the pre-#1287
+    /// behavior, where every worker bound the one shared endpoint config: the second
+    /// worker unlinked worker 0's IPC socket silently and a fixed http/ws port failed
+    /// later with `AddrInUse`.
+    #[error(
+        "worker {worker_id} {transport} rpc port derivation left the valid port range: \
+         base port {base}, worker offset {offset}"
+    )]
+    WorkerRpcPort {
+        /// The worker whose endpoint was being derived.
+        worker_id: WorkerId,
+        /// The transport whose port left the range (`"http"` or `"ws"`).
+        transport: &'static str,
+        /// The operator-configured port the offset applies to.
+        base: u16,
+        /// The band offset for this worker (stride times worker id).
+        offset: u32,
+    },
+    /// Multi-worker RPC derivation needs the ws base port at or above the http base.
+    ///
+    /// http bands stride down and ws bands stride up from the operator's bases, so
+    /// `ws_port >= http_port` (reth's own default layout; equality is the shared
+    /// http+ws server) is what keeps every derived endpoint distinct across workers.
+    /// Worker 0 binds the operator's ports as configured, so single-worker nodes
+    /// never see this error; the first derived worker refuses startup loudly instead
+    /// of colliding with another worker's endpoint at bind time.
+    #[error(
+        "worker {worker_id} rpc port derivation needs ws_port ({ws}) at or above http_port \
+         ({http}): http bands stride down and ws bands stride up, so inverted bases collide \
+         across workers"
+    )]
+    WorkerRpcPortOrder {
+        /// The first derived worker that hit the inverted bases.
+        worker_id: WorkerId,
+        /// The operator-configured http base port.
+        http: u16,
+        /// The operator-configured ws base port.
+        ws: u16,
     },
 }
 

@@ -21,9 +21,20 @@
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
 //! while actively appending (`end` is the logical data length). The physical file is reconciled to
 //! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
-//! `PackIter`/`raw_iter`, which read to EOF) and `Drop` (clean close) both truncate to `end` —
-//! while our own reads are bounded by `end` and never see the padding. After a crash the file may
-//! be left padded; the pack's CRC + `recover_pack` path truncates it back to the last good record.
+//! `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close) truncates
+//! to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are bounded by
+//! `end` and never see the padding.
+//!
+//! ## Clean-close sentinel
+//!
+//! On clean close `Drop` appends an 8-byte sentinel at physical EOF (`crc32(end)` followed by the
+//! `crc32` of those four bytes; see `clean_close_sentinel`). A reopen validates it against the
+//! physical size, and on a match strips it back to `end` and knows the file was sealed. A missing
+//! or invalid sentinel means the file was **not** closed cleanly (most likely still padded after a
+//! crash); [`Self::opened_unclean`] surfaces that, the logical end is left at physical EOF, and the
+//! pack's CRC + `recover_pack` path truncates it back to the last good record. The self-referential
+//! second CRC is what stops trailing zero padding from masquerading as a clean close
+//! (`crc32(0x00000000) != 0`).
 //!
 //! ## Durability
 //!
@@ -39,8 +50,9 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use memmap2::{Mmap, MmapMut};
@@ -157,6 +169,52 @@ enum Backing {
     Empty,
 }
 
+/// Width of the clean-close sentinel appended at physical EOF by [`MmapDataFile`]'s `Drop`.
+pub(crate) const SENTINEL_LEN: u64 = 8;
+
+/// Build the 8-byte clean-close sentinel for a file whose logical data length is `end`.
+///
+/// Layout (little-endian): bytes `[0..4]` are `crc32(end)`, bytes `[4..8]` are the `crc32` of those
+/// first four bytes. The self-referential second CRC is what stops trailing zero padding from
+/// masquerading as a clean close: `crc32(0x00000000) != 0`, so an all-zero tail never satisfies it.
+fn clean_close_sentinel(end: u64) -> [u8; 8] {
+    let mut sentinel = [0_u8; 8];
+    let len_crc = crc32fast::hash(&end.to_le_bytes());
+    sentinel[0..4].copy_from_slice(&len_crc.to_le_bytes());
+    let crc_of_crc = crc32fast::hash(&sentinel[0..4]);
+    sentinel[4..8].copy_from_slice(&crc_of_crc.to_le_bytes());
+    sentinel
+}
+
+/// True iff `tail` is a valid clean-close sentinel for a file whose logical data length is
+/// `data_len`. Because the sentinel is fully determined by `data_len`, an exact match confirms both
+/// that the first CRC equals `crc32(data_len)` (ties the marker to the actual file size, so a
+/// torn/padded tail that happens to be self-consistent still fails) and that the trailing CRC
+/// equals `crc32` of the first four bytes (self-consistency / zero-padding guard).
+fn sentinel_matches(tail: &[u8; 8], data_len: u64) -> bool {
+    *tail == clean_close_sentinel(data_len)
+}
+
+/// Given the physical size `disk_len` of `file`, return `(logical_end, opened_unclean)` by checking
+/// for a clean-close sentinel at physical EOF. A valid sentinel means the file was sealed and the
+/// logical data ends [`SENTINEL_LEN`] bytes before EOF; a missing/invalid sentinel means the file
+/// was not cleanly closed (most likely still padded), so the logical end is left at the physical
+/// size for the heal path. A 0-length file is fresh/empty, not unclean.
+fn detect_sentinel(file: &File, disk_len: u64) -> io::Result<(u64, bool)> {
+    if disk_len == 0 {
+        return Ok((0, false));
+    }
+    if disk_len >= SENTINEL_LEN {
+        let mut tail = [0_u8; 8];
+        file.read_exact_at(&mut tail, disk_len - SENTINEL_LEN)?;
+        if sentinel_matches(&tail, disk_len - SENTINEL_LEN) {
+            return Ok((disk_len - SENTINEL_LEN, false));
+        }
+    }
+    // Too short to hold a sentinel, or the tail is not a valid one: not cleanly sealed.
+    Ok((disk_len, true))
+}
+
 /// An mmap-backed, append-only data file — the storage behind every
 /// [`Pack`](crate::archive::pack::Pack).
 #[derive(Debug)]
@@ -172,16 +230,17 @@ pub struct MmapDataFile {
     seek_pos: u64,
     read_only: bool,
     remove_on_drop: bool,
-    /// Set by [`Self::try_clone`] after it truncates the file to `end`; the next write re-maps
-    /// first. `AtomicBool` (not `Cell`) so the file stays `Sync`, letting a pack hold it
-    /// behind a `Send + Sync` trait object.
-    remap_needed: AtomicBool,
     /// High-water offset already `msync`'d to the backing store. The `WriteMode::Append` sync fast
     /// path flushes only the newly-written tail `[flushed_end, end)` instead of re-scanning the
     /// whole mapping each sync. Only meaningful for append (in-place `Random` writes can land
     /// below this offset, so that mode always flushes the full `[0, end)` range). `AtomicU64`
-    /// for the same `Sync`-through-`&self`-`sync_all` reason as `remap_needed`.
+    /// (not `Cell`) so the file stays `Sync` behind `&self` (e.g. the `&self` `sync_all`), letting
+    /// a pack hold it behind a `Send + Sync` trait object.
     flushed_end: AtomicU64,
+    /// True when this handle was opened from a file with no valid clean-close sentinel — the file
+    /// was not sealed by a clean `Drop` and is most likely still padded, so the pack's heal path
+    /// should run. Set once at open; a fresh (0-length) file is not considered unclean.
+    opened_unclean: bool,
     opts: MmapFileOptions,
 }
 
@@ -210,18 +269,37 @@ impl MmapDataFile {
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let orig_len = file.metadata()?.len();
 
+        // A clean `Drop` appends an 8-byte sentinel at physical EOF (see `clean_close_sentinel`).
+        // Detect it here: a valid sentinel means the file was sealed, so the logical data ends 8
+        // bytes before physical EOF; a missing/invalid sentinel means the file was not closed
+        // cleanly (most likely still padded), which `opened_unclean` surfaces so the pack's heal
+        // path runs — the logical end is left at physical EOF for that scan.
+        let (logical_end, opened_unclean) = detect_sentinel(&file, orig_len)?;
+
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
         // until the first write, so a crash before any data keeps it 0-length (and it reopens as
-        // empty). Existing content is mapped as-is; any trailing padding a crashed writer left is
-        // handled by the pack's heal path.
+        // empty). Existing content (including a clean file's trailing sentinel, which sits in the
+        // `[end, capacity)` padding region and is overwritten by the next append) is mapped as-is;
+        // any trailing padding a crashed writer left is handled by the pack's heal path.
         let (backing, capacity) = if orig_len == 0 {
             (Backing::Empty, 0)
         } else if read_only {
-            // SAFETY: single-writer pack model — the file is not concurrently truncated/replaced.
+            // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
+            // clean-closed (its `Drop` truncated the mmap capacity padding away and appended the
+            // clean-close sentinel, validated above; `opened_unclean` flags a file that was not)
+            // and has no live writer. A writer that later shrinks the file under this
+            // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
+            // error path catches. The pack upholds this: `get_static` serves the live epoch from
+            // the writer handle (never a read-only map of it), and `open_static` runs
+            // only on sealed epochs and is gated by `files_consistent`. As
+            // defense-in-depth, the read bound (`end`) is additionally clamped to the
+            // index-attested length via `set_read_bound`, so reads never touch bytes a
+            // writer truncation could remove even if that discipline slipped.
             let map = unsafe { Mmap::map(&file)? };
             (Backing::Ro(map), orig_len)
         } else {
-            // SAFETY: as above; we hold the file open for writing for this handle's lifetime.
+            // SAFETY: single-writer pack model — we hold the file open for writing for this
+            // handle's lifetime and nothing else writes/truncates it concurrently.
             let map = unsafe { MmapMut::map_mut(&file)? };
             (Backing::Rw(map), orig_len)
         };
@@ -230,14 +308,14 @@ impl MmapDataFile {
             file,
             path: path.to_owned(),
             backing,
-            end: orig_len,
+            end: logical_end,
             capacity,
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
-            remap_needed: AtomicBool::new(false),
             // Existing content is already durable on disk, so the sync fast path starts here.
-            flushed_end: AtomicU64::new(orig_len),
+            flushed_end: AtomicU64::new(logical_end),
+            opened_unclean,
             opts,
         };
         df.advise_backing();
@@ -257,6 +335,30 @@ impl MmapDataFile {
     /// Logical length (bytes of real data) — also the position a new record is appended at.
     pub fn len(&self) -> u64 {
         self.end
+    }
+
+    /// True when this file was opened without a valid clean-close sentinel — it was not sealed by a
+    /// clean shutdown and is most likely still padded. Callers (e.g. the pack heal path) use this
+    /// to decide whether a recovery scan is needed. Always `false` for a freshly created
+    /// (0-length) file.
+    pub fn opened_unclean(&self) -> bool {
+        self.opened_unclean
+    }
+
+    /// Clamp a read-only handle's read bound down to `logical_end` (the caller's index-attested
+    /// record end). `slice`/`read`/`len` are all bounded by `end`, so after this no read touches a
+    /// byte above `logical_end` — the region a writer truncation would remove — even if this handle
+    /// mapped a file that was physically padded past its logical data. Never grows `end` (a
+    /// read-only handle cannot have more logical data than it opened with) and does not re-map: the
+    /// mapping may still span padding, but those pages are never accessed. No-op on a writable
+    /// handle.
+    pub fn set_read_bound(&mut self, logical_end: u64) {
+        if self.read_only {
+            self.end = self.end.min(logical_end);
+            if self.seek_pos > self.end {
+                self.seek_pos = self.end;
+            }
+        }
     }
 
     /// Is the logical file empty?
@@ -375,14 +477,6 @@ impl MmapDataFile {
 
     /// Ensure a writable mapping large enough for `[0, needed)`, growing (reopen-larger) if needed.
     fn ensure_capacity(&mut self, needed: u64) -> io::Result<()> {
-        if self.remap_needed.load(Ordering::Relaxed) {
-            // `try_clone` truncated the physical file to `end` and left a stale over-length map;
-            // reflect the real physical size so the growth math is correct, then force a fresh map
-            // below (writes always append, so `needed > end == capacity` and we take the grow
-            // path).
-            self.capacity = self.end;
-            self.remap_needed.store(false, Ordering::Relaxed);
-        }
         if needed <= self.capacity {
             return Ok(());
         }
@@ -429,7 +523,6 @@ impl MmapDataFile {
         }
         self.remap(len)?;
         self.end = len;
-        self.remap_needed.store(false, Ordering::Relaxed);
         // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
         // is still flushed (bytes still present under `len` stay durable).
         let fe = self.flushed_end.load(Ordering::Relaxed).min(len);
@@ -440,27 +533,58 @@ impl MmapDataFile {
         Ok(())
     }
 
-    /// Clone the underlying file handle, first reconciling the physical file to the logical length
-    /// so a consumer that reads to EOF (e.g. `PackIter` via `raw_iter`) sees exactly the written
-    /// bytes with no trailing padding. The next write re-establishes a writable mapping.
-    pub fn try_clone(&self) -> io::Result<File> {
-        if !self.read_only {
-            if self.end > 0 {
-                if let Backing::Rw(map) = &self.backing {
-                    // Flush dirty pages so the cloned handle observes current data.
-                    map.flush_range(0, self.end as usize)?;
-                }
-                // The whole `[0, end)` region was just flushed durably.
-                self.flushed_end.store(self.end, Ordering::Relaxed);
-            }
-            // Truncate away the capacity padding. `File::set_len` takes `&self`; the existing map
-            // still spans the old capacity but `[end, capacity)` is never touched (reads are
-            // bounded by `end`), and the next write re-maps first (see `remap_needed` /
-            // `ensure_capacity`).
-            self.file.set_len(self.end)?;
-            self.remap_needed.store(true, Ordering::Relaxed);
+    /// Roll the logical end back to `new_len`, zeroing the abandoned region `[new_len, end)` in the
+    /// mapping, WITHOUT physically truncating or re-`mmap`ping the file.
+    ///
+    /// Unlike [`Self::set_len`] this keeps the current capacity (no `ftruncate`, no remap), so it
+    /// opens no read-only-mmap SIGBUS window and is cheap. The abandoned bytes become ordinary
+    /// capacity padding: every read/slice/iterator is bounded to `end`, a clean close truncates the
+    /// padding away, and recovery bounds it out via the index-attested length. Zeroing keeps the
+    /// "capacity padding reads as zeros" invariant intact in memory (the zeros sit past `end`, so
+    /// they are not force-flushed — recovery correctness does not depend on them).
+    ///
+    /// Used to atomically undo a partial append (see the consensus pack's save rollback). `new_len`
+    /// must be `<= end`; a value at or beyond `end` is ignored (use [`Self::ensure_len`] to grow).
+    /// No-op on a read-only handle.
+    pub fn rewind_to(&mut self, new_len: u64) {
+        if self.read_only || new_len >= self.end {
+            return;
         }
-        self.file.try_clone()
+        if let Backing::Rw(map) = &mut self.backing {
+            map[new_len as usize..self.end as usize].fill(0);
+        }
+        self.end = new_len;
+        // The tail is gone; clamp the append watermark so a later write is flushed, and pull a
+        // past-end read cursor back (mirrors `set_len`).
+        let fe = self.flushed_end.load(Ordering::Relaxed).min(new_len);
+        self.flushed_end.store(fe, Ordering::Relaxed);
+        if self.seek_pos > new_len {
+            self.seek_pos = new_len;
+        }
+    }
+
+    /// Clone the underlying file handle, flushing `[0, end)` first so the cloned handle's read
+    /// syscalls observe the current mmap writes. Returns the clone together with the logical `end`
+    /// at the moment of the call.
+    ///
+    /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
+    /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
+    /// `end` is the ONLY reliable data boundary. A consumer that reads to physical EOF would run
+    /// into the padding; readers must stop at `end` instead
+    /// ([`PackIter`](crate::archive::pack_iter)
+    /// via [`raw_iter`](crate::archive::pack::Pack::raw_iter) does). An external byte consumer that
+    /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must bound its
+    /// own read to `end`; the physical padding is only ever removed on a clean close (`Drop`).
+    pub fn try_clone(&self) -> io::Result<(File, u64)> {
+        if !self.read_only && self.end > 0 {
+            if let Backing::Rw(map) = &self.backing {
+                // Flush dirty pages so the cloned handle observes current data.
+                map.flush_range(0, self.end as usize)?;
+            }
+            // The whole `[0, end)` region was just flushed durably.
+            self.flushed_end.store(self.end, Ordering::Relaxed);
+        }
+        Ok((self.file.try_clone()?, self.end))
     }
 
     /// `msync` the dirty region to the backing store. For [`WriteMode::Append`] this is only the
@@ -533,25 +657,42 @@ impl MmapDataFile {
     /// if the file grew. Intended for following a cleanly-closed writer; a writer that is
     /// mid-append may have the file padded beyond its logical data, so pair with index-bounded
     /// reads.
+    ///
+    /// This re-adopts the current physical length and recomputes `opened_unclean`, so it **clears
+    /// any prior [`Self::set_read_bound`] clamp**: if a caller had clamped this handle below a
+    /// writer's padding and then refreshes against a still-mid-append (unsentineled) writer, `end`
+    /// returns to the padded physical size and the caller must re-clamp before reading. (No
+    /// production path currently refreshes a clamped handle — the only caller is a test — so this
+    /// is a documented precondition, not a live hazard.)
     pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
         let disk_len = self.file.metadata()?.len();
-        if disk_len == self.capacity {
-            self.end = disk_len;
-            return Ok(());
+        // A cleanly-closed writer leaves a sentinel past its logical data; strip it so `end` is the
+        // logical length (physical == logical + sentinel). A mid-append writer has no valid
+        // sentinel and `end` stays at the padded physical size — pair with
+        // `set_read_bound`.
+        let (logical_end, opened_unclean) = detect_sentinel(&self.file, disk_len)?;
+        if disk_len != self.capacity {
+            self.backing = Backing::Empty;
+            if disk_len > 0 {
+                self.backing = if self.read_only {
+                    // SAFETY: read-only refresh is only sound while the underlying file is sealed
+                    // (a cleanly-closed writer, physical == logical + sentinel,
+                    // no live writer). Following a mid-append writer would
+                    // adopt its padded physical size and SIGBUS on a later
+                    // truncation; pair with `set_read_bound` (see the read-only branch of
+                    // `open_with`).
+                    Backing::Ro(unsafe { Mmap::map(&self.file)? })
+                } else {
+                    // SAFETY: single-writer model — this handle is the sole writer for its
+                    // lifetime.
+                    Backing::Rw(unsafe { MmapMut::map_mut(&self.file)? })
+                };
+            }
+            self.capacity = disk_len;
+            self.advise_backing();
         }
-        self.backing = Backing::Empty;
-        if disk_len > 0 {
-            self.backing = if self.read_only {
-                // SAFETY: single-writer model.
-                Backing::Ro(unsafe { Mmap::map(&self.file)? })
-            } else {
-                // SAFETY: as above.
-                Backing::Rw(unsafe { MmapMut::map_mut(&self.file)? })
-            };
-        }
-        self.capacity = disk_len;
-        self.end = disk_len;
-        self.advise_backing();
+        self.end = logical_end;
+        self.opened_unclean = opened_unclean;
         Ok(())
     }
 
@@ -611,10 +752,20 @@ impl Read for MmapDataFile {
 impl Seek for MmapDataFile {
     /// Seek within the logical byte range; `SeekFrom::End` is relative to the logical length.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(p) => p as i64,
-            SeekFrom::End(p) => self.end as i64 + p,
-            SeekFrom::Current(p) => self.seek_pos as i64 + p,
+        // Compute the target in `i64`, failing on any overflow (an out-of-range `Start`, or an
+        // `End`/`Current` offset that wraps) rather than the raw `as`/`+` that could silently wrap.
+        let out_of_range =
+            || io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range");
+        let new: i64 = match pos {
+            SeekFrom::Start(p) => i64::try_from(p).map_err(|_| out_of_range())?,
+            SeekFrom::End(p) => i64::try_from(self.end)
+                .ok()
+                .and_then(|e| e.checked_add(p))
+                .ok_or_else(out_of_range)?,
+            SeekFrom::Current(p) => i64::try_from(self.seek_pos)
+                .ok()
+                .and_then(|c| c.checked_add(p))
+                .ok_or_else(out_of_range)?,
         };
         if new < 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek to negative position"));
@@ -647,7 +798,7 @@ impl Write for MmapDataFile {
         let start_us = start as usize;
         match &mut self.backing {
             Backing::Rw(map) => map[start_us..start_us + buf.len()].copy_from_slice(buf),
-            _ => return Err(io::Error::other("no writable mapping")),
+            Backing::Ro(_) | Backing::Empty => return Err(io::Error::other("no writable mapping")),
         }
         match self.opts.write_mode {
             WriteMode::Append => self.end += n,
@@ -680,8 +831,10 @@ impl Drop for MmapDataFile {
         if self.read_only {
             return;
         }
-        // Clean close: msync, then truncate away the padding and fsync so the on-disk file is
-        // exactly `end` bytes and durable — a reopen sees exactly the written bytes.
+        // Clean close: msync, truncate away the padding, then append an 8-byte clean-close sentinel
+        // and fsync so the on-disk file is exactly `end` data bytes plus the sentinel and durable —
+        // a reopen validates the sentinel, strips it back to `end`, and knows the file was sealed.
+        // A 0-length file is left empty (nothing to seal).
         if let Err(e) = self.flush_dirty(true) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to msync on drop: {e}");
@@ -691,6 +844,16 @@ impl Drop for MmapDataFile {
         if let Err(e) = self.file.set_len(self.end) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to truncate on drop: {e}");
+            }
+        }
+        if self.end > 0 {
+            let sentinel = clean_close_sentinel(self.end);
+            if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
+                if !std::thread::panicking() {
+                    tracing::error!(
+                        "MmapDataFile: failed to write clean-close sentinel on drop: {e}"
+                    );
+                }
             }
         }
         if let Err(e) = self.file.sync_all() {
@@ -886,8 +1049,8 @@ mod tests {
             df.seek(SeekFrom::Start(40)).expect("seek");
             assert_eq!(df.read(&mut [0u8; 8]).expect("read past end"), 0);
         }
-        // Physical file is exactly the truncated length after a clean close.
-        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 40);
+        // Physical file is the truncated length plus the clean-close sentinel.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 40 + SENTINEL_LEN);
     }
 
     #[test]
@@ -898,9 +1061,9 @@ mod tests {
         {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
             df.write_all(&data).expect("write");
-        } // clean close: truncates padding + fsync
-          // No padding after a clean close.
-        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 250);
+        } // clean close: truncates padding, appends sentinel, fsync
+          // After a clean close the physical file is the logical data plus the 8-byte sentinel.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 250 + SENTINEL_LEN);
         // Reopen read-write and read back.
         {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("reopen rw");
@@ -920,26 +1083,168 @@ mod tests {
     }
 
     #[test]
-    fn try_clone_reads_to_eof_exact() {
+    fn clean_close_writes_and_strips_sentinel() {
+        let tmp = TempDir::with_prefix("mmap_df_sentinel").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(120);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+        } // clean close: truncate to `end`, append the sentinel, fsync
+          // Physical file is the logical data plus the 8-byte sentinel, whose bytes are exactly
+          // `clean_close_sentinel(end)`.
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), data.len() as u64 + SENTINEL_LEN);
+        let raw = std::fs::read(&path).expect("read raw");
+        assert_eq!(&raw[data.len()..], &clean_close_sentinel(data.len() as u64));
+
+        // Reopen: the sentinel is validated and stripped, `len()` is the logical data, and the file
+        // is reported as cleanly closed.
+        let df = MmapDataFile::open(&path, false).expect("reopen");
+        assert_eq!(df.len(), data.len() as u64);
+        assert!(!df.opened_unclean(), "a sealed file must not be flagged unclean");
+    }
+
+    #[test]
+    fn missing_sentinel_flags_unclean_and_keeps_padding() {
+        let tmp = TempDir::with_prefix("mmap_df_padded").expect("temp dir");
+        let path = tmp.path().join("data");
+        // A crashed writer leaves the logical data followed by zero padding and no sentinel.
+        let data = pattern(80);
+        let mut raw = data.clone();
+        raw.extend(std::iter::repeat_n(0u8, 40));
+        std::fs::write(&path, &raw).expect("write padded file");
+
+        let df = MmapDataFile::open(&path, false).expect("open padded");
+        assert!(df.opened_unclean(), "a file with no valid sentinel must be flagged unclean");
+        // The logical end is left at physical EOF for the heal path (zero padding never masquerades
+        // as a clean close: crc32(0x00000000) != 0).
+        assert_eq!(df.len(), raw.len() as u64);
+    }
+
+    #[test]
+    fn self_consistent_sentinel_for_wrong_length_is_rejected() {
+        let tmp = TempDir::with_prefix("mmap_df_nearmiss").expect("temp dir");
+        let path = tmp.path().join("data");
+        // Craft a tail that IS a valid sentinel — but for the wrong logical length. It satisfies
+        // the self-consistency check (`last4 == crc32(first4)`) yet fails the length
+        // tie-in, so the file must still read as unclean.
+        let data = pattern(100);
+        let mut raw = data.clone();
+        raw.extend_from_slice(&clean_close_sentinel(999)); // encodes len 999, not 100
+        std::fs::write(&path, &raw).expect("write near-miss file");
+
+        let df = MmapDataFile::open(&path, false).expect("open near-miss");
+        assert!(df.opened_unclean(), "a sentinel for the wrong length must not count as sealed");
+        assert_eq!(df.len(), raw.len() as u64);
+    }
+
+    #[test]
+    fn reopen_append_overwrites_sentinel_and_reseals() {
+        let tmp = TempDir::with_prefix("mmap_df_reappend").expect("temp dir");
+        let path = tmp.path().join("data");
+        let first = pattern(60);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&first).expect("write");
+        }
+        // Reopen (strips the sentinel), append more, clean close again.
+        let second = pattern(30);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("reopen rw");
+            assert!(!df.opened_unclean());
+            assert_eq!(df.len(), first.len() as u64);
+            df.seek(SeekFrom::End(0)).expect("seek end");
+            df.write_all(&second).expect("append");
+        }
+        // A fresh sentinel now seals the combined data; the old one was overwritten by the append.
+        let total = (first.len() + second.len()) as u64;
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), total + SENTINEL_LEN);
+        let mut df = MmapDataFile::open(&path, false).expect("final reopen");
+        assert!(!df.opened_unclean());
+        assert_eq!(df.len(), total);
+        let mut buf = vec![0u8; total as usize];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..first.len()], &first[..]);
+        assert_eq!(&buf[first.len()..], &second[..]);
+    }
+
+    #[test]
+    fn rewind_to_rolls_back_logical_end_without_physical_truncate() {
+        let tmp = TempDir::with_prefix("mmap_df_rewind").expect("temp dir");
+        let path = tmp.path().join("data");
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&pattern(200)).expect("write");
+        assert_eq!(df.len(), 200);
+        let phys_before = std::fs::metadata(&path).expect("meta").len();
+
+        // Roll the logical end back to 80 — no physical truncate (capacity/padding unchanged).
+        df.rewind_to(80);
+        assert_eq!(df.len(), 80, "logical end moved back");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            phys_before,
+            "rewind_to must not physically truncate the file"
+        );
+        assert!(df.slice(80, 10).is_none(), "reads are bounded to the rewound end");
+
+        // A subsequent (shorter) append lands exactly at the rewound end.
+        df.seek(SeekFrom::End(0)).expect("seek end");
+        df.write_all(&pattern(20)).expect("append after rewind");
+        assert_eq!(df.len(), 100);
+        drop(df); // clean close truncates the padding and seals
+
+        // Reopen: exactly [first 80 kept bytes][20 appended bytes]; no stale tail from [80, 200).
+        let mut df = MmapDataFile::open(&path, false).expect("reopen");
+        assert!(!df.opened_unclean());
+        assert_eq!(df.len(), 100);
+        let mut buf = vec![0u8; 100];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..80], &pattern(80)[..], "kept prefix survives");
+        assert_eq!(&buf[80..], &pattern(20)[..], "append landed at the rewound end");
+    }
+
+    #[test]
+    fn empty_clean_close_writes_no_sentinel() {
+        let tmp = TempDir::with_prefix("mmap_df_empty").expect("temp dir");
+        let path = tmp.path().join("data");
+        {
+            let _df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            // No writes: a fresh 0-length file has nothing to seal.
+        }
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 0, "empty file stays 0 bytes");
+        let df = MmapDataFile::open(&path, false).expect("reopen empty");
+        assert_eq!(df.len(), 0);
+        assert!(!df.opened_unclean(), "a fresh/empty file is not unclean");
+    }
+
+    #[test]
+    fn try_clone_returns_end_without_truncating() {
         let tmp = TempDir::with_prefix("mmap_df_clone").expect("temp dir");
         let path = tmp.path().join("data");
         let data = pattern(200);
         let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
         df.write_all(&data).expect("write");
-        // A raw clone read to EOF must yield exactly the written bytes (the PackIter/raw_iter
-        // path): no trailing zero padding.
-        let mut clone = df.try_clone().expect("clone");
+        // The mmap backend pads the physical file past the logical end.
+        let phys_padded = std::fs::metadata(&path).expect("metadata").len();
+        assert!(phys_padded > data.len() as u64, "precondition: file is padded past the data");
+
+        // try_clone reports the logical end and does NOT truncate the physical padding.
+        let (mut clone, end) = df.try_clone().expect("clone");
+        assert_eq!(end, data.len() as u64, "clone reports the logical end");
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            phys_padded,
+            "try_clone must not shrink the physical file"
+        );
+        // A consumer bounded to `end` (the PackIter/raw_iter path) reads exactly the written bytes.
         clone.seek(SeekFrom::Start(0)).expect("seek clone");
-        let mut all = Vec::new();
-        clone.read_to_end(&mut all).expect("read clone to eof");
-        assert_eq!(all, data, "clone must expose exactly the logical bytes");
-        // Appending after a try_clone still works (re-maps first).
-        df.write_all(&pattern(50)).expect("append after clone");
-        assert_eq!(df.len(), 250);
-        df.seek(SeekFrom::Start(200)).expect("seek");
-        let mut tail = vec![0u8; 50];
-        df.read_exact(&mut tail).expect("read tail");
-        assert_eq!(tail, pattern(50));
+        let mut bounded = vec![0u8; end as usize];
+        clone.read_exact(&mut bounded).expect("bounded read");
+        assert_eq!(bounded, data, "bytes [0, end) are exactly the written data");
+        // Reading past `end` to physical EOF would hit the padding (the hazard readers must avoid).
+        let mut rest = Vec::new();
+        clone.read_to_end(&mut rest).expect("read padding");
+        assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
     }
 
     #[test]
@@ -996,6 +1301,51 @@ mod tests {
         let mut buf = vec![0u8; 80];
         ro.read_exact(&mut buf).expect("read");
         assert_eq!(&buf[..50], &pattern(50)[..]);
+    }
+
+    /// A read-only handle bounded to the logical length never reads the writer's capacity padding,
+    /// so a later writer truncation (which removes that padding) cannot deliver SIGBUS: bounded
+    /// reads stay within the committed region that survives the truncation.
+    #[test]
+    fn ro_read_bound_keeps_reads_below_a_later_truncation() {
+        let tmp = TempDir::with_prefix("mmap_df_bound").expect("temp dir");
+        let path = tmp.path().join("data");
+        // Writer stays LIVE (not dropped), so the physical file keeps its capacity padding.
+        let mut w = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open writer");
+        w.write_all(&pattern(50)).expect("write");
+        w.sync_all().expect("sync");
+        let physical = std::fs::metadata(&path).expect("metadata").len();
+        assert!(
+            physical > 50,
+            "a live writer file must be padded past its logical data ({physical})"
+        );
+
+        // A read-only handle adopts the padded physical length...
+        let mut ro = MmapDataFile::open(&path, true).expect("open ro");
+        assert_eq!(ro.len(), physical);
+        // ...clamp its read bound to the logical data length.
+        ro.set_read_bound(50);
+        assert_eq!(ro.len(), 50, "the read bound clamps len to the logical end");
+        // `set_read_bound` never grows the bound.
+        ro.set_read_bound(physical);
+        assert_eq!(ro.len(), 50, "the read bound never grows back toward the padding");
+        // A slice past the bound is a clean `None`, never a fault into the padding.
+        assert!(ro.slice(0, 50).is_some());
+        assert!(ro.slice(0, 51).is_none(), "reads never exceed the clamped bound");
+        assert!(ro.slice(50, 1).is_none());
+
+        // The writer truncates the padding away on clean close. The read-only handle, bounded to
+        // `[0, 50)`, still reads the committed bytes and never touches a now-truncated page.
+        drop(w);
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            50 + SENTINEL_LEN,
+            "clean close truncates padding and appends the sentinel"
+        );
+        ro.seek(SeekFrom::Start(0)).expect("seek");
+        let mut buf = vec![0u8; 50];
+        ro.read_exact(&mut buf).expect("bounded read survives the truncation");
+        assert_eq!(&buf[..], &pattern(50)[..]);
     }
 
     #[test]

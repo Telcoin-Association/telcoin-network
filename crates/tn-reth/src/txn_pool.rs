@@ -10,11 +10,13 @@
 //!   task would take down the whole node. The task subscribes to the raw receiver rather than
 //!   `canonical_state_stream()` (whose wrapper silently swallows broadcast lag) so it can observe
 //!   `Lagged`, mark every pool sender dirty, and reload canonical account state in bounded chunks,
-//!   discarding transactions mined in the lost rounds (issue #1236).
-//! - [`TxPool::get_pending_base_fee`] currently returns `MIN_PROTOCOL_BASE_FEE` (7 wei)
-//!   unconditionally; issue 114 tracks computing a real per-round base fee. Both callers (the task
-//!   above and the batch builder's maintenance path) use it only as the fallback when a tip header
-//!   carries no `base_fee_per_gas` — otherwise the pool's pending base fee tracks the new tip's.
+//!   discarding transactions mined in the lost rounds (issue #1236). A retry interval re-arms the
+//!   residual reload between notifications, so a large dirty set drains at the retry cadence even
+//!   when notification traffic goes quiet (issue #1304).
+//! - The pool's pending base fee always comes from the shared per-worker [`BaseFeeContainer`] (the
+//!   gas accumulator's fee for the current epoch). Canonical tip headers never set it: at an epoch
+//!   boundary the tip is the previous epoch's closing block, whose header carries the old epoch's
+//!   fee (issue #1262).
 //! - [`new_pool_txn`] hard-codes `propagate: false` (reth's flag for devp2p tx gossip): transaction
 //!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
 //!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
@@ -27,7 +29,7 @@
 //!   out of the pending set.
 
 use alloy::primitives::map::AddressSet;
-use futures::StreamExt as _;
+use futures::{stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
@@ -50,11 +52,17 @@ use reth_transaction_pool::{
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{sync::Arc, time::Instant};
-use tn_types::{
-    Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
-    TxHash, MIN_PROTOCOL_BASE_FEE, U256,
+use std::{
+    collections::HashMap,
+    pin::pin,
+    sync::Arc,
+    time::{Duration, Instant},
 };
+use tn_types::{
+    gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
+    TaskSpawner, TransactionSigned, TxHash, U256,
+};
+use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, info, trace, warn};
 
@@ -70,8 +78,45 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 ///
 /// Lag means the loop is already behind, so recovery must not stall it further: each
 /// iteration reloads at most this many dirty senders and carries the rest to the next
-/// iteration, which arrives at consensus-round rate.
+/// reload event, which is the next notification or the [`RELOAD_RETRY_INTERVAL`] tick,
+/// whichever comes first.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// Interval at which the maintenance loop re-arms the residual dirty-sender reload between
+/// canonical-state notifications.
+///
+/// After a `Lagged` event the broadcast ring still holds up to its capacity in buffered
+/// `Commit`s, so the first reload chunks drain back-to-back. The residual beyond that used
+/// to advance only when the next notification arrived: consensus-round cadence at best, and
+/// a post-spike lull (exactly what follows the volume spike that builds a large dirty set)
+/// stalls it entirely. Re-arming on this interval drains the residual at one chunk per
+/// interval instead, about 30 s at the theoretical ~30,000-dirty-sender maximum, independent
+/// of notification traffic; the interval is a deliberate throttle on recovery DB pressure.
+/// This adapts reth's `maintain_transaction_pool`, which re-arms its `reload_accounts_fut`
+/// on every loop iteration; here the re-arm is paced by an explicit interval (issue #1304).
+const RELOAD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One input to the pool maintenance loop (see [`WorkerTxPool::maintain_pool`]).
+enum MaintenanceEvent {
+    /// A canonical-state broadcast item: a notification, or `Lagged` when the subscriber
+    /// fell behind.
+    Update(Result<CanonStateNotification, BroadcastStreamRecvError>),
+    /// The reload retry interval fired: reload one residual dirty-sender chunk, if any.
+    RetryTick,
+    /// The canonical-state stream closed; the loop ends and the critical task reports it.
+    Closed,
+}
+
+impl MaintenanceEvent {
+    /// True when the canonical-state stream has closed and the maintenance loop must end.
+    fn is_closed(&self) -> bool {
+        match self {
+            MaintenanceEvent::Update(_) => false,
+            MaintenanceEvent::RetryTick => false,
+            MaintenanceEvent::Closed => true,
+        }
+    }
+}
 
 /// Generate a new pooled transaction from an eth transaction and id.
 ///
@@ -93,31 +138,41 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
 pub trait TxPool {
     /// Return an iterator over the best transactions in a pool.
     fn best_transactions(&self) -> BestTxns;
-    /// Return the pending txn base fee.
-    fn get_pending_base_fee(&self) -> u64;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
     /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
     /// pool, along with their descendants.
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
-    /// Return the canonical balance of `address` as of the latest committed block.
+    /// Return the canonical balances of `addresses` as of the latest committed block.
     ///
-    /// Used to build the optimistic per-sender balance in a post-mining pool update. A missing
-    /// account (or a read error) yields [`U256::ZERO`], which is the conservative choice: it can
-    /// only keep a sender's remaining transactions parked, never promote an unfunded one, and the
-    /// engine's authoritative canonical update corrects it within the same consensus round.
-    fn get_account_balance(&self, address: Address) -> U256;
+    /// Used to build the optimistic per-sender balances in a post-mining pool update. The
+    /// accessor is batched so implementations can acquire ONE state provider for the whole set:
+    /// a per-address `BlockchainProvider::basic_account` call builds a fresh
+    /// `ConsistentProvider` -- an MDBX read transaction plus a `MemoryOverlayStateProvider` over
+    /// the in-memory canonical blocks -- and a batch bounded only by the 30M-gas/1MB limits can
+    /// hold ~1,400 distinct senders, i.e. ~1,400 repetitions of that setup per build.
+    ///
+    /// The result holds an entry for every requested address. A missing account (or a read
+    /// error) yields [`U256::ZERO`], which is the conservative choice: it can only keep a
+    /// sender's remaining transactions parked, never promote an unfunded one, and the engine's
+    /// authoritative canonical update corrects it within the same consensus round. A failure to
+    /// acquire the state provider itself degrades the WHOLE set to that conservative zero, so
+    /// implementations log it before degrading.
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256>;
 }
 
 /// A telcoin network transaction pool.
 ///
-/// The second field is a handle to the blockchain provider, retained so the pool can read a
-/// sender's canonical balance when constructing optimistic pool updates after mining a batch
-/// (see [`TxPool::get_account_balance`]).
+/// The second field is a handle to the blockchain provider, retained so the pool can read
+/// senders' canonical balances when constructing optimistic pool updates after mining a batch
+/// (see [`TxPool::get_account_balances`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTxPool(
     EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
     BlockchainProvider<TelcoinNode>,
+    /// The shared per-worker base-fee container: the single source of the pool's pending base
+    /// fee (issue #1262).
+    BaseFeeContainer,
 );
 
 impl From<WorkerTxPool>
@@ -135,8 +190,10 @@ impl WorkerTxPool {
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
-        let this = Self::build(node_config, task_spawner, blockchain_provider, evm_config)?;
+        let this =
+            Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
         Ok(this)
     }
@@ -151,6 +208,7 @@ impl WorkerTxPool {
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
@@ -209,7 +267,7 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone()))
+        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee))
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -223,57 +281,101 @@ impl WorkerTxPool {
     /// `Stream` shape but surfaces `Lagged` as an error item, so the task can mark every
     /// pool sender dirty and reload canonical account state in bounded chunks, mirroring
     /// reth's `maintain_transaction_pool` drift recovery.
+    ///
+    /// The loop body lives in [`Self::maintain_pool`] so tests can drive it with a
+    /// synthetic stream. Tests run on real time: the `RethEnv` harness holds a
+    /// `spawn_blocking` task for its whole life, which inhibits tokio's paused-clock
+    /// auto-advance (see the test module comment).
     fn spawn_maintenance_task(
         &self,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
     ) {
-        let mut state_stream =
-            BroadcastStream::new(blockchain_provider.subscribe_to_canonical_state());
+        let state_stream = BroadcastStream::new(blockchain_provider.subscribe_to_canonical_state());
         let txn_pool_clone = self.clone();
         // Update the txn pool as the canonical tip changes.
         task_spawner.spawn_critical_task("canonical txn pool", async move {
-            let mut dirty_addresses = AddressSet::default();
-            while let Some(update) = state_stream.next().await {
-                let newly_dirty = update
+            txn_pool_clone
+                .maintain_pool(state_stream, RELOAD_RETRY_INTERVAL, MAX_RELOAD_ACCOUNTS)
+                .await
+        });
+    }
+
+    /// Drive pool maintenance until `state_stream` closes.
+    ///
+    /// Applies every canonical-state notification, marks all pool senders dirty on
+    /// `Lagged`, and reloads dirty senders in chunks of `max_reload`. A `retry_interval`
+    /// tick re-arms the reload between notifications, so a residual dirty set drains at
+    /// the retry cadence even when notification traffic goes quiet after the volume spike that
+    /// built it (issue #1304). A tick with no dirty senders is a no-op.
+    ///
+    /// The chunk reload is awaited inline, so a tick can never start a second reload while
+    /// one is in flight; ticks that would fire during a reload are pushed back a full
+    /// `retry_interval` ([`MissedTickBehavior::Delay`]).
+    async fn maintain_pool(
+        self,
+        state_stream: impl Stream<Item = Result<CanonStateNotification, BroadcastStreamRecvError>>
+            + Send,
+        retry_interval: Duration,
+        max_reload: usize,
+    ) -> Result<(), TaskError> {
+        let mut interval = tokio::time::interval(retry_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let ticks = stream::unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some((MaintenanceEvent::RetryTick, interval))
+        });
+        // `select` polls `ticks` forever, so the merged stream alone would never end. The
+        // chained `Closed` sentinel plus `take_while` end it when `state_stream` closes,
+        // preserving the shutdown semantics of the plain notification loop.
+        let updates = state_stream
+            .map(MaintenanceEvent::Update)
+            .chain(stream::once(std::future::ready(MaintenanceEvent::Closed)));
+        let mut events = pin!(stream::select(updates, ticks)
+            .take_while(|event| std::future::ready(!event.is_closed())));
+        let mut dirty_addresses = AddressSet::default();
+        while let Some(event) = events.next().await {
+            let newly_dirty = match event {
+                MaintenanceEvent::Update(update) => update
                     .map(|notification| {
-                        txn_pool_clone.apply_canon_notification(notification);
+                        self.apply_canon_notification(notification);
                         AddressSet::default()
                     })
                     .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
-                        txn_pool_clone.mark_drifted(missed)
-                    });
-                let to_reload: AddressSet =
-                    dirty_addresses.into_iter().chain(newly_dirty).collect();
-                dirty_addresses = if to_reload.is_empty() {
-                    to_reload
-                } else {
-                    // The reload is synchronous MDBX I/O. Run it on the blocking pool so it
-                    // never occupies one of the async worker threads this runtime also uses
-                    // for consensus and networking (reth offloads the same work:
-                    // `maintain_transaction_pool` runs under `spawn_blocking_task`).
-                    let pool = txn_pool_clone.clone();
-                    let retained = to_reload.clone();
-                    tokio::task::spawn_blocking(move || {
-                        pool.reload_dirty_accounts(to_reload, MAX_RELOAD_ACCOUNTS)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        // the blocking task was dropped or panicked: keep every sender
-                        // dirty so the next notification retries the reload
-                        warn!(
-                            target: "txpool",
-                            ?error,
-                            "dirty-account reload task failed; retrying next round"
-                        );
-                        retained
-                    })
-                };
-            }
-            Err(TaskError::from_message(
-                "canonical txn pool task ended because state_stream closed",
-            ))
-        });
+                        self.mark_drifted(missed)
+                    }),
+                MaintenanceEvent::RetryTick => AddressSet::default(),
+                // `take_while` ends the stream at `Closed`, so this arm never runs; a
+                // plain value keeps the match total (no panic in a critical task).
+                MaintenanceEvent::Closed => AddressSet::default(),
+            };
+            let to_reload: AddressSet = dirty_addresses.into_iter().chain(newly_dirty).collect();
+            dirty_addresses = if to_reload.is_empty() {
+                to_reload
+            } else {
+                // The reload is synchronous MDBX I/O. Run it on the blocking pool so it
+                // never occupies one of the async worker threads this runtime also uses
+                // for consensus and networking (reth offloads the same work:
+                // `maintain_transaction_pool` runs under `spawn_blocking_task`).
+                let pool = self.clone();
+                let retained = to_reload.clone();
+                tokio::task::spawn_blocking(move || {
+                    pool.reload_dirty_accounts(to_reload, max_reload)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    // the blocking task was dropped or panicked: keep every sender
+                    // dirty so the next reload event retries the reload
+                    warn!(
+                        target: "txpool",
+                        ?error,
+                        "dirty-account reload task failed; retrying on the next reload event"
+                    );
+                    retained
+                })
+            };
+        }
+        Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
     }
 
     /// Apply one canonical-state notification to the pool.
@@ -367,9 +469,11 @@ impl WorkerTxPool {
                 RETH_METRICS
                     .canon_state_resync_read_failures_total
                     .increment(u64::try_from(failures.len()).unwrap_or(u64::MAX));
-                // one aggregated warn per iteration; the per-address debug in
-                // `load_changed_account` carries each address and `ProviderError`
-                warn!(
+                // One aggregated debug line per iteration, matching reth's
+                // `maintain_transaction_pool`. Persistent provider failures retry every
+                // `RELOAD_RETRY_INTERVAL`; the sustained rate of
+                // `canon_state_resync_read_failures_total` carries the alert.
+                debug!(
                     target: "txpool",
                     failed = failures.len(),
                     "canonical account reads failed during pool resync; senders stay \
@@ -412,11 +516,16 @@ impl WorkerTxPool {
             })
     }
 
-    /// update pool to remove mined transactions
+    /// Apply a canonical state update to the pool: remove mined transactions and refresh
+    /// changed accounts.
+    ///
+    /// The pending base fee always comes from the worker's shared [`BaseFeeContainer`], the fee
+    /// for the current epoch. At an epoch boundary the canonical tip is the previous epoch's
+    /// closing block and its header carries the old epoch's fee, so tip headers must never set
+    /// the pool's fee (issue #1262).
     pub fn update_canonical_state(
         &self,
         new_tip: &SealedBlock,
-        pending_block_base_fee: u64,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
@@ -424,7 +533,7 @@ impl WorkerTxPool {
         // create canonical state update
         let update = CanonicalStateUpdate {
             new_tip,
-            pending_block_base_fee,
+            pending_block_base_fee: self.2.base_fee(),
             pending_block_blob_fee,
             changed_accounts,
             mined_transactions,
@@ -475,11 +584,9 @@ impl WorkerTxPool {
 
         debug!(target: "block-builder", ?mined_transactions);
 
-        let base_fee_per_gas = tip.base_fee_per_gas.unwrap_or_else(|| self.get_pending_base_fee());
         // sync fn so self will block until all pool updates are complete
         self.update_canonical_state(
             tip.sealed_block(),
-            base_fee_per_gas,
             Some(u128::MAX), // set max fee for blobs
             mined_transactions,
             changed_accounts,
@@ -561,14 +668,6 @@ impl TxPool for WorkerTxPool {
         BestTxns { inner: self.0.best_transactions() }
     }
 
-    /// Return the pending txn base fee.  Currently just the min protocol base fee.
-    fn get_pending_base_fee(&self) -> u64 {
-        // TODO issue 114: calculate the next basefee HERE for the entire round
-        //
-        // for now, always use lowest base fee possible
-        MIN_PROTOCOL_BASE_FEE
-    }
-
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
         self.0.remove_transactions_and_descendants(blobs.clone());
         self.0.delete_blobs(blobs);
@@ -578,13 +677,40 @@ impl TxPool for WorkerTxPool {
         self.0.remove_transactions_and_descendants(txs);
     }
 
-    fn get_account_balance(&self, address: Address) -> U256 {
-        self.1
-            .basic_account(&address)
-            .ok()
-            .flatten()
-            .map(|account| account.balance)
-            .unwrap_or(U256::ZERO)
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        // An empty set needs no state: acquiring the provider opens an MDBX read
+        // transaction (and, mid-round, collects the in-memory canonical blocks into a
+        // memory overlay). `build_batch` reaches this call with no senders whenever the
+        // pending set drained between the build gate and `best_transactions()`.
+        if addresses.is_empty() {
+            return HashMap::new();
+        }
+        // one state provider (one MDBX read transaction + memory overlay) for the whole set;
+        // a failure to acquire it reports the documented conservative zero for every address,
+        // so it is logged loudly rather than degrading silently
+        let provider = self
+            .1
+            .latest()
+            .inspect_err(|error| {
+                warn!(
+                    target: "txpool",
+                    ?error,
+                    num_addresses = addresses.len(),
+                    "failed to acquire state provider; reporting zero balance for all senders"
+                );
+            })
+            .ok();
+        addresses
+            .iter()
+            .map(|address| {
+                let balance = provider
+                    .as_ref()
+                    .and_then(|state| state.basic_account(address).ok().flatten())
+                    .map(|account| account.balance)
+                    .unwrap_or(U256::ZERO);
+                (*address, balance)
+            })
+            .collect()
     }
 }
 
@@ -690,7 +816,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{
-        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager, U256,
+        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Build a pool over a chain whose genesis funds the factory's sender, so a rejected
@@ -707,7 +834,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
     }
 
@@ -744,7 +871,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let tx = tx_factory.create_eip1559(
@@ -821,7 +948,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let encoded_txs: Vec<Vec<u8>> = (0..3)
@@ -868,7 +995,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let tx = tx_factory.create_eip1559(
             chain.clone(),
@@ -918,7 +1045,7 @@ mod tests {
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
-        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
 
         let dirty: AddressSet = (1u8..=3).map(Address::repeat_byte).collect();
 
@@ -928,6 +1055,181 @@ mod tests {
         assert_eq!(after_two.len(), 1);
         let after_three = pool.reload_dirty_accounts(after_two, 1);
         assert!(after_three.is_empty());
+    }
+
+    /// Issue #1304: residual dirty senders beyond the per-event reload bound must drain on
+    /// the retry interval alone. The synthetic stream delivers one `Lagged` marker and then
+    /// goes silent (the post-spike lull), so any progress past the first chunk can come
+    /// only from the re-armed reload, never from a notification.
+    //
+    // The three issue #1304 tests run on real time. With `start_paused`, the `RethEnv`
+    // harness keeps `spawn_blocking` tasks alive for its whole life
+    // (`TaskSpawner::spawn_reth_task` wraps `Handle::block_on`), and tokio inhibits
+    // paused-clock auto-advance while a blocking task is in flight, so every timer
+    // waits forever.
+    #[tokio::test]
+    async fn test_residual_dirty_senders_drain_between_notifications() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut factories: Vec<TransactionFactory> =
+            (0..3).map(|_| TransactionFactory::new_random()).collect();
+        let genesis =
+            test_genesis().extend_accounts(factories.iter().map(|factory| {
+                (factory.address(), GenesisAccount::default().with_balance(U256::MAX))
+            }));
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let encoded_txs: Vec<Vec<u8>> = factories
+            .iter_mut()
+            .map(|factory| {
+                factory
+                    .create_eip1559(
+                        chain.clone(),
+                        Some(21_000),
+                        7,
+                        Some(Address::ZERO),
+                        U256::from(100),
+                        Bytes::new(),
+                    )
+                    .encoded_2718()
+            })
+            .collect();
+        let outcomes = futures::future::join_all(encoded_txs.iter().map(|encoded| {
+            let recovered = recover_raw_transaction(encoded).unwrap();
+            pool.add_recovered_transaction_external(recovered)
+        }))
+        .await;
+        outcomes.into_iter().for_each(|outcome| {
+            outcome.unwrap();
+        });
+        assert_eq!(pool.pool_size().pending, 3);
+
+        // commit a canonical block that mines all three transactions; with no maintenance
+        // task subscribed, the pool never sees the notification . . . the lag scenario
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, encoded_txs).unwrap();
+        let state = pool.1.latest().unwrap();
+        factories.iter().for_each(|factory| {
+            let account = WorkerTxPool::load_changed_account(&state, factory.address()).unwrap();
+            assert_eq!(account.nonce, 1, "test block must mine every transaction");
+        });
+        // negative control: the pool is drifted, the mined transactions are still pending
+        assert_eq!(pool.pool_size().pending, 3);
+
+        // one Lagged marker, then a silent stream: the loop reloads one sender on the
+        // marker (chunk size 1) and must drain the residual two on retry ticks alone
+        let updates: Vec<Result<CanonStateNotification, BroadcastStreamRecvError>> =
+            vec![Err(BroadcastStreamRecvError::Lagged(1))];
+        let state_stream = stream::iter(updates).chain(stream::pending());
+        let maintenance =
+            tokio::spawn(pool.clone().maintain_pool(state_stream, Duration::from_millis(100), 1));
+
+        let mut poll = pin!(stream::iter(0..600u32)
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                pool.pool_size().pending
+            })
+            .skip_while(|pending| std::future::ready(*pending != 0)));
+        let drained = tokio::time::timeout(Duration::from_secs(60), poll.next())
+            .await
+            .expect("drain poll must finish within its wall-clock deadline");
+        assert_eq!(drained, Some(0), "residual dirty senders must drain on retry ticks alone");
+        assert!(!maintenance.is_finished(), "a silent stream must keep the maintenance loop alive");
+        maintenance.abort();
+        // join the aborted task so test teardown cannot race the maintenance loop
+        let _ = maintenance.await;
+    }
+
+    /// The retry ticks alone must not keep the maintenance loop alive: when the
+    /// canonical-state stream closes, the loop ends and the critical task reports the
+    /// closure, exactly as the plain notification loop did before issue #1304.
+    #[tokio::test]
+    async fn test_maintenance_loop_ends_when_state_stream_closes() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let updates: Vec<Result<CanonStateNotification, BroadcastStreamRecvError>> = Vec::new();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.maintain_pool(stream::iter(updates), Duration::from_millis(100), 1),
+        )
+        .await
+        .expect("maintenance loop must end when the canonical-state stream closes");
+        assert!(
+            format!("{ended:?}").contains("state_stream closed"),
+            "unexpected loop exit: {ended:?}"
+        );
+    }
+
+    /// A live `Commit` notification still drives the pool through the merged-stream loop:
+    /// a maintenance loop subscribed to the real canonical-state broadcast removes the
+    /// mined transaction, proving the notification arm survived the issue #1304
+    /// restructuring.
+    #[tokio::test]
+    async fn test_maintenance_loop_applies_canonical_notifications() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default()).unwrap();
+
+        let tx = tx_factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let hash = *tx.hash();
+        let encoded = tx.encoded_2718();
+        let recovered = recover_raw_transaction(&encoded).unwrap();
+        pool.add_recovered_transaction_external(recovered).await.unwrap();
+        assert_eq!(pool.pool_size().pending, 1);
+
+        // subscribe before the commit so the notification reaches the loop
+        let state_stream = BroadcastStream::new(pool.1.subscribe_to_canonical_state());
+        let maintenance = tokio::spawn(pool.clone().maintain_pool(
+            state_stream,
+            Duration::from_millis(100),
+            MAX_RELOAD_ACCOUNTS,
+        ));
+
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded]).unwrap();
+
+        let mut poll = pin!(stream::iter(0..600u32)
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                pool.pool_size().pending
+            })
+            .skip_while(|pending| std::future::ready(*pending != 0)));
+        let applied = tokio::time::timeout(Duration::from_secs(60), poll.next())
+            .await
+            .expect("apply poll must finish within its wall-clock deadline");
+        assert_eq!(applied, Some(0), "the maintenance loop must apply the Commit notification");
+        assert!(pool.get(&hash).is_none());
+        maintenance.abort();
+        // join the aborted task so test teardown cannot race the maintenance loop
+        let _ = maintenance.await;
     }
 
     #[tokio::test]
@@ -945,7 +1247,7 @@ mod tests {
             rpc_args,
         )
         .unwrap();
-        let pool = reth_env.init_txn_pool().unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
         let mut tx_factory = TransactionFactory::new();
         let tx = tx_factory.create_eip1559(
@@ -962,6 +1264,34 @@ mod tests {
             .await
             .expect_err("local transaction over the cap is refused by the validator");
         assert!(format!("{err:?}").contains("ExceedsFeeCap"), "unexpected error: {err:?}");
+    }
+
+    /// Regression test for issue #1262: a canonical tip whose header carries another epoch's
+    /// base fee must not overwrite the pool's pending base fee. The pending fee always comes
+    /// from the worker's shared [`BaseFeeContainer`].
+    #[tokio::test]
+    async fn test_canonical_update_cannot_clobber_epoch_base_fee() {
+        const EPOCH_FEE: u64 = MIN_PROTOCOL_BASE_FEE + 1234;
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::new(EPOCH_FEE)).unwrap();
+
+        // The genesis header carries the chain's default fee. It must differ from EPOCH_FEE,
+        // or the assertion below could not distinguish the container from the tip header.
+        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
+
+        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+
+        assert_eq!(
+            pool.block_info().pending_basefee,
+            EPOCH_FEE,
+            "a canonical tip from the previous epoch must not clobber the epoch base fee",
+        );
     }
 
     #[test]

@@ -199,11 +199,23 @@ pub(crate) struct RequestId(Value);
 impl RequestId {
     /// The top-level `id` of a request the caller has already parsed.
     ///
-    /// The raw-transaction screen parses the body to decide whether to reject
-    /// it; taking the id from that parse is what keeps the screening reject
-    /// path to a single parse of the request.
+    /// Now only a test helper: it is the reference `id` extraction that
+    /// [`Self::recover`] is checked against, since the screen no longer builds a
+    /// `Value` for the request to take an id from.
+    #[cfg(test)]
     pub(crate) fn from_request(request: &Value) -> Self {
         Self(request.get("id").cloned().unwrap_or(Value::Null))
+    }
+
+    /// The top-level `id` a caller extracted on its own.
+    ///
+    /// Now only a test helper, like [`Self::from_request`]: the raw-transaction
+    /// screen skips the `id` member entirely while parsing and recovers it via
+    /// [`Self::recover`] on its reject paths, so nothing outside tests holds an
+    /// extracted id to wrap.
+    #[cfg(test)]
+    pub(crate) fn from_id(id: Value) -> Self {
+        Self(id)
     }
 
     /// Best-effort recovery of the top-level `id` from an unparsed body.

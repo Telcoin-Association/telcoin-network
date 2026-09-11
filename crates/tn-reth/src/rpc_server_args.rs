@@ -89,6 +89,10 @@ pub struct RpcServerArgs {
     pub http_disable_compression: bool,
 
     /// Rpc Modules to be configured for the HTTP server
+    ///
+    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
+    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
+    /// list every module by name instead.
     #[arg(long = "http.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub http_api: Option<RpcModuleSelection>,
 
@@ -113,6 +117,10 @@ pub struct RpcServerArgs {
     pub ws_allowed_origins: Option<String>,
 
     /// Rpc Modules to be configured for the WS server
+    ///
+    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
+    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
+    /// list every module by name instead.
     #[arg(long = "ws.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub ws_api: Option<RpcModuleSelection>,
 

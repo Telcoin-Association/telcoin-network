@@ -7,10 +7,15 @@
 //! reth's metrics server never launched (the prometheus endpoint is owned by `tn-metrics`).
 //!
 //! Security/operational policies enforced here:
-//! - RPC namespace allowlist: only the modules in `ALL_MODULES` (eth, net, web3, debug, trace, rpc)
-//!   can be enabled. `admin` and `txpool` are stripped from any selection with a warning, and a
-//!   `--http.api all` style selection is rewritten to the allowlist (see
-//!   `RethConfig::validate_rpc_modules`).
+//! - RPC namespace allowlist: only the modules in `ALLOWED_MODULES` (eth, net, web3, debug, trace,
+//!   rpc) can be enabled, and every module dropped from a selection is warned about by name. A
+//!   `--http.api all` style selection is rewritten to `DEFAULT_MODULES`, which deliberately omits
+//!   the expensive `debug` and `trace` namespaces: they stay available, but only when named
+//!   explicitly, and enabling them warns (see `RethConfig::validate_rpc_modules`). The IPC
+//!   transport has no selection flag; it serves the same `DEFAULT_MODULES` set
+//!   (`RethConfig::ipc_modules`, applied in `RethEnv::get_rpc_server`). The allowlist governs reth
+//!   namespaces only: the TN-specific `tn_*` module is registered unconditionally on every enabled
+//!   transport (`RethEnv::get_rpc_server`).
 //! - Pruning is disabled: every `PruningArgs` field is off, so nodes keep full history (archive
 //!   mode). Other code relies on this — e.g. ExEx replay treats missing receipts for an existing
 //!   block as database corruption (`TnRethError::ReplayReceiptsMissing`), which is only sound
@@ -53,7 +58,7 @@ use reth_node_builder::{
 };
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     dirs::path_to_datadir,
@@ -82,9 +87,10 @@ pub struct RethCommand {
 
 const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// All the rpc modules we allow.
-/// Disallow admin, txpool.
-const ALL_MODULES: [RethRpcModule; 6] = [
+/// The rpc modules an operator may enable at all.
+///
+/// Disallow admin, txpool: they do not work as expected with TN, or at all.
+const ALLOWED_MODULES: [RethRpcModule; 6] = [
     RethRpcModule::Eth,
     RethRpcModule::Net,
     RethRpcModule::Web3,
@@ -92,6 +98,19 @@ const ALL_MODULES: [RethRpcModule; 6] = [
     RethRpcModule::Trace,
     RethRpcModule::Rpc,
 ];
+
+/// The subset `--http.api all` expands to.
+///
+/// `debug` and `trace` are allowed but deliberately not part of `all`. They are the two most
+/// expensive namespaces to serve, and TN nodes run archive mode by policy, so the whole chain
+/// is traceable: an operator writing `all` should not silently pick up namespaces where one
+/// request can cost orders of magnitude more than an `eth_*` call. Asking for them by name
+/// still works, and warns.
+const DEFAULT_MODULES: [RethRpcModule; 4] =
+    [RethRpcModule::Eth, RethRpcModule::Net, RethRpcModule::Web3, RethRpcModule::Rpc];
+
+/// Modules that are honoured only when named explicitly, never through `all`.
+const EXPENSIVE_MODULES: [RethRpcModule; 2] = [RethRpcModule::Debug, RethRpcModule::Trace];
 
 /// Telcoin Network's per-sender transaction pool slot default.
 ///
@@ -168,26 +187,60 @@ impl RethConfig {
     fn validate_rpc_modules(mods: &mut Option<RpcModuleSelection>) {
         match &mods {
             Some(RpcModuleSelection::All) => {
-                *mods = Some(RpcModuleSelection::Selection(HashSet::from(ALL_MODULES)));
+                // `all` means every module that is safe to serve by default, which excludes
+                // the expensive ones. An operator who wants those names them explicitly. The
+                // log line is the runtime signal for operators whose `all` enabled debug and
+                // trace before this rewrite.
+                info!(
+                    target: "tn::reth",
+                    "The `all` RPC selection enables eth, net, web3, rpc; the expensive debug \
+                     and trace modules must be named explicitly"
+                );
+                *mods = Some(RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES)));
             }
             Some(RpcModuleSelection::Standard) => {}
             Some(RpcModuleSelection::Selection(hash_set)) => {
-                let mut new_set = HashSet::new();
-                for r in ALL_MODULES {
-                    if hash_set.contains(&r) {
-                        new_set.insert(r);
-                    }
-                }
-                if hash_set.contains(&RethRpcModule::Admin) {
-                    warn!(target: "tn::reth", "Attempted to configure unsupported admin RPC module!");
-                }
-                if hash_set.contains(&RethRpcModule::Txpool) {
-                    warn!(target: "tn::reth", "Attempted to configure unsupported txpool RPC module!");
-                }
+                let new_set: HashSet<RethRpcModule> = ALLOWED_MODULES
+                    .into_iter()
+                    .filter(|module| hash_set.contains(module))
+                    .collect();
+                // Name every dropped module: admin and txpool are unsupported on TN, and
+                // anything else is an unknown or mis-cased name reth parsed as `Other`.
+                // With debug/trace reachable only by explicit name, a typo that silently
+                // cost the namespace would otherwise look like success.
+                hash_set.difference(&new_set).for_each(|dropped| {
+                    warn!(
+                        target: "tn::reth",
+                        "Dropping unsupported RPC module `{dropped}` from the selection"
+                    );
+                });
+                EXPENSIVE_MODULES.into_iter().filter(|module| hash_set.contains(module)).for_each(
+                    |module| {
+                        warn!(
+                            target: "tn::reth",
+                            "Enabling the {module} RPC module: it is expensive to serve on an \
+                             archive node and is not included in `--http.api all`. Do not expose \
+                             it publicly without a method allowlist or per-method rate limiting."
+                        );
+                    },
+                );
                 *mods = Some(RpcModuleSelection::Selection(new_set));
             }
             None => {}
         }
+    }
+
+    /// The module selection TN serves on the IPC transport.
+    ///
+    /// There is no `--ipc.api` flag: reth's `transport_rpc_module_config` fills an enabled IPC
+    /// transport with `default_ipc_modules()`, which is every `RethRpcModule` variant, admin
+    /// and txpool included, so no operator input reaches that slot and
+    /// [`Self::validate_rpc_modules`] never runs on it. `RethEnv::get_rpc_server` rewrites the
+    /// slot with this set instead: the unconfigurable full-module default gets the same
+    /// treatment as an `all` selection, so a local IPC client sees exactly what
+    /// `--http.api all` serves, with nothing expensive enabled implicitly.
+    pub(crate) fn ipc_modules() -> RpcModuleSelection {
+        RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES))
     }
 
     /// Create a new RethConfig wrapper.
@@ -479,18 +532,136 @@ mod tests {
     /// coincide with reth's, which is the condition that made 16 unreachable in the first place.
     const RETH_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 16;
 
+    /// Resolve a selection through the validator and return the surviving set.
+    fn validated(selection: RpcModuleSelection) -> HashSet<RethRpcModule> {
+        let mut mods = Some(selection);
+        RethConfig::validate_rpc_modules(&mut mods);
+        match mods {
+            Some(RpcModuleSelection::Selection(set)) => set,
+            other => panic!("expected an explicit selection, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_rpc_validator() {
         let mut mods: Option<RpcModuleSelection> = None;
         RethConfig::validate_rpc_modules(&mut mods);
         assert!(mods.is_none());
-        let mut mods = Some(RpcModuleSelection::All);
+
+        // Through `validated` rather than an `if let` arm: a non-`Selection` result panics
+        // instead of skipping the assertions, and equality proves debug/trace absent rather
+        // than only `DEFAULT_MODULES` present.
+        assert_eq!(validated(RpcModuleSelection::All), HashSet::from(DEFAULT_MODULES));
+    }
+
+    /// `--http.api all` must not hand out the expensive namespaces. TN nodes are archive by
+    /// policy, so `debug_*` and `trace_*` can walk the whole chain, and an operator writing
+    /// `all` is not asking for that.
+    #[test]
+    fn all_excludes_debug_and_trace() {
+        let resolved = validated(RpcModuleSelection::All);
+
+        assert_eq!(resolved, HashSet::from(DEFAULT_MODULES));
+        for module in EXPENSIVE_MODULES {
+            assert!(!resolved.contains(&module), "`all` must not enable {module}");
+        }
+    }
+
+    /// Naming them explicitly still works: this is a change to what `all` means, not a
+    /// capability removal. An operator who needs tracing keeps it, and gets warned.
+    #[test]
+    fn explicit_debug_and_trace_are_honoured() {
+        let resolved = validated(RpcModuleSelection::Selection(HashSet::from([
+            RethRpcModule::Eth,
+            RethRpcModule::Debug,
+            RethRpcModule::Trace,
+        ])));
+
+        assert_eq!(
+            resolved,
+            HashSet::from([RethRpcModule::Eth, RethRpcModule::Debug, RethRpcModule::Trace])
+        );
+    }
+
+    /// The pre-existing admin/txpool stripping must be unaffected, including when it is mixed
+    /// with modules that are allowed.
+    #[test]
+    fn admin_and_txpool_are_still_stripped() {
+        let resolved = validated(RpcModuleSelection::Selection(HashSet::from([
+            RethRpcModule::Eth,
+            RethRpcModule::Admin,
+            RethRpcModule::Txpool,
+            RethRpcModule::Debug,
+        ])));
+
+        assert_eq!(resolved, HashSet::from([RethRpcModule::Eth, RethRpcModule::Debug]));
+        assert!(!resolved.contains(&RethRpcModule::Admin));
+        assert!(!resolved.contains(&RethRpcModule::Txpool));
+    }
+
+    /// `standard` and an absent flag are reth's own behaviour and stay untouched.
+    #[test]
+    fn standard_selection_is_left_alone() {
+        let mut mods = Some(RpcModuleSelection::Standard);
         RethConfig::validate_rpc_modules(&mut mods);
-        if let Some(RpcModuleSelection::Selection(mods)) = &mut mods {
-            for r in ALL_MODULES {
-                assert!(mods.remove(&r));
-            }
-        };
+        assert!(matches!(mods, Some(RpcModuleSelection::Standard)));
+    }
+
+    /// The three module lists form a two-way partition: every allowed module is either in
+    /// `all`'s expansion or in the expensive explicit-only list, and never both. Subset
+    /// checks alone would let a new `ALLOWED_MODULES` entry ship unclassified (reachable by
+    /// name, absent from `all`, absent from the expensive warning) with every test green.
+    #[test]
+    fn allowed_modules_partition_into_default_and_expensive() {
+        let default_set = HashSet::from(DEFAULT_MODULES);
+        let expensive_set = HashSet::from(EXPENSIVE_MODULES);
+        assert!(
+            default_set.is_disjoint(&expensive_set),
+            "a module cannot be both in `all` and explicit-only"
+        );
+
+        let classified: HashSet<RethRpcModule> =
+            default_set.union(&expensive_set).cloned().collect();
+        assert_eq!(
+            classified,
+            HashSet::from(ALLOWED_MODULES),
+            "every allowed module must be classified as default or expensive"
+        );
+    }
+
+    /// The validator must be wired into [`RethConfig::new`] for both transports: every other
+    /// test here calls `validate_rpc_modules` directly, so deleting the two calls in `new`
+    /// would keep them all green while shipping `all` unrewritten.
+    #[test]
+    fn validate_rpc_modules_is_wired_into_new() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command = RethCommand::try_parse_from([
+            "tn-reth",
+            "--http",
+            "--http.api",
+            "all",
+            "--ws",
+            "--ws.api",
+            "all",
+        ])?;
+
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+
+        let expected = Some(RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES)));
+        assert_eq!(config.0.rpc.http_api, expected);
+        assert_eq!(config.0.rpc.ws_api, expected);
+        Ok(())
+    }
+
+    /// IPC has no selection flag, so its slot must resolve to `all`'s expansion rather than
+    /// reth's every-module IPC default (admin and txpool included).
+    #[test]
+    fn ipc_modules_match_the_all_expansion() {
+        assert_eq!(
+            RethConfig::ipc_modules(),
+            RpcModuleSelection::Selection(validated(RpcModuleSelection::All))
+        );
     }
 
     /// An operator-supplied per-sender slot limit must reach the node config untouched.

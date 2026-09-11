@@ -9,8 +9,9 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, Certificate, ConsensusResult, Epoch, EpochCertificate,
-    EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round, Vote,
+    error::HeaderError, roaring_container_count, AuthorityIdentifier, Certificate, ConsensusResult,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round,
+    Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -132,7 +133,9 @@ impl MissingCertificatesRequest {
                 // at most N containers, so the cardinality limit doubles as a sound container-count
                 // limit that never rejects a well-formed request while capping the ~8 KiB-per-
                 // container heap that deserialization would otherwise allocate.
-                let containers = roaring_container_count(serialized)?;
+                let containers = roaring_container_count(serialized).map_err(|e| {
+                    PrimaryNetworkError::InvalidRequest(format!("skip_rounds bitmap: {e}"))
+                })?;
                 (containers <= max_cardinality).then_some(()).ok_or_else(|| {
                     PrimaryNetworkError::InvalidRequest(format!(
                         "skip_rounds bitmap declares too many containers: {containers} > {max_cardinality}"
@@ -197,44 +200,6 @@ impl MissingCertificatesRequest {
     pub fn set_max_response_size(mut self, max_size: usize) -> Self {
         self.max_response_size = max_size;
         self
-    }
-}
-
-/// Cookie prefixing a serialized [`RoaringBitmap`] with no run containers: a `u32` container count
-/// follows it. (roaring 0.10.12, `bitmap/serialization.rs`.)
-const ROARING_SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
-/// Cookie (low 16 bits) prefixing a serialized [`RoaringBitmap`] that may contain run containers:
-/// the container count minus one is packed into the high 16 bits of the cookie word.
-const ROARING_SERIAL_COOKIE: u32 = 12347;
-
-/// Number of containers declared in a serialized [`RoaringBitmap`] header, read without
-/// materializing the bitmap.
-///
-/// Roaring's portable format opens with either [`ROARING_SERIAL_COOKIE_NO_RUNCONTAINER`] followed
-/// by a `u32` count or [`ROARING_SERIAL_COOKIE`] with `count - 1` packed into the cookie word's
-/// high 16 bits; this reads only that count so a caller can bound a bitmap's size before allocating
-/// its containers. Mirrors `RoaringBitmap::deserialize_from`. Errors on a truncated header or an
-/// unrecognized cookie (both of which `deserialize_from` would also reject).
-fn roaring_container_count(serialized: &[u8]) -> PrimaryNetworkResult<u64> {
-    let le_u32 = |start: usize| -> PrimaryNetworkResult<u32> {
-        serialized
-            .get(start..start.saturating_add(4))
-            .and_then(|word| <[u8; 4]>::try_from(word).ok())
-            .map(u32::from_le_bytes)
-            .ok_or_else(|| {
-                PrimaryNetworkError::InvalidRequest("skip_rounds bitmap header truncated".into())
-            })
-    };
-
-    let cookie = le_u32(0)?;
-    if cookie == ROARING_SERIAL_COOKIE_NO_RUNCONTAINER {
-        le_u32(4).map(u64::from)
-    } else if cookie & 0xFFFF == ROARING_SERIAL_COOKIE {
-        Ok(u64::from(cookie >> 16) + 1)
-    } else {
-        Err(PrimaryNetworkError::InvalidRequest(
-            "skip_rounds bitmap has an unrecognized roaring cookie".into(),
-        ))
     }
 }
 

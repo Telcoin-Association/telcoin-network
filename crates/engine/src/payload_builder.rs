@@ -10,7 +10,8 @@ use tn_reth::{
     RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, EngineUpdate,
+    Hash as _, SealedHeader, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span, warn};
@@ -24,6 +25,7 @@ use tracing::{debug, error, field, info, info_span, warn};
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
+    repack_monitor: RepackMonitor,
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
@@ -196,6 +198,35 @@ pub fn execute_consensus_output(
                 .ok_or(TnEngineError::NextBlockDigestMissing)?;
             let cert_batch = &output.batches()[cert_idx];
             let batch = &cert_batch.batches[batch_idx_in_cert];
+
+            // Watch for cross-producer transaction re-packing (issue #1259). Batches are
+            // observed in ordering position, so the first-recorded copy of a transaction is
+            // the copy execution credits with the priority fees. Telemetry only: a flagged
+            // duplicate never changes execution, because an honest sender that submits the
+            // same transaction to two validators produces the same signature.
+            let repacked = repack_monitor.observe_batch(
+                output.number(),
+                cert_batch.address,
+                &batch.transactions,
+            );
+            if !repacked.is_empty() {
+                crate::metrics::ENGINE_METRICS
+                    .cross_producer_repacked_txs_total
+                    .increment(u64::try_from(repacked.len()).unwrap_or(u64::MAX));
+                // Log a bounded sample, never the whole list: the duplicate set is derived
+                // from remote-controlled batch contents, so a hostile producer could otherwise
+                // force one warn line with thousands of entries per batch at no cost to
+                // itself. The counter above carries the full count.
+                let sample: Vec<B256> =
+                    repacked.iter().take(4).map(|duplicate| duplicate.tx_hash).collect();
+                warn!(
+                    target: "engine",
+                    producer = ?cert_batch.address,
+                    repacked = repacked.len(),
+                    ?sample,
+                    "batch repacks transactions first packed by another producer (priority-fee poaching indicator, issue #1259)"
+                );
+            }
 
             // use batch's base fee, gas limit, and withdrawals
             let base_fee_per_gas = batch.base_fee_per_gas;
