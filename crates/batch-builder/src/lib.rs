@@ -53,6 +53,9 @@ struct MinedBatchResult {
 /// this as the `Err` of the surrounding [`BatchBuilderResult`].
 #[derive(Debug)]
 enum BuildOutcome {
+    /// Transaction selection produced no batch to propose. Defer the next build without
+    /// sealing, updating the pool, or changing the forward-admission backoff.
+    Empty,
     /// The batch reached quorum (or a forward task was admitted to deliver it): prune the
     /// mined transactions from the pool and apply the account changes.
     Mined(MinedBatchResult),
@@ -64,15 +67,6 @@ enum BuildOutcome {
     /// Any other non-fatal seal failure (quorum, timeout, reporting). The pool keeps its
     /// transactions and the loop retries on the next delay tick, as before.
     Failed,
-    /// The build produced no transactions, so nothing was sent to the worker (issue #1329).
-    ///
-    /// The pending pool is not empty here: every transaction in it was deferred because a
-    /// validated peer batch already carries it. Sealing that build would broadcast a batch with
-    /// no transactions, which peers reject as
-    /// [`BatchValidationError::EmptyBatch`](tn_types::error::BatchValidationError::EmptyBatch)
-    /// and score as a fatal penalty. The run loop treats this as a quiet tick: no pool update,
-    /// no error log, and no refusal backoff, because forward admission was never exercised.
-    NothingToSeal,
 }
 
 /// Ceiling for the refusal backoff (issue #1145).
@@ -193,7 +187,7 @@ impl BatchBuilder {
     ///
     /// The task performs the following actions:
     /// - create a batch
-    /// - send the batch to worker's batch proposer
+    /// - defer an empty batch, otherwise send it to the worker's batch proposer
     /// - wait for ack that quorum was reached
     /// - convert result to fatal/non-fatal
     /// - return result
@@ -225,18 +219,17 @@ impl BatchBuilder {
             metrics
                 .peer_deferred_txs_total
                 .increment(u64::try_from(peer_deferred).unwrap_or(u64::MAX));
-            // A build in which every pending transaction was deferred yields a batch with no
-            // transactions. Peers reject an empty batch (`BatchValidationError::EmptyBatch`) and
-            // score the sender a fatal penalty, so report no work and send nothing to the worker
-            // (issue #1329). The deferral metric above is still recorded: this build is exactly
-            // the case an operator watches that metric for.
-            if batch.transactions.is_empty() {
+            // Canonical updates can drain the pending pool after the run loop's build gate.
+            // Selection can also skip every candidate, including peer-deferred transactions
+            // (issue #1329). Peers reject empty batches, so record the deferral metric above
+            // but send nothing to the worker in every empty-build case.
+            if batch.transactions().is_empty() {
                 debug!(
                     target: "worker::batch_builder",
                     peer_deferred,
-                    "every pending transaction is deferred by a peer batch; sealing nothing"
+                    "transaction selection produced an empty batch; sealing nothing"
                 );
-                result.send(Ok(BuildOutcome::NothingToSeal)).err().into_iter().for_each(|e| {
+                result.send(Ok(BuildOutcome::Empty)).err().into_iter().for_each(|e| {
                     error!(target: "worker::batch_builder", ?e, "failed to send no-work outcome to block builder task");
                 });
                 Ok(())
@@ -462,7 +455,7 @@ impl BatchBuilder {
                     let outcome = res??;
 
                     // Refusal backoff bookkeeping (issue #1145): a refusal arms or extends the
-                    // backoff, anything mined ends it. Refused and Failed then take the
+                    // backoff, anything mined ends it. Empty, Refused and Failed take the
                     // pre-existing empty-mined path below: no pool update, one deferred build,
                     // park until a wake-up.
                     let MinedBatchResult { mined_transactions, changed_accounts } = match outcome {
@@ -474,20 +467,10 @@ impl BatchBuilder {
                                 changed_accounts: vec![],
                             }
                         }
-                        BuildOutcome::Failed => MinedBatchResult {
+                        BuildOutcome::Empty | BuildOutcome::Failed => MinedBatchResult {
                             mined_transactions: vec![],
                             changed_accounts: vec![],
                         },
-                        // nothing was sent to the worker, so there is no seal to judge: take the
-                        // empty-mined path below (interval reset, one deferred build) without a
-                        // pool update, an error log, or backoff bookkeeping (issue #1329)
-                        BuildOutcome::NothingToSeal => {
-                            debug!(
-                                target: "worker::batch_builder",
-                                "build sealed nothing: every pending transaction is deferred by a peer batch"
-                            );
-                            MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] }
-                        }
                     };
 
                     // NOTE: a mined batch that pruned nothing applies no pool update; it also
@@ -562,6 +545,133 @@ mod tests {
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
+
+    /// Drain the pending pool after the build gate but before the spawned task is polled.
+    /// The empty result must never reach the worker, and the run loop must defer a newly
+    /// affordable transaction until the reset batch delay has elapsed.
+    #[tokio::test]
+    async fn empty_build_after_pending_pool_drain_is_deferred() -> std::io::Result<()> {
+        // Keep setup, spawned builds and acknowledgement bounded by a running clock.
+        timeout(Duration::from_secs(10), async {
+            let tmp_dir = TempDir::new()?;
+            let TestTools { mut tx_factory, execution_components, task_manager } =
+                get_test_tools(tmp_dir.path());
+            let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
+            let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+            let delay = Duration::from_millis(100);
+            let mut batch_builder = BatchBuilder::new(
+                &reth_env,
+                txpool.clone(),
+                to_worker,
+                Address::ZERO,
+                delay,
+                task_manager.get_spawner(),
+                0,
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+            )
+            .map_err(std::io::Error::other)?;
+            let hash = tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    u128::from(MIN_PROTOCOL_BASE_FEE),
+                    Address::ZERO,
+                    U256::from(10),
+                    txpool.clone(),
+                )
+                .await;
+
+            // Match the run loop's gate, then spawn without yielding. This single-threaded
+            // runtime cannot poll the build task before the synchronous canonical update below.
+            assert_eq!(txpool.pending_transactions().len(), 1);
+            let done = batch_builder.spawn_execution_task();
+            txpool.update_canonical_state(
+                &batch_builder.last_canonical_update,
+                None,
+                vec![],
+                vec![ChangedAccount {
+                    address: tx_factory.address(),
+                    nonce: 0,
+                    balance: U256::ZERO,
+                }],
+            );
+            assert!(txpool.pending_transactions().is_empty());
+
+            let outcome = tokio::select! {
+                outcome = done => outcome
+                    .map_err(std::io::Error::other)?
+                    .map_err(std::io::Error::other)?,
+                _ = from_batch_builder.recv() => {
+                    Err::<BuildOutcome, _>(std::io::Error::other("empty batch reached worker"))?
+                }
+            };
+            assert_matches!(outcome, BuildOutcome::Empty);
+            assert_matches!(
+                from_batch_builder.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            );
+
+            // Make the same transaction affordable before the loop consumes the empty result.
+            // This also proves that an empty build did not remove it from the pool.
+            txpool.update_canonical_state(
+                &batch_builder.last_canonical_update,
+                None,
+                vec![],
+                vec![ChangedAccount {
+                    address: tx_factory.address(),
+                    nonce: 0,
+                    balance: U256::from(1_000_000_000_u64),
+                }],
+            );
+            assert_eq!(txpool.pending_transactions().len(), 1);
+            let (result, done) = oneshot::channel();
+            result
+                .send(Ok(outcome))
+                .map_err(|_| std::io::Error::other("build result receiver closed"))?;
+            batch_builder.pending_task = Some(done);
+            tokio::time::pause();
+            let mut builder_task = Box::pin(batch_builder.run());
+
+            // Register the reset deadline before advancing time. Reth's blocking validation
+            // tasks inhibit paused-clock auto-advance, so move the clock explicitly.
+            assert!(futures_util::poll!(&mut builder_task).is_pending());
+            tokio::time::advance(delay.saturating_sub(Duration::from_millis(1))).await;
+            assert!(futures_util::poll!(&mut builder_task).is_pending());
+            assert_matches!(
+                from_batch_builder.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            );
+            // Resume before awaiting spawned work so both the interval and watchdog can
+            // progress without depending on exact paused-clock timer boundaries.
+            tokio::time::resume();
+            let (batch, ack) = tokio::select! {
+                result = &mut builder_task => Err(std::io::Error::other(format!(
+                    "builder exited before proposing a batch: {result:?}"
+                ))),
+                batch = from_batch_builder.recv() =>
+                    batch.ok_or_else(|| std::io::Error::other("worker channel closed")),
+            }?;
+            assert_eq!(batch.batch().transactions().len(), 1);
+            let encoded = batch
+                .batch()
+                .transactions()
+                .first()
+                .ok_or_else(|| std::io::Error::other("missing transaction"))?;
+            assert_eq!(
+                recover_raw_transaction(encoded).map_err(std::io::Error::other)?.hash(),
+                &hash
+            );
+            assert_eq!(txpool.pending_transactions().len(), 1);
+
+            // Acknowledge a fatal result to terminate the builder deterministically.
+            ack.send(Err(BlockSealError::FatalDBFailure))
+                .map_err(|_| std::io::Error::other("batch acknowledgement receiver closed"))?;
+            assert_matches!(builder_task.await, Err(BatchBuilderError::FatalDBFailure));
+            Ok(())
+        })
+        .await
+        .map_err(|_| std::io::Error::other("empty-build regression exceeded its 10-second limit"))?
+    }
 
     #[tokio::test]
     async fn test_make_block_no_ack_txs_in_pool_still() {
@@ -1020,7 +1130,7 @@ mod tests {
     /// in a peer's in-flight batch: the build gate sees a non-empty pending pool, the build
     /// defers every transaction, and the resulting batch has no transactions. Sending it would
     /// earn a fatal penalty from every peer (`BatchValidationError::EmptyBatch`), so the task
-    /// reports [`BuildOutcome::NothingToSeal`] and sends nothing to the worker.
+    /// reports [`BuildOutcome::Empty`] and sends nothing to the worker.
     ///
     /// Deterministic: the build task is awaited to completion, so a batch sent to the worker
     /// would already sit in the channel when `try_recv` runs.
@@ -1074,7 +1184,7 @@ mod tests {
             .expect("build task reports its outcome")
             .expect("an all-deferred build is not a fatal error");
 
-        assert_matches!(outcome, BuildOutcome::NothingToSeal);
+        assert_matches!(outcome, BuildOutcome::Empty);
         assert!(
             from_batch_builder.try_recv().is_err(),
             "an empty batch must never reach the worker"
