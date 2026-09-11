@@ -138,7 +138,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             consensus_registry_fork_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH,
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
-            region_shuffle_fork_epoch = tn_types::forks::REGION_SHUFFLE_FORK_EPOCH,
             prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
             leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
             "fork schedule (adiri)"
@@ -146,7 +145,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature, multi_workers, region_shuffle, prevrandao, and \
+            "fork schedule: seed_signature, multi_workers, prevrandao, and \
              leader_seeded_ordering active from genesis"
         );
 

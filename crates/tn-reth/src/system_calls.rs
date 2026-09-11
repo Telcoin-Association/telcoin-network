@@ -103,8 +103,9 @@ sol!(
             ///
             /// This supports updating stake amount.
             uint8 stakeVersion;
-            /// GSMA region identifier for geographic diversity.
-            /// 0 = unspecified, 1-8 = assigned regions.
+            /// GSMA region identifier held in contract storage.
+            /// The client does not read this field: the committee draw is region-blind.
+            /// It stays here only so the struct layout matches the pinned contract ABI.
             uint8 region;
         }
 
@@ -275,9 +276,6 @@ sol!(
         function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator, uint256 deadline) external view returns (bytes32);
         /// Issuance not yet distributed to validators (public variable getter).
         function undistributedIssuance() external view returns (uint256);
-        /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
-        /// Only callable by governance (owner).
-        function setValidatorRegion(address validatorAddress, uint8 region) external;
     }
 
     /// Worker fee configs for base fee adjustment.
