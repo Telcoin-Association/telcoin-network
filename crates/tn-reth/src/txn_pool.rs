@@ -29,7 +29,7 @@
 //!   out of the pending set.
 
 use alloy::primitives::map::AddressSet;
-use futures::{stream, Stream, StreamExt as _};
+use futures::{stream, FutureExt as _, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
@@ -62,7 +62,7 @@ use tn_types::{
     gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
     TaskSpawner, TransactionSigned, TxHash, U256,
 };
-use tokio::time::MissedTickBehavior;
+use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, info, trace, warn};
 
@@ -309,6 +309,7 @@ impl WorkerTxPool {
     /// the retry cadence even when notification traffic goes quiet after the volume spike that
     /// built it (issue #1304). A tick with no dirty senders is a no-op.
     ///
+    /// Canonical pool updates finish before the next maintenance event is processed.
     /// The chunk reload is awaited inline, so a tick can never start a second reload while
     /// one is in flight; ticks that would fire during a reload are pushed back a full
     /// `retry_interval` ([`MissedTickBehavior::Delay`]).
@@ -336,14 +337,20 @@ impl WorkerTxPool {
         let mut dirty_addresses = AddressSet::default();
         while let Some(event) = events.next().await {
             let newly_dirty = match event {
-                MaintenanceEvent::Update(update) => update
-                    .map(|notification| {
-                        self.apply_canon_notification(notification);
-                        AddressSet::default()
-                    })
-                    .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
-                        self.mark_drifted(missed)
-                    }),
+                MaintenanceEvent::Update(update) => {
+                    update
+                        .map(|notification| {
+                            async {
+                                self.apply_canon_notification(notification).await?;
+                                Ok::<_, JoinError>(AddressSet::default())
+                            }
+                            .left_future()
+                        })
+                        .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
+                            futures::future::ready(Ok(self.mark_drifted(missed))).right_future()
+                        })
+                        .await?
+                }
                 MaintenanceEvent::RetryTick => AddressSet::default(),
                 // `take_while` ends the stream at `Closed`, so this arm never runs; a
                 // plain value keeps the match total (no panic in a critical task).
@@ -378,19 +385,25 @@ impl WorkerTxPool {
         Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
     }
 
-    /// Apply one canonical-state notification to the pool.
-    fn apply_canon_notification(&self, notification: CanonStateNotification) {
+    /// Apply one canonical-state notification, awaiting pool maintenance before the next one.
+    async fn apply_canon_notification(
+        &self,
+        notification: CanonStateNotification,
+    ) -> Result<(), JoinError> {
         match notification {
-            CanonStateNotification::Commit { new } => self.process_canon_state_update(new),
+            CanonStateNotification::Commit { new } => self.process_canon_state_update(new).await,
             // TN never reorgs: consensus output only extends the canonical chain, so a
             // Reorg notification here is a bug upstream. Skip it rather than panic . . .
             // this runs inside a critical task, and aborting it would take down the
             // whole node over a pool-maintenance miss.
-            CanonStateNotification::Reorg { .. } => warn!(
-                target: "txpool",
-                "unexpected canonical state notification (TN never reorgs); skipping \
-                 transaction pool update"
-            ),
+            CanonStateNotification::Reorg { .. } => {
+                warn!(
+                    target: "txpool",
+                    "unexpected canonical state notification (TN never reorgs); skipping \
+                     transaction pool update"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -523,27 +536,31 @@ impl WorkerTxPool {
     /// for the current epoch. At an epoch boundary the canonical tip is the previous epoch's
     /// closing block and its header carries the old epoch's fee, so tip headers must never set
     /// the pool's fee (issue #1262).
-    pub fn update_canonical_state(
+    ///
+    /// Pool maintenance runs on the blocking executor because it can hold pool locks and
+    /// process many transactions. Awaiting it preserves the caller's update ordering and
+    /// reports a blocking-task failure instead of continuing with an incomplete pool update.
+    pub async fn update_canonical_state(
         &self,
         new_tip: &SealedBlock,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
-    ) {
-        // create canonical state update
-        let update = CanonicalStateUpdate {
-            new_tip,
-            pending_block_base_fee: self.2.base_fee(),
-            pending_block_blob_fee,
-            changed_accounts,
-            mined_transactions,
-            update_kind: PoolUpdateKind::Commit,
-        };
-
-        // TODO: should this be a spawned blocking task?
-        //
-        // update pool to remove mined transactions
-        self.0.on_canonical_state_change(update);
+    ) -> Result<(), JoinError> {
+        let pool = self.clone();
+        let new_tip = new_tip.clone();
+        tokio::task::spawn_blocking(move || {
+            let update = CanonicalStateUpdate {
+                new_tip: &new_tip,
+                pending_block_base_fee: pool.2.base_fee(),
+                pending_block_blob_fee,
+                changed_accounts,
+                mined_transactions,
+                update_kind: PoolUpdateKind::Commit,
+            };
+            pool.0.on_canonical_state_change(update);
+        })
+        .await
     }
 
     /// Return pending transactions.
@@ -558,8 +575,8 @@ impl WorkerTxPool {
 
     /// This method is called when a canonical state update is received.
     ///
-    /// Trigger the maintenance task to update pool before building the next block.
-    fn process_canon_state_update(&self, update: Arc<Chain>) {
+    /// Await the pool update before the maintenance task receives another notification.
+    async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
         trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
         // update pool based with canonical tip update
@@ -584,13 +601,13 @@ impl WorkerTxPool {
 
         debug!(target: "block-builder", ?mined_transactions);
 
-        // sync fn so self will block until all pool updates are complete
         self.update_canonical_state(
             tip.sealed_block(),
             Some(u128::MAX), // set max fee for blobs
             mined_transactions,
             changed_accounts,
-        );
+        )
+        .await
     }
 
     /// Return the current status of the pool.
@@ -1270,7 +1287,7 @@ mod tests {
     /// base fee must not overwrite the pool's pending base fee. The pending fee always comes
     /// from the worker's shared [`BaseFeeContainer`].
     #[tokio::test]
-    async fn test_canonical_update_cannot_clobber_epoch_base_fee() {
+    async fn test_canonical_update_cannot_clobber_epoch_base_fee() -> Result<(), JoinError> {
         const EPOCH_FEE: u64 = MIN_PROTOCOL_BASE_FEE + 1234;
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
@@ -1285,13 +1302,65 @@ mod tests {
         let genesis_block = reth_env.chainspec().sealed_genesis_block();
         assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
 
-        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]).await?;
 
         assert_eq!(
             pool.block_info().pending_basefee,
             EPOCH_FEE,
             "a canonical tip from the previous epoch must not clobber the epoch base fee",
         );
+        Ok(())
+    }
+
+    /// A saturated blocking executor keeps canonical maintenance pending while the async
+    /// executor makes progress, and completion guarantees that the pool update was applied.
+    #[tokio::test]
+    async fn test_canonical_update_awaits_blocking_pool_work() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+        let pool = reth_env
+            .init_txn_pool_without_maintenance(BaseFeeContainer::new(MIN_PROTOCOL_BASE_FEE))?;
+        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        pool.set_block_info(RethBlockInfo { pending_basefee: 0, ..pool.block_info() });
+
+        // Keep validator tasks on the outer runtime so they cannot occupy the sole blocking
+        // slot used by this test's independent runtime.
+        tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()?;
+            runtime.block_on(async {
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    blocked.recv()
+                });
+                ready.await?;
+
+                let update =
+                    pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+                tokio::pin!(update);
+                let first_poll = futures::poll!(&mut update);
+                let fee_before_release = pool.block_info().pending_basefee;
+
+                // Release before assertions so a regression cannot strand the blocking task
+                // and prevent the test runtime from shutting down.
+                release.send(())?;
+                blocker.await??;
+                assert!(first_poll.is_pending(), "canonical work must yield to the executor");
+                assert_eq!(fee_before_release, 0, "queued pool work must not run inline");
+
+                update.await?;
+                assert_eq!(pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+                Ok(())
+            })
+        })
+        .await??;
+        Ok(())
     }
 
     #[test]

@@ -92,7 +92,7 @@ struct RefusalBackoff {
     refusals: u32,
 }
 
-/// Type alias for the blocking task that locks the tx pool and builds the next batch.
+/// Receiver for the async task that awaits a blocking batch build and the worker's seal result.
 type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 
 /// The type that builds blocks for workers to propose.
@@ -103,8 +103,8 @@ type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 ///     - tries to build the next batch when there transactions are available
 #[derive(Debug)]
 pub struct BatchBuilder {
-    /// Single active future that executes consensus output on a blocking thread and then returns
-    /// the result through a oneshot channel.
+    /// Single active task that awaits batch construction on the blocking pool, proposes it, and
+    /// returns the seal result through a oneshot channel.
     pending_task: Option<BuildResult>,
     /// The transaction pool with pending transactions.
     pool: WorkerTxPool,
@@ -213,7 +213,8 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } =
+                batch::spawn_batch_build(build_args, worker_id, base_fee).await?;
             // Canonical updates can drain the pending pool after the run loop's build gate.
             // Selection can also skip every candidate. Neither case should reach the worker.
             if batch.transactions().is_empty() {
@@ -477,14 +478,14 @@ impl BatchBuilder {
                     // update pool to remove mined transactions
                     //
                     // The pool derives its pending fee from the shared per-worker container, so
-                    // a stale `last_canonical_update` — at an epoch boundary, the previous
-                    // epoch's closing block — cannot reprice the pool (issue #1262).
+                    // a stale `last_canonical_update` (at an epoch boundary, the previous
+                    // epoch's closing block) cannot reprice the pool (issue #1262).
                     self.pool.update_canonical_state(
                         &self.last_canonical_update,
                         Some(u128::MAX), // set max fee for blobs
                         mined_transactions,
                         changed_accounts,
-                    );
+                    ).await?;
 
                     // loop again to check for any other pending transactions
                     // and possibly start building the next block
@@ -565,21 +566,24 @@ mod tests {
                 )
                 .await;
 
-            // Match the run loop's gate, then spawn without yielding. This single-threaded
-            // runtime cannot poll the build task before the synchronous canonical update below.
+            // Match the run loop's gate, then drain the pending pool before starting the build.
+            // Await maintenance so the blocking build deterministically observes the empty pool.
             assert_eq!(txpool.pending_transactions().len(), 1);
-            let done = batch_builder.spawn_execution_task();
-            txpool.update_canonical_state(
-                &batch_builder.last_canonical_update,
-                None,
-                vec![],
-                vec![ChangedAccount {
-                    address: tx_factory.address(),
-                    nonce: 0,
-                    balance: U256::ZERO,
-                }],
-            );
+            txpool
+                .update_canonical_state(
+                    &batch_builder.last_canonical_update,
+                    None,
+                    vec![],
+                    vec![ChangedAccount {
+                        address: tx_factory.address(),
+                        nonce: 0,
+                        balance: U256::ZERO,
+                    }],
+                )
+                .await
+                .map_err(std::io::Error::other)?;
             assert!(txpool.pending_transactions().is_empty());
+            let done = batch_builder.spawn_execution_task();
 
             let outcome = tokio::select! {
                 outcome = done => outcome
@@ -597,16 +601,19 @@ mod tests {
 
             // Make the same transaction affordable before the loop consumes the empty result.
             // This also proves that an empty build did not remove it from the pool.
-            txpool.update_canonical_state(
-                &batch_builder.last_canonical_update,
-                None,
-                vec![],
-                vec![ChangedAccount {
-                    address: tx_factory.address(),
-                    nonce: 0,
-                    balance: U256::from(1_000_000_000_u64),
-                }],
-            );
+            txpool
+                .update_canonical_state(
+                    &batch_builder.last_canonical_update,
+                    None,
+                    vec![],
+                    vec![ChangedAccount {
+                        address: tx_factory.address(),
+                        nonce: 0,
+                        balance: U256::from(1_000_000_000_u64),
+                    }],
+                )
+                .await
+                .map_err(std::io::Error::other)?;
             assert_eq!(txpool.pending_transactions().len(), 1);
             let (result, done) = oneshot::channel();
             result
@@ -1284,9 +1291,9 @@ mod tests {
         assert_eq!(pending_pool_len, 7);
     }
 
-    /// Test transactions are mined from the pool.
+    /// Test transactions are mined from the pool after post-quorum maintenance completes.
     #[tokio::test]
-    async fn test_pool_updates_after_txs_mined() {
+    async fn test_pool_updates_after_txs_mined() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let TestTools { mut tx_factory, execution_components, task_manager } =
             get_test_tools(tmp_dir.path());
@@ -1403,12 +1410,16 @@ mod tests {
         let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
         assert_eq!(tx.hash(), &expected_tx_hash);
 
-        // yield to try and give pool a chance to update
-        tokio::task::yield_now().await;
+        // Wait for the acknowledged batch's blocking pool update to remove the mined transactions.
+        tn_test_utils::wait_until(duration, "mined transactions removed from pool", || async {
+            Ok(txpool.pool_size().pending == 0)
+        })
+        .await?;
 
         // assert all transactions mined
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
+        Ok(())
     }
 
     /// Regression test for issue #1262: after a mined batch the pool update must install the
