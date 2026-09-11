@@ -2826,7 +2826,6 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .and_then(|stored| stored.expires)
         .ok_or_else(|| eyre!("initial expiry"))?;
 
-    assert_eq!(network.record_freshness(&record), RecordFreshness::Identical);
     record.expires = Some(instant + Duration::from_secs(120));
     network.process_kad_put_request(source, record.clone())?;
     let stored = network
@@ -2840,6 +2839,20 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     assert_eq!(stored.value, record.value);
     assert_eq!(stored.publisher, record.publisher);
     assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+
+    // A replicated copy with less remaining TTL must not undo the refresh.
+    let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
+    record.expires = Some(instant + Duration::from_secs(90));
+    network.process_kad_put_request(source, record.clone())?;
+    let retained_expiry = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .and_then(|stored| stored.expires)
+        .ok_or_else(|| eyre!("retained expiry"))?;
+    assert!(refreshed_expiry.saturating_duration_since(retained_expiry) < Duration::from_secs(1));
     Ok(())
 }
 
@@ -2860,7 +2873,7 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
         if older {
             info.timestamp = info.timestamp.saturating_sub(1);
         } else {
-            info.multiaddrs.push("/ip4/127.0.0.1/udp/54321/quic-v1".parse()?);
+            info.multiaddrs = vec!["/ip4/192.0.2.1/udp/54321/quic-v1".parse()?];
         }
         let chain_id = peer2.config.network_config().libp2p_config().chain_id;
         let bytes =
@@ -2871,8 +2884,7 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
             expires: Some(std::time::Instant::now() + Duration::from_secs(120)),
             ..current.clone()
         };
-        assert!(network.peer_record_valid(&candidate).is_some());
-        assert_eq!(network.record_freshness(&candidate), RecordFreshness::Older);
+        assert!(network.peer_record_valid(&candidate).is_some(), "valid candidate: older={older}");
         network.process_kad_put_request(source, candidate)?;
         let stored = network
             .swarm

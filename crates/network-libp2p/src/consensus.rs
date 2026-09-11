@@ -2041,7 +2041,7 @@ where
     fn process_kad_put_request(
         &mut self,
         source: PeerId,
-        record: kad::Record,
+        mut record: kad::Record,
     ) -> NetworkResult<()> {
         // check if source or publisher are banned
         let publisher_is_banned = record
@@ -2089,8 +2089,20 @@ where
         } else if let Some((key, value)) = self.peer_record_valid(&record) {
             // verify record signature and ensure publisher matches record's network key
 
+            let freshness = self.record_freshness(&record);
+            if freshness == RecordFreshness::Identical {
+                // A relayed identical copy can carry less remaining TTL. Refreshing it must
+                // not shorten the lifetime we already accepted. None means no expiry.
+                record.expires =
+                    self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).map_or(
+                        record.expires,
+                        |existing| {
+                            existing.expires.zip(record.expires).map(|(old, new)| old.max(new))
+                        },
+                    );
+            }
             // Store newer records and refresh the expiry of byte-identical republishes.
-            match self.record_freshness(&record) {
+            match freshness {
                 RecordFreshness::Newer | RecordFreshness::Identical => {
                     self.swarm
                         .behaviour_mut()
