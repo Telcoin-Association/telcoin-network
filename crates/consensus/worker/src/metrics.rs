@@ -34,6 +34,33 @@ impl ForwardDropReason {
     }
 }
 
+/// Why an inbound sync stream was refused without being served.
+///
+/// Both refusals happen on stream open, before any request frame is read
+/// (`WorkerNetwork::shed_inbound_sync_stream`), so no downstream counter sees the
+/// stream (issue #1307). The pair is the signal, not just the sum: the shed budget has
+/// no per-peer sub-cap, while the admission path it guards has one. A nonzero
+/// `budget_exhausted` rate while `denied` stays low is the signature of shed slots
+/// pinned by peers that never read their deny reply. The series carry no peer label, so
+/// attribution needs the per-peer `debug!` lines in `shed_inbound_sync_stream`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SyncShedReason {
+    /// Admission caps hit; the stream got a shed task that writes `Deny(AtCapacity)`.
+    Denied,
+    /// Shed budget exhausted; the stream was dropped with no reply.
+    BudgetExhausted,
+}
+
+impl SyncShedReason {
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
 /// Derive-backed metric handles for the worker, labeled per `worker`.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_worker")]
@@ -151,6 +178,23 @@ impl WorkerMetrics {
             .increment(u64::try_from(count).unwrap_or(u64::MAX));
         }
     }
+
+    /// Record an inbound sync stream refused without being served, labeled by
+    /// [`SyncShedReason`].
+    ///
+    /// One stream per call, so every refusal creates or bumps its series. The counter
+    /// pairs with the `debug!` lines in `shed_inbound_sync_stream`, which the default
+    /// `info` filter hides. On the requester side a budget-exhausted drop reads as a
+    /// generic `failed to read sync ack frame` I/O error, so this responder-side counter
+    /// is the only place that condition is visible (issue #1307).
+    pub(crate) fn record_sync_stream_shed(&self, reason: SyncShedReason) {
+        metrics::counter!(
+            "tn_worker.sync_streams_shed_total",
+            "worker" => self.worker_id.to_string(),
+            "reason" => reason.label(),
+        )
+        .increment(1);
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +219,9 @@ mod tests {
             metrics.record_batch_fetch_duration(Duration::from_millis(80));
             metrics.record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, 4);
             metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, 0); // no-op, no series
+            metrics.record_sync_stream_shed(SyncShedReason::Denied);
+            metrics.record_sync_stream_shed(SyncShedReason::Denied);
+            metrics.record_sync_stream_shed(SyncShedReason::BudgetExhausted);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -226,6 +273,25 @@ mod tests {
                     && key.key().labels().any(|l| l.value() == "discovery_failed")
             }),
             "zero-count forward drop should not register a series"
+        );
+
+        // one shed series per reason, both under this worker's label
+        let shed_series = |reason: &str| {
+            snapshot.iter().find(|(key, ..)| {
+                key.key().name() == "tn_worker.sync_streams_shed_total"
+                    && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
+                    && key.key().labels().any(|l| l.key() == "worker" && l.value() == "0")
+            })
+        };
+        assert!(
+            shed_series("denied")
+                .is_some_and(|(.., value)| matches!(value, DebugValue::Counter(2))),
+            "denied shed series should count both refusals"
+        );
+        assert!(
+            shed_series("budget_exhausted")
+                .is_some_and(|(.., value)| matches!(value, DebugValue::Counter(1))),
+            "budget-exhausted shed series should count the dropped stream"
         );
     }
 }
