@@ -21,7 +21,7 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
     EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
@@ -158,20 +158,29 @@ impl ExecutionNode {
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
-    /// #1262), and the RPC server keeps a handle for `eth_feeHistory`.
+    /// #1262). `worker_base_fee` is the worker's per-query epoch base-fee handle: the RPC
+    /// server keeps it so `eth_feeHistory` resolves the worker's current fee on every quote,
+    /// surviving worker-count changes (#1282).
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
+        worker_base_fee: WorkerBaseFee,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
         guard
-            .initialize_worker_components(worker_id, network_handle, engine_to_primary, base_fee)
+            .initialize_worker_components(
+                worker_id,
+                network_handle,
+                engine_to_primary,
+                base_fee,
+                worker_base_fee,
+            )
             .await
     }
 

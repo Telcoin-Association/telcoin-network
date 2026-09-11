@@ -16,8 +16,11 @@
 //!   worker-agnostic: the entry reports the fee of whichever worker produced that block, exactly
 //!   like the per-block entries reth already returns;
 //! - otherwise (the newest returned block is the tip), the entry is a quote: this worker's current
-//!   epoch base fee from the shared [`BaseFeeContainer`]. Every RPC server belongs to one worker,
-//!   and its clients price new transactions for that worker's next block.
+//!   epoch base fee, resolved per query through the [`WorkerBaseFee`] handle. Every RPC server
+//!   belongs to one worker, and its clients price new transactions for that worker's next block.
+//!   The handle (not a pinned `BaseFeeContainer` clone) matters once multi-worker lands: a
+//!   worker-count shrink and regrow replaces the slot's container, and a pinned clone would quote a
+//!   permanently stale fee (issue #1282).
 //!
 //! Two boundary windows bound the correction's accuracy. The database read has no
 //! in-memory overlay ([`RethEnv::header_by_number`]), so a block executed but not yet
@@ -46,7 +49,7 @@ use alloy::{
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_eth_api::{helpers::EthFees, EthApiTypes};
-use tn_types::gas_accumulator::BaseFeeContainer;
+use tn_types::gas_accumulator::WorkerBaseFee;
 
 /// The `eth` fee-history method TN overrides.
 ///
@@ -75,14 +78,14 @@ pub(crate) struct FeeHistoryWithEpochBaseFee<Api> {
     eth_api: Api,
     /// Database access for the recorded base fee of an already-executed next block.
     reth_env: RethEnv,
-    /// This worker's shared epoch base fee.
-    base_fee: BaseFeeContainer,
+    /// Per-query resolver for this worker's current epoch base fee (issue #1282).
+    base_fee: WorkerBaseFee,
 }
 
 impl<Api> FeeHistoryWithEpochBaseFee<Api> {
     /// Create a new handler from the built `EthApi`, the env, and the worker's
-    /// base-fee container.
-    pub(crate) const fn new(eth_api: Api, reth_env: RethEnv, base_fee: BaseFeeContainer) -> Self {
+    /// base-fee handle.
+    pub(crate) const fn new(eth_api: Api, reth_env: RethEnv, base_fee: WorkerBaseFee) -> Self {
         Self { eth_api, reth_env, base_fee }
     }
 }

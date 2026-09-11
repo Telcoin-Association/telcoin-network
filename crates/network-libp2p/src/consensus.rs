@@ -365,7 +365,7 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
-        let network_key = key_config.worker_network_keypair().clone();
+        let network_key = key_config.worker_network_keypair(worker_id);
         Self::new(
             network_config,
             event_stream,
@@ -1144,11 +1144,11 @@ where
                         }
                         // Resolve the author's BLS identity too. The message is already
                         // authenticated, but deep validation in the application layer (the
-                        // worker's batch checks) runs after this `Accept`, and an
-                        // author-content fault it surfaces must be charged to the author,
-                        // not the forwarder (see issue #819). On a restricted topic
-                        // acceptance guarantees the author resolved; on an open topic it may
-                        // be `None`, in which case the consumer skips the author penalty.
+                        // worker's batch checks) runs after this `Accept`, and an author-content
+                        // fault it surfaces must be charged to the author, not the forwarder
+                        // (see issue #819). The `Option` reflects the two fallible lookups it is
+                        // built from, `message.source` and the `peer_to_bls` index, not any
+                        // topic policy; on `None` the consumer skips the author penalty.
                         let author = message
                             .source
                             .as_ref()
@@ -1839,7 +1839,7 @@ where
                         num_provider_peers: _,
                     } => {}
                     kad::InboundRequest::AddProvider { record } => {
-                        self.process_kad_add_provider(record)?;
+                        self.process_kad_add_provider(record);
                     }
                     kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
                     kad::InboundRequest::PutRecord { source, connection: _, record } => {
@@ -2094,26 +2094,46 @@ where
     /// peer banned at the application layer that the `PutRecord` path would also
     /// reject) before anything reaches the store. Records from banned peers are
     /// dropped rather than written. See issue #1001.
-    fn process_kad_add_provider(
-        &mut self,
-        record: Option<kad::ProviderRecord>,
-    ) -> NetworkResult<()> {
-        // The ban check borrows the swarm immutably and completes before the
-        // store write borrows it mutably, so the combinator chain avoids holding
-        // both borrows at once.
-        record
-            .filter(|record| !self.swarm.behaviour().peer_manager.peer_banned(&record.provider))
-            .map(|record| {
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .add_provider(record)
-                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))
-            })
-            .transpose()?;
+    ///
+    /// Two further bounds keep one unbanned peer from starving the network task
+    /// through this write path (GHSA-5475-xf29-3rv8). First, a per-provider rate
+    /// limit ([`PeerManager::add_provider_rate_limited`]): each admitted message
+    /// costs a row decode, merge, re-encode, insert, and a physical MDBX commit,
+    /// and repeating `AddProvider` for an already-stored key skips the store's
+    /// capacity gate, so an unbounded stream would run that work at line rate;
+    /// over-budget messages are dropped with a [`Penalty::Medium`]. Second, the
+    /// expected capacity rejection is logged at `debug!` and never propagated:
+    /// once the provider table saturates, `MaxProvidedKeys` is remotely
+    /// triggerable, so propagating it would amplify a flood in the run-loop's
+    /// per-event `error!`. Other store rejections remain visible at `warn!`, and
+    /// database failures are logged at `error!` by the store with their cause.
+    /// Rate-limit drops are counted separately for the primary and worker networks.
+    fn process_kad_add_provider(&mut self, record: Option<kad::ProviderRecord>) {
+        // The ban check borrows the swarm immutably and yields an owned `Option`
+        // before the rate-limit and store steps borrow it mutably, so no two
+        // borrows are held at once.
+        let permitted = record
+            .filter(|record| !self.swarm.behaviour().peer_manager.peer_banned(&record.provider));
 
-        Ok(())
+        permitted.into_iter().for_each(|record| {
+            let provider = record.provider;
+            if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
+                trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
+                self.metrics.record_add_provider_rate_limited();
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+            } else {
+                self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
+                    |error| match error {
+                        kad::store::Error::MaxProvidedKeys => {
+                            debug!(target: "network-kad", ?provider, "dropping inbound provider record: store at capacity");
+                        }
+                        kad::store::Error::ValueTooLarge | kad::store::Error::MaxRecords => {
+                            warn!(target: "network-kad", ?provider, ?error, "dropping inbound provider record");
+                        }
+                    },
+                );
+            }
+        });
     }
 
     /// Check the local kad store to compare record timestamps.

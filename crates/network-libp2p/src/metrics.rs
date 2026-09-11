@@ -1,7 +1,7 @@
 //! Prometheus metrics for the libp2p consensus networks.
 //!
 //! Both the primary and worker networks instantiate the same types, so every series
-//! carries a `network` label ({`primary`, `worker`}) set at construction.
+//! carries a `network` label (`primary` or `worker-{id}`) set at construction.
 
 use crate::{peers::Penalty, types::NetworkType};
 use reth_metrics::{
@@ -10,10 +10,10 @@ use reth_metrics::{
 };
 
 /// Map a [`NetworkType`] to its metric label value.
-pub(crate) fn network_label(network_type: &NetworkType) -> &'static str {
+pub(crate) fn network_label(network_type: &NetworkType) -> String {
     match network_type {
-        NetworkType::Primary => "primary",
-        NetworkType::Worker(_) => "worker",
+        NetworkType::Primary => "primary".to_owned(),
+        NetworkType::Worker(id) => format!("worker-{id}"),
     }
 }
 
@@ -27,6 +27,8 @@ struct SwarmMetricHandles {
     gossip_received_total: Counter,
     /// Gossip messages rejected (failed verification against authorized publishers).
     gossip_rejected_total: Counter,
+    /// Inbound provider announcements dropped by the per-source rate limit.
+    add_provider_rate_limited_total: Counter,
     /// Graceful peer-exchange disconnects awaiting the peer's ack.
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
@@ -39,14 +41,17 @@ pub(crate) struct SwarmMetrics {
     /// The derive-backed handles.
     handles: SwarmMetricHandles,
     /// The network label value for per-event labeled counters.
-    network: &'static str,
+    network: String,
 }
 
 impl SwarmMetrics {
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
-        Self { handles: SwarmMetricHandles::new_with_labels(&[("network", network)]), network }
+        Self {
+            handles: SwarmMetricHandles::new_with_labels(&[("network", network.clone())]),
+            network,
+        }
     }
 
     /// Record a successfully published gossip message.
@@ -64,6 +69,11 @@ impl SwarmMetrics {
         self.handles.gossip_rejected_total.increment(1);
     }
 
+    /// Record an inbound provider announcement dropped before a store write.
+    pub(crate) fn record_add_provider_rate_limited(&self) {
+        self.handles.add_provider_rate_limited_total.increment(1);
+    }
+
     /// Update the in-flight request gauges (called once per event-loop iteration).
     pub(crate) fn set_pending(&self, px_disconnects: usize, outbound_requests: usize) {
         self.handles.px_disconnects_pending.set(px_disconnects as f64);
@@ -74,7 +84,7 @@ impl SwarmMetrics {
     pub(crate) fn record_outbound_failure(&self, kind: &'static str) {
         metrics::counter!(
             "tn_network.outbound_request_failures_total",
-            "network" => self.network,
+            "network" => self.network.clone(),
             "kind" => kind,
         )
         .increment(1);
@@ -110,7 +120,7 @@ pub(crate) struct PeerManagerMetrics {
     /// The derive-backed handles.
     handles: PeerManagerMetricHandles,
     /// The network label value for per-event labeled counters.
-    network: &'static str,
+    network: String,
 }
 
 impl PeerManagerMetrics {
@@ -118,7 +128,7 @@ impl PeerManagerMetrics {
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
         Self {
-            handles: PeerManagerMetricHandles::new_with_labels(&[("network", network)]),
+            handles: PeerManagerMetricHandles::new_with_labels(&[("network", network.clone())]),
             network,
         }
     }
@@ -141,7 +151,7 @@ impl PeerManagerMetrics {
     pub(crate) fn record_connection_established(&self, direction: &'static str) {
         metrics::counter!(
             "tn_network.connections_established_total",
-            "network" => self.network,
+            "network" => self.network.clone(),
             "direction" => direction,
         )
         .increment(1);
@@ -172,7 +182,7 @@ impl PeerManagerMetrics {
         };
         metrics::counter!(
             "tn_network.peer_penalties_total",
-            "network" => self.network,
+            "network" => self.network.clone(),
             "severity" => severity,
         )
         .increment(1);
@@ -189,6 +199,7 @@ mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
+    /// Primary and worker metrics register their expected labels and update every handle.
     #[test]
     fn test_metrics_register_and_update() {
         let recorder = DebuggingRecorder::new();
@@ -226,7 +237,7 @@ mod tests {
 
         let (key, _, _, value) = find("tn_network.connected_peers");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 4.0));
-        assert!(key.key().labels().any(|l| l.key() == "network" && l.value() == "worker"));
+        assert!(key.key().labels().any(|l| l.key() == "network" && l.value() == "worker-0"));
 
         let (key, _, _, _) = find("tn_network.outbound_request_failures_total");
         assert!(key.key().labels().any(|l| l.key() == "kind" && l.value() == "timeout"));
@@ -244,5 +255,76 @@ mod tests {
         find("tn_network.external_addr_confirmed");
         find("tn_network.dial_failures_total");
         find("tn_network.connections_closed_total");
+    }
+
+    /// Worker swarms must retain independent gauges and counters in the shared recorder.
+    #[test]
+    fn test_worker_metrics_are_isolated() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let first = SwarmMetrics::new_for(&NetworkType::Worker(0));
+            let second = SwarmMetrics::new_for(&NetworkType::Worker(1));
+            first.set_pending(3, 3);
+            second.set_pending(7, 7);
+            [&first, &second].into_iter().for_each(|swarm| {
+                swarm.record_gossip_published();
+                swarm.record_outbound_failure("timeout");
+            });
+
+            let first = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
+            let second = PeerManagerMetrics::new_for(&NetworkType::Worker(1));
+            first.set_peer_counts(3, 3, 3, 3);
+            second.set_peer_counts(7, 7, 7, 7);
+            [&first, &second].into_iter().for_each(|peers| {
+                peers.record_connection_established("in");
+                peers.record_penalty(&Penalty::Severe);
+            });
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        [("worker-0", 3.0), ("worker-1", 7.0)].into_iter().for_each(|(network, expected)| {
+            let value = |name| {
+                snapshot
+                    .iter()
+                    .find(|(key, ..)| {
+                        key.key().name() == name
+                            && key
+                                .key()
+                                .labels()
+                                .any(|label| label.key() == "network" && label.value() == network)
+                    })
+                    .map(|(_, _, _, value)| value)
+            };
+            [
+                "tn_network.px_disconnects_pending",
+                "tn_network.outbound_requests_pending",
+                "tn_network.connected_peers",
+                "tn_network.known_peers",
+                "tn_network.discovery_peers",
+                "tn_network.banned_peers",
+            ]
+            .into_iter()
+            .for_each(|name| {
+                assert!(
+                    matches!(value(name), Some(DebugValue::Gauge(g)) if g.0 == expected),
+                    "{name} must retain {network}'s gauge value"
+                );
+            });
+            [
+                "tn_network.gossip_published_total",
+                "tn_network.outbound_request_failures_total",
+                "tn_network.connections_established_total",
+                "tn_network.peer_penalties_total",
+            ]
+            .into_iter()
+            .for_each(|name| {
+                assert!(
+                    matches!(value(name), Some(DebugValue::Counter(1))),
+                    "{name} must count {network}'s events separately"
+                );
+            });
+        });
     }
 }

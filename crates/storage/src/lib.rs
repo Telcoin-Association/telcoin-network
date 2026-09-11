@@ -70,10 +70,14 @@ const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
 const CONSENSUS_OUTPUT_CACHE_CF: &str = "consensus_output_cache";
 
-const KAD_RECORD_CF: &str = "kad_record";
-const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
-const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
-const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
+/// Discovery records with role and worker id in their row hashes.
+const KAD_RECORD_CF: &str = "kad_record_v2";
+/// Provider rows with a separately decodable ownership key.
+const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record_v2";
+/// Worker discovery records isolated by worker id.
+const KAD_WORKER_RECORD_CF: &str = "kad_worker_record_v2";
+/// Worker provider rows isolated by worker id and ownership key.
+const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record_v2";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;$hint:expr;<$K:ty, $V:ty>),*) => {
