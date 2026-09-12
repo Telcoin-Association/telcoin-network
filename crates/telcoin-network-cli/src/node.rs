@@ -6,13 +6,22 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism,
+};
 use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
-use tn_types::{Genesis, B256, MAINNET_GENESIS};
+use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+/// Parse bootstrap dial hints using the same map and legacy worker decoding as NetworkConfig.
+fn parse_bootstrap_peers(
+    raw: &str,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, serde_yaml::Error> {
+    serde_yaml::from_str(raw)
+}
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -32,6 +41,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Join a named telcoin network (for instance test or main net).
     #[arg(long, value_name = "NAMED_TN_NETWORK", verbatim_doc_comment)]
     pub chain: Option<NamedChain>,
+
+    /// Bootstrap dial hints as a YAML or JSON map keyed by BLS public key.
+    ///
+    /// Replaces network-config bootstrap_peers for this process only. A nonempty map replaces
+    /// all genesis seeds; an explicit '{}' selects the genesis fallback. Each entry contains
+    /// primary and workers (a list). Committee membership still comes from chain state.
+    #[arg(long, value_name = "MAP", value_parser = parse_bootstrap_peers, allow_hyphen_values = true)]
+    bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
 
     /// Enable Prometheus consensus metrics.
     ///
@@ -229,7 +246,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
+            chain: _, // Used above
+            bootstrap_peers,
             observer: _, // Used above
             metrics,
             enable_state_export,
@@ -254,16 +272,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder = TnBuilder {
-            node_config,
-            tn_config,
-            metrics,
-            healthcheck,
-            enable_state_export,
-            enable_repack_monitor,
-            reth_db,
-            exex_fns: vec![],
-        };
+        let mut builder =
+            TnBuilder::new(node_config, tn_config, reth_db).with_bootstrap_peers(bootstrap_peers);
+        builder.metrics = metrics;
+        builder.healthcheck = healthcheck;
+        builder.enable_state_export = enable_state_export;
+        builder.enable_repack_monitor = enable_repack_monitor;
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
@@ -315,6 +329,57 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
+
+    /// The CLI accepts the same multi-worker map as network-config, in YAML or JSON form.
+    #[test]
+    fn bootstrap_peers_cli_parses_yaml_and_json() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        [serde_yaml::to_string(&peers)?, serde_json::to_string(&peers)?].into_iter().try_for_each(
+            |raw| -> eyre::Result<()> {
+                let command = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])?;
+                assert_eq!(command.bootstrap_peers, Some(peers.clone()));
+                Ok(())
+            },
+        )
+    }
+
+    /// An omitted option and an explicit empty override retain distinct precedence semantics.
+    #[test]
+    fn bootstrap_peers_cli_distinguishes_absent_and_empty() -> eyre::Result<()> {
+        let absent = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(absent.bootstrap_peers, None);
+        let empty = NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", "{}"])?;
+        assert_eq!(empty.bootstrap_peers, Some(BTreeMap::new()));
+        Ok(())
+    }
+
+    /// Invalid keys and empty worker lists fail at argument parsing, before node startup.
+    #[test]
+    fn bootstrap_peers_cli_rejects_invalid_entries() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        peers.values_mut().for_each(|server| server.workers.clear());
+        ["{invalid-key: {}}".to_owned(), serde_yaml::to_string(&peers)?].into_iter().for_each(
+            |raw| {
+                let result = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])
+                .map(|_| ())
+                .map_err(|error| error.kind());
+                assert_eq!(result, Err(ErrorKind::ValueValidation));
+            },
+        );
+        Ok(())
+    }
 
     /// Parse `--instance <raw>` through the node command and return the parsed value, or the
     /// clap error kind that rejected it.

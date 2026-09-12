@@ -3,8 +3,8 @@
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, time::Duration};
-use tn_types::{Round, WorkerId};
+use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
+use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -24,9 +24,38 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// The hostname for the validator.
     hostname: String,
+    /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
+    ///
+    /// A nonempty map replaces the genesis bootstrap set in full; entries are never merged.
+    /// An empty or absent map preserves the genesis fallback. A CLI override takes precedence
+    /// over this map, with an explicitly empty override selecting the genesis fallback.
+    /// Committee membership and gossip publisher authorization remain derived from chain state.
+    bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl NetworkConfig {
+    /// Return the configured bootstrap dial hints.
+    pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
+        &self.bootstrap_peers
+    }
+
+    /// Select bootstrap dial hints: CLI override, then network config, then genesis.
+    ///
+    /// The selected override or config map replaces genesis in full when nonempty. An empty
+    /// selected map falls back to genesis, including when the CLI explicitly supplies `{}`.
+    pub fn resolve_bootstrap_peers(
+        &self,
+        genesis: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        let configured = cli_override.unwrap_or(&self.bootstrap_peers);
+        if configured.is_empty() {
+            genesis.clone()
+        } else {
+            configured.clone()
+        }
+    }
+
     /// Return a reference to the [SyncConfig].
     pub fn sync_config(&self) -> &SyncConfig {
         &self.sync_config
@@ -559,6 +588,108 @@ impl ScoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Use the checked-in genesis peers so fixtures exercise real key decoding.
+    fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
+        serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
+            .map(|committee| committee.bootstrap_servers())
+            .map_err(Into::into)
+    }
+
+    /// Network config round-trips every worker and peer in the current bootstrap format.
+    #[test]
+    fn bootstrap_peers_yaml_round_trips_multiple_workers() -> eyre::Result<()> {
+        let mut peers = bootstrap_fixture()?;
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(peers.values().all(|server| server.num_workers() == 2));
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        let yaml = serde_yaml::to_string(&config)?;
+        let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+        assert_eq!(parsed.bootstrap_peers(), &peers);
+        Ok(())
+    }
+
+    /// Missing files, absent keys, and explicit empty maps preserve the genesis fallback.
+    #[test]
+    fn bootstrap_peers_default_and_legacy_configs_use_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let dir = tempfile::tempdir()?;
+        let missing = NetworkConfig::read_config(&dir.path().to_path_buf())?;
+        assert!(missing.bootstrap_peers().is_empty());
+        assert_eq!(missing.resolve_bootstrap_peers(&genesis, None), genesis);
+
+        let mut legacy = serde_yaml::to_value(NetworkConfig::default())?;
+        assert!(legacy
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected network config mapping"))?
+            .remove(&serde_yaml::Value::String("bootstrap_peers".into()))
+            .is_some());
+        ["{}".to_owned(), "bootstrap_peers: {}".to_owned(), serde_yaml::to_string(&legacy)?]
+            .into_iter()
+            .try_for_each(|yaml| -> eyre::Result<()> {
+                let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+                assert!(parsed.bootstrap_peers().is_empty());
+                assert_eq!(parsed.resolve_bootstrap_peers(&genesis, None), genesis);
+                Ok(())
+            })
+    }
+
+    /// The map inherits BootstrapServer's legacy single-worker reader.
+    #[test]
+    fn bootstrap_peers_accept_legacy_worker_shape() -> eyre::Result<()> {
+        let expected = bootstrap_fixture()?;
+        let mut peers = serde_yaml::to_value(&expected)?;
+        peers
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected peer map"))?
+            .iter_mut()
+            .try_for_each(|(_, server)| -> eyre::Result<()> {
+                let worker = server
+                    .get("workers")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .and_then(|workers| workers.first())
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("expected a worker"))?;
+                let server =
+                    server.as_mapping_mut().ok_or_else(|| eyre::eyre!("expected server map"))?;
+                assert!(server.remove(&serde_yaml::Value::String("workers".into())).is_some());
+                server.insert(serde_yaml::Value::String("worker".into()), worker);
+                Ok(())
+            })?;
+        let mut config = serde_yaml::Mapping::new();
+        config.insert(serde_yaml::Value::String("bootstrap_peers".into()), peers);
+        let parsed: NetworkConfig = serde_yaml::from_value(serde_yaml::Value::Mapping(config))?;
+        assert_eq!(parsed.bootstrap_peers(), &expected);
+        assert!(parsed.bootstrap_peers().values().all(|server| server.num_workers() == 1));
+        Ok(())
+    }
+
+    /// A nonempty configured map replaces all genesis peers, including colliding entries.
+    #[test]
+    fn bootstrap_peers_config_replaces_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let mut peers: BTreeMap<_, _> = genesis.clone().into_iter().take(1).collect();
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(genesis.len() > peers.len());
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, None), peers);
+        Ok(())
+    }
+
+    /// CLI peers win over YAML; an explicitly empty CLI map restores genesis.
+    #[test]
+    fn bootstrap_peers_cli_override_has_precedence() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let configured = genesis.clone().into_iter().take(1).collect();
+        let mut cli: BTreeMap<_, _> = genesis.clone().into_iter().skip(1).collect();
+        cli.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(!cli.is_empty());
+        let config = NetworkConfig { bootstrap_peers: configured, ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&cli)), cli);
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&BTreeMap::new())), genesis);
+        Ok(())
+    }
 
     #[test]
     fn empty_yaml_deserializes_to_default() {
