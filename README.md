@@ -45,10 +45,11 @@ This generates a BLS keypair, network keys, proof-of-possession, and a `node-inf
 
 Worker network configuration is checked before any swarm starts. Each entry in
 `node_info.p2p_info.workers` must advertise the network key derived for its worker ID from the
-loaded BLS keystore, and worker network addresses must be distinct. Existing configurations with
-mismatched keys or duplicate addresses now fail startup with an error naming the offending field.
-Restore worker key entries that match the node's BLS keystore and configure a separate network
-address for each worker.
+loaded BLS keystore, and worker listen addresses must be distinct, ignoring trailing `/p2p/`
+identities. Configurations with mismatched keys or duplicate addresses fail startup with an
+error naming the offending field.
+Restore worker key entries using the expected Base58 key printed in the startup error and
+configure a separate listen address for each worker.
 
 - `--address` is the execution layer address that receives fees
 - `--external-primary-addr` should be set to the node's public IP and port

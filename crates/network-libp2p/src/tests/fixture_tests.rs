@@ -1,11 +1,11 @@
-//! Regression tests for network identities exposed by committee fixtures.
+//! Regression tests for network identities and addresses exposed by committee fixtures.
 
-use std::num::NonZeroUsize;
+use std::{collections::HashSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{NetworkPublicKey, DEFAULT_WORKER_ID};
 
-/// Single-worker and multi-worker fixtures advertise the derived key for each worker id.
+/// Fixtures advertise each worker's derived key and distinct bootstrap and startup addresses.
 #[test]
 fn every_authority_fixture_matches_advertised_worker_keys() -> Result<(), &'static str> {
     [1, 3].into_iter().try_for_each(|worker_count| {
@@ -37,6 +37,17 @@ fn every_authority_fixture_matches_advertised_worker_keys() -> Result<(), &'stat
                 "fixture must authenticate as its authority's advertised worker zero"
             );
             let consensus_config = authority.consensus_config();
+            let advertised_addresses: HashSet<_> =
+                server.workers.iter().map(|worker| &worker.network_address).collect();
+            assert_eq!(advertised_addresses.len(), worker_count);
+            let configured_addresses: HashSet<_> = consensus_config
+                .config()
+                .node_info
+                .worker_p2p_nodes()
+                .iter()
+                .map(|worker| &worker.network_address)
+                .collect();
+            assert_eq!(configured_addresses.len(), worker_count);
             committee.worker_ids().try_for_each(|worker_id| {
                 let advertised =
                     server.worker(worker_id).ok_or("every worker must be advertised")?;
