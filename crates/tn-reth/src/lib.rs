@@ -112,13 +112,15 @@ pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
-    identifier::SenderIdentifiers,
+    identifier::{SenderId, SenderIdentifiers},
     BestTransactions, EthPooledTransaction, TransactionPool as TransactionPoolT,
 };
 
 mod cli;
 pub mod dirs;
 pub mod payload;
+pub mod peer_batch;
+pub use peer_batch::{PeerBatchTxs, PEER_BATCH_DEFER_TTL, PEER_BATCH_SEEN_MAX_TXS};
 pub mod traits;
 pub mod txn_pool;
 pub use txn_pool::*;
