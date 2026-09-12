@@ -926,6 +926,9 @@ where
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
             }
+            NetworkCommand::EstablishedPeerCount { reply } => {
+                send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
+            }
             NetworkCommand::ConnectedPeers { reply } => {
                 let peers = self
                     .swarm

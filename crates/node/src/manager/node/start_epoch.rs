@@ -1028,7 +1028,8 @@ where
             .unwrap_or(Ok(fallback))
     }
 
-    /// Block until the given [`NetworkHandle`] has at least one connected peer.
+    /// Block until the given [`NetworkHandle`] has at least one established peer available for
+    /// requests. Pending dials do not satisfy this readiness check.
     ///
     /// Polls the peer count every 500ms, logging periodically, and gives up after 240 attempts
     /// (~2 minutes) with an error rather than letting epoch startup hang forever on a network that
@@ -1038,7 +1039,7 @@ where
         handle: &NetworkHandle<Req, Res>,
         network_name: &str,
     ) -> eyre::Result<()> {
-        let mut peers = handle.connected_peer_count().await.unwrap_or(0);
+        let mut peers = handle.established_peer_count().await.unwrap_or(0);
         let mut retries = 0;
         while peers == 0 {
             retries += 1;
@@ -1051,7 +1052,7 @@ where
                 error!(target: "epoch-manager", "failed to join the {network_name}!");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = handle.connected_peer_count().await.unwrap_or(0);
+            peers = handle.established_peer_count().await.unwrap_or(0);
         }
         Ok(())
     }
@@ -1177,6 +1178,38 @@ mod tests {
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
     use std::num::NonZeroUsize;
+
+    /// Both the initial readiness probe and its retry must use established connections. A zero
+    /// snapshot keeps startup pending until a later probe observes an established peer.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_waits_for_established_peer() -> eyre::Result<()> {
+        use super::{EpochManager, NetworkHandle};
+        use std::{path::PathBuf, time::Duration};
+        use tn_network_libp2p::{types::NetworkCommand, PeerExchangeMap};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (sender, mut commands) = tokio::sync::mpsc::channel(2);
+        let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
+        let readiness =
+            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network");
+        tokio::pin!(readiness);
+        assert!(futures::poll!(&mut readiness).is_pending());
+        let initial_probe = commands.try_recv()?;
+        assert!(matches!(&initial_probe, NetworkCommand::EstablishedPeerCount { .. }));
+        if let NetworkCommand::EstablishedPeerCount { reply } = initial_probe {
+            reply.send(0).map_err(|count| eyre::eyre!("initial count {count} was dropped"))?;
+        }
+        assert!(futures::poll!(&mut readiness).is_pending());
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(futures::poll!(&mut readiness).is_pending());
+        if let NetworkCommand::EstablishedPeerCount { reply } = commands.try_recv()? {
+            reply.send(1).map_err(|count| eyre::eyre!("established count {count} was dropped"))?;
+            readiness.await
+        } else {
+            Err(eyre::eyre!("readiness probe must exclude pending dials"))
+        }
+    }
 
     /// An active committee validator prefetches batches for the vote path.
     #[test]
