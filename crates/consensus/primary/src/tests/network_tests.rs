@@ -970,11 +970,11 @@ async fn test_primary_batch_gossip_topics() {
 // ============================================================================
 // EpochVote Authorization-Before-Verify Tests (GHSA-j2g4-553f-875r)
 // ============================================================================
-// `epoch_vote_topic` is an open gossip topic, so a non-committee observer can publish an
-// `EpochVote` with arbitrary fields. The handler must authorize a vote (committee membership by
-// epoch number) *before* paying the expensive BLS pairing verify, must drop a vote for an
-// unknown epoch before the verify, and must not turn a bad vote into a `Fatal` penalty charged
-// to the honest relayer.
+// The handler cannot assume the network-layer publisher allowlist already screened the author -
+// the two checks live in different layers, and the application layer must not rely on the
+// network layer having run. It must authorize a vote (committee membership by epoch number)
+// *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
+// the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
 
 /// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
 fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
