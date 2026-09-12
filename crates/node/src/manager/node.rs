@@ -681,16 +681,13 @@ where
     ) -> eyre::Result<Self> {
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
-        let committee_zero = if let Ok(committee_zero) =
+        let committee_zero =
             Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
-        {
-            committee_zero
-        } else {
-            error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
-            return Err(eyre::eyre!(
-                "unable to load committee zero (genesis committee), this is fatal"
-            ));
-        };
+                .map_err(|_| {
+                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
+                    eyre::eyre!("unable to load committee zero (genesis committee), this is fatal")
+                })?;
+        let bootstrap_servers = committee_zero.bootstrap_servers();
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
@@ -709,17 +706,6 @@ where
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
             .map(|_| QueChannel::new())
             .collect();
-        let bootstrap_servers = if let Ok(committee_zero) =
-            Config::load_from_path_or_default::<Committee>(
-                tn_datadir.committee_path(),
-                ConfigFmt::YAML,
-            ) {
-            committee_zero.bootstrap_servers()
-        } else {
-            error!(target: "epoch-manager", "Unable to load bootstrap servers from the genesis committee!");
-            BTreeMap::new()
-        };
-
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
             builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
