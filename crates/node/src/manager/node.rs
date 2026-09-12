@@ -20,6 +20,7 @@ use crate::{
     metrics::EpochMetrics,
 };
 use eyre::{eyre, WrapErr as _};
+use futures::TryStreamExt as _;
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use std::{collections::BTreeMap, future::ready, sync::Arc};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
@@ -171,10 +172,9 @@ fn prepare_worker_networks<Events: Clone>(
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
 /// across epochs (p2p network handles, consensus DB, consensus bus, consensus chain) alongside the
 /// small amount of cross-epoch carry-over state that the next epoch needs to start correctly -
-/// notably [`last_consensus_header`](Self::last_consensus_header),
-/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number), and
-/// [`network_initialized`](Self::network_initialized). Per-epoch consensus components are built and
-/// dropped inside the epoch loop rather than stored here.
+/// notably [`last_consensus_header`](Self::last_consensus_header) and
+/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number). Per-epoch consensus
+/// components are built and dropped inside the epoch loop rather than stored here.
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
@@ -196,19 +196,6 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Whether the long-running p2p networks have completed their one-time, per-process setup
-    /// (start listening, register bootstrap peers).
-    ///
-    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
-    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
-    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
-    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
-    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
-    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
-    ///
-    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
-    /// state via `update_committees`.
-    network_initialized: bool,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
@@ -741,7 +728,6 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
-            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -762,7 +748,8 @@ where
     /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), spawn the epoch-record and vote
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
+    /// listeners, schedule process-lifetime bootstrap dials, spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
     /// and spawn the engine-update task. It then requests any missing epoch pack files and
     /// launches the app-scoped consensus fetch workers.
@@ -860,10 +847,86 @@ where
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
-        self.spawn_node_networks(node_task_spawner, &network_config, epoch, on_chain_workers)
+        self.spawn_node_networks(
+            node_task_spawner.clone(),
+            &network_config,
+            epoch,
+            on_chain_workers,
+        )
+        .await?;
+        let primary_network_handle = self
+            .primary_network_handle
+            .as_ref()
+            .ok_or_else(|| eyre!("no primary network handle"))?
+            .clone();
+
+        // Register bootstrap peers before per-epoch committee updates resolve known peers.
+        // Listening and bootstrap dials belong to process startup, before replay can close an
+        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
+        primary_network_handle
+            .inner_handle()
+            .add_bootstrap_peers(
+                self.bootstrap_servers
+                    .iter()
+                    .map(|(key, peer)| (*key, peer.primary.clone()))
+                    .collect(),
+            )
             .await?;
-        let primary_network_handle =
-            self.primary_network_handle.as_ref().expect("primary network").clone();
+        let node_info = &self.builder.tn_config.node_info;
+        let primary_address = Self::parse_listener_address_for_swarm(
+            "PRIMARY_LISTENER_MULTIADDR",
+            node_info.p2p_info.primary.network_key.clone(),
+            node_info.primary_network_address().clone(),
+        )?;
+        info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
+        primary_network_handle.inner_handle().start_listening(primary_address).await?;
+        self.bootstrap_servers.keys().copied().for_each(|key| {
+            self.dial_peer_bls(
+                primary_network_handle.inner_handle().clone(),
+                key,
+                node_task_spawner.clone(),
+            );
+        });
+
+        let manager = &*self;
+        let startup_spawner = &node_task_spawner;
+        futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
+            .try_for_each(|network_handle| async move {
+                let worker_id = network_handle.worker_id();
+                let bootstrap_peers: BTreeMap<_, _> = manager
+                    .bootstrap_servers
+                    .iter()
+                    // Peers with fewer workers have no swarm for this id.
+                    .filter_map(|(key, peer)| {
+                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
+                    })
+                    .collect();
+                network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
+                let configured_address =
+                    node_info.worker_network_address(worker_id).cloned().ok_or_else(|| {
+                        eyre!("no network address for worker {worker_id} in node info")
+                    })?;
+                // One override cannot name multiple listeners, so it applies only to worker 0.
+                let worker_address = if worker_id == DEFAULT_WORKER_ID {
+                    Self::parse_listener_address_for_swarm(
+                        "WORKER_LISTENER_MULTIADDR",
+                        node_info.p2p_info.primary.network_key.clone(),
+                        configured_address,
+                    )?
+                } else {
+                    configured_address
+                };
+                network_handle.inner_handle().start_listening(worker_address).await?;
+                bootstrap_peers.into_keys().for_each(|key| {
+                    manager.dial_peer_bls(
+                        network_handle.inner_handle().clone(),
+                        key,
+                        startup_spawner.clone(),
+                    );
+                });
+                Ok(())
+            })
+            .await?;
         // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
         // they are subscribed per-epoch in `spawn_primary_network_for_epoch` against a
         // committee-restricted publisher set (alongside `primary_topic`), and intentionally not
