@@ -1,31 +1,64 @@
-//! Regression tests for network identities exposed by committee fixtures.
+//! Regression tests for network identities and addresses exposed by committee fixtures.
 
+use std::{collections::HashSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{NetworkPublicKey, DEFAULT_WORKER_ID};
 
-/// Every authority fixture exposes worker zero with the key advertised for that worker.
+/// Fixtures advertise each worker's derived key and distinct bootstrap and startup addresses.
 #[test]
-fn every_authority_fixture_matches_advertised_worker_zero() -> Result<(), &'static str> {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let bootstrap_servers = committee.bootstrap_servers();
-    assert_eq!(fixture.num_authorities(), 4, "exercise authorities beyond the first position");
-    assert_eq!(committee.number_of_workers(), 1);
+fn every_authority_fixture_matches_advertised_worker_keys() -> Result<(), &'static str> {
+    [1, 3].into_iter().try_for_each(|worker_count| {
+        let number_of_workers =
+            NonZeroUsize::new(worker_count).ok_or("worker count must be nonzero")?;
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .number_of_workers(number_of_workers)
+            .build();
+        let committee = fixture.committee();
+        let bootstrap_servers = committee.bootstrap_servers();
+        assert_eq!(fixture.num_authorities(), 4, "exercise authorities beyond the first position");
+        assert_eq!(committee.number_of_workers(), number_of_workers.get());
 
-    fixture.authorities().try_for_each(|authority| {
-        let worker = authority.worker();
-        let advertised = bootstrap_servers
-            .get(&authority.primary_public_key())
-            .and_then(|server| server.worker(DEFAULT_WORKER_ID))
-            .ok_or("every authority must advertise worker zero")?;
-        assert_eq!(worker.id, DEFAULT_WORKER_ID, "worker id must not depend on authority order");
-        let fixture_key: NetworkPublicKey = worker.keypair().public().into();
-        assert_eq!(
-            fixture_key, advertised.network_key,
-            "fixture must authenticate as its authority's advertised worker zero"
-        );
-        Ok::<(), &'static str>(())
-    })?;
-    Ok(())
+        fixture.authorities().try_for_each(|authority| {
+            let worker = authority.worker();
+            let server = bootstrap_servers
+                .get(&authority.primary_public_key())
+                .ok_or("every authority must advertise its worker network identities")?;
+            let advertised = server
+                .worker(DEFAULT_WORKER_ID)
+                .ok_or("every authority must advertise worker zero")?;
+            assert_eq!(
+                worker.id, DEFAULT_WORKER_ID,
+                "worker id must not depend on authority order"
+            );
+            let fixture_key: NetworkPublicKey = worker.keypair().public().into();
+            assert_eq!(
+                fixture_key, advertised.network_key,
+                "fixture must authenticate as its authority's advertised worker zero"
+            );
+            let consensus_config = authority.consensus_config();
+            let advertised_addresses: HashSet<_> =
+                server.workers.iter().map(|worker| &worker.network_address).collect();
+            assert_eq!(advertised_addresses.len(), worker_count);
+            let configured_addresses: HashSet<_> = consensus_config
+                .config()
+                .node_info
+                .worker_p2p_nodes()
+                .iter()
+                .map(|worker| &worker.network_address)
+                .collect();
+            assert_eq!(configured_addresses.len(), worker_count);
+            committee.worker_ids().try_for_each(|worker_id| {
+                let advertised =
+                    server.worker(worker_id).ok_or("every worker must be advertised")?;
+                assert_eq!(
+                    consensus_config.key_config().worker_network_public_key(worker_id),
+                    advertised.network_key,
+                    "worker {worker_id} must authenticate as its advertised network identity"
+                );
+                Ok::<(), &'static str>(())
+            })
+        })?;
+        Ok(())
+    })
 }
