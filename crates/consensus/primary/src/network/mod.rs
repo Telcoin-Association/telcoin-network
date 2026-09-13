@@ -100,6 +100,18 @@ pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
 /// Prevents a single malicious peer from filling all global slots.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
+/// Maximum number of concurrent shed tasks for denied inbound sync streams.
+///
+/// A denied stream still gets a short-lived task that writes
+/// [`DenyReason::AtCapacity`] so the requester fails fast instead of waiting out
+/// a timeout. Without a budget on that spawn, a burst of opened substreams
+/// beyond the admission caps fans out to one task each, bounded only by the
+/// stream behavior's per-peer inbound rate limit (#1308). Past this budget the
+/// stream is dropped without spawning (the requester sees a reset and retries
+/// elsewhere), so the primary's total sync-task fan-out stays bounded by
+/// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
+pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
@@ -262,6 +274,15 @@ fn try_admit_sync(
         *sync_guard.entry(peer).or_insert(0) += 1;
         PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
     })
+}
+
+/// Try to reserve a slot in the bounded shed-task budget.
+///
+/// Returns `None` when [`MAX_CONCURRENT_SHED_TASKS`] shed tasks are already in
+/// flight; the caller then drops the stream without spawning. Dropping the
+/// permit frees the slot for the next denied stream.
+fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    semaphore.clone().try_acquire_owned().ok()
 }
 
 /// Try to admit one `EpochRecord` request-response serve for `peer`.
@@ -1180,6 +1201,12 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Admission checks this count against [`MAX_PENDING_REQUESTS_PER_PEER`], the
     /// sole per-peer cap now that every bulk path rides the typed sync protocol.
     sync_stream_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    /// Semaphore bounding concurrent shed tasks for denied sync streams.
+    ///
+    /// A permit is held for the lifetime of a shed task (the bounded
+    /// `Deny(AtCapacity)` write), so [`MAX_CONCURRENT_SHED_TASKS`] caps the
+    /// spawn fan-out from over-cap substream bursts.
+    shed_task_semaphore: Arc<Semaphore>,
     /// Semaphore bounding concurrent `EpochRecord` request-response serves.
     ///
     /// Separate from `epoch_stream_semaphore` so an epoch-record flood and the stream-serving
@@ -1220,6 +1247,7 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
+            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
         }
@@ -1422,45 +1450,37 @@ where
     ///
     /// Admission against the per-peer concurrency cap happens here on stream open:
     /// the request rides in the opening frame, so there is no `(peer, digest)`
-    /// pending map for this path. A shedding responder writes
-    /// [`DenyReason::AtCapacity`] without reading so the requester retries elsewhere
-    /// immediately. Once admitted, the opening request frame is read (bounded by
-    /// [`SYNC_REQUEST_READ_TIMEOUT`]) and an `EpochPack` request is served by
+    /// pending map for this path. Admission runs ahead of any task spawn (#1308).
+    /// A shedding responder writes [`DenyReason::AtCapacity`] without reading so
+    /// the requester retries elsewhere immediately; that shed write runs on its
+    /// own task gated by the [`MAX_CONCURRENT_SHED_TASKS`] budget (see
+    /// [`Self::shed_inbound_sync_stream`]). Once admitted, the opening request
+    /// frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]) and an
+    /// `EpochPack` request is served by
     /// [`RequestHandler::process_sync_epoch_pack_stream`]. The admission permit is
     /// held for the lifetime of the spawned task.
     fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
-        // admit against the per-peer cap before spawning; the permit (if any) moves
-        // into the task and frees capacity on drop
-        let permit = try_admit_sync(&self.epoch_stream_semaphore, &self.sync_stream_peers, peer);
+        // admit against the caps before spawning; the permit moves into the task
+        // and frees capacity on drop. A denied stream takes the bounded shed
+        // path instead of spawning here, so over-cap substream bursts cannot fan
+        // out past the shed budget (#1308).
+        let Some(permit) =
+            try_admit_sync(&self.epoch_stream_semaphore, &self.sync_stream_peers, peer)
+        else {
+            self.shed_inbound_sync_stream(peer, stream);
+            return;
+        };
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let task_name = format!("sync-epoch-pack-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
+            // hold the admission permit for the lifetime of the exchange
+            let _permit = permit;
             let mut stream = stream;
             // bounds the opening `Req` read and the tiny control writes below; the
             // per-request-type data bounds live in each serve function.
             let max_frame = MAX_SYNC_REQUEST_FRAME_SIZE;
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-
-            // shed load: deny without reading so the requester retries elsewhere
-            let Some(_permit) = permit else {
-                debug!(target: "primary::network", %peer, "denying inbound sync stream: at capacity");
-                // bound the best-effort shed write: a peer that applies receive
-                // backpressure and never reads must not stall this task.
-                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
-                    let _ = write_frame(
-                        &mut stream,
-                        &SyncFrame::<PrimarySyncRequest>::Deny(DenyReason::AtCapacity),
-                        &mut encode_buffer,
-                        &mut compressed_buffer,
-                        max_frame,
-                    )
-                    .await;
-                    let _ = stream.close().await;
-                })
-                .await;
-                return Ok(());
-            };
 
             // read the opening request frame; a peer that never sends one (timeout)
             // or sends a malformed one (io error) is dropped after releasing the
@@ -1561,6 +1581,46 @@ where
             }
             Ok(())
         });
+    }
+
+    /// Shed a denied inbound sync stream on a budgeted task.
+    ///
+    /// Spawns a short-lived task that writes [`DenyReason::AtCapacity`] and
+    /// closes, so the requester fails fast and tries elsewhere. The spawn is
+    /// gated by [`MAX_CONCURRENT_SHED_TASKS`]: past that budget the stream is
+    /// dropped without spawning (the requester sees a reset), so a burst of
+    /// over-cap substreams cannot fan out to unbounded tasks (#1308).
+    fn shed_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
+        try_admit_shed(&self.shed_task_semaphore).map_or_else(
+            || {
+                debug!(target: "primary::network", %peer, "dropping inbound sync stream: shed budget exhausted");
+            },
+            |shed_permit| {
+                let task_name = format!("shed-sync-epoch-pack-{peer}");
+                self.task_spawner.spawn_task(task_name, async move {
+                    // hold the shed budget slot for the lifetime of the task
+                    let _shed_permit = shed_permit;
+                    let mut stream = stream;
+                    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+                    debug!(target: "primary::network", %peer, "denying inbound sync stream: at capacity");
+                    // bound the best-effort shed write: a peer that applies receive
+                    // backpressure and never reads must not pin the shed budget slot.
+                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+                        let _ = write_frame(
+                            &mut stream,
+                            &SyncFrame::<PrimarySyncRequest>::Deny(DenyReason::AtCapacity),
+                            &mut encode_buffer,
+                            &mut compressed_buffer,
+                            MAX_SYNC_REQUEST_FRAME_SIZE,
+                        )
+                        .await;
+                        let _ = stream.close().await;
+                    })
+                    .await;
+                    Ok(())
+                });
+            },
+        )
     }
 }
 

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Library for managing all components used by a full-node in a single process.
+
+//! Library for managing all components used by a full-node in a single process.
+//!
+//! `tn-node` assembles the consensus, execution, storage, and networking crates into a running
+//! full node and drives them across epoch boundaries with `EpochManager`.
 
 #![allow(missing_docs)]
 

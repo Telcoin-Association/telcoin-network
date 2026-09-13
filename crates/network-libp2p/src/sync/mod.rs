@@ -21,9 +21,9 @@
 //! ## Protocols
 //!
 //! The frames ride on streams negotiated with the per-role sync protocols
-//! (`/tn-primary-sync/0.0.1`, `/tn-worker-{id}-sync/0.0.1`), which the stream
-//! behaviour registers as its sole upgrade. Every bulk path (worker batch, epoch
-//! pack, missing certificates, consensus output) rides this layer.
+//! (`/tn-primary-sync-{chain_id}/0.0.1`, `/tn-worker-{id}-sync-{chain_id}/0.0.1`),
+//! which the stream behaviour registers as its sole upgrade. Every bulk path
+//! (worker batch, epoch pack, missing certificates, consensus output) rides this layer.
 //!
 //! [`encode_message`]: crate::encode_message
 //! [`decode_message`]: crate::decode_message

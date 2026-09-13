@@ -2529,6 +2529,35 @@ mod tests {
         Ok(())
     }
 
+    /// `real_header_floor` derives the guaranteed-real header bound from the floor marker:
+    /// no marker => 0 (every header is real down to genesis), marker `B` =>
+    /// `max(1, B - (BLOCKHASH_ANCESTORS - 1))`, the bound backward header walks must not cross
+    /// on a restored datadir (issue #1321). The mature-chain (non-clamped) arm is exercised here
+    /// with a hand-written marker; the clamped arm is covered by the scaffold test below.
+    #[tokio::test]
+    async fn real_header_floor_derives_from_the_floor_marker() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let dir = TempDir::new()?;
+        let tm = TaskManager::new("Real Header Floor");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dir.path())?;
+        let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+        assert_eq!(
+            env.real_header_floor(),
+            0,
+            "a normally-synced datadir must let backward walks reach genesis"
+        );
+        drop(env);
+
+        // a mature restored chain: the marker sits far above the lookback window, so the bound
+        // is `B - (BLOCKHASH_ANCESTORS - 1)`, not the genesis clamp
+        std::fs::write(RethEnv::restored_state_floor_path(&reth_config.0), "100000\n")?;
+        let (reth_config, db) = temp_config_and_db(chain, dir.path())?;
+        let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+        assert_eq!(env.real_header_floor(), 100_000 - (BLOCKHASH_ANCESTORS - 1));
+
+        Ok(())
+    }
+
     /// The scaffold persists the restored-state floor marker as the snapshot's FINAL block `B` —
     /// not the window's first block, because window headers below `B` resolve by hash yet carry
     /// no state — before any chain data commits, and a fresh env over the datadir refuses pinned
@@ -2536,6 +2565,7 @@ mod tests {
     #[tokio::test]
     async fn scaffold_persists_restored_state_floor_and_env_refuses_below_it() -> eyre::Result<()> {
         use crate::error::StateReadError;
+        use tn_types::CanonicalExecutionReader;
 
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let dst_dir = TempDir::new()?;
@@ -2563,6 +2593,15 @@ mod tests {
 
         let (reth_config, db) = temp_config_and_db(chain, dst_dir.path())?;
         let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+
+        // the real-header bound derives from the marker: max(1, B - (BLOCKHASH_ANCESTORS - 1)),
+        // here clamped to block 1 (B = 5 sits inside the lookback). Backward header walks stop
+        // there instead of reading scaffold dummies (issue #1321)
+        assert_eq!(
+            env.real_header_floor(),
+            1,
+            "a restored env must bound backward header walks at the guaranteed-real floor"
+        );
 
         // below the floor: refused up front, before the (unresolvable) pin hash matters
         let phantom =
@@ -2630,6 +2669,29 @@ mod tests {
         assert!(
             !err.to_string().contains("below this datadir's restored-state floor"),
             "the floor must not refuse a pin at the floor itself, got: {err}"
+        );
+
+        // #1323: the CanonicalExecutionReader DB fallback (consensus `wait_for_execution`) must
+        // refuse the whole scaffold region below the floor. Below `B` it attests no block — not
+        // even a window-interior height whose header carries a real hash, and certainly not a
+        // zero-hash dummy that would otherwise read back as its own `B256::ZERO`. So a peer's
+        // header referencing a scaffold `latest_execution_block` can never clear the execution
+        // check on a restored node, which is what let the poison certify network-wide. At the
+        // floor the reader answers truthfully from the DB.
+        assert_eq!(
+            env.canonical_execution_hash(2),
+            None,
+            "a below-floor height must never be attested as canonical execution"
+        );
+        assert_eq!(
+            env.canonical_execution_hash(3),
+            None,
+            "a window-interior height below B must never be attested as canonical execution"
+        );
+        assert_eq!(
+            env.canonical_execution_hash(5),
+            Some(h5.hash()),
+            "the block at the floor must resolve to its real canonical execution hash"
         );
 
         Ok(())

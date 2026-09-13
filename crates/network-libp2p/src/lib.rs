@@ -46,3 +46,6 @@ pub use libp2p::{
 #[cfg(test)]
 #[path = "./tests/common.rs"]
 pub(crate) mod common;
+#[cfg(test)]
+#[path = "tests/fixture_tests.rs"]
+mod fixture_tests;

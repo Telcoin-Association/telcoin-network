@@ -4,9 +4,13 @@ use crate::common::get_block;
 
 use super::common::{
     create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
-    start_nodes, ProcessGuard, NEW_VALIDATOR,
+    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR,
 };
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::{
+    primitives::Bytes,
+    providers::{Provider, ProviderBuilder},
+    sol_types::SolCall,
+};
 use e2e_tests::NodeEndpoints;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -16,8 +20,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_reth::{
-    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethChainSpec,
 };
@@ -28,7 +33,7 @@ use tn_types::{
         leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
         seed_signature_active,
     },
-    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256,
+    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256, U256,
 };
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -725,6 +730,151 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator, &endpoints)
         .await
+}
+
+/// Submit a governance update to `WorkerConfigs` and wait for its transaction to confirm.
+///
+/// A transaction crossing an epoch boundary can be reinjected into the next epoch, so allow
+/// two epoch durations plus startup slack for confirmation. Callers verify the resulting state.
+async fn send_worker_config_update<P: Provider>(
+    provider: &P,
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    calldata: Bytes,
+) -> eyre::Result<()> {
+    let tx = governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(WORKER_CONFIGS_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&tx).await?;
+    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
+    Ok(())
+}
+
+/// Change the worker count and prove every original node closes an epoch under the new count.
+///
+/// The epoch observed after confirmation may already include the update. Waiting through its
+/// successor guarantees a complete epoch under the changed count regardless of transaction timing.
+async fn change_worker_count_across_epoch_boundary<P: Provider>(
+    provider: &P,
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    endpoints: &[NodeEndpoints],
+    worker_count: u16,
+) -> eyre::Result<()> {
+    send_worker_config_update(
+        provider,
+        governance,
+        chain,
+        WorkerConfigs::setNumWorkersCall { numWorkers_: worker_count }.abi_encode().into(),
+    )
+    .await?;
+    let configs = WorkerConfigs::new(WORKER_CONFIGS_ADDRESS, provider);
+    eyre::ensure!(
+        configs.numWorkers().call().await? == worker_count,
+        "governance did not set the worker count to {worker_count}",
+    );
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+    let observed_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let changed_epoch = observed_epoch.saturating_add(1);
+    let following_epoch = changed_epoch.saturating_add(1);
+
+    futures::future::try_join_all(endpoints.iter().map(|endpoint| async move {
+        let node = ProviderBuilder::new().connect_http(endpoint.http_url.parse()?);
+        let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &node);
+        wait_until(
+            Duration::from_secs(EPOCH_DURATION * 8),
+            &format!(
+                "{} to close epoch {changed_epoch} with {worker_count} workers",
+                endpoint.http_url,
+            ),
+            || async {
+                Ok(registry.getCurrentEpochInfo().call().await?.epochId >= following_epoch)
+            },
+        )
+        .await?;
+        let record = fetch_verified_epoch_record(&endpoint.http_url, changed_epoch, 60).await?;
+        eyre::ensure!(record.epoch == changed_epoch, "node served the wrong epoch record");
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
+    Ok(())
+}
+
+/// Governance can grow and shrink the protocol worker count while validators keep running.
+///
+/// Every node starts with one configured worker. Growing to two therefore exercises the live
+/// epoch-entry shortfall after startup; no second worker key or swarm appears. The original
+/// processes must still close epochs and accept the subsequent decrease back to one worker.
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    pin_fork_epochs(Some(0), None, None);
+
+    let committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+    let extra_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let mut governance = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let temp_dir = tempfile::TempDir::with_prefix("worker_count")?;
+    let genesis = create_genesis_for_test(
+        temp_dir.path(),
+        (NEW_VALIDATOR, extra_validator.address()),
+        governance.address(),
+        &committee,
+        EPOCH_DURATION,
+    )?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let (children, endpoints) = start_nodes(temp_dir.path(), &committee, "worker_count", 1)?;
+    let mut guard = ProcessGuard::new(children);
+    // A quorum can commit governance before the final validator has opened its RPC listener.
+    futures::future::try_join_all(endpoints.iter().map(|endpoint| async move {
+        let node = ProviderBuilder::new().connect_http(endpoint.http_url.parse()?);
+        wait_for_rpc(&node).await
+    }))
+    .await?;
+    let first = endpoints.first().ok_or_else(|| eyre::eyre!("no validator endpoints"))?;
+    let provider = ProviderBuilder::new().connect_http(first.http_url.parse()?);
+    let configs = WorkerConfigs::new(WORKER_CONFIGS_ADDRESS, &provider);
+    eyre::ensure!(configs.numWorkers().call().await? == 1, "genesis must use one worker");
+
+    // The contract requires worker 1's configuration before governance raises the count.
+    send_worker_config_update(
+        &provider,
+        &mut governance,
+        chain.clone(),
+        WorkerConfigs::setWorkerConfigCall {
+            workerId: 1,
+            strategy: 0,
+            value: 30_000_000,
+            data: Default::default(),
+        }
+        .abi_encode()
+        .into(),
+    )
+    .await?;
+    change_worker_count_across_epoch_boundary(
+        &provider,
+        &mut governance,
+        chain.clone(),
+        &endpoints,
+        2,
+    )
+    .await?;
+    change_worker_count_across_epoch_boundary(&provider, &mut governance, chain, &endpoints, 1)
+        .await?;
+
+    guard.kill_all();
+    Ok(())
 }
 
 #[ignore = "only run independently from all other it tests"]
