@@ -33,7 +33,7 @@ use tracing::{debug, error, trace, warn};
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
 
-/// Fixed window over which inbound kad `PutRecord` messages are counted per source.
+/// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Maximum tracked sources in each inbound kad rate-window map.
@@ -43,14 +43,48 @@ const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_WINDOWS: usize = 1024;
 
 /// Maximum inbound kad `PutRecord` messages accepted from a single source per
-/// [`PUT_RECORD_RATE_WINDOW`] before the source is rate limited.
+/// [`PUT_RECORD_RATE_WINDOW`] before records from the source are shed.
 ///
-/// Honest inbound sits far below this. A source refreshes its own record on the kad
-/// republication cadence (`kad_publication_interval`, 12h by default) and the libp2p
-/// replication interval (~1h), so even a post-restart burst is a small handful of records
-/// per minute. A source sustaining more than this per fixed minute is not explainable by
-/// that cadence and is treated as a flood (GHSA-f6rq-62rr-4h9g).
-const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
+/// This is the starvation bound: it caps the BLS verify + store write work one source can
+/// place on the network task (~30 verifies per source-minute). Exceeding it sheds records
+/// without penalizing the source, because honest traffic can cross this line.
+///
+/// Sized against kad *replication* fan-in, not against a source republishing its own
+/// record. On every `record_replication_interval` tick (`kad_replication_interval`, 1h by
+/// default) libp2p-kad re-puts every stored record whose publisher is **not** the local
+/// node (`libp2p-kad::jobs::PutRecordJob::poll`), one iterative query per record, each
+/// fanning out to the `replication_factor` (20) closest peers. The count one target sees
+/// from one source per tick is therefore
+///
+///     N * min(1, replication_factor / R)
+///
+/// where `N` is the source's stored-record count (~one row per node seen, capped by
+/// `MemoryStoreConfig::max_records` = 1024) and `R` is the peer set the source's lookup
+/// reaches. With healthy routing (`R >= replication_factor`) this is ~20 and Poisson
+/// distributed; when a source's reach is small (bootstrap, partition heal, post-restart)
+/// it degrades toward `N`.
+pub(crate) const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
+
+/// Maximum records in an honest source's store, hence its replication fan-in per tick.
+///
+/// Mirrors `MemoryStoreConfig::default().max_records`, adopted by `KadStore::new`.
+/// `test_put_record_penalty_threshold_above_honest_ceiling` pins the upstream default so a
+/// dependency update cannot silently move the honest ceiling above the penalty threshold.
+const KAD_MAX_STORED_RECORDS: usize = 1024;
+
+/// Sustained inbound rate above which a source is scored, not merely shed.
+///
+/// Twice the honest store ceiling: libp2p drains its replication snapshot without pacing,
+/// so a source with routing reach at or below the replication factor can send its entire
+/// store to one target in a single window. Crossing this threshold incurs one severe
+/// penalty per window until [`PUT_RECORD_DISCONNECT_THRESHOLD`] is exceeded.
+pub(crate) const PUT_RECORD_PENALTY_THRESHOLD: usize = 2 * KAD_MAX_STORED_RECORDS;
+
+/// Records per window above which every further message incurs a severe penalty.
+///
+/// Sixteen times the honest store ceiling. Repeated penalties drive a non-exempt source
+/// through the existing disconnect and ban paths without waiting for another window.
+pub(crate) const PUT_RECORD_DISCONNECT_THRESHOLD: usize = 8 * PUT_RECORD_PENALTY_THRESHOLD;
 
 /// Per-source inbound kad `PutRecord` rate window.
 struct PutRecordWindow {
@@ -58,6 +92,20 @@ struct PutRecordWindow {
     count: usize,
     /// When the current window started.
     started: Instant,
+    /// Whether the one-time penalty was assessed below the repeated-penalty ceiling.
+    penalized: bool,
+}
+
+/// Outcome of recording an inbound kad `PutRecord` against the per-source window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutRecordRate {
+    /// Under the shed threshold: process the record.
+    Allowed,
+    /// Per-source budget or tracking capacity exhausted: drop without penalizing the source.
+    Shed,
+    /// First crossing of the penalty threshold, or any message past the repeated-penalty
+    /// ceiling: drop the record and penalize the source.
+    Flooding,
 }
 
 /// Length of the sliding window over which inbound `AddProvider` messages from one
@@ -996,34 +1044,51 @@ impl PeerManager {
         self.cache_known_peer(bls_key, info);
     }
 
-    /// Record an inbound kad `PutRecord` from `source` and report whether it exceeds the
+    /// Record an inbound kad `PutRecord` from `source` and classify it against the
     /// per-source rate.
     ///
-    /// Counts messages in a [`PUT_RECORD_RATE_WINDOW`] fixed window and reports `true` after
-    /// [`MAX_PUT_RECORDS_PER_WINDOW`] admissions, or when an untracked source cannot fit within
-    /// [`MAX_RATE_WINDOWS`]. The caller drops the record before signature verification and the
-    /// store write. The local node's own id is exempt, and live budgets survive disconnects.
-    pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> bool {
+    /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] tumbling window. A source
+    /// past [`MAX_PUT_RECORDS_PER_WINDOW`] has its records shed before the expensive
+    /// signature verify and store write; only a source past
+    /// [`PUT_RECORD_PENALTY_THRESHOLD`] is flagged for a penalty, once per window below
+    /// [`PUT_RECORD_DISCONNECT_THRESHOLD`] and on every message above that ceiling.
+    /// Untracked sources are shed without a penalty when [`MAX_RATE_WINDOWS`] is full.
+    /// The local node's own id is never limited, and live budgets survive disconnects.
+    /// Shed and flood outcomes each bump the rate-limit metric.
+    pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> PutRecordRate {
         if self.is_local_peer(&source) {
-            false
+            PutRecordRate::Allowed
         } else if self.put_record_windows.len() >= MAX_RATE_WINDOWS
             && !self.put_record_windows.contains_key(&source)
         {
-            true
+            self.metrics.record_put_record_rate_limited(&PutRecordRate::Shed);
+            PutRecordRate::Shed
         } else {
             let now = Instant::now();
-            let window = self
-                .put_record_windows
-                .entry(source)
-                .or_insert(PutRecordWindow { count: 0, started: now });
+            let window = self.put_record_windows.entry(source).or_insert(PutRecordWindow {
+                count: 0,
+                started: now,
+                penalized: false,
+            });
             let window_expired = now.duration_since(window.started) >= PUT_RECORD_RATE_WINDOW;
             if window_expired {
                 window.count = 1;
                 window.started = now;
+                window.penalized = false;
             } else {
                 window.count = window.count.saturating_add(1);
             }
-            window.count > MAX_PUT_RECORDS_PER_WINDOW
+            let rate = match () {
+                () if window.count <= MAX_PUT_RECORDS_PER_WINDOW => PutRecordRate::Allowed,
+                () if window.count > PUT_RECORD_DISCONNECT_THRESHOLD => PutRecordRate::Flooding,
+                () if window.count > PUT_RECORD_PENALTY_THRESHOLD && !window.penalized => {
+                    window.penalized = true;
+                    PutRecordRate::Flooding
+                }
+                () => PutRecordRate::Shed,
+            };
+            self.metrics.record_put_record_rate_limited(&rate);
+            rate
         }
     }
 

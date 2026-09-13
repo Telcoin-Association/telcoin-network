@@ -150,9 +150,20 @@ pub struct LibP2pConfig {
     pub kad_record_ttl: Duration,
     /// How often this node republishes its own kademlia records.
     ///
-    /// Must be < `kad_record_ttl`, otherwise records expire before they are
-    /// refreshed.
+    /// Must be nonzero to give republication a positive cadence. Must also be <
+    /// `kad_record_ttl`, otherwise records expire before they are refreshed.
     pub kad_publication_interval: Duration,
+    /// How often this node replicates every stored record (its own and others') to the
+    /// `replication_factor` closest peers.
+    ///
+    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
+    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
+    /// so the value is a deliberate choice rather than an inherited libp2p default; the
+    /// default matches the libp2p default (1h).
+    ///
+    /// Exactly zero panics libp2p's replication job on the first swarm poll. Must also be <
+    /// `kad_record_ttl`, otherwise other publishers' records expire before they are re-replicated.
+    pub kad_replication_interval: Duration,
     /// The chain id, used to namespace every libp2p wire protocol and gossip
     /// topic so nodes on different chains never negotiate a connection or share
     /// a gossip mesh.
@@ -166,6 +177,39 @@ pub struct LibP2pConfig {
 }
 
 impl LibP2pConfig {
+    /// Reject kad cadences that would panic the network task or break record persistence.
+    ///
+    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
+    /// equal to the current time, triggering its unconditional assertion on the first swarm
+    /// poll. Publication and replication must also occur before records expire. Validate at
+    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
+    /// configuration error before either critical network task starts.
+    pub fn validate(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.kad_replication_interval.is_zero(),
+            "LibP2pConfig.kad_replication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_replication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_replication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are re-replicated",
+            self.kad_replication_interval,
+            self.kad_record_ttl,
+        );
+        eyre::ensure!(
+            !self.kad_publication_interval.is_zero(),
+            "LibP2pConfig.kad_publication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_publication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_publication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are refreshed",
+            self.kad_publication_interval,
+            self.kad_record_ttl,
+        );
+        Ok(())
+    }
+
     /// Return the primary gossip topic for `chain_id`.
     pub fn primary_topic(chain_id: u64) -> String {
         format!("tn-primary-{chain_id}")
@@ -200,6 +244,7 @@ impl Default for LibP2pConfig {
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            kad_replication_interval: Duration::from_secs(60 * 60),
             // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
             chain_id: 0,
         }
@@ -571,6 +616,10 @@ mod tests {
             parsed.libp2p_config.kad_publication_interval,
             default.libp2p_config.kad_publication_interval
         );
+        assert_eq!(
+            parsed.libp2p_config.kad_replication_interval,
+            default.libp2p_config.kad_replication_interval
+        );
         assert_eq!(parsed.peer_config.target_num_peers, default.peer_config.target_num_peers);
         assert_eq!(
             parsed.sync_config.max_skip_rounds_for_missing_certs,
@@ -629,6 +678,7 @@ hostname: "my-validator"
         // missing new fields fall back to defaults
         assert_eq!(parsed.libp2p_config.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.libp2p_config.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.libp2p_config.kad_replication_interval, default.kad_replication_interval);
 
         // entirely-missing sub-sections also default
         assert_eq!(parsed.peer_config.target_num_peers, PeerConfig::default().target_num_peers);
@@ -653,6 +703,10 @@ hostname: "my-validator"
             mapping.remove(&serde_yaml::Value::String("kad_publication_interval".into())).is_some(),
             "kad_publication_interval must be present in the default serialization"
         );
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_replication_interval".into())).is_some(),
+            "kad_replication_interval must be present in the default serialization"
+        );
         let legacy = serde_yaml::to_string(&value).expect("serialize stripped value");
 
         let parsed: LibP2pConfig =
@@ -660,8 +714,87 @@ hostname: "my-validator"
 
         assert_eq!(parsed.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.kad_replication_interval, default.kad_replication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    /// The shipped kad cadences must pass startup validation.
+    #[test]
+    fn default_libp2p_config_validates() -> eyre::Result<()> {
+        LibP2pConfig::default().validate()
+    }
+
+    /// Positive cadences strictly below the TTL remain valid at the upper boundary.
+    #[test]
+    fn libp2p_config_accepts_intervals_below_ttl() -> eyre::Result<()> {
+        LibP2pConfig {
+            kad_record_ttl: Duration::from_secs(2),
+            kad_replication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            kad_publication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding replication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_replication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_replication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_replication_interval")
+                    }),
+                    "replication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding publication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_publication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_publication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_publication_interval")
+                    }),
+                    "publication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// A zero record TTL cannot satisfy either positive cadence.
+    #[test]
+    fn libp2p_config_rejects_zero_record_ttl() {
+        let config = LibP2pConfig { kad_record_ttl: Duration::ZERO, ..Default::default() };
+        assert!(
+            config.validate().is_err_and(|error| error.to_string().contains("kad_record_ttl")),
+            "a zero record TTL must fail with an error naming the TTL",
+        );
+    }
+
+    /// Operator-provided zero durations deserialize but fail the startup cadence guard.
+    #[test]
+    fn libp2p_config_rejects_zero_intervals_from_yaml() -> eyre::Result<()> {
+        ["kad_replication_interval", "kad_publication_interval"].into_iter().try_for_each(|field| {
+            let yaml = format!("libp2p_config:\n  {field}: {{secs: 0, nanos: 0}}\n");
+            let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+            assert!(
+                parsed.libp2p_config().validate().is_err_and(|error| {
+                    error.to_string().contains(&format!("LibP2pConfig.{field}"))
+                }),
+                "a deserialized zero {field} must fail with a field-named error",
+            );
+            Ok(())
+        })
     }
 
     #[test]

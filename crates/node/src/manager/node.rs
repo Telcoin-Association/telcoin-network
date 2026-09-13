@@ -1115,6 +1115,10 @@ where
         // that actually performs the one-time install.
         network_config.peer_config().score_config.validate()?;
 
+        // Validate the operator-provided kad cadences before installing them into either swarm,
+        // so a zero replication interval fails here instead of panicking a critical network task.
+        network_config.libp2p_config().validate()?;
+
         //
         //=== PRIMARY
         //
