@@ -723,7 +723,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         config_2.network_config(),
         tx2,
         config_2.key_config().clone(),
-        config_2.key_config().worker_network_keypair().clone(),
+        config_2.key_config().worker_network_keypair(DEFAULT_WORKER_ID),
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
@@ -753,7 +753,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
     primary
         .add_explicit_peer(
             worker_bls,
-            config_2.key_config().worker_network_public_key(),
+            config_2.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
             worker_addr,
         )
         .await?;
@@ -853,7 +853,7 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
         config_2.network_config(),
         tx2,
         config_2.key_config().clone(),
-        config_2.key_config().worker_network_keypair().clone(),
+        config_2.key_config().worker_network_keypair(DEFAULT_WORKER_ID),
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
@@ -878,7 +878,7 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     primary
         .add_explicit_peer(
             worker_bls,
-            config_2.key_config().worker_network_public_key(),
+            config_2.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
             worker_addr,
         )
         .await?;
@@ -3485,6 +3485,100 @@ async fn test_startup_scrubs_legacy_and_corrupt_kad_records() -> eyre::Result<()
         "legacy record scrubbed as poisoned"
     );
 
+    Ok(())
+}
+
+/// Startup verifies only its worker namespace and preserves sibling records signed by the same key.
+#[tokio::test]
+async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()> {
+    use libp2p::kad;
+    use tn_config::KeyConfig;
+    use tn_storage::tables::KadWorkerRecords;
+
+    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let publisher_key_config =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let owner_bls = publisher_key_config.primary_public_key();
+    let key = kad::RecordKey::new(&owner_bls);
+    let network_config = NetworkConfig::default();
+    let chain_id = network_config.libp2p_config().chain_id;
+    let task_manager = TaskManager::default();
+    let db = MemDatabase::default();
+    let local_network_key = key_config.worker_network_keypair(0);
+    let worker_0_key = publisher_key_config.worker_network_keypair(0);
+    let worker_1_key = publisher_key_config.worker_network_keypair(1);
+    let worker_0_address = create_multiaddr(None);
+    let worker_0_record = NodeRecord::build(
+        RecordDomain::new(chain_id, NetworkType::Worker(0)),
+        worker_0_key.public().into(),
+        worker_0_address.clone(),
+        None,
+        |data| publisher_key_config.request_signature_direct(data),
+    );
+    let worker_1_record = NodeRecord::build(
+        RecordDomain::new(chain_id, NetworkType::Worker(1)),
+        worker_1_key.public().into(),
+        create_multiaddr(None),
+        None,
+        |data| publisher_key_config.request_signature_direct(data),
+    );
+    let mut store_0 = KadStore::new(
+        db.clone(),
+        local_network_key.public().into(),
+        &key_config,
+        NetworkType::Worker(0),
+    );
+    let mut store_1 = KadStore::new(
+        db.clone(),
+        key_config.worker_network_keypair(1).public().into(),
+        &key_config,
+        NetworkType::Worker(1),
+    );
+    store_0.put(kad::Record {
+        key: key.clone(),
+        value: encode(&worker_0_record),
+        publisher: None,
+        expires: None,
+    })?;
+    store_1.put(kad::Record {
+        key: key.clone(),
+        value: encode(&worker_1_record),
+        publisher: None,
+        expires: None,
+    })?;
+    let persisted = db.iter::<KadWorkerRecords>().collect::<Vec<_>>();
+    assert_eq!(persisted.len(), 2);
+
+    let (tx, _network_events) = mpsc::channel(10);
+    let network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        &network_config,
+        tx,
+        key_config.clone(),
+        local_network_key,
+        db.clone(),
+        task_manager.get_spawner(),
+        NetworkType::Worker(0),
+        worker_0_address,
+        None,
+    )?;
+    assert_eq!(db.iter::<KadWorkerRecords>().collect::<Vec<_>>(), persisted);
+    assert_eq!(
+        store_0.get(&key).map(|record| record.value.clone()),
+        Some(encode(&worker_0_record))
+    );
+    assert_eq!(
+        store_1.get(&key).map(|record| record.value.clone()),
+        Some(encode(&worker_1_record))
+    );
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).map(|(peer_id, _)| peer_id),
+        Some(worker_0_key.public().into()),
+    );
     Ok(())
 }
 

@@ -4,9 +4,10 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        try_admit_epoch_record, MissingCertificatesRequest, PrimaryNetwork, PrimaryNetworkHandle,
-        RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS,
-        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
+        PrimaryNetworkHandle, RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
+        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -969,11 +970,11 @@ async fn test_primary_batch_gossip_topics() {
 // ============================================================================
 // EpochVote Authorization-Before-Verify Tests (GHSA-j2g4-553f-875r)
 // ============================================================================
-// `epoch_vote_topic` is an open gossip topic, so a non-committee observer can publish an
-// `EpochVote` with arbitrary fields. The handler must authorize a vote (committee membership by
-// epoch number) *before* paying the expensive BLS pairing verify, must drop a vote for an
-// unknown epoch before the verify, and must not turn a bad vote into a `Fatal` penalty charged
-// to the honest relayer.
+// The handler cannot assume the network-layer publisher allowlist already screened the author -
+// the two checks live in different layers, and the application layer must not rely on the
+// network layer having run. It must authorize a vote (committee membership by epoch number)
+// *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
+// the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
 
 /// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
 fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
@@ -2200,6 +2201,30 @@ fn test_epoch_record_admission_enforces_global_cap() {
         try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
         "dropping in-flight serves must free global concurrency"
     );
+}
+
+/// The shed budget admits exactly [`MAX_CONCURRENT_SHED_TASKS`] concurrent shed
+/// tasks, denies the next, and frees a slot when a shed permit drops (#1308).
+/// Before the fix, `process_inbound_sync_stream` spawned a task per denied
+/// stream, so the cost of refusing work scaled with the arrival rate of refused
+/// work rather than with the cap.
+#[test]
+fn test_shed_admit_enforces_budget_and_frees_on_drop() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+
+    // fill the shed budget
+    let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
+        .map(|_| try_admit_shed(&semaphore).expect("admit below the shed budget"))
+        .collect();
+    assert_eq!(semaphore.available_permits(), 0);
+
+    // at the budget: the next shed spawn is refused (stream dropped, no task)
+    assert!(try_admit_shed(&semaphore).is_none());
+
+    // dropping a shed permit frees its slot for the next denied stream
+    drop(permits);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
+    assert!(try_admit_shed(&semaphore).is_some());
 }
 
 // ============================================================================
