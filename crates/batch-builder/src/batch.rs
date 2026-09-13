@@ -91,17 +91,48 @@ pub fn build_batch<P: TxPool>(
         // NOTE: `ValidPoolTransaction::size()` is private
         let tx = pool_tx.to_consensus();
 
-        // ignore any transaction type outside the executable allowlist (EIP-4844
-        // blobs and EIP-7702 today): the batch validator rejects such batches, so
-        // packing one would cost this node a peer penalty on every vote request
-        if !tn_types::batch_allowlisted_tx_type(&tx) {
+        // ignore any transaction type outside the executable allowlist (the
+        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702), and the
+        // symmetric bound: an EIP-7702 transaction whose authorization list
+        // falls outside 1..=max_tx_authorizations(epoch). The batch validator
+        // rejects a batch carrying either with a Medium peer penalty, so
+        // packing one would cost this node reputation on every vote request.
+        // The 4844 arm discards blob transactions; the else arm handles the
+        // out-of-bounds authorization list and is default-deny for any future
+        // decodable type outside the allowlist (no such type exists today).
+        // Both feed `remove_unsupported_txs` below so the transaction and its
+        // descendants leave the pool
+        //
+        // Reachability: the authorization-list half cannot fire in production.
+        // `max_tx_authorizations` is derived from `max_batch_gas`
+        // ((max_batch_gas - 21_000) / 25_000), so for any N >= cap + 1 the
+        // intrinsic cost 21_000 + 25_000 * N exceeds `max_batch_gas` as an
+        // algebraic identity — the gas-capacity check at the top of this loop
+        // therefore always diverts an over-cap 7702 transaction that declares
+        // executable gas, and that masking survives any future fork that moves
+        // `max_batch_gas` (note the gas arm only skips: it marks the sender
+        // invalid for this iterator and mutates no pool state, so such a
+        // transaction is passed over rather than evicted). One that instead
+        // under-declares its gas never reaches the pool at all: reth's
+        // `ensure_intrinsic_gas`, reth's `ExceedsGasLimit` against TN's
+        // permanently-30,000,000 block gas limit, and `TnPoolValidator::screen`
+        // each reject it at admission. The branch is kept as defense in depth —
+        // it mirrors the batch validator's twin, which IS reachable on
+        // untrusted peer batches — and is exercised on a synthetic pool by
+        // `over_cap_7702_tx_is_skipped_by_the_list_predicate` below. Do not
+        // reorder it above the gas check to "unmask" it: the gas arm is the
+        // cheaper rejection and the correct one for a transaction that cannot
+        // fit the batch at all.
+        if !tn_types::batch_allowlisted_tx_type(&tx)
+            || !tn_types::batch_allowlisted_authorization_list(&*tx, epoch)
+        {
             if tx.is_eip4844() {
                 best_txs.ignore_eip4844(&pool_tx);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
                 blob_transactions.push(*tx.hash());
             } else {
-                best_txs.ignore_eip7702(&pool_tx);
-                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted tx type invalid");
+                best_txs.ignore_denylist_type(&pool_tx);
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted or out-of-bounds 7702 tx invalid");
                 unsupported_transactions.push(*tx.hash());
             }
             continue;
@@ -344,6 +375,58 @@ mod tests {
             "the producer packed {encoded_total} encoded bytes, over the {} limit the validator \
              enforces on the same measurement",
             max_batch_size(EPOCH),
+        );
+    }
+
+    /// A type-0x04 transaction whose authorization list exceeds
+    /// `max_tx_authorizations(epoch)` must never be packed: the batch validator
+    /// rejects a batch carrying one with a Medium peer penalty. The builder must
+    /// skip it and route it to `remove_unsupported_txs`.
+    ///
+    /// This pins the predicate wiring on a synthetic pool state, not a production
+    /// sequence. `TestPool::new` only decodes and recovers — no validator, no
+    /// intrinsic-gas gate, no `TnPoolValidator::screen` — so it can hold a
+    /// transaction no real pool admits: `cap + 1` tuples declaring
+    /// `gas_limit = 1_000_000` against an intrinsic cost of 30,021,000, an
+    /// under-declaration of 29,021,000. Declaring honest gas instead would trip the
+    /// gas-capacity arm before this predicate runs (see the reachability note in
+    /// `build_batch`), so the branch cannot be reached from a genuine pool state at
+    /// all — which is exactly why it is worth pinning here.
+    #[test]
+    fn over_cap_7702_tx_is_skipped_by_the_list_predicate() {
+        let genesis = test_genesis();
+        let chain_id = genesis.config.chain_id;
+        let mut tx_factory = TransactionFactory::new();
+
+        // one tuple past the cap, dummy tuples; the declared gas limit stays under
+        // max_batch_gas(0) so the gas-capacity arm cannot mask the list check (it
+        // also under-declares the transaction's own intrinsic gas, which only a
+        // validator-free TestPool would ever hold)
+        let cap = usize::try_from(tn_types::max_tx_authorizations(0)).expect("cap fits usize");
+        let over_cap = tx_factory.create_eip7702_with_authorizations(
+            chain_id,
+            1_000_000,
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            cap + 1,
+            Bytes::new(),
+        );
+        let hash = *over_cap.hash();
+
+        let pool = TestPool::new(&[over_cap.encoded_2718()]);
+        let removed = pool.removed_unsupported_handle();
+
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
+        let BatchBuilderOutput { batch, mined_transactions, .. } =
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        // never packed
+        assert!(batch.transactions.is_empty(), "over-cap 7702 tx must not be packed");
+        assert!(mined_transactions.is_empty(), "over-cap 7702 tx must not be mined");
+        // evicted from the pool through remove_unsupported_txs
+        assert_eq!(
+            removed.lock().expect("removed lock").as_slice(),
+            &[hash],
+            "over-cap 7702 tx must leave the pool"
         );
     }
 }

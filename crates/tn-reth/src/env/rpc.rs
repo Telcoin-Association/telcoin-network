@@ -31,22 +31,19 @@ use reth::rpc::{
     builder::{config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle},
     eth::{EthApi, EthApiBuilder},
 };
-use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_types::{gas_accumulator::WorkerBaseFee, WorkerId};
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    evm::TnEvmConfig,
     rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
     rpc_gas_price::{EpochGasPriceServer as _, GasPriceWithEpochBaseFee},
-    traits::{TNExecution, TelcoinNode},
+    traits::TNExecution,
     worker::WorkerNetwork,
-    RethEnv, RpcServer, WorkerTxPool,
+    RethEnv, RpcServer, TnEthTransactionPool, WorkerTxPool,
 };
 
 /// Port distance between per-worker RPC endpoint bands.
@@ -251,11 +248,7 @@ impl RethEnv {
         base_fee: WorkerBaseFee,
         other: impl Into<Methods>,
     ) -> eyre::Result<RpcServer> {
-        let transaction_pool: EthTransactionPool<
-            BlockchainProvider<TelcoinNode>,
-            DiskFileBlobStore,
-            TnEvmConfig,
-        > = transaction_pool.into();
+        let transaction_pool: TnEthTransactionPool = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())
