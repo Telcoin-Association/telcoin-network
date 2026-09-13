@@ -87,6 +87,17 @@ impl BatchValidation for BatchValidator {
 
         // validate base fee- all batches for a worker and epoch have the same base fee.
         self.validate_basefee(batch.base_fee_per_gas)?;
+
+        // Recover authorities only after the list, intrinsic gas and aggregate gas bounds.
+        // A tuple that recovers to an account other than the outer signer (a foreign
+        // tuple) can install a delegate on that account from a different worker pool
+        // and skip its nonce-contiguous sequence without fees (issue #1334).
+        decoded_txs
+            .iter()
+            .find(|tx| !tn_types::batch_allowlisted_signed_authorities(*tx))
+            .map_or(Ok(()), |tx| {
+                Err(BatchValidationError::NonSelfAuthorization { hash: *tx.hash() })
+            })?;
         Ok(())
     }
 
@@ -769,9 +780,11 @@ mod tests {
 
     /// A well-formed EIP-7702 transaction passes batch validation: the type
     /// allowlist admits `0x04`, and validation is structural (decode, signer
-    /// recovery, size/gas/base-fee) — authorization-tuple contents are an
-    /// execution concern, not a validation concern. The single-tuple list also
-    /// proves the admit direction of the authorization-list length check.
+    /// recovery, size/gas/base-fee, tuple authority recovery). Validation
+    /// checks that every recoverable tuple authority equals the outer signer;
+    /// tuple chain id and nonce validity stay an execution concern. The
+    /// single-tuple list also proves the admit direction of the
+    /// authorization-list length check and of the self-authorization check.
     #[tokio::test]
     async fn test_valid_tx_eip7702() {
         let tmp_dir = TempDir::new().unwrap();
@@ -793,10 +806,12 @@ mod tests {
 
     /// A batch carrying an EIP-7702 transaction whose authorization list
     /// exceeds `max_tx_authorizations` is rejected with
-    /// `InvalidAuthorizationList`. The tuples are dummy-signed with a
-    /// mismatched chain id: batch validation never verifies tuple signatures,
-    /// only the list length, so the check must fire regardless of tuple
-    /// validity.
+    /// `InvalidAuthorizationList`. The padding helper
+    /// (`create_eip7702_with_authorizations`) signs every tuple with the
+    /// factory's own key and only mismatches the chain id. Batch validation
+    /// recovers tuple authorities, but the length check runs first, so the
+    /// check must fire before any authority recovery. Tuple chain id and
+    /// nonce validity stay an execution concern.
     #[tokio::test]
     async fn test_invalid_batch_over_cap_authorization_list() {
         let tmp_dir = TempDir::new().unwrap();
