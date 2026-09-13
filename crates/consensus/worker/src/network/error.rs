@@ -89,6 +89,7 @@ impl WorkerNetworkError {
                     | BatchValidationError::InvalidTx4844(_)
                     | BatchValidationError::UnsupportedTxType { .. }
                     | BatchValidationError::InvalidAuthorizationList { .. }
+                    | BatchValidationError::NonSelfAuthorization { .. }
                     | BatchValidationError::IntrinsicGasTooLow { .. } => Some(Penalty::Medium),
                     // severe
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),

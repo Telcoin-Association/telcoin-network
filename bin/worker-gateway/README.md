@@ -223,15 +223,12 @@ body is rejected with a JSON-RPC "request too large" error before forwarding.
 
 ### Transaction screening
 
-A single `eth_sendRawTransaction` call is decoded far enough to reject, at the
-edge, the three cases the worker would also reject — an undecodable payload, a
-transaction type off the executable allowlist (legacy, EIP-2930, EIP-1559 and
-EIP-7702 are accepted; an EIP-4844 blob transaction is not), and an EIP-7702
-transaction whose authorization list is empty or longer than the network's cap
-— saving a wasted upstream round-trip. The decode uses the same pooled wire
-format the worker's RPC accepts and never recovers the signer, so it cannot
-reject a transaction the worker would accept. Batches (JSON arrays) and every
-other method are forwarded unchanged and validated by the worker.
+A single `eth_sendRawTransaction` call is checked for malformed encoding, unsupported
+transaction types, empty or excessive EIP-7702 authorization lists, and foreign
+authorizations. The gateway bounds the list before recovering its authorities. Every
+recoverable authority must be the outer sender, matching the worker pool and peer
+validator. Self-installation and later sponsored calls to delegated accounts are supported.
+JSON array batches and other methods are forwarded for validation by the worker.
 
 ## Gateway endpoints
 
@@ -258,6 +255,7 @@ echoed when it can be recovered.
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | EIP-7702 authorization list empty or over the cap | `400` | `-32009` |
+| EIP-7702 authorization belongs to another sender | `400` | `-32010` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
 
 The gateway's own codes sit in the JSON-RPC server-error range

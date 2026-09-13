@@ -13,9 +13,38 @@ TN supports these transaction types:
 
 All Ethereum hardfork rules through Prague/Pectra are active.
 
-Set-code transactions carry two extra admission rules. The authorization list must hold between 1 and 1,199 tuples: an empty list is invalid under EIP-7702 itself, and 1,200 tuples owe `21,000 + 25,000 * 1,200 = 30,021,000` in intrinsic gas, more than a batch's 30,000,000 gas limit. Separately, every transaction in a batch must declare `gas_limit >= 21,000 + 25,000 * N` for its `N` tuples, which holds a whole batch to the same 1,199 tuples one transaction may carry. Neither rule can reject a transaction that could otherwise have executed. See [gas-penalty](gas-penalty.md) for the error a sender gets when either fires.
+Set-code transactions carry three extra admission rules; the third, self-installation, is described in [EIP-7702 self-installation](#eip-7702-self-installation) below. The authorization list must hold between 1 and 1,199 tuples: an empty list is invalid under EIP-7702 itself, and 1,200 tuples owe `21,000 + 25,000 * 1,200 = 30,021,000` in intrinsic gas, more than a batch's 30,000,000 gas limit. Separately, every transaction in a batch must declare `gas_limit >= 21,000 + 25,000 * N` for its `N` tuples, which holds a whole batch to the same 1,199 tuples one transaction may carry. Neither rule can reject a transaction that could otherwise have executed. See [gas-penalty](gas-penalty.md) for the error a sender gets when either fires.
 
 The sections below cover the areas where TN diverges from mainnet Ethereum behavior.
+
+### EIP-7702 self-installation
+
+Every recoverable authorization in a set-code transaction must be signed by that transaction's
+outer sender. Alice can install, replace, or revoke her own delegation. Bob cannot install Alice's
+delegation in his transaction, including when Alice signed the authorization herself. After Alice's
+installation executes, Bob can sponsor an ordinary transaction that calls Alice's delegated account.
+The delegate remains responsible for authenticating the call and enforcing spending permissions.
+
+This policy addresses [cross-pool authorization invalidation (#1334)](https://github.com/Telcoin-Association/telcoin-network/issues/1334).
+Independent worker pools do not share Reth's pending-authority reservations. Without this rule,
+Bob could install a sweep delegate on an initially undelegated Alice while another pool had already
+admitted Alice's funded transaction sequence. Executing Bob first would invalidate that sequence.
+The gateway, pool, batch builder, and peer validator enforce the same self-installation rule, so it
+does not depend on routing, arrival order, worker ID, or knowledge of another pool's contents.
+
+Recoverable foreign authorizations are rejected even if their chain ID or nonce would currently
+prevent execution. Unrecoverable tuples remain inert and pay their intrinsic gas, as in EIP-7702.
+The existing list-length, intrinsic-gas, and gas-penalty rules still apply. The gateway returns
+`-32010` with reason `non_self_authorization` for a foreign authorization.
+
+This is a restriction on authorization installation, not a guarantee that every certified
+transaction remains executable. Competing transactions from the same signer and calls to accounts
+that were already delegated can still invalidate pending transactions. Reth's delegated-account
+pool limits remain in effect, and execution retains its deterministic invalid-transaction skip
+behavior. Atomic installation sponsored by another account requires a future protocol decision.
+
+Deploy this policy to every validator together with the EIP-7702 gas-penalty changes before
+admitting type `0x04`. A mixed fleet disagrees on which batches may be certified.
 
 ### Custom Precompiles
 
@@ -212,7 +241,7 @@ commit). Contracts that need unbiasable randomness must not rely on `PREVRANDAO`
 | -------------------- | ------------------------------------ | ----------------------------- |
 | EVM opcodes          | Standard                             | Standard (identical)          |
 | Gas costs            | Standard                             | Standard (identical)          |
-| Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702 | Legacy, EIP-2930, EIP-1559, EIP-7702 (1-1,199 authorizations) |
+| Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702 | Legacy, EIP-2930, EIP-1559, EIP-7702 (1-1,199 self-authorizations) |
 | Native asset ERC-20  | Requires WETH wrapper                | Requires WTEL wrapper         |
 | Custom precompiles   | None                                 | TEL issuance at `0x7e1`, BLS verify at `0xb151` (both report `0xfe` code) |
 | Base fee destination | Burned                               | Base-fee address (governance) |

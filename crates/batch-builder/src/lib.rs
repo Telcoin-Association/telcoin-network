@@ -32,6 +32,8 @@ use tokio::{
 };
 use tracing::{debug, error, field, info, info_span, warn, Instrument};
 
+#[cfg(test)]
+mod authorization_tests;
 mod batch;
 mod error;
 mod metrics;
