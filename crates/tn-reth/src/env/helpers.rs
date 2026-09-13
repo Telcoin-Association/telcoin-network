@@ -596,20 +596,34 @@ impl CanonicalExecutionReader for RethEnv {
     /// whether `number` is *durably* canonical, so an in-memory-tip-aware read would defeat the
     /// question by reporting speculatively executed blocks as confirmed.
     fn canonical_execution_hash(&self, number: BlockNumber) -> Option<B256> {
-        // A read error (e.g. a transient provider/DB error) is treated as "not confirmed" rather
-        // than as a canonical match, so the caller keeps its conservative fork handling.
-        self.sealed_header_by_number(number)
-            .inspect_err(|error| {
-                tracing::debug!(
-                    target: "tn::reth",
-                    ?error,
-                    number,
-                    "canonical_execution_hash: canonical DB read failed; treating as unconfirmed"
-                );
-            })
-            .ok()
-            .flatten()
-            .map(|header| header.hash())
+        // A snapshot-restored datadir scaffolds the whole region below its restored-state floor
+        // `B`: zero-hash dummy headers below the window and real-hashed but stateless window
+        // headers within it. None of these are blocks this node executed, so confirming one as
+        // canonical would let a peer's header that references a scaffold height clear the
+        // execution-result check — a zero-hash dummy reads back as its own `B256::ZERO` hash and
+        // matches a poison `latest_execution_block`. The region below the floor is refused here,
+        // mirroring `read_only_state_db`'s floor guard, so the DB fallback can never attest it.
+        self.inner.restored_state_floor.filter(|floor| number < *floor).map_or_else(
+            // not below the floor (or a normally-synced node): answer from the canonical DB.
+            // A read error (e.g. a transient provider/DB error) is treated as "not confirmed"
+            // rather than as a canonical match, so the caller keeps its conservative fork handling.
+            || {
+                self.sealed_header_by_number(number)
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            target: "tn::reth",
+                            ?error,
+                            number,
+                            "canonical_execution_hash: canonical DB read failed; treating as unconfirmed"
+                        );
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|header| header.hash())
+            },
+            // below the restored-state floor: the scaffold region, never attested as canonical.
+            |_floor| None,
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 //! Worker network implementation.
 
+use crate::metrics::{SyncShedReason, WorkerMetrics};
 use futures::{AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
@@ -143,6 +144,24 @@ fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     semaphore.clone().try_acquire_owned().ok()
 }
 
+/// Reserve a shed slot and record the refusal that follows from the outcome.
+///
+/// A reserved slot means the stream gets a deny task, so it counts as
+/// [`SyncShedReason::Denied`]. No slot means the stream is dropped with no reply,
+/// so it counts as [`SyncShedReason::BudgetExhausted`]. Recording here, at the
+/// decision, keeps the count exact when the best-effort deny write later fails
+/// or the task never runs (#1307).
+fn admit_shed_and_record(
+    semaphore: &Arc<Semaphore>,
+    metrics: &WorkerMetrics,
+) -> Option<OwnedSemaphorePermit> {
+    let permit = try_admit_shed(semaphore);
+    let reason =
+        permit.as_ref().map_or(SyncShedReason::BudgetExhausted, |_| SyncShedReason::Denied);
+    metrics.record_sync_stream_shed(reason);
+    permit
+}
+
 /// Shed a denied inbound sync stream on a budgeted task.
 ///
 /// Spawns a short-lived task that writes [`DenyReason::AtCapacity`] and closes,
@@ -154,11 +173,16 @@ fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
 /// deny write is bounded by [`SYNC_REQUEST_READ_TIMEOUT`], so a peer that never
 /// reads returns the slot at the timeout.
 ///
+/// Both arms record `tn_worker.sync_streams_shed_total` by [`SyncShedReason`]
+/// at the admission decision through [`admit_shed_and_record`] (#1307),
+/// before the best-effort deny task runs or its write can fail.
+///
 /// Generic over the stream, in the style of `send_sync_batches_over_stream`, so
 /// unit tests drive the full shed path with in-memory writers and a paused
 /// clock (#1314).
 fn shed_sync_stream<S>(
     shed_semaphore: &Arc<Semaphore>,
+    metrics: &WorkerMetrics,
     spawner: &TaskSpawner,
     epoch: Epoch,
     peer: BlsPublicKey,
@@ -166,7 +190,7 @@ fn shed_sync_stream<S>(
 ) where
     S: AsyncWrite + Unpin + Send + 'static,
 {
-    try_admit_shed(shed_semaphore).map_or_else(
+    admit_shed_and_record(shed_semaphore, metrics).map_or_else(
         || {
             debug!(target: "worker::network", %peer, "dropping inbound sync stream: shed budget exhausted");
         },
@@ -225,6 +249,12 @@ pub struct WorkerNetwork<DB, Events> {
     /// `Deny(AtCapacity)` write), so [`MAX_CONCURRENT_SHED_TASKS`] caps the
     /// spawn fan-out from over-cap substream bursts.
     shed_task_semaphore: Arc<Semaphore>,
+    /// Prometheus metrics for the inbound sync stream admission path.
+    ///
+    /// Built from the worker id, like the [`RequestHandler`]'s instance: the registry
+    /// keys a series by name and labels, so both record into the same per-worker
+    /// series and no handle is threaded through [`Self::new`].
+    metrics: WorkerMetrics,
     /// Access to the consensus chain.
     consensus_chain: ConsensusChain,
 }
@@ -252,6 +282,7 @@ where
             batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
             sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
+            metrics: WorkerMetrics::new_for_worker(id),
             consensus_chain,
         }
     }
@@ -499,6 +530,7 @@ where
     fn shed_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
         shed_sync_stream(
             &self.shed_task_semaphore,
+            &self.metrics,
             self.network_handle.get_task_spawner(),
             self.network_handle.epoch(),
             peer,
@@ -510,6 +542,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::{
         pin::Pin,
         task::{Context, Poll},
@@ -576,6 +609,48 @@ mod tests {
         assert!(try_admit_shed(&semaphore).is_some());
     }
 
+    // Both shed arms record their own reason: every budgeted slot counts as
+    // `denied`, and the refusal past the budget counts as `budget_exhausted`.
+    // The full shed path records before any spawned task can run. Bypassing
+    // the recording helper or swapping its reasons fails this test.
+    #[tokio::test(start_paused = true)]
+    async fn shed_admit_records_reason_per_arm() {
+        let task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+            let metrics = WorkerMetrics::new_for_worker(0);
+            (0..MAX_CONCURRENT_SHED_TASKS).for_each(|_| {
+                shed_sync_stream(&semaphore, &metrics, &spawner, 0, peer(), PendingWriter);
+            });
+            assert_eq!(semaphore.available_permits(), 0, "every budgeted slot admits");
+            shed_sync_stream(&semaphore, &metrics, &spawner, 0, peer(), PendingWriter);
+            assert_eq!(semaphore.available_permits(), 0, "the request past the budget is refused");
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counted = |reason: &str, expected: usize| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == "tn_worker.sync_streams_shed_total"
+                    && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
+                    && matches!(
+                        value,
+                        DebugValue::Counter(n) if usize::try_from(*n).ok() == Some(expected)
+                    )
+            })
+        };
+        assert!(
+            counted("denied", MAX_CONCURRENT_SHED_TASKS),
+            "every budgeted slot records `denied`"
+        );
+        assert!(
+            counted("budget_exhausted", 1),
+            "the refusal past the budget records `budget_exhausted`"
+        );
+    }
+
     // A writer whose polls never complete, modeling a peer that applies receive
     // backpressure and never reads its deny reply. `poll_close` pends too, so
     // only the SYNC_REQUEST_READ_TIMEOUT bound can end a shed task.
@@ -609,10 +684,12 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
+        let metrics = WorkerMetrics::new_for_worker(0);
 
         // fill the budget: every denied stream below the cap spawns a shed task
-        (0..MAX_CONCURRENT_SHED_TASKS)
-            .for_each(|_| shed_sync_stream(&semaphore, &spawner, 0, peer(), PendingWriter));
+        (0..MAX_CONCURRENT_SHED_TASKS).for_each(|_| {
+            shed_sync_stream(&semaphore, &metrics, &spawner, 0, peer(), PendingWriter)
+        });
         // let each task start and block on the pending deny write, inside the
         // SYNC_REQUEST_READ_TIMEOUT bound. The permit is taken at admit time
         // (before the spawn); the timeout step below proves the running task is
@@ -625,7 +702,7 @@ mod tests {
         );
 
         // over budget: no spawn, no negative accounting
-        shed_sync_stream(&semaphore, &spawner, 0, peer(), PendingWriter);
+        shed_sync_stream(&semaphore, &metrics, &spawner, 0, peer(), PendingWriter);
         tokio::task::yield_now().await;
         assert_eq!(semaphore.available_permits(), 0);
 
@@ -670,10 +747,11 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
+        let metrics = WorkerMetrics::new_for_worker(0);
         let writer = CapturingWriter::default();
         let bytes = writer.bytes.clone();
 
-        shed_sync_stream(&semaphore, &spawner, 0, peer(), writer);
+        shed_sync_stream(&semaphore, &metrics, &spawner, 0, peer(), writer);
         tokio::task::yield_now().await;
 
         // the task completed with no clock advance: the slot is already back
