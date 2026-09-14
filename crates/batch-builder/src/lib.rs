@@ -214,7 +214,17 @@ impl BatchBuilder {
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred } =
-                batch::spawn_batch_build(build_args, worker_id, base_fee).await?;
+                match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
+                    Ok(output) => output,
+                    Err(e) => {
+                        error!(target: "worker::batch_builder", ?e, "blocking batch build failed");
+                        // Surface the join error to the run loop. A dropped sender is misreported
+                        // as `AckChannelClosed`, and the task manager discards a non-critical
+                        // task's `Err` without logging it.
+                        let _ = result.send(Err(BatchBuilderError::BlockingTask(e)));
+                        return Ok(());
+                    }
+                };
 
             // report the transactions this build left to an in-flight peer batch (issue #1329)
             metrics
