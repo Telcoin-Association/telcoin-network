@@ -301,20 +301,73 @@ impl PeerBatchWindow {
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics::{Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+    use metrics_util::{
+        debugging::DebugValue,
+        registry::{AtomicStorage, Registry},
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Preserve cumulative values across reads; `DebuggingRecorder` clears each snapshot.
+    struct TelemetryRecorder {
+        registry: Registry<Key, AtomicStorage>,
+    }
+
+    impl TelemetryRecorder {
+        /// Create an isolated registry for the current test.
+        fn new() -> Self {
+            Self { registry: Registry::atomic() }
+        }
+
+        /// Observe the recorded values without resetting the handles held by live windows.
+        fn snapshot(&self) -> Vec<(Key, DebugValue)> {
+            let counters = self
+                .registry
+                .get_counter_handles()
+                .into_iter()
+                .map(|(key, value)| (key, DebugValue::Counter(value.load(Ordering::SeqCst))));
+            let gauges = self.registry.get_gauge_handles().into_iter().map(|(key, value)| {
+                (key, DebugValue::Gauge(f64::from_bits(value.load(Ordering::SeqCst)).into()))
+            });
+            counters.chain(gauges).collect()
+        }
+    }
+
+    impl Recorder for TelemetryRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            self.registry.get_or_create_counter(key, |counter| Counter::from_arc(counter.clone()))
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            self.registry.get_or_create_gauge(key, |gauge| Gauge::from_arc(gauge.clone()))
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
 
     /// Observe capacity loss without counting remembered or immune hashes as dropped insertions.
     #[test]
     fn telemetry_distinguishes_capacity_loss_from_repeated_hashes() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let recorder = TelemetryRecorder::new();
         let sample = |name: &str| {
-            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
-                (key.key().name() == name
-                    && key
-                        .key()
-                        .labels()
-                        .any(|label| label.key() == "worker" && label.value() == "7"))
+            recorder.snapshot().into_iter().find_map(|(key, value)| {
+                (key.name() == name
+                    && key.labels().any(|label| label.key() == "worker" && label.value() == "7"))
                 .then_some(value)
             })
         };
@@ -356,15 +409,11 @@ mod metrics_tests {
     /// Clones, repeated registration, and overlapping epoch windows do not overwrite occupancy.
     #[test]
     fn telemetry_tracks_window_lifetimes_and_worker_labels() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let recorder = TelemetryRecorder::new();
         let occupancy = |worker: &str| {
-            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
-                (key.key().name() == "tn_peer_batch.retained_hashes"
-                    && key
-                        .key()
-                        .labels()
-                        .any(|label| label.key() == "worker" && label.value() == worker))
+            recorder.snapshot().into_iter().find_map(|(key, value)| {
+                (key.name() == "tn_peer_batch.retained_hashes"
+                    && key.labels().any(|label| label.key() == "worker" && label.value() == worker))
                 .then_some(value)
             })
         };
