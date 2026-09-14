@@ -42,6 +42,8 @@ pub mod pack_validate;
 /// The `redb`-backed database implementation (the default persistent consensus store).
 pub mod redb;
 
+pub mod tndb;
+
 pub use tn_types::error::StoreError;
 
 use crate::composite_db::CompositeDatabase;
