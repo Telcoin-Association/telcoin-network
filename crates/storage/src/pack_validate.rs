@@ -507,6 +507,15 @@ pub fn classify_physical_corruption(
                     // record 0 is the epoch meta
                     (true, false) => CorruptionKind::TornMetaEmpty,
                     (true, true) => CorruptionKind::CorruptMetaWithData,
+                    // This verdict is intentionally `attested_end`-agnostic: it cannot see the
+                    // index-synced durable watermark `recover_pack` uses, so an *unacked*
+                    // out-of-order mmap writeback (a torn tail above the acked
+                    // data with a decodable record after the gap) is
+                    // conservatively reported as `MidLogCorruption` even though
+                    // `recover_pack` would safely truncate it. That is the safe direction, never
+                    // the reverse — `repair_epoch`'s apply path re-runs
+                    // `recover_pack` (the authority) for the truncatable
+                    // verdicts, so real below-acked corruption is still caught.
                     (false, true) => CorruptionKind::MidLogCorruption,
                     (false, false) => CorruptionKind::TornTrailingTail,
                 };

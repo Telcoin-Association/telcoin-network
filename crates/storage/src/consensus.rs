@@ -968,7 +968,10 @@ impl ConsensusChain {
                 }
             };
         }
-        if let Ok(pack) = self.get_static(epoch).await {
+        // A present-but-corrupt sealed pack must surface as `Err`, not be masked as a miss; only a
+        // genuinely absent epoch (`Ok(None)`) falls through to staging. Mirrors
+        // `consensus_header_by_digest`.
+        if let Some(pack) = self.get_static_if_present(epoch).await? {
             Ok(Some(pack.consensus_header_by_number(number).await?))
         } else if let Some(staging) = self.staging() {
             // Don't expose any staging errors.
@@ -1007,7 +1010,10 @@ impl ConsensusChain {
                 }
             };
         }
-        if let Ok(pack) = self.get_static(epoch).await {
+        // A present-but-corrupt sealed pack must surface as `Err`, not be masked as a miss; only a
+        // genuinely absent epoch (`Ok(None)`) falls through to staging. Mirrors
+        // `consensus_header_by_digest`.
+        if let Some(pack) = self.get_static_if_present(epoch).await? {
             Ok(Some(pack.get_consensus_output(number).await?))
         } else if let Some(staging) = self.staging() {
             // Note we don't want to expose staging errors, we either find the record or we don't at
@@ -1125,7 +1131,10 @@ impl ConsensusChain {
                 }
             };
         }
-        if let Ok(pack) = self.get_static(epoch).await {
+        // A present-but-corrupt sealed pack must surface as `Err`, not be masked as a miss; only a
+        // genuinely absent epoch (`Ok(None)`) falls through to staging. Mirrors
+        // `consensus_header_by_digest`.
+        if let Some(pack) = self.get_static_if_present(epoch).await? {
             Ok(Some(pack.get_consensus_output_bytes(number).await?))
         } else if let Some(staging) = self.staging() {
             if epoch == staging.pack.epoch() {
@@ -1386,15 +1395,24 @@ impl ConsensusChain {
         // must not be held across `close()` (same rule as the eviction block above), and the
         // redundant pack's `close()` must not run under the cache lock. Unlikely to trigger but
         // possible.
-        let existing = {
+        let (existing, evicted) = {
             let mut recents = self.recent_packs.lock();
             if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
-                Some(p.clone())
+                (Some(p.clone()), None)
             } else {
+                // Re-check the cap here too: two concurrent opens of distinct uncached epochs can
+                // each clear the eviction block above and then both push, overshooting
+                // PACK_CACHE_SIZE. Evict the oldest again if needed (closed outside the lock
+                // below).
+                let evicted =
+                    if recents.len() >= Self::PACK_CACHE_SIZE { recents.pop_front() } else { None };
                 recents.push_back(pack.clone());
-                None
+                (None, evicted)
             }
         };
+        if let Some(old) = evicted {
+            old.close().await; // close the re-evicted pack outside the lock
+        }
         if let Some(p) = existing {
             pack.close().await; // close the redundant open outside the lock
             Ok(p)

@@ -431,9 +431,11 @@ impl ConsensusPack {
                 }
                 CorruptionKind::MidLogCorruption => {
                     return Ok(EpochRepair::Unrepairable(format!(
-                        "epoch {epoch}: mid-log corruption at offset {} with valid records past it; \
-                         durably-committed data is damaged and cannot be recovered by truncation. \
-                         Re-sync the epoch from peers.",
+                        "epoch {epoch}: mid-log corruption at offset {} with valid records past it. \
+                         If this data was durably committed it cannot be recovered by truncation — \
+                         re-sync the epoch from peers. (Classification is conservative: for the \
+                         current/most-recent epoch an unacked partial write can look the same, and a \
+                         normal node restart runs full recovery, which may heal it.)",
                         c.offset
                     )));
                 }
@@ -449,8 +451,12 @@ impl ConsensusPack {
         // best-effort classifier missed, this surfaces as an error -> Unrepairable.
         match Self::open_append_exists(epochs_dir, epoch) {
             Ok(pack) => {
-                pack.persist().await?;
-                // Async-close (sole handle) so the background-thread join does not block a worker.
+                // Async-close (sole handle) so the background-thread join does not block a worker
+                // on either the success or the persist-error path (never `?`-drop the sole handle).
+                if let Err(e) = pack.persist().await {
+                    pack.close().await;
+                    return Err(e);
+                }
                 pack.close().await;
             }
             Err(e) => {
@@ -460,8 +466,10 @@ impl ConsensusPack {
                 )));
             }
         }
-        // Confirm the repaired pack now opens read-only cleanly.
-        Self::open_static(epochs_dir, epoch).map(drop)?;
+        // Confirm the repaired pack now opens read-only cleanly, then async-close the sole handle
+        // so the background-thread join does not block a worker (matching the healthy-check
+        // above).
+        Self::open_static(epochs_dir, epoch)?.close().await;
         Ok(EpochRepair::Repaired(plan))
     }
 

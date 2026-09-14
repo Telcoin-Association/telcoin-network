@@ -892,6 +892,17 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Write the bloom filter to its fixed region (immediately after the header). Split out from
     /// the header write so [`Self::ordered_sync`] can make the bloom durable *before*
     /// publishing the header, which carries the `data_file_length` commit marker.
+    ///
+    /// NOTE (residual integrity gap): unlike each hash bucket, the bloom region carries no
+    /// CRC/length attestation and `files_consistent` does not cover it. At-rest corruption
+    /// confined to the bloom on an otherwise cleanly-sealed index (valid header marker +
+    /// first-bucket CRC) is therefore not detected, and yields a bloom false-negative — a
+    /// present digest reported `NotFound`, since the bloom fronts and short-circuits negative
+    /// lookups before the buckets. This is rare (bit-rot localized to this region on a sealed
+    /// file) and non-destructive: the data log stays the source of truth and any full index
+    /// rebuild (`db repair`, or any `files_consistent` failure) restores the bloom. Attesting
+    /// it would be an on-disk format change (version bump), deliberately deferred to keep the
+    /// format stable.
     fn write_bloom(&mut self) -> Result<(), io::Error> {
         self.hdx_file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.hdx_file.write_all(self.bloom.data())?;
