@@ -12,7 +12,7 @@ use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::{
     payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
-    RethChainSpec, RethEnv,
+    RethChainSpec, RethEnv, TxPool as _,
 };
 use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_test_utils::wait_until;
@@ -561,6 +561,145 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.queued, 0);
     assert_eq!(pool_size.pending, 0);
+
+    Ok(())
+}
+
+/// A transaction a validated peer batch already carries must not be packed into this node's own
+/// batch. The client can submit one signed transaction to every committee validator, so without
+/// the deferral every worker packs a copy, every copy passes peer validation and takes a vote
+/// round, and only the first executed copy pays (issue #1329).
+#[tokio::test]
+async fn test_peer_batched_tx_is_not_repacked() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let task_manager = TaskManager::default();
+
+    //
+    //=== Consensus Layer
+    //
+
+    let network_client = LocalNetwork::new_with_empty_id();
+    let db_path = tmp_dir.path().join("c-db");
+    let _ = std::fs::create_dir_all(&db_path);
+    let store = open_db(db_path);
+
+    // Mock the primary client to always succeed.
+    let mock_server = MockWorkerToPrimary();
+    network_client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
+
+    let qw = TestMakeBlockQuorumWaiter::new_test();
+    let mut batch_provider = Worker::new(
+        0,
+        Some(qw.clone()),
+        network_client,
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
+    );
+    batch_provider.spawn_batch_builder("test builder", &task_manager);
+
+    //
+    //=== Execution Layer
+    //
+
+    // adiri genesis funds the default factory; fund a second, independent sender so the two
+    // transactions below never share a nonce sequence
+    let genesis = test_genesis();
+    let mut factory_b = TransactionFactory::new_random();
+    let genesis = genesis.extend_accounts([(
+        factory_b.address(),
+        GenesisAccount::default().with_balance(U256::MAX),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
+    let address = Address::from(U160::from(333));
+
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        batch_provider.batches_tx(),
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+        0,
+        MIN_PROTOCOL_BASE_FEE,
+        0,
+    )
+    .expect("batch builder");
+
+    let gas_price = reth_env.get_gas_price().unwrap();
+    let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+    let mut factory_a = TransactionFactory::new();
+
+    // two transactions from two senders, both admitted to this node's pool
+    let tx1 = factory_a.create_eip1559(
+        chain.clone(),
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value, // 1 TEL
+        Bytes::new(),
+    );
+    let tx2 = factory_b.create_eip1559(
+        chain.clone(),
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value, // 1 TEL
+        Bytes::new(),
+    );
+
+    let added_result = factory_a.submit_tx_to_pool(tx1.clone(), txpool.clone()).await;
+    assert_matches!(added_result, hash if &hash == tx1.hash());
+    let added_result = factory_b.submit_tx_to_pool(tx2.clone(), txpool.clone()).await;
+    assert_matches!(added_result, hash if &hash == tx2.hash());
+    assert_eq!(txpool.pool_size().pending, 2);
+
+    // a peer proposes a valid batch that carries tx1: the same transaction the client also sent
+    // to this node
+    let peer_batch = Batch {
+        transactions: vec![tx1.encoded_2718()],
+        epoch: 0,
+        beneficiary: Address::ZERO,
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    }
+    .seal_slow();
+
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
+    assert!(batch_validator.validate_batch(peer_batch).is_ok());
+
+    // validating the peer batch deferred exactly its own transactions
+    assert!(txpool.is_peer_deferred(tx1.hash()));
+    assert!(!txpool.is_peer_deferred(tx2.hash()));
+
+    //
+    //=== Test batch flow
+    //
+
+    let _batch_builder = tokio::spawn(batch_builder.run());
+
+    // wait for this node's batch to be stored
+    wait_until(Duration::from_secs(5), "batch stored", || async {
+        Ok(store.iter::<NodeBatchesCache>().next().is_some())
+    })
+    .await?;
+
+    // the peer's transaction is in no batch this node produced; its own transaction is
+    let stored: Vec<Vec<u8>> = store
+        .iter::<NodeBatchesCache>()
+        .flat_map(|(_, batch)| batch.transactions().to_vec())
+        .collect();
+    assert_eq!(stored, vec![tx2.encoded_2718()]);
 
     Ok(())
 }
