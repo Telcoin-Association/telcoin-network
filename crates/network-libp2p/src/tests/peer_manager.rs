@@ -2178,18 +2178,43 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
 }
 
-/// The PutRecord budget admits its threshold and rejects the next message.
+/// The cheap-work bound remains independent of the scoring thresholds.
 #[tokio::test(start_paused = true)]
-async fn test_put_record_rate_limit_trips_after_threshold() {
+async fn test_put_record_rate_limit_sheds_after_threshold() {
     let mut peer_manager = create_test_peer_manager(None);
     let source = PeerId::random();
 
     // the first window's worth of records are accepted
-    (0..MAX_PUT_RECORDS_PER_WINDOW)
-        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(source)));
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed)
+    });
 
-    // the next record in the same window trips the limit
-    assert!(peer_manager.put_record_rate_limited(source));
+    // the next record in the same window is shed without a penalty
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+}
+
+/// The first threshold crossing is scored once below the hard ceiling.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_penalizes_flood_once_per_window() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // The honest safe band is shed without a penalty above the cheap-work bound.
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|i| {
+        let expected = if i < MAX_PUT_RECORDS_PER_WINDOW {
+            PutRecordRate::Allowed
+        } else {
+            PutRecordRate::Shed
+        };
+        assert_eq!(peer_manager.put_record_rate_limited(source), expected, "message {}", i + 1);
+    });
+
+    // the message past the penalty threshold floods, exactly once
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+
+    // further messages in the same window are shed, not re-penalized
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
 }
 
 /// A fixed PutRecord budget renews exactly when its interval expires.
@@ -2201,44 +2226,201 @@ async fn test_put_record_window_resets_after_interval() {
     (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
         peer_manager.put_record_rate_limited(source);
     });
-    assert!(peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
 
     tokio::time::advance(PUT_RECORD_RATE_WINDOW - Duration::from_millis(1)).await;
-    assert!(peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
     tokio::time::advance(Duration::from_millis(1)).await;
-    assert!(!peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
 }
 
-/// Reconnecting the same source cannot restore an exhausted PutRecord budget.
+/// Expired windows permit a fresh one-time flood penalty.
 #[tokio::test(start_paused = true)]
-async fn test_put_record_window_survives_reconnect() {
+async fn test_put_record_window_reset_clears_penalized() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // drive the source past the penalty threshold so the window is marked penalized
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    assert!(peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
+
+    // Expiry starts a clean window that can receive a fresh flood penalty.
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(!peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
+}
+
+/// Reconnecting cannot refill a partially consumed PutRecord budget.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_partial_budget_survives_reconnect() {
     let mut peer_manager = create_test_peer_manager(None);
     let source = register_peer(&mut peer_manager, None);
 
-    (0..MAX_PUT_RECORDS_PER_WINDOW)
-        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(source)));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+
     peer_manager.register_disconnected(&source);
     assert!(peer_manager.put_record_windows.contains_key(&source));
     assert!(peer_manager.register_peer_connection(
         &source,
         ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
     ));
-    assert!(peer_manager.put_record_rate_limited(source));
-
-    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
-    assert!(!peer_manager.put_record_rate_limited(source));
+    (1..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
 }
 
-/// The local source never consumes a tracked PutRecord budget.
+/// Reconnecting the same source cannot restore an exhausted PutRecord budget.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_exhausted_budget_survives_reconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    });
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+}
+
+/// The local identity never allocates rate-limit state, even above the hard ceiling.
 #[tokio::test]
 async fn test_put_record_rate_limit_never_applies_to_local_peer() {
     let mut peer_manager = create_test_peer_manager(None);
     let local = peer_manager.local_peer_id;
 
     // the local id is exempt no matter how many records arrive, and never allocates a window
-    (0..=MAX_PUT_RECORDS_PER_WINDOW)
-        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(local)));
+    (0..=PUT_RECORD_DISCONNECT_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(local), PutRecordRate::Allowed)
+    });
     assert!(!peer_manager.put_record_windows.contains_key(&local));
+}
+
+/// Rate-limit metrics distinguish unscored sheds from penalty escalations.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_metric_counts_shed_and_flood() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        let source = PeerId::random();
+        // Allowed through the work bound, then shed until the first flood penalty.
+        (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+            peer_manager.put_record_rate_limited(source);
+        });
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let count_for = |outcome: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_network.put_records_rate_limited_total"
+                    && key.key().labels().any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(c) => *c,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                    panic!("rate-limit metric must be a counter")
+                }
+            })
+            .unwrap_or_else(|| panic!("no rate-limit counter for outcome {outcome}"))
+    };
+
+    // Every message between the work and penalty thresholds is shed without scoring.
+    let expected_shed = u64::try_from(PUT_RECORD_PENALTY_THRESHOLD - MAX_PUT_RECORDS_PER_WINDOW)
+        .expect("shed count fits in u64");
+    assert_eq!(count_for("shed"), expected_shed);
+    assert_eq!(count_for("flood"), 1);
+}
+
+/// An upstream store-cap change must not silently exceed the honest safe band.
+#[test]
+fn test_put_record_penalty_threshold_above_honest_ceiling() {
+    let honest_ceiling = libp2p::kad::store::MemoryStoreConfig::default().max_records;
+    assert_eq!(honest_ceiling, KAD_MAX_STORED_RECORDS);
+    assert!(PUT_RECORD_PENALTY_THRESHOLD > honest_ceiling);
+}
+
+/// The hard ceiling is inclusive; each subsequent message escalates the penalty.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_repeats_penalty_above_hard_ceiling() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+    (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    ((PUT_RECORD_PENALTY_THRESHOLD + 1)..PUT_RECORD_DISCONNECT_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    });
+    (0..3).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    });
+}
+
+/// Reconnecting cannot restore the allowance or clear an already assessed penalty.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_survives_reconnect() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    ((MAX_PUT_RECORDS_PER_WINDOW + 2)..PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    let window = peer_manager
+        .put_record_windows
+        .get(&source)
+        .ok_or_else(|| eyre::eyre!("the over-limit window must survive reconnect"))?;
+    assert!(window.penalized);
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    Ok(())
+}
+
+/// Heartbeats retain active windows and reclaim expired state without another message.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_heartbeat_expires_disconnected_source() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    peer_manager.register_disconnected(&source);
+    peer_manager.heartbeat();
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    peer_manager.heartbeat();
+    assert!(!peer_manager.put_record_windows.contains_key(&source));
 }
 
 /// The rolling AddProvider allowance is exactly five accepted messages per minute.
@@ -2355,7 +2537,7 @@ async fn test_kad_rate_windows_heartbeat_retains_live_and_sweeps_expired() {
     let mut peer_manager = create_test_peer_manager(None);
     let source = PeerId::random();
 
-    assert!(!peer_manager.put_record_rate_limited(source));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
     assert!(!peer_manager.add_provider_rate_limited(source));
     tokio::time::advance(Duration::from_secs(30)).await;
     assert!(!peer_manager.add_provider_rate_limited(source));
@@ -2380,7 +2562,7 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     let mut peer_manager = create_test_peer_manager(None);
     let tracked: Vec<PeerId> = (0..1024).map(|_| PeerId::random()).collect();
     tracked.iter().for_each(|source| {
-        assert!(!peer_manager.put_record_rate_limited(*source));
+        assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
         assert!(!peer_manager.add_provider_rate_limited(*source));
         peer_manager.register_disconnected(source);
     });
@@ -2389,7 +2571,7 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
 
     (0..32).for_each(|_| {
         let source = PeerId::random();
-        assert!(peer_manager.put_record_rate_limited(source));
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
         assert!(peer_manager.add_provider_rate_limited(source));
         assert!(!peer_manager.put_record_windows.contains_key(&source));
         assert!(!peer_manager.add_provider_windows.contains_key(&source));
@@ -2399,15 +2581,16 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
 
     // Full maps preserve each tracked source's remaining allowance and exhaustion.
     tracked.iter().for_each(|source| {
-        (1..MAX_PUT_RECORDS_PER_WINDOW)
-            .for_each(|_| assert!(!peer_manager.put_record_rate_limited(*source)));
+        (1..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+            assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
+        });
         (1..MAX_ADD_PROVIDERS_PER_WINDOW)
             .for_each(|_| assert!(!peer_manager.add_provider_rate_limited(*source)));
-        assert!(peer_manager.put_record_rate_limited(*source));
+        assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Shed);
         assert!(peer_manager.add_provider_rate_limited(*source));
     });
     let local = peer_manager.local_peer_id;
-    assert!(!peer_manager.put_record_rate_limited(local));
+    assert_eq!(peer_manager.put_record_rate_limited(local), PutRecordRate::Allowed);
     assert!(!peer_manager.add_provider_rate_limited(local));
     assert_eq!(peer_manager.put_record_windows.len(), 1024);
     assert_eq!(peer_manager.add_provider_windows.len(), 1024);
@@ -2418,6 +2601,6 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     assert!(peer_manager.put_record_windows.is_empty());
     assert!(peer_manager.add_provider_windows.is_empty());
     let newcomer = PeerId::random();
-    assert!(!peer_manager.put_record_rate_limited(newcomer));
+    assert_eq!(peer_manager.put_record_rate_limited(newcomer), PutRecordRate::Allowed);
     assert!(!peer_manager.add_provider_rate_limited(newcomer));
 }

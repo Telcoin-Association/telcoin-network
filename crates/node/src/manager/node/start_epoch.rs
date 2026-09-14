@@ -339,7 +339,8 @@ where
     ///
     /// Epoch 0 has no on-chain history, so the genesis committee is loaded from the
     /// committee file on disk. Every later epoch is built with a [`CommitteeBuilder`] from the
-    /// statically configured bootstrap servers plus the on-chain validator set for that epoch.
+    /// on-chain validator set for that epoch. Bootstrap dial hints stay in the manager's
+    /// process-lifetime configuration instead of being copied into later committees.
     ///
     /// In both cases the committee's worker count comes from the on-chain `WorkerConfigs` state
     /// at the previous epoch's closing block (`epoch_first_block - 1`; genesis state for epoch
@@ -378,17 +379,9 @@ where
             .with_num_workers(num_workers)
         } else {
             let mut committee_builder = CommitteeBuilder::new(epoch).with_num_workers(num_workers);
-            for (key, bootstrap) in &self.bootstrap_servers {
-                committee_builder.add_bootstrap_server(
-                    *key,
-                    bootstrap.primary.clone(),
-                    bootstrap.workers.clone(),
-                );
-            }
-
-            for validator in validators {
-                committee_builder.add_authority(validator.0, validator.1.validatorAddress);
-            }
+            validators.into_iter().for_each(|(key, validator)| {
+                committee_builder.add_authority(key, validator.validatorAddress);
+            });
             committee_builder.build()
         };
 
@@ -612,12 +605,8 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
-            .iter()
-            .map(|(k, v)| (*k, v.primary.clone()))
-            .collect();
+        let bootstrap_peers =
+            self.bootstrap_servers.iter().map(|(k, v)| (*k, v.primary.clone())).collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
         // Publishers authorized for the epoch-boundary topics (`epoch_vote_topic`,
@@ -823,9 +812,8 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
+        let bootstrap_peers = self
+            .bootstrap_servers
             .iter()
             // worker 0 always exists (the non-empty list invariant is enforced at deserialize).
             // for higher ids a missing entry drops the peer, which is correct: a peer that runs

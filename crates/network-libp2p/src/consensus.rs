@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::KadStore,
     metrics::{PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty},
+    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -70,6 +70,13 @@ mod network_tests;
 /// The value is a generous multiple of the live-peer target (`PeerConfig::max_peers()` defaults to
 /// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
 const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
+
+/// Maximum encoded kademlia message size in bytes, including the record and protocol overhead.
+///
+/// Pin the 16 KiB wire limit explicitly so libp2p upgrades cannot silently widen the inbound
+/// bandwidth allowed by the per-source `PutRecord` limits. The codec applies this bound before
+/// records reach the store, whose larger value limit is not the effective wire bound.
+const MAX_KAD_PACKET_SIZE: usize = 16 * 1024;
 
 /// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
 ///
@@ -450,9 +457,11 @@ where
         let libp2p = network_config.libp2p_config();
         kad_config.set_kbucket_size(libp2p.k_bucket_size);
         kad_config
+            .set_max_packet_size(MAX_KAD_PACKET_SIZE)
             .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
             .set_publication_interval(Some(libp2p.kad_publication_interval))
+            .set_replication_interval(Some(libp2p.kad_replication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let mut kad_store = KadStore::new(db.clone(), peer_id, &key_config, network_type);
@@ -2040,43 +2049,54 @@ where
         // the accept path, so without this a single unbanned peer can flood valid records and
         // force repeated ~1ms BLS verifies plus MDBX writes on the network task that also relays
         // consensus gossip, starving the event loop (GHSA-f6rq-62rr-4h9g). Banned sources already
-        // returned above, so this bounds the unbanned population; an honest source's
-        // republication cadence stays far below the limit.
-        if self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
-            trace!(target: "network-kad", ?source, "rate limiting inbound put request");
-            self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Medium);
-        } else if let Some((key, value)) = self.peer_record_valid(&record) {
-            // verify record signature and ensure publisher matches record's network key
-
-            // store latest node records
-            if self.is_newer_record(&record) {
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .put(record)
-                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
-                trace!(target: "network-kad", "Got record {key} {value:?}");
-                // a peer pushing its own record over its own connection (source == the record's
-                // network identity) also confirms its identity so a live non-committee connection
-                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
-                // committee-gated (issue #827).
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_self_advertised_peer(source, key, value.info);
-            } else {
-                // A peer republishing a slightly stale (but signature-valid) record is
-                // expected after restarts and benign — the local store keeps the newer
-                // version. Log only; no penalty.
-                trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+        // returned above, so this bounds the unbanned population. Honest kad replication
+        // fan-in can cross the shed threshold as the network grows, so shedding carries no
+        // penalty (a shed record is redundant: up to `replication_factor` other peers re-put
+        // it hourly). A source past the flood threshold is scored once per window, then on every
+        // message above the hard cutoff so a sustained flood promptly triggers disconnection.
+        match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
+            PutRecordRate::Flooding => {
+                debug!(target: "network-kad", ?source, "put record flood: penalizing source");
+                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
             }
-        } else {
-            warn!(target: "network-kad", "Received invalid peer record!");
+            PutRecordRate::Shed => {
+                trace!(target: "network-kad", ?source, "shedding rate limited put request");
+            }
+            PutRecordRate::Allowed => {
+                if let Some((key, value)) = self.peer_record_valid(&record) {
+                    // verify record signature and ensure publisher matches record's network key
 
-            // assess penalty for invalid peer record
-            trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
-            self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
+                    // store latest node records
+                    if self.is_newer_record(&record) {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .store_mut()
+                            .put(record)
+                            .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
+                        trace!(target: "network-kad", "Got record {key} {value:?}");
+                        // a peer pushing its own record over its own connection (source == the
+                        // record's network identity) also confirms its identity so a live
+                        // non-committee connection (e.g. an nvv in the gossip mesh) is retained;
+                        // relayed and non-self records stay committee-gated (issue #827).
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .add_self_advertised_peer(source, key, value.info);
+                    } else {
+                        // A peer republishing a slightly stale (but signature-valid) record is
+                        // expected after restarts and benign. The local store keeps the newer
+                        // version. Log only; no penalty.
+                        trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
+                    }
+                } else {
+                    warn!(target: "network-kad", "Received invalid peer record!");
+
+                    // assess penalty for invalid peer record
+                    trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
+                }
+            }
         }
 
         Ok(())

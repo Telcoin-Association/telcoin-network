@@ -21,7 +21,11 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::{collections::BTreeMap, future::ready, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::ready,
+    sync::Arc,
+};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -32,9 +36,9 @@ use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, P2pNode,
-    SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
-    DEFAULT_WORKER_ID,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Multiaddr,
+    P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner,
+    TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -125,13 +129,28 @@ fn check_configured_worker_count(
     Ok(())
 }
 
+/// Remove trailing peer identities that QUIC ignores when binding a listener.
+fn listen_address(addr: &Multiaddr) -> Multiaddr {
+    let end = addr.iter().enumerate().fold(0, |end, (index, protocol)| {
+        if matches!(protocol, Protocol::P2p(_)) {
+            end
+        } else {
+            index + 1
+        }
+    });
+    addr.iter().take(end).collect()
+}
+
 /// Validate every worker and pair its configuration with its persistent event stream.
 ///
 /// Runs before either primary or worker swarm construction. Checking the complete layout first
-/// prevents a bad later RPC endpoint, count, or worker id from leaving partially spawned networks.
+/// prevents a bad later key, address, RPC endpoint, count, or worker id from leaving partially
+/// spawned networks. Each advertised key must match the swarm's derived identity, and each worker
+/// needs its own listen address, regardless of trailing `/p2p/` identities.
 fn prepare_worker_networks<Events: Clone>(
     workers: &[P2pNode],
     event_streams: &[Events],
+    key_config: &KeyConfig,
     epoch: Epoch,
     on_chain_workers: usize,
 ) -> eyre::Result<Vec<PreparedWorkerNetwork<Events>>> {
@@ -147,11 +166,27 @@ fn prepare_worker_networks<Events: Clone>(
         event_streams.len()
     );
 
+    let mut addresses = HashSet::with_capacity(configured);
     workers
         .iter()
         .zip(event_streams)
         .zip(0..=WorkerId::MAX)
         .map(|((p2p, event_stream), worker_id)| {
+            eyre::ensure!(
+                addresses.insert(listen_address(&p2p.network_address)),
+                "node config `node_info.p2p_info.workers[{worker_id}].network_address` ({}) \
+                 duplicates an earlier worker's listen address (a differing `/p2p/` suffix is \
+                 still the same socket): every worker swarm needs its own address",
+                p2p.network_address
+            );
+            let expected = key_config.worker_network_public_key(worker_id);
+            eyre::ensure!(
+                p2p.network_key == expected,
+                "node config `node_info.p2p_info.workers[{worker_id}].network_key` does not \
+                 match the key derived for worker {worker_id} (expected {expected}, found \
+                 {}): set this entry to the expected value to match the loaded BLS keystore",
+                p2p.network_key
+            );
             p2p.rpc.as_ref().map(tn_types::RpcInfo::validate).transpose().wrap_err_with(|| {
                 format!(
                     "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in node config"
@@ -681,16 +716,13 @@ where
     ) -> eyre::Result<Self> {
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
-        let committee_zero = if let Ok(committee_zero) =
+        let committee_zero =
             Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
-        {
-            committee_zero
-        } else {
-            error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
-            return Err(eyre::eyre!(
-                "unable to load committee zero (genesis committee), this is fatal"
-            ));
-        };
+                .map_err(|_| {
+                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
+                    eyre::eyre!("unable to load committee zero (genesis committee), this is fatal")
+                })?;
+        let bootstrap_servers = committee_zero.bootstrap_servers();
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
@@ -709,17 +741,6 @@ where
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
             .map(|_| QueChannel::new())
             .collect();
-        let bootstrap_servers = if let Ok(committee_zero) =
-            Config::load_from_path_or_default::<Committee>(
-                tn_datadir.committee_path(),
-                ConfigFmt::YAML,
-            ) {
-            committee_zero.bootstrap_servers()
-        } else {
-            error!(target: "epoch-manager", "Unable to load bootstrap servers from the genesis committee!");
-            BTreeMap::new()
-        };
-
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
             builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
@@ -1114,6 +1135,7 @@ where
         let workers = prepare_worker_networks(
             &self.builder.tn_config.node_info.p2p_info.workers,
             &self.worker_event_streams,
+            &self.key_config,
             epoch,
             on_chain_workers,
         )?;
@@ -1128,6 +1150,10 @@ where
         // construction path (tests, epoch transitions); this guard covers the node boot
         // that actually performs the one-time install.
         network_config.peer_config().score_config.validate()?;
+
+        // Validate the operator-provided kad cadences before installing them into either swarm,
+        // so a zero replication interval fails here instead of panicking a critical network task.
+        network_config.libp2p_config().validate()?;
 
         //
         //=== PRIMARY
@@ -1464,8 +1490,12 @@ mod tests {
     /// Give each worker a distinct advertised address, derived network key, and RPC endpoint.
     fn worker_p2p(keys: &KeyConfig, worker_id: WorkerId) -> eyre::Result<P2pNode> {
         Ok(P2pNode {
-            network_address: format!("/ip4/127.0.0.1/udp/{}/quic-v1", 9000 + u32::from(worker_id))
-                .parse()?,
+            network_address: format!(
+                "/ip4/127.0.{}.1/udp/{}/quic-v1",
+                worker_id / 256,
+                9000 + worker_id % 256
+            )
+            .parse()?,
             network_key: keys.worker_network_public_key(worker_id),
             rpc: Some(RpcInfo {
                 http: format!("https://worker-{worker_id}.example.com/").parse()?,
@@ -1482,7 +1512,7 @@ mod tests {
         let streams: Vec<QueChannel<WorkerId>> =
             workers.iter().map(|_| QueChannel::new()).collect();
         let receivers: Vec<_> = streams.iter().map(QueChannel::subscribe).collect();
-        let prepared = prepare_worker_networks(&workers, &streams, Epoch::MAX, 3)?;
+        let prepared = prepare_worker_networks(&workers, &streams, &keys, Epoch::MAX, 3)?;
 
         assert_eq!(prepared.len(), 3);
         assert_ne!(keys.worker_network_public_key(0), keys.worker_network_public_key(1));
@@ -1490,10 +1520,6 @@ mod tests {
             |((worker, configured), expected_id)| -> eyre::Result<()> {
                 assert_eq!(worker.worker_id, expected_id);
                 assert_eq!(worker.p2p, *configured);
-                assert_eq!(
-                    worker.p2p.network_key,
-                    keys.worker_network_public_key(worker.worker_id)
-                );
                 worker.event_stream.try_send(worker.worker_id)?;
                 Ok(())
             },
@@ -1511,12 +1537,112 @@ mod tests {
     /// Both missing and surplus event streams are rejected instead of silently truncating `zip`.
     #[test]
     fn prepare_worker_networks_rejects_event_stream_count_mismatch() -> eyre::Result<()> {
-        let workers = [worker_p2p(&worker_key_config(), 0)?];
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?];
         [Vec::new(), vec![(), ()]].into_iter().try_for_each(|streams| -> eyre::Result<()> {
-            let error = prepare_worker_networks(&workers, &streams, 0, 1)
+            let error = prepare_worker_networks(&workers, &streams, &keys, 0, 1)
                 .err()
                 .ok_or_else(|| eyre!("expected worker event stream count mismatch"))?;
             assert!(error.to_string().contains("worker event streams"));
+            Ok(())
+        })
+    }
+
+    /// A wrong derived key at any position rejects the complete worker layout.
+    #[test]
+    fn prepare_worker_networks_rejects_mismatched_network_keys() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        [0, 1, 2].into_iter().try_for_each(|invalid_id| -> eyre::Result<()> {
+            let workers = (0..3)
+                .map(|worker_id| {
+                    worker_p2p(&keys, worker_id).map(|worker| {
+                        if worker_id == invalid_id {
+                            P2pNode {
+                                network_key: keys.worker_network_public_key((worker_id + 1) % 3),
+                                ..worker
+                            }
+                        } else {
+                            worker
+                        }
+                    })
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let error = prepare_worker_networks(&workers, &[(); 3], &keys, Epoch::MAX, 3)
+                .err()
+                .ok_or_else(|| eyre!("expected mismatched worker network key"))?;
+            assert!(error
+                .to_string()
+                .contains(&format!("node_info.p2p_info.workers[{invalid_id}].network_key")));
+            assert!(error.to_string().contains(&format!(
+                "expected {}, found {}",
+                keys.worker_network_public_key(invalid_id),
+                keys.worker_network_public_key((invalid_id + 1) % 3)
+            )));
+            Ok(())
+        })
+    }
+
+    /// Adjacent and nonadjacent duplicate addresses fail while all worker keys remain valid.
+    #[test]
+    fn prepare_worker_networks_rejects_duplicate_network_addresses() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let first_address = worker_p2p(&keys, 0)?.network_address;
+        [1, 2].into_iter().try_for_each(|duplicate_id| -> eyre::Result<()> {
+            let workers = (0..3)
+                .map(|worker_id| {
+                    worker_p2p(&keys, worker_id).map(|worker| {
+                        if worker_id == duplicate_id {
+                            P2pNode { network_address: first_address.clone(), ..worker }
+                        } else {
+                            worker
+                        }
+                    })
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let error = prepare_worker_networks(&workers, &[(); 3], &keys, Epoch::MAX, 3)
+                .err()
+                .ok_or_else(|| eyre!("expected duplicate worker network address"))?;
+            assert!(error
+                .to_string()
+                .contains(&format!("node_info.p2p_info.workers[{duplicate_id}].network_address")));
+            assert!(error.to_string().contains(&first_address.to_string()));
+            Ok(())
+        })
+    }
+
+    /// Distinct peer identities cannot hide adjacent or nonadjacent duplicate listen addresses.
+    #[test]
+    fn prepare_worker_networks_rejects_duplicate_listen_addresses() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let first_address = worker_p2p(&keys, 0)?.network_address;
+        [1, 2].into_iter().try_for_each(|duplicate_id| -> eyre::Result<()> {
+            let workers = (0..3)
+                .map(|worker_id| {
+                    worker_p2p(&keys, worker_id).map(|worker| {
+                        let address = if worker_id == duplicate_id {
+                            first_address.clone()
+                        } else {
+                            worker.network_address.clone()
+                        };
+                        P2pNode {
+                            network_address: address
+                                .with(Protocol::P2p(worker.network_key.clone().into())),
+                            ..worker
+                        }
+                    })
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let error = prepare_worker_networks(&workers, &[(); 3], &keys, Epoch::MAX, 3)
+                .err()
+                .ok_or_else(|| eyre!("expected duplicate worker listen address"))?;
+            let configured = workers
+                .get(usize::from(duplicate_id))
+                .ok_or_else(|| eyre!("expected duplicate worker"))?;
+            let message = error.to_string();
+            assert!(message
+                .contains(&format!("node_info.p2p_info.workers[{duplicate_id}].network_address")));
+            assert!(message.contains(&configured.network_address.to_string()));
+            assert!(message.contains("listen address"));
             Ok(())
         })
     }
@@ -1533,7 +1659,7 @@ mod tests {
                 ..worker
             },
         ];
-        let error = prepare_worker_networks(&workers, &[(), ()], Epoch::MAX, 2)
+        let error = prepare_worker_networks(&workers, &[(), ()], &keys, Epoch::MAX, 2)
             .err()
             .ok_or_else(|| eyre!("expected invalid RPC endpoint"))?;
         assert!(error.to_string().contains("node_info.p2p_info.workers[1].rpc"));
@@ -1545,7 +1671,7 @@ mod tests {
     fn prepare_worker_networks_rejects_chain_count_shortfall() -> eyre::Result<()> {
         let keys = worker_key_config();
         let workers = [worker_p2p(&keys, 0)?];
-        let error = prepare_worker_networks(&workers, &[()], Epoch::MAX, 2)
+        let error = prepare_worker_networks(&workers, &[()], &keys, Epoch::MAX, 2)
             .err()
             .ok_or_else(|| eyre!("expected chain worker count shortfall"))?;
         assert!(error.to_string().contains("configure at least"));
@@ -1557,7 +1683,7 @@ mod tests {
     fn prepare_worker_networks_accepts_surplus_workers() -> eyre::Result<()> {
         let keys = worker_key_config();
         let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
-        let prepared = prepare_worker_networks(&workers, &[(), ()], Epoch::MAX, 1)?;
+        let prepared = prepare_worker_networks(&workers, &[(), ()], &keys, Epoch::MAX, 1)?;
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared.last().map(|worker| worker.worker_id), Some(1));
         Ok(())
@@ -1566,12 +1692,13 @@ mod tests {
     /// Raw zero counts must fail even though the gas accumulator clamps a zero resize to one.
     #[test]
     fn prepare_worker_networks_rejects_zero_worker_counts() -> eyre::Result<()> {
-        let workers = [worker_p2p(&worker_key_config(), 0)?];
-        let chain_error = prepare_worker_networks(&workers, &[()], 0, 0)
+        let keys = worker_key_config();
+        let workers = [worker_p2p(&keys, 0)?];
+        let chain_error = prepare_worker_networks(&workers, &[()], &keys, 0, 0)
             .err()
             .ok_or_else(|| eyre!("expected zero chain count rejection"))?;
         assert!(chain_error.to_string().contains("chain-derived count for epoch 0 is 0"));
-        let config_error = prepare_worker_networks::<()>(&[], &[], 0, 0)
+        let config_error = prepare_worker_networks::<()>(&[], &[], &keys, 0, 0)
             .err()
             .ok_or_else(|| eyre!("expected empty worker config rejection"))?;
         assert!(config_error.to_string().contains("at least one worker"));
@@ -1584,30 +1711,51 @@ mod tests {
     fn prepare_worker_networks_accepts_multi_worker_genesis() -> eyre::Result<()> {
         let keys = worker_key_config();
         let workers = [worker_p2p(&keys, 0)?, worker_p2p(&keys, 1)?];
-        let prepared = prepare_worker_networks(&workers, &[(), ()], 0, 2)?;
+        let prepared = prepare_worker_networks(&workers, &[(), ()], &keys, 0, 2)?;
         assert_eq!(prepared.len(), 2);
         Ok(())
     }
 
-    /// The full WorkerId range is accepted, and the next configured worker is rejected.
+    /// WorkerId overflow is rejected before per-worker checks, so one cloned entry is enough.
     #[test]
-    fn prepare_worker_networks_enforces_worker_id_bound() -> eyre::Result<()> {
+    fn prepare_worker_networks_rejects_worker_id_overflow() -> eyre::Result<()> {
+        let keys = worker_key_config();
         let max_workers = usize::from(WorkerId::MAX) + 1;
-        let worker = P2pNode { rpc: None, ..worker_p2p(&worker_key_config(), 0)? };
+        let worker = P2pNode { rpc: None, ..worker_p2p(&keys, 0)? };
         let workers = vec![worker; max_workers + 1];
         let streams = vec![(); max_workers + 1];
-        let prepared = prepare_worker_networks(
-            &workers[..max_workers],
-            &streams[..max_workers],
-            Epoch::MAX,
-            max_workers,
-        )?;
-        assert_eq!(prepared.len(), max_workers);
-        assert_eq!(prepared.last().map(|worker| worker.worker_id), Some(WorkerId::MAX));
-        let error = prepare_worker_networks(&workers, &streams, Epoch::MAX, max_workers + 1)
+        let error = prepare_worker_networks(&workers, &streams, &keys, Epoch::MAX, max_workers + 1)
             .err()
             .ok_or_else(|| eyre!("expected WorkerId overflow"))?;
         assert!(error.to_string().contains("WorkerId range"));
+        Ok(())
+    }
+
+    /// The inclusive WorkerId range reaches its last id without silently truncating the zip.
+    /// Each worker is derived twice, making this a costly explicit boundary check.
+    #[test]
+    #[ignore = "derives 2 x 65,536 worker network keys; run with `cargo nextest run --run-ignored all`"]
+    fn prepare_worker_networks_accepts_full_worker_id_range() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let max_workers = usize::from(WorkerId::MAX) + 1;
+        let workers = (0..=WorkerId::MAX)
+            .map(|worker_id| {
+                Ok(P2pNode {
+                    network_address: format!(
+                        "/ip4/127.0.{}.1/udp/{}/quic-v1",
+                        worker_id / 256,
+                        9000 + worker_id % 256
+                    )
+                    .parse()?,
+                    network_key: keys.worker_network_public_key(worker_id),
+                    rpc: None,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let streams = vec![(); max_workers];
+        let prepared = prepare_worker_networks(&workers, &streams, &keys, Epoch::MAX, max_workers)?;
+        assert_eq!(prepared.len(), max_workers);
+        assert_eq!(prepared.last().map(|worker| worker.worker_id), Some(WorkerId::MAX));
         Ok(())
     }
 
@@ -1622,7 +1770,7 @@ mod tests {
             .into_iter()
             .try_for_each(|(configured, chain_count)| -> eyre::Result<()> {
                 let streams = vec![(); configured.len()];
-                let error = prepare_worker_networks(configured, &streams, 0, chain_count)
+                let error = prepare_worker_networks(configured, &streams, &keys, 0, chain_count)
                     .err()
                     .ok_or_else(|| eyre!("expected pre-fork multi-worker rejection"))?;
                 assert!(error.to_string().contains("multi-workers fork is not active"));
