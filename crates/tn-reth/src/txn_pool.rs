@@ -29,7 +29,7 @@
 //!   out of the pending set.
 
 use alloy::primitives::map::AddressSet;
-use futures::{stream, FutureExt as _, Stream, StreamExt as _};
+use futures::{stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
