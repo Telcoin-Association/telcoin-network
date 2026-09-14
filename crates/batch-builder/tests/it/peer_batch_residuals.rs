@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use std::{collections::VecDeque, io, sync::Arc};
 use tempfile::TempDir;
-use tn_batch_builder::build_batch;
+use tn_batch_builder::test_utils::build_test_batch;
 use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_reth::{payload::BuildArguments, test_utils::TransactionFactory, RethChainSpec, RethEnv};
@@ -61,7 +61,7 @@ async fn duplicate_build_schedule(transaction_count: usize) -> eyre::Result<()> 
     }))
     .await;
     let encoded: Vec<_> = transactions.iter().map(Encodable2718::encoded_2718).collect();
-    let first = build_batch(
+    let first = build_test_batch(
         BatchBuilderArgs {
             pool: first_pool.clone(),
             beneficiary: Address::from([1; 20]),
@@ -69,9 +69,8 @@ async fn duplicate_build_schedule(transaction_count: usize) -> eyre::Result<()> 
         },
         0,
         MIN_PROTOCOL_BASE_FEE,
-    )
-    .batch;
-    let second = build_batch(
+    );
+    let second = build_test_batch(
         BatchBuilderArgs {
             pool: second_pool.clone(),
             beneficiary: Address::from([2; 20]),
@@ -79,8 +78,7 @@ async fn duplicate_build_schedule(transaction_count: usize) -> eyre::Result<()> 
         },
         0,
         MIN_PROTOCOL_BASE_FEE,
-    )
-    .batch;
+    );
     assert_eq!(first.transactions(), &encoded);
     assert_eq!(second.transactions(), &encoded);
     assert_ne!(first.digest(), second.digest());

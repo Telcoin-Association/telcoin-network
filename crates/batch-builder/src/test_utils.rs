@@ -10,7 +10,18 @@ use tn_reth::{
     new_pool_txn, BestTransactions, InvalidPoolTransactionError, PeerBatchTxs, PoolTxn, PoolTxnId,
     SenderId, SenderIdentifiers, TxPool,
 };
-use tn_types::{Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, U256};
+use tn_types::{
+    Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, WorkerId, U256,
+};
+
+/// Build from the supplied pool through the production selection path for integration tests.
+pub fn build_test_batch<P: TxPool>(
+    args: BatchBuilderArgs<P>,
+    worker_id: WorkerId,
+    base_fee: u64,
+) -> Batch {
+    build_batch(args, worker_id, base_fee).batch
+}
 
 /// Attempt to update batch with accurate header information.
 ///
