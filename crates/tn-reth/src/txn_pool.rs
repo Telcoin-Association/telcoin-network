@@ -348,20 +348,13 @@ impl WorkerTxPool {
         let mut dirty_addresses = AddressSet::default();
         while let Some(event) = events.next().await {
             let newly_dirty = match event {
-                MaintenanceEvent::Update(update) => {
-                    update
-                        .map(|notification| {
-                            async {
-                                self.apply_canon_notification(notification).await?;
-                                Ok::<_, JoinError>(AddressSet::default())
-                            }
-                            .left_future()
-                        })
-                        .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
-                            futures::future::ready(Ok(self.mark_drifted(missed))).right_future()
-                        })
-                        .await?
-                }
+                MaintenanceEvent::Update(update) => match update {
+                    Ok(notification) => {
+                        self.apply_canon_notification(notification).await?;
+                        AddressSet::default()
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(missed)) => self.mark_drifted(missed),
+                },
                 MaintenanceEvent::RetryTick => AddressSet::default(),
                 // `take_while` ends the stream at `Closed`, so this arm never runs; a
                 // plain value keeps the match total (no panic in a critical task).
