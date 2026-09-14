@@ -256,8 +256,7 @@ mod tests {
             .map(|index| B256::from(U256::from(index).to_be_bytes::<32>()))
             .collect();
         let pool = TestPool::new(std::slice::from_ref(&raw)).with_peer_batch_window(window.clone());
-        let overflow_hashes: Vec<B256> =
-            pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
+        let overflow_hashes: Vec<B256> = pool.best_transactions().map(|tx| *tx.hash()).collect();
         assert_eq!(overflow_hashes.len(), 1);
         assert!(overflow_hashes.iter().all(|hash| !fillers.contains(hash)));
 
