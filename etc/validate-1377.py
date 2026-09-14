@@ -16,6 +16,7 @@ EXPECTED = os.environ["PR_HEAD"]
 if re.fullmatch(r"[0-9a-f]{40}", EXPECTED) is None:
     raise ValueError("PR_HEAD must be a complete commit ID")
 PIN = "1.94"
+BASE = "08a507835011675a32348ac60d0488bbba891552"
 NIGHTLY = (ROOT / "rust-nightly").read_text().strip()
 FILES = [
     "crates/tn-reth/src/peer_batch.rs",
@@ -41,24 +42,56 @@ REPORT = {
 }
 
 
-def run(label, command, *, mutant=False):
+def compiler_errors(output):
+    errors = []
+    for line in output.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        message = entry.get("message", {})
+        if entry.get("reason") == "compiler-message" and isinstance(message, dict) and message.get("level") == "error":
+            errors.append({
+                "code": (message.get("code") or {}).get("code"),
+                "message": message["message"],
+                "locations": [
+                    [span["file_name"], span["line_start"], span["column_start"]]
+                    for span in message.get("spans", []) if span.get("is_primary")
+                ],
+            })
+    return sorted(errors, key=lambda error: json.dumps(error, sort_keys=True))
+
+
+def run(label, command, *, mutant=False, required=True):
     print(f"Running {label}: {' '.join(command)}", flush=True)
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     (OUT / f"{label}.log").write_text(result.stdout)
     passed = result.returncode == 0
     if mutant:
         passed = result.returncode != 0 and "test result: FAILED." in result.stdout
-    REPORT["checks"].append({
+    summaries = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;", result.stdout)
+    tests_passed = sum(int(count) for count, _ in summaries)
+    tests_failed = sum(int(count) for _, count in summaries)
+    if len(command) > 2 and command[2] == "test":
+        passed = passed and tests_passed + tests_failed > 0
+    check = {
         "label": label,
         "command": command,
         "exit_code": result.returncode,
         "expected_test_failure": mutant,
         "passed": passed,
-    })
+        "tests_passed": tests_passed,
+        "tests_failed": tests_failed,
+        "diagnostics": compiler_errors(result.stdout),
+    }
+    REPORT["checks"].append(check)
     (OUT / f"{PHASE}.json").write_text(json.dumps(REPORT, indent=2) + "\n")
     print("\n".join(result.stdout.splitlines()[-70:]), flush=True)
-    if not passed:
+    if required and not passed:
         raise RuntimeError(f"Validation failed: {label}")
+    return check
 
 
 def test_command(package, target, pattern, feature=False):
@@ -89,12 +122,63 @@ try:
             "tn-rpc", "tn-storage", "tn-test-utils", "tn-test-utils-committee", "tn-types",
             "tn-worker",
         ]
-        command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked"]
+        command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--message-format=json"]
         for package in packages:
             command += ["-p", package]
         command += ["--all-targets", "--no-deps"]
-        run("clippy-default", command + ["--", "-D", "warnings"])
-        run("clippy-all-features", command + ["--all-features", "--", "-D", "warnings"])
+        modes = {
+            "default": ["--", "-D", "warnings"],
+            "all-features": ["--all-features", "--", "-D", "warnings"],
+        }
+        broad = {
+            mode: run(f"clippy-{mode}", command + flags, required=False)
+            for mode, flags in modes.items()
+        }
+        focused = [
+            "cargo", f"+{NIGHTLY}", "clippy", "--locked", "--message-format=json",
+            "-p", "tn-reth", "-p", "tn-batch-validator", "-p", "tn-batch-builder",
+            "--all-targets", "--no-deps",
+        ]
+        changed = {
+            mode: run(f"clippy-changed-{mode}", focused + flags, required=False)
+            for mode, flags in modes.items()
+        }
+        if not all(check["passed"] for check in broad.values()):
+            subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", BASE], check=True)
+            changed_paths = subprocess.check_output(
+                ["git", "diff", "--name-only", BASE, EXPECTED], text=True,
+            ).splitlines()
+            if set(changed_paths) != set(FILES):
+                raise ValueError("The baseline substitution must cover the complete PR diff")
+            baseline_paths = set(subprocess.check_output(
+                ["git", "ls-tree", "-r", "--name-only", BASE, "--", *FILES], text=True,
+            ).splitlines())
+            REPORT["baseline_commit"] = BASE
+            try:
+                for name in FILES:
+                    if name in baseline_paths:
+                        (ROOT / name).write_bytes(subprocess.check_output(["git", "show", f"{BASE}:{name}"]))
+                    else:
+                        (ROOT / name).unlink()
+                baseline = {
+                    mode: run(f"clippy-baseline-{mode}", command + flags, required=False)
+                    for mode, flags in modes.items()
+                }
+                REPORT["baseline_comparisons"] = [
+                    {
+                        "mode": mode,
+                        "head_exit": broad[mode]["exit_code"],
+                        "base_exit": baseline[mode]["exit_code"],
+                        "same_diagnostics": broad[mode]["diagnostics"] == baseline[mode]["diagnostics"],
+                        "nonempty_diagnostics": bool(broad[mode]["diagnostics"]),
+                    }
+                    for mode in modes
+                ]
+            finally:
+                for name, content in ORIGINAL.items():
+                    (ROOT / name).write_bytes(content)
+        if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
+            raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
