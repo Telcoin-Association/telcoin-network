@@ -238,6 +238,41 @@ mod tests {
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{test_genesis, BatchBuilderArgs, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
+    /// Saturation loses deferral coverage for a new hash while preserving the existing bound.
+    #[test]
+    fn peer_batch_capacity_loss_keeps_the_overflow_transaction_selectable() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut factory = TransactionFactory::new();
+        let raw = factory.create_eip1559_encoded(
+            chain,
+            Some(21_000),
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            Some(Address::ZERO),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let window = tn_reth::PeerBatchTxs::new(std::time::Duration::MAX);
+        let fillers: Vec<B256> = (0..tn_reth::PEER_BATCH_SEEN_MAX_TXS)
+            .map(|index| B256::from(U256::from(index).to_be_bytes::<32>()))
+            .collect();
+        let pool = TestPool::new(std::slice::from_ref(&raw)).with_peer_batch_window(window.clone());
+        let overflow_hashes: Vec<B256> =
+            pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
+        assert_eq!(overflow_hashes.len(), 1);
+        assert!(overflow_hashes.iter().all(|hash| !fillers.contains(hash)));
+
+        pool.record_peer_batch(&fillers);
+        pool.record_peer_batch(&overflow_hashes);
+        assert_eq!(window.len(), tn_reth::PEER_BATCH_SEEN_MAX_TXS);
+        let output = build_batch(
+            BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 },
+            0,
+            MIN_PROTOCOL_BASE_FEE,
+        );
+        assert_eq!(output.batch.transactions(), std::slice::from_ref(&raw));
+        assert_eq!(output.peer_deferred, 0);
+    }
+
     /// A transaction a validated peer batch already carries must not be packed again here: the
     /// duplicate costs batch space, bandwidth and a vote round, and execution skips it for free
     /// (issue #1329). The sender's later nonces must be skipped in the same build too, because a

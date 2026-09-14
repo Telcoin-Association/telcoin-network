@@ -84,6 +84,12 @@ impl TxPool for TestPool {
 }
 
 impl TestPool {
+    /// Select a window whose lifetime is controlled by a particular builder regression.
+    #[cfg(test)]
+    pub(crate) fn with_peer_batch_window(self, peer_batch_txs: PeerBatchTxs) -> Self {
+        Self { peer_batch_txs, ..self }
+    }
+
     /// Override the balance [`TxPool::get_account_balances`] reports for `address`.
     #[cfg(test)]
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {

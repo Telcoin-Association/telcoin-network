@@ -99,10 +99,12 @@ Future iterations are planned to address this inefficiency.
 
 One local mitigation is in place (issue #1329): when this node validates a peer's batch, the batch's transaction hashes are deferred by this node's builder for `PEER_BATCH_DEFER_TTL` (10 seconds, the default batch vote timeout), bounded by `PEER_BATCH_SEEN_MAX_TXS` remembered hashes.
 The builder skips a deferred hash and, with it, that sender's later nonces: those nonces wait exactly as long as the deferred earlier nonce does, which they could not execute ahead of anyway.
-A transaction a client sent to every validator is therefore not packed by every worker at once.
-The builder only skips the transaction for this build, and it seals nothing at all when every pending transaction is deferred (`BuildOutcome::NothingToSeal`), because an empty batch is rejected by peers and penalized as fatal.
+Workers that validate a peer batch before selecting their own transactions can avoid packing those copies. Workers that select first can still propose duplicates, including a copy on every validator when all selections precede peer validation.
+The builder only skips the transaction for this build, and it seals nothing at all when every pending transaction is deferred (`BuildOutcome::Empty`), because an empty batch is rejected by peers and penalized as fatal.
 Each arming costs a transaction at most one TTL: the deferral expires on its own, the entry stays immune to re-arming until it is forgotten at twice the TTL, and execution still tolerates duplicates.
 A flood of peer batches cannot evict a live entry; once the window is full further hashes are simply not remembered, so a flood can only switch the deferral off, never re-arm it.
+
+Issue #1377 adds per-worker retained-hash and dropped-insertion telemetry, plus controlled regressions for the concurrent-build schedule and saturation fallback. See [peer-batch deferral](../../docs/peer-batch-deferral.md) for metric semantics, the conditional amplification accounting, and RPC admission/failover considerations.
 
 ### Safety of Early Pool Updates
 

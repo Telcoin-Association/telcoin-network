@@ -5,5 +5,6 @@
 
 // it test
 mod build_batches;
+mod peer_batch_residuals;
 
 fn main() {}

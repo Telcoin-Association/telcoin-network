@@ -124,7 +124,7 @@ impl BatchValidation for BatchValidator {
 }
 
 impl BatchValidator {
-    /// Create a new instance of [Self]
+    /// Create a validator and register its pool's peer-batch telemetry under the worker label.
     pub fn new(
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
@@ -132,6 +132,7 @@ impl BatchValidator {
         base_fee: u64,
         epoch: Epoch,
     ) -> Self {
+        tx_pool.iter().for_each(|pool| pool.peer_batch_txs().register_metrics(worker_id));
         Self { reth_env, tx_pool, worker_id, base_fee, epoch }
     }
 
