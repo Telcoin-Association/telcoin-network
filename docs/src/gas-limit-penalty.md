@@ -10,9 +10,13 @@ To counter this, TN applies a **quadratic penalty** on transactions whose gas li
 
 ### How It Works
 
+For the exact formula, worked examples, and guidance for wallets and integrators on detecting the charge, see [Gas Over-Reservation Penalty](gas-penalty.md).
+
 #### The 10% Rule
 
-The penalty only activates when a transaction uses **less than 10%** of its declared gas limit. Any transaction that uses 10% or more of its gas limit pays zero penalty.
+The penalty only activates when a transaction uses **less than 10%** of its declared gas limit. For legacy, EIP-2930 and EIP-1559 transactions, using 10% or more of the gas limit pays zero penalty.
+
+**EIP-7702 set-code transactions are measured differently.** Each authorization tuple costs a flat 25,000 gas, charged for the tuple's presence alone. That gas is removed from *both* the usage figure and the gas limit before the 10% test runs, so an authorization list cannot be used to clear the threshold. A type-0x04 transaction can sit above 10% raw usage and still pay a large penalty: 120 tuples plus 21,000 gas of real work under a 30,000,000 gas limit is 10.07% raw usage and pays 26,560,959 gas. Read the [set-code section](gas-penalty.md#eip-7702-set-code-transactions) of the detailed page before setting a gas limit on a set-code transaction.
 
 Additionally, transactions with a gas limit at or below 210,000 are always exempt, regardless of usage ratio. This protects simple transfers and low-cost interactions from unintended penalties.
 
@@ -37,6 +41,10 @@ For transactions above the minimum gas limit threshold and below 10% usage:
 usage_ratio = gas_used / gas_limit
 inefficiency = 0.10 - usage_ratio
 penalty_gas = (inefficiency^2 / 0.10^2) * unused_gas
+
+# EIP-7702 only: take the ratio net of the authorization intrinsic.
+# unused_gas is unchanged, since the intrinsic cancels out of the difference.
+usage_ratio = (gas_used - auth_intrinsic) / (gas_limit - auth_intrinsic)
 ```
 
 Where:
@@ -44,6 +52,7 @@ Where:
 * `gas_used` is the actual gas consumed (before EVM refunds like SSTORE clearing)
 * `gas_limit` is the gas limit declared by the sender
 * `unused_gas = gas_limit - gas_used` (computed from the same pre-refund `gas_used`)
+* `auth_intrinsic = 25,000 * N` for an EIP-7702 transaction carrying `N` authorization tuples, and zero for every other type
 * The result is clamped so the penalty never exceeds `unused_gas`
 
 **Note on EVM refunds:** The penalty calculation uses pre-refund gas (actual execution cost) to determine the usage ratio, so SSTORE refunds do not artificially inflate the penalty. The standard EVM refund is still applied when computing the user's gas reimbursement.
@@ -63,6 +72,8 @@ The penalty is deducted from what would otherwise be refunded to the transaction
 
 ### Example Penalty Table
 
+Every row is a plain transfer with no authorization list. Worked EIP-7702 rows are in the [set-code section](gas-penalty.md#eip-7702-set-code-transactions) of the detailed page.
+
 | Gas Limit  | Gas Used | Usage % | Unused Gas | Penalty Gas | Penalty % of Unused |
 | ---------- | -------- | ------- | ---------- | ----------- | ------------------- |
 | 21,000     | 21,000   | 100%    | 0          | 0           | 0%                  |
@@ -75,20 +86,18 @@ The penalty is deducted from what would otherwise be refunded to the transaction
 
 ### How to Avoid Penalties
 
-1. **Use accurate gas estimation.** Call `eth_estimateGas` before submitting transactions and set the gas limit based on the estimate. A reasonable buffer (e.g., 1.5x-2x the estimate) will not trigger penalties as long as the final usage stays above 10% of the gas limit.
-2. **Understand the 10x safe zone.** As a rule of thumb, if your gas limit is no more than 10x your actual gas consumption, you will never pay a penalty. A simple transfer using \~21,000 gas can safely use a gas limit up to 210,000 with zero penalty.
+1. **Use accurate gas estimation.** Call `eth_estimateGas` before submitting transactions and set the gas limit based on the estimate. A reasonable buffer (e.g., 1.5x-2x the estimate) will not trigger penalties as long as the final usage stays above 10% of the gas limit. For an EIP-7702 transaction, apply the buffer to the part of the estimate that is not authorization gas; the `25,000 * N` intrinsic is a fixed cost and needs no buffer.
+2. **Understand the 10x safe zone.** As a rule of thumb, if your gas limit is no more than 10x your actual gas consumption, you will never pay a penalty. A simple transfer using \~21,000 gas can safely use a gas limit up to 210,000 with zero penalty. **For an EIP-7702 transaction, apply the rule to non-authorization gas only:** keep `gas_limit - 25,000 * N` under ten times the gas you expect to spend outside the authorization list. Ten tuples behind 21,000 gas of work under a 2,710,000 gas limit is exactly 10x the spend, and still pays 2,040,359 gas of penalty.
 3. **Small transactions are exempt.** Any transaction with a gas limit of 210,000 or less is exempt from penalties entirely, regardless of usage ratio.
 4. **Do not hardcode inflated gas limits.** Setting a gas limit to the maximum batch gas without estimating actual usage is the primary behavior this penalty targets. Bridge contracts and relayers should always estimate gas for each message rather than using a static high value.
 
 ### Summary
 
-| Property                      | Value                                                |
-| ----------------------------- | ---------------------------------------------------- |
-| Penalty threshold             | Usage below 10% of gas limit                         |
-| Scaling                       | Quadratic (gentle near threshold, steep at extremes) |
-| Minimum gas limit for penalty | > 210,000                                            |
-| Penalty destination           | Base-fee address (for governance processing)         |
-| Maximum penalty               | Cannot exceed unused gas                             |
-| Safe multiplier               | Up to 10x estimated gas = zero penalty               |
-
-For the exact formula, worked examples, and guidance for wallets and integrators on detecting the charge, see [Gas Over-Reservation Penalty](gas-penalty.md).
+| Property                      | Value                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------ |
+| Penalty threshold             | Usage below 10% of gas limit; for EIP-7702, usage and limit net of authorization gas |
+| Scaling                       | Quadratic (gentle near threshold, steep at extremes)                                 |
+| Minimum gas limit for penalty | > 210,000; for EIP-7702, > 210,000 plus authorization gas                            |
+| Penalty destination           | Base-fee address (for governance processing)                                         |
+| Maximum penalty               | Cannot exceed unused gas                                                             |
+| Safe multiplier               | Up to 10x estimated gas = zero penalty; for EIP-7702, 10x the non-authorization gas  |

@@ -140,7 +140,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Rejected requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body)."
+      "description": "Rejected requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, invalid_authorization_list, unreadable_body)."
     },
     {
       "id": 6,

@@ -206,10 +206,16 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
 /// Shallow pre-flight for `eth_sendRawTransaction`.
 ///
 /// Returns `Some((error, id))` only when `body` is a single
-/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
-/// decodes to an EIP-4844 blob transaction (which the network does not accept).
-/// Every other request — including batches, other methods, and any
-/// structurally-off submission — returns `None` and is forwarded unchanged.
+/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded,
+/// decodes to a type outside the executable allowlist (legacy, EIP-2930,
+/// EIP-1559, and EIP-7702 are accepted; an EIP-4844 blob transaction is not),
+/// or decodes to an EIP-7702 transaction whose authorization list fails
+/// [`tn_types::batch_allowlisted_authorization_list`] (empty, or longer than
+/// the network's cap; such a transaction can never execute, so this is not a
+/// false rejection). Every other request, including JSON array batches, other
+/// methods, and any structurally-off submission, returns `None` and is
+/// forwarded unchanged; the worker's own pool is the authoritative enforcement
+/// for the elements of a batch.
 ///
 /// The `id` rides along with the rejection so the response path does not have
 /// to parse the body again. Only the reject paths recover it, and they read it
@@ -253,6 +259,14 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
             Err(_) => Some(GatewayError::InvalidTransaction),
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
                 Some(GatewayError::UnsupportedTransactionType)
+            }
+            // Epoch 0: the authorization-list cap is epoch-uniform today, and the
+            // screen only front-runs a rejection the worker's own pool issues. If a
+            // future fork makes the cap epoch-varying, this screen must loosen (use
+            // the largest cap across epochs), never tighten, to preserve the
+            // no-false-rejection property documented above.
+            Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
+                Some(GatewayError::InvalidAuthorizationList)
             }
             Ok(_) => None,
         }
@@ -469,11 +483,13 @@ mod tests {
     /// well-formed, non-blob raw transaction that must be forwarded untouched.
     const EIP155_LEGACY_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
 
-    /// The hex of a genuine, decodable transaction of a type outside the batch
-    /// allowlist: EIP-7702 (type 4) is the cheapest such type, needing no
-    /// sidecar. Built from a default body and a dummy signature, since
-    /// `decode_2718` checks structure, not signature validity.
-    fn eip7702_raw_hex() -> String {
+    /// The hex of a genuine, decodable EIP-7702 (type 4) transaction whose
+    /// authorization list is empty. Type 4 is on the batch allowlist, so this
+    /// fixture is rejected for its list, not its type: the empty list fails
+    /// `batch_allowlisted_authorization_list`'s lower bound. Built from a
+    /// default body and a dummy signature, since `decode_2718` checks
+    /// structure, not signature validity.
+    fn eip7702_empty_auth_list_raw_hex() -> String {
         let signature = EthSignature::new(U256::from(1), U256::from(1), false);
         let signed = TxEip7702::default().into_signed(signature);
         let encoded = PooledTransaction::Eip7702(signed).encoded_2718();
@@ -520,6 +536,9 @@ mod tests {
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
                 Some((GatewayError::UnsupportedTransactionType, id))
             }
+            Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
+                Some((GatewayError::InvalidAuthorizationList, id))
+            }
             Ok(_) => None,
         }
     }
@@ -538,8 +557,8 @@ mod tests {
             send_raw(&valid),
             send_raw(r#"["0xdeadbeef"]"#),
             send_raw(r#"["not-hex"]"#),
-            // Decodes cleanly, but to a type outside the batch allowlist.
-            send_raw(&format!("[\"{}\"]", eip7702_raw_hex())),
+            // Decodes cleanly, but to an empty EIP-7702 authorization list.
+            send_raw(&format!("[\"{}\"]", eip7702_empty_auth_list_raw_hex())),
             send_raw("[]"),
             send_raw(r#"[123]"#),
             send_raw(r#"[null]"#),
@@ -718,23 +737,98 @@ mod tests {
         assert!(err.is_some());
     }
 
-    /// The previously untested reject arm: a payload that decodes cleanly but
-    /// to a type outside the batch allowlist (legacy / EIP-2930 / EIP-1559)
-    /// must be rejected as unsupported, with its id, not as undecodable. The
-    /// old parse rejected it the same way, so the fixture rides the
-    /// equivalence corpus too.
+    /// A payload that decodes cleanly but is rejected on its merits comes back
+    /// with its id, not as undecodable. Type `0x04` is on the batch allowlist,
+    /// so this empty-authorization-list transaction is refused for its list
+    /// rather than its type: EIP-7702 declares an empty list invalid and reth's
+    /// pool rejects it at admission, so the screen only front-runs a rejection
+    /// the worker would issue anyway. This is the only coverage of the
+    /// predicate's lower bound at the gateway. The reference parse rejects it
+    /// the same way, so the fixture rides the equivalence corpus too.
     #[test]
-    fn decodable_but_disallowed_tx_type_is_rejected_with_its_id() {
+    fn decodable_but_rejected_payload_carries_its_id() {
         let body = format!(
             r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":42}}"#,
-            eip7702_raw_hex()
+            eip7702_empty_auth_list_raw_hex()
         )
         .into_bytes();
 
-        let (err, id) = screen_raw_transaction(&body).expect("disallowed type must be rejected");
-        assert!(matches!(err, GatewayError::UnsupportedTransactionType));
+        let (err, id) =
+            screen_raw_transaction(&body).expect("empty authorization list must be rejected");
+        assert!(matches!(err, GatewayError::InvalidAuthorizationList));
         assert_eq!(id, RequestId::from_id(serde_json::json!(42)));
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+    }
+
+    #[test]
+    fn eip7702_typed_payload_is_forwarded() {
+        use tn_types::{
+            Address, Authorization, Encodable2718, EthSignature, SignableTransaction, TxEip7702,
+            U256,
+        };
+
+        // A well-formed type-`0x04` (EIP-7702) set-code transaction is on the
+        // executable allowlist and must be forwarded. The screen is decode-only
+        // and never recovers signers, so dummy signatures suffice.
+        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let authorization =
+            Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 };
+        let tx = TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![authorization.into_signed(dummy_signature)],
+            input: Default::default(),
+        };
+        let raw = tx.into_signed(dummy_signature).encoded_2718();
+        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        assert!(screen_err(&send_raw(&format!("[\"{raw_hex}\"]"))).is_none());
+    }
+
+    #[test]
+    fn over_cap_eip7702_payload_is_rejected() {
+        use tn_types::{
+            Address, Authorization, Encodable2718, EthSignature, SignableTransaction, TxEip7702,
+            U256,
+        };
+
+        // A type-`0x04` transaction whose authorization list exceeds the
+        // network cap can never execute (see
+        // `tn_types::batch_allowlisted_authorization_list`), so the screen
+        // rejects it before the upstream round-trip. Dummy signatures suffice:
+        // the screen reads the list length and never recovers signers.
+        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let over_cap = usize::try_from(tn_types::max_tx_authorizations(0))
+            .expect("cap fits usize")
+            .checked_add(1)
+            .expect("cap + 1 fits usize");
+        let authorization_list = (0..over_cap)
+            .map(|_| {
+                Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 }
+                    .into_signed(dummy_signature)
+            })
+            .collect();
+        let tx = TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list,
+            input: Default::default(),
+        };
+        let raw = tx.into_signed(dummy_signature).encoded_2718();
+        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        let err = screen_err(&send_raw(&format!("[\"{raw_hex}\"]")));
+        assert!(matches!(err, Some(GatewayError::InvalidAuthorizationList)));
     }
 
     #[test]
