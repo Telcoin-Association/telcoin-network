@@ -11225,6 +11225,7 @@ name = "state-sync"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "futures",
  "metrics",
  "metrics-util",
  "parking_lot",

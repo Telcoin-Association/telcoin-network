@@ -37,9 +37,9 @@ use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Multiaddr,
-    P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
+    Multiaddr, P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager,
+    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -971,15 +971,6 @@ where
         // #912. `worker_batch_topic` follows the same per-epoch pattern in
         // `spawn_worker_network_for_epoch`, and is additionally gated on node mode: only
         // committee validators subscribe, observers unsubscribe (issue #960).
-        state_sync::spawn_epoch_record_collector(
-            self.consensus_chain.clone(),
-            primary_network_handle.clone(),
-            self.consensus_bus.clone(),
-            node_task_manager.get_spawner(),
-            self.node_shutdown.subscribe(),
-        )
-        .await?;
-
         spawn_epoch_vote_collector(
             self.consensus_chain.clone(),
             self.consensus_bus.clone(),
@@ -988,13 +979,6 @@ where
             node_task_manager.get_spawner(),
             self.node_shutdown.clone(),
         );
-
-        seed_node_mode_on_startup(
-            self.consensus_chain.epochs(),
-            self.consensus_bus.node_mode(),
-            &self.key_config.primary_public_key(),
-        )
-        .await;
 
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed
         // only by the in-memory `epoch_record_watch`, so a record that a previous process
@@ -1005,6 +989,50 @@ where
             self.consensus_bus.epoch_record_watch(),
         )
         .await;
+
+        // Startup ordering is load-bearing: subscribe the vote collector, re-vote durable records,
+        // seed the dummy, sync records, seed the mode, then start background collection. The
+        // re-vote hook must never see the uncertifiable dummy, and the two record
+        // collectors must not race.
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
+            let (committee, ..) = self.get_committee_with_epoch_start_info(&engine).await?;
+            eyre::ensure!(
+                committee.epoch() == 0,
+                "We have epoch 0 in our database if we are past epoch 0, on {}",
+                committee.epoch()
+            );
+            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            // This in-memory anchor is neither persisted nor signed and is replaced at epoch close.
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
+        }
+
+        let synced_epoch = state_sync::sync_epoch_records_to_tip(
+            &self.consensus_chain,
+            &primary_network_handle,
+            &self.consensus_bus,
+            self.node_shutdown.subscribe(),
+        )
+        .await;
+        info!(target: "epoch-manager", synced_epoch, "startup epoch record sync finished");
+
+        seed_node_mode_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.node_mode(),
+            &self.key_config.primary_public_key(),
+        )
+        .await;
+
+        state_sync::spawn_epoch_record_collector(
+            self.consensus_chain.clone(),
+            primary_network_handle.clone(),
+            self.consensus_bus.clone(),
+            node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        )
+        .await?;
 
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
