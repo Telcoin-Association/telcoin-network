@@ -4,6 +4,9 @@
 #![allow(missing_docs)]
 
 mod stores;
+
+#[cfg(test)]
+mod batch_slot_tests;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
@@ -171,7 +174,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
         .expect("Cannot open database (epoch)");
     let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, KAD_MAX, GROWTH)
         .expect("Cannot open database (kad)");
-    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, CACHE_MAX, CACHE_GROWTH)
+    // Preserve the existing four table slots and add the three slot metadata tables.
+    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4 + 3, CACHE_MAX, CACHE_GROWTH)
         .expect("Cannot open database (cache)");
 
     let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);

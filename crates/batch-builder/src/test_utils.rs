@@ -10,7 +10,18 @@ use tn_reth::{
     new_pool_txn, BestTransactions, InvalidPoolTransactionError, PeerBatchTxs, PoolTxn, PoolTxnId,
     SenderId, SenderIdentifiers, TxPool,
 };
-use tn_types::{Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, U256};
+use tn_types::{
+    Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, WorkerId, U256,
+};
+
+/// Build from the supplied pool through the production selection path for integration tests.
+pub fn build_test_batch<P: TxPool>(
+    args: BatchBuilderArgs<P>,
+    worker_id: WorkerId,
+    base_fee: u64,
+) -> Batch {
+    build_batch(args, worker_id, base_fee).batch
+}
 
 /// Attempt to update batch with accurate header information.
 ///
@@ -84,6 +95,12 @@ impl TxPool for TestPool {
 }
 
 impl TestPool {
+    /// Select a window whose lifetime is controlled by a particular builder regression.
+    #[cfg(test)]
+    pub(crate) fn with_peer_batch_window(self, peer_batch_txs: PeerBatchTxs) -> Self {
+        Self { peer_batch_txs, ..self }
+    }
+
     /// Override the balance [`TxPool::get_account_balances`] reports for `address`.
     #[cfg(test)]
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {

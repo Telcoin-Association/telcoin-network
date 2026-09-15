@@ -214,14 +214,10 @@ where
 
     /// Validate a gossip-prefetched batch body, then cache it on success.
     ///
-    /// The vote-path sync (`PrimaryReceiverHandler::synchronize`) treats a digest
-    /// already present in `NodeBatchesCache` as validated-and-available and skips
-    /// `validate_batch` for it. A body fetched by the gossip prefetch must therefore
-    /// be validated here before it enters that cache, exactly as
-    /// `process_report_batch` does; an invalid body is dropped (never cached) and the
-    /// failure recorded. Without this, a Byzantine committee member could gossip and
-    /// serve a semantically-invalid batch, have every honest worker cache it
-    /// unvalidated, and then get it voted on and certified (issue #933).
+    /// Prefetch validates before caching and never contributes an availability vote. Fresh
+    /// vote-path sync revalidates cached native records and durably reserves their slot before
+    /// replying. Cached availability alone cannot bypass the reservation barrier. Invalid
+    /// prefetched bodies are dropped and the failure is recorded (issue #933).
     ///
     /// A batch for a future epoch is discarded rather than cached: the cache is
     /// cleared on epoch boundaries and storing it would let a rogue validator waste
@@ -286,8 +282,14 @@ where
         })?;
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
-        self.validator
-            .validate_batch(sealed_batch.clone())
+        self.consensus_config
+            .slot_votes()
+            .validate_and_reserve(
+                &self.consensus_config.slot_control(),
+                self.validator.as_ref(),
+                sealed_batch.clone(),
+            )
+            .await
             .inspect_err(|_| self.metrics.record_batch_validation_failure())?;
 
         let (mut batch, digest) = sealed_batch.split();

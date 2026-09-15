@@ -565,6 +565,120 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An observer keeps retrying after submission succeeds, until execution confirms the nonce.
+#[tokio::test]
+async fn native_ack_retains_transactions_until_canonical_execution() -> eyre::Result<()> {
+    let directory = TempDir::new()?;
+    let tasks = TaskManager::default();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let env = RethEnv::new_for_temp_chain(chain.clone(), directory.path(), &tasks, None)?;
+    let pool = env.init_txn_pool(BaseFeeContainer::default())?;
+    let fixture =
+        tn_test_utils::CommitteeFixture::builder(tn_storage::mem_db::MemDatabase::default).build();
+    let slots = tn_types::BatchSlots::new(
+        env.chainspec().chain_id().into(),
+        fixture.committee(),
+        tn_types::BatchSlotParent::new(tn_types::B256::ZERO, chain.sealed_genesis_header().hash()),
+    )?;
+    let store = tn_types::BatchSlotVoteStore::new(
+        tn_storage::mem_db::MemDatabase::default(),
+        slots.epoch(),
+    );
+    store.initialize().await?;
+    let receiver = env.batch_slots().install(slots.clone(), None);
+    let control = env.batch_slots().clone();
+    let publication = tokio::spawn(async move { control.serve(store, receiver).await });
+    let (to_worker, mut submitted) = tokio::sync::mpsc::channel(2);
+    let builder = BatchBuilder::new(
+        &env,
+        pool.clone(),
+        to_worker,
+        Address::ZERO,
+        Duration::from_millis(20),
+        tasks.get_spawner(),
+        0,
+        MIN_PROTOCOL_BASE_FEE,
+        0,
+    )?;
+    let mut factory = TransactionFactory::new();
+    let transaction = factory.create_eip1559(
+        chain.clone(),
+        None,
+        env.get_gas_price()?,
+        Some(Address::ZERO),
+        U256::from(1),
+        Bytes::new(),
+    );
+    let _ = factory.submit_tx_to_pool(transaction, pool.clone()).await;
+    let building = tokio::spawn(builder.run());
+    let (first, acknowledgement) = timeout(Duration::from_secs(10), submitted.recv())
+        .await?
+        .ok_or_else(|| eyre::eyre!("builder stopped before first submission"))?;
+    acknowledgement.send(Ok(())).map_err(|_| eyre::eyre!("first acknowledgement was dropped"))?;
+    // Receiving the retry proves the first success was processed without evicting the nonce.
+    let (retry, acknowledgement) = timeout(Duration::from_secs(10), submitted.recv())
+        .await?
+        .ok_or_else(|| eyre::eyre!("builder stopped before retry"))?;
+    assert_eq!(first.batch.transactions(), retry.batch.transactions());
+    assert_eq!(pool.pool_size().pending, 1, "a successful submission is not canonical execution");
+    let _ = acknowledgement.send(Ok(()));
+    building.abort();
+    let _ = building.await;
+    let (batch, _) = first.split();
+    let sender = recover_raw_transaction(
+        batch.transactions.first().ok_or_else(|| eyre::eyre!("empty retry fixture"))?,
+    )?
+    .signer();
+    let bucket = slots.bucket(sender);
+    let owner = *slots.producer(slots.position(bucket)?)?;
+    let authority = fixture
+        .authorities()
+        .find(|authority| {
+            tn_types::BlsSigner::public_key(authority.consensus_config().key_config()) == owner
+        })
+        .ok_or_else(|| eyre::eyre!("assigned producer is missing"))?;
+    let proposal =
+        slots.sign_proposal(bucket, owner, batch, authority.consensus_config().key_config())?;
+    let envelope = proposal.envelope()?;
+    let output = ConsensusOutput::new(
+        CommittedSubDag::new(
+            vec![Certificate::default()],
+            Certificate::default(),
+            1,
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        ),
+        ConsensusHeaderDigest::default(),
+        1,
+        false,
+        VecDeque::from([envelope.digest()]),
+        vec![CertifiedBatch { address: Address::ZERO, batches: vec![envelope] }],
+    );
+    let args = BuildArguments::new(env.clone(), output, chain.sealed_genesis_header());
+    let gas = GasAccumulator::new(1);
+    gas.rewards_counter().set_committee(fixture.committee());
+    let (updates, _receiver) = tokio::sync::mpsc::channel(8);
+    let executed = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            updates,
+        )
+    });
+    assert_eq!(timeout(Duration::from_secs(20), executed).await???.number, 1);
+    wait_until(
+        Duration::from_secs(10),
+        "canonical execution removes retained transaction",
+        || async { Ok(pool.pool_size().pending == 0) },
+    )
+    .await?;
+    env.batch_slots().disable();
+    publication.abort();
+    Ok(())
+}
+
 /// A transaction a validated peer batch already carries must not be packed into this node's own
 /// batch. The client can submit one signed transaction to every committee validator, so without
 /// the deferral every worker packs a copy, every copy passes peer validation and takes a vote

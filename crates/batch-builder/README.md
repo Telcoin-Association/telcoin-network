@@ -3,7 +3,11 @@
 ## Purpose & Scope
 
 The batch builder selects transactions from the node's transaction pool and assembles them into batches that extend the current canonical tip.
-It operates as a Future-based task that coordinates with the consensus layer to ensure batches are only mined after successfully reaching quorum of support from other workers.
+It operates as a Future-based task that coordinates availability with the consensus layer.
+After the coordinated [native sender-slot fork](../../docs/native-batch-slots.md), validators
+build only their currently assigned bucket, and successful availability or forwarding leaves
+transactions pending until canonical execution removes them. Quorum-backed retries preserve
+fallback when a producer is unavailable. The fork remains inactive until an epoch is scheduled.
 
 ## Key Components
 
@@ -35,6 +39,9 @@ The logic for validating batches is in the `batch-validator` library.
 If a node includes a batch that was not validated by the worker's peers, the Primary's `Header` will fail validation.
 
 ## Pool State Updates and Nonce Tracking
+
+The optimistic updates below describe legacy batching. Native slots retain transactions and
+account state until canonical execution, including after a successful forwarding response.
 
 ### Problem
 
@@ -99,10 +106,15 @@ Future iterations are planned to address this inefficiency.
 
 One local mitigation is in place (issue #1329): when this node validates a peer's batch, the batch's transaction hashes are deferred by this node's builder for `PEER_BATCH_DEFER_TTL` (10 seconds, the default batch vote timeout), bounded by `PEER_BATCH_SEEN_MAX_TXS` remembered hashes.
 The builder skips a deferred hash and, with it, that sender's later nonces: those nonces wait exactly as long as the deferred earlier nonce does, which they could not execute ahead of anyway.
-A transaction a client sent to every validator is therefore not packed by every worker at once.
-The builder only skips the transaction for this build, and it seals nothing at all when every pending transaction is deferred (`BuildOutcome::NothingToSeal`), because an empty batch is rejected by peers and penalized as fatal.
+Workers that validate a peer batch before selecting their own transactions can avoid packing those copies. Workers that select first can still propose duplicates, including a copy on every validator when all selections precede peer validation.
+The builder only skips the transaction for this build, and it seals nothing at all when every pending transaction is deferred (`BuildOutcome::Empty`), because an empty batch is rejected by peers and penalized as fatal.
 Each arming costs a transaction at most one TTL: the deferral expires on its own, the entry stays immune to re-arming until it is forgotten at twice the TTL, and execution still tolerates duplicates.
 A flood of peer batches cannot evict a live entry; once the window is full further hashes are simply not remembered, so a flood can only switch the deferral off, never re-arm it.
+
+Issue #1377 adds native sender-slot admission and quorum-backed failover, together with
+per-worker retained-hash and dropped-insertion telemetry for the legacy deferral window.
+See [native sender slots](../../docs/native-batch-slots.md) for activation, durability and
+remaining costs, and [peer-batch deferral](../../docs/peer-batch-deferral.md) for legacy metrics.
 
 ### Safety of Early Pool Updates
 

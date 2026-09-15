@@ -4,6 +4,8 @@
 
 #![allow(unused_crate_dependencies)]
 
+mod native_slots;
+
 use assert_matches::assert_matches;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},

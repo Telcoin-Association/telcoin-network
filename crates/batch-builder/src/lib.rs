@@ -8,9 +8,10 @@
 //! Upon successfully building the next block, the block builder forwards to the worker's block
 //! provider. The worker's block provider reliably broadcasts the block and tries to reach quorum
 //! within a time limit. If quorum fails, the block builder receives the error and does not mine the
-//! transactions. If quorum is reached, the transactions are mined and removed from the pending
-//! pool. When this task removes transactions from the pending pool, it uses the current canonical
-//! tip. The pool's pending base fee is never taken from a canonical update: it always comes from
+//! transactions. Legacy batching removes transactions after quorum, using the current canonical
+//! tip. Native sender slots retain acknowledged transactions until canonical execution, so
+//! losing proposals and unsuccessful forwarding remain retryable. The pool's pending base fee
+//! is never taken from a canonical update: it always comes from
 //! the worker's shared [`BaseFeeContainer`](tn_types::gas_accumulator::BaseFeeContainer), the gas
 //! accumulator's fee for the current epoch (issue #1262).
 
@@ -21,7 +22,7 @@ pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{future::OptionFuture, StreamExt};
 use std::time::{Duration, Instant};
-use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
+use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
     TxHash, WorkerId,
@@ -56,8 +57,8 @@ enum BuildOutcome {
     /// Transaction selection produced no batch to propose. Defer the next build without
     /// sealing, updating the pool, or changing the forward-admission backoff.
     Empty,
-    /// The batch reached quorum (or a forward task was admitted to deliver it): prune the
-    /// mined transactions from the pool and apply the account changes.
+    /// The batch reached quorum or a forward task accepted it. Legacy batching applies its
+    /// optimistic pool update; native slots retain transactions until canonical execution.
     Mined(MinedBatchResult),
     /// The worker refused the seal because no forward admitted the batch
     /// ([`BlockSealError::NotValidator`], issue #1132). The pool keeps its transactions; the
@@ -223,7 +224,8 @@ impl BatchBuilder {
             // Selection can also skip every candidate, including peer-deferred transactions
             // (issue #1329). Peers reject empty batches, so record the deferral metric above
             // but send nothing to the worker in every empty-build case.
-            if batch.transactions().is_empty() {
+            let retry_due = worker_id == 0 && pool.batch_slot_control().is_some_and(|control| control.retry_position().is_some());
+            if batch.transactions().is_empty() && !retry_due {
                 debug!(
                     target: "worker::batch_builder",
                     peer_deferred,
@@ -275,7 +277,8 @@ impl BatchBuilder {
                                         debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
                                         Ok(BuildOutcome::Refused)
                                     }
-                                    BlockSealError::QuorumRejected
+                                    BlockSealError::SlotAdmission(_)
+                                    | BlockSealError::QuorumRejected
                                     | BlockSealError::AntiQuorum
                                     | BlockSealError::Timeout
                                     | BlockSealError::FailedToReport
@@ -413,7 +416,12 @@ impl BatchBuilder {
             // closed, so a canonical-state wake-up cannot bypass it (issue #1145)
             let backing_off = self.refusal_backoff_holds();
             if self.pending_task.is_none() && !defer_build && !backing_off {
-                if self.pool.pending_transactions().is_empty() {
+                let retry_due = self.worker_id == 0
+                    && self
+                        .pool
+                        .batch_slot_control()
+                        .is_some_and(|control| control.retry_position().is_some());
+                if self.pool.pending_transactions().is_empty() && !retry_due {
                     // reset interval to wake up after some time
                     //
                     // only need to reset here if there is no pending block being built
@@ -476,7 +484,14 @@ impl BatchBuilder {
                     // NOTE: a mined batch that pruned nothing applies no pool update; it also
                     // proves nothing about forward admission, so it neither ends nor extends
                     // a refusal backoff (issue #1145)
-                    if mined_transactions.is_empty() {
+                    let native = self.pool.batch_slot_control().is_some_and(|control| control.snapshot().is_some());
+                    if native && !mined_transactions.is_empty() {
+                        self.note_recovery();
+                    }
+                    // Native acknowledgement only proves availability or forwarding admission.
+                    // Canonical maintenance removes transactions after actual execution, leaving
+                    // retries possible after a proposal loses its slot or an RPC lies about success.
+                    if mined_transactions.is_empty() || native {
                         // reset interval to prevent immediate re-wake from stale tick
                         self.max_delay_interval.reset();
 
@@ -534,7 +549,7 @@ mod tests {
         payload::BuildArguments,
         recover_raw_transaction,
         test_utils::{create_committee_from_state, TransactionFactory},
-        ForwardTargetPolicy, RethChainSpec, TxPool as _, WorkerRpcForwarder,
+        ForwardTargetPolicy, RethChainSpec, WorkerRpcForwarder,
     };
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{

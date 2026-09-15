@@ -153,6 +153,9 @@ impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for DagError {
 /// Errors that can be reported while seal a block.
 #[derive(Clone, Debug, Error)]
 pub enum BlockSealError {
+    /// The proposed native slot failed authentication, ownership or pinned admission checks.
+    #[error("Batch slot admission failed: {0}")]
+    SlotAdmission(String),
     #[error("Block was rejected by enough peers to never reach quorum")]
     QuorumRejected,
     #[error("Anti quorum reached for block (note this may not be permanent)")]

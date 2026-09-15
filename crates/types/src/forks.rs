@@ -3,6 +3,32 @@
 use crate::Epoch;
 use alloy::primitives::{b256, B256};
 
+/// First epoch using signed sender slots and quorum-approved producer retries.
+///
+/// Dormant until a coordinated network upgrade chooses a future epoch. Every validator
+/// and execution node must deploy the same activation point before that epoch begins.
+/// Enabling this changes batch encoding and consensus-to-execution selection.
+pub const BATCH_SLOTS_FORK_EPOCH: Epoch = Epoch::MAX;
+
+/// Whether an epoch uses native slot admission and execution selection.
+///
+/// Production builds have no environment override. Historical epochs retain legacy batches.
+pub fn batch_slots_active(epoch: Epoch) -> bool {
+    let fork = BATCH_SLOTS_FORK_EPOCH;
+    #[cfg(feature = "test-utils")]
+    let fork = batch_slots_fork_epoch_override().unwrap_or(fork);
+    fork != Epoch::MAX && epoch >= fork
+}
+
+/// Process-local test fork point for multi-node tests, compiled out of production builds.
+#[cfg(feature = "test-utils")]
+pub fn batch_slots_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_BATCH_SLOTS_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 /// Keccak-256 hash of the pre-fork `ConsensusRegistry` runtime bytecode deployed on the live
 /// adiri testnet (the registry account's `code` in the committed
 /// `chain-configs/testnet/genesis.yaml`).
@@ -715,6 +741,7 @@ pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
             ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
             ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+            ("TN_BATCH_SLOTS_FORK_EPOCH", batch_slots_fork_epoch_override()),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
         ]
         .into_iter()

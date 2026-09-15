@@ -3,6 +3,7 @@
 //! This approach heavily inspired by reth's `default_ethereum_payload_builder`.
 
 use crate::error::{EngineResult, TnEngineError};
+use std::borrow::Cow;
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
@@ -10,11 +11,79 @@ use tn_reth::{
     RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, EngineUpdate,
-    Hash as _, SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, max_batch_size, repack_monitor::RepackMonitor,
+    Address, Batch, BatchSlotError, BatchSlotMessage, BatchSlotOutput, BatchSlotTransition,
+    ConsensusOutput, EngineUpdate, Hash as _, SealedHeader, SignedBatchSlotRecord, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span, warn};
+
+/// One selected execution body with its original consensus position.
+struct ExecutionBatch<'a> {
+    /// Flat consensus index, preserved for digest and randomness derivation.
+    index: usize,
+    /// Certificate author used by the existing repacking monitor.
+    producer: Address,
+    /// Legacy body borrowed from the output, or the selected signed native body.
+    batch: Cow<'a, Batch>,
+}
+
+/// Authenticate and select native slots before any speculative EVM state changes.
+fn select_execution_batches<'a>(
+    reth_env: &RethEnv,
+    output: &'a ConsensusOutput,
+    slots: &mut Option<BatchSlotOutput>,
+) -> EngineResult<Vec<ExecutionBatch<'a>>> {
+    if slots.as_ref().is_some_and(|slots| slots.previous().epoch() != output.leader().epoch()) {
+        Err(TnEngineError::BatchSlot(BatchSlotError::WrongEpoch))
+    } else {
+        output.flatten_batches().into_iter().enumerate().try_fold(
+            Vec::new(),
+            |mut selected, (index, (certificate, batch))| {
+                let certificate = output
+                    .batches()
+                    .get(certificate)
+                    .ok_or(TnEngineError::NextBlockDigestMissing)?;
+                let batch =
+                    certificate.batches.get(batch).ok_or(TnEngineError::NextBlockDigestMissing)?;
+                let body = if let Some(slots) = slots.as_mut() {
+                    let bytes = batch
+                        .transactions
+                        .iter()
+                        .try_fold(0_usize, |size, tx| size.checked_add(tx.len()));
+                    if bytes.is_none_or(|bytes| bytes > max_batch_size(output.leader().epoch())) {
+                        Err(TnEngineError::BatchSlot(BatchSlotError::InvalidEnvelope))
+                    } else {
+                        let record = SignedBatchSlotRecord::from_envelope(batch)
+                            .map_err(TnEngineError::BatchSlot)?;
+                        let transition = slots.apply(&record).map_err(TnEngineError::BatchSlot)?;
+                        if transition == BatchSlotTransition::Selected {
+                            reth_env
+                                .validate_slot_transactions(slots.previous(), &record)
+                                .map_err(TnEngineError::BatchSlotAdmission)?;
+                            match record.message() {
+                                BatchSlotMessage::Proposal { batch, .. } => {
+                                    Ok(Some(Cow::Owned(batch.clone())))
+                                }
+                                BatchSlotMessage::Timeout { .. } => {
+                                    Err(TnEngineError::BatchSlot(BatchSlotError::InvalidEnvelope))
+                                }
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                } else {
+                    Ok(Some(Cow::Borrowed(batch)))
+                }?;
+                if let Some(batch) = body {
+                    selected.push(ExecutionBatch { index, producer: certificate.address, batch });
+                }
+                Ok(selected)
+            },
+        )
+    }
+}
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -95,7 +164,12 @@ pub fn execute_consensus_output(
         }
     }
 
-    // ensure at least 1 block for empty output when close_epoch is true
+    let mut slot_output = reth_env.batch_slots().prepare(output_digest);
+    let batches = select_execution_batches(&reth_env, &output, &mut slot_output)?;
+    let last_execution_index = batches.last().map(|batch| batch.index);
+    let slot_state_changed = slot_output.as_ref().is_some_and(BatchSlotOutput::changed);
+
+    // A native control transition also needs one durable execution anchor.
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
     // The pre-output canonical tip. Each block eagerly advances the shared in-memory state
@@ -112,8 +186,8 @@ pub fn execute_consensus_output(
     let mut output_overlay = OutputTrieOverlay::new();
 
     if batches.is_empty() {
-        if !output.close_epoch() {
-            // Skip execution entirely — no batches and epoch is not closing.
+        if !output.close_epoch() && !slot_state_changed {
+            // No execution body, epoch closing, or native control change needs a block.
             // Leader count was already incremented above for rewards tracking.
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");
             crate::metrics::ENGINE_METRICS.empty_outputs_skipped_total.increment(1);
@@ -130,8 +204,11 @@ pub fn execute_consensus_output(
 
         // Execute single empty block to close the epoch.
         // Use parent values for next block (these values would come from the worker's block).
-        let base_fee_per_gas = canonical_header.base_fee_per_gas.unwrap_or_default();
-        let gas_limit = canonical_header.gas_limit;
+        let (base_fee_per_gas, gas_limit) = if slot_output.is_some() {
+            (gas_accumulator.base_fee(0).base_fee(), max_batch_gas(epoch))
+        } else {
+            (canonical_header.base_fee_per_gas.unwrap_or_default(), canonical_header.gas_limit)
+        };
         let leader = output.leader().author();
         // INVARIANT: this lookup cannot miss for valid output, and the halt on `None` is a
         // deliberate fail-safe for impossible state; do NOT replace it with a default
@@ -169,8 +246,13 @@ pub fn execute_consensus_output(
             base_fee_per_gas,
             gas_limit,
             mix_hash,
-            0, // Use worker 0 becuase we have to provide on.
+            0, // Empty control blocks use worker zero.
         );
+        let payload = if slot_output.is_some() {
+            payload.with_execution_boundary(&output, true)
+        } else {
+            payload
+        };
 
         debug!(target: "engine", "executing empty batch payload");
 
@@ -192,23 +274,18 @@ pub fn execute_consensus_output(
         })?;
     } else {
         // loop and construct blocks from batches with transactions
-        for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
+        for ExecutionBatch { index: batch_index, producer, batch } in batches {
             let batch_digest = output
                 .get_batch_digest(batch_index)
                 .ok_or(TnEngineError::NextBlockDigestMissing)?;
-            let cert_batch = &output.batches()[cert_idx];
-            let batch = &cert_batch.batches[batch_idx_in_cert];
 
             // Watch for cross-producer transaction re-packing (issue #1259). Batches are
             // observed in ordering position, so the first-recorded copy of a transaction is
             // the copy execution credits with the priority fees. Telemetry only: a flagged
             // duplicate never changes execution, because an honest sender that submits the
             // same transaction to two validators produces the same signature.
-            let repacked = repack_monitor.observe_batch(
-                output.number(),
-                cert_batch.address,
-                &batch.transactions,
-            );
+            let repacked =
+                repack_monitor.observe_batch(output.number(), producer, &batch.transactions);
             if !repacked.is_empty() {
                 crate::metrics::ENGINE_METRICS
                     .cross_producer_repacked_txs_total
@@ -221,7 +298,7 @@ pub fn execute_consensus_output(
                     repacked.iter().take(4).map(|duplicate| duplicate.tx_hash).collect();
                 warn!(
                     target: "engine",
-                    producer = ?cert_batch.address,
+                    ?producer,
                     repacked = repacked.len(),
                     ?sample,
                     "batch repacks transactions first packed by another producer (priority-fee poaching indicator, issue #1259)"
@@ -253,6 +330,11 @@ pub fn execute_consensus_output(
                 mix_hash,
                 batch.worker_id,
             );
+            let payload = if slot_output.is_some() {
+                payload.with_execution_boundary(&output, Some(batch_index) == last_execution_index)
+            } else {
+                payload
+            };
 
             // execute the payload and update the current canonical header
             let executed = execute_payload(
@@ -307,6 +389,13 @@ pub fn execute_consensus_output(
         crate::metrics::ENGINE_METRICS.persist_failures_total.increment(1);
         rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
     })?;
+    if let Some(mut slot_output) = slot_output.filter(BatchSlotOutput::changed) {
+        slot_output.finalize(canonical_header.hash()).map_err(TnEngineError::BatchSlot)?;
+        reth_env
+            .batch_slots()
+            .commit_blocking(slot_output)
+            .map_err(TnEngineError::BatchSlotPublication)?;
+    }
     reth_env.announce_executed_output(
         executed_blocks,
         Some((leader_round, consensus_num_hash, engine_update_tx)),

@@ -47,6 +47,7 @@ use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
+mod batch_slots;
 mod close_epoch;
 mod run_epoch;
 mod start_epoch;

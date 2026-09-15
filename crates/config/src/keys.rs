@@ -565,6 +565,13 @@ impl BlsSigner for KeyConfig {
     }
 }
 
+impl tn_types::Signer for KeyConfig {
+    /// Sign protocol records through the configured key service without exposing private keys.
+    fn sign(&self, message: &[u8]) -> tn_types::BlsSignature {
+        self.request_signature_direct(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

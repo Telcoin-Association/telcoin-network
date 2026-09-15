@@ -12,15 +12,16 @@
 //! does) instead of packing a copy. No peer is penalized and nothing leaves the pool: after the
 //! peer batch executes, the canonical update drops the transaction from the pool anyway, so the
 //! memory only matters while the peer batch is in flight or lost. A build in which every pending
-//! transaction is deferred seals nothing at all (`BuildOutcome::NothingToSeal` in
+//! transaction is deferred seals nothing at all (`BuildOutcome::Empty` in
 //! `tn-batch-builder`), because an empty batch is a message peers reject and penalize as fatal.
 
+use metrics::{Counter, Gauge};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
-use tn_types::TxHash;
+use tn_types::{TxHash, WorkerId};
 
 /// How long a transaction stays deferred after a peer batch that carries it validates.
 ///
@@ -84,6 +85,68 @@ struct PeerBatchWindow {
     seen: HashMap<TxHash, Instant>,
     /// The same entries in insertion (time) order, oldest at the front.
     order: VecDeque<(Instant, TxHash)>,
+    /// Telemetry registered by the validator before it accepts peer batches.
+    metrics: PeerBatchMetrics,
+}
+
+/// Whether an attempted insertion retained a hash or lost deferral coverage.
+enum PeerBatchInsertion {
+    /// The hash was newly remembered.
+    Remembered,
+    /// The hash already has an entry, including the immune half of its lifetime.
+    AlreadyRemembered,
+    /// The hash was unknown and the bounded window had no room for it.
+    AtCapacity,
+}
+
+/// Handles shared by worker label, with one occupancy contribution per live window.
+struct PeerBatchMetrics {
+    /// Retained hashes, including immune entries and expired entries awaiting the next record.
+    retained_hashes: Gauge,
+    /// Unknown-hash insertion attempts dropped at capacity, including repeated attempts.
+    insertions_dropped_total: Counter,
+}
+
+impl std::fmt::Debug for PeerBatchMetrics {
+    /// Format the handles without requiring the recorder's implementation to implement `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerBatchMetrics").finish_non_exhaustive()
+    }
+}
+
+impl Default for PeerBatchMetrics {
+    /// Standalone windows remain unregistered until a validator assigns their worker label.
+    fn default() -> Self {
+        Self { retained_hashes: Gauge::noop(), insertions_dropped_total: Counter::noop() }
+    }
+}
+
+impl PeerBatchMetrics {
+    /// Convert a retained count to an exact gauge input; the per-window cap fits in `u32`.
+    fn retained_value(count: usize) -> f64 {
+        f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Register the bounded worker label, including a zero counter before any overflow occurs.
+    fn for_worker(worker_id: WorkerId) -> Self {
+        let metrics = Self {
+            retained_hashes: metrics::gauge!(
+                "tn_peer_batch.retained_hashes", "worker" => worker_id.to_string()
+            ),
+            insertions_dropped_total: metrics::counter!(
+                "tn_peer_batch.insertions_dropped_total", "worker" => worker_id.to_string()
+            ),
+        };
+        metrics.insertions_dropped_total.increment(0);
+        metrics
+    }
+}
+
+impl Drop for PeerBatchWindow {
+    /// Release only this window's contribution, including across overlapping epoch lifetimes.
+    fn drop(&mut self) {
+        self.metrics.retained_hashes.decrement(PeerBatchMetrics::retained_value(self.seen.len()));
+    }
 }
 
 impl Default for PeerBatchTxs {
@@ -98,6 +161,19 @@ impl PeerBatchTxs {
         Self::with_cap(ttl, PEER_BATCH_SEEN_MAX_TXS)
     }
 
+    /// Register this window's telemetry under `worker_id` before validating peer batches.
+    ///
+    /// Clones share one occupancy contribution. Re-registration and overlapping old/new epoch
+    /// windows preserve the total retained hashes for the worker; counters keep accumulating.
+    /// Occupancy includes immune entries and expired entries until the next record prunes them.
+    pub fn register_metrics(&self, worker_id: WorkerId) {
+        let mut window = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let retained = window.seen.len();
+        window.metrics.retained_hashes.decrement(PeerBatchMetrics::retained_value(retained));
+        window.metrics = PeerBatchMetrics::for_worker(worker_id);
+        window.metrics.retained_hashes.increment(PeerBatchMetrics::retained_value(retained));
+    }
+
     /// Create an empty window with an explicit capacity.
     ///
     /// Private: tests use a small capacity to exercise the full-window policy without recording
@@ -109,6 +185,7 @@ impl PeerBatchTxs {
                 cap,
                 seen: HashMap::new(),
                 order: VecDeque::new(),
+                metrics: PeerBatchMetrics::default(),
             })),
         }
     }
@@ -166,8 +243,19 @@ impl PeerBatchTxs {
 impl PeerBatchWindow {
     /// Forget what has aged out, then remember every hash that still fits.
     fn record(&mut self, hashes: &[TxHash], now: Instant) {
+        let retained_before = self.seen.len();
         self.forget_expired(now);
-        hashes.iter().for_each(|hash| self.insert(*hash, now));
+        let dropped = hashes.iter().fold(0_u64, |dropped, hash| match self.insert(*hash, now) {
+            PeerBatchInsertion::Remembered | PeerBatchInsertion::AlreadyRemembered => dropped,
+            PeerBatchInsertion::AtCapacity => dropped.saturating_add(1),
+        });
+        self.metrics.insertions_dropped_total.increment(dropped);
+        self.metrics.retained_hashes.increment(PeerBatchMetrics::retained_value(
+            self.seen.len().saturating_sub(retained_before),
+        ));
+        self.metrics.retained_hashes.decrement(PeerBatchMetrics::retained_value(
+            retained_before.saturating_sub(self.seen.len()),
+        ));
     }
 
     /// Return true if `hash` is remembered and its deferral has not elapsed at `now`.
@@ -197,11 +285,175 @@ impl PeerBatchWindow {
     ///
     /// A full window drops the hash instead of evicting a live entry, which is what stops a
     /// flood from re-arming a target's deferral (see [`PEER_BATCH_SEEN_MAX_TXS`]).
-    fn insert(&mut self, hash: TxHash, now: Instant) {
-        let fresh = self.seen.len() < self.cap && !self.seen.contains_key(&hash);
-        fresh.then_some(hash).into_iter().for_each(|hash| {
+    fn insert(&mut self, hash: TxHash, now: Instant) -> PeerBatchInsertion {
+        if self.seen.contains_key(&hash) {
+            PeerBatchInsertion::AlreadyRemembered
+        } else if self.seen.len() >= self.cap {
+            PeerBatchInsertion::AtCapacity
+        } else {
             self.seen.insert(hash, now);
             self.order.push_back((now, hash));
+            PeerBatchInsertion::Remembered
+        }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    //! Check retained counts and capacity loss across window lifetimes.
+
+    use super::*;
+    use metrics::{Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+    use metrics_util::{
+        debugging::DebugValue,
+        registry::{AtomicStorage, Registry},
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Preserve cumulative values across reads; `DebuggingRecorder` clears each snapshot.
+    struct TelemetryRecorder {
+        /// Atomic counter and gauge handles shared by matching metric keys.
+        registry: Registry<Key, AtomicStorage>,
+    }
+
+    impl TelemetryRecorder {
+        /// Create an isolated registry for the current test.
+        fn new() -> Self {
+            Self { registry: Registry::atomic() }
+        }
+
+        /// Observe the recorded values without resetting the handles held by live windows.
+        fn snapshot(&self) -> Vec<(Key, DebugValue)> {
+            let counters = self
+                .registry
+                .get_counter_handles()
+                .into_iter()
+                .map(|(key, value)| (key, DebugValue::Counter(value.load(Ordering::SeqCst))));
+            let gauges = self.registry.get_gauge_handles().into_iter().map(|(key, value)| {
+                (key, DebugValue::Gauge(f64::from_bits(value.load(Ordering::SeqCst)).into()))
+            });
+            counters.chain(gauges).collect()
+        }
+    }
+
+    impl Recorder for TelemetryRecorder {
+        /// Ignore counter descriptions, which these value assertions do not inspect.
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        /// Ignore gauge descriptions, which these value assertions do not inspect.
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        /// Ignore histogram descriptions, which these value assertions do not inspect.
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        /// Reuse the counter handle associated with this metric key.
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            self.registry.get_or_create_counter(key, |counter| Counter::from_arc(counter.clone()))
+        }
+
+        /// Reuse the gauge handle associated with this metric key.
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            self.registry.get_or_create_gauge(key, |gauge| Gauge::from_arc(gauge.clone()))
+        }
+
+        /// Supply a no-op handle for histogram instrumentation outside these assertions.
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    /// Observe capacity loss without counting remembered or immune hashes as dropped insertions.
+    #[test]
+    fn telemetry_distinguishes_capacity_loss_from_repeated_hashes() {
+        let recorder = TelemetryRecorder::new();
+        let sample = |name: &str| {
+            recorder.snapshot().into_iter().find_map(|(key, value)| {
+                (key.name() == name
+                    && key.labels().any(|label| label.key() == "worker" && label.value() == "7"))
+                .then_some(value)
+            })
+        };
+        let occupancy = "tn_peer_batch.retained_hashes";
+        let dropped = "tn_peer_batch.insertions_dropped_total";
+        let first = TxHash::from([1; 32]);
+        let second = TxHash::from([2; 32]);
+        let overflow = TxHash::from([3; 32]);
+        let t0 = Instant::now();
+        let ttl = PEER_BATCH_DEFER_TTL;
+
+        metrics::with_local_recorder(&recorder, || {
+            let window = PeerBatchTxs::with_cap(ttl, 2);
+            window.register_metrics(7);
+            assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+            assert!(matches!(sample(dropped), Some(DebugValue::Counter(0))));
+
+            window.record_at(&[first, second], t0);
+            window.record_at(&[first, overflow, overflow], t0 + Duration::from_secs(1));
+            assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 2.0));
+            assert!(matches!(sample(dropped), Some(DebugValue::Counter(2))));
+            assert!(!window.is_deferred_at(&overflow, t0 + Duration::from_secs(1)));
+
+            window.record_at(&[first], t0 + ttl);
+            assert!(!window.is_deferred_at(&first, t0 + ttl));
+            assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 2.0));
+            assert!(matches!(sample(dropped), Some(DebugValue::Counter(2))));
+
+            window.record_at(&[], t0 + ttl * 2);
+            assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+            window.record_at(&[overflow], t0 + ttl * 2);
+            assert!(window.is_deferred_at(&overflow, t0 + ttl * 2));
+            assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 1.0));
+            assert!(matches!(sample(dropped), Some(DebugValue::Counter(2))));
+        });
+        assert!(matches!(sample(occupancy), Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+    }
+
+    /// Clones, repeated registration, and overlapping epoch windows do not overwrite occupancy.
+    #[test]
+    fn telemetry_tracks_window_lifetimes_and_worker_labels() {
+        let recorder = TelemetryRecorder::new();
+        let occupancy = |worker: &str| {
+            recorder.snapshot().into_iter().find_map(|(key, value)| {
+                (key.name() == "tn_peer_batch.retained_hashes"
+                    && key.labels().any(|label| label.key() == "worker" && label.value() == worker))
+                .then_some(value)
+            })
+        };
+        let t0 = Instant::now();
+        metrics::with_local_recorder(&recorder, || {
+            let old = PeerBatchTxs::with_cap(PEER_BATCH_DEFER_TTL, 2);
+            old.record_at(&[TxHash::from([1; 32])], t0);
+            old.register_metrics(7);
+            let clone = old.clone();
+            old.register_metrics(7);
+            assert!(matches!(occupancy("7"), Some(DebugValue::Gauge(value)) if value.0 == 1.0));
+
+            let new = PeerBatchTxs::with_cap(PEER_BATCH_DEFER_TTL, 2);
+            new.register_metrics(7);
+            new.record_at(&[TxHash::from([2; 32]), TxHash::from([3; 32])], t0);
+            let other_worker = PeerBatchTxs::with_cap(PEER_BATCH_DEFER_TTL, 2);
+            other_worker.register_metrics(8);
+            other_worker.record_at(&[TxHash::from([4; 32])], t0);
+            assert!(matches!(occupancy("7"), Some(DebugValue::Gauge(value)) if value.0 == 3.0));
+            assert!(matches!(occupancy("8"), Some(DebugValue::Gauge(value)) if value.0 == 1.0));
+
+            drop(old);
+            assert!(matches!(occupancy("7"), Some(DebugValue::Gauge(value)) if value.0 == 3.0));
+            drop(clone);
+            assert!(matches!(occupancy("7"), Some(DebugValue::Gauge(value)) if value.0 == 2.0));
+            new.register_metrics(9);
+            assert!(matches!(occupancy("7"), Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+            assert!(matches!(occupancy("9"), Some(DebugValue::Gauge(value)) if value.0 == 2.0));
+        });
+        ["7", "8", "9"].into_iter().for_each(|worker| {
+            assert!(matches!(occupancy(worker), Some(DebugValue::Gauge(value)) if value.0 == 0.0));
         });
     }
 }

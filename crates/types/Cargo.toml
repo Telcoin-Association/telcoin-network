@@ -28,7 +28,7 @@ serde_yaml = { workspace = true }
 serde_repr = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "signal", "time"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 parking_lot = { workspace = true }

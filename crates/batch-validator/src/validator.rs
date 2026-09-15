@@ -13,11 +13,11 @@ use tn_types::{
 /// Type convenience for implementing block validation errors.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
-/// Batch validator
-/// Important note about batch validation, we rely on libp2p to verify that
-/// batches came from a committee member.  This means we do not generate or
-/// check our own signatures for batches since they all came from current
-/// committee members.
+/// Validate legacy batches or authenticated native sender-slot envelopes.
+///
+/// Legacy batch provenance relies on the authenticated committee network. Native envelopes
+/// additionally bind the chain, epoch, slot and full body with a committee BLS signature.
+/// Availability voters must also reserve the validated native record durably before replying.
 #[derive(Clone, Debug)]
 pub struct BatchValidator {
     /// Database provider to encompass tree and provider factory.
@@ -36,6 +36,74 @@ pub struct BatchValidator {
 }
 
 impl BatchValidation for BatchValidator {
+    fn slot_bucket(&self, transaction: &[u8]) -> BatchValidationResult<tn_types::BatchBucket> {
+        let slots = self.reth_env.batch_slots().snapshot().ok_or_else(|| {
+            BatchValidationError::SlotAdmission("native transaction routing has no snapshot".into())
+        })?;
+        recover_raw_transaction(transaction)
+            .map(|transaction| slots.bucket(transaction.signer()))
+            .map_err(|error| BatchValidationError::SlotAdmission(error.to_string()))
+    }
+
+    fn validate_batch(&self, batch: SealedBatch) -> BatchValidationResult<()> {
+        self.validate_batch_for_vote(batch).map(|_| ())
+    }
+
+    fn validate_batch_for_vote(
+        &self,
+        batch: SealedBatch,
+    ) -> BatchValidationResult<Option<tn_types::SignedBatchSlotRecord>> {
+        self.reth_env.batch_slots().snapshot().map_or_else(
+            || self.validate_legacy_batch(batch.clone(), true).map(|()| None),
+            |slots| self.validate_native_batch(batch.clone(), &slots).map(Some),
+        )
+    }
+
+    fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
+        BatchValidator::submit_txn_if_mine(self, tx_bytes, committee_size, committee_slot);
+    }
+}
+
+impl BatchValidator {
+    /// Validate the canonical transport envelope and its pinned execution body.
+    fn validate_native_batch(
+        &self,
+        sealed: SealedBatch,
+        slots: &tn_types::BatchSlots,
+    ) -> BatchValidationResult<tn_types::SignedBatchSlotRecord> {
+        let (envelope, digest) = sealed.split();
+        match () {
+            () if envelope.clone().seal_slow().digest() != digest => {
+                Err(BatchValidationError::InvalidDigest)
+            }
+            () if envelope.worker_id != self.worker_id => {
+                Err(BatchValidationError::InvalidWorkerId {
+                    expected_worker_id: self.worker_id,
+                    worker_id: envelope.worker_id,
+                })
+            }
+            () if envelope.epoch != self.epoch => Err(BatchValidationError::InvalidEpoch {
+                expected: self.epoch,
+                found: envelope.epoch,
+            }),
+            () => {
+                self.validate_batch_size_bytes(envelope.transactions(), envelope.epoch)?;
+                let record = tn_types::SignedBatchSlotRecord::from_envelope(&envelope)
+                    .map_err(BatchValidationError::SlotProtocol)?;
+                self.reth_env
+                    .validate_slot_transactions(slots, &record)
+                    .map_err(|error| BatchValidationError::SlotAdmission(error.to_string()))?;
+                match record.message() {
+                    tn_types::BatchSlotMessage::Proposal { batch, .. } => {
+                        self.validate_legacy_batch(batch.clone().seal_slow(), false)
+                    }
+                    tn_types::BatchSlotMessage::Timeout { .. } => Ok(()),
+                }?;
+                Ok(record)
+            }
+        }
+    }
+
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
@@ -43,7 +111,11 @@ impl BatchValidation for BatchValidator {
     /// On success (and only on success) the batch's transaction hashes are recorded in the
     /// worker pool's deferral window, so this node's batch builder skips them while the peer
     /// batch is in flight (issue #1329). A node without a pool (an observer) records nothing.
-    fn validate_batch(&self, sealed_batch: SealedBatch) -> BatchValidationResult<()> {
+    fn validate_legacy_batch(
+        &self,
+        sealed_batch: SealedBatch,
+        record_peer: bool,
+    ) -> BatchValidationResult<()> {
         // ensure digest matches batch
         let (batch, digest) = sealed_batch.split();
         let verified_hash = batch.clone().seal_slow().digest();
@@ -90,7 +162,7 @@ impl BatchValidation for BatchValidator {
         // a copy of something a peer is already proposing (issue #1329). Recording happens only
         // after every check passes, so an invalid batch never defers anything, and the deferral
         // expires on its own (see `PEER_BATCH_DEFER_TTL`) if the peer batch is abandoned.
-        if let Some(pool) = &self.tx_pool {
+        if let Some(pool) = self.tx_pool.as_ref().filter(|_| record_peer) {
             let hashes: Vec<TxHash> = decoded_txs.iter().map(|tx| *tx.hash()).collect();
             pool.record_peer_batch(&hashes);
         }
@@ -124,7 +196,7 @@ impl BatchValidation for BatchValidator {
 }
 
 impl BatchValidator {
-    /// Create a new instance of [Self]
+    /// Create a validator and register its pool's peer-batch telemetry under the worker label.
     pub fn new(
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
@@ -132,6 +204,7 @@ impl BatchValidator {
         base_fee: u64,
         epoch: Epoch,
     ) -> Self {
+        tx_pool.iter().for_each(|pool| pool.peer_batch_txs().register_metrics(worker_id));
         Self { reth_env, tx_pool, worker_id, base_fee, epoch }
     }
 

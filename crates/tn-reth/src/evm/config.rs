@@ -264,6 +264,52 @@ mod tests {
     use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv as _;
     use tn_types::{Address, Block, Bytes, ExecHeader, TxKind};
 
+    /// Delegated execution can advance a sender nonce beyond admission's single reservation.
+    #[test]
+    fn native_admission_rejects_delegated_sender_nonce_side_effects() -> eyre::Result<()> {
+        use reth_revm::context::result::{EVMError, InvalidTransaction};
+
+        let chain: Arc<ChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config = TnEvmConfig::new(chain.clone(), GasAccumulator::default());
+        let env = config.evm_env(&chain.sealed_genesis_header())?;
+        let caller = Address::with_last_byte(0xf0);
+        let delegate = Address::with_last_byte(0xaa);
+        let mut db = InMemoryDB::default();
+        let mut account = AccountInfo::from_bytecode(Bytecode::new_eip7702(delegate));
+        account.balance = U256::from(10u64).pow(U256::from(18u64));
+        db.insert_account_info(caller, account);
+        db.insert_account_info(
+            delegate,
+            AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[
+                0x5f, 0x5f, 0x5f, 0xf0, 0x00,
+            ]))),
+        );
+        let tx = TxEnv {
+            caller,
+            nonce: 1,
+            kind: TxKind::Call(caller),
+            gas_limit: 100_000,
+            gas_price: u128::from(env.block_env.basefee),
+            chain_id: None,
+            ..Default::default()
+        };
+        let mut execution = config.evm_factory().create_evm(db.clone(), env.clone());
+        let result = execution.transact(tx.clone())?;
+        assert!(result.result.is_success());
+        let executed_sender =
+            result.state.get(&caller).ok_or_else(|| eyre::eyre!("sender state missing"))?;
+        assert_eq!(
+            executed_sender.info.nonce, 3,
+            "delegated CREATE must demonstrate the extra nonce advance"
+        );
+        let mut admission = config.evm_factory().create_evm(db, env);
+        assert!(matches!(
+            admission.admit_slot_transaction(tx),
+            Err(EVMError::Transaction(InvalidTransaction::RejectCallerWithCode))
+        ));
+        Ok(())
+    }
+
     /// Run `BLOBBASEFEE PUSH0 MSTORE PUSH1 32 PUSH0 RETURN` through the TN EVM under `env`, from
     /// a funded caller sending a plain (non-blob) call, and decode the returned word.
     fn blobbasefee_under(config: &TnEvmConfig, env: EvmEnv) -> U256 {

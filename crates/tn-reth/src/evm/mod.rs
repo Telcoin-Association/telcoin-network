@@ -27,7 +27,7 @@ use alloy_evm::Database;
 use reth_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
 use reth_revm::{
     context::{
-        result::{EVMError, HaltReason, ResultAndState},
+        result::{EVMError, HaltReason, InvalidTransaction, ResultAndState},
         BlockEnv, ContextSetters, ContextTr as _, Evm as RevmEvm, TxEnv,
     },
     handler::{instructions::EthInstructions, EthFrame, Handler as _, PrecompileProvider},
@@ -176,6 +176,52 @@ impl<DB: Database, I, PRECOMPILE> DerefMut for TNEvm<DB, I, PRECOMPILE> {
 }
 
 // alloy-evm
+impl<DB, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE>
+where
+    DB: Database,
+    I: Inspector<TNEvmContext<DB>>,
+    PRECOMPILE: PrecompileProvider<TNEvmContext<DB>, Output = InterpreterResult>,
+{
+    /// Validate a slot transaction without running its EVM bytecode.
+    ///
+    /// Uses execution's environment, intrinsic-gas and caller checks. The private journal
+    /// reserves the full fee cap plus value and advances the nonce for both calls and creates,
+    /// so later transactions cannot depend on speculative refunds or incoming transfers.
+    pub(crate) fn admit_slot_transaction(&mut self, tx: TxEnv) -> Result<(), EVMError<DB::Error>> {
+        use reth_revm::{
+            context_interface::{
+                journaled_state::account::JournaledAccountTr as _, JournalTr as _, Transaction as _,
+            },
+            handler::pre_execution::validate_account_nonce_and_code_with_components,
+        };
+
+        tx.nonce
+            .checked_add(1)
+            .ok_or(EVMError::Transaction(InvalidTransaction::NonceOverflowInTransaction))?;
+        self.inner.set_tx(tx);
+        TNEvmHandler::default().validate(&mut self.inner)?;
+        let (_block, tx, cfg, journal, _, _) = self.ctx_mut().all_mut();
+        let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
+        // Delegated callers can CREATE in their own account context and advance their nonce
+        // again during execution. Slot admission requires plain senders so nonce reservations
+        // stay valid without speculatively executing bytecode.
+        caller
+            .account()
+            .info
+            .code
+            .as_ref()
+            .is_none_or(|code| code.is_empty())
+            .then_some(())
+            .ok_or(InvalidTransaction::RejectCallerWithCode)?;
+        validate_account_nonce_and_code_with_components(&caller.account().info, tx, cfg)?;
+        tx.ensure_enough_balance(*caller.balance())?;
+        let debit = tx.max_balance_spending()?;
+        caller.set_balance(*caller.balance() - debit);
+        caller.bump_nonce();
+        Ok(())
+    }
+}
+
 impl<DB, I, PRECOMPILE> Evm for TNEvm<DB, I, PRECOMPILE>
 where
     DB: Database,

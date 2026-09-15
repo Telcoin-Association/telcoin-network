@@ -14,13 +14,23 @@ use tn_types::{
 use tracing::info;
 
 #[derive(Debug)]
+/// Shared configuration and per-epoch resources for one validator.
 struct ConsensusConfigInner<DB> {
+    /// Node configuration and validated consensus parameters.
     config: Config,
+    /// Committee governing the current epoch.
     committee: Committee,
     /// Contains the keys for the next epoch.
     next_committee_keys: Vec<BlsPublicKey>,
+    /// Persistent consensus database shared by primary and workers.
     node_storage: DB,
+    /// One availability-vote reservation store shared across every worker.
+    slot_votes: tn_types::BatchSlotVoteStore<DB>,
+    /// Admission handle installed from the execution environment before epoch tasks start.
+    slot_control: std::sync::OnceLock<tn_types::BatchSlotControl>,
+    /// Local protocol and network signing keys.
     key_config: KeyConfig,
+    /// This node's authority when it belongs to the committee.
     authority: Option<Authority>,
     /// One [`LocalNetwork`] per worker id, keyed by the committee's worker ids.
     ///
@@ -28,7 +38,9 @@ struct ConsensusConfigInner<DB> {
     /// future process separation. Sized from [`Committee::number_of_workers`], the chain-derived
     /// count, so the key set cannot drift from the committee the config carries.
     local_networks: BTreeMap<WorkerId, LocalNetwork>,
+    /// Validated networking parameters for the epoch.
     network_config: NetworkConfig,
+    /// Genesis certificates anchoring the epoch's DAG.
     genesis: HashMap<HeaderDigest, Certificate>,
     /// Digest of the previous epoch's `EpochRecord` ([`EpochDigest::default`] for epoch 0).
     ///
@@ -198,6 +210,8 @@ where
         // before replication or publication can refresh them.
         network_config.libp2p_config().validate()?;
 
+        let slot_votes = tn_types::BatchSlotVoteStore::new(node_storage.clone(), committee.epoch());
+
         let local_networks = committee
             .worker_ids()
             .map(|worker_id| (worker_id, LocalNetwork::new(key_config.primary_public_key())))
@@ -218,6 +232,8 @@ where
                 committee,
                 next_committee_keys,
                 node_storage,
+                slot_votes,
+                slot_control: std::sync::OnceLock::new(),
                 key_config,
                 authority,
                 local_networks,
@@ -275,6 +291,24 @@ where
     /// Returns a reference to the node's persistent storage database for the current epoch.
     pub fn node_storage(&self) -> &DB {
         &self.inner.node_storage
+    }
+
+    /// Return the single vote store that all workers must share for batch-slot reservations.
+    pub fn slot_votes(&self) -> &tn_types::BatchSlotVoteStore<DB> {
+        &self.inner.slot_votes
+    }
+
+    /// Share the execution environment's admission handle before starting epoch workers.
+    pub fn set_slot_control(
+        &self,
+        control: tn_types::BatchSlotControl,
+    ) -> Result<(), tn_types::BatchSlotControlError> {
+        self.inner.slot_control.set(control).map_err(|_| tn_types::BatchSlotControlError::Replaced)
+    }
+
+    /// Return the node-wide admission handle shared by every worker and execution.
+    pub fn slot_control(&self) -> tn_types::BatchSlotControl {
+        self.inner.slot_control.get().cloned().unwrap_or_default()
     }
 
     /// Returns a reference to the cryptographic key configuration.
