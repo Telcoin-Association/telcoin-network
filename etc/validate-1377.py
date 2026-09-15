@@ -305,7 +305,7 @@ try:
                "self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));", storage_command)
         mutate("mutant-slot-timeout-refresh", source,
                "slot.view = next_view;\n                    slot.opening = SlotOpening::Pending(output);",
-               "slot.view = next_view;\n                    slot.opening = SlotOpening::Ready(position.parent);", execution_command)
+               "slot.view = next_view;\n                    slot.opening = SlotOpening::Ready(BatchSlotParent::new(output, position.parent.execution));", execution_command)
         mutate("mutant-slot-timeout-history", "crates/types/src/worker/batch_slot_control.rs",
                "matches!(transition, BatchSlotTransition::Selected | BatchSlotTransition::ViewAdvanced)",
                "matches!(transition, BatchSlotTransition::Selected)", execution_command)
@@ -361,6 +361,13 @@ try:
         run("slot-worker-restored", worker_command)
         run("slot-builder-restored", builder_command)
         run("slot-admission-restored", admission_command)
+    elif PHASE == "slot-timeout-refresh":
+        command = test_command("tn-engine", ["--test", "it"], "native_slots::timeout_refresh_allows_newly_funded_sender_to_spend")
+        run("slot-timeout-refresh-default", command)
+        mutate("mutant-slot-timeout-refresh", "crates/types/src/worker/batch_slots.rs",
+               "slot.view = next_view;\n                    slot.opening = SlotOpening::Pending(output);",
+               "slot.view = next_view;\n                    slot.opening = SlotOpening::Ready(BatchSlotParent::new(output, position.parent.execution));", command)
+        run("slot-timeout-refresh-restored", command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),

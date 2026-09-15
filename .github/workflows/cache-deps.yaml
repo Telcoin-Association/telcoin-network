@@ -11,7 +11,7 @@ on:
         description: Validation lane to run
         type: choice
         default: all
-        options: [all, clippy, tests, slot-core]
+        options: [all, clippy, tests, slot-core, slot-timeout-refresh]
 
 permissions:
   contents: read
@@ -79,9 +79,11 @@ jobs:
           name: issue-1377-tests
           path: validation-1377/
   slot-core:
-    if: inputs.lane == 'all' || inputs.lane == 'slot-core'
+    if: inputs.lane == 'all' || inputs.lane == 'slot-core' || inputs.lane == 'slot-timeout-refresh'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      VALIDATION_PHASE: ${{ inputs.lane == 'slot-timeout-refresh' && 'slot-timeout-refresh' || 'slot-core' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,9 +97,9 @@ jobs:
           shared-key: test-cache
           save-if: "false"
       - name: Test slot ordering, retries, reservations, and mutation sensitivity
-        run: python3 -I etc/validate-1377.py slot-core
+        run: python3 -I etc/validate-1377.py "$VALIDATION_PHASE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: issue-1377-slot-core
+          name: ${{ inputs.lane == 'slot-timeout-refresh' && 'issue-1377-slot-timeout-refresh' || 'issue-1377-slot-core' }}
           path: validation-1377/
