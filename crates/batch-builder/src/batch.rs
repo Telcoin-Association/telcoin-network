@@ -46,7 +46,10 @@ pub(crate) fn spawn_batch_build<P: TxPool + Send + 'static>(
     worker_id: WorkerId,
     base_fee: u64,
 ) -> tokio::task::JoinHandle<BatchBuilderOutput> {
-    tokio::task::spawn_blocking(move || build_batch(args, worker_id, base_fee))
+    // `spawn_blocking` does not carry the caller's tracing span onto the blocking thread;
+    // re-enter `propose-batch` so the build's log lines keep worker_id/base_fee/epoch.
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(|| build_batch(args, worker_id, base_fee)))
 }
 
 /// Construct an TN batch using the best transactions from the pool.
