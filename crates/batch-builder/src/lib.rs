@@ -548,7 +548,7 @@ mod tests {
         payload::BuildArguments,
         recover_raw_transaction,
         test_utils::{create_committee_from_state, TransactionFactory},
-        ForwardTargetPolicy, RethChainSpec, TxPool as _, WorkerRpcForwarder,
+        ForwardTargetPolicy, RethChainSpec, WorkerRpcForwarder,
     };
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{

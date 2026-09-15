@@ -147,11 +147,11 @@ impl Fixture {
         close: bool,
     ) -> eyre::Result<ConsensusOutput> {
         let mut leader = Certificate::default();
-        let authority = self
+        let (authority, address) = self
             .committee
             .authorities()
             .first()
-            .map(|authority| authority.id())
+            .map(|authority| (authority.id(), authority.execution_address()))
             .ok_or_else(|| eyre::eyre!("empty committee"))?;
         leader.update_header_author_for_test(authority);
         leader.update_header_round_for_test(number);
@@ -172,7 +172,7 @@ impl Fixture {
             u64::from(number),
             close,
             digests,
-            vec![CertifiedBatch { address: authority.execution_address(), batches }],
+            vec![CertifiedBatch { address, batches }],
         ))
     }
 
