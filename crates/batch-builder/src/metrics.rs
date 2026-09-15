@@ -38,6 +38,7 @@ impl BatchBuilderMetrics {
     /// still lives in the same registry as the derive-backed handles.
     pub(crate) fn record_seal_failure(&self, worker_id: WorkerId, error: &BlockSealError) {
         let reason = match error {
+            BlockSealError::SlotAdmission(_) => "slot_admission",
             BlockSealError::QuorumRejected => "quorum_rejected",
             BlockSealError::AntiQuorum => "anti_quorum",
             BlockSealError::Timeout => "timeout",

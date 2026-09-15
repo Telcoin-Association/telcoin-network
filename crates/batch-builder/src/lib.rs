@@ -276,7 +276,8 @@ impl BatchBuilder {
                                         debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
                                         Ok(BuildOutcome::Refused)
                                     }
-                                    BlockSealError::QuorumRejected
+                                    BlockSealError::SlotAdmission(_)
+                                    | BlockSealError::QuorumRejected
                                     | BlockSealError::AntiQuorum
                                     | BlockSealError::Timeout
                                     | BlockSealError::FailedToReport

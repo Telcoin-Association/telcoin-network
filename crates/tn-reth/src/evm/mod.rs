@@ -202,6 +202,17 @@ where
         TNEvmHandler::default().validate(&mut self.inner)?;
         let (_block, tx, cfg, journal, _, _) = self.ctx_mut().all_mut();
         let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
+        // Delegated callers can CREATE in their own account context and advance their nonce
+        // again during execution. Slot admission requires plain senders so nonce reservations
+        // stay valid without speculatively executing bytecode.
+        caller
+            .account()
+            .info
+            .code
+            .as_ref()
+            .is_none_or(|code| code.is_empty())
+            .then_some(())
+            .ok_or(InvalidTransaction::RejectCallerWithCode)?;
         validate_account_nonce_and_code_with_components(&caller.account().info, &*tx, &*cfg)?;
         tx.ensure_enough_balance(*caller.balance())?;
         let debit = tx.max_balance_spending()?;
