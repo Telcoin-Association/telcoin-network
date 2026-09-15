@@ -112,6 +112,7 @@ fn seeded_deltas(rng: &mut StdRng) -> Vec<HashedPostState> {
 /// Trie-level differential: per block, the layered-cursor root and updates equal
 /// reth's `overlay_root_from_nodes_with_updates` over the `prepend_self`-merged
 /// `TrieInput` built from the same deltas (#1301).
+/// Includes interleaving distinct keys across carries at 8, 16, 32, and 64 blocks.
 #[test]
 fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<()> {
     let env = PipelineTestEnv::new();
@@ -119,9 +120,11 @@ fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<
     let tx = provider.tx_ref();
 
     let mut rng = StdRng::seed_from_u64(0x1301);
-    let deltas = seeded_deltas(&mut rng);
+    let deltas = (0..8)
+        .flat_map(|_| seeded_deltas(&mut rng))
+        .chain(std::iter::once(HashedPostState::default()));
 
-    deltas.into_iter().enumerate().try_fold(
+    deltas.enumerate().try_fold(
         (OutputTrieOverlay::new(), TrieInput::default()),
         |(mut overlay, mut oracle_input),
          (i, delta)|
