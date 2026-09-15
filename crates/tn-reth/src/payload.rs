@@ -93,6 +93,16 @@ pub struct TNPayload {
 }
 
 impl TNPayload {
+    /// Set epoch closing from the final selected execution batch after native slot filtering.
+    ///
+    /// The original consensus index remains unchanged for digest and randomness derivation.
+    /// Only the final executed block may carry the output's epoch-closing system calls.
+    pub fn with_execution_boundary(mut self, output: &ConsensusOutput, is_final: bool) -> Self {
+        self.close_epoch =
+            (output.close_epoch() && is_final).then(|| output.committee_shuffle_seed());
+        self
+    }
+
     /// Create a new instance of [Self].
     #[allow(clippy::too_many_arguments)]
     pub fn new(

@@ -10,6 +10,15 @@ pub(crate) type EngineResult<T> = Result<T, TnEngineError>;
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
 pub enum TnEngineError {
+    /// Native slot authentication, envelope or ordering rules failed.
+    #[error("Invalid batch slot: {0}")]
+    BatchSlot(tn_types::BatchSlotError),
+    /// A selected native proposal is not executable from its pinned admission state.
+    #[error("Invalid batch slot transactions: {0}")]
+    BatchSlotAdmission(tn_reth::BatchSlotAdmissionError),
+    /// Execution was durable but the slot history or snapshot could not be published.
+    #[error("Failed to publish batch slot execution: {0}")]
+    BatchSlotPublication(tn_types::BatchSlotControlError),
     /// Error from Reth
     #[error(transparent)]
     Reth(#[from] TnRethError),

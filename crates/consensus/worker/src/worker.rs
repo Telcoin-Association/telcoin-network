@@ -125,7 +125,7 @@ fn new_worker_internal<DB: Database>(
 /// Process batch from EL into sealed batches for CL.
 pub struct Worker<DB, QW> {
     /// Native admission dependencies installed by the production worker constructor.
-    native: Option<NativeWorker<DB>>,
+    native: Option<Arc<NativeWorker<DB>>>,
     /// Our worker's id.
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
@@ -172,6 +172,7 @@ struct NativeWorker<DB> {
 impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
     fn clone(&self) -> Self {
         Self {
+            native: self.native.clone(),
             id: self.id,
             quorum_waiter: self.quorum_waiter.clone(),
             client: self.client.clone(),
@@ -229,11 +230,11 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         config: ConsensusConfig<DB>,
         validator: Arc<dyn BatchValidation>,
     ) -> Self {
-        self.native = Some(NativeWorker {
+        self.native = Some(Arc::new(NativeWorker {
             config,
             validator,
             forward_attempt: std::sync::atomic::AtomicUsize::new(0),
-        });
+        }));
         self
     }
 
