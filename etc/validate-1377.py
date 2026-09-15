@@ -36,6 +36,7 @@ FILES = [
     "crates/types/src/worker/batch_slot_votes.rs",
     "crates/config/src/consensus.rs",
     "crates/storage/src/lib.rs",
+    "crates/storage/src/mem_db.rs",
     "Cargo.lock",
     "crates/types/src/worker/batch_slot_control.rs",
     "crates/types/src/worker/sealed_batch.rs",
@@ -220,6 +221,9 @@ try:
         storage_command = test_command("tn-storage", ["--lib"], "batch_slot_tests::")
         run("slot-storage-default", storage_command, required=False)
         run("slot-storage-adiri", test_command("tn-storage", ["--lib"], "batch_slot_tests::", True), required=False)
+        for label, pattern in (("memory-backend", "mem_db::"), ("layered-backend", "layered_db::")):
+            run(f"{label}-default", test_command("tn-storage", ["--lib"], pattern), required=False)
+            run(f"{label}-adiri", test_command("tn-storage", ["--lib"], pattern, True), required=False)
         execution_command = test_command("tn-engine", ["--test", "it"], "native_slots")
         run("slot-execution-default", execution_command, required=False)
         run("slot-execution-adiri", test_command("tn-engine", ["--test", "it"], "native_slots", True), required=False)
@@ -296,6 +300,9 @@ try:
         ]
         for label, before, after in storage_mutations:
             mutate(f"mutant-{label}", store_source, before, after, storage_command)
+        mutate("mutant-slot-memory-table-reopen", "crates/storage/src/mem_db.rs",
+               "self.store.entry(T::NAME).or_default();",
+               "self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));", storage_command)
         mutate("mutant-slot-timeout-refresh", source,
                "slot.view = next_view;\n                    slot.opening = SlotOpening::Pending(output);",
                "slot.view = next_view;\n                    slot.opening = SlotOpening::Ready(position.parent);", execution_command)
@@ -331,15 +338,12 @@ try:
         mutate("mutant-slot-wire-budget", source,
                "prototype.encode().map(|bytes| bytes.len().saturating_add(4))",
                "prototype.encode().map(|bytes| bytes.len())", storage_command)
-        run("slot-core-restored", command)
-        run("slot-storage-restored", storage_command)
         mutate("mutant-slot-stale-timeout-demand", "crates/types/src/worker/batch_slot_control.rs",
                ".filter(|current| current.position == position)",
                ".filter(|current| current.position.bucket() == position.bucket())", storage_command)
         mutate("mutant-slot-idle-retry-demand", "crates/types/src/worker/batch_slot_control.rs",
                "// old demand would keep producing control-only blocks after a pool empties.\n                    demanded: false,",
                "// old demand would keep producing control-only blocks after a pool empties.\n                    demanded: local.demanded,", storage_command)
-        run("slot-execution-restored", execution_command)
         mutate("mutant-slot-cloned-reservation", "crates/consensus/worker/src/worker.rs",
                "native: self.native.clone(),", "native: None,", worker_command)
         mutate("mutant-slot-retry-witness", "crates/consensus/worker/src/worker.rs",
@@ -348,11 +352,14 @@ try:
         mutate("mutant-slot-pending-retention", "crates/batch-builder/src/lib.rs",
                "if mined_transactions.is_empty() || native {",
                "if mined_transactions.is_empty() {", builder_command)
-        run("slot-worker-restored", worker_command)
-        run("slot-builder-restored", builder_command)
         mutate("mutant-slot-delegated-sender", "crates/tn-reth/src/evm/mod.rs",
                ".is_none_or(|code| code.is_empty())",
                ".is_none_or(|code| code.is_empty() || code.is_eip7702())", admission_command)
+        run("slot-core-restored", command)
+        run("slot-storage-restored", storage_command)
+        run("slot-execution-restored", execution_command)
+        run("slot-worker-restored", worker_command)
+        run("slot-builder-restored", builder_command)
         run("slot-admission-restored", admission_command)
     elif PHASE == "tests":
         cases = [
