@@ -150,7 +150,7 @@ def mutate(label, name, before, after, command):
         raise ValueError(f"Mutation must target one exact source span: {label}")
     try:
         (ROOT / name).write_text(original.replace(before, after, 1))
-        run(label, command, mutant=True)
+        run(label, command, mutant=True, required=False)
     finally:
         (ROOT / name).write_bytes(ORIGINAL[name])
 
@@ -273,7 +273,7 @@ try:
              "() if position.view != authorization.position.view && position.view.0 == u64::MAX => Err(BatchSlotError::FutureView),"),
             ("slot-worker-capacity",
              "let count = u64::from(self.producer_count.get());",
-             "let count = u64::from(self.bucket_count.get());"),
+             "let count = u64::from(self.bucket_count.get()).max(u64::from(self.producer_count.get()));"),
         ]
         for label, before, after in mutations:
             mutate(f"mutant-{label}", source, before, after, command)
@@ -400,6 +400,8 @@ try:
             run(f"{label}-restored", test_command(package, target, pattern))
     else:
         raise ValueError(f"Unknown validation phase: {PHASE}")
+    if not all(check["passed"] for check in REPORT["checks"]):
+        raise RuntimeError("Validation failed; reports retain every failed check and mutation")
 finally:
     for name, content in ORIGINAL.items():
         (ROOT / name).write_bytes(content)
