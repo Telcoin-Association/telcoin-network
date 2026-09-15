@@ -32,7 +32,6 @@ FILES = [
     "crates/types/src/worker/batch_slots.rs",
     "crates/types/src/worker/mod.rs",
     "crates/types/src/worker/batch_slot_votes.rs",
-    "crates/types/Cargo.toml",
     "crates/config/src/consensus.rs",
     "crates/storage/src/lib.rs",
     "Cargo.lock",
@@ -155,13 +154,6 @@ def mutate(label, name, before, after, command):
 
 try:
     if PHASE == "clippy":
-        packages = [
-            "e2e-tests", "exex-indexer", "exex-lifecycle", "state-sync", "telcoin-network",
-            "telcoin-network-cli", "tn-batch-builder", "tn-batch-validator", "tn-engine",
-            "tn-executor", "tn-exex", "tn-network-libp2p", "tn-node", "tn-primary", "tn-reth",
-            "tn-rpc", "tn-storage", "tn-test-utils", "tn-test-utils-committee", "tn-types",
-            "tn-worker", "tn-config", "tn-metrics", "tn-network-types", "tn-worker-gateway",
-        ]
         command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json"]
         command += ["--workspace", "--all-targets", "--no-deps"]
         modes = {
@@ -175,6 +167,7 @@ try:
         focused = [
             "cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json",
             "-p", "tn-reth", "-p", "tn-batch-validator", "-p", "tn-batch-builder", "-p", "tn-types",
+            "-p", "tn-config", "-p", "tn-storage", "-p", "tn-worker", "-p", "tn-engine", "-p", "tn-node",
             "--all-targets", "--no-deps",
         ]
         changed = {
@@ -218,7 +211,7 @@ try:
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "slot-core":
-        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "-p", "tn-engine", "-p", "tn-worker", "-p", "tn-batch-builder", "-p", "tn-reth", "--all-targets", "--features", "tn-types/test-utils"])
+        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "--keep-going", "-p", "tn-node", "-p", "tn-engine", "-p", "tn-worker", "-p", "tn-batch-builder", "-p", "tn-reth", "--all-targets", "--features", "tn-types/test-utils"])
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
