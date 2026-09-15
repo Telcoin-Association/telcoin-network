@@ -9,7 +9,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
-pub(crate) use manager::PeerManager;
+pub(crate) use manager::{PeerManager, PutRecordRate};
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 // the per-peer address cap also bounds the addresses a signed record may advertise
@@ -18,3 +18,9 @@ pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
 // visibility for tests
 #[cfg(test)]
 pub(crate) use score::GLOBAL_SCORE_CONFIG;
+
+/// Shared production thresholds used by the consensus call-site regression tests.
+#[cfg(test)]
+pub(crate) use manager::{
+    MAX_PUT_RECORDS_PER_WINDOW, PUT_RECORD_DISCONNECT_THRESHOLD, PUT_RECORD_PENALTY_THRESHOLD,
+};
