@@ -49,6 +49,8 @@ mod execution;
 mod genesis;
 mod helpers;
 mod output_overlay;
+mod slot_admission;
+pub use slot_admission::BatchSlotAdmissionError;
 mod rpc;
 
 pub use output_overlay::OutputTrieOverlay;
@@ -82,6 +84,8 @@ struct RethEnvInner {
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// Node-wide batch admission snapshots, shared with consensus and every worker pool.
+    batch_slots: tn_types::BatchSlotControl,
     /// The snapshot's final block `B` — the first block whose state this datadir holds — when it
     /// was bootstrapped from a snapshot; `None` on a normally-synced node.
     ///
@@ -197,6 +201,7 @@ impl RethEnv {
                 blockchain_provider,
                 evm_config,
                 task_spawner,
+                batch_slots: tn_types::BatchSlotControl::default(),
                 restored_state_floor,
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
@@ -398,6 +403,7 @@ impl RethEnv {
             self.evm_config(),
             base_fee,
         )
+        .map(|pool| pool.with_batch_slots(self.batch_slots().clone()))
     }
 
     /// Initialize a worker transaction pool WITHOUT its canonical-state maintenance task.
@@ -417,6 +423,12 @@ impl RethEnv {
             self.evm_config(),
             base_fee,
         )
+        .map(|pool| pool.with_batch_slots(self.batch_slots().clone()))
+    }
+
+    /// Admission state shared by execution, consensus and transaction pools for this node.
+    pub fn batch_slots(&self) -> &tn_types::BatchSlotControl {
+        &self.inner.batch_slots
     }
 
     /// Return the reth [`NodeConfig`] this env was built from: chain spec, datadir,

@@ -286,8 +286,14 @@ where
         })?;
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
-        self.validator
-            .validate_batch(sealed_batch.clone())
+        self.consensus_config
+            .slot_votes()
+            .validate_and_reserve(
+                &self.consensus_config.slot_control(),
+                self.validator.as_ref(),
+                sealed_batch.clone(),
+            )
+            .await
             .inspect_err(|_| self.metrics.record_batch_validation_failure())?;
 
         let (mut batch, digest) = sealed_batch.split();

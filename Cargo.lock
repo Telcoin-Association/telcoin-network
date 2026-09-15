@@ -12055,7 +12055,6 @@ dependencies = [
  "serde_repr",
  "serde_with 2.3.3",
  "serde_yaml",
- "tempfile",
  "thiserror 1.0.69",
  "tn-storage",
  "tn-test-utils-committee",

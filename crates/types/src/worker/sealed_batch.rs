@@ -212,6 +212,17 @@ pub trait BatchValidation: Send + Sync + Debug {
     /// Determines if this batch can be voted on
     fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
 
+    /// Validate transport and execution content before a fresh availability vote.
+    ///
+    /// Native records must additionally be authorized and durably reserved by the worker's
+    /// shared slot store before it acknowledges the batch, including on cache hits.
+    fn validate_batch_for_vote(
+        &self,
+        batch: SealedBatch,
+    ) -> Result<Option<super::SignedBatchSlotRecord>, BatchValidationError> {
+        self.validate_batch(batch).map(|()| None)
+    }
+
     /// Submit a transaction (as bytes) for inclusion in a batch.
     /// Will only submit if the txn hash fits the provided committee slot.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64);
@@ -273,6 +284,12 @@ impl TxnForwarder for NoopTxnForwarder {
 /// Block validation error types
 #[derive(Error, Debug)]
 pub enum BatchValidationError {
+    /// Signed slot authentication or canonical transport encoding failed.
+    #[error("Invalid batch slot record: {0}")]
+    SlotProtocol(super::BatchSlotError),
+    /// The slot's pinned transaction checks failed or its canonical state is unavailable.
+    #[error("Invalid batch slot admission: {0}")]
+    SlotAdmission(String),
     /// The sealed batch hash does not match this worker's calculated digest.
     #[error("Invalid digest for sealed batch.")]
     InvalidDigest,

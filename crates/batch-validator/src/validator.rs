@@ -36,6 +36,65 @@ pub struct BatchValidator {
 }
 
 impl BatchValidation for BatchValidator {
+    fn validate_batch(&self, batch: SealedBatch) -> BatchValidationResult<()> {
+        self.validate_batch_for_vote(batch).map(|_| ())
+    }
+
+    fn validate_batch_for_vote(
+        &self,
+        batch: SealedBatch,
+    ) -> BatchValidationResult<Option<tn_types::SignedBatchSlotRecord>> {
+        self.reth_env.batch_slots().snapshot().map_or_else(
+            || self.validate_legacy_batch(batch.clone(), true).map(|()| None),
+            |slots| self.validate_native_batch(batch.clone(), &slots).map(Some),
+        )
+    }
+
+    fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
+        BatchValidator::submit_txn_if_mine(self, tx_bytes, committee_size, committee_slot);
+    }
+}
+
+impl BatchValidator {
+    /// Validate the canonical transport envelope and its pinned execution body.
+    fn validate_native_batch(
+        &self,
+        sealed: SealedBatch,
+        slots: &tn_types::BatchSlots,
+    ) -> BatchValidationResult<tn_types::SignedBatchSlotRecord> {
+        let (envelope, digest) = sealed.split();
+        match () {
+            () if envelope.clone().seal_slow().digest() != digest => {
+                Err(BatchValidationError::InvalidDigest)
+            }
+            () if envelope.worker_id != self.worker_id => {
+                Err(BatchValidationError::InvalidWorkerId {
+                    expected_worker_id: self.worker_id,
+                    worker_id: envelope.worker_id,
+                })
+            }
+            () if envelope.epoch != self.epoch => Err(BatchValidationError::InvalidEpoch {
+                expected: self.epoch,
+                found: envelope.epoch,
+            }),
+            () => {
+                self.validate_batch_size_bytes(envelope.transactions(), envelope.epoch)?;
+                let record = tn_types::SignedBatchSlotRecord::from_envelope(&envelope)
+                    .map_err(BatchValidationError::SlotProtocol)?;
+                self.reth_env
+                    .validate_slot_transactions(slots, &record)
+                    .map_err(|error| BatchValidationError::SlotAdmission(error.to_string()))?;
+                match record.message() {
+                    tn_types::BatchSlotMessage::Proposal { batch, .. } => {
+                        self.validate_legacy_batch(batch.clone().seal_slow(), false)
+                    }
+                    tn_types::BatchSlotMessage::Timeout { .. } => Ok(()),
+                }?;
+                Ok(record)
+            }
+        }
+    }
+
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
@@ -43,7 +102,11 @@ impl BatchValidation for BatchValidator {
     /// On success (and only on success) the batch's transaction hashes are recorded in the
     /// worker pool's deferral window, so this node's batch builder skips them while the peer
     /// batch is in flight (issue #1329). A node without a pool (an observer) records nothing.
-    fn validate_batch(&self, sealed_batch: SealedBatch) -> BatchValidationResult<()> {
+    fn validate_legacy_batch(
+        &self,
+        sealed_batch: SealedBatch,
+        record_peer: bool,
+    ) -> BatchValidationResult<()> {
         // ensure digest matches batch
         let (batch, digest) = sealed_batch.split();
         let verified_hash = batch.clone().seal_slow().digest();
@@ -90,7 +153,7 @@ impl BatchValidation for BatchValidator {
         // a copy of something a peer is already proposing (issue #1329). Recording happens only
         // after every check passes, so an invalid batch never defers anything, and the deferral
         // expires on its own (see `PEER_BATCH_DEFER_TTL`) if the peer batch is abandoned.
-        if let Some(pool) = &self.tx_pool {
+        if let Some(pool) = self.tx_pool.as_ref().filter(|_| record_peer) {
             let hashes: Vec<TxHash> = decoded_txs.iter().map(|tx| *tx.hash()).collect();
             pool.record_peer_batch(&hashes);
         }

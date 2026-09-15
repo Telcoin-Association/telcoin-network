@@ -265,6 +265,70 @@ impl SignedBatchSlotRecord {
             .and_then(|body| bcs::from_bytes(body).map_err(BatchSlotError::Encoding))
     }
 
+    /// Wrap a signed record in its unique worker transport envelope.
+    ///
+    /// Proposal metadata is copied from the signed body. Control records use worker zero,
+    /// zero beneficiary and zero base fee, so relaying a vote cannot create a new batch digest.
+    pub fn envelope(&self) -> Result<Batch, BatchSlotError> {
+        self.encode().map(|encoded| {
+            let (beneficiary, base_fee_per_gas, worker_id) = match self.message() {
+                BatchSlotMessage::Proposal { batch, .. } => {
+                    (batch.beneficiary, batch.base_fee_per_gas, batch.worker_id)
+                }
+                BatchSlotMessage::Timeout { .. } => (Address::ZERO, 0, 0),
+            };
+            Batch {
+                transactions: vec![encoded],
+                epoch: self.epoch,
+                beneficiary,
+                base_fee_per_gas,
+                worker_id,
+                received_at: None,
+            }
+        })
+    }
+
+    /// Decode a bounded transport envelope and reject unsigned metadata or extra records.
+    ///
+    /// The caller checks the outer digest and byte limit before decoding. The full encoded
+    /// record counts against that limit, including its signature and vector length prefixes.
+    pub fn from_envelope(envelope: &Batch) -> Result<Self, BatchSlotError> {
+        envelope
+            .transactions
+            .first()
+            .ok_or(BatchSlotError::InvalidEnvelope)
+            .and_then(|bytes| Self::decode(bytes))
+            .and_then(|record| {
+                let mut canonical = record.envelope()?;
+                canonical.received_at = envelope.received_at;
+                if canonical == *envelope {
+                    Ok(record)
+                } else {
+                    Err(BatchSlotError::InvalidEnvelope)
+                }
+            })
+    }
+
+    /// Verify the signed identity and producer assignment independently of voting history.
+    ///
+    /// Callers still authorize the position from canonical slot history before reserving a
+    /// fresh vote. This check also applies when replaying already certified historical records.
+    pub fn authenticate(&self, slots: &BatchSlots) -> Result<(), BatchSlotError> {
+        self.verify(slots.chain_id, &slots.committee)?;
+        match self.message() {
+            BatchSlotMessage::Proposal { position, batch } => match () {
+                () if slots.producer(*position)? != self.authority() => {
+                    Err(BatchSlotError::WrongProducer)
+                }
+                () if batch.epoch != slots.epoch() => Err(BatchSlotError::WrongEpoch),
+                () => Ok(()),
+            },
+            BatchSlotMessage::Timeout { position } => {
+                slots.bucket_state(position.bucket()).map(|_| ())
+            }
+        }
+    }
+
     /// Check domain and membership before performing BLS verification.
     fn verify(
         &self,
@@ -793,6 +857,8 @@ pub enum BatchSlotError {
     VotingPowerOverflow,
     /// The native record marker was absent.
     InvalidPrefix,
+    /// Transport metadata or record count differs from the canonical signed envelope.
+    InvalidEnvelope,
     /// A fresh vote refers to a slot or view that is no longer current.
     StalePosition,
     /// A reservation was looked up under the wrong proposal or timeout namespace.
