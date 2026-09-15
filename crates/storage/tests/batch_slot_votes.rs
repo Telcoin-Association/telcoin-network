@@ -66,6 +66,33 @@ fn native_wire_budget_covers_vector_prefix_boundaries() -> Result<(), BatchSlotV
 }
 
 #[test]
+fn orphaned_envelopes_restore_proposals_and_discard_control_records(
+) -> Result<(), BatchSlotVoteStoreError> {
+    let (slots, proposal, _) = conflicting_records()?;
+    let restored = proposal
+        .envelope()
+        .and_then(SignedBatchSlotRecord::orphaned_batch)
+        .map_err(BatchSlotVoteStoreError::Protocol)?;
+    assert_eq!(restored.transactions, vec![vec![1]]);
+    assert_eq!(
+        SignedBatchSlotRecord::orphaned_batch(restored.clone())
+            .map_err(BatchSlotVoteStoreError::Protocol)?,
+        restored
+    );
+    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
+    let timeout = slots
+        .sign_timeout(slots.bucket(Address::ZERO), *key.public(), &key)
+        .map_err(BatchSlotVoteStoreError::Protocol)?;
+    assert!(timeout
+        .envelope()
+        .and_then(SignedBatchSlotRecord::orphaned_batch)
+        .map_err(BatchSlotVoteStoreError::Protocol)?
+        .transactions
+        .is_empty());
+    Ok(())
+}
+
+#[test]
 fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlotVoteStoreError> {
     let (slots, record, _) = conflicting_records()?;
     let control = tn_types::BatchSlotControl::default();

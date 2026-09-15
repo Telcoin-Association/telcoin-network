@@ -288,6 +288,21 @@ impl SignedBatchSlotRecord {
         })
     }
 
+    /// Extract transactions from a locally cached orphan without forwarding native control bytes.
+    ///
+    /// Legacy bodies retain their encoding. A native proposal restores its signed inner batch;
+    /// timeout records restore no transactions. Pool admission still validates every transaction.
+    pub fn orphaned_batch(envelope: Batch) -> Result<Batch, BatchSlotError> {
+        if envelope.transactions.first().is_some_and(|bytes| bytes.starts_with(WIRE_PREFIX)) {
+            Self::from_envelope(&envelope).map(|record| match record.message {
+                BatchSlotMessage::Proposal { batch, .. } => batch,
+                BatchSlotMessage::Timeout { .. } => Batch { transactions: Vec::new(), ..envelope },
+            })
+        } else {
+            Ok(envelope)
+        }
+    }
+
     /// Decode a bounded transport envelope and reject unsigned metadata or extra records.
     ///
     /// The caller checks the outer digest and byte limit before decoding. The full encoded

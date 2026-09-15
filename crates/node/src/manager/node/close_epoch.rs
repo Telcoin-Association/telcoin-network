@@ -162,7 +162,10 @@ where
         // Collect any batches from this epoch that never made it to the consensus chain.
         let mut orphan_batches: Vec<(BlockHash, Batch)> =
             // Any batches in this table were created by us but never made it to consensus.
-            self.consensus_db.iter::<OurNodeBatchesCache>().collect();
+            self.consensus_db.iter::<OurNodeBatchesCache>()
+                .map(|(_, batch)| tn_types::SignedBatchSlotRecord::orphaned_batch(batch)
+                    .map(|batch| (tn_types::Hash::digest(&batch), batch)))
+                .collect::<Result<_, _>>()?;
         // We have what we need so clear our Batch cache now.
         // We are reintroducing the transactions so these batches are now defunct.
         self.consensus_db.clear_table::<OurNodeBatchesCache>()?;
@@ -174,12 +177,15 @@ where
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
                 info!(target: "epoch-manager", "Re-introducing orphaned batches {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
-                let is_cvv = consensus_bus.is_active_cvv();
+                // Native observers retain recovered transactions until canonical execution,
+                // including when an RPC owner acknowledges receipt without including them.
+                let retain_in_pool = consensus_bus.is_active_cvv()
+                    || engine.get_reth_env().await.batch_slots().snapshot().is_some();
                 for (digest, batch) in orphan_batches.drain(..) {
                     // Loop through any orphaned batches and resubmit it's transactions.
                     // This is most likely because of epoch changes but could be caused by a restart as
                     // well.
-                    if is_cvv {
+                    if retain_in_pool {
                         // Put the txns back into the mempool.
                         repool_batch_txns(&pools, &batch).await;
                     } else {
