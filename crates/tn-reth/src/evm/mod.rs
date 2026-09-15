@@ -213,7 +213,7 @@ where
             .is_none_or(|code| code.is_empty())
             .then_some(())
             .ok_or(InvalidTransaction::RejectCallerWithCode)?;
-        validate_account_nonce_and_code_with_components(&caller.account().info, &*tx, &*cfg)?;
+        validate_account_nonce_and_code_with_components(&caller.account().info, tx, cfg)?;
         tx.ensure_enough_balance(*caller.balance())?;
         let debit = tx.max_balance_spending()?;
         caller.set_balance(*caller.balance() - debit);
