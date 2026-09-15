@@ -47,6 +47,14 @@ FILES = [
     "crates/config/src/keys.rs",
     "crates/types/src/error.rs",
     "crates/batch-builder/src/lib.rs",
+    "crates/consensus/worker/src/network/error.rs",
+    "crates/engine/src/error.rs",
+    "crates/engine/src/payload_builder.rs",
+    "crates/tn-reth/src/payload.rs",
+    "crates/node/src/manager/node.rs",
+    "crates/node/src/manager/node/run_epoch.rs",
+    "crates/node/src/manager/node/batch_slots.rs",
+    "crates/types/src/forks.rs",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -200,6 +208,7 @@ try:
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "slot-core":
+        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "--all-targets", "--features", "tn-types/test-utils"])
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
@@ -268,6 +277,8 @@ try:
         ]
         for label, before, after in storage_mutations:
             mutate(f"mutant-{label}", store_source, before, after, storage_command)
+        mutate("mutant-slot-unpublished-retry", "crates/types/src/worker/batch_slot_control.rs",
+               "self.previous.vote(record)?;", "record.authenticate(&self.previous)?;", storage_command)
         mutate("mutant-slot-envelope", source,
                "if canonical == *envelope {", "if canonical.epoch == envelope.epoch {", storage_command)
         mutate("mutant-slot-publication-anchor", "crates/types/src/worker/batch_slot_control.rs",
