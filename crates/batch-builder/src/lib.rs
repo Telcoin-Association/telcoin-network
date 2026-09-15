@@ -21,7 +21,7 @@ pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{future::OptionFuture, StreamExt};
 use std::time::{Duration, Instant};
-use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
+use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
     TxHash, WorkerId,
