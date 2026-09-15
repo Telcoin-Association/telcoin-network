@@ -8,6 +8,8 @@ mod sealed_batch;
 pub use sealed_batch::*;
 mod batch_slots;
 pub use batch_slots::*;
+mod batch_slot_votes;
+pub use batch_slot_votes::*;
 mod pending_batch;
 use crate::error::BlockSealError;
 pub use pending_batch::*;

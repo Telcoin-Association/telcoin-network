@@ -109,6 +109,11 @@ pub struct BatchSlotPosition {
 }
 
 impl BatchSlotPosition {
+    /// Identify this slot independently of its retry view.
+    pub const fn id(self, epoch: Epoch) -> BatchSlotId {
+        BatchSlotId { epoch, bucket: self.bucket, sequence: self.sequence }
+    }
+
     /// Return the sender bucket.
     pub const fn bucket(self) -> BatchBucket {
         self.bucket
@@ -127,6 +132,40 @@ impl BatchSlotPosition {
     /// Return the canonical admission anchor.
     pub const fn parent(self) -> BatchSlotParent {
         self.parent
+    }
+}
+
+/// Epoch-scoped identity of one sender bucket's proposal sequence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct BatchSlotId {
+    /// Committee epoch governing the slot.
+    epoch: Epoch,
+    /// Sender bucket shared across all workers.
+    bucket: BatchBucket,
+    /// Proposal sequence within the bucket.
+    sequence: BatchSlotSequence,
+}
+
+/// Canonical admission anchor and highest approved retry for one slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BatchSlotAuthorization {
+    /// Chain domain of the canonical state that authorized this slot.
+    chain_id: BatchSlotChainId,
+    /// Committee epoch of the canonical authorization.
+    epoch: Epoch,
+    /// Slot identity, opening state, and highest retry approved before the slot closed.
+    position: BatchSlotPosition,
+}
+
+impl BatchSlotAuthorization {
+    /// Return the committee epoch that approved this slot.
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Return the key used to retain this authorization through the epoch.
+    pub const fn id(&self) -> BatchSlotId {
+        self.position.id(self.epoch)
     }
 }
 
@@ -197,6 +236,11 @@ impl SignedBatchSlotRecord {
     /// Return the authenticated proposal or timeout vote.
     pub const fn message(&self) -> &BatchSlotMessage {
         &self.message
+    }
+
+    /// Return the epoch-scoped slot whose authorization this record requires.
+    pub const fn slot(&self) -> BatchSlotId {
+        self.message.position().id(self.epoch)
     }
 
     /// Hash the entire authenticated record for durable vote reservations.
@@ -307,12 +351,24 @@ pub enum BatchSlotTransition {
 }
 
 /// Namespace for a durable availability vote, shared by every worker on one validator.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum BatchSlotVoteKey {
     /// One execution proposal per sender bucket, sequence, and view.
-    Proposal(BatchBucket),
+    Proposal {
+        /// Proposal sequence in its committee epoch.
+        slot: BatchSlotId,
+        /// Retry whose reservation must not be released during the epoch.
+        view: BatchSlotView,
+    },
     /// One timeout record per bucket and authenticated timeout author.
-    Timeout(BatchBucket, BlsPublicKey),
+    Timeout {
+        /// Proposal sequence in its committee epoch.
+        slot: BatchSlotId,
+        /// Retry for which the author requests rotation.
+        view: BatchSlotView,
+        /// Committee identity signing the timeout.
+        authority: BlsPublicKey,
+    },
 }
 
 /// An authenticated vote decision to persist before acknowledging a batch.
@@ -331,6 +387,11 @@ pub struct BatchSlotVote {
 }
 
 impl BatchSlotVote {
+    /// Return the committee epoch authenticated by this vote.
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     /// Return the database key shared across workers.
     pub const fn key(&self) -> &BatchSlotVoteKey {
         &self.key
@@ -338,16 +399,13 @@ impl BatchSlotVote {
 
     /// Check that replacing a durable reservation cannot acknowledge an equivocation.
     ///
-    /// The new vote must first be obtained from the current canonical slot snapshot through
-    /// [BatchSlots::vote]. A greater sequence or retry can then replace an older reservation.
+    /// Every authorized retry has its own key. Old reservations remain intact through the
+    /// epoch so delayed honest proposals can finish certification without reopening equivocation.
     pub fn permits(&self, next: &Self) -> Result<(), BatchSlotError> {
-        let old_order = (self.epoch, self.position.sequence, self.position.view);
-        let next_order = (next.epoch, next.position.sequence, next.position.view);
         match () {
             () if self.chain_id != next.chain_id => Err(BatchSlotError::WrongChain),
             () if self.key != next.key => Err(BatchSlotError::WrongReservationKey),
-            () if next_order < old_order => Err(BatchSlotError::StalePosition),
-            () if next_order == old_order && self != next => Err(BatchSlotError::ConflictingVote),
+            () if self != next => Err(BatchSlotError::ConflictingVote),
             () => Ok(()),
         }
     }
@@ -365,7 +423,9 @@ pub struct BatchSlots {
     committee: Committee,
     /// Producers in canonical public-key order.
     producers: Vec<BlsPublicKey>,
-    /// Nonzero count used by sender routing and producer rotation.
+    /// Nonzero committee size used for producer rotation.
+    producer_count: NonZeroU32,
+    /// Sender bucket count, preserving one parallel slot per validator and worker.
     bucket_count: NonZeroU32,
     /// One outstanding sequence per sender bucket across all workers.
     buckets: Vec<BucketSlot>,
@@ -387,9 +447,14 @@ impl BatchSlots {
             .collect();
         let count =
             u32::try_from(producers.len()).map_err(|_| BatchSlotError::CommitteeTooLarge)?;
-        let bucket_count = NonZeroU32::new(count).ok_or(BatchSlotError::EmptyCommittee)?;
-        let buckets = producers
-            .iter()
+        let producer_count = NonZeroU32::new(count).ok_or(BatchSlotError::EmptyCommittee)?;
+        let total = producers
+            .len()
+            .checked_mul(committee.number_of_workers())
+            .and_then(|total| u32::try_from(total).ok())
+            .ok_or(BatchSlotError::CommitteeTooLarge)?;
+        let bucket_count = NonZeroU32::new(total).ok_or(BatchSlotError::EmptyCommittee)?;
+        let buckets = (0..bucket_count.get())
             .map(|_| BucketSlot {
                 sequence: BatchSlotSequence::default(),
                 view: BatchSlotView::default(),
@@ -397,7 +462,7 @@ impl BatchSlots {
                 timeout_voters: BTreeSet::new(),
             })
             .collect();
-        Ok(Self { chain_id, committee, producers, bucket_count, buckets })
+        Ok(Self { chain_id, committee, producers, producer_count, bucket_count, buckets })
     }
 
     /// Return the epoch whose committee controls these slots.
@@ -433,10 +498,22 @@ impl BatchSlots {
         })
     }
 
+    /// Capture a slot's canonical authorization, retaining it when the slot closes.
+    pub fn authorization(
+        &self,
+        bucket: BatchBucket,
+    ) -> Result<BatchSlotAuthorization, BatchSlotError> {
+        self.position(bucket).map(|position| BatchSlotAuthorization {
+            chain_id: self.chain_id,
+            epoch: self.epoch(),
+            position,
+        })
+    }
+
     /// Return the producer for a position in this epoch.
     pub fn producer(&self, position: BatchSlotPosition) -> Result<&BlsPublicKey, BatchSlotError> {
         self.bucket_state(position.bucket)?;
-        let count = u64::from(self.bucket_count.get());
+        let count = u64::from(self.producer_count.get());
         // Three terms, each below u32::MAX, cannot overflow u64.
         let ordinal =
             (u64::from(position.bucket.0) + position.sequence.0 % count + position.view.0 % count)
@@ -491,36 +568,62 @@ impl BatchSlots {
         }
     }
 
-    /// Authenticate a fresh availability vote against the exact current producer slot.
+    /// Authenticate an availability vote for any authorized view of the current slot.
     ///
     /// The caller must also validate the execution body, and persist this decision before
-    /// acknowledging it. Certified historical records use [Self::apply] during replay, where
-    /// an earlier view remains eligible until its sequence is filled.
+    /// acknowledging it. A delayed proposal can finish certification after a retry because
+    /// each view keeps its own durable reservation through the epoch.
     pub fn vote(&self, record: &SignedBatchSlotRecord) -> Result<BatchSlotVote, BatchSlotError> {
+        self.authorization(record.message().position().bucket)
+            .and_then(|authorization| self.vote_for_authorization(record, &authorization))
+    }
+
+    /// Authenticate a vote against an authorization retained from canonical execution.
+    ///
+    /// Historical authorizations let delayed honest headers finish certification. They must
+    /// come from the current epoch's canonical slot history, never from the submitted record.
+    /// The caller must fully validate the execution body and durably reserve the resulting vote.
+    pub fn vote_for_authorization(
+        &self,
+        record: &SignedBatchSlotRecord,
+        authorization: &BatchSlotAuthorization,
+    ) -> Result<BatchSlotVote, BatchSlotError> {
         record.verify(self.chain_id, &self.committee)?;
         let position = record.message().position();
-        if self.position(position.bucket)? != position {
-            Err(BatchSlotError::StalePosition)
-        } else {
-            let key = match record.message() {
-                BatchSlotMessage::Proposal { batch, .. } => match () {
-                    () if self.producer(position)? != record.authority() => {
-                        Err(BatchSlotError::WrongProducer)
-                    }
-                    () if batch.epoch != self.epoch() => Err(BatchSlotError::WrongEpoch),
-                    () => Ok(BatchSlotVoteKey::Proposal(position.bucket)),
-                },
-                BatchSlotMessage::Timeout { .. } => {
-                    Ok(BatchSlotVoteKey::Timeout(position.bucket, *record.authority()))
-                }
-            }?;
-            record.digest().map(|digest| BatchSlotVote {
-                chain_id: self.chain_id,
-                epoch: self.epoch(),
-                key,
-                position,
-                digest,
-            })
+        match () {
+            () if authorization.chain_id != self.chain_id => Err(BatchSlotError::WrongChain),
+            () if authorization.epoch != self.epoch() => Err(BatchSlotError::WrongEpoch),
+            () if record.slot() != authorization.id() => Err(BatchSlotError::StalePosition),
+            () if position.parent != authorization.position.parent => {
+                Err(BatchSlotError::WrongParent)
+            }
+            () if position.view > authorization.position.view => Err(BatchSlotError::FutureView),
+            () => {
+                let key = match record.message() {
+                    BatchSlotMessage::Proposal { batch, .. } => match () {
+                        () if self.producer(position)? != record.authority() => {
+                            Err(BatchSlotError::WrongProducer)
+                        }
+                        () if batch.epoch != self.epoch() => Err(BatchSlotError::WrongEpoch),
+                        () => Ok(BatchSlotVoteKey::Proposal {
+                            slot: record.slot(),
+                            view: position.view,
+                        }),
+                    },
+                    BatchSlotMessage::Timeout { .. } => Ok(BatchSlotVoteKey::Timeout {
+                        slot: record.slot(),
+                        view: position.view,
+                        authority: *record.authority(),
+                    }),
+                }?;
+                record.digest().map(|digest| BatchSlotVote {
+                    chain_id: self.chain_id,
+                    epoch: self.epoch(),
+                    key,
+                    position,
+                    digest,
+                })
+            }
         }
     }
 
@@ -1007,19 +1110,102 @@ mod tests {
     }
 
     #[test]
-    fn reservations_advance_only_with_the_canonical_retry() -> Result<(), BatchSlotError> {
+    fn retry_views_keep_independent_reservations_for_late_votes() -> Result<(), BatchSlotError> {
         let fixture = Fixture::new()?;
         let mut slots = fixture.slots.clone();
         let bucket = slots.bucket(Address::ZERO);
         let original = fixture.proposal(&slots, bucket)?;
         let reserved = slots.vote(&original)?;
         fixture.rotate(&mut slots, bucket)?;
-        assert!(matches!(slots.vote(&original), Err(BatchSlotError::StalePosition)));
+        let late = slots.vote(&original);
+        assert!(late.is_ok(), "a delayed honest proposal must still be able to obtain votes");
+        reserved.permits(&late?)?;
         let replacement = fixture.proposal(&slots, bucket)?;
         let next = slots.vote(&replacement)?;
-        reserved.permits(&next)?;
-        assert!(matches!(next.permits(&reserved), Err(BatchSlotError::StalePosition)));
+        assert_ne!(reserved.key(), next.key());
+        assert!(matches!(reserved.permits(&next), Err(BatchSlotError::WrongReservationKey)));
+        assert!(matches!(next.permits(&reserved), Err(BatchSlotError::WrongReservationKey)));
         assert_eq!(slots.apply(&original, B256::ZERO)?, BatchSlotTransition::Selected);
+        Ok(())
+    }
+
+    #[test]
+    fn closed_slot_authorization_keeps_delayed_headers_certifiable() -> Result<(), BatchSlotError> {
+        let fixture = Fixture::new()?;
+        let mut slots = fixture.slots.clone();
+        let bucket = slots.bucket(Address::ZERO);
+        let original = fixture.proposal(&slots, bucket)?;
+        let authorization = slots.authorization(bucket)?;
+        let reserved = slots.vote(&original)?;
+        assert_eq!(slots.apply(&original, B256::repeat_byte(4))?, BatchSlotTransition::Selected);
+        slots.finalize_openings(B256::repeat_byte(4), B256::repeat_byte(5))?;
+        assert!(matches!(slots.vote(&original), Err(BatchSlotError::StalePosition)));
+        let late = slots.vote_for_authorization(&original, &authorization);
+        assert!(
+            late.is_ok(),
+            "the retained authorization must let honest peers finish a delayed header"
+        );
+        reserved.permits(&late?)?;
+        assert_eq!(slots.apply(&original, B256::repeat_byte(6))?, BatchSlotTransition::Unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn closed_slot_history_does_not_authorize_an_unopened_retry() -> Result<(), BatchSlotError> {
+        let fixture = Fixture::new()?;
+        let mut slots = fixture.slots.clone();
+        let bucket = slots.bucket(Address::ZERO);
+        let original = fixture.proposal(&slots, bucket)?;
+        let authorization = slots.authorization(bucket)?;
+        assert_eq!(slots.apply(&original, B256::repeat_byte(4))?, BatchSlotTransition::Selected);
+        slots.finalize_openings(B256::repeat_byte(4), B256::repeat_byte(5))?;
+        let mut forged = original.message.clone();
+        if let BatchSlotMessage::Proposal { position, .. } = &mut forged {
+            position.view = BatchSlotView(1);
+        }
+        let author = *slots.producer(forged.position())?;
+        let key = fixture
+            .keys
+            .iter()
+            .find(|key| key.public() == &author)
+            .ok_or(BatchSlotError::UnknownAuthority)?;
+        let forged =
+            SignedBatchSlotRecord::sign(slots.chain_id, slots.epoch(), author, forged, key)?;
+        assert!(matches!(
+            slots.vote_for_authorization(&forged, &authorization),
+            Err(BatchSlotError::FutureView)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_workers_preserve_parallel_proposal_capacity() -> Result<(), BatchSlotError> {
+        let fixture = Fixture::new()?;
+        let workers = std::num::NonZeroUsize::new(2).ok_or(BatchSlotError::CommitteeTooLarge)?;
+        let committee = fixture.slots.committee.with_num_workers(workers);
+        let slots = BatchSlots::new(
+            fixture.slots.chain_id,
+            committee,
+            BatchSlotParent::new(B256::ZERO, B256::ZERO),
+        )?;
+        let positions =
+            slots.buckets().map(|bucket| slots.position(bucket)).collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(positions.len(), 8, "four validators with two workers need eight slots");
+        let owners: Vec<_> =
+            positions.into_iter().map(|position| slots.producer(position)).collect();
+        assert!(
+            owners.iter().all(Result::is_ok),
+            "every worker slot must map to a committee producer"
+        );
+        let counts = owners.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().fold(
+            std::collections::BTreeMap::<BlsPublicKey, usize>::new(),
+            |mut counts, owner| {
+                *counts.entry(*owner).or_default() += 1;
+                counts
+            },
+        );
+        assert_eq!(counts.len(), 4);
+        assert!(counts.values().all(|count| *count == 2));
         Ok(())
     }
 }
