@@ -34,6 +34,16 @@ FILES = [
     "crates/config/src/consensus.rs",
     "crates/storage/src/lib.rs",
     "Cargo.lock",
+    "crates/types/src/worker/batch_slot_control.rs",
+    "crates/types/src/worker/sealed_batch.rs",
+    "crates/storage/tests/batch_slot_votes.rs",
+    "crates/tn-reth/src/env/slot_admission.rs",
+    "crates/tn-reth/src/env/mod.rs",
+    "crates/tn-reth/src/evm/mod.rs",
+    "crates/tn-reth/src/txn_pool.rs",
+    "crates/consensus/worker/src/network/handler.rs",
+    "crates/consensus/worker/src/network/primary.rs",
+    "crates/consensus/worker/src/worker.rs",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -103,8 +113,10 @@ def run(label, command, *, mutant=False, required=True):
 
 def test_command(package, target, pattern, feature=False):
     command = ["cargo", f"+{PIN}", "test", "--locked", "-p", package]
+    if package == "tn-storage":
+        command += ["--features", "test-utils"]
     if feature:
-        command += ["--features", "adiri" if package == "tn-types" else "tn-reth/adiri"]
+        command += ["--features", "adiri" if package == "tn-types" else "tn-types/adiri" if package == "tn-storage" else "tn-reth/adiri"]
     command += target + [pattern, "--", "--nocapture"]
     return command
 
@@ -188,6 +200,9 @@ try:
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
+        storage_command = test_command("tn-storage", ["--test", "batch_slot_votes"], "")
+        run("slot-storage-default", storage_command)
+        run("slot-storage-adiri", test_command("tn-storage", ["--test", "batch_slot_votes"], "", True))
         source = "crates/types/src/worker/batch_slots.rs"
         mutations = [
             ("slot-resolved-sequence",
@@ -249,14 +264,20 @@ try:
              "Ok(())"),
         ]
         for label, before, after in storage_mutations:
-            mutate(f"mutant-{label}", store_source, before, after, command)
+            mutate(f"mutant-{label}", store_source, before, after, storage_command)
+        mutate("mutant-slot-envelope", source,
+               "if canonical == *envelope {", "if canonical.epoch == envelope.epoch {", storage_command)
+        mutate("mutant-slot-publication-anchor", "crates/types/src/worker/batch_slot_control.rs",
+               "output.candidate.position(bucket).map(|_| ())", "output.previous.position(bucket).map(|_| ())", storage_command)
         run("slot-core-restored", command)
+        run("slot-storage-restored", storage_command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
             ("builder-capacity", "tn-batch-builder", ["--lib"], "peer_batch_capacity_loss_"),
             ("race-execution", "tn-batch-builder", ["--test", "it"], "peer_batch_residuals::"),
             ("slot-core", "tn-types", ["--lib"], "worker::batch_slot"),
+            ("slot-storage", "tn-storage", ["--test", "batch_slot_votes"], ""),
         ]
         for feature in [False, True]:
             suffix = "adiri" if feature else "default"
