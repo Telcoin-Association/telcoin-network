@@ -7,13 +7,11 @@ use super::{
 use crate::{BlsPublicKey, Database, B256};
 use futures::StreamExt;
 use parking_lot::RwLock;
-use std::{
-    collections::BTreeMap,
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Instant,
 };
-use tokio::sync::{mpsc, oneshot};
 
 /// One node-wide admission handle, shared across execution, workers and transaction pools.
 #[derive(Clone, Debug, Default)]
