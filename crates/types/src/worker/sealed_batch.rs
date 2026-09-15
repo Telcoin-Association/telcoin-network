@@ -209,6 +209,11 @@ pub fn max_batch_size(_epoch: Epoch) -> usize {
 ///
 /// Invalid transactions will not receive further processing.
 pub trait BatchValidation: Send + Sync + Debug {
+    /// Recover the sender bucket for a locally built transaction under native admission.
+    fn slot_bucket(&self, _transaction: &[u8]) -> Result<super::BatchBucket, BatchValidationError> {
+        Err(BatchValidationError::SlotAdmission("native transaction routing is unavailable".into()))
+    }
+
     /// Determines if this batch can be voted on
     fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
 

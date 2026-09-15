@@ -136,6 +136,11 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
 
 /// Trait on a transaction pool to produce the best transaction.
 pub trait TxPool {
+    /// Node-wide ordered admission, absent for pool implementations using the legacy protocol.
+    fn batch_slot_control(&self) -> Option<tn_types::BatchSlotControl> {
+        None
+    }
+
     /// Return an iterator over the best transactions in a pool.
     fn best_transactions(&self) -> BestTxns;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
@@ -702,6 +707,10 @@ impl WorkerTxPool {
 }
 
 impl TxPool for WorkerTxPool {
+    fn batch_slot_control(&self) -> Option<tn_types::BatchSlotControl> {
+        Some(self.4.clone())
+    }
+
     fn best_transactions(&self) -> BestTxns {
         BestTxns { inner: self.0.best_transactions() }
     }

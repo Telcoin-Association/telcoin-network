@@ -84,6 +84,11 @@ impl BatchSlotControl {
         self.0.read().session.as_ref().map(|session| session.slots.clone())
     }
 
+    /// Whether this node can sign retry votes and proposals in the installed committee.
+    pub fn is_validator(&self) -> bool {
+        self.0.read().authority.is_some()
+    }
+
     /// Install reconstructed canonical epoch state before starting any voting workers.
     ///
     /// The caller initializes the epoch's vote store and replays canonical slot transitions
