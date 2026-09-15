@@ -298,15 +298,8 @@ impl BatchSlotOutput {
         &mut self,
         record: &SignedBatchSlotRecord,
     ) -> Result<BatchSlotTransition, BatchSlotError> {
-        let position = record.message().position();
-        let published = self.previous.position(position.bucket())?;
-        if position.sequence() >= published.sequence() {
-            // A retry advanced inside this output was not yet available for voting. Only
-            // positions authorized by the preceding published snapshot can select a proposal.
-            self.previous.vote(record)?;
-        }
         let transition = self.candidate.apply(record, self.output)?;
-        if transition == BatchSlotTransition::Selected {
+        if matches!(transition, BatchSlotTransition::Selected | BatchSlotTransition::ViewAdvanced) {
             let bucket = record.message().position().bucket();
             let authorization = self.previous.authorization(bucket)?;
             self.closed.insert(bucket, authorization);

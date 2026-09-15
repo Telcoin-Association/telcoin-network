@@ -5,7 +5,12 @@ retains at most 65,536 hashes, never refreshes an entry, and forgets entries aft
 The second half of that lifetime permits local inclusion while preventing a peer from repeatedly
 rearming a deferral. An abandoned peer batch therefore cannot hold a transaction indefinitely.
 
-Issue #1377 tracks the remaining loss of batch capacity. The mitigation depends on when the node
+This page describes the legacy mitigation. Issue #1377 also adds the coordinated
+[native sender-slot fork](native-batch-slots.md), which enforces admission across validators
+while preserving quorum-backed failover. Native slot safety does not depend on this cache.
+That fork is inactive until the network schedules its activation epoch.
+
+Before native activation, the mitigation depends on when the node
 learns about peer proposals: two builders that select before either peer batch is validated can
 both pack the same transactions. Validation afterward does not retract either proposal. If their
 distinct batches reach execution, the first copy pays fees and advances the nonce; the later copy

@@ -13,11 +13,11 @@ use tn_types::{
 /// Type convenience for implementing block validation errors.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
-/// Batch validator
-/// Important note about batch validation, we rely on libp2p to verify that
-/// batches came from a committee member.  This means we do not generate or
-/// check our own signatures for batches since they all came from current
-/// committee members.
+/// Validate legacy batches or authenticated native sender-slot envelopes.
+///
+/// Legacy batch provenance relies on the authenticated committee network. Native envelopes
+/// additionally bind the chain, epoch, slot and full body with a committee BLS signature.
+/// Availability voters must also reserve the validated native record durably before replying.
 #[derive(Clone, Debug)]
 pub struct BatchValidator {
     /// Database provider to encompass tree and provider factory.

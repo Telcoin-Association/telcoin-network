@@ -122,6 +122,9 @@ fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchS
     output.apply(&timeout).map_err(BatchSlotVoteStoreError::Protocol)?;
     let mut advanced = slots;
     advanced.apply(&timeout, hash).map_err(BatchSlotVoteStoreError::Protocol)?;
+    advanced
+        .finalize_openings(hash, B256::repeat_byte(10))
+        .map_err(BatchSlotVoteStoreError::Protocol)?;
     let batch = match original.message() {
         tn_types::BatchSlotMessage::Proposal { batch, .. } => Ok(batch.clone()),
         tn_types::BatchSlotMessage::Timeout { .. } => Err(BatchSlotError::InvalidEnvelope),
@@ -130,7 +133,7 @@ fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchS
     let premature = advanced
         .sign_proposal(bucket, *key.public(), batch, &key)
         .map_err(BatchSlotVoteStoreError::Protocol)?;
-    assert!(matches!(output.apply(&premature), Err(BatchSlotError::FutureView)));
+    assert!(matches!(output.apply(&premature), Err(BatchSlotError::OpeningNotFinalized)));
     Ok(())
 }
 

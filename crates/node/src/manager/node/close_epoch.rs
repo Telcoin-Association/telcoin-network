@@ -164,7 +164,7 @@ where
             // Any batches in this table were created by us but never made it to consensus.
             self.consensus_db.iter::<OurNodeBatchesCache>()
                 .map(|(_, batch)| tn_types::SignedBatchSlotRecord::orphaned_batch(batch)
-                    .map(|batch| (tn_types::Hash::digest(&batch), batch)))
+                    .map(|batch| (batch.digest(), batch)))
                 .collect::<Result<_, _>>()?;
         // We have what we need so clear our Batch cache now.
         // We are reintroducing the transactions so these batches are now defunct.

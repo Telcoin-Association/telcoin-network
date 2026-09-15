@@ -1,8 +1,8 @@
 //! Consensus-ordered producer slots for sender buckets.
 //!
-//! A quorum of ordered timeout votes rotates the producer of an unfilled slot. An earlier
-//! proposal remains eligible until one proposal fills the slot. Opening the next slot requires
-//! durable execution. Availability voters must also validate proposal bodies and durably
+//! A quorum of ordered timeout votes closes a stalled sequence and rotates its producer.
+//! A filled or timed-out sequence cannot execute again. Opening the next sequence requires
+//! a durable execution anchor. Availability voters must also validate proposal bodies and durably
 //! reserve one proposal digest per slot and view before acknowledging them.
 
 use crate::{
@@ -37,7 +37,7 @@ impl BatchBucket {
     }
 }
 
-/// Number of selected proposals in a bucket.
+/// Number of filled or timed-out sequences in a bucket.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BatchSlotSequence(u64);
 
@@ -53,7 +53,7 @@ impl BatchSlotSequence {
     }
 }
 
-/// Consensus-approved retry number within an unfilled slot.
+/// Consecutive consensus-approved retries since the last selected proposal.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BatchSlotView(u64);
 
@@ -423,7 +423,7 @@ pub enum BatchSlotTransition {
     Selected,
     /// A new timeout vote was recorded, without reaching a quorum.
     TimeoutRecorded,
-    /// A timeout quorum rotated the producer of the unfilled slot.
+    /// A timeout quorum closed the sequence and fenced a retry with the next producer.
     ViewAdvanced,
     /// An earlier record already resolved the sequence, view, or vote.
     Unchanged,
@@ -629,10 +629,8 @@ impl BatchSlots {
     pub fn producer(&self, position: BatchSlotPosition) -> Result<&BlsPublicKey, BatchSlotError> {
         self.bucket_state(position.bucket)?;
         let count = u64::from(self.producer_count.get());
-        // Three terms, each below u32::MAX, cannot overflow u64.
-        let ordinal =
-            (u64::from(position.bucket.0) + position.sequence.0 % count + position.view.0 % count)
-                % count;
+        // Every filled or timed-out sequence advances to the next producer exactly once.
+        let ordinal = (u64::from(position.bucket.0) + position.sequence.0 % count) % count;
         usize::try_from(ordinal)
             .ok()
             .and_then(|index| self.producers.get(index))
@@ -712,7 +710,7 @@ impl BatchSlots {
             () if position.parent != authorization.position.parent => {
                 Err(BatchSlotError::WrongParent)
             }
-            () if position.view > authorization.position.view => Err(BatchSlotError::FutureView),
+            () if position.view != authorization.position.view => Err(BatchSlotError::FutureView),
             () => {
                 let key = match record.message() {
                     BatchSlotMessage::Proposal { batch, .. } => match () {
@@ -762,7 +760,7 @@ impl BatchSlots {
                 () => self.apply_proposal(*position, output),
             },
             BatchSlotMessage::Timeout { position } => {
-                self.apply_timeout(*position, *record.authority())
+                self.apply_timeout(*position, *record.authority(), output)
             }
         }
     }
@@ -797,14 +795,14 @@ impl BatchSlots {
             .ok_or(BatchSlotError::UnknownBucket)
     }
 
-    /// Check sequence and anchor; old retry views remain eligible until the slot is filled.
+    /// Check the open sequence and anchor; filled or timed-out sequences are no longer eligible.
     fn is_current_sequence(&self, position: BatchSlotPosition) -> Result<bool, BatchSlotError> {
         let slot = self.bucket_state(position.bucket)?;
         match () {
             () if position.sequence < slot.sequence => Ok(false),
             () if position.sequence > slot.sequence => Err(BatchSlotError::FutureSequence),
             () if position.parent != slot.opening.parent()? => Err(BatchSlotError::WrongParent),
-            () if position.view > slot.view => Err(BatchSlotError::FutureView),
+            () if position.view != slot.view => Err(BatchSlotError::FutureView),
             () => Ok(true),
         }
     }
@@ -835,6 +833,7 @@ impl BatchSlots {
         &mut self,
         position: BatchSlotPosition,
         author: BlsPublicKey,
+        output: B256,
     ) -> Result<BatchSlotTransition, BatchSlotError> {
         let slot = self.bucket_state(position.bucket)?;
         match () {
@@ -850,16 +849,20 @@ impl BatchSlots {
                             .ok_or(BatchSlotError::VotingPowerOverflow)
                     },
                 )?;
-                let next_view = if power >= self.committee.quorum_threshold() {
-                    slot.view.next()?
+                let (sequence, next_view) = if power >= self.committee.quorum_threshold() {
+                    (slot.sequence.next()?, slot.view.next()?)
                 } else {
-                    slot.view
+                    (slot.sequence, slot.view)
                 };
                 let index = usize::try_from(position.bucket.0)
                     .map_err(|_| BatchSlotError::UnknownBucket)?;
                 let slot = self.buckets.get_mut(index).ok_or(BatchSlotError::UnknownBucket)?;
                 if power >= self.committee.quorum_threshold() {
+                    // Close the stalled sequence so the retry can use fresh execution state.
+                    // Late proposals keep their certification history but cannot execute.
+                    slot.sequence = sequence;
                     slot.view = next_view;
+                    slot.opening = SlotOpening::Pending(output);
                     slot.timeout_voters.clear();
                     Ok(BatchSlotTransition::ViewAdvanced)
                 } else {
@@ -1039,7 +1042,8 @@ mod tests {
             self.timeouts(slots, bucket)?
                 .iter()
                 .take(3)
-                .try_for_each(|vote| slots.apply(vote, B256::repeat_byte(3)).map(|_| ()))
+                .try_for_each(|vote| slots.apply(vote, B256::repeat_byte(3)).map(|_| ()))?;
+            slots.finalize_openings(B256::repeat_byte(3), B256::repeat_byte(4))
         }
     }
 
@@ -1058,8 +1062,11 @@ mod tests {
         assert_eq!(slots.position(bucket)?, original);
         let third = votes.get(2).ok_or(BatchSlotError::UnknownAuthority)?;
         assert_eq!(slots.apply(third, B256::ZERO)?, BatchSlotTransition::ViewAdvanced);
+        assert!(matches!(slots.position(bucket), Err(BatchSlotError::OpeningNotFinalized)));
+        slots.finalize_openings(B256::ZERO, B256::repeat_byte(5))?;
         assert_eq!(slots.position(bucket)?.view().value(), 1);
-        assert_eq!(slots.position(bucket)?.parent(), original.parent());
+        assert_eq!(slots.position(bucket)?.sequence().value(), 1);
+        assert_eq!(slots.position(bucket)?.parent().execution(), B256::repeat_byte(5));
         assert_eq!(slots.apply(third, B256::ZERO)?, BatchSlotTransition::Unchanged);
         Ok(())
     }
@@ -1078,18 +1085,30 @@ mod tests {
     }
 
     #[test]
-    fn late_original_proposal_wins_only_while_its_slot_is_unfilled() -> Result<(), BatchSlotError> {
+    fn consecutive_timeouts_visit_every_producer() -> Result<(), BatchSlotError> {
+        let fixture = Fixture::new()?;
+        let mut slots = fixture.slots.clone();
+        let bucket = slots.bucket(Address::ZERO);
+        let visited = (0..fixture.keys.len()).try_fold(BTreeSet::new(), |mut visited, _| {
+            visited.insert(*slots.producer(slots.position(bucket)?)?);
+            fixture.rotate(&mut slots, bucket)?;
+            Ok::<_, BatchSlotError>(visited)
+        })?;
+        assert_eq!(visited.len(), fixture.keys.len(), "retry rotation must reach every validator");
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_closes_the_old_sequence_before_a_late_proposal_arrives() -> Result<(), BatchSlotError>
+    {
         let fixture = Fixture::new()?;
         let mut slots = fixture.slots.clone();
         let bucket = slots.bucket(Address::ZERO);
         let original = fixture.proposal(&slots, bucket)?;
         fixture.rotate(&mut slots, bucket)?;
         let replacement = fixture.proposal(&slots, bucket)?;
-        assert_eq!(slots.apply(&original, B256::repeat_byte(4))?, BatchSlotTransition::Selected);
-        assert_eq!(
-            slots.apply(&replacement, B256::repeat_byte(4))?,
-            BatchSlotTransition::Unchanged
-        );
+        assert_eq!(slots.apply(&original, B256::repeat_byte(4))?, BatchSlotTransition::Unchanged);
+        assert_eq!(slots.apply(&replacement, B256::repeat_byte(4))?, BatchSlotTransition::Selected);
         assert_eq!(slots.apply(&original, B256::repeat_byte(4))?, BatchSlotTransition::Unchanged);
         Ok(())
     }
@@ -1236,8 +1255,9 @@ mod tests {
         let bucket = slots.bucket(Address::ZERO);
         let original = fixture.proposal(&slots, bucket)?;
         let reserved = slots.vote(&original)?;
+        let authorization = slots.authorization(bucket)?;
         fixture.rotate(&mut slots, bucket)?;
-        let late = slots.vote(&original);
+        let late = slots.vote_for_authorization(&original, &authorization);
         assert!(late.is_ok(), "a delayed honest proposal must still be able to obtain votes");
         reserved.permits(&late?)?;
         let replacement = fixture.proposal(&slots, bucket)?;
@@ -1245,7 +1265,7 @@ mod tests {
         assert_ne!(reserved.key(), next.key());
         assert!(matches!(reserved.permits(&next), Err(BatchSlotError::WrongReservationKey)));
         assert!(matches!(next.permits(&reserved), Err(BatchSlotError::WrongReservationKey)));
-        assert_eq!(slots.apply(&original, B256::ZERO)?, BatchSlotTransition::Selected);
+        assert_eq!(slots.apply(&original, B256::ZERO)?, BatchSlotTransition::Unchanged);
         Ok(())
     }
 
