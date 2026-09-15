@@ -1333,12 +1333,33 @@ impl Inner {
                 }
             }
         } else {
-            // Header-only file: brand new, or a crash landed between the header write and the meta
-            // append.  A crash can leave the file grown to its mmap capacity and zero-padded past
-            // the header, so roll the logical end back to exactly the header first -- the meta must
-            // be the first record at DATA_HEADER_BYTES, never after the padding. Commit immediately
-            // so the header+meta prefix is durable before we return: a valid pack always has a
-            // durable meta, which is what lets the torn-meta path above fail instead of repair.
+            // `record_present_at` is false: the meta's 4-byte length prefix reads as zero. That is
+            // the shape of a brand-new or header-only file -- but it is ALSO the shape of an
+            // occupied pack whose meta length-prefix was corrupted to zero, where the meta payload
+            // and every committed output still sit past the header as non-zero bytes. Truncating to
+            // the header (below) would silently erase them, so first prove the region past the
+            // header is genuinely empty. Any content there means a real (if now unreadable) meta
+            // over live data: reject and preserve the pack -- the same fail-closed treatment as
+            // `open_append_exists` and the torn-prefix path above -- rather than re-initialize.
+            if data.any_content_after(DATA_HEADER_BYTES as u64) {
+                return Err(PackError::EpochLoad(format!(
+                    "epoch {epoch} pack {} ({pack_len} bytes): the epoch meta's length prefix is \
+                     zeroed but committed data remains past the header -- refusing to \
+                     re-initialize, which would erase it. The data is intact; inspect it with \
+                     `telcoin-network db validate {}` and re-sync this epoch from peers. Do NOT \
+                     delete this `epoch-{epoch}` directory or the chain-data directories (`db`, \
+                     `static_files`, `consensus-db`)",
+                    pack_file.display(),
+                    base_dir.display(),
+                )));
+            }
+            // Genuinely header-only: brand new, or a crash landed between the header write and the
+            // meta append.  A crash can leave the file grown to its mmap capacity and zero-padded
+            // past the header, so roll the logical end back to exactly the header first -- the meta
+            // must be the first record at DATA_HEADER_BYTES, never after the padding. Commit
+            // immediately so the header+meta prefix is durable before we return: a valid pack
+            // always has a durable meta, which is what lets the torn-meta path above
+            // fail instead of repair.
             if pack_len > DATA_HEADER_BYTES as u64 {
                 data.truncate(DATA_HEADER_BYTES as u64)?;
             }
@@ -5444,6 +5465,53 @@ pub(crate) mod test {
         );
         let len_after = std::fs::metadata(&data_path).expect("metadata").len();
         assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// R2 regression: zeroing the epoch meta's 4-byte length prefix on an *occupied* pack must not
+    /// be mistaken for a header-only file and re-initialized -- that would silently erase the meta
+    /// payload and every committed output. `open_append` must fail closed (like
+    /// `open_append_exists` and the torn-prefix path) and leave the data untouched. The
+    /// existing meta-corruption tests use a damaged payload or an inflated, *nonzero* prefix,
+    /// so they take the rejecting `if` branch and miss this zeroed-prefix `else`-branch case.
+    #[tokio::test]
+    async fn test_zero_meta_length_preserves_existing_outputs() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let temp_dir = TempDir::with_prefix("test_cp_zero_meta_len").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // All three outputs + meta + clean-close sentinel; must survive the rejected open.
+        let committed_len = std::fs::metadata(&data_path).expect("metadata").len();
+
+        // Zero ONLY the meta record's 4-byte length prefix at DATA_HEADER_BYTES, leaving the meta
+        // payload, all outputs, the indexes, and the clean-close sentinel intact.
+        // `record_present_at` now reads the prefix as empty even though the pack is fully
+        // occupied.
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(DATA_HEADER_BYTES as u64)).expect("seek");
+            f.write_all(&[0u8; 4]).expect("zero the meta length prefix");
+            f.sync_all().expect("sync");
+        }
+
+        // Must reject (not re-initialize), and must leave the occupied data untouched.
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(super::PackError::EpochLoad(_))),
+            "a zeroed meta length prefix over committed data must reject, got {res:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            committed_len,
+            "the rejected open must not truncate the occupied pack (outputs preserved)"
+        );
     }
 
     /// The header-only branch reinitializes the digest index lengths: the data file is rolled back

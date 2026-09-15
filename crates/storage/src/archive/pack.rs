@@ -101,6 +101,23 @@ where
             && self.inner.data_file.slice(pos, avail).is_some_and(|b| b.iter().any(|&x| x != 0))
     }
 
+    /// True iff any logical byte at or after `pos` is non-zero — i.e. real record bytes (a meta or
+    /// an output) were written past `pos`, as opposed to unwritten, zero-filled mmap capacity
+    /// padding. Reads a zero-copy view of the mapped bytes and short-circuits at the first non-zero
+    /// byte, so an occupied pack returns immediately while a genuinely empty, all-zero-padded tail
+    /// is fully scanned.
+    ///
+    /// Complements [`Self::record_present_at`], which inspects only the 4-byte length prefix: a
+    /// prefix corrupted to zero reads there as "no record", but real content can still sit past
+    /// `pos`. `open_append` uses this to tell a genuinely header-only file (safe to initialize)
+    /// from an occupied pack whose meta length-prefix was zeroed (which a blind re-initialize would
+    /// erase).
+    pub(crate) fn any_content_after(&self, pos: u64) -> bool {
+        let span = self.inner.data_file.len().saturating_sub(pos) as usize;
+        span != 0
+            && self.inner.data_file.slice(pos, span).is_some_and(|b| b.iter().any(|&x| x != 0))
+    }
+
     /// Return a refernce to the pack files header.
     pub fn header(&self) -> &DataHeader {
         &self.inner.header
