@@ -29,6 +29,11 @@ FILES = [
     "docs/peer-batch-deferral.md",
     "crates/types/src/worker/batch_slots.rs",
     "crates/types/src/worker/mod.rs",
+    "crates/types/src/worker/batch_slot_votes.rs",
+    "crates/types/Cargo.toml",
+    "crates/config/src/consensus.rs",
+    "crates/storage/src/lib.rs",
+    "Cargo.lock",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -125,9 +130,7 @@ try:
             "tn-worker", "tn-config", "tn-metrics", "tn-network-types", "tn-worker-gateway",
         ]
         command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json"]
-        for package in packages:
-            command += ["-p", package]
-        command += ["--all-targets", "--no-deps"]
+        command += ["--workspace", "--all-targets", "--no-deps"]
         modes = {
             "default": ["--", "-D", "warnings"],
             "all-features": ["--all-features", "--", "-D", "warnings"],
@@ -182,9 +185,9 @@ try:
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "slot-core":
-        command = test_command("tn-types", ["--lib"], "worker::batch_slots::tests::")
+        command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
-        run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slots::tests::", True))
+        run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
         source = "crates/types/src/worker/batch_slots.rs"
         mutations = [
             ("slot-resolved-sequence",
@@ -210,21 +213,50 @@ try:
              "            self.buckets.iter_mut().for_each(|other| other.sequence = sequence);\n"
              "            Ok(BatchSlotTransition::Selected)\n"),
             ("slot-conflicting-vote",
-             "() if next_order == old_order && self != next => Err(BatchSlotError::ConflictingVote),",
-             "() if next_order == old_order && self != next => Ok(()),"),
-            ("slot-reservation-rewind",
-             "() if next_order < old_order => Err(BatchSlotError::StalePosition),",
-             "() if next_order < old_order => Ok(()),"),
+             "() if self != next => Err(BatchSlotError::ConflictingVote),",
+             "() if self != next => Ok(()),"),
+            ("slot-late-vote",
+             "position.view > authorization.position.view",
+             "position.view != authorization.position.view"),
+            ("slot-unopened-view",
+             "() if position.view > authorization.position.view => Err(BatchSlotError::FutureView),",
+             "() if position.view > authorization.position.view && position.view.0 == u64::MAX => Err(BatchSlotError::FutureView),"),
+            ("slot-worker-capacity",
+             "let count = u64::from(self.producer_count.get());",
+             "let count = u64::from(self.bucket_count.get());"),
         ]
         for label, before, after in mutations:
             mutate(f"mutant-{label}", source, before, after, command)
+        store_source = "crates/types/src/worker/batch_slot_votes.rs"
+        storage_mutations = [
+            ("slot-vote-durability",
+             "self.database\n                .persist::<BatchSlotVotes>()\n                .await\n                .map_err(BatchSlotVoteStoreError::Database)",
+             "Ok(())"),
+            ("slot-lost-reservation",
+             ".insert::<BatchSlotVotes>(vote.key(), vote)",
+             ".remove::<BatchSlotVotes>(vote.key())"),
+            ("slot-lost-history",
+             "|authorization| slots.vote_for_authorization(record, &authorization)",
+             "|_authorization| slots.vote(record)"),
+            ("slot-history-durability",
+             "self.database\n            .persist::<BatchSlotAuthorizations>()\n            .await\n            .map_err(BatchSlotVoteStoreError::Database)",
+             "Ok(())"),
+            ("slot-epoch-rewind",
+             "stored.is_some_and(|epoch| epoch > self.epoch)",
+             "stored.is_some_and(|epoch| epoch > self.epoch && epoch == u32::MAX)"),
+            ("slot-epoch-marker-durability",
+             "self.database\n                            .persist::<BatchSlotStoreEpoch>()\n                            .await\n                            .map_err(BatchSlotVoteStoreError::Database)",
+             "Ok(())"),
+        ]
+        for label, before, after in storage_mutations:
+            mutate(f"mutant-{label}", store_source, before, after, command)
         run("slot-core-restored", command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
             ("builder-capacity", "tn-batch-builder", ["--lib"], "peer_batch_capacity_loss_"),
             ("race-execution", "tn-batch-builder", ["--test", "it"], "peer_batch_residuals::"),
-            ("slot-core", "tn-types", ["--lib"], "worker::batch_slots::tests::"),
+            ("slot-core", "tn-types", ["--lib"], "worker::batch_slot"),
         ]
         for feature in [False, True]:
             suffix = "adiri" if feature else "default"
