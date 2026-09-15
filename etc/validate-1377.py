@@ -55,6 +55,9 @@ FILES = [
     "crates/node/src/manager/node/run_epoch.rs",
     "crates/node/src/manager/node/batch_slots.rs",
     "crates/types/src/forks.rs",
+    "crates/engine/Cargo.toml",
+    "crates/engine/tests/it/main.rs",
+    "crates/engine/tests/it/native_slots.rs",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -127,7 +130,8 @@ def test_command(package, target, pattern, feature=False):
     if package == "tn-storage":
         command += ["--features", "test-utils"]
     if feature:
-        command += ["--features", "adiri" if package == "tn-types" else "tn-types/adiri" if package == "tn-storage" else "tn-reth/adiri"]
+        features = {"tn-types": "adiri", "tn-storage": "tn-types/adiri", "tn-engine": "adiri,tn-reth/adiri"}
+        command += ["--features", features.get(package, "tn-reth/adiri")]
     command += target + [pattern, "--", "--nocapture"]
     return command
 
@@ -215,6 +219,9 @@ try:
         storage_command = test_command("tn-storage", ["--test", "batch_slot_votes"], "")
         run("slot-storage-default", storage_command)
         run("slot-storage-adiri", test_command("tn-storage", ["--test", "batch_slot_votes"], "", True))
+        execution_command = test_command("tn-engine", ["--test", "it"], "native_slots")
+        run("slot-execution-default", execution_command)
+        run("slot-execution-adiri", test_command("tn-engine", ["--test", "it"], "native_slots", True))
         source = "crates/types/src/worker/batch_slots.rs"
         mutations = [
             ("slot-resolved-sequence",
@@ -279,6 +286,25 @@ try:
             mutate(f"mutant-{label}", store_source, before, after, storage_command)
         mutate("mutant-slot-unpublished-retry", "crates/types/src/worker/batch_slot_control.rs",
                "self.previous.vote(record)?;", "record.authenticate(&self.previous)?;", storage_command)
+        execution_source = "crates/engine/src/payload_builder.rs"
+        mutate("mutant-slot-losing-execution", execution_source,
+               "if transition == BatchSlotTransition::Selected {",
+               "if transition == BatchSlotTransition::Selected || matches!(record.message(), BatchSlotMessage::Proposal { .. }) {", execution_command)
+        mutate("mutant-slot-control-anchor", execution_source,
+               "!output.close_epoch() && !slot_state_changed",
+               "!output.close_epoch() && (!slot_state_changed || batches.is_empty())", execution_command)
+        publication_point = "    let slot_state_changed = slot_output.as_ref().is_some_and(BatchSlotOutput::changed);"
+        premature_publication = publication_point + "\n" + """    if let Some(mut premature) = slot_output.take() {
+        premature.finalize(canonical_header.hash()).map_err(TnEngineError::BatchSlot)?;
+        reth_env.batch_slots().commit_blocking(premature).map_err(TnEngineError::BatchSlotPublication)?;
+    }"""
+        mutate("mutant-slot-premature-publication", execution_source,
+               publication_point, premature_publication, execution_command)
+        mutate("mutant-slot-admission-nonce", "crates/tn-reth/src/evm/mod.rs",
+               "        caller.bump_nonce();", "        // Mutation: omit the admission nonce advance.", execution_command)
+        mutate("mutant-slot-selected-epoch-boundary", "crates/tn-reth/src/payload.rs",
+               "output.close_epoch() && is_final",
+               "output.close_epoch() && is_final && output.close_epoch_for_last_batch(self.batch_index).is_some_and(|last| last)", execution_command)
         mutate("mutant-slot-envelope", source,
                "if canonical == *envelope {", "if canonical.epoch == envelope.epoch {", storage_command)
         mutate("mutant-slot-publication-anchor", "crates/types/src/worker/batch_slot_control.rs",
@@ -288,6 +314,7 @@ try:
                "prototype.encode().map(|bytes| bytes.len())", storage_command)
         run("slot-core-restored", command)
         run("slot-storage-restored", storage_command)
+        run("slot-execution-restored", execution_command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
