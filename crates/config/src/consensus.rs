@@ -26,6 +26,8 @@ struct ConsensusConfigInner<DB> {
     node_storage: DB,
     /// One availability-vote reservation store shared across every worker.
     slot_votes: tn_types::BatchSlotVoteStore<DB>,
+    /// Admission handle installed from the execution environment before epoch tasks start.
+    slot_control: std::sync::OnceLock<tn_types::BatchSlotControl>,
     /// Local protocol and network signing keys.
     key_config: KeyConfig,
     /// This node's authority when it belongs to the committee.
@@ -231,6 +233,7 @@ where
                 next_committee_keys,
                 node_storage,
                 slot_votes,
+                slot_control: std::sync::OnceLock::new(),
                 key_config,
                 authority,
                 local_networks,
@@ -293,6 +296,19 @@ where
     /// Return the single vote store that all workers must share for batch-slot reservations.
     pub fn slot_votes(&self) -> &tn_types::BatchSlotVoteStore<DB> {
         &self.inner.slot_votes
+    }
+
+    /// Share the execution environment's admission handle before starting epoch workers.
+    pub fn set_slot_control(
+        &self,
+        control: tn_types::BatchSlotControl,
+    ) -> Result<(), tn_types::BatchSlotControlError> {
+        self.inner.slot_control.set(control).map_err(|_| tn_types::BatchSlotControlError::Replaced)
+    }
+
+    /// Return the node-wide admission handle shared by every worker and execution.
+    pub fn slot_control(&self) -> tn_types::BatchSlotControl {
+        self.inner.slot_control.get().cloned().unwrap_or_default()
     }
 
     /// Returns a reference to the cryptographic key configuration.

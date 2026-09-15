@@ -52,12 +52,12 @@ pub fn new_worker<DB: Database>(
         .local_network(id)
         .cloned()
         .ok_or_else(|| eyre::eyre!("no local network instance for worker id {id}"))?;
-    local_network.set_primary_to_worker_local_handler(Arc::new(PrimaryReceiverHandler {
-        store: consensus_config.node_storage().clone(),
-        network: Some(network_handle.clone()),
+    local_network.set_primary_to_worker_local_handler(Arc::new(PrimaryReceiverHandler::new(
+        &consensus_config,
+        Some(network_handle.clone()),
         batch_fetcher,
-        validator,
-    }))?;
+        validator.clone(),
+    )))?;
     let batch_provider = new_worker_internal(
         id,
         &consensus_config,

@@ -184,6 +184,8 @@ pub struct WorkerTxPool(
     /// The transactions this node has seen inside a validated peer batch, deferred by the
     /// builder while that peer batch is in flight (issue #1329).
     PeerBatchTxs,
+    /// Node-wide ordered admission state, shared across all worker pools.
+    tn_types::BatchSlotControl,
 );
 
 impl From<WorkerTxPool>
@@ -278,7 +280,13 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee, PeerBatchTxs::default()))
+        Ok(Self(
+            transaction_pool,
+            blockchain_provider.clone(),
+            base_fee,
+            PeerBatchTxs::default(),
+            tn_types::BatchSlotControl::default(),
+        ))
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -679,6 +687,17 @@ impl WorkerTxPool {
     /// transaction a peer is already proposing is not packed again here (issue #1329).
     pub fn peer_batch_txs(&self) -> &PeerBatchTxs {
         &self.3
+    }
+
+    /// Bind a newly created pool to the node's shared admission handle.
+    pub fn with_batch_slots(mut self, control: tn_types::BatchSlotControl) -> Self {
+        self.4 = control;
+        self
+    }
+
+    /// Read the node's admission handle without unwrapping the underlying Ethereum pool.
+    pub fn batch_slots(&self) -> &tn_types::BatchSlotControl {
+        &self.4
     }
 }
 

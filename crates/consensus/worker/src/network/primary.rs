@@ -22,6 +22,10 @@ pub(crate) struct PrimaryReceiverHandler<DB> {
     pub batch_fetcher: BatchFetcher<DB>,
     /// Validate incoming batches
     pub validator: Arc<dyn BatchValidation>,
+    /// Node-wide canonical admission snapshot shared by every worker.
+    slot_control: tn_types::BatchSlotControl,
+    /// Durable per-view reservations shared across every worker.
+    slot_votes: tn_types::BatchSlotVoteStore<DB>,
 }
 
 #[async_trait::async_trait]
@@ -40,7 +44,16 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
                 }
-                Ok(Some(_)) => {
+                Ok(Some(batch)) => {
+                    if !message.is_certified {
+                        self.slot_votes
+                            .validate_and_reserve(
+                                &self.slot_control,
+                                self.validator.as_ref(),
+                                batch.seal(*digest),
+                            )
+                            .await?;
+                    }
                     trace!("Digest {digest} already in store, nothing to sync");
                 }
                 Err(e) => {
@@ -58,6 +71,23 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let requested = missing.clone();
         let response = network.request_batches(&mut missing).await?;
 
+        // Reserve before opening the batch-cache write transaction. The reservation's durable
+        // barrier may wait on that database, so holding its transaction here would deadlock.
+        if !message.is_certified {
+            use futures::TryStreamExt as _;
+            futures::stream::iter(response.iter().map(Ok::<_, tn_types::BatchValidationError>))
+                .try_for_each(|(digest, batch)| async move {
+                    self.slot_votes
+                        .validate_and_reserve(
+                            &self.slot_control,
+                            self.validator.as_ref(),
+                            batch.clone().seal(*digest),
+                        )
+                        .await
+                })
+                .await?;
+        }
+
         self.store_synced_batches(response, &requested, &missing, message.is_certified)
     }
 
@@ -70,6 +100,23 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
 }
 
 impl<DB: Database> PrimaryReceiverHandler<DB> {
+    /// Construct the handler with the validator's shared admission and reservation state.
+    pub(crate) fn new(
+        config: &tn_config::ConsensusConfig<DB>,
+        network: Option<WorkerNetworkHandle>,
+        batch_fetcher: BatchFetcher<DB>,
+        validator: Arc<dyn BatchValidation>,
+    ) -> Self {
+        Self {
+            store: config.node_storage().clone(),
+            network,
+            batch_fetcher,
+            validator,
+            slot_control: config.slot_control(),
+            slot_votes: config.slot_votes().clone(),
+        }
+    }
+
     /// Validate and persist the batches returned by
     /// [`WorkerNetworkHandle::request_batches`].
     ///
@@ -173,6 +220,8 @@ mod tests {
             network: None,
             batch_fetcher,
             validator: Arc::new(NoopBatchValidator),
+            slot_control: tn_types::BatchSlotControl::default(),
+            slot_votes: tn_types::BatchSlotVoteStore::new(store.clone(), 0),
         };
         (handler, store, temp_dir)
     }
