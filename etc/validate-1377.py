@@ -44,6 +44,9 @@ FILES = [
     "crates/consensus/worker/src/network/handler.rs",
     "crates/consensus/worker/src/network/primary.rs",
     "crates/consensus/worker/src/worker.rs",
+    "crates/config/src/keys.rs",
+    "crates/types/src/error.rs",
+    "crates/batch-builder/src/lib.rs",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -269,6 +272,9 @@ try:
                "if canonical == *envelope {", "if canonical.epoch == envelope.epoch {", storage_command)
         mutate("mutant-slot-publication-anchor", "crates/types/src/worker/batch_slot_control.rs",
                "output.candidate.position(bucket).map(|_| ())", "output.previous.position(bucket).map(|_| ())", storage_command)
+        mutate("mutant-slot-wire-budget", source,
+               "prototype.encode().map(|bytes| bytes.len().saturating_add(4))",
+               "prototype.encode().map(|bytes| bytes.len())", storage_command)
         run("slot-core-restored", command)
         run("slot-storage-restored", storage_command)
     elif PHASE == "tests":
