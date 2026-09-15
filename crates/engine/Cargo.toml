@@ -25,6 +25,8 @@ metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
+rand = { workspace = true }
+tn-storage = { workspace = true }
 metrics-util = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }

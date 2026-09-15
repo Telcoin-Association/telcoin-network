@@ -5,8 +5,8 @@ use futures::TryStreamExt;
 use tn_config::TelcoinDirs;
 use tn_reth::RethEnv;
 use tn_types::{
-    BatchSlotChainId, BatchSlotOutput, BatchSlotParent, BatchSlotVoteStore, BatchSlots, BlsSigner,
-    Committee, Database, Hash as _, SealedHeader, SignedBatchSlotRecord, B256,
+    BatchSlotOutput, BatchSlotParent, BatchSlotVoteStore, BatchSlots, BlsSigner, Committee,
+    Database, Hash as _, SealedHeader, SignedBatchSlotRecord, B256,
 };
 
 impl<P, DB> EpochManager<P, DB>
@@ -42,7 +42,7 @@ where
                     .ok_or_else(|| eyre::eyre!("epoch opening has no consensus anchor"))?
             };
             let slots = BatchSlots::new(
-                BatchSlotChainId::new(reth_env.chainspec().chain_id()),
+                reth_env.chainspec().chain_id().into(),
                 committee.clone(),
                 BatchSlotParent::new(opening_consensus, epoch_start.hash()),
             )?;
