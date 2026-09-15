@@ -619,7 +619,7 @@ async fn native_ack_retains_transactions_until_canonical_execution() -> eyre::Re
     let (retry, acknowledgement) = timeout(Duration::from_secs(10), submitted.recv())
         .await?
         .ok_or_else(|| eyre::eyre!("builder stopped before retry"))?;
-    assert_eq!(first.transactions(), retry.transactions());
+    assert_eq!(first.batch.transactions(), retry.batch.transactions());
     assert_eq!(pool.pool_size().pending, 1, "a successful submission is not canonical execution");
     let _ = acknowledgement.send(Ok(()));
     building.abort();
