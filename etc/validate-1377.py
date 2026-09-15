@@ -336,6 +336,12 @@ try:
                "prototype.encode().map(|bytes| bytes.len())", storage_command)
         run("slot-core-restored", command)
         run("slot-storage-restored", storage_command)
+        mutate("mutant-slot-stale-timeout-demand", "crates/types/src/worker/batch_slot_control.rs",
+               ".filter(|current| current.position == position)",
+               ".filter(|current| current.position.bucket() == position.bucket())", storage_command)
+        mutate("mutant-slot-idle-retry-demand", "crates/types/src/worker/batch_slot_control.rs",
+               "// old demand would keep producing control-only blocks after a pool empties.\n                    demanded: false,",
+               "// old demand would keep producing control-only blocks after a pool empties.\n                    demanded: local.demanded,", storage_command)
         run("slot-execution-restored", execution_command)
         mutate("mutant-slot-cloned-reservation", "crates/consensus/worker/src/worker.rs",
                "native: self.native.clone(),", "native: None,", worker_command)
