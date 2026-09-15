@@ -206,7 +206,7 @@ async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSl
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retrying(
 ) -> eyre::Result<()> {
     let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
@@ -226,7 +226,7 @@ async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retr
     output.finalize(B256::repeat_byte(7))?;
     let commit = control.clone();
     tokio::task::spawn_blocking(move || commit.commit_blocking(output)).await??;
-    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
     assert!(control.retry_position().is_none(), "closed demand must not create idle retry traffic");
     control.observe_timeout(stale.message().position());
     assert!(
@@ -245,10 +245,12 @@ async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retr
     Ok(())
 }
 
+/// A deterministic four-validator committee with a three-vote quorum.
 fn fixture_keys() -> [BlsKeypair; 4] {
     [1377, 1378, 1379, 1380].map(|seed| BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)))
 }
 
+/// Select the key assigned to the fixture sender's current canonical position.
 fn producer_key(slots: &BatchSlots) -> Result<BlsKeypair, BatchSlotVoteStoreError> {
     let position =
         slots.position(slots.bucket(Address::ZERO)).map_err(BatchSlotVoteStoreError::Protocol)?;
@@ -422,7 +424,10 @@ async fn history_publication_waits_for_durable_commit() -> Result<(), BatchSlotV
 
 #[tokio::test]
 async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchSlotVoteStoreError> {
-    let database = MemDatabase::new();
+    let directory =
+        tempfile::tempdir().map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?;
+    let path = directory.path().join("epoch.redb");
+    let database = ReDB::open(&path).map_err(BatchSlotVoteStoreError::Database)?;
     let store = BatchSlotVoteStore::new(database.clone(), 7);
     let (first, _) = conflicting_votes()?;
     store.reserve(&first).await?;
@@ -435,7 +440,11 @@ async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchS
         next_epoch.reserve(&first).await,
         Err(BatchSlotVoteStoreError::Protocol(BatchSlotError::WrongEpoch))
     ));
-    let rewind = BatchSlotVoteStore::new(database, 7);
+    drop(store);
+    drop(next_epoch);
+    drop(database);
+    let rewind =
+        BatchSlotVoteStore::new(ReDB::open(&path).map_err(BatchSlotVoteStoreError::Database)?, 7);
     assert!(matches!(rewind.initialize().await, Err(BatchSlotVoteStoreError::EpochRewind)));
     Ok(())
 }

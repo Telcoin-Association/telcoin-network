@@ -286,6 +286,7 @@ mod tests {
         );
         let tx = TxEnv {
             caller,
+            nonce: 1,
             kind: TxKind::Call(caller),
             gas_limit: 100_000,
             gas_price: u128::from(env.block_env.basefee),
@@ -298,7 +299,7 @@ mod tests {
         let executed_sender =
             result.state.get(&caller).ok_or_else(|| eyre::eyre!("sender state missing"))?;
         assert_eq!(
-            executed_sender.info.nonce, 2,
+            executed_sender.info.nonce, 3,
             "delegated CREATE must demonstrate the extra nonce advance"
         );
         let mut admission = config.evm_factory().create_evm(db, env);
