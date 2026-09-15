@@ -26,6 +26,9 @@ use tracing::{error, info, instrument, warn};
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
+#[cfg(test)]
+mod slot_tests;
+
 /// Spawn the worker.
 ///
 /// Create an instance of `Self` and start all tasks to participate in consensus.
