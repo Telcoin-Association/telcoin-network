@@ -424,7 +424,10 @@ async fn history_publication_waits_for_durable_commit() -> Result<(), BatchSlotV
 
 #[tokio::test]
 async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchSlotVoteStoreError> {
-    let database = MemDatabase::new();
+    let directory =
+        tempfile::tempdir().map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?;
+    let path = directory.path().join("epoch.redb");
+    let database = ReDB::open(&path).map_err(BatchSlotVoteStoreError::Database)?;
     let store = BatchSlotVoteStore::new(database.clone(), 7);
     let (first, _) = conflicting_votes()?;
     store.reserve(&first).await?;
@@ -437,7 +440,11 @@ async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchS
         next_epoch.reserve(&first).await,
         Err(BatchSlotVoteStoreError::Protocol(BatchSlotError::WrongEpoch))
     ));
-    let rewind = BatchSlotVoteStore::new(database, 7);
+    drop(store);
+    drop(next_epoch);
+    drop(database);
+    let rewind =
+        BatchSlotVoteStore::new(ReDB::open(&path).map_err(BatchSlotVoteStoreError::Database)?, 7);
     assert!(matches!(rewind.initialize().await, Err(BatchSlotVoteStoreError::EpochRewind)));
     Ok(())
 }
