@@ -136,9 +136,22 @@ impl BatchSlotControl {
         }
     }
 
-    /// Record pending work or an authenticated peer retry, with committee-bounded memory.
+    /// Record pending work in a local pool, with committee-bounded memory.
     pub fn demand(&self, bucket: BatchBucket) {
         if let Some(local) = self.0.write().local.get_mut(&bucket) {
+            local.demanded = true;
+        }
+    }
+
+    /// Let a validated peer timeout reveal demand only for its exact current position.
+    pub fn observe_timeout(&self, position: BatchSlotPosition) {
+        if let Some(local) = self
+            .0
+            .write()
+            .local
+            .get_mut(&position.bucket())
+            .filter(|current| current.position == position)
+        {
             local.demanded = true;
         }
     }
@@ -257,7 +270,9 @@ impl ControlState {
                     position,
                     opened: Instant::now(),
                     proposed: false,
-                    demanded: local.demanded,
+                    // Fresh pool scans or current peer timeouts must renew demand. Retaining
+                    // old demand would keep producing control-only blocks after a pool empties.
+                    demanded: false,
                     timed_out: false,
                 };
             }

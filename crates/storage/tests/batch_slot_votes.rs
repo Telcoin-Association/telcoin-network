@@ -204,6 +204,45 @@ async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSl
     Ok(())
 }
 
+#[tokio::test]
+async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retrying(
+) -> eyre::Result<()> {
+    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
+    let (slots, proposal, _) = conflicting_records()?;
+    let bucket = slots.bucket(Address::ZERO);
+    let stale = slots.sign_timeout(bucket, *key.public(), &key)?;
+    let control = tn_types::BatchSlotControl::default();
+    let store = BatchSlotVoteStore::new(MemDatabase::new(), slots.epoch());
+    store.initialize().await?;
+    let receiver = control.install(slots, Some(*key.public()));
+    let publication = control.clone();
+    let publisher = tokio::spawn(async move { publication.serve(store, receiver).await });
+    control.demand(bucket);
+    let mut output =
+        control.prepare(B256::repeat_byte(6)).ok_or_else(|| eyre::eyre!("missing session"))?;
+    output.apply(&proposal)?;
+    output.finalize(B256::repeat_byte(7))?;
+    let commit = control.clone();
+    tokio::task::spawn_blocking(move || commit.commit_blocking(output)).await??;
+    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    assert!(control.retry_position().is_none(), "closed demand must not create idle retry traffic");
+    control.observe_timeout(stale.message().position());
+    assert!(
+        control.retry_position().is_none(),
+        "a delayed old timeout must not wake its successor"
+    );
+    let current =
+        control.snapshot().ok_or_else(|| eyre::eyre!("missing current slots"))?.position(bucket)?;
+    control.observe_timeout(current);
+    assert_eq!(
+        control.retry_position(),
+        Some(current),
+        "current peer demand must still enable fallback"
+    );
+    publisher.abort();
+    Ok(())
+}
+
 /// Two authenticated, conflicting proposals for one producer's initial slot.
 fn conflicting_records(
 ) -> Result<(BatchSlots, SignedBatchSlotRecord, SignedBatchSlotRecord), BatchSlotVoteStoreError> {
