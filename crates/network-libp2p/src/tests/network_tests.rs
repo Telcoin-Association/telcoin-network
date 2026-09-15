@@ -22,6 +22,67 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Query both public counts while processing only commands, leaving swarm progress under the
+/// test's control so a pending dial cannot race a handshake or a dial failure.
+async fn query_peer_counts(
+    network: &mut ConsensusNetworkMemoryDB<TestWorkerRequest, TestWorkerResponse>,
+) -> eyre::Result<(usize, usize)> {
+    let handle = network.network_handle();
+    let (counts, processed) = tokio::join!(
+        async {
+            Ok::<_, eyre::Report>((
+                handle.connected_peer_count().await?,
+                handle.established_peer_count().await?,
+            ))
+        },
+        async {
+            let command = network.commands.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            network.process_command(command)?;
+            let command = network.commands.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            network.process_command(command)?;
+            Ok::<_, eyre::Report>(())
+        }
+    );
+    processed?;
+    counts
+}
+
+/// Readiness excludes pending dials, tracks the request-routing queue after connection, and
+/// returns to zero when the established peer disconnects.
+#[tokio::test]
+async fn established_peer_count_excludes_pending_dials() -> eyre::Result<()> {
+    use libp2p::{core::Endpoint, swarm::ConnectionId};
+
+    let TestTypes { mut peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let peer_id = *peer2.network.swarm.local_peer_id();
+    let addr = peer2.config.primary_address();
+    assert_eq!(query_peer_counts(network).await?, (0, 0));
+
+    // Exercise the same registration hook as a kademlia-initiated dial, without polling the swarm.
+    network.swarm.behaviour_mut().peer_manager.handle_pending_outbound_connection(
+        ConnectionId::new_unchecked(1),
+        Some(peer_id),
+        std::slice::from_ref(&addr),
+        Endpoint::Dialer,
+    )?;
+    assert_eq!(query_peer_counts(network).await?, (1, 0));
+    let (reply, response) = oneshot::channel();
+    network.process_command(NetworkCommand::SendRequestAny {
+        request: TestWorkerRequest::MissingBatches(Vec::new()),
+        reply,
+    })?;
+    assert_matches!(response.await?, Err(NetworkError::NoPeers));
+
+    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr))?;
+    assert_eq!(query_peer_counts(network).await?.1, 1);
+
+    network.process_peer_manager_event(PeerEvent::PeerDisconnected(peer_id))?;
+    assert_eq!(query_peer_counts(network).await?.1, 0);
+    Ok(())
+}
+
 /// Building a consensus config with a peer-score config whose `min_score > max_score` must fail
 /// at construction, before any `PeerManager`/`Score` exists. This pins the startup wiring of
 /// `ScoreConfig::validate` into `ConsensusConfig::new_with_committee`: without that call the bad
