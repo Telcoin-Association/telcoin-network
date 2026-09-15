@@ -19,7 +19,7 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{encode, try_decode, BlockHash, Database, DefaultHashFunction};
+use tn_types::{encode, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
 use tracing::{error, warn};
 
 /// A record stored in the DHT.
@@ -217,6 +217,19 @@ impl KadProviderRow {
 /// interval bounds that cost without losing any eviction a 48h TTL could yield.
 const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The DHT key under which a node's [`NodeRecord`](crate::types::NodeRecord) lives: the
+/// raw bytes of its primary BLS public key.
+///
+/// This is deliberately *not* the BCS encoding of the key, which would prepend a ULEB128
+/// length prefix and land on a different row. Every producer and consumer of a node's
+/// record key must go through this function: `ConsensusNetwork::get_peer_record` publishes
+/// under it, the lookups by BLS key query it, and [`KadStore`] uses it as `node_key` so
+/// [`RecordStore::provided`] enumerates the row `start_providing` actually wrote (issue
+/// #1331).
+pub fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
+    RecordKey::new(primary_public_key)
+}
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
@@ -262,7 +275,7 @@ impl<DB: Database> KadStore<DB> {
         key_config: &KeyConfig,
         kad_type: NetworkType,
     ) -> Self {
-        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let node_key = node_record_key(&key_config.primary_public_key());
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
         let mut store = Self {
@@ -1220,8 +1233,11 @@ mod test {
         let local_peer_id = PeerId::random();
         let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
 
-        // Both records key on `node_key`, the slot `provided()` reads.
-        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        // Both records key on the node's published record key, which must be the slot
+        // `provided()` reads (issue #1331): derive it the way the publish path does, not
+        // from the store's private field, so a divergence fails this test.
+        let node_key = node_record_key(&key_config.primary_public_key());
+        assert_eq!(kad_store.node_key, node_key, "store node_key matches the published key");
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
         let ours = ProviderRecord {
             key: node_key.clone(),
@@ -1248,6 +1264,46 @@ mod test {
             kad_store.provided().map(|record| record.into_owned()).collect();
         assert_eq!(provided.len(), 1, "provided() enumerates only self-authored records");
         assert_eq!(provided[0].provider, local_peer_id, "the enumerated record is ours");
+    }
+
+    /// The store's `node_key` is the raw primary BLS public key, byte for byte the key
+    /// `ConsensusNetwork::get_peer_record` publishes under, and not its BCS encoding.
+    ///
+    /// Before issue #1331 the store BCS-encoded the key (one ULEB128 length byte ahead of
+    /// the raw bytes) while the publish path used the raw bytes, so `provided()` scanned a
+    /// row production never wrote and the node never republished its own provider record.
+    #[test]
+    fn test_node_key_is_raw_primary_key_bytes() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let local_peer_id = PeerId::random();
+        let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
+
+        let primary_key = key_config.primary_public_key();
+        // The exact expression the publish path uses.
+        let published_key = RecordKey::new(&primary_key);
+        assert_eq!(kad_store.node_key, published_key, "node_key is the published record key");
+        assert_eq!(kad_store.node_key.as_ref(), primary_key.as_ref(), "raw key bytes");
+        assert_ne!(
+            kad_store.node_key.as_ref(),
+            encode(&primary_key).as_slice(),
+            "node_key must not be the BCS encoding of the key"
+        );
+
+        // A self-provide under the published key is what the republish job enumerates.
+        let ours = ProviderRecord {
+            key: published_key,
+            provider: local_peer_id,
+            expires: Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)),
+            addresses: vec![],
+        };
+        kad_store.add_provider(ours).expect("add our provider record");
+        let provided: Vec<ProviderRecord> =
+            kad_store.provided().map(|record| record.into_owned()).collect();
+        assert_eq!(provided.len(), 1, "provided() enumerates the self-provide");
+        assert_eq!(provided[0].provider, local_peer_id);
     }
 
     /// Expired records must be filtered from `get()` and `records()` even though
