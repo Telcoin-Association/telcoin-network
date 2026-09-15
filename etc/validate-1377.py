@@ -122,7 +122,7 @@ try:
             "tn-rpc", "tn-storage", "tn-test-utils", "tn-test-utils-committee", "tn-types",
             "tn-worker",
         ]
-        command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--message-format=json"]
+        command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json"]
         for package in packages:
             command += ["-p", package]
         command += ["--all-targets", "--no-deps"]
@@ -135,7 +135,7 @@ try:
             for mode, flags in modes.items()
         }
         focused = [
-            "cargo", f"+{NIGHTLY}", "clippy", "--locked", "--message-format=json",
+            "cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json",
             "-p", "tn-reth", "-p", "tn-batch-validator", "-p", "tn-batch-builder",
             "--all-targets", "--no-deps",
         ]

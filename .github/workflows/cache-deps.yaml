@@ -7,6 +7,11 @@ on:
         description: Exact PR commit whose source files must match
         required: true
         type: string
+      lane:
+        description: Validation lane to run
+        type: choice
+        default: all
+        options: [all, clippy, tests]
 
 permissions:
   contents: read
@@ -26,6 +31,7 @@ env:
 
 jobs:
   clippy:
+    if: inputs.lane != 'tests'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -50,6 +56,7 @@ jobs:
           name: issue-1377-clippy
           path: validation-1377/
   focused-tests:
+    if: inputs.lane != 'clippy'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
