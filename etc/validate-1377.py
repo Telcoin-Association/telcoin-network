@@ -54,6 +54,7 @@ FILES = [
     "crates/node/src/manager/node.rs",
     "crates/node/src/manager/node/run_epoch.rs",
     "crates/node/src/manager/node/batch_slots.rs",
+    "crates/node/src/manager/node/close_epoch.rs",
     "crates/types/src/forks.rs",
     "crates/engine/Cargo.toml",
     "crates/engine/tests/it/main.rs",
@@ -307,6 +308,9 @@ try:
                "output.close_epoch() && is_final && output.close_epoch_for_last_batch(self.batch_index).is_some_and(|last| last)", execution_command)
         mutate("mutant-slot-envelope", source,
                "if canonical == *envelope {", "if canonical.epoch == envelope.epoch {", storage_command)
+        mutate("mutant-slot-orphan-recovery", source,
+               "BatchSlotMessage::Proposal { batch, .. } => batch,",
+               "BatchSlotMessage::Proposal { batch, .. } => Batch { transactions: envelope.transactions, ..batch },", storage_command)
         mutate("mutant-slot-publication-anchor", "crates/types/src/worker/batch_slot_control.rs",
                "output.candidate.position(bucket).map(|_| ())", "output.previous.position(bucket).map(|_| ())", storage_command)
         mutate("mutant-slot-wire-budget", source,
