@@ -63,6 +63,7 @@ impl QuorumWaiterTrait for RejectingQuorum {
     }
 }
 
+/// Cloned workers cannot contribute self-stake before their shared reservation is durable.
 #[tokio::test]
 async fn self_stake_waits_for_durability_and_conflicting_clones_cannot_revote() -> eyre::Result<()>
 {
@@ -126,19 +127,12 @@ async fn self_stake_waits_for_durability_and_conflicting_clones_cannot_revote() 
     let producer = worker.clone();
     let submitted = batch.clone();
     let pending = tokio::spawn(async move { producer.seal(submitted.seal_slow()).await });
-    tokio::time::timeout(
+    tn_test_utils::wait_until(
         Duration::from_secs(10),
-        futures::future::poll_fn(|cx| {
-            let visible = database.contains_key::<BatchSlotVotes>(vote.key());
-            if visible.as_ref().is_ok_and(|present| *present) || visible.is_err() {
-                std::task::Poll::Ready(visible.map(|_| ()))
-            } else {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        }),
+        "worker reservation prepared before self-stake",
+        || async { database.contains_key::<BatchSlotVotes>(vote.key()) },
     )
-    .await??;
+    .await?;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
@@ -190,6 +184,7 @@ impl TxnForwarder for AcceptingForwarder {
     }
 }
 
+/// Accepted forwarding jobs must still rotate through every retry witness.
 #[tokio::test]
 async fn accepted_forward_jobs_still_visit_every_retry_witness() -> eyre::Result<()> {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();

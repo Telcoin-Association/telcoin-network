@@ -122,7 +122,7 @@ impl Database for MemDatabase {
         Self: 'txn;
 
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));
+        self.store.entry(T::NAME).or_default();
         Ok(())
     }
 
