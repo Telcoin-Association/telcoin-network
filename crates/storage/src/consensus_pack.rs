@@ -1762,24 +1762,37 @@ impl Inner {
         Ok(len.saturating_sub(batch_pos))
     }
 
-    /// Roll the data log and the index state that `files_consistent` trusts back to the snapshot
-    /// captured before a failed [`Self::append_output_records`], making the save atomic.
+    /// Roll the data log and position index back to the snapshot captured before a failed
+    /// [`Self::append_output_records`], and mark the digest indexes for rebuild — making the save
+    /// atomic.
     ///
     /// The data log's logical end is moved back with [`Pack::rewind_to`] (zeroing the abandoned
     /// region, no physical truncate/remap → no read-only-mmap SIGBUS window), so a retry or the
     /// next output appends exactly at `data_start`. The position index is rolled back to
     /// `pos_idx_start` (normally a no-op — index saves are atomic and there is no fallible step
-    /// after the pos-index save today), and the digest length markers are re-pointed at
-    /// `data_start` so `files_consistent` still holds. Digest bucket entries / bloom bits added
-    /// by the failed save are intentionally left: reads mask a position past the rewound end
-    /// via the `pos < data.file_len()` guards and re-verify the digest, a deterministic retry
-    /// overwrites them, and recovery rebuilds every index from the WAL (the crate's "indexes
-    /// are derived" model).
+    /// after the pos-index save today).
+    ///
+    /// The digest indexes are NOT surgically restored. A failed save may have overwritten a
+    /// duplicate key in place — e.g. a batch digest already committed by an earlier output whose
+    /// position is now clobbered to point into the discarded region. The `pos < file_len()`
+    /// read mask cannot recover the earlier position, so rather than trust the digest indexes we
+    /// invalidate their commit marker ([`HdxIndex::set_data_file_length`] to a value that can never
+    /// equal the rewound data length): the next open fails [`Self::files_consistent`] and
+    /// [`Self::recover_pack`] rebuilds every index from the data-log WAL, which now holds only the
+    /// good pre-failure outputs. This is safe and complete because a failed output save is FATAL —
+    /// the executor subscriber is a critical task, so the node shuts down and reopens the epoch via
+    /// `open_append` (→ `recover_pack`) before the pack is served again. See the storage README
+    /// ("Intentional design decisions").
     fn rollback_output(&mut self, data_start: u64, pos_idx_start: usize) {
         self.data.rewind_to(data_start);
         self.consensus_pos_idx.rewind_to_len(pos_idx_start);
-        self.consensus_digests.set_data_file_length(data_start);
-        self.batch_digests.set_data_file_length(data_start);
+        // 0 can never equal the real data length (always >= DATA_HEADER_BYTES), so
+        // `files_consistent` always triggers the WAL rebuild; it also leaves
+        // `recover_pack`'s attested_end = max(0, pos_end) = pos_end (the true watermark),
+        // so recovery validation stays correct.
+        const FORCE_INDEX_REBUILD: u64 = 0;
+        self.consensus_digests.set_data_file_length(FORCE_INDEX_REBUILD);
+        self.batch_digests.set_data_file_length(FORCE_INDEX_REBUILD);
     }
 
     /// True if consensus header by digest is found by digest.
@@ -4433,6 +4446,106 @@ pub(crate) mod test {
             );
         }
         assert!(pack.get_consensus_output(5).await.is_err(), "no phantom 5th output");
+    }
+
+    /// Build a consensus output whose single certificate's payload is exactly `batch`. Used to
+    /// force the (production-impossible) case where the same batch digest appears in two different
+    /// outputs, so a rolled-back save's in-place overwrite of that digest's index slot can be
+    /// exercised.
+    fn make_output_reusing_batch(
+        committee: &Committee,
+        authority_index: usize,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        batch: Batch,
+    ) -> ConsensusOutput {
+        let authority =
+            committee.authorities().get(authority_index).expect("authority in committee").id();
+        let batch_producer = committee
+            .authorities()
+            .get(authority_index)
+            .expect("authority in committee")
+            .execution_address();
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority);
+        let builder = HeaderBuilder::from_header(leader.header()).with_payload_batch(&batch, 0_u16);
+        leader.update_header_for_test(builder.build());
+        leader.update_header_round_for_test(number as u32);
+        leader.update_header_epoch_for_test(committee.epoch());
+        let batch_digests: VecDeque<BlockHash> = std::iter::once(batch.digest()).collect();
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            number,
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+        )
+    }
+
+    /// Regression: a rolled-back save that overwrote a duplicate batch's index slot in place
+    /// must not hide that batch's earlier, still-valid copy. Save output 1 (carrying batch B);
+    /// save output 2 re-using B and fail after the batch-index overwrite (the injector) →
+    /// `rollback_output`; a clean close + reopen must leave B readable. The fix invalidates the
+    /// digest commit marker on rollback, so the reopen rebuilds the indexes from the WAL
+    /// (output 1) instead of trusting the clobbered entry. Duplicate batches across outputs
+    /// cannot occur in production, so B is shared via a hand-built output. The existing
+    /// rollback test retries the failed output immediately (which re-stamps the marker) and
+    /// never checks the earlier batch before that retry.
+    #[tokio::test]
+    async fn test_rollback_keeps_previously_saved_batch_readable() {
+        let temp_dir = TempDir::with_prefix("test_cp_rollback_dup_batch").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Output 1 carries batch B; capture B (digest + bytes) from it.
+        let parent = ConsensusHeader::default().digest();
+        let output1 = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let (b_digest, b_batch) = super::collect_batches(&output1)
+            .into_iter()
+            .next()
+            .expect("output 1 has at least one batch");
+        // Output 2 re-uses B (production-impossible, so built explicitly).
+        let output2 = make_output_reusing_batch(&committee, 1, 2, output1.digest(), b_batch);
+
+        let mut inner =
+            Inner::open_append(temp_dir.path(), &previous_epoch, committee.clone(), PACK_VERSION)
+                .expect("open append");
+        inner.save_consensus_output(&output1).expect("save output 1");
+        assert!(inner.contains_batch(b_digest), "B is readable after output 1 is saved");
+
+        // Fail output 2 after its records + index updates land (B's slot is overwritten), then roll
+        // back. Do NOT retry (the production path is a fatal shutdown, not an in-process retry).
+        inner.fail_save_after_append = true;
+        let err = inner.save_consensus_output(&output2).expect_err("injected mid-save failure");
+        assert!(matches!(err, super::PackError::IndexAppend(_)), "got {err:?}");
+
+        inner.persist().expect("persist");
+        drop(inner); // clean close seals the (now rebuild-marked) indexes
+
+        // Reopen for append (the fatal-save restart path) → `recover_pack` rebuilds from the WAL.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("reopen for append rebuilds the indexes");
+        pack.persist().await.expect("persist after rebuild");
+
+        assert!(
+            pack.contains_batch(b_digest).await,
+            "batch B from output 1 must stay readable after a rolled-back duplicate save"
+        );
+        // Output 1 still reads back by number; the rolled-back output 2 is absent.
+        assert_eq!(pack.get_consensus_output(1).await.expect("output 1 by number").number(), 1);
+        assert!(pack.get_consensus_output(2).await.is_err(), "rolled-back output 2 must be absent");
     }
 
     /// `ConsensusPack::close` is an async drop: it must fully SEAL the pack (commit the data, sync

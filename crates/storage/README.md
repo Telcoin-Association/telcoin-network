@@ -234,3 +234,16 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 16. **`eyre`-everywhere error style (`StoreResult<T> = eyre::Result<T>`).** Returning `eyre` errors
     (rather than a bespoke error enum per module) is an intentional, pre-existing convention for this
     crate; not a "define a proper error type" finding.
+17. **A rolled-back consensus-output save invalidates the digest commit marker (forces a rebuild),
+    it does not surgically restore overwritten index entries.** `rollback_output` rewinds the data
+    log + position index, then sets the digest indexes' `data_file_length` to a value that can never
+    equal the rewound data length, so the next `open_append` fails `files_consistent` and
+    `recover_pack` rebuilds every index from the data-log WAL. This deliberately does not try to
+    restore an overwritten duplicate-key position (e.g. a batch already committed by an earlier
+    output whose in-place index slot the failed output clobbered). It is safe because a failed output
+    save is **fatal** (the executor subscriber is a critical task → node shutdown), so the epoch is
+    reopened for append and rebuilt before it is served again. Corollary: a read-only `open_static` /
+    `db validate` of an epoch whose most recent save failed will correctly report it inconsistent
+    (rebuild pending) rather than silently trust a stale mapping — that is the intended signal, not a
+    bug. (Duplicate batches across outputs cannot arise under honest consensus — Bullshark commits
+    each certificate once — so this path is defense-in-depth.)
