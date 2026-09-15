@@ -25,6 +25,7 @@ FILES = [
     "crates/batch-builder/src/test_utils.rs",
     "crates/batch-builder/tests/it/main.rs",
     "crates/batch-builder/tests/it/peer_batch_residuals.rs",
+    "crates/batch-builder/tests/it/build_batches.rs",
     "crates/batch-builder/README.md",
     "docs/peer-batch-deferral.md",
     "crates/types/src/worker/batch_slots.rs",
@@ -44,6 +45,7 @@ FILES = [
     "crates/consensus/worker/src/network/handler.rs",
     "crates/consensus/worker/src/network/primary.rs",
     "crates/consensus/worker/src/worker.rs",
+    "crates/consensus/worker/src/worker/slot_tests.rs",
     "crates/config/src/keys.rs",
     "crates/types/src/error.rs",
     "crates/batch-builder/src/lib.rs",
@@ -213,7 +215,7 @@ try:
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "slot-core":
-        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "--all-targets", "--features", "tn-types/test-utils"])
+        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "-p", "tn-engine", "-p", "tn-worker", "-p", "tn-batch-builder", "--all-targets", "--features", "tn-types/test-utils"])
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
@@ -223,6 +225,12 @@ try:
         execution_command = test_command("tn-engine", ["--test", "it"], "native_slots")
         run("slot-execution-default", execution_command)
         run("slot-execution-adiri", test_command("tn-engine", ["--test", "it"], "native_slots", True))
+        worker_command = test_command("tn-worker", ["--lib"], "worker::slot_tests::")
+        run("slot-worker-default", worker_command)
+        run("slot-worker-adiri", test_command("tn-worker", ["--lib"], "worker::slot_tests::", True))
+        builder_command = test_command("tn-batch-builder", ["--test", "it"], "native_ack_retains_transactions_")
+        run("slot-builder-default", builder_command)
+        run("slot-builder-adiri", test_command("tn-batch-builder", ["--test", "it"], "native_ack_retains_transactions_", True))
         source = "crates/types/src/worker/batch_slots.rs"
         mutations = [
             ("slot-resolved-sequence",
@@ -319,6 +327,16 @@ try:
         run("slot-core-restored", command)
         run("slot-storage-restored", storage_command)
         run("slot-execution-restored", execution_command)
+        mutate("mutant-slot-cloned-reservation", "crates/consensus/worker/src/worker.rs",
+               "native: self.native.clone(),", "native: None,", worker_command)
+        mutate("mutant-slot-retry-witness", "crates/consensus/worker/src/worker.rs",
+               ".chain((witness != owner).then_some(witness))",
+               ".chain((witness != owner && self.committee_slots.is_empty()).then_some(witness))", worker_command)
+        mutate("mutant-slot-pending-retention", "crates/batch-builder/src/lib.rs",
+               "if mined_transactions.is_empty() || native {",
+               "if mined_transactions.is_empty() {", builder_command)
+        run("slot-worker-restored", worker_command)
+        run("slot-builder-restored", builder_command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
