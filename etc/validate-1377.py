@@ -15,6 +15,7 @@ PHASE = sys.argv[1]
 EXPECTED = os.environ["PR_HEAD"]
 if re.fullmatch(r"[0-9a-f]{40}", EXPECTED) is None:
     raise ValueError("PR_HEAD must be a complete commit ID")
+subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", EXPECTED], check=True)
 PIN = "1.94"
 BASE = "08a507835011675a32348ac60d0488bbba891552"
 NIGHTLY = (ROOT / "rust-nightly").read_text().strip()
