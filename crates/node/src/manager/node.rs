@@ -784,8 +784,8 @@ where
     /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
     /// listeners, schedule process-lifetime bootstrap dials, spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
-    /// and spawn the engine-update task. It then requests any missing epoch pack files and
-    /// launches the app-scoped consensus fetch workers.
+    /// and spawn the engine-update task. It then launches the epoch pack fetch workers before
+    /// requesting any missing epoch pack files, followed by the recent-consensus fetch task.
     ///
     /// Finally it selects over two futures: the node task manager running to exit, and the epoch
     /// loop ([`run_epochs`](Self::run_epochs)). Whichever resolves first ends the node; the
@@ -1130,8 +1130,6 @@ where
             );
         }
 
-        // Do a sanity check, request any pack files for complete epochs we are missing.
-        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
         // Note, these workers will just go dormant once we have caught up- that's ok.
         for i in 0..3 {
@@ -1154,6 +1152,10 @@ where
                 },
             );
         }
+        // Request missing pack files only after spawning the workers: the bounded epoch request
+        // queue needs live consumers so a backlog larger than its capacity cannot block startup.
+        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
+
         // Fire up a app scoped task to fetch rencent consensus.
         // This will not be used by CVVs but won't hurt anything and
         // will be used when not active or catching up and needs to
