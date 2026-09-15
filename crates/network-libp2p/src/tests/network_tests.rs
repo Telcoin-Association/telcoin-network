@@ -2902,6 +2902,158 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
     })
 }
 
+/// A relayed copy must not prevent its owner from confirming its identity with the same record.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_equal_record_after_relay() -> eyre::Result<()> {
+    check_kad_self_advertisement_after_relay(0)
+}
+
+/// An older self-advertisement still proves identity without replacing a newer stored record.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_older_record_after_relay() -> eyre::Result<()> {
+    check_kad_self_advertisement_after_relay(1)
+}
+
+/// A saturated kad store must not prevent an authenticated owner from confirming its identity.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Result<()> {
+    use tn_types::Signer as _;
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = *peer2.network.swarm.local_peer_id();
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let domain = RecordDomain::new(
+        peer1.config.network_config().libp2p_config().chain_id,
+        NetworkType::Primary,
+    );
+    let max_records = kad::store::MemoryStoreConfig::default().max_records;
+    let mut rng = StdRng::from_seed([7; 32]);
+
+    // Two valid records per relay stay below both the per-source message limit and the
+    // tracked-source cap. Fill the real store through the inbound handler without confirming
+    // any of the non-committee identities advertised by these relays.
+    std::iter::repeat_with(PeerId::random)
+        .flat_map(|source| std::iter::repeat_n(source, 2))
+        .take(max_records)
+        .try_for_each(|source| -> eyre::Result<()> {
+            let bls = BlsKeypair::generate(&mut rng);
+            let netkey = NetworkKeypair::generate_ed25519();
+            let record = NodeRecord::build(
+                domain,
+                netkey.public().into(),
+                create_multiaddr(None),
+                None,
+                |data| bls.sign(data),
+            );
+            network.process_kad_put_request(
+                source,
+                kad::Record {
+                    key: kad::RecordKey::new(bls.public()),
+                    value: encode(&record),
+                    publisher: Some(netkey.public().to_peer_id()),
+                    expires: None,
+                },
+            )?;
+            assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+            Ok(())
+        })?;
+    assert_eq!(network.swarm.behaviour_mut().kademlia.store_mut().records().count(), max_records);
+
+    let self_record = peer2.network.get_peer_record();
+    assert_eq!(
+        network.record_freshness(&self_record),
+        RecordFreshness::Newer,
+        "owner key must be absent from the full store"
+    );
+    assert_matches!(
+        network.swarm.behaviour_mut().kademlia.store_mut().put(self_record.clone()),
+        Err(kad::store::Error::MaxRecords)
+    );
+
+    let relay = PeerId::random();
+    let relay_result = network.process_kad_put_request(relay, self_record.clone());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), None);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
+
+    let owner_result = network.process_kad_put_request(owner, self_record.clone());
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&owner),
+        Some(owner_bls),
+        "an authenticated self-advertisement must confirm identity regardless of store capacity"
+    );
+    relay_result?;
+    owner_result?;
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
+    let store = network.swarm.behaviour_mut().kademlia.store_mut();
+    assert_eq!(store.records().count(), max_records);
+    assert!(store.get(&self_record.key).is_none(), "confirmation must not bypass the store cap");
+    Ok(())
+}
+
+/// Exercise relay, self-advertisement, and replay through the inbound handler with a signed record.
+fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = *peer2.network.swarm.local_peer_id();
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let relay = PeerId::random();
+    let stored_record = peer2.network.get_peer_record();
+
+    // The network has no tracked committee. Replication can deliver this authentic record
+    // before the owner's connection, but the relay cannot confirm either peer's identity.
+    network.process_kad_put_request(relay, stored_record.clone())?;
+    network.process_kad_put_request(relay, stored_record.clone())?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), None);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
+    assert_eq!(
+        network.record_freshness(&stored_record),
+        RecordFreshness::Identical,
+        "the relay must have populated the store"
+    );
+
+    // Sign the equal or older timestamp using the same domain as a primary node record.
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+    let mut info = peer2.network.node_record.info.clone();
+    info.timestamp = info.timestamp.saturating_sub(timestamp_lag);
+    let signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+    let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
+    peer2.network.node_record = NodeRecord { info, signature };
+    let self_record = peer2.network.get_peer_record();
+    assert!(network.peer_record_valid(&self_record).is_some());
+    assert_ne!(network.record_freshness(&self_record), RecordFreshness::Newer);
+
+    network.process_kad_put_request(owner, self_record.clone())?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&owner),
+        Some(owner_bls),
+        "an authenticated self-advertisement must confirm identity regardless of store freshness"
+    );
+
+    // A repeat must retain identity, reputation, and the stored signed value.
+    network.swarm.behaviour_mut().peer_manager.process_penalty(owner, Penalty::Mild);
+    let score = network.swarm.behaviour().peer_manager.peer_score(&owner);
+    assert!(score.is_some());
+    network.process_kad_put_request(owner, self_record)?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), Some(owner_bls));
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&owner), score);
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&stored_record.key)
+        .ok_or_else(|| eyre!("the relayed record must remain stored"))?;
+    assert_eq!(stored.key, stored_record.key);
+    assert_eq!(stored.value, stored_record.value);
+    assert_eq!(stored.publisher, stored_record.publisher);
+    Ok(())
+}
+
 /// A newer signed record replaces a previously stored record for the same publisher.
 #[tokio::test]
 async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
