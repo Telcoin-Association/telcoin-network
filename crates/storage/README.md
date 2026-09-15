@@ -209,8 +209,11 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    macOS `F_FULLFSYNC` caveat). This is a deliberate performance choice, not a durability bug.
 9. **No OS file lock on the datadir; single-writer by construction.** The node is the sole writer;
    the crate takes no advisory lock. `db repair` therefore cannot *detect* a running node and instead
-   requires the operator to stop it (dry-run by default, `--force` to apply, current epoch skipped).
-   Do not flag "missing file lock / TOCTOU".
+   requires the operator to stop it (dry-run by default, `--force` to apply, current epoch skipped in
+   all-mode). Naming `--epoch N` explicitly — including the current/latest epoch — is intentionally
+   allowed and rewrites that pack under the same operator-stopped contract; the loud banner, not a
+   lock, is the guard (`--force` is sufficient by design). Do not flag "missing file lock / TOCTOU"
+   or "`--epoch` bypasses the current-epoch skip".
 10. **`db repair` / `open_append_exists` mutate pack files on open.** Truncating a torn tail and
     rebuilding derived indexes from the authoritative log is the *point*. Gated by the node-stopped
     contract above. Not an "unsafe destructive operation".

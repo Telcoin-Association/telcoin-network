@@ -840,22 +840,30 @@ impl Drop for MmapDataFile {
         if self.read_only {
             return;
         }
-        // Clean close: msync, truncate away the padding, then append an 8-byte clean-close sentinel
-        // and fsync so the on-disk file is exactly `end` data bytes plus the sentinel and durable —
-        // a reopen validates the sentinel, strips it back to `end`, and knows the file was sealed.
-        // A 0-length file is left empty (nothing to seal).
-        if let Err(e) = self.flush_dirty(true) {
-            if !std::thread::panicking() {
-                tracing::error!("MmapDataFile: failed to msync on drop: {e}");
+        // Clean close: msync, truncate away the padding, then (only if the msync succeeded) append
+        // an 8-byte clean-close sentinel and fsync so the on-disk file is exactly `end` data bytes
+        // plus the sentinel and durable — a reopen validates the sentinel, strips it back to `end`,
+        // and knows the file was sealed. A 0-length file is left empty (nothing to seal).
+        let flushed = match self.flush_dirty(true) {
+            Ok(()) => true,
+            Err(e) => {
+                if !std::thread::panicking() {
+                    tracing::error!("MmapDataFile: failed to msync on drop: {e}");
+                }
+                false
             }
-        }
+        };
         self.backing = Backing::Empty; // unmap before truncating
         if let Err(e) = self.file.set_len(self.end) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to truncate on drop: {e}");
             }
         }
-        if self.end > 0 {
+        // Only stamp the clean-close sentinel when the tail msync succeeded. If it failed we cannot
+        // vouch for the durability of the `[flushed_end, end)` tail, so leave the file unsentineled
+        // and let the next open take the recovery/heal path rather than trust a possibly-short
+        // tail.
+        if flushed && self.end > 0 {
             let sentinel = clean_close_sentinel(self.end);
             if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
                 if !std::thread::panicking() {

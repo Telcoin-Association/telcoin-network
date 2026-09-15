@@ -1722,15 +1722,14 @@ impl Inner {
     }
 
     /// True if consensus header is found by digest.
+    ///
+    /// Delegates to [`Self::consensus_header_by_digest`] so membership carries the same guards as a
+    /// real read: a position past the (possibly repaired) data end is masked, and the fetched
+    /// record is re-hashed against `digest`. That way a stale index entry left by a rolled-back
+    /// save — one that now points at an offset reused by a *different* record — can never report a
+    /// spurious hit (which would wrongly suppress storing the real header).
     fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
-        // This is a bit more complicated (the pos file_len check) because in a very rare
-        // case of repairing a damaged pack we might have something in the index not in the
-        // pack file (yet).
-        if let Ok(pos) = self.consensus_digests.load(digest.into()) {
-            pos < self.data.file_len()
-        } else {
-            false
-        }
+        self.consensus_header_by_digest(digest).is_some()
     }
 
     /// Retrieve a consensus header by digest.
@@ -1915,15 +1914,13 @@ impl Inner {
     }
 
     /// True if the pack contains the batch for digest.
+    ///
+    /// Delegates to [`Self::batch`] so membership carries the same guards as a real read (data-end
+    /// masking + digest re-verification) and can never report a spurious hit from a stale index
+    /// entry that points at an offset reused by a different record. A miss short-circuits in
+    /// `load` before any fetch, so only a genuine hit pays the read.
     fn contains_batch(&mut self, digest: BlockHash) -> bool {
-        // This is a bit more complicated (the pos file_len check) because in a very rare
-        // case of repairing a damaged pack we might have something in the index not in the
-        // pack file (yet).
-        if let Ok(pos) = self.batch_digests.load(digest) {
-            pos < self.data.file_len()
-        } else {
-            false
-        }
+        self.batch(digest).is_some()
     }
 
     /// Return the Batch for digest if found.
