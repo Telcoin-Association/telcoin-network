@@ -49,6 +49,8 @@ FILES = [
     "crates/config/src/keys.rs",
     "crates/types/src/error.rs",
     "crates/batch-builder/src/lib.rs",
+    "crates/batch-builder/src/metrics.rs",
+    "crates/tn-reth/src/evm/config.rs",
     "crates/consensus/worker/src/network/error.rs",
     "crates/engine/src/error.rs",
     "crates/engine/src/payload_builder.rs",
@@ -215,7 +217,7 @@ try:
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
     elif PHASE == "slot-core":
-        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "-p", "tn-engine", "-p", "tn-worker", "-p", "tn-batch-builder", "--all-targets", "--features", "tn-types/test-utils"])
+        run("slot-runtime-compile", ["cargo", f"+{PIN}", "check", "--locked", "-p", "tn-node", "-p", "tn-engine", "-p", "tn-worker", "-p", "tn-batch-builder", "-p", "tn-reth", "--all-targets", "--features", "tn-types/test-utils"])
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
@@ -231,6 +233,9 @@ try:
         builder_command = test_command("tn-batch-builder", ["--test", "it"], "native_ack_retains_transactions_")
         run("slot-builder-default", builder_command)
         run("slot-builder-adiri", test_command("tn-batch-builder", ["--test", "it"], "native_ack_retains_transactions_", True))
+        admission_command = test_command("tn-reth", ["--lib"], "native_admission_rejects_delegated_sender_")
+        run("slot-admission-default", admission_command)
+        run("slot-admission-adiri", test_command("tn-reth", ["--lib"], "native_admission_rejects_delegated_sender_", True))
         source = "crates/types/src/worker/batch_slots.rs"
         mutations = [
             ("slot-resolved-sequence",
@@ -337,6 +342,10 @@ try:
                "if mined_transactions.is_empty() {", builder_command)
         run("slot-worker-restored", worker_command)
         run("slot-builder-restored", builder_command)
+        mutate("mutant-slot-delegated-sender", "crates/tn-reth/src/evm/mod.rs",
+               ".is_none_or(|code| code.is_empty())",
+               ".is_none_or(|code| code.is_empty() || code.is_eip7702())", admission_command)
+        run("slot-admission-restored", admission_command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
