@@ -59,6 +59,11 @@ pub fn build_batch<P: TxPool>(
     let gas_limit = max_batch_gas(epoch);
     let max_size = max_batch_size(epoch);
     let base_fee_per_gas = base_fee;
+    let native = pool
+        .batch_slot_control()
+        .and_then(|control| control.snapshot().map(|slots| (control, slots)));
+    let proposing = native.as_ref().filter(|(control, _)| control.is_validator());
+    let mut selected_bucket = None;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current
@@ -68,8 +73,19 @@ pub fn build_batch<P: TxPool>(
 
     // collect data for successful transactions
     // let mut sum_blob_gas_used = 0;
-    let mut total_bytes_size = 0;
-    let mut total_possible_gas = 0;
+    let mut total_bytes_size = proposing.map_or(0, |(_, slots)| {
+        slots
+            .proposal_overhead(Batch {
+                transactions: Vec::new(),
+                epoch,
+                beneficiary,
+                base_fee_per_gas,
+                worker_id,
+                received_at: None,
+            })
+            .unwrap_or(max_size.saturating_add(1))
+    });
+    let mut total_possible_gas = 0_u64;
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
     let mut blob_transactions = Vec::new();
@@ -84,10 +100,17 @@ pub fn build_batch<P: TxPool>(
         // a validated peer batch may already carry this transaction: that peer is proposing it
         // right now, so packing a copy here only spends batch space, bandwidth and a vote round
         // before execution skips the copy for free (issue #1329)
-        let deferred_by_peer = pool.is_peer_deferred(pool_tx.hash());
+        let deferred_by_peer = native.is_none() && pool.is_peer_deferred(pool_tx.hash());
+        let candidate_bucket = proposing.map(|(_, slots)| slots.bucket(pool_tx.sender()));
+        let deferred_by_slot = proposing.is_some_and(|(control, slots)| {
+            let bucket = slots.bucket(pool_tx.sender());
+            control.demand(bucket);
+            selected_bucket.is_some_and(|selected| selected != bucket)
+                || slots.position(bucket).map_or(true, |position| !control.can_propose(position))
+        });
 
         // ensure block has capacity (in gas) for this transaction
-        let exceeds_gas_limit = total_possible_gas + pool_tx.gas_limit() > gas_limit;
+        let exceeds_gas_limit = total_possible_gas.saturating_add(pool_tx.gas_limit()) > gas_limit;
 
         // either guard skips the transaction:
         // - the tx could exceed max gas limit for the block
@@ -97,11 +120,13 @@ pub fn build_batch<P: TxPool>(
         // current iteration  all dependents for this transaction are now considered invalid
         // before continuing loop. For the deferral that is deliberate: a later nonce from the
         // same sender would land nonce-gapped and only be skipped at execution.
-        if deferred_by_peer || exceeds_gas_limit {
-            if deferred_by_peer {
+        if deferred_by_peer || deferred_by_slot || exceeds_gas_limit {
+            if deferred_by_peer || deferred_by_slot {
                 best_txs.peer_deferred(&pool_tx);
-                peer_deferred = peer_deferred.saturating_add(1);
-                debug!(target: "worker::batch_builder", ?pool_tx, "deferring tx already packed by a validated peer batch");
+                if deferred_by_peer {
+                    peer_deferred = peer_deferred.saturating_add(1);
+                }
+                debug!(target: "worker::batch_builder", ?pool_tx, "deferring transaction awaiting its eligible batch slot");
             } else {
                 best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
@@ -142,25 +167,28 @@ pub fn build_batch<P: TxPool>(
         // (issue #1248).
         let tx_gas_limit = tx.gas_limit();
         let encoded = tx.into_inner().encoded_2718();
+        let encoded_size = proposing
+            .map_or(encoded.len(), |_| tn_types::BatchSlots::transaction_wire_size(&encoded));
 
         // ensure the batch has capacity (in bytes) for this transaction
-        if total_bytes_size + encoded.len() > max_size {
+        if total_bytes_size.saturating_add(encoded_size) > max_size {
             // the tx could exceed the max byte size for the batch
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
-            best_txs.max_batch_size(&pool_tx, encoded.len(), max_size);
+            best_txs.max_batch_size(&pool_tx, encoded_size, max_size);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             continue;
         }
 
         // txs are not executed, so use the gas_limit
         total_possible_gas += tx_gas_limit;
-        total_bytes_size += encoded.len();
+        total_bytes_size += encoded_size;
 
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
         transactions.push(encoded);
+        selected_bucket = selected_bucket.or(candidate_bucket);
 
         // track max nonce per sender for pool state updates
         let sender = pool_tx.sender();

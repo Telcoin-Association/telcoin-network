@@ -223,7 +223,8 @@ impl BatchBuilder {
             // Selection can also skip every candidate, including peer-deferred transactions
             // (issue #1329). Peers reject empty batches, so record the deferral metric above
             // but send nothing to the worker in every empty-build case.
-            if batch.transactions().is_empty() {
+            let retry_due = worker_id == 0 && pool.batch_slot_control().is_some_and(|control| control.retry_position().is_some());
+            if batch.transactions().is_empty() && !retry_due {
                 debug!(
                     target: "worker::batch_builder",
                     peer_deferred,
@@ -413,7 +414,12 @@ impl BatchBuilder {
             // closed, so a canonical-state wake-up cannot bypass it (issue #1145)
             let backing_off = self.refusal_backoff_holds();
             if self.pending_task.is_none() && !defer_build && !backing_off {
-                if self.pool.pending_transactions().is_empty() {
+                let retry_due = self.worker_id == 0
+                    && self
+                        .pool
+                        .batch_slot_control()
+                        .is_some_and(|control| control.retry_position().is_some());
+                if self.pool.pending_transactions().is_empty() && !retry_due {
                     // reset interval to wake up after some time
                     //
                     // only need to reset here if there is no pending block being built
@@ -476,7 +482,14 @@ impl BatchBuilder {
                     // NOTE: a mined batch that pruned nothing applies no pool update; it also
                     // proves nothing about forward admission, so it neither ends nor extends
                     // a refusal backoff (issue #1145)
-                    if mined_transactions.is_empty() {
+                    let native = self.pool.batch_slot_control().is_some_and(|control| control.snapshot().is_some());
+                    if native && !mined_transactions.is_empty() {
+                        self.note_recovery();
+                    }
+                    // Native acknowledgement only proves availability or forwarding admission.
+                    // Canonical maintenance removes transactions after actual execution, leaving
+                    // retries possible after a proposal loses its slot or an RPC lies about success.
+                    if mined_transactions.is_empty() || native {
                         // reset interval to prevent immediate re-wake from stale tick
                         self.max_delay_interval.reset();
 

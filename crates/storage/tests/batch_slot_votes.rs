@@ -35,6 +35,37 @@ fn canonical_envelopes_reject_unsigned_metadata() -> Result<(), BatchSlotVoteSto
 }
 
 #[test]
+fn native_wire_budget_covers_vector_prefix_boundaries() -> Result<(), BatchSlotVoteStoreError> {
+    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
+    let (slots, record, _) = conflicting_records()?;
+    let bucket = slots.bucket(Address::ZERO);
+    let template = match record.message() {
+        tn_types::BatchSlotMessage::Proposal { batch, .. } => {
+            let mut template = batch.clone();
+            template.transactions.clear();
+            Ok(template)
+        }
+        tn_types::BatchSlotMessage::Timeout { .. } => Err(BatchSlotError::InvalidEnvelope),
+    }
+    .map_err(BatchSlotVoteStoreError::Protocol)?;
+    let overhead =
+        slots.proposal_overhead(template.clone()).map_err(BatchSlotVoteStoreError::Protocol)?;
+    [(1, 1), (127, 127), (128, 128), (3, 16_384)].into_iter().try_for_each(|(count, size)| {
+        let transaction = vec![1; size];
+        let budget = overhead + count * BatchSlots::transaction_wire_size(&transaction);
+        let mut batch = template.clone();
+        batch.transactions = vec![transaction; count];
+        let encoded = slots
+            .sign_proposal(bucket, *key.public(), batch, &key)
+            .and_then(|record| record.encode())
+            .map_err(BatchSlotVoteStoreError::Protocol)?;
+        assert!(encoded.len() <= budget);
+        assert!(budget - encoded.len() <= 4);
+        Ok(())
+    })
+}
+
+#[test]
 fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlotVoteStoreError> {
     let (slots, record, _) = conflicting_records()?;
     let control = tn_types::BatchSlotControl::default();

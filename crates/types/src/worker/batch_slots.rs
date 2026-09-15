@@ -496,6 +496,42 @@ pub struct BatchSlots {
 }
 
 impl BatchSlots {
+    /// Bound the native metadata overhead for a batch with no transactions yet.
+    ///
+    /// Serializing an unsigned sizing prototype accounts for every fixed field. The extra
+    /// four bytes cover growth of the transaction-count prefix from one byte to BCS's five-byte
+    /// maximum. Each transaction is charged separately with `transaction_wire_size`.
+    pub fn proposal_overhead(&self, template: Batch) -> Result<usize, BatchSlotError> {
+        match () {
+            () if !template.transactions.is_empty() => Err(BatchSlotError::InvalidEnvelope),
+            () if template.epoch != self.epoch() => Err(BatchSlotError::WrongEpoch),
+            () => {
+                let position = self
+                    .buckets()
+                    .next()
+                    .ok_or(BatchSlotError::EmptyCommittee)
+                    .and_then(|bucket| self.position(bucket))?;
+                let prototype = SignedBatchSlotRecord {
+                    chain_id: self.chain_id,
+                    epoch: self.epoch(),
+                    authority: *self.producer(position)?,
+                    message: BatchSlotMessage::Proposal { position, batch: template },
+                    signature: BlsSignature::default(),
+                };
+                prototype.encode().map(|bytes| bytes.len().saturating_add(4))
+            }
+        }
+    }
+
+    /// Count a transaction's encoded bytes and its BCS byte-vector length prefix.
+    pub fn transaction_wire_size(encoded: &[u8]) -> usize {
+        let prefix = std::iter::successors(Some(encoded.len()), |remaining| {
+            (*remaining >= 128).then(|| *remaining >> 7)
+        })
+        .count();
+        encoded.len().saturating_add(prefix)
+    }
+
     /// Initialize an epoch after the preceding epoch's execution is durable.
     pub fn new(
         chain_id: BatchSlotChainId,
@@ -891,6 +927,9 @@ impl fmt::Display for BatchSlotError {
             Self::ViewExhausted => formatter.write_str("batch-slot retry exhausted"),
             Self::VotingPowerOverflow => formatter.write_str("batch-slot voting power overflow"),
             Self::InvalidPrefix => formatter.write_str("invalid batch-slot record prefix"),
+            Self::InvalidEnvelope => {
+                formatter.write_str("noncanonical batch-slot transport envelope")
+            }
             Self::StalePosition => formatter.write_str("batch-slot vote is not current"),
             Self::WrongReservationKey => formatter.write_str("batch-slot reservation key mismatch"),
             Self::ConflictingVote => {

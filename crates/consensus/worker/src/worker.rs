@@ -64,7 +64,8 @@ pub fn new_worker<DB: Database>(
         local_network,
         network_handle.clone(),
         forwarder,
-    );
+    )
+    .with_slot_config(consensus_config.clone(), validator);
 
     // NOTE: This log entry is used to compute performance.
     info!(target: "worker::worker",
@@ -123,6 +124,8 @@ fn new_worker_internal<DB: Database>(
 
 /// Process batch from EL into sealed batches for CL.
 pub struct Worker<DB, QW> {
+    /// Native admission dependencies installed by the production worker constructor.
+    native: Option<NativeWorker<DB>>,
     /// Our worker's id.
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
@@ -150,6 +153,17 @@ pub struct Worker<DB, QW> {
     committee_slots: Vec<BlsPublicKey>,
     /// Prometheus metrics for this worker.
     metrics: WorkerMetrics,
+}
+
+/// Shared epoch admission resources and the worker-specific execution validator.
+#[derive(Debug)]
+struct NativeWorker<DB> {
+    /// Canonical control, durable reservations and the configured signing service.
+    config: ConsensusConfig<DB>,
+    /// Validates the worker's full signed envelope before self-stake can count.
+    validator: Arc<dyn BatchValidation>,
+    /// Round-robin witness for unconfirmed forwarded transactions, independent of RPC replies.
+    forward_attempt: std::sync::atomic::AtomicUsize,
 }
 
 // Need to implement clone directly because of the rx_batches field.
@@ -194,6 +208,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     ) -> Self {
         let (tx_batches, rx_batches) = tokio::sync::mpsc::channel(1000);
         Self {
+            native: None,
             id,
             quorum_waiter,
             client,
@@ -206,6 +221,20 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             committee_slots,
             metrics: WorkerMetrics::new_for_worker(id),
         }
+    }
+
+    /// Bind the production worker to shared native admission before accepting batches.
+    fn with_slot_config(
+        mut self,
+        config: ConsensusConfig<DB>,
+        validator: Arc<dyn BatchValidation>,
+    ) -> Self {
+        self.native = Some(NativeWorker {
+            config,
+            validator,
+            forward_attempt: std::sync::atomic::AtomicUsize::new(0),
+        });
+        self
     }
 
     /// Spawn a little task to accept batches from a channel and seal them that way.
@@ -298,10 +327,142 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Seal and broadcast the current batch, treating empty batches as a successful no-op.
     #[instrument(level = "debug", skip_all, fields(batch_size = sealed_batch.size(), num_txs = sealed_batch.batch.transactions.len()))]
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
-        if sealed_batch.batch.transactions.is_empty() {
+        let native = self.native.as_ref().and_then(|context| {
+            context.config.slot_control().snapshot().map(|slots| (context, slots))
+        });
+        if let Some((context, slots)) = native {
+            self.seal_native(context, &slots, sealed_batch).await
+        } else if sealed_batch.batch.transactions.is_empty() {
             Ok(())
         } else {
             self.seal_non_empty(sealed_batch).await
+        }
+    }
+
+    /// Sign and reserve a native proposal or worker-zero retry before broadcasting it.
+    async fn seal_native(
+        &self,
+        context: &NativeWorker<DB>,
+        slots: &tn_types::BatchSlots,
+        raw: SealedBatch,
+    ) -> Result<(), BlockSealError> {
+        let control = context.config.slot_control();
+        if self.quorum_waiter.is_none() {
+            self.forward_native(context, slots, raw).await
+        } else {
+            let signer = context.config.key_config();
+            let author = tn_types::BlsSigner::public_key(signer);
+            let record = if raw.batch.transactions.is_empty() {
+                control
+                    .retry_position()
+                    .filter(|_| self.id == 0)
+                    .map(|position| slots.sign_timeout(position.bucket(), author, signer))
+                    .transpose()
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?
+            } else {
+                let first = raw.batch.transactions.first().ok_or_else(|| {
+                    BlockSealError::SlotAdmission("proposal has no transaction".into())
+                })?;
+                let bucket = context
+                    .validator
+                    .slot_bucket(first)
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?;
+                Some(
+                    slots
+                        .sign_proposal(bucket, author, raw.batch, signer)
+                        .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?,
+                )
+            };
+            if let Some(record) = record {
+                let envelope = record
+                    .envelope()
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?
+                    .seal_slow();
+                let reservation = context
+                    .config
+                    .slot_votes()
+                    .validate_and_reserve(&control, context.validator.as_ref(), envelope.clone())
+                    .await;
+                if let tn_types::BatchSlotMessage::Proposal { position, .. } = record.message() {
+                    // A conflicting recovered reservation also closes local scheduling for this
+                    // view. Its pending transactions remain available for the ordered retry.
+                    control.proposed(*position);
+                }
+                reservation.map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?;
+                self.seal_non_empty(envelope).await?;
+                if let tn_types::BatchSlotMessage::Timeout { position } = record.message() {
+                    control.timeout_submitted(*position);
+                }
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Forward pending transactions to the currently assigned producer for each bucket.
+    ///
+    /// Native pools retain these transactions until canonical execution. A refused or offline
+    /// producer is replaced through ordered timeout votes, after which forwarding follows the
+    /// new assignment instead of authorizing concurrent proposals from arbitrary validators.
+    async fn forward_native(
+        &self,
+        context: &NativeWorker<DB>,
+        slots: &tn_types::BatchSlots,
+        raw: SealedBatch,
+    ) -> Result<(), BlockSealError> {
+        let groups = raw.batch.transactions.into_iter().try_fold(
+            std::collections::BTreeMap::<BlsPublicKey, Vec<Vec<u8>>>::new(),
+            |mut groups, transaction| {
+                let bucket = context
+                    .validator
+                    .slot_bucket(&transaction)
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?;
+                let position = slots
+                    .position(bucket)
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?;
+                let owner = *slots
+                    .producer(position)
+                    .map_err(|error| BlockSealError::SlotAdmission(error.to_string()))?;
+                groups.entry(owner).or_default().push(transaction);
+                Ok::<_, BlockSealError>(groups)
+            },
+        )?;
+        if groups.is_empty() {
+            Ok(())
+        } else {
+            let rpcs = self
+                .network_handle
+                .get_all_validator_rpcs()
+                .await
+                .map_err(|_| BlockSealError::NotValidator)?;
+            let count = std::num::NonZeroUsize::new(self.committee_slots.len())
+                .ok_or(BlockSealError::NotValidator)?;
+            let witness_index =
+                context.forward_attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % count.get();
+            let witness = self
+                .committee_slots
+                .get(witness_index)
+                .copied()
+                .ok_or(BlockSealError::NotValidator)?;
+            groups.into_iter().try_for_each(|(owner, transactions)| {
+                // An RPC success cannot prove inclusion. Keep trying an additional validator
+                // while the transactions remain pending, so a lying owner cannot hide demand
+                // from every honest retry voter. At most two jobs are queued for each group.
+                std::iter::once(owner)
+                    .chain((witness != owner).then_some(witness))
+                    .map(|target| {
+                        self.forwarder.forward_txns(
+                            transactions.clone(),
+                            vec![target],
+                            rpcs.clone(),
+                        )
+                    })
+                    .fold(true, |accepted, current| accepted & current)
+                    .then_some(())
+                    .ok_or(BlockSealError::NotValidator)
+            })
         }
     }
 

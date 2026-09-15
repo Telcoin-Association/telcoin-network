@@ -51,7 +51,7 @@ impl RethEnv {
                         let transaction = recover_raw_transaction(bytes)
                             .map_err(BatchSlotAdmissionError::Provider)?;
                         match () {
-                            () if !batch_allowlisted_tx_type(transaction.ty()) => {
+                            () if !batch_allowlisted_tx_type(transaction.inner()) => {
                                 Err(BatchSlotAdmissionError::UnsupportedType(transaction.ty()))
                             }
                             () if slots.bucket(transaction.signer()) != position.bucket() => {

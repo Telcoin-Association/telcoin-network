@@ -36,6 +36,15 @@ pub struct BatchValidator {
 }
 
 impl BatchValidation for BatchValidator {
+    fn slot_bucket(&self, transaction: &[u8]) -> BatchValidationResult<tn_types::BatchBucket> {
+        let slots = self.reth_env.batch_slots().snapshot().ok_or_else(|| {
+            BatchValidationError::SlotAdmission("native transaction routing has no snapshot".into())
+        })?;
+        recover_raw_transaction(transaction)
+            .map(|transaction| slots.bucket(transaction.signer()))
+            .map_err(|error| BatchValidationError::SlotAdmission(error.to_string()))
+    }
+
     fn validate_batch(&self, batch: SealedBatch) -> BatchValidationResult<()> {
         self.validate_batch_for_vote(batch).map(|_| ())
     }
