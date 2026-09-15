@@ -158,7 +158,7 @@ impl<DB: Database> BatchSlotVoteStore<DB> {
                 }
             })
             .await
-            .map(|()| ())
+            .copied()
     }
 
     /// Authenticate a current or delayed proposal against canonical slot history.

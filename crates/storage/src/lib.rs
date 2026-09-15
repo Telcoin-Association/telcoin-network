@@ -4,6 +4,9 @@
 #![allow(missing_docs)]
 
 mod stores;
+
+#[cfg(test)]
+mod batch_slot_tests;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
