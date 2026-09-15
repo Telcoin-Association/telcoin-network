@@ -38,7 +38,7 @@ FILES = [
     "Cargo.lock",
     "crates/types/src/worker/batch_slot_control.rs",
     "crates/types/src/worker/sealed_batch.rs",
-    "crates/storage/tests/batch_slot_votes.rs",
+    "crates/storage/src/batch_slot_tests.rs",
     "crates/tn-reth/src/env/slot_admission.rs",
     "crates/tn-reth/src/env/mod.rs",
     "crates/tn-reth/src/evm/mod.rs",
@@ -216,9 +216,9 @@ try:
         command = test_command("tn-types", ["--lib"], "worker::batch_slot")
         run("slot-core-default", command)
         run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slot", True))
-        storage_command = test_command("tn-storage", ["--test", "batch_slot_votes"], "")
+        storage_command = test_command("tn-storage", ["--lib"], "batch_slot_tests::")
         run("slot-storage-default", storage_command)
-        run("slot-storage-adiri", test_command("tn-storage", ["--test", "batch_slot_votes"], "", True))
+        run("slot-storage-adiri", test_command("tn-storage", ["--lib"], "batch_slot_tests::", True))
         execution_command = test_command("tn-engine", ["--test", "it"], "native_slots")
         run("slot-execution-default", execution_command)
         run("slot-execution-adiri", test_command("tn-engine", ["--test", "it"], "native_slots", True))
@@ -357,7 +357,7 @@ try:
             ("builder-capacity", "tn-batch-builder", ["--lib"], "peer_batch_capacity_loss_"),
             ("race-execution", "tn-batch-builder", ["--test", "it"], "peer_batch_residuals::"),
             ("slot-core", "tn-types", ["--lib"], "worker::batch_slot"),
-            ("slot-storage", "tn-storage", ["--test", "batch_slot_votes"], ""),
+            ("slot-storage", "tn-storage", ["--lib"], "batch_slot_tests::"),
         ]
         for feature in [False, True]:
             suffix = "adiri" if feature else "default"
