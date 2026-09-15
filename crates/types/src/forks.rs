@@ -741,6 +741,7 @@ pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
             ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
             ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
+            ("TN_BATCH_SLOTS_FORK_EPOCH", batch_slots_fork_epoch_override()),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
         ]
         .into_iter()

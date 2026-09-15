@@ -1,7 +1,7 @@
 //! Pinned transaction admission for ordered sender slots.
 
 use super::RethEnv;
-use crate::{recover_raw_transaction, TnRethError};
+use crate::{error::TnRethError, recover_raw_transaction};
 use alloy_evm::IntoTxEnv as _;
 use reth_evm::{ConfigureEvm as _, EvmFactory as _};
 use reth_provider::ProviderError;
@@ -80,7 +80,7 @@ pub enum BatchSlotAdmissionError {
     /// The execution configuration cannot construct the pinned environment.
     Environment(String),
     /// Revm rejected an environment, intrinsic-gas, nonce, code or balance check.
-    Transaction(EVMError<ProviderError>),
+    Transaction(EVMError<reth_revm::database::bal::EvmDatabaseError<ProviderError>>),
     /// An execution proposal must contain at least one transaction.
     EmptyProposal,
     /// A transaction's sender belongs to another bucket.

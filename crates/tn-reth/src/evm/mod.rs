@@ -189,7 +189,9 @@ where
     /// so later transactions cannot depend on speculative refunds or incoming transfers.
     pub(crate) fn admit_slot_transaction(&mut self, tx: TxEnv) -> Result<(), EVMError<DB::Error>> {
         use reth_revm::{
-            context_interface::{JournalTr as _, Transaction as _},
+            context_interface::{
+                journaled_state::account::JournaledAccountTr as _, JournalTr as _, Transaction as _,
+            },
             handler::pre_execution::validate_account_nonce_and_code_with_components,
         };
 
