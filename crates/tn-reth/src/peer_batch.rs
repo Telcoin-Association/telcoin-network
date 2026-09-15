@@ -300,6 +300,8 @@ impl PeerBatchWindow {
 
 #[cfg(test)]
 mod metrics_tests {
+    //! Check retained counts and capacity loss across window lifetimes.
+
     use super::*;
     use metrics::{Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use metrics_util::{
@@ -310,6 +312,7 @@ mod metrics_tests {
 
     /// Preserve cumulative values across reads; `DebuggingRecorder` clears each snapshot.
     struct TelemetryRecorder {
+        /// Atomic counter and gauge handles shared by matching metric keys.
         registry: Registry<Key, AtomicStorage>,
     }
 
@@ -334,11 +337,14 @@ mod metrics_tests {
     }
 
     impl Recorder for TelemetryRecorder {
+        /// Ignore counter descriptions, which these value assertions do not inspect.
         fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
         }
 
+        /// Ignore gauge descriptions, which these value assertions do not inspect.
         fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
+        /// Ignore histogram descriptions, which these value assertions do not inspect.
         fn describe_histogram(
             &self,
             _key: KeyName,
@@ -347,14 +353,17 @@ mod metrics_tests {
         ) {
         }
 
+        /// Reuse the counter handle associated with this metric key.
         fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
             self.registry.get_or_create_counter(key, |counter| Counter::from_arc(counter.clone()))
         }
 
+        /// Reuse the gauge handle associated with this metric key.
         fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
             self.registry.get_or_create_gauge(key, |gauge| Gauge::from_arc(gauge.clone()))
         }
 
+        /// Supply a no-op handle for histogram instrumentation outside these assertions.
         fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
             Histogram::noop()
         }
