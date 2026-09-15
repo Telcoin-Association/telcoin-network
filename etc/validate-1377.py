@@ -27,6 +27,8 @@ FILES = [
     "crates/batch-builder/tests/it/peer_batch_residuals.rs",
     "crates/batch-builder/README.md",
     "docs/peer-batch-deferral.md",
+    "crates/types/src/worker/batch_slots.rs",
+    "crates/types/src/worker/mod.rs",
 ]
 ORIGINAL = {name: (ROOT / name).read_bytes() for name in FILES}
 for name, content in ORIGINAL.items():
@@ -97,7 +99,7 @@ def run(label, command, *, mutant=False, required=True):
 def test_command(package, target, pattern, feature=False):
     command = ["cargo", f"+{PIN}", "test", "--locked", "-p", package]
     if feature:
-        command += ["--features", "tn-reth/adiri"]
+        command += ["--features", "adiri" if package == "tn-types" else "tn-reth/adiri"]
     command += target + [pattern, "--", "--nocapture"]
     return command
 
@@ -120,7 +122,7 @@ try:
             "telcoin-network-cli", "tn-batch-builder", "tn-batch-validator", "tn-engine",
             "tn-executor", "tn-exex", "tn-network-libp2p", "tn-node", "tn-primary", "tn-reth",
             "tn-rpc", "tn-storage", "tn-test-utils", "tn-test-utils-committee", "tn-types",
-            "tn-worker",
+            "tn-worker", "tn-config", "tn-metrics", "tn-network-types", "tn-worker-gateway",
         ]
         command = ["cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json"]
         for package in packages:
@@ -136,7 +138,7 @@ try:
         }
         focused = [
             "cargo", f"+{NIGHTLY}", "clippy", "--locked", "--keep-going", "--message-format=json",
-            "-p", "tn-reth", "-p", "tn-batch-validator", "-p", "tn-batch-builder",
+            "-p", "tn-reth", "-p", "tn-batch-validator", "-p", "tn-batch-builder", "-p", "tn-types",
             "--all-targets", "--no-deps",
         ]
         changed = {
@@ -179,11 +181,50 @@ try:
                     (ROOT / name).write_bytes(content)
         if not all(check["passed"] for check in [*broad.values(), *changed.values()]):
             raise RuntimeError("Clippy failed; reports preserve the focused results and baseline comparison")
+    elif PHASE == "slot-core":
+        command = test_command("tn-types", ["--lib"], "worker::batch_slots::tests::")
+        run("slot-core-default", command)
+        run("slot-core-adiri", test_command("tn-types", ["--lib"], "worker::batch_slots::tests::", True))
+        source = "crates/types/src/worker/batch_slots.rs"
+        mutations = [
+            ("slot-resolved-sequence",
+             "() if position.sequence < slot.sequence => Ok(false),",
+             "() if position.sequence < slot.sequence => Ok(true),"),
+            ("slot-repeated-timeout",
+             "slot.timeout_voters.contains(&author)",
+             "(slot.timeout_voters.contains(&author) && position.view.0 == u64::MAX)"),
+            ("slot-rotation",
+             "slot.view = next_view;",
+             "slot.view = next_view.min(position.view);"),
+            ("slot-producer",
+             "() if self.producer(*position)? != record.authority() =>",
+             "() if self.producer(*position)? != record.authority() && position.bucket.0 == u32::MAX =>"),
+            ("slot-body-signature",
+             "if bls_verify_secure(&self.signature, &self.authority, &bytes) {",
+             "if bls_verify_secure(&self.signature, &self.authority, &bytes) || self.epoch == committee.epoch() {"),
+            ("slot-execution-fence",
+             "slot.opening = SlotOpening::Pending(output);",
+             "slot.opening = SlotOpening::Ready(BatchSlotParent::new(output, B256::ZERO));"),
+            ("slot-independent-buckets",
+             "            Ok(BatchSlotTransition::Selected)\n",
+             "            self.buckets.iter_mut().for_each(|other| other.sequence = sequence);\n"
+             "            Ok(BatchSlotTransition::Selected)\n"),
+            ("slot-conflicting-vote",
+             "() if next_order == old_order && self != next => Err(BatchSlotError::ConflictingVote),",
+             "() if next_order == old_order && self != next => Ok(()),"),
+            ("slot-reservation-rewind",
+             "() if next_order < old_order => Err(BatchSlotError::StalePosition),",
+             "() if next_order < old_order => Ok(()),"),
+        ]
+        for label, before, after in mutations:
+            mutate(f"mutant-{label}", source, before, after, command)
+        run("slot-core-restored", command)
     elif PHASE == "tests":
         cases = [
             ("peer-window", "tn-reth", ["--lib"], "peer_batch::"),
             ("builder-capacity", "tn-batch-builder", ["--lib"], "peer_batch_capacity_loss_"),
             ("race-execution", "tn-batch-builder", ["--test", "it"], "peer_batch_residuals::"),
+            ("slot-core", "tn-types", ["--lib"], "worker::batch_slots::tests::"),
         ]
         for feature in [False, True]:
             suffix = "adiri" if feature else "default"

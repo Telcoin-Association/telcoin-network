@@ -11,7 +11,7 @@ on:
         description: Validation lane to run
         type: choice
         default: all
-        options: [all, clippy, tests]
+        options: [all, clippy, tests, slot-core]
 
 permissions:
   contents: read
@@ -31,7 +31,7 @@ env:
 
 jobs:
   clippy:
-    if: inputs.lane != 'tests'
+    if: inputs.lane == 'all' || inputs.lane == 'clippy'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -56,7 +56,7 @@ jobs:
           name: issue-1377-clippy
           path: validation-1377/
   focused-tests:
-    if: inputs.lane != 'clippy'
+    if: inputs.lane == 'all' || inputs.lane == 'tests'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -77,4 +77,27 @@ jobs:
         if: always()
         with:
           name: issue-1377-tests
+          path: validation-1377/
+  slot-core:
+    if: inputs.lane == 'all' || inputs.lane == 'slot-core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 3
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+      - name: Test slot ordering, retries, reservations, and mutation sensitivity
+        run: python3 -I etc/validate-1377.py slot-core
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-1377-slot-core
           path: validation-1377/
