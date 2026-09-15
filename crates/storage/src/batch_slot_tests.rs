@@ -9,6 +9,20 @@ use tn_types::{
 };
 use tokio::sync::oneshot;
 
+/// Reopening a table must preserve the handles captured by an active transaction.
+#[test]
+fn reopening_memory_tables_preserves_active_transaction_writes() -> eyre::Result<()> {
+    let database = MemDatabase::new();
+    database.open_table::<BatchSlotStoreEpoch>()?;
+    let mut transaction = database.write_txn()?;
+    database.open_table::<BatchSlotStoreEpoch>()?;
+    transaction.insert::<BatchSlotStoreEpoch>(&(), &7)?;
+    transaction.commit()?;
+    assert_eq!(database.get::<BatchSlotStoreEpoch>(&())?, Some(7));
+    Ok(())
+}
+
+/// Unsigned envelope metadata must not change the canonical signed body.
 #[test]
 fn canonical_envelopes_reject_unsigned_metadata() -> Result<(), BatchSlotVoteStoreError> {
     let (_, record, _) = conflicting_records()?;
@@ -34,6 +48,7 @@ fn canonical_envelopes_reject_unsigned_metadata() -> Result<(), BatchSlotVoteSto
     Ok(())
 }
 
+/// Builder wire accounting must include variable-length vector prefixes.
 #[test]
 fn native_wire_budget_covers_vector_prefix_boundaries() -> Result<(), BatchSlotVoteStoreError> {
     let (slots, record, _) = conflicting_records()?;
@@ -65,6 +80,7 @@ fn native_wire_budget_covers_vector_prefix_boundaries() -> Result<(), BatchSlotV
     })
 }
 
+/// Orphan recovery restores transactions while discarding timeout records.
 #[test]
 fn orphaned_envelopes_restore_proposals_and_discard_control_records(
 ) -> Result<(), BatchSlotVoteStoreError> {
@@ -92,6 +108,7 @@ fn orphaned_envelopes_restore_proposals_and_discard_control_records(
     Ok(())
 }
 
+/// An execution opening remains unavailable until its anchor is finalized.
 #[test]
 fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlotVoteStoreError> {
     let (slots, record, _) = conflicting_records()?;
@@ -107,6 +124,7 @@ fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlot
     Ok(())
 }
 
+/// A quorum timeout cannot authorize a successor within the same consensus output.
 #[test]
 fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchSlotVoteStoreError> {
     let (slots, original, _) = conflicting_records()?;
@@ -139,6 +157,7 @@ fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchS
     Ok(())
 }
 
+/// Execution publication waits for durable closed-slot authorizations.
 #[tokio::test]
 async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSlotVoteStoreError> {
     let database = LayeredDatabase::open(MemDatabase::new(), false);
@@ -157,24 +176,12 @@ async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSl
     let transaction = database.write_txn().map_err(BatchSlotVoteStoreError::Database)?;
     let publishing = control.clone();
     let publication = tokio::task::spawn_blocking(move || publishing.commit_blocking(output));
-    tokio::time::timeout(
+    tn_test_utils::wait_until(
         std::time::Duration::from_secs(10),
-        std::future::poll_fn(|context| {
-            database.contains_key::<BatchSlotAuthorizations>(&record.slot()).map_or_else(
-                |error| std::task::Poll::Ready(Err(error)),
-                |present| {
-                    if present {
-                        std::task::Poll::Ready(Ok(()))
-                    } else {
-                        context.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                },
-            )
-        }),
+        "closed-slot history prepared behind the durability barrier",
+        || async { database.contains_key::<BatchSlotAuthorizations>(&record.slot()) },
     )
     .await
-    .map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?
     .map_err(BatchSlotVoteStoreError::Database)?;
     assert!(!publication.is_finished(), "execution published before durable history");
     assert_eq!(
@@ -206,6 +213,7 @@ async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSl
     Ok(())
 }
 
+/// Closed demand and stale timeout records cannot perpetuate idle retries.
 #[tokio::test(start_paused = true)]
 async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retrying(
 ) -> eyre::Result<()> {
@@ -304,6 +312,7 @@ fn conflicting_votes() -> Result<(BatchSlotVote, BatchSlotVote), BatchSlotVoteSt
     slots.vote(&second).map_err(BatchSlotVoteStoreError::Protocol).map(|second| (first, second))
 }
 
+/// Reopening disk storage cannot permit a conflicting vote for the same position.
 #[tokio::test]
 async fn reopening_preserves_the_first_vote() -> Result<(), BatchSlotVoteStoreError> {
     let directory =
@@ -324,6 +333,7 @@ async fn reopening_preserves_the_first_vote() -> Result<(), BatchSlotVoteStoreEr
     Ok(())
 }
 
+/// Worker clones share both the first reservation and its durability barrier.
 #[tokio::test]
 async fn workers_wait_for_the_shared_durability_barrier() -> Result<(), BatchSlotVoteStoreError> {
     let database = LayeredDatabase::open(MemDatabase::new(), false);
@@ -341,9 +351,13 @@ async fn workers_wait_for_the_shared_durability_barrier() -> Result<(), BatchSlo
         first_worker.reserve(&first).await
     });
     first_ready.await.map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?;
-    assert!(database
-        .contains_key::<BatchSlotVotes>(&first_key)
-        .map_err(BatchSlotVoteStoreError::Database)?);
+    tn_test_utils::wait_until(
+        std::time::Duration::from_secs(10),
+        "first worker reservation prepared behind the durability barrier",
+        || async { database.contains_key::<BatchSlotVotes>(&first_key) },
+    )
+    .await
+    .map_err(BatchSlotVoteStoreError::Database)?;
     assert!(!first_task.is_finished(), "a vote escaped before its database commit");
 
     let second_worker = store.clone();
@@ -366,6 +380,7 @@ async fn workers_wait_for_the_shared_durability_barrier() -> Result<(), BatchSlo
     Ok(())
 }
 
+/// Persisted history lets delayed honest proposals finish certification after restart.
 #[tokio::test]
 async fn reopening_recovers_closed_slot_authorizations() -> Result<(), BatchSlotVoteStoreError> {
     let directory =
@@ -397,6 +412,7 @@ async fn reopening_recovers_closed_slot_authorizations() -> Result<(), BatchSlot
     Ok(())
 }
 
+/// History writes cannot acknowledge completion before the underlying commit.
 #[tokio::test]
 async fn history_publication_waits_for_durable_commit() -> Result<(), BatchSlotVoteStoreError> {
     let database = LayeredDatabase::open(MemDatabase::new(), false);
@@ -413,6 +429,13 @@ async fn history_publication_waits_for_durable_commit() -> Result<(), BatchSlotV
         store.publish_authorizations(&[authorization]).await
     });
     ready.await.map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?;
+    tn_test_utils::wait_until(
+        std::time::Duration::from_secs(10),
+        "closed-slot authorization prepared behind the durability barrier",
+        || async { database.contains_key::<BatchSlotAuthorizations>(&original.slot()) },
+    )
+    .await
+    .map_err(BatchSlotVoteStoreError::Database)?;
     assert!(!writer.is_finished(), "slot history escaped before the durable commit");
     transaction.commit().map_err(BatchSlotVoteStoreError::Database)?;
     writer.await.map_err(|error| BatchSlotVoteStoreError::Database(error.into()))??;
@@ -422,6 +445,7 @@ async fn history_publication_waits_for_durable_commit() -> Result<(), BatchSlotV
     Ok(())
 }
 
+/// Advancing the durable epoch retires old votes and prevents an unsafe rewind.
 #[tokio::test]
 async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchSlotVoteStoreError> {
     let directory =
@@ -449,10 +473,16 @@ async fn epoch_advance_retires_history_and_refuses_rewind() -> Result<(), BatchS
     Ok(())
 }
 
+/// Initialization waits for its epoch marker even when another transaction delays persistence.
 #[tokio::test]
 async fn epoch_initialization_waits_for_its_durable_marker() -> Result<(), BatchSlotVoteStoreError>
 {
     let database = LayeredDatabase::open(MemDatabase::new(), false);
+    database
+        .open_table::<BatchSlotVotes>()
+        .and_then(|()| database.open_table::<BatchSlotAuthorizations>())
+        .and_then(|()| database.open_table::<BatchSlotStoreEpoch>())
+        .map_err(BatchSlotVoteStoreError::Database)?;
     let store = BatchSlotVoteStore::new(database.clone(), 7);
     let transaction = database.write_txn().map_err(BatchSlotVoteStoreError::Database)?;
     let (started, ready) = oneshot::channel();
@@ -461,6 +491,13 @@ async fn epoch_initialization_waits_for_its_durable_marker() -> Result<(), Batch
         store.initialize().await
     });
     ready.await.map_err(|error| BatchSlotVoteStoreError::Database(error.into()))?;
+    tn_test_utils::wait_until(
+        std::time::Duration::from_secs(10),
+        "epoch marker prepared behind the durability barrier",
+        || async { database.get::<BatchSlotStoreEpoch>(&()).map(|epoch| epoch == Some(7)) },
+    )
+    .await
+    .map_err(BatchSlotVoteStoreError::Database)?;
     assert!(!writer.is_finished(), "epoch initialization escaped before its durable marker");
     transaction.commit().map_err(BatchSlotVoteStoreError::Database)?;
     writer.await.map_err(|error| BatchSlotVoteStoreError::Database(error.into()))??;
