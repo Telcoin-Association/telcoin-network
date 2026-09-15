@@ -171,13 +171,7 @@ impl BatchSlotControl {
 
     /// Start an isolated candidate for one consensus output.
     pub fn prepare(&self, output: B256) -> Option<BatchSlotOutput> {
-        self.snapshot().map(|previous| BatchSlotOutput {
-            candidate: (*previous).clone(),
-            previous,
-            output,
-            closed: BTreeMap::new(),
-            changed: false,
-        })
+        self.snapshot().map(|previous| BatchSlotOutput::new(previous, output))
     }
 
     /// Commit an executed candidate from the engine's blocking thread.
@@ -204,7 +198,9 @@ impl BatchSlotControl {
         receive.blocking_recv().map_err(|_| BatchSlotControlError::Unavailable)?
     }
 
-    /// Serve the epoch's execution commits on its task manager, preserving backpressure.
+    /// Serve execution commits until controller replacement closes the channel.
+    ///
+    /// This service must outlive epoch worker teardown, which can precede the final output drain.
     pub async fn serve<DB: Database>(
         &self,
         store: BatchSlotVoteStore<DB>,
@@ -270,11 +266,45 @@ impl ControlState {
 }
 
 impl BatchSlotOutput {
+    /// Construct the same private candidate for live execution and canonical recovery.
+    fn new(previous: Arc<BatchSlots>, output: B256) -> Self {
+        Self {
+            candidate: (*previous).clone(),
+            previous,
+            output,
+            closed: BTreeMap::new(),
+            changed: false,
+        }
+    }
+
+    /// Reconstruct one already durable output and its closed-slot authorizations.
+    ///
+    /// The caller must obtain the records in consensus order and the final execution hash
+    /// from canonical storage. This does not authorize a speculative or merely certified output.
+    pub fn recover<'a>(
+        previous: BatchSlots,
+        output: B256,
+        records: impl IntoIterator<Item = &'a SignedBatchSlotRecord>,
+        execution: B256,
+    ) -> Result<(BatchSlots, Vec<BatchSlotAuthorization>), BatchSlotError> {
+        let mut recovered = Self::new(Arc::new(previous), output);
+        records.into_iter().try_for_each(|record| recovered.apply(record).map(|_| ()))?;
+        recovered.finalize(execution)?;
+        Ok((recovered.candidate, recovered.closed.into_values().collect()))
+    }
+
     /// Apply an authenticated, fully validated record in its original consensus order.
     pub fn apply(
         &mut self,
         record: &SignedBatchSlotRecord,
     ) -> Result<BatchSlotTransition, BatchSlotError> {
+        let position = record.message().position();
+        let published = self.previous.position(position.bucket())?;
+        if position.sequence() >= published.sequence() {
+            // A retry advanced inside this output was not yet available for voting. Only
+            // positions authorized by the preceding published snapshot can select a proposal.
+            self.previous.vote(record)?;
+        }
         let transition = self.candidate.apply(record, self.output)?;
         if transition == BatchSlotTransition::Selected {
             let bucket = record.message().position().bucket();

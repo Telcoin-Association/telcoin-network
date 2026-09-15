@@ -80,6 +80,33 @@ fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlot
     Ok(())
 }
 
+#[test]
+fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchSlotVoteStoreError> {
+    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
+    let (slots, original, _) = conflicting_records()?;
+    let bucket = slots.bucket(Address::ZERO);
+    let control = tn_types::BatchSlotControl::default();
+    drop(control.install(slots.clone(), Some(*key.public())));
+    let hash = B256::repeat_byte(9);
+    let mut output = control.prepare(hash).ok_or(BatchSlotVoteStoreError::NotInitialized)?;
+    let timeout = slots
+        .sign_timeout(bucket, *key.public(), &key)
+        .map_err(BatchSlotVoteStoreError::Protocol)?;
+    output.apply(&timeout).map_err(BatchSlotVoteStoreError::Protocol)?;
+    let mut advanced = slots;
+    advanced.apply(&timeout, hash).map_err(BatchSlotVoteStoreError::Protocol)?;
+    let batch = match original.message() {
+        tn_types::BatchSlotMessage::Proposal { batch, .. } => Ok(batch.clone()),
+        tn_types::BatchSlotMessage::Timeout { .. } => Err(BatchSlotError::InvalidEnvelope),
+    }
+    .map_err(BatchSlotVoteStoreError::Protocol)?;
+    let premature = advanced
+        .sign_proposal(bucket, *key.public(), batch, &key)
+        .map_err(BatchSlotVoteStoreError::Protocol)?;
+    assert!(matches!(output.apply(&premature), Err(BatchSlotError::FutureView)));
+    Ok(())
+}
+
 #[tokio::test]
 async fn execution_publication_waits_for_durable_history() -> Result<(), BatchSlotVoteStoreError> {
     let database = LayeredDatabase::open(MemDatabase::new(), false);

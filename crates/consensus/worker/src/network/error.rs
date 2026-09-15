@@ -82,6 +82,9 @@ impl WorkerNetworkError {
         match self {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
+                    // A local slot view or storage barrier can lag the reporting peer.
+                    BatchValidationError::SlotProtocol(_)
+                    | BatchValidationError::SlotAdmission(_) => None,
                     // mild
                     BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
                     // medium

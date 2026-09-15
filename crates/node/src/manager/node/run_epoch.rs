@@ -251,6 +251,7 @@ where
         self.recover_previous_epoch_record(committee.epoch(), engine).await?;
 
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
+        self.initialize_batch_slots(&reth_env, &committee, &epoch_start_header).await?;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -332,6 +333,10 @@ where
         let consensus_config = self
             .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
             .await?;
+        consensus_config.set_slot_control(reth_env.batch_slots().clone())?;
+        if reth_env.batch_slots().snapshot().is_some() {
+            consensus_config.slot_votes().initialize().await?;
+        }
 
         // Epoch-entry agreement check (issue #556): the committee's worker count sizes the
         // per-worker `LocalNetwork` seam, while the accumulator was sized from the on-chain
