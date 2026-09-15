@@ -308,7 +308,7 @@ impl BatchSlotOutput {
         Ok((recovered.candidate, recovered.closed.into_values().collect()))
     }
 
-    /// Apply an authenticated, fully validated record in its original consensus order.
+    /// Order a signed record; selected execution bodies must validate before publication.
     pub fn apply(
         &mut self,
         record: &SignedBatchSlotRecord,

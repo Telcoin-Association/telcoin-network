@@ -146,14 +146,14 @@ pub struct BatchSlotId {
     sequence: BatchSlotSequence,
 }
 
-/// Canonical admission anchor and highest approved retry for one slot.
+/// Canonical admission anchor and exact approved retry for one sequence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchSlotAuthorization {
     /// Chain domain of the canonical state that authorized this slot.
     chain_id: BatchSlotChainId,
     /// Committee epoch of the canonical authorization.
     epoch: Epoch,
-    /// Slot identity, opening state, and highest retry approved before the slot closed.
+    /// Slot identity, opening state, and retry approved before the sequence closed.
     position: BatchSlotPosition,
 }
 
@@ -446,7 +446,7 @@ pub enum BatchSlotVoteKey {
         /// Retry for which the author requests rotation.
         view: BatchSlotView,
         /// Committee identity signing the timeout.
-        authority: BlsPublicKey,
+        authority: Box<BlsPublicKey>,
     },
 }
 
@@ -541,7 +541,7 @@ impl BatchSlots {
     /// Count a transaction's encoded bytes and its BCS byte-vector length prefix.
     pub fn transaction_wire_size(encoded: &[u8]) -> usize {
         let prefix = std::iter::successors(Some(encoded.len()), |remaining| {
-            (*remaining >= 128).then(|| *remaining >> 7)
+            (*remaining >= 128).then_some(*remaining >> 7)
         })
         .count();
         encoded.len().saturating_add(prefix)
@@ -681,11 +681,11 @@ impl BatchSlots {
         }
     }
 
-    /// Authenticate an availability vote for any authorized view of the current slot.
+    /// Authenticate an availability vote for the currently open sequence.
     ///
     /// The caller must also validate the execution body, and persist this decision before
-    /// acknowledging it. A delayed proposal can finish certification after a retry because
-    /// each view keeps its own durable reservation through the epoch.
+    /// acknowledging it. Delayed proposals for closed sequences instead require the retained
+    /// authorization through `vote_for_authorization`, as enforced by `BatchSlotVoteStore`.
     pub fn vote(&self, record: &SignedBatchSlotRecord) -> Result<BatchSlotVote, BatchSlotError> {
         self.authorization(record.message().position().bucket)
             .and_then(|authorization| self.vote_for_authorization(record, &authorization))
@@ -726,7 +726,7 @@ impl BatchSlots {
                     BatchSlotMessage::Timeout { .. } => Ok(BatchSlotVoteKey::Timeout {
                         slot: record.slot(),
                         view: position.view,
-                        authority: *record.authority(),
+                        authority: Box::new(*record.authority()),
                     }),
                 }?;
                 record.digest().map(|digest| BatchSlotVote {
@@ -742,9 +742,9 @@ impl BatchSlots {
 
     /// Authenticate and apply one record in consensus order.
     ///
-    /// The caller must validate a proposal's execution transactions, sender buckets, and
-    /// opening-state nonces before calling this method. A selected proposal must execute
-    /// before the snapshot is published or its next slot can be used.
+    /// The caller must validate a selected proposal's execution transactions, sender bucket,
+    /// and opening-state nonces before executing or publishing this candidate. A closed
+    /// sequence's successor remains fenced until its consensus output is durable.
     pub fn apply(
         &mut self,
         record: &SignedBatchSlotRecord,

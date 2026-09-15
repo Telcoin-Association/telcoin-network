@@ -1,7 +1,7 @@
 //! Reservations must survive reopening and cannot escape a pending durability barrier.
 
+use crate::{layered_db::LayeredDatabase, mem_db::MemDatabase, redb::database::ReDB};
 use rand::{rngs::StdRng, SeedableRng};
-use tn_storage::{layered_db::LayeredDatabase, mem_db::MemDatabase, redb::database::ReDB};
 use tn_types::{
     Address, Batch, BatchSlotAuthorizations, BatchSlotError, BatchSlotParent, BatchSlotStoreEpoch,
     BatchSlotVote, BatchSlotVoteStore, BatchSlotVoteStoreError, BatchSlotVotes, BatchSlots,
