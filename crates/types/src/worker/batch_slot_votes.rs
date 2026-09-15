@@ -94,7 +94,7 @@ impl<DB: Database> BatchSlotVoteStore<DB> {
                 .await
                 .map_err(|error| crate::BatchValidationError::SlotAdmission(error.to_string()))?;
             if let super::BatchSlotMessage::Timeout { position } = record.message() {
-                control.demand(position.bucket());
+                control.observe_timeout(*position);
             }
         }
         Ok(())

@@ -60,6 +60,10 @@ This lets honest witnesses learn demand when a destination accepts requests but 
 Retry progress still requires eventual delivery to honest validators and a live consensus
 quorum, as does transaction inclusion elsewhere in the protocol.
 
+A sequence closure clears local retry demand. A fresh pool scan or a timeout for the exact
+new position must renew it. Delayed timeout records for closed sequences cannot wake an idle
+successor, and old demand cannot perpetuate control-only outputs after pending work is gone.
+
 Restart recovery reads canonical execution anchors and archived consensus bodies before
 workers can vote. It rebuilds positions and closed authorizations, while durable vote records
 prevent conflicting signatures. Native orphan recovery unwraps transaction bodies and discards

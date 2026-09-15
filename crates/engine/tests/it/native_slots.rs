@@ -147,9 +147,13 @@ impl Fixture {
         close: bool,
     ) -> eyre::Result<ConsensusOutput> {
         let mut leader = Certificate::default();
-        let authority =
-            self.committee.authorities().first().ok_or_else(|| eyre::eyre!("empty committee"))?;
-        leader.update_header_author_for_test(authority.id());
+        let authority = self
+            .committee
+            .authorities()
+            .first()
+            .map(|authority| authority.id())
+            .ok_or_else(|| eyre::eyre!("empty committee"))?;
+        leader.update_header_author_for_test(authority);
         leader.update_header_round_for_test(number);
         let batches =
             records.iter().map(SignedBatchSlotRecord::envelope).collect::<Result<Vec<_>, _>>()?;
@@ -359,11 +363,11 @@ async fn timeout_refresh_allows_newly_funded_sender_to_spend() -> eyre::Result<(
             ..fixture.batch.clone()
         };
         let stale = fixture.proposal_for(bucket, pending.clone())?;
-        assert!(fixture.env.validate_slot_transactions(&fixture.slots()?, &stale).is_err());
+        assert!(fixture.env.validate_slot_transactions(fixture.slots()?.as_ref(), &stale).is_err());
         let transfer = fixture.proposal(fixture.batch.clone())?;
         fixture.execute(fixture.output(&[transfer], 1, false)?).await??;
         assert!(
-            fixture.env.validate_slot_transactions(&fixture.slots()?, &stale).is_err(),
+            fixture.env.validate_slot_transactions(fixture.slots()?.as_ref(), &stale).is_err(),
             "incoming funds cannot alter an already published admission snapshot"
         );
         let slots = fixture.slots()?;
@@ -377,7 +381,7 @@ async fn timeout_refresh_allows_newly_funded_sender_to_spend() -> eyre::Result<(
         let anchor = fixture.execute(fixture.output(&votes, 2, false)?).await??;
         assert_eq!(fixture.slots()?.position(bucket)?.parent().execution(), anchor.hash());
         let retry = fixture.proposal_for(bucket, pending)?;
-        fixture.env.validate_slot_transactions(&fixture.slots()?, &retry)?;
+        fixture.env.validate_slot_transactions(fixture.slots()?.as_ref(), &retry)?;
         let spent = fixture.execute(fixture.output(&[retry], 3, false)?).await??;
         assert_eq!(spent.number, 3);
         assert_eq!(spent.gas_used, 21_000);
