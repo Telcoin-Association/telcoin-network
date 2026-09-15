@@ -30,6 +30,13 @@ from the code at the cited paths; when the code and this file disagree, the code
   and continues (`src/env/execution.rs`). Transactions whose signer cannot be recovered are
   dropped deterministically instead of halting the network (issue #933) and counted by the
   alertable `tn_reth_unrecoverable_txs_dropped_total` metric (`src/metrics.rs`).
+- Peer batch deferral (`src/peer_batch.rs`, issue #1329): a batch this node validates records its
+  transaction hashes in the pool's `PeerBatchTxs` window, and the batch builder skips a remembered
+  hash for `PEER_BATCH_DEFER_TTL` (10 seconds), bounded by `PEER_BATCH_SEEN_MAX_TXS` hashes. A
+  full window drops further hashes instead of evicting live entries, which are forgotten only at
+  twice the TTL, so a flood of peer batches can switch a deferral off but never re-arm one.
+  Duplicates across workers stay tolerated at execution; this only stops this node from packing a
+  copy of what a peer is already proposing.
 
 ## Header field mapping
 

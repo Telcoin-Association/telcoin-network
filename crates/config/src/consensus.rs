@@ -194,6 +194,10 @@ where
         // peer penalty routes the config through the running swarm.
         network_config.peer_config().score_config.validate()?;
 
+        // Reject kad cadences that would panic the network task or let stored records expire
+        // before replication or publication can refresh them.
+        network_config.libp2p_config().validate()?;
+
         let local_networks = committee
             .worker_ids()
             .map(|worker_id| (worker_id, LocalNetwork::new(key_config.primary_public_key())))
