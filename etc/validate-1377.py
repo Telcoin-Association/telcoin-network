@@ -28,6 +28,7 @@ FILES = [
     "crates/batch-builder/tests/it/build_batches.rs",
     "crates/batch-builder/README.md",
     "docs/peer-batch-deferral.md",
+    "docs/native-batch-slots.md",
     "crates/types/src/worker/batch_slots.rs",
     "crates/types/src/worker/mod.rs",
     "crates/types/src/worker/batch_slot_votes.rs",
@@ -254,8 +255,8 @@ try:
              "if bls_verify_secure(&self.signature, &self.authority, &bytes) {",
              "if bls_verify_secure(&self.signature, &self.authority, &bytes) || self.epoch == committee.epoch() {"),
             ("slot-execution-fence",
-             "slot.opening = SlotOpening::Pending(output);",
-             "slot.opening = SlotOpening::Ready(BatchSlotParent::new(output, B256::ZERO));"),
+             "slot.view = BatchSlotView::default();\n            slot.opening = SlotOpening::Pending(output);",
+             "slot.view = BatchSlotView::default();\n            slot.opening = SlotOpening::Ready(BatchSlotParent::new(output, B256::ZERO));"),
             ("slot-independent-buckets",
              "            Ok(BatchSlotTransition::Selected)\n",
              "            self.buckets.iter_mut().for_each(|other| other.sequence = sequence);\n"
@@ -263,12 +264,12 @@ try:
             ("slot-conflicting-vote",
              "() if self != next => Err(BatchSlotError::ConflictingVote),",
              "() if self != next => Ok(()),"),
-            ("slot-late-vote",
-             "position.view > authorization.position.view",
-             "position.view != authorization.position.view"),
+            ("slot-every-retry-producer",
+             "let ordinal = (u64::from(position.bucket.0) + position.sequence.0 % count) % count;",
+             "let ordinal = (u64::from(position.bucket.0) + position.sequence.0 % count + position.view.0 % count) % count;"),
             ("slot-unopened-view",
-             "() if position.view > authorization.position.view => Err(BatchSlotError::FutureView),",
-             "() if position.view > authorization.position.view && position.view.0 == u64::MAX => Err(BatchSlotError::FutureView),"),
+             "() if position.view != authorization.position.view => Err(BatchSlotError::FutureView),",
+             "() if position.view != authorization.position.view && position.view.0 == u64::MAX => Err(BatchSlotError::FutureView),"),
             ("slot-worker-capacity",
              "let count = u64::from(self.producer_count.get());",
              "let count = u64::from(self.bucket_count.get());"),
@@ -298,8 +299,12 @@ try:
         ]
         for label, before, after in storage_mutations:
             mutate(f"mutant-{label}", store_source, before, after, storage_command)
-        mutate("mutant-slot-unpublished-retry", "crates/types/src/worker/batch_slot_control.rs",
-               "self.previous.vote(record)?;", "record.authenticate(&self.previous)?;", storage_command)
+        mutate("mutant-slot-timeout-refresh", source,
+               "slot.view = next_view;\n                    slot.opening = SlotOpening::Pending(output);",
+               "slot.view = next_view;\n                    slot.opening = SlotOpening::Ready(position.parent);", execution_command)
+        mutate("mutant-slot-timeout-history", "crates/types/src/worker/batch_slot_control.rs",
+               "matches!(transition, BatchSlotTransition::Selected | BatchSlotTransition::ViewAdvanced)",
+               "matches!(transition, BatchSlotTransition::Selected)", execution_command)
         execution_source = "crates/engine/src/payload_builder.rs"
         mutate("mutant-slot-losing-execution", execution_source,
                "if transition == BatchSlotTransition::Selected {",
