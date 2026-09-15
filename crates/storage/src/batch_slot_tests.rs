@@ -36,9 +36,9 @@ fn canonical_envelopes_reject_unsigned_metadata() -> Result<(), BatchSlotVoteSto
 
 #[test]
 fn native_wire_budget_covers_vector_prefix_boundaries() -> Result<(), BatchSlotVoteStoreError> {
-    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
     let (slots, record, _) = conflicting_records()?;
     let bucket = slots.bucket(Address::ZERO);
+    let key = producer_key(&slots)?;
     let template = match record.message() {
         tn_types::BatchSlotMessage::Proposal { batch, .. } => {
             let mut template = batch.clone();
@@ -109,19 +109,20 @@ fn publication_rejects_an_unfinalized_execution_anchor() -> Result<(), BatchSlot
 
 #[test]
 fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchSlotVoteStoreError> {
-    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
     let (slots, original, _) = conflicting_records()?;
     let bucket = slots.bucket(Address::ZERO);
     let control = tn_types::BatchSlotControl::default();
-    drop(control.install(slots.clone(), Some(*key.public())));
+    drop(control.install(slots.clone(), Some(*original.authority())));
     let hash = B256::repeat_byte(9);
     let mut output = control.prepare(hash).ok_or(BatchSlotVoteStoreError::NotInitialized)?;
-    let timeout = slots
-        .sign_timeout(bucket, *key.public(), &key)
-        .map_err(BatchSlotVoteStoreError::Protocol)?;
-    output.apply(&timeout).map_err(BatchSlotVoteStoreError::Protocol)?;
-    let mut advanced = slots;
-    advanced.apply(&timeout, hash).map_err(BatchSlotVoteStoreError::Protocol)?;
+    let mut advanced = slots.clone();
+    fixture_keys().iter().take(3).try_for_each(|key| {
+        let timeout = slots
+            .sign_timeout(bucket, *key.public(), key)
+            .map_err(BatchSlotVoteStoreError::Protocol)?;
+        output.apply(&timeout).map_err(BatchSlotVoteStoreError::Protocol)?;
+        advanced.apply(&timeout, hash).map(|_| ()).map_err(BatchSlotVoteStoreError::Protocol)
+    })?;
     advanced
         .finalize_openings(hash, B256::repeat_byte(10))
         .map_err(BatchSlotVoteStoreError::Protocol)?;
@@ -130,6 +131,7 @@ fn output_cannot_select_a_retry_opened_inside_that_output() -> Result<(), BatchS
         tn_types::BatchSlotMessage::Timeout { .. } => Err(BatchSlotError::InvalidEnvelope),
     }
     .map_err(BatchSlotVoteStoreError::Protocol)?;
+    let key = producer_key(&advanced)?;
     let premature = advanced
         .sign_proposal(bucket, *key.public(), batch, &key)
         .map_err(BatchSlotVoteStoreError::Protocol)?;
@@ -243,12 +245,27 @@ async fn closed_sequence_demand_and_stale_timeouts_cannot_keep_idle_buckets_retr
     Ok(())
 }
 
+fn fixture_keys() -> [BlsKeypair; 4] {
+    [1377, 1378, 1379, 1380].map(|seed| BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)))
+}
+
+fn producer_key(slots: &BatchSlots) -> Result<BlsKeypair, BatchSlotVoteStoreError> {
+    let position =
+        slots.position(slots.bucket(Address::ZERO)).map_err(BatchSlotVoteStoreError::Protocol)?;
+    let producer = slots.producer(position).map_err(BatchSlotVoteStoreError::Protocol)?;
+    fixture_keys()
+        .into_iter()
+        .find(|key| key.public() == producer)
+        .ok_or(BatchSlotVoteStoreError::NotInitialized)
+}
+
 /// Two authenticated, conflicting proposals for one producer's initial slot.
 fn conflicting_records(
 ) -> Result<(BatchSlots, SignedBatchSlotRecord, SignedBatchSlotRecord), BatchSlotVoteStoreError> {
-    let key = BlsKeypair::generate(&mut StdRng::seed_from_u64(1377));
     let mut committee = CommitteeBuilder::new(7);
-    committee.add_authority(*key.public(), Address::ZERO);
+    fixture_keys().iter().for_each(|key| {
+        committee.add_authority(*key.public(), Address::ZERO);
+    });
     let slots = BatchSlots::new(
         2017.into(),
         committee.build(),
@@ -256,6 +273,7 @@ fn conflicting_records(
     )
     .map_err(BatchSlotVoteStoreError::Protocol)?;
     let bucket = slots.bucket(Address::ZERO);
+    let key = producer_key(&slots)?;
     let proposal = |byte| {
         slots
             .sign_proposal(
