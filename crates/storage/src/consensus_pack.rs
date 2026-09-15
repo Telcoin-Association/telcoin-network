@@ -397,14 +397,27 @@ impl ConsensusPack {
         epoch: Epoch,
         apply: bool,
     ) -> Result<EpochRepair, PackError> {
-        // Healthy check: a read-only open is side-effect free and proves data + indexes + seal
-        // agree.
-        if let Ok(pack) = Self::open_static(epochs_dir, epoch) {
-            pack.close().await;
+        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+        // Healthy requires BOTH a clean read-only open AND full validation. `open_static` proves
+        // the seal, cross-file lengths, final position entry, and the FIRST digest-index
+        // bucket's CRC — but it does NOT scan the other buckets or the data stream, so on
+        // its own it would call a corrupt non-first index bucket "healthy".
+        // `validate_pack_file` (the `db validate` engine) walks the whole data stream and
+        // every bucket CRC; requiring both closes that gap.
+        let opens_clean = match Self::open_static(epochs_dir, epoch) {
+            Ok(pack) => {
+                pack.close().await;
+                true
+            }
+            Err(_) => false,
+        };
+        let validates_clean = matches!(
+            crate::pack_validate::validate_pack_file(&data_file, epoch, None),
+            Ok(report) if report.verdict == crate::pack_validate::Verdict::Valid
+        );
+        if opens_clean && validates_clean {
             return Ok(EpochRepair::Healthy);
         }
-
-        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
         let corruption = crate::pack_validate::classify_physical_corruption(&data_file, epoch)?;
         let plan = match &corruption {
             // The data log is physically sound; open_static failed on the indexes / seal / a length
@@ -446,6 +459,25 @@ impl ConsensusPack {
             return Ok(EpochRepair::WouldRepair(plan));
         }
 
+        // Force a rebuild when `open_static` opened clean: a length-consistent corrupt digest
+        // bucket passes `files_consistent`, so the append open's `recover_pack` would
+        // early-return and leave it untouched. Remove the derived digest indexes so the
+        // open must rebuild them from the data-log WAL. The position index is kept so
+        // `recover_pack`'s `attested_end` (the torn-tail safety watermark) stays correct.
+        // After the `!apply` return above, so a dry run writes nothing. Every other
+        // repairable case has `open_static` already failing, so `recover_pack` runs on its
+        // own and the indexes are left in place.
+        if opens_clean {
+            let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
+            for name in [Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME] {
+                match std::fs::remove_dir_all(epoch_dir.join(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
         // Apply: the writable open runs recover_pack (truncate torn tail) + open_indexes_for_append
         // (rebuild indexes); persist + drop re-seals. If recover_pack finds mid-log corruption the
         // best-effort classifier missed, this surfaces as an error -> Unrepairable.
@@ -466,10 +498,17 @@ impl ConsensusPack {
                 )));
             }
         }
-        // Confirm the repaired pack now opens read-only cleanly, then async-close the sole handle
-        // so the background-thread join does not block a worker (matching the healthy-check
-        // above).
+        // Confirm the repaired pack now opens read-only cleanly AND fully validates (`open_static`
+        // alone would repeat the first-bucket blind spot). Async-close the sole handle so the
+        // background-thread join does not block a worker (matching the healthy check above).
         Self::open_static(epochs_dir, epoch)?.close().await;
+        let report = crate::pack_validate::validate_pack_file(&data_file, epoch, None)?;
+        if report.verdict != crate::pack_validate::Verdict::Valid {
+            return Ok(EpochRepair::Unrepairable(format!(
+                "epoch {epoch}: rebuilt the indexes but validation still reports damage; the data \
+                 itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+            )));
+        }
         Ok(EpochRepair::Repaired(plan))
     }
 
@@ -4659,6 +4698,80 @@ pub(crate) mod test {
             "broken index must repair, got {outcome:?}"
         );
         assert_pack_reads_back(&temp_dir, 5).await;
+    }
+
+    /// R4: `repair_epoch` must not declare a pack `Healthy` when a corrupt NON-first digest bucket
+    /// slips past `open_static` (which only CRC-checks the first bucket). The full validator
+    /// catches it, so repair must diagnose it, force a rebuild, and re-validate before
+    /// reporting `Repaired`. Uses the same corruption as
+    /// `test_validate_scans_index_bucket_crcs`.
+    #[tokio::test]
+    async fn test_repair_rebuilds_corrupt_nonfirst_bucket() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        // On-disk width of one hdx bucket (KSIZE=32); the final BUCKET_SIZE bytes of a clean-closed
+        // hdx are exactly the last (non-first) bucket.
+        const HDX_BUCKET: usize = 16 + (32 + 8) * 32;
+
+        let temp_dir = TempDir::with_prefix("test_repair_nonfirst_bucket").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
+
+        // Flip a payload byte in the LAST (non-first) bucket, leaving its stamped CRC -> a corrupt
+        // bucket that a first-bucket-only open cannot see.
+        {
+            let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
+            let n = bytes.len();
+            bytes[n - HDX_BUCKET + 12] ^= 0xFF;
+            std::fs::write(&hdx_path, &bytes).expect("write hdx");
+        }
+
+        // The bug context: open_static still succeeds, but full validation reports the corruption.
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
+            "a corrupt NON-first bucket must still pass the first-bucket-only read-only open"
+        );
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Invalid,
+            "the full validator must detect the corrupt bucket"
+        );
+
+        // Dry run must NOT say Healthy, and must not change anything.
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
+            .await
+            .expect("dry run must not err");
+        assert!(
+            matches!(dry, EpochRepair::WouldRepair(_)),
+            "a corrupt non-first bucket must be WouldRepair on a dry run, got {dry:?}"
+        );
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Invalid,
+            "dry run must leave the corruption in place"
+        );
+
+        // Apply: repair rebuilds the index and re-validates clean.
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("apply must not err");
+        assert!(
+            matches!(applied, EpochRepair::Repaired(_)),
+            "a corrupt non-first bucket must be Repaired on apply, got {applied:?}"
+        );
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Valid,
+            "after repair the pack must validate clean"
+        );
+        assert_pack_reads_back(&temp_dir, 3).await;
     }
 
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
