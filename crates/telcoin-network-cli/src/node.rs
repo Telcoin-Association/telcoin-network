@@ -73,9 +73,8 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(1..=200))]
     pub instance: Option<u16>,
 
-    /// Is this an observer node?  True if set, an observer will never be in the committee
-    /// but will follow consensus and provide node RPC access.
-    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
+    /// Deprecated and ignored. Node role is derived from committee membership.
+    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false, hide = true)]
     pub observer: bool,
 
     /// Export each epoch's final execution state to a snapshot pack under
@@ -154,6 +153,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig, &'static str) -> JoinHandle<eyre::Result<()>>,
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
+
+        if self.observer {
+            warn!(
+                target: "cli",
+                "--observer is deprecated and ignored (Telcoin-Association/telcoin-network#1355). \
+                 Node role is derived from committee membership. To take a validator out of \
+                 consensus, exit it on chain."
+            );
+        }
 
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives; several fork constants document this log
@@ -342,6 +350,21 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
+
+    /// Legacy observer commands still parse, but neither help view advertises the ignored flag.
+    #[test]
+    fn deprecated_observer_flag_parses_but_is_hidden() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        let default = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        let legacy = NodeCommand::<NoArgs>::try_parse_from(["node", "--observer"])?;
+        assert!(!default.observer);
+        assert!(legacy.observer);
+        let mut command = NodeCommand::<NoArgs>::command();
+        assert!(!command.render_help().to_string().contains("--observer"));
+        assert!(!command.render_long_help().to_string().contains("--observer"));
+        Ok(())
+    }
 
     /// The CLI accepts the same multi-worker map as network-config, in YAML or JSON form.
     #[test]
