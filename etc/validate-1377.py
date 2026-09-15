@@ -30,6 +30,7 @@ FILES = [
     "crates/batch-builder/README.md",
     "docs/peer-batch-deferral.md",
     "docs/native-batch-slots.md",
+    "crates/types/Cargo.toml",
     "crates/types/src/worker/batch_slots.rs",
     "crates/types/src/worker/mod.rs",
     "crates/types/src/worker/batch_slot_votes.rs",
