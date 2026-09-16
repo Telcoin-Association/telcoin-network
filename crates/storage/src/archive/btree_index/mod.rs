@@ -2,7 +2,8 @@
 //! sorted point lookup plus range/prefix/forward/reverse iteration.  It complements the hash-based
 //! [`digest_index`](crate::archive::digest_index), which offers point lookups only.
 //!
-//! Keys are fixed `KSIZE`-byte byte strings compared lexicographically; values are `u64` byte
+//! Keys are fixed `ksize`-byte byte strings (the key length is chosen at creation and stored in
+//! the header) compared lexicographically; values are `u64` byte
 //! offsets into a pack file.  The tree is a B+tree with doubly-linked leaves, stored in fixed
 //! 4 KiB pages (each protected by a trailing CRC32) in a single `index.btx` file.  See
 //! [`index::BtreeIndex`].

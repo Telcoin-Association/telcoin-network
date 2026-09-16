@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+//! Pack-file-backed `Database` implementation keyed by the sorted B+tree index (work in progress).
+
 pub mod database;
 
 pub use database::TnDatabase;

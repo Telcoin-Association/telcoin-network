@@ -189,7 +189,7 @@ impl PackBtreeKv {
         let data =
             Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
                 .expect("open pack data");
-        let index = BtreeIndex::open_btx_file(dir.join("btx"), data.header(), false)
+        let index = BtreeIndex::open_btx_file(dir.join("btx"), data.header(), 32, false)
             .expect("open btree index");
         Self { data, index }
     }

@@ -60,33 +60,41 @@ pub struct PageCrcReport {
     pub corrupt: u64,
 }
 
-/// A paged, mmap-backed on-disk B+tree "sortable index" over `KSIZE`-byte keys → `u64` file
-/// positions.
+/// A paged, mmap-backed on-disk B+tree "sortable index" over fixed `ksize`-byte keys → `u64` file
+/// positions.  The key length is chosen at creation and recorded in the header (see
+/// [`BtreeIndex::open_btx_file`]); keys are ordered lexicographically.
 ///
-/// Implements [`Index`] over `[u8; KSIZE]` (plus, for `KSIZE == 32`, `B256` adapters). Keys are
-/// ordered lexicographically.
+/// The primary API takes byte-slice keys (`&[u8]`); a fixed [`Index`] over `[u8; 32]` plus `B256`
+/// digest adapters are provided for the common 32-byte case.
 #[derive(Debug)]
-pub struct BtreeIndex<const KSIZE: usize = 32> {
+pub struct BtreeIndex {
     header: BtreeHeader,
     file: MmapDataFile,
+    /// Page geometry derived from the header's key size.
+    node: Node,
     read_only: bool,
     synced: bool,
     _index_dir: PathBuf,
 }
 
-impl<const KSIZE: usize> BtreeIndex<KSIZE> {
+impl BtreeIndex {
     /// Open (or create) a B+tree index in directory `dir` (file `index.btx`).
     ///
-    /// Identity (`version`/`uid`/`appnum`) and geometry (`page_size`/`ksize`/`value_size`) are
-    /// stamped from `data_header` on create and validated on reopen.  A fresh index starts as a
-    /// single empty leaf.
+    /// `ksize` is the key length in bytes.  Identity (`version`/`uid`/`appnum`) and geometry
+    /// (`page_size`/`ksize`/`value_size`) are stamped from `data_header` and `ksize` on create and
+    /// validated against them on reopen.  A fresh index starts as a single empty leaf.
     pub fn open_btx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
+        ksize: u16,
         read_only: bool,
-    ) -> Result<BtreeIndex<KSIZE>, LoadHeaderError> {
-        // Force the compile-time page/key feasibility check for this KSIZE.
-        let () = Node::<KSIZE>::GEOMETRY_OK;
+    ) -> Result<BtreeIndex, LoadHeaderError> {
+        // Build the page geometry for this key size and check it fits a page (was a compile-time
+        // assert on the const generic).  Do this before touching the filesystem.
+        let node = Node::new(ksize as usize);
+        if !node.geometry_ok() {
+            return Err(LoadHeaderError::InvalidIndexGeometry);
+        }
 
         let dir = dir.as_ref();
         let dir_created = fs::create_dir(dir).is_ok();
@@ -108,7 +116,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
-            let header = BtreeHeader::new(data_header, KSIZE as u16);
+            let header = BtreeHeader::new(data_header, ksize);
             file.ensure_len(2 * PAGE_SIZE as u64)?;
             // Page 0: header (valid CRC — it is the commit marker).
             let page = header.to_page();
@@ -120,7 +128,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
                 let leaf = file
                     .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
                     .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
-                Node::<KSIZE>::init_leaf(leaf, NULL_PAGE, NULL_PAGE);
+                node.init_leaf(leaf, NULL_PAGE, NULL_PAGE);
                 add_crc32(leaf);
             }
             file.sync_all()?; // msync the fresh empty tree
@@ -143,7 +151,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
             // The on-disk page/key/value geometry must match this binary's compile-time layout,
             // or every offset computation would be wrong.  Reject like the identity fields.
             if header.page_size != PAGE_SIZE as u32
-                || header.ksize != KSIZE as u16
+                || header.ksize != ksize
                 || header.value_size != VALUE_SIZE
             {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
@@ -160,7 +168,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
             header
         };
 
-        Ok(Self { header, file, read_only, synced: true, _index_dir: dir.to_owned() })
+        Ok(Self { header, file, node, read_only, synced: true, _index_dir: dir.to_owned() })
     }
 
     /// Number of keys stored in this index.
@@ -176,6 +184,11 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     /// Current height of the tree (1 = a single leaf).
     pub fn height(&self) -> u32 {
         self.header.height
+    }
+
+    /// The key length in bytes this index was created with.
+    pub fn ksize(&self) -> usize {
+        self.node.ksize()
     }
 
     /// Set the tracked length of the paired pack file (used by pack wrappers for crash repair);
@@ -216,16 +229,17 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     /// wrapper can recover a corrupt index (see [`Self::page_crc_scan`]) by re-scanning the pack
     /// and feeding `(key, position)` pairs here. The index must be writable; call
     /// [`Index::sync`] afterwards to make the rebuild durable.
-    pub fn rebuild_from<I>(&mut self, entries: I) -> Result<(), AppendError>
+    pub fn rebuild_from<K, I>(&mut self, entries: I) -> Result<(), AppendError>
     where
-        I: IntoIterator<Item = ([u8; KSIZE], u64)>,
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = (K, u64)>,
     {
         if self.read_only {
             return Err(AppendError::ReadOnly);
         }
         self.reset_empty()?;
         for (k, v) in entries {
-            self.insert_kv(&k, v)?;
+            self.insert_kv(k.as_ref(), v)?;
         }
         Ok(())
     }
@@ -251,7 +265,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
                 .file
                 .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
                 .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
-            Node::<KSIZE>::init_leaf(leaf, NULL_PAGE, NULL_PAGE);
+            self.node.init_leaf(leaf, NULL_PAGE, NULL_PAGE);
             add_crc32(leaf);
         }
         self.file.sync_all()?;
@@ -298,6 +312,11 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         self.header.last_leaf
     }
 
+    /// The page geometry (a small `Copy` value) for the iterators to decode leaves with.
+    pub(super) fn node(&self) -> Node {
+        self.node
+    }
+
     /// Return an owned copy of page `p` for iteration (one copy per leaf hop).
     pub(super) fn fetch_page(&mut self, p: u32) -> Result<Vec<u8>, FetchError> {
         Ok(self.page(p)?.to_vec())
@@ -305,14 +324,15 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
 
     /// Descend to the leaf page that would contain `key`.
     pub(super) fn find_leaf(&mut self, key: &[u8]) -> Result<u32, FetchError> {
+        let node = self.node;
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
             let buf = self.page(pno)?;
-            if Node::<KSIZE>::is_leaf(buf) {
+            if node.is_leaf(buf) {
                 return Ok(pno);
             }
-            let ci = Node::<KSIZE>::internal_child_index(buf, key);
-            pno = Node::<KSIZE>::internal_child(buf, ci);
+            let ci = node.internal_child_index(buf, key);
+            pno = node.internal_child(buf, ci);
         }
         Err(FetchError::CrcFailed)
     }
@@ -320,17 +340,18 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     // ---- lookup ----
 
     fn get_value(&self, key: &[u8]) -> Result<u64, FetchError> {
+        let node = self.node;
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
             let buf = self.page(pno)?;
-            if Node::<KSIZE>::is_leaf(buf) {
-                return match Node::<KSIZE>::leaf_search(buf, key) {
-                    Ok(i) => Ok(Node::<KSIZE>::leaf_value(buf, i)),
+            if node.is_leaf(buf) {
+                return match node.leaf_search(buf, key) {
+                    Ok(i) => Ok(node.leaf_value(buf, i)),
                     Err(_) => Err(FetchError::NotFound),
                 };
             }
-            let ci = Node::<KSIZE>::internal_child_index(buf, key);
-            pno = Node::<KSIZE>::internal_child(buf, ci);
+            let ci = node.internal_child_index(buf, key);
+            pno = node.internal_child(buf, ci);
         }
         Err(FetchError::CrcFailed)
     }
@@ -338,18 +359,19 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     // ---- insertion (all in place on the mapping) ----
 
     fn insert_kv(&mut self, key: &[u8], val: u64) -> Result<(), AppendError> {
+        let node = self.node;
         // Descend to the target leaf, recording the (page, child_index) path for split propagation.
         let mut path: Vec<(u32, usize)> = Vec::new();
         let mut pno = self.header.root_page;
         let mut leaf_no = None;
         for _ in 0..MAX_DEPTH {
             let buf = self.page(pno).map_err(fetch_to_append)?;
-            if Node::<KSIZE>::is_leaf(buf) {
+            if node.is_leaf(buf) {
                 leaf_no = Some(pno);
                 break;
             }
-            let ci = Node::<KSIZE>::internal_child_index(buf, key);
-            let child = Node::<KSIZE>::internal_child(buf, ci);
+            let ci = node.internal_child_index(buf, key);
+            let child = node.internal_child(buf, ci);
             path.push((pno, ci));
             pno = child;
         }
@@ -366,21 +388,20 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         key: &[u8],
         val: u64,
     ) -> Result<(), AppendError> {
+        let node = self.node;
         // Decide the action from a read-only view of the leaf.
         let (found, at, full) = {
             let buf = self.page(leaf_no).map_err(fetch_to_append)?;
-            match Node::<KSIZE>::leaf_search(buf, key) {
+            match node.leaf_search(buf, key) {
                 Ok(i) => (Some(i), 0usize, false),
-                Err(at) => {
-                    (None, at, Node::<KSIZE>::entry_count(buf) >= Node::<KSIZE>::MAX_LEAF_KEYS)
-                }
+                Err(at) => (None, at, node.entry_count(buf) >= node.max_leaf_keys()),
             }
         };
         if let Some(i) = found {
             // Duplicate key: overwrite the value in place; tree shape and count unchanged.
             {
                 let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
-                Node::<KSIZE>::set_leaf_value(buf, i, val);
+                node.set_leaf_value(buf, i, val);
                 zero_crc(buf);
             }
             self.synced = false;
@@ -389,7 +410,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         if !full {
             {
                 let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
-                Node::<KSIZE>::leaf_insert(buf, at, key, val);
+                node.leaf_insert(buf, at, key, val);
                 zero_crc(buf);
             }
             self.synced = false;
@@ -409,10 +430,11 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         key: &[u8],
         val: u64,
     ) -> Result<(), AppendError> {
+        let node = self.node;
         // Read the old successor before mutating, then allocate the right sibling (may remap).
         let old_next = {
             let l = self.page(leaf_no).map_err(fetch_to_append)?;
-            Node::<KSIZE>::leaf_next(l)
+            node.leaf_next(l)
         };
         let right_no = self.allocate_page()?;
 
@@ -420,13 +442,13 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         let mut rbuf = vec![0_u8; PAGE_SIZE];
         let sep = {
             let left = self.page_mut(leaf_no).map_err(fetch_to_append)?;
-            let sep = Node::<KSIZE>::leaf_split(left, &mut rbuf, at, key, val);
-            Node::<KSIZE>::set_leaf_next(left, right_no);
+            let sep = node.leaf_split(left, &mut rbuf, at, key, val);
+            node.set_leaf_next(left, right_no);
             zero_crc(left);
             sep
         };
-        Node::<KSIZE>::set_leaf_prev(&mut rbuf, leaf_no);
-        Node::<KSIZE>::set_leaf_next(&mut rbuf, old_next);
+        node.set_leaf_prev(&mut rbuf, leaf_no);
+        node.set_leaf_next(&mut rbuf, old_next);
         zero_crc(&mut rbuf);
         {
             let r = self.page_mut(right_no).map_err(fetch_to_append)?;
@@ -435,7 +457,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         // Relink the old successor's back-pointer, or record the new rightmost leaf.
         if old_next != NULL_PAGE {
             let nb = self.page_mut(old_next).map_err(fetch_to_append)?;
-            Node::<KSIZE>::set_leaf_prev(nb, right_no);
+            node.set_leaf_prev(nb, right_no);
             zero_crc(nb);
         } else {
             self.header.last_leaf = right_no;
@@ -449,20 +471,21 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     fn insert_into_parent(
         &mut self,
         mut path: Vec<(u32, usize)>,
-        sep: [u8; KSIZE],
+        sep: Vec<u8>,
         right_no: u32,
     ) -> Result<(), AppendError> {
+        let node = self.node;
         let mut sep = sep;
         let mut right_no = right_no;
         while let Some((pno, ci)) = path.pop() {
             let has_room = {
                 let buf = self.page(pno).map_err(fetch_to_append)?;
-                Node::<KSIZE>::entry_count(buf) < Node::<KSIZE>::MAX_INTERNAL_KEYS
+                node.entry_count(buf) < node.max_internal_keys()
             };
             if has_room {
                 {
                     let buf = self.page_mut(pno).map_err(fetch_to_append)?;
-                    Node::<KSIZE>::internal_insert(buf, ci, &sep, right_no);
+                    node.internal_insert(buf, ci, &sep, right_no);
                     zero_crc(buf);
                 }
                 self.synced = false;
@@ -474,7 +497,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
             let mut qbuf = vec![0_u8; PAGE_SIZE];
             let median = {
                 let p = self.page_mut(pno).map_err(fetch_to_append)?;
-                let median = Node::<KSIZE>::internal_split(p, &mut qbuf, ci, &sep, right_no);
+                let median = node.internal_split(p, &mut qbuf, ci, &sep, right_no);
                 zero_crc(p);
                 median
             };
@@ -491,8 +514,8 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         let old_root = self.header.root_page;
         {
             let r = self.page_mut(new_root_no).map_err(fetch_to_append)?;
-            Node::<KSIZE>::init_internal(r, old_root);
-            Node::<KSIZE>::internal_insert(r, 0, &sep, right_no);
+            node.init_internal(r, old_root);
+            node.internal_insert(r, 0, &sep, right_no);
             zero_crc(r);
         }
         self.header.root_page = new_root_no;
@@ -504,15 +527,16 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     // ---- removal ----
 
     fn remove_kv(&mut self, key: &[u8]) -> Result<bool, AppendError> {
+        let node = self.node;
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
             let buf = self.page(pno).map_err(fetch_to_append)?;
-            if Node::<KSIZE>::is_leaf(buf) {
-                match Node::<KSIZE>::leaf_search(buf, key) {
+            if node.is_leaf(buf) {
+                match node.leaf_search(buf, key) {
                     Err(_) => return Ok(false),
                     Ok(i) => {
                         let buf = self.page_mut(pno).map_err(fetch_to_append)?;
-                        Node::<KSIZE>::leaf_delete(buf, i);
+                        node.leaf_delete(buf, i);
                         zero_crc(buf);
                         self.header.values -= 1;
                         self.synced = false;
@@ -520,19 +544,66 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
                     }
                 }
             }
-            let ci = Node::<KSIZE>::internal_child_index(buf, key);
-            pno = Node::<KSIZE>::internal_child(buf, ci);
+            let ci = node.internal_child_index(buf, key);
+            pno = node.internal_child(buf, ci);
         }
         Err(AppendError::SerializeValue("btree descent exceeded max depth".to_string()))
     }
 
     /// Remove `key` from the index. Returns `true` if the key was present and removed, `false` if
     /// not found. No node merging is performed — underflowing leaves are left sparse.
-    pub fn remove(&mut self, key: [u8; KSIZE]) -> Result<bool, AppendError> {
+    pub fn remove(&mut self, key: &[u8]) -> Result<bool, AppendError> {
         if self.read_only {
             return Err(AppendError::ReadOnly);
         }
-        self.remove_kv(&key)
+        debug_assert_eq!(
+            key.len(),
+            self.node.ksize(),
+            "key wrong size, expected {}, got {}",
+            self.node.ksize(),
+            key.len()
+        );
+        self.remove_kv(key)
+    }
+
+    // ---- point API (byte-slice keys; the index's key length is `ksize()`) ----
+
+    /// Save the file position `record_pos` for `key` (inserting or overwriting).
+    pub fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        debug_assert_eq!(
+            key.len(),
+            self.node.ksize(),
+            "key wrong size, expected {}, got {}",
+            self.node.ksize(),
+            key.len()
+        );
+        self.synced = false;
+        self.insert_kv(key, record_pos)
+    }
+
+    /// Load the file position for `key`, or [`FetchError::NotFound`].
+    pub fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+        debug_assert_eq!(
+            key.len(),
+            self.node.ksize(),
+            "key wrong size, expected {}, got {}",
+            self.node.ksize(),
+            key.len()
+        );
+        self.get_value(key)
+    }
+
+    /// True if the index contains `key`.
+    pub fn contains(&mut self, key: &[u8]) -> bool {
+        self.load(key).is_ok()
+    }
+
+    /// Flush and sync all index data to disk (see the lazy-CRC, header-last commit regime).
+    pub fn sync(&mut self) -> Result<(), CommitError> {
+        self.sync_impl()
     }
 
     // ---- durability (lazy CRC + msync, header-last commit) ----
@@ -574,48 +645,46 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     }
 }
 
-impl<const KSIZE: usize> Index<[u8; KSIZE], u64> for BtreeIndex<KSIZE> {
-    fn save(&mut self, key: [u8; KSIZE], record_pos: u64) -> Result<(), AppendError> {
-        if self.read_only {
-            return Err(AppendError::ReadOnly);
-        }
-        self.synced = false;
-        self.insert_kv(&key, record_pos)
+/// A fixed `[u8; 32]` [`Index`] impl so the generic point-index bench harness (and any other
+/// `Index<K, u64>` consumer) can drive a 32-byte-key B+tree; it forwards to the inherent byte-slice
+/// API.  It is only reachable through a generic `Index` bound — on a concrete `BtreeIndex`,
+/// `save`/`load`/`sync` resolve to the inherent methods (inherent-method priority).
+impl Index<[u8; 32], u64> for BtreeIndex {
+    fn save(&mut self, key: [u8; 32], record_pos: u64) -> Result<(), AppendError> {
+        self.save(&key, record_pos)
     }
 
-    fn load(&mut self, key: [u8; KSIZE]) -> Result<u64, FetchError> {
-        self.get_value(&key)
+    fn load(&mut self, key: [u8; 32]) -> Result<u64, FetchError> {
+        self.load(&key)
     }
 
     fn sync(&mut self) -> Result<(), CommitError> {
-        self.sync_impl()
+        self.sync()
     }
 }
 
 /// Convenience adapters so 32-byte digests ([`B256`]) can be used as keys without manual
 /// conversion, matching how [`HdxIndex`](crate::archive::digest_index::index::HdxIndex) is called.
-///
-/// These are inherent methods rather than a second `Index<B256, u64>` impl: a second `Index` impl
-/// would make argument-less trait methods (`sync`, and `contains` by inference) ambiguous at the
-/// call site.  `B256` is a newtype over `[u8; 32]`, so these just forward to the byte-array impl.
-impl BtreeIndex<32> {
-    /// Save a `B256` digest → file position mapping (see [`Index::save`]).
+/// `B256` is a newtype over `[u8; 32]`, so these forward to the byte-slice API (valid on a 32-byte
+/// index; otherwise the length guard trips).
+impl BtreeIndex {
+    /// Save a `B256` digest → file position mapping (see [`BtreeIndex::save`]).
     pub fn save_digest(&mut self, key: B256, record_pos: u64) -> Result<(), AppendError> {
-        self.save(key.0, record_pos)
+        self.save(&key.0, record_pos)
     }
 
-    /// Load the file position for a `B256` digest (see [`Index::load`]).
+    /// Load the file position for a `B256` digest (see [`BtreeIndex::load`]).
     pub fn load_digest(&mut self, key: B256) -> Result<u64, FetchError> {
-        self.load(key.0)
+        self.load(&key.0)
     }
 
     /// Remove a `B256` digest key (see [`BtreeIndex::remove`]).
     pub fn remove_digest(&mut self, key: B256) -> Result<bool, AppendError> {
-        self.remove(key.0)
+        self.remove(&key.0)
     }
 }
 
-impl<const KSIZE: usize> Drop for BtreeIndex<KSIZE> {
+impl Drop for BtreeIndex {
     fn drop(&mut self) {
         if !self.read_only && !self.synced {
             if !std::thread::panicking() {
@@ -657,16 +726,16 @@ mod tests {
         // Empty tree: nothing found.
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
             assert!(idx.is_empty());
-            assert!(matches!(idx.load(key_of(0)), Err(FetchError::NotFound)));
+            assert!(matches!(idx.load(&key_of(0)), Err(FetchError::NotFound)));
             // A handful of keys, then sync.
             for i in 0..500 {
-                idx.save(key_of(i), i).expect("save");
+                idx.save(&key_of(i), i).expect("save");
             }
             assert_eq!(idx.len(), 500);
             for i in 0..500 {
-                assert_eq!(idx.load(key_of(i)).expect("load"), i);
+                assert_eq!(idx.load(&key_of(i)).expect("load"), i);
             }
             idx.sync().expect("sync");
         }
@@ -674,10 +743,10 @@ mod tests {
         // Reopen read-write, verify, add more.
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
             assert_eq!(idx.len(), 500);
             for i in 0..500 {
-                assert_eq!(idx.load(key_of(i)).expect("load"), i);
+                assert_eq!(idx.load(&key_of(i)).expect("load"), i);
             }
             // Exercise the B256 write adapter on the way in.
             for i in 500..800 {
@@ -689,14 +758,14 @@ mod tests {
         // Reopen read-only, verify all, and confirm write/sync are rejected.
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
             assert_eq!(idx.len(), 800);
             for i in 0..800 {
-                assert_eq!(idx.load(key_of(i)).expect("load"), i);
+                assert_eq!(idx.load(&key_of(i)).expect("load"), i);
             }
             // B256 read adapter resolves to the same entry.
             assert_eq!(idx.load_digest(B256::from(key_of(7))).expect("load_digest"), 7);
-            assert!(matches!(idx.save(key_of(0), 0), Err(AppendError::ReadOnly)));
+            assert!(matches!(idx.save(&key_of(0), 0), Err(AppendError::ReadOnly)));
             assert!(matches!(idx.sync(), Err(CommitError::ReadOnly)));
         }
     }
@@ -708,20 +777,20 @@ mod tests {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
 
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
         for i in 0..1_000_000u64 {
-            idx.save(key_of(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
+            idx.save(&key_of(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
         }
         assert_eq!(idx.len(), 1_000_000);
         // A million random-ish keys must have grown the tree past a single leaf.
         assert!(idx.height() >= 3, "expected a multi-level tree, got height {}", idx.height());
         for i in 0..1_000_000u64 {
-            assert_eq!(idx.load(key_of(i)).unwrap_or_else(|e| panic!("load {i}: {e}")), i);
+            assert_eq!(idx.load(&key_of(i)).unwrap_or_else(|e| panic!("load {i}: {e}")), i);
         }
 
         // Duplicate key overwrites the value; count is unchanged.
-        idx.save(key_of(42), 999_999_999).expect("overwrite");
-        assert_eq!(idx.load(key_of(42)).expect("load dup"), 999_999_999);
+        idx.save(&key_of(42), 999_999_999).expect("overwrite");
+        assert_eq!(idx.load(&key_of(42)).expect("load dup"), 999_999_999);
         assert_eq!(idx.len(), 1_000_000);
         idx.sync().expect("sync");
         // A fully synced tree has no dirty or corrupt pages.
@@ -730,11 +799,11 @@ mod tests {
 
         // Reopen read-only and re-verify persistence across the split-heavy tree.
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
         assert_eq!(idx.len(), 1_000_000);
         for i in (0..1_000_000u64).step_by(7) {
             let expect = if i == 42 { 999_999_999 } else { i };
-            assert_eq!(idx.load(key_of(i)).expect("load"), expect, "mismatch at {i}");
+            assert_eq!(idx.load(&key_of(i)).expect("load"), expect, "mismatch at {i}");
         }
     }
 
@@ -746,13 +815,13 @@ mod tests {
 
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
-            idx.save(key_of(1), 1).expect("save");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            idx.save(&key_of(1), 1).expect("save");
             idx.sync().expect("sync");
         }
 
         // Reopen with a different key size (16) -> geometry mismatch.
-        let res = BtreeIndex::<16>::open_btx_file(&dir, &data_header, false);
+        let res = BtreeIndex::open_btx_file(&dir, &data_header, 16, false);
         assert!(
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
@@ -766,13 +835,13 @@ mod tests {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
-            idx.save(key_of(1), 1).expect("save");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            idx.save(&key_of(1), 1).expect("save");
             idx.sync().expect("sync");
         }
         // A DataHeader built from a different uid_idx must be rejected.
         let other = DataHeader::new(7, PackCompression::ZStd, 0);
-        let res = BtreeIndex::<32>::open_btx_file(&dir, &other, true);
+        let res = BtreeIndex::open_btx_file(&dir, &other, 32, true);
         assert!(
             matches!(res, Err(LoadHeaderError::InvalidIndexUID)),
             "expected InvalidIndexUID, got {res:?}"
@@ -789,9 +858,9 @@ mod tests {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
             for i in 0..2_000 {
-                idx.save(key_of(i), i).expect("save");
+                idx.save(&key_of(i), i).expect("save");
             }
             idx.sync().expect("sync");
         }
@@ -814,9 +883,9 @@ mod tests {
         // A writable reopen normalizes the file back to exactly the committed pages; keys read
         // back.
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
         for i in 0..2_000 {
-            assert_eq!(idx.load(key_of(i)).expect("load"), i);
+            assert_eq!(idx.load(&key_of(i)).expect("load"), i);
         }
         idx.sync().expect("sync");
         drop(idx);
@@ -834,9 +903,9 @@ mod tests {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
 
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
         for i in 0..1_000 {
-            idx.save(key_of(i), i).expect("save");
+            idx.save(&key_of(i), i).expect("save");
         }
         idx.sync().expect("sync");
 
@@ -845,14 +914,14 @@ mod tests {
         idx.rebuild_from(entries.iter().copied()).expect("rebuild");
         idx.sync().expect("sync");
         assert_eq!(idx.len(), 500);
-        assert!(matches!(idx.load(key_of(0)), Err(FetchError::NotFound)), "old keys gone");
+        assert!(matches!(idx.load(&key_of(0)), Err(FetchError::NotFound)), "old keys gone");
         for i in 2_000..2_500 {
-            assert_eq!(idx.load(key_of(i)).expect("load"), i);
+            assert_eq!(idx.load(&key_of(i)).expect("load"), i);
         }
         // Rebuild is rejected on a read-only index.
         drop(idx);
         let mut ro: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
         assert_eq!(ro.len(), 500);
         assert!(matches!(ro.rebuild_from(entries.iter().copied()), Err(AppendError::ReadOnly)));
     }
@@ -864,24 +933,24 @@ mod tests {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
 
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
         for i in 0..100u64 {
-            idx.save(key_of(i), i).expect("save");
+            idx.save(&key_of(i), i).expect("save");
         }
         assert_eq!(idx.len(), 100);
 
         // Remove an existing key.
-        assert!(idx.remove(key_of(42)).expect("remove"), "expected true for present key");
+        assert!(idx.remove(&key_of(42)).expect("remove"), "expected true for present key");
         assert_eq!(idx.len(), 99);
-        assert!(matches!(idx.load(key_of(42)), Err(FetchError::NotFound)), "42 should be gone");
+        assert!(matches!(idx.load(&key_of(42)), Err(FetchError::NotFound)), "42 should be gone");
 
         // Remove again: not found.
-        assert!(!idx.remove(key_of(42)).expect("remove again"), "expected false for absent key");
+        assert!(!idx.remove(&key_of(42)).expect("remove again"), "expected false for absent key");
         assert_eq!(idx.len(), 99);
 
         // Remove a key that was never inserted.
         assert!(
-            !idx.remove(key_of(999)).expect("remove missing"),
+            !idx.remove(&key_of(999)).expect("remove missing"),
             "expected false for never-inserted key"
         );
 
@@ -890,20 +959,20 @@ mod tests {
             if i == 42 {
                 continue;
             }
-            assert_eq!(idx.load(key_of(i)).expect("load"), i);
+            assert_eq!(idx.load(&key_of(i)).expect("load"), i);
         }
 
         // Remove on read-only index is rejected.
         idx.sync().expect("sync");
         drop(idx);
         let mut ro: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
-        assert!(matches!(ro.remove(key_of(0)), Err(AppendError::ReadOnly)));
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
+        assert!(matches!(ro.remove(&key_of(0)), Err(AppendError::ReadOnly)));
 
         // remove_digest adapter.
         drop(ro);
         let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
         assert!(idx.remove_digest(B256::from(key_of(7))).expect("remove_digest"));
         assert_eq!(idx.len(), 98);
     }
@@ -921,9 +990,9 @@ mod tests {
         // Insert without syncing: modified pages carry the zero-CRC dirty marker.
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
             for (k, v) in &all {
-                idx.save(*k, *v).expect("save");
+                idx.save(k, *v).expect("save");
             }
             let before = idx.page_crc_scan();
             assert!(before.dirty > 0, "unsynced writes should leave dirty pages, got {before:?}");
@@ -949,7 +1018,7 @@ mod tests {
         // Reads no longer verify a per-op CRC, but the off-path scan detects the corruption.
         {
             let idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
             let rep = idx.page_crc_scan();
             assert!(rep.corrupt > 0, "corrupted page must be flagged by the scan, got {rep:?}");
         }
@@ -957,13 +1026,57 @@ mod tests {
         // Rebuilding from the (pack-derived) entries recovers a fully readable, clean index.
         {
             let mut idx: BtreeIndex =
-                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
             idx.rebuild_from(all.iter().copied()).expect("rebuild");
             idx.sync().expect("sync");
             for (k, v) in &all {
-                assert_eq!(idx.load(*k).expect("load"), *v);
+                assert_eq!(idx.load(k).expect("load"), *v);
             }
             assert_eq!(idx.page_crc_scan(), PageCrcReport::default(), "rebuilt index is clean");
         }
+    }
+
+    #[test]
+    fn test_archive_btx_custom_ksize() {
+        let tmp = TempDir::with_prefix("test_archive_btx_ksize16").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+
+        // 16-byte big-endian keys; 2_000 entries force splits (170 keys/leaf at ksize=16).
+        let key = |i: u64| -> [u8; 16] {
+            let mut k = [0_u8; 16];
+            k[8..16].copy_from_slice(&i.to_be_bytes());
+            k
+        };
+
+        {
+            let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 16, false).expect("open");
+            assert_eq!(idx.ksize(), 16);
+            for i in 0..2_000u64 {
+                idx.save(&key(i), i).expect("save");
+            }
+            assert_eq!(idx.len(), 2_000);
+            assert!(idx.height() >= 2, "expected splits, got height {}", idx.height());
+            idx.sync().expect("sync");
+        }
+
+        // Reopen read-only with the same key size: values persist and iterate in sorted order.
+        let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 16, true).expect("reopen ro");
+        assert_eq!(idx.ksize(), 16);
+        for i in 0..2_000u64 {
+            assert_eq!(idx.load(&key(i)).expect("load"), i);
+        }
+        let keys: Vec<u64> = idx
+            .iter()
+            .expect("iter")
+            .map(|r| u64::from_be_bytes(r.expect("item").0[8..16].try_into().unwrap()))
+            .collect();
+        assert_eq!(keys, (0..2_000u64).collect::<Vec<_>>());
+
+        // Opening the same file as 32-byte keys is a geometry mismatch.
+        assert!(matches!(
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true),
+            Err(LoadHeaderError::InvalidIndexGeometry)
+        ));
     }
 }

@@ -1,9 +1,9 @@
 //! Sorted iteration over a [`BtreeIndex`]: forward, reverse, bounded ranges, and key prefixes.
 //!
 //! All iterators walk the doubly-linked leaf chain, so once positioned they advance one leaf at a
-//! time with no re-descent.  Each step yields `Result<([u8; KSIZE], u64), FetchError>` and streams
-//! (holding `&mut BtreeIndex` to fetch successive leaves); a fetch/CRC failure is surfaced as a
-//! terminal `Err`.
+//! time with no re-descent.  Each step yields `Result<(Vec<u8>, u64), FetchError>` (the key is a
+//! fresh `ksize`-byte `Vec`) and streams (holding `&mut BtreeIndex` to fetch successive leaves); a
+//! fetch/CRC failure is surfaced as a terminal `Err`.
 
 use std::ops::{Bound, RangeBounds};
 
@@ -23,8 +23,10 @@ const NEED_PREV: usize = usize::MAX;
 /// Created by [`BtreeIndex::iter`], [`BtreeIndex::rev_iter`], [`BtreeIndex::range`],
 /// [`BtreeIndex::rev_range`], and [`BtreeIndex::prefix`].
 #[derive(Debug)]
-pub struct BtreeIter<'a, const KSIZE: usize> {
-    index: &'a mut BtreeIndex<KSIZE>,
+pub struct BtreeIter<'a> {
+    index: &'a mut BtreeIndex,
+    /// Page geometry (key size) copied from the index, to decode leaf buffers.
+    node: Node,
     /// Owned copy of the current leaf page (empty until initialized).
     buf: Vec<u8>,
     /// Current leaf page number, or [`NULL_PAGE`] when exhausted.
@@ -33,20 +35,21 @@ pub struct BtreeIter<'a, const KSIZE: usize> {
     pos: usize,
     reverse: bool,
     /// Inclusive/exclusive lower bound (the stop bound in reverse, start bound in forward).
-    lower: Bound<[u8; KSIZE]>,
+    lower: Bound<Vec<u8>>,
     /// Inclusive/exclusive upper bound (the stop bound in forward, start bound in reverse).
-    upper: Bound<[u8; KSIZE]>,
+    upper: Bound<Vec<u8>>,
 }
 
-impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
+impl<'a> BtreeIter<'a> {
     fn new(
-        index: &'a mut BtreeIndex<KSIZE>,
+        index: &'a mut BtreeIndex,
         reverse: bool,
-        lower: Bound<[u8; KSIZE]>,
-        upper: Bound<[u8; KSIZE]>,
+        lower: Bound<Vec<u8>>,
+        upper: Bound<Vec<u8>>,
     ) -> Result<Self, FetchError> {
+        let node = index.node();
         let mut it =
-            Self { index, buf: Vec::new(), leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
+            Self { index, node, buf: Vec::new(), leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
         if reverse {
             it.reverse_start()?;
         } else {
@@ -57,7 +60,7 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
 
     /// Position the cursor at the first entry `>= lower` (ascending).
     fn forward_start(&mut self) -> Result<(), FetchError> {
-        match self.lower {
+        match self.lower.clone() {
             Bound::Unbounded => {
                 let sl = self.index.first_leaf();
                 self.buf = self.index.fetch_page(sl)?;
@@ -68,7 +71,7 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
                 let sl = self.index.find_leaf(&lo)?;
                 self.buf = self.index.fetch_page(sl)?;
                 self.leaf = sl;
-                self.pos = match Node::<KSIZE>::leaf_search(&self.buf, &lo) {
+                self.pos = match self.node.leaf_search(&self.buf, &lo) {
                     Ok(i) => i,
                     Err(i) => i,
                 };
@@ -77,7 +80,7 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
                 let sl = self.index.find_leaf(&lo)?;
                 self.buf = self.index.fetch_page(sl)?;
                 self.leaf = sl;
-                self.pos = match Node::<KSIZE>::leaf_search(&self.buf, &lo) {
+                self.pos = match self.node.leaf_search(&self.buf, &lo) {
                     Ok(i) => i + 1,
                     Err(i) => i,
                 };
@@ -88,18 +91,18 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
 
     /// Position the cursor at the greatest entry `<= upper` (descending).
     fn reverse_start(&mut self) -> Result<(), FetchError> {
-        let sp: isize = match self.upper {
+        let sp: isize = match self.upper.clone() {
             Bound::Unbounded => {
                 let sl = self.index.last_leaf();
                 self.buf = self.index.fetch_page(sl)?;
                 self.leaf = sl;
-                Node::<KSIZE>::entry_count(&self.buf) as isize - 1
+                self.node.entry_count(&self.buf) as isize - 1
             }
             Bound::Included(hi) => {
                 let sl = self.index.find_leaf(&hi)?;
                 self.buf = self.index.fetch_page(sl)?;
                 self.leaf = sl;
-                match Node::<KSIZE>::leaf_search(&self.buf, &hi) {
+                match self.node.leaf_search(&self.buf, &hi) {
                     Ok(i) => i as isize,
                     Err(i) => i as isize - 1,
                 }
@@ -108,7 +111,7 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
                 let sl = self.index.find_leaf(&hi)?;
                 self.buf = self.index.fetch_page(sl)?;
                 self.leaf = sl;
-                match Node::<KSIZE>::leaf_search(&self.buf, &hi) {
+                match self.node.leaf_search(&self.buf, &hi) {
                     Ok(i) => i as isize - 1,
                     Err(i) => i as isize - 1,
                 }
@@ -119,20 +122,18 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
         Ok(())
     }
 
-    fn key_at(&self, i: usize) -> [u8; KSIZE] {
-        let mut k = [0_u8; KSIZE];
-        k.copy_from_slice(Node::<KSIZE>::leaf_key(&self.buf, i));
-        k
+    fn key_at(&self, i: usize) -> Vec<u8> {
+        self.node.leaf_key(&self.buf, i).to_vec()
     }
 
-    fn next_forward(&mut self) -> Option<Result<([u8; KSIZE], u64), FetchError>> {
+    fn next_forward(&mut self) -> Option<Result<(Vec<u8>, u64), FetchError>> {
         loop {
             if self.leaf == NULL_PAGE {
                 return None;
             }
-            let n = Node::<KSIZE>::entry_count(&self.buf);
+            let n = self.node.entry_count(&self.buf);
             if self.pos >= n {
-                let nx = Node::<KSIZE>::leaf_next(&self.buf);
+                let nx = self.node.leaf_next(&self.buf);
                 if nx == NULL_PAGE {
                     self.leaf = NULL_PAGE;
                     return None;
@@ -151,35 +152,35 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
                 continue;
             }
             let key = self.key_at(self.pos);
-            let stop = match self.upper {
+            let stop = match &self.upper {
                 Bound::Unbounded => false,
-                Bound::Included(hi) => key > hi,
-                Bound::Excluded(hi) => key >= hi,
+                Bound::Included(hi) => key > *hi,
+                Bound::Excluded(hi) => key >= *hi,
             };
             if stop {
                 self.leaf = NULL_PAGE;
                 return None;
             }
-            let val = Node::<KSIZE>::leaf_value(&self.buf, self.pos);
+            let val = self.node.leaf_value(&self.buf, self.pos);
             self.pos += 1;
             return Some(Ok((key, val)));
         }
     }
 
-    fn next_reverse(&mut self) -> Option<Result<([u8; KSIZE], u64), FetchError>> {
+    fn next_reverse(&mut self) -> Option<Result<(Vec<u8>, u64), FetchError>> {
         loop {
             if self.leaf == NULL_PAGE {
                 return None;
             }
-            if self.pos == NEED_PREV || Node::<KSIZE>::entry_count(&self.buf) == 0 {
-                let pv = Node::<KSIZE>::leaf_prev(&self.buf);
+            if self.pos == NEED_PREV || self.node.entry_count(&self.buf) == 0 {
+                let pv = self.node.leaf_prev(&self.buf);
                 if pv == NULL_PAGE {
                     self.leaf = NULL_PAGE;
                     return None;
                 }
                 match self.index.fetch_page(pv) {
                     Ok(b) => {
-                        let n = Node::<KSIZE>::entry_count(&b);
+                        let n = self.node.entry_count(&b);
                         self.buf = b;
                         self.leaf = pv;
                         self.pos = if n > 0 { n - 1 } else { NEED_PREV };
@@ -192,16 +193,16 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
                 continue;
             }
             let key = self.key_at(self.pos);
-            let stop = match self.lower {
+            let stop = match &self.lower {
                 Bound::Unbounded => false,
-                Bound::Included(lo) => key < lo,
-                Bound::Excluded(lo) => key <= lo,
+                Bound::Included(lo) => key < *lo,
+                Bound::Excluded(lo) => key <= *lo,
             };
             if stop {
                 self.leaf = NULL_PAGE;
                 return None;
             }
-            let val = Node::<KSIZE>::leaf_value(&self.buf, self.pos);
+            let val = self.node.leaf_value(&self.buf, self.pos);
             // Advance to the previous entry for the next call.
             self.pos = if self.pos == 0 { NEED_PREV } else { self.pos - 1 };
             return Some(Ok((key, val)));
@@ -209,8 +210,8 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
     }
 }
 
-impl<const KSIZE: usize> Iterator for BtreeIter<'_, KSIZE> {
-    type Item = Result<([u8; KSIZE], u64), FetchError>;
+impl Iterator for BtreeIter<'_> {
+    type Item = Result<(Vec<u8>, u64), FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reverse {
@@ -221,44 +222,49 @@ impl<const KSIZE: usize> Iterator for BtreeIter<'_, KSIZE> {
     }
 }
 
-impl<const KSIZE: usize> BtreeIndex<KSIZE> {
+impl BtreeIndex {
     /// Ascending iterator over all `(key, position)` entries.
-    pub fn iter(&mut self) -> Result<BtreeIter<'_, KSIZE>, FetchError> {
+    pub fn iter(&mut self) -> Result<BtreeIter<'_>, FetchError> {
         BtreeIter::new(self, false, Bound::Unbounded, Bound::Unbounded)
     }
 
     /// Descending iterator over all `(key, position)` entries.
-    pub fn rev_iter(&mut self) -> Result<BtreeIter<'_, KSIZE>, FetchError> {
+    pub fn rev_iter(&mut self) -> Result<BtreeIter<'_>, FetchError> {
         BtreeIter::new(self, true, Bound::Unbounded, Bound::Unbounded)
     }
 
     /// Ascending iterator over the entries whose keys fall within `bounds`.
-    pub fn range<R: RangeBounds<[u8; KSIZE]>>(
+    ///
+    /// The bound element may be any `AsRef<[u8]>` (e.g. `[u8; 32]` or `Vec<u8>`).  A fully
+    /// unbounded `..` needs the element type spelled out (e.g. `range::<[u8; 32], _>(..)`) or use
+    /// [`BtreeIndex::iter`].
+    pub fn range<T: AsRef<[u8]>, R: RangeBounds<T>>(
         &mut self,
         bounds: R,
-    ) -> Result<BtreeIter<'_, KSIZE>, FetchError> {
+    ) -> Result<BtreeIter<'_>, FetchError> {
         let (lower, upper) = clone_bounds(&bounds);
         BtreeIter::new(self, false, lower, upper)
     }
 
     /// Descending iterator over the entries whose keys fall within `bounds`.
-    pub fn rev_range<R: RangeBounds<[u8; KSIZE]>>(
+    pub fn rev_range<T: AsRef<[u8]>, R: RangeBounds<T>>(
         &mut self,
         bounds: R,
-    ) -> Result<BtreeIter<'_, KSIZE>, FetchError> {
+    ) -> Result<BtreeIter<'_>, FetchError> {
         let (lower, upper) = clone_bounds(&bounds);
         BtreeIter::new(self, true, lower, upper)
     }
 
     /// Ascending iterator over all keys sharing the given byte `prefix` (a prefix longer than
-    /// `KSIZE` is truncated to `KSIZE`).
-    pub fn prefix(&mut self, prefix: &[u8]) -> Result<BtreeIter<'_, KSIZE>, FetchError> {
-        let plen = prefix.len().min(KSIZE);
+    /// `ksize()` is truncated to `ksize()`).
+    pub fn prefix(&mut self, prefix: &[u8]) -> Result<BtreeIter<'_>, FetchError> {
+        let ksize = self.ksize();
+        let plen = prefix.len().min(ksize);
         // Lower bound: the prefix padded with zero bytes (smallest key with this prefix).
-        let mut lo = [0_u8; KSIZE];
+        let mut lo = vec![0_u8; ksize];
         lo[..plen].copy_from_slice(&prefix[..plen]);
         // Upper bound: increment the last non-0xFF prefix byte; all-0xFF means unbounded.
-        let mut hi = [0_u8; KSIZE];
+        let mut hi = vec![0_u8; ksize];
         hi[..plen].copy_from_slice(&prefix[..plen]);
         let mut i = plen;
         let upper = loop {
@@ -278,13 +284,11 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     }
 }
 
-/// Copy the (possibly borrowed) bounds of a range into owned `Bound<[u8; KSIZE]>` values.
-fn clone_bounds<const KSIZE: usize, R: RangeBounds<[u8; KSIZE]>>(
-    bounds: &R,
-) -> (Bound<[u8; KSIZE]>, Bound<[u8; KSIZE]>) {
-    let map = |b: Bound<&[u8; KSIZE]>| match b {
-        Bound::Included(k) => Bound::Included(*k),
-        Bound::Excluded(k) => Bound::Excluded(*k),
+/// Copy the (possibly borrowed) bounds of a range into owned `Bound<Vec<u8>>` values.
+fn clone_bounds<T: AsRef<[u8]>, R: RangeBounds<T>>(bounds: &R) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let map = |b: Bound<&T>| match b {
+        Bound::Included(k) => Bound::Included(k.as_ref().to_vec()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_ref().to_vec()),
         Bound::Unbounded => Bound::Unbounded,
     };
     (map(bounds.start_bound()), map(bounds.end_bound()))
@@ -295,10 +299,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::archive::{
-        index::Index as _,
-        pack::{DataHeader, PackCompression},
-    };
+    use crate::archive::pack::{DataHeader, PackCompression};
 
     /// 32-byte big-endian key so lexicographic order equals numeric order.
     fn bkey(i: u64) -> [u8; 32] {
@@ -317,7 +318,7 @@ mod tests {
 
     fn open(dir: &std::path::Path) -> BtreeIndex {
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
-        BtreeIndex::open_btx_file(dir, &data_header, false).expect("open")
+        BtreeIndex::open_btx_file(dir, &data_header, 32, false).expect("open")
     }
 
     #[test]
@@ -328,7 +329,7 @@ mod tests {
         // Insert in reverse order to prove ordering is a tree invariant, not insertion luck.
         let n = 10_000u64;
         for i in (0..n).rev() {
-            idx.save(bkey(i), i).expect("save");
+            idx.save(&bkey(i), i).expect("save");
         }
         assert_eq!(idx.len() as u64, n);
 
@@ -365,10 +366,10 @@ mod tests {
         let mut idx = open(&tmp.path().join("idx"));
         let n = 5_000u64;
         for i in 0..n {
-            idx.save(bkey(i), i * 10).expect("save");
+            idx.save(&bkey(i), i * 10).expect("save");
         }
 
-        let collect = |it: BtreeIter<'_, 32>| -> Vec<u64> {
+        let collect = |it: BtreeIter<'_>| -> Vec<u64> {
             it.map(|r| u64::from_be_bytes(r.expect("item").0[24..32].try_into().unwrap())).collect()
         };
 
@@ -381,8 +382,8 @@ mod tests {
         let tail = collect(idx.range(bkey(4997)..).expect("range"));
         assert_eq!(tail, vec![4997, 4998, 4999]);
 
-        // Full range equals iter().
-        assert_eq!(collect(idx.range(..).expect("range")).len() as u64, n);
+        // Full range equals iter() (the element type must be named for a bare `..`).
+        assert_eq!(collect(idx.range::<[u8; 32], _>(..).expect("range")).len() as u64, n);
 
         // Empty range (b <= a) yields nothing.
         assert!(collect(idx.range(bkey(500)..bkey(500)).expect("range")).is_empty());
@@ -403,12 +404,12 @@ mod tests {
         // Groups 0..4 plus the all-0xFF group, each with several members.
         for g in [0u8, 1, 2, 3, 0xFF] {
             for i in 0..50u64 {
-                idx.save(gkey(g, i), (g as u64) * 1000 + i).expect("save");
+                idx.save(&gkey(g, i), (g as u64) * 1000 + i).expect("save");
             }
         }
 
         let collect =
-            |it: BtreeIter<'_, 32>| -> Vec<[u8; 32]> { it.map(|r| r.expect("item").0).collect() };
+            |it: BtreeIter<'_>| -> Vec<Vec<u8>> { it.map(|r| r.expect("item").0).collect() };
 
         for g in [0u8, 2, 3] {
             let got = collect(idx.prefix(&[g]).expect("prefix"));

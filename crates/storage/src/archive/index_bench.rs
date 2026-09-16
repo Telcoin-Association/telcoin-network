@@ -227,8 +227,8 @@ fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool) -> HdxIndex {
     .expect("open mmap")
 }
 
-fn open_btree(header: &DataHeader, dir: &Path, read_only: bool) -> BtreeIndex<32> {
-    BtreeIndex::open_btx_file(dir.join("btx"), header, read_only).expect("open btree")
+fn open_btree(header: &DataHeader, dir: &Path, read_only: bool) -> BtreeIndex {
+    BtreeIndex::open_btx_file(dir.join("btx"), header, 32, read_only).expect("open btree")
 }
 
 fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
