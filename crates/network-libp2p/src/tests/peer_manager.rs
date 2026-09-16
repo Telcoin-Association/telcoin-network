@@ -1266,6 +1266,42 @@ async fn test_pinned_peer_kad_record_bypasses_staleness_guard() {
     assert_eq!(cached.rpc, Some(rpc), "advertised rpc must reach the cache despite older stamp");
 }
 
+#[tokio::test]
+async fn test_self_advertised_record_from_pinned_peer_cached_before_committee_seed() {
+    // The production ordering for a node joining with a cold datadir: `AddBootstrapPeers` pins an
+    // rpc-less stub for every committee validator, each validator then pushes its real rpc-bearing
+    // record on first connect, and only afterwards does the epoch loop seed the worker swarm's
+    // committee slots. The pushed record must be cached while the committee set is still empty:
+    // the push is one-shot, and the pinned stub otherwise satisfies every re-discovery trigger.
+    //
+    // fails on main: the committee gate in `add_self_advertised_peer` ran before the worker
+    // swarm's slots were seeded, so the record was discarded and the stub kept forever.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([53; 32])).public();
+
+    // (a) the cold-store bootstrap stub: pinned, rpc-less
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+
+    // (b) the peer pushes its own signed record over its authenticated connection while the
+    // committee set is still empty
+    let (real, rpc) = random_network_info_with_rpc();
+    let real_addrs = real.multiaddrs.clone();
+    let source: PeerId = real.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(source, bls, real);
+
+    // (c) the epoch loop seeds the committee afterwards
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // (d) the advertised rpc is resolvable and the real record replaced the stub
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "record pushed before the committee seed must be cached for a pinned peer"
+    );
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, real_addrs, "real record must replace the bootstrap stub");
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {

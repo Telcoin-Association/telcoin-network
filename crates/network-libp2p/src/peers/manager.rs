@@ -1096,16 +1096,27 @@ impl PeerManager {
     /// whose `source` is the sending peer).
     ///
     /// A committee member is cached in `known_peers` exactly as via [`Self::add_discovered_peer`].
-    /// A non-committee peer that advertises its OWN record - the authenticated kad-put `source`
-    /// equals the record's advertised network identity, so libp2p has already proven the sender
-    /// owns that transport key - has only its `bls_key <-> peer_id` identity confirmed in the peer
-    /// store, so a live connection (for example an nvv joining the gossip mesh) is retained. It is
-    /// deliberately NOT inserted into the committee-only `known_peers` cache. Because
-    /// [`AllPeers::upsert_peer`] re-keys by peer id, a peer can only ever hold ONE confirmed
-    /// identity for its own connection, so this is bounded by the live connection count and keeps
-    /// the issue #827 bound against unbounded record injection intact. A relayed record (`source`
-    /// != the advertised identity) cannot confirm an identity the sender does not control and is
-    /// dropped, so this never lets a peer displace another peer's identity.
+    ///
+    /// A pinned peer (operator-provisioned trusted/bootstrap/explicit) is admitted the same way
+    /// even while it sits in no committee slot. The pinned set is bounded by node configuration,
+    /// so the issue #827 bound holds, and the record's BLS signature was already verified in
+    /// `peer_record_valid`. This matters for a node joining with a cold datadir: each validator
+    /// pushes its record once, on first connect, which lands before the epoch loop has seeded
+    /// this swarm's committee slots. Gating on membership alone would discard that push, and the
+    /// config stub would then satisfy every re-discovery trigger until the next kad republish.
+    /// The pinned exemption in [`Self::kad_record_is_stale`] lets the real record replace the
+    /// stub as designed.
+    ///
+    /// A non-committee, unpinned peer that advertises its OWN record - the authenticated kad-put
+    /// `source` equals the record's advertised network identity, so libp2p has already proven the
+    /// sender owns that transport key - has only its `bls_key <-> peer_id` identity confirmed in
+    /// the peer store, so a live connection (for example an nvv joining the gossip mesh) is
+    /// retained. It is deliberately NOT inserted into the committee-only `known_peers` cache.
+    /// Because [`AllPeers::upsert_peer`] re-keys by peer id, a peer can only ever hold ONE
+    /// confirmed identity for its own connection, so this is bounded by the live connection count
+    /// and keeps the issue #827 bound against unbounded record injection intact. A relayed record
+    /// (`source` != the advertised identity) cannot confirm an identity the sender does not
+    /// control and is dropped, so this never lets a peer displace another peer's identity.
     pub(crate) fn add_self_advertised_peer(
         &mut self,
         source: PeerId,
@@ -1113,7 +1124,7 @@ impl PeerManager {
         info: NetworkInfo,
     ) {
         let advertised: PeerId = info.pubkey.clone().into();
-        if self.peers.is_committee_member(&bls_key) {
+        if self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key) {
             if self.kad_record_is_stale(&bls_key, &info) {
                 trace!(
                     target: "peer-manager",
