@@ -3268,9 +3268,11 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
 /// production: `AddBootstrapPeers` pins a stub for every validator, each validator pushes its
 /// record on first connect, and the worker swarm's committee slots are seeded afterwards from
 /// epoch state. The sibling test seeds the committee before connecting and so never exercises
-/// this window. The advertised rpc must still be resolvable afterwards — either because the
-/// pushed record was admitted for the pinned key, or because the stub is chased via kad once
-/// the committee is known.
+/// this window. The pushed record must be admitted for the pinned key while the committee set
+/// is still empty (checked before the seed — otherwise the stub re-discovery that follows
+/// `update_committees` would recover the record from the nvv's own kad store and mask a
+/// regression of that admission), and the advertised rpc must remain resolvable after the
+/// committee is seeded.
 #[tokio::test]
 async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
     use crate::types::RpcInfo;
@@ -3359,6 +3361,14 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
     .await?;
     // let target's self-advertised push land while the nvv's committee set is still empty
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // the push must be admitted for the pinned key NOW, while no committee slot is seeded;
+    // without this check the stub re-discovery after `update_committees` recovers the record
+    // from the nvv's own kad store and masks a regression of the pinned-key admission
+    assert_eq!(
+        nvv.get_validator_rpc(target_peer_bls).await?,
+        Some(rpc.clone()),
+        "pushed record must be cached for the pinned key before the committee is seeded"
+    );
 
     // only now does the nvv learn the committee from epoch state
     let committee_keys = std::iter::once(target_peer_bls)

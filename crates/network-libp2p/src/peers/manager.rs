@@ -190,7 +190,9 @@ pub(crate) struct PeerManager {
     /// triggers treat a stubbed committee member exactly like an unknown one — see
     /// [`Self::record_unlearned`]. Without this distinction a pinned stub would satisfy every
     /// "is the record known?" check, and a node that missed the peer's one-shot record push
-    /// would never ask kad again.
+    /// would never ask kad again. The same set scopes the timestamp-staleness exemption in
+    /// [`Self::kad_record_is_stale`]: only a stub's locally stamped timestamp is ignored, so a
+    /// learned record under a pinned key still enjoys monotonicity against replayed older ones.
     ///
     /// Always a subset of `known_peers` (pruned alongside it). Today also a subset of
     /// `pinned_peers`, since every stub writer pins.
@@ -1136,8 +1138,8 @@ impl PeerManager {
     /// pushes its record once, on first connect, which lands before the epoch loop has seeded
     /// this swarm's committee slots. Gating on membership alone would discard that push, and the
     /// config stub would then satisfy every re-discovery trigger until the next kad republish.
-    /// The pinned exemption in [`Self::kad_record_is_stale`] lets the real record replace the
-    /// stub as designed.
+    /// The stub exemption in [`Self::kad_record_is_stale`] lets the real record replace the
+    /// stub; once it has, the usual timestamp monotonicity guards the learned record.
     ///
     /// A non-committee, unpinned peer that advertises its OWN record - the authenticated kad-put
     /// `source` equals the record's advertised network identity, so libp2p has already proven the
@@ -1202,14 +1204,18 @@ impl PeerManager {
     /// `AddExplicitPeer` / `AddBootstrapPeers` handlers in consensus.rs), and
     /// [`Self::add_bootstrap_peer`] never overwrites an existing entry at all.
     ///
-    /// Pinned (operator-provisioned) entries are exempt from the comparison in the other
-    /// direction too: their timestamp is a local provisioning stamp, not a peer-signed record
-    /// timestamp, and node records are signed once at peer startup — so an operator stub stamped
-    /// after the peer started would otherwise block the peer's real record (fresh multiaddrs,
-    /// advertised rpc) forever. A signed record may therefore always refresh a pinned entry,
-    /// which is the pre-existing upgrade flow for trusted/explicit peers.
+    /// Stub entries (`stub_records`) are exempt from the comparison in the other direction too:
+    /// a stub's timestamp is a local provisioning stamp, not a peer-signed record timestamp, and
+    /// node records are signed once at peer startup — so an operator stub stamped after the peer
+    /// started would otherwise block the peer's real record (fresh multiaddrs, advertised rpc)
+    /// forever. A signed record may therefore always replace a stub, which is the upgrade flow
+    /// for trusted/bootstrap/explicit peers. The exemption ends with the stub: once a learned
+    /// record is cached under a pinned key its timestamp IS peer-signed, and monotonicity applies
+    /// so a relayed or replayed older record cannot regress it. Keying the exemption on
+    /// `pinned_peers` instead would leave every operator-provisioned validator open to that
+    /// regression for the life of the process, because pins are never cleared.
     fn kad_record_is_stale(&self, bls_key: &BlsPublicKey, info: &NetworkInfo) -> bool {
-        !self.pinned_peers.contains(bls_key)
+        !self.stub_records.contains(bls_key)
             && self
                 .known_peers
                 .get(bls_key)

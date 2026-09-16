@@ -2073,8 +2073,11 @@ where
                     trace!(target: "network-kad", "Got record {key} {value:?}");
 
                     // Confirm before the fallible store write, including for equal or older records.
-                    // The peer manager never reads the store, keeps relays committee-gated, checks
-                    // committee freshness, and requires source to match a non-committee identity.
+                    // The peer manager never reads the store. It caches the record for a committee
+                    // member or a pinned (operator-provisioned) key, relays included, with the
+                    // freshness check waived only while the entry is still a config stub; for any
+                    // other key it only confirms the sender's own identity and requires source to
+                    // match the advertised one.
                     self.swarm
                         .behaviour_mut()
                         .peer_manager

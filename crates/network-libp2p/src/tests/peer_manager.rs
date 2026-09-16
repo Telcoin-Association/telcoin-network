@@ -1302,6 +1302,67 @@ async fn test_self_advertised_record_from_pinned_peer_cached_before_committee_se
     assert_eq!(cached.multiaddrs, real_addrs, "real record must replace the bootstrap stub");
 }
 
+#[tokio::test]
+async fn test_learned_pinned_record_not_regressed_by_older_push() {
+    // The staleness exemption is scoped to the stub, not to the pin. Once a pinned peer's real
+    // record (peer-signed timestamp T) is cached, an older validly-signed record for the same
+    // key — relayed over kad PUT by ANY connected peer, since the committee/pinned branch does
+    // not require `source == advertised` — must not regress the cached multiaddrs/rpc. Pins are
+    // never cleared, so keying the exemption on `pinned_peers` would leave every bootstrap
+    // validator open to this replay for the life of the process.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([73; 32])).public();
+
+    // pinned + stubbed via bootstrap config
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    assert!(peer_manager.stub_records.contains(&bls), "bootstrap entry starts as a stub");
+
+    // the peer's real record lands over its own connection and replaces the stub
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 1_000;
+    let real_addrs = real.multiaddrs.clone();
+    let own_source: PeerId = real.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(own_source, bls, real);
+    assert!(!peer_manager.stub_records.contains(&bls), "stub cleared after learning");
+
+    // an older record for the same key arrives from an UNRELATED source (replay)
+    let mut older = random_network_info();
+    older.timestamp = 999;
+    assert_ne!(older.multiaddrs, real_addrs, "addresses must differ for this test");
+    peer_manager.add_self_advertised_peer(PeerId::random(), bls, older);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("record cached");
+    assert_eq!(cached.timestamp, 1_000, "older replay must not regress the cached timestamp");
+    assert_eq!(cached.multiaddrs, real_addrs, "older replay must not regress the multiaddrs");
+    assert_eq!(cached.rpc, Some(rpc), "older replay must not drop the advertised rpc");
+}
+
+#[tokio::test]
+async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
+    // Same invariant on the `get_record` result path: a single stale responder must not regress
+    // a learned record held under a pinned key.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([79; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 1_000;
+    let real_addrs = real.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, real);
+    assert!(!peer_manager.stub_records.contains(&bls), "stub cleared after learning");
+
+    let mut older = random_network_info();
+    older.timestamp = 999;
+    assert_ne!(older.multiaddrs, real_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, older);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("record cached");
+    assert_eq!(cached.timestamp, 1_000, "older query result must not regress the timestamp");
+    assert_eq!(cached.multiaddrs, real_addrs, "older query result must not regress multiaddrs");
+    assert_eq!(cached.rpc, Some(rpc), "older query result must not drop the advertised rpc");
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {
