@@ -1098,7 +1098,7 @@ where
                 self.swarm.behaviour_mut().peer_manager.prepare_committee_dial(committee);
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
-                // this will trigger a PeerEvent to fetch records through kad if not in the peer map
+                // Fetch signed records for unknown peers and unresolved configured dial hints.
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
             }
             NetworkCommand::GetValidatorRpc { bls_key, reply } => {
@@ -1807,7 +1807,7 @@ where
             }
             PeerEvent::MissingAuthorities(missing) => {
                 // Polling callers such as `current_committee_rpcs` report a member as
-                // missing on every call until its record lands in `known_peers`, so the
+                // missing on every call until its signed metadata reaches `known_peers`, so the
                 // same key arrives here repeatedly while its lookup is still in flight.
                 // Issue at most one live `get_record` per key: skip keys already tracked
                 // in `kad_record_queries` (issue #1135). The map is safe as the dedupe

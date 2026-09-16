@@ -160,7 +160,7 @@ pub(crate) struct PeerManager {
     /// design, because a committee member must stay resolvable for its whole committee window —
     /// an expiry-driven resolution failure would be a consensus liveness bug.
     ///
-    /// Values are post-validation — BLS signature verified and publisher-checked
+    /// Kad-sourced values are BLS signature verified and publisher-checked
     /// (`peer_record_valid` in consensus.rs), committee-gated per issue #827, malformed
     /// advertised RPC info stripped in [`Self::cache_known_peer`] — while the store holds raw
     /// signed record bytes.
@@ -169,6 +169,12 @@ pub(crate) struct PeerManager {
     /// ([`Self::prune_known_peers`]); kad-sourced updates are timestamp-monotonic
     /// ([`Self::kad_record_is_stale`]), mirroring the store-side `is_newer_record` rule.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// Operator-provisioned peers whose cached dial hints still need a signed node record.
+    ///
+    /// A configured address does not establish whether the peer advertises RPC. Keep these keys
+    /// eligible for discovery until a validated record supplies that metadata. Only pinned
+    /// insertion paths populate this set, so its size is bounded by operator configuration.
+    pending_peer_records: HashSet<BlsPublicKey>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
     /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
@@ -261,6 +267,7 @@ impl PeerManager {
             heartbeat,
             peers,
             known_peers: Default::default(),
+            pending_peer_records: Default::default(),
             pinned_peers: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
@@ -276,6 +283,7 @@ impl PeerManager {
     ///
     /// These peers are considered "trusted" and do not receive penalties.
     /// This does not unban ips and should only be called during initialization.
+    /// Configured dial hints remain eligible for signed-record discovery.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
         bls_key: BlsPublicKey,
@@ -293,6 +301,7 @@ impl PeerManager {
         // trusted peers are operator-provisioned; pin so committee rotation never evicts them
         self.pinned_peers.insert(bls_key);
         self.known_peers.insert(bls_key, info);
+        self.pending_peer_records.insert(bls_key);
 
         self.dial_peer(peer_id, multiaddr, Some(reply));
     }
@@ -953,11 +962,16 @@ impl PeerManager {
         }
     }
 
-    /// Emit a [`PeerEvent::MissingAuthorities`] for any committee keys with no known network info
-    /// so kad discovery can chase them.
+    /// Whether an authority still needs signed metadata, even if its dial address is configured.
+    fn needs_peer_record(&self, bls_key: &BlsPublicKey) -> bool {
+        !self.known_peers.contains_key(bls_key) || self.pending_peer_records.contains(bls_key)
+    }
+
+    /// Emit a [`PeerEvent::MissingAuthorities`] for committee keys whose signed metadata is
+    /// unresolved, including peers known only through operator-provisioned dial hints.
     fn trigger_missing_authorities(&mut self, committee: &HashSet<BlsPublicKey>) {
         let missing: Vec<BlsPublicKey> =
-            committee.iter().filter(|k| !self.known_peers.contains_key(k)).copied().collect();
+            committee.iter().filter(|key| self.needs_peer_record(key)).copied().collect();
         if !missing.is_empty() {
             self.events.push_back(PeerEvent::MissingAuthorities(missing));
         }
@@ -979,9 +993,11 @@ impl PeerManager {
     /// pin — they go through [`Self::add_restored_peer`]. The attacker-reachable kad discovery
     /// path must instead use [`Self::add_discovered_peer`], which is bounded to committee
     /// membership.
+    /// The configured addresses remain usable while signed metadata is fetched.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
         self.cache_known_peer(bls_key, info);
+        self.pending_peer_records.insert(bls_key);
     }
 
     /// Add a peer record restored from the persisted kad store at startup, WITHOUT pinning it.
@@ -1006,10 +1022,12 @@ impl PeerManager {
     /// richer record restored from persistence, which may carry fresher multiaddrs/rpc info) is
     /// not overwritten by the config-derived stub, preserving the don't-overwrite contract of
     /// the [`AddBootstrapPeers`](crate::types::NetworkCommand) command.
+    /// Only a newly inserted stub needs discovery; a previously fetched record stays resolved.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
+            self.pending_peer_records.insert(bls_key);
         }
     }
 
@@ -1178,6 +1196,7 @@ impl PeerManager {
     ///
     /// Shared body of the known-peer insertion paths; the caller decides whether the entry is
     /// pinned or admitted at all.
+    /// Clears pending discovery; operator-provisioned callers re-arm it after inserting dial hints.
     fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in
@@ -1196,6 +1215,7 @@ impl PeerManager {
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
+        self.pending_peer_records.remove(&bls_key);
         // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
         // (closing the trust window) instead of waiting for the next epoch's `update_committees`.
         // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can
@@ -1204,17 +1224,10 @@ impl PeerManager {
         self.apply_unban_actions(unban_actions);
     }
 
-    /// Find authorities for the epoch manager.
+    /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
     pub(crate) fn find_authorities(&mut self, authorities: Vec<BlsPublicKey>) {
-        let mut missing = Vec::new();
-
-        // check all peers for authority and track missing
-        for bls_key in authorities {
-            // identify missing authorities
-            if !self.known_peers.contains_key(&bls_key) {
-                missing.push(bls_key);
-            }
-        }
+        let missing: Vec<_> =
+            authorities.into_iter().filter(|key| self.needs_peer_record(key)).collect();
 
         // emit event for kad to try to discover
         trace!(target: "peer-manager", ?missing, "requesting kad records");
@@ -1228,14 +1241,14 @@ impl PeerManager {
     }
 
     /// Return the advertised [RpcInfo] for every current-committee validator, and
-    /// chase node records for current members that are still unknown.
+    /// fetch signed node records for current members whose metadata is still unresolved.
     ///
     /// Scoped to the current committee: pinned operator peers and previous/next
     /// committee members never appear, even if they advertised RPC info. For any
-    /// current member with no known record, kad discovery is (re)triggered via
+    /// current member with no signed record, kad discovery is (re)triggered via
     /// [`PeerEvent::MissingAuthorities`] — the same path `update_committees` takes at
     /// epoch start — so a polling caller converges as records arrive. Members whose
-    /// record is known but carries no RPC info did not advertise one and are skipped
+    /// signed record carries no RPC info did not advertise one and are skipped
     /// without a re-fetch.
     pub(crate) fn current_committee_rpcs(&mut self) -> Vec<(BlsPublicKey, RpcInfo)> {
         let current = self.peers.current_committee().clone();
