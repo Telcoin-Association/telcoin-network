@@ -20,6 +20,7 @@ use crate::{
     metrics::EpochMetrics,
 };
 use eyre::{eyre, WrapErr as _};
+use futures::TryStreamExt as _;
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -49,9 +50,11 @@ use tracing::{debug, error, info, warn};
 
 mod batch_slots;
 mod close_epoch;
+mod export_retention;
 mod run_epoch;
 mod start_epoch;
 pub use close_epoch::build_epoch_record;
+use export_retention::StateExportRetention;
 use run_epoch::retry_provider_faults;
 pub(crate) use run_epoch::RunEpochMode;
 
@@ -207,10 +210,9 @@ fn prepare_worker_networks<Events: Clone>(
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
 /// across epochs (p2p network handles, consensus DB, consensus bus, consensus chain) alongside the
 /// small amount of cross-epoch carry-over state that the next epoch needs to start correctly -
-/// notably [`last_consensus_header`](Self::last_consensus_header),
-/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number), and
-/// [`network_initialized`](Self::network_initialized). Per-epoch consensus components are built and
-/// dropped inside the epoch loop rather than stored here.
+/// notably [`last_consensus_header`](Self::last_consensus_header) and
+/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number). Per-epoch consensus
+/// components are built and dropped inside the epoch loop rather than stored here.
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
@@ -232,19 +234,6 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Whether the long-running p2p networks have completed their one-time, per-process setup
-    /// (start listening, register bootstrap peers).
-    ///
-    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
-    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
-    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
-    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
-    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
-    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
-    ///
-    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
-    /// state via `update_committees`.
-    network_initialized: bool,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
@@ -282,6 +271,9 @@ pub(crate) struct EpochManager<P, DB> {
     /// Background execution-state exporter. `Some` only when `--enable-state-export` is set;
     /// exports each epoch's final state at the epoch boundary. Stops on drop.
     exec_state_exporter: Option<ExecStateExporter>,
+
+    /// Shared publication and retention state for exports across epoch completion tasks.
+    state_export_retention: StateExportRetention,
 
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
@@ -745,14 +737,20 @@ where
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
             builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
+        let export_root = tn_datadir.consensus_db_path().join("state_exports");
+        let state_export_retention =
+            StateExportRetention::new(export_root.clone(), builder.state_export_keep());
 
         // With export enabled, clean up any orphaned temp export dirs left by a crashed/interrupted
         // prior run. Safe here (startup) because no export is in flight; the per-epoch export path
         // only ever clears its own epoch's temp, so it can never delete an in-flight one.
         if exec_state_exporter.is_some() {
-            close_epoch::sweep_stale_tmp_exports(
-                &tn_datadir.consensus_db_path().join("state_exports"),
-            );
+            tokio::task::spawn_blocking(move || close_epoch::sweep_stale_tmp_exports(&export_root))
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(target: "tn::snapshot", %error, "stale export cleanup task failed");
+                });
+            state_export_retention.prune().await;
         }
 
         Ok(Self {
@@ -763,7 +761,6 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
-            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -774,6 +771,7 @@ where
             bootstrap_servers,
             version_str,
             exec_state_exporter,
+            state_export_retention,
             metrics: EpochMetrics::default(),
         })
     }
@@ -784,10 +782,11 @@ where
     /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), spawn the epoch-record and vote
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
+    /// listeners, schedule process-lifetime bootstrap dials, spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
-    /// and spawn the engine-update task. It then requests any missing epoch pack files and
-    /// launches the app-scoped consensus fetch workers.
+    /// and spawn the engine-update task. It then launches the epoch pack fetch workers before
+    /// requesting any missing epoch pack files, followed by the recent-consensus fetch task.
     ///
     /// Finally it selects over two futures: the node task manager running to exit, and the epoch
     /// loop ([`run_epochs`](Self::run_epochs)). Whichever resolves first ends the node; the
@@ -881,11 +880,89 @@ where
         // #765). Genesis is the single source of truth; this one value is read by the
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        self.bootstrap_servers = network_config
+            .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
-        self.spawn_node_networks(node_task_spawner, &network_config, epoch, on_chain_workers)
+        self.spawn_node_networks(
+            node_task_spawner.clone(),
+            &network_config,
+            epoch,
+            on_chain_workers,
+        )
+        .await?;
+        let primary_network_handle = self
+            .primary_network_handle
+            .as_ref()
+            .ok_or_else(|| eyre!("no primary network handle"))?
+            .clone();
+
+        // Register bootstrap peers before per-epoch committee updates resolve known peers.
+        // Listening and bootstrap dials belong to process startup, before replay can close an
+        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
+        primary_network_handle
+            .inner_handle()
+            .add_bootstrap_peers(
+                self.bootstrap_servers
+                    .iter()
+                    .map(|(key, peer)| (*key, peer.primary.clone()))
+                    .collect(),
+            )
             .await?;
-        let primary_network_handle =
-            self.primary_network_handle.as_ref().expect("primary network").clone();
+        let node_info = &self.builder.tn_config.node_info;
+        let primary_address = Self::parse_listener_address_for_swarm(
+            "PRIMARY_LISTENER_MULTIADDR",
+            node_info.p2p_info.primary.network_key.clone(),
+            node_info.primary_network_address().clone(),
+        )?;
+        info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
+        primary_network_handle.inner_handle().start_listening(primary_address).await?;
+        self.bootstrap_servers.keys().copied().for_each(|key| {
+            self.dial_peer_bls(
+                primary_network_handle.inner_handle().clone(),
+                key,
+                node_task_spawner.clone(),
+            );
+        });
+
+        let manager = &*self;
+        let startup_spawner = &node_task_spawner;
+        futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
+            .try_for_each(|network_handle| async move {
+                let worker_id = network_handle.worker_id();
+                let bootstrap_peers: BTreeMap<_, _> = manager
+                    .bootstrap_servers
+                    .iter()
+                    // Peers with fewer workers have no swarm for this id.
+                    .filter_map(|(key, peer)| {
+                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
+                    })
+                    .collect();
+                network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
+                let configured_address =
+                    node_info.worker_network_address(worker_id).cloned().ok_or_else(|| {
+                        eyre!("no network address for worker {worker_id} in node info")
+                    })?;
+                // One override cannot name multiple listeners, so it applies only to worker 0.
+                let worker_address = if worker_id == DEFAULT_WORKER_ID {
+                    Self::parse_listener_address_for_swarm(
+                        "WORKER_LISTENER_MULTIADDR",
+                        node_info.p2p_info.primary.network_key.clone(),
+                        configured_address,
+                    )?
+                } else {
+                    configured_address
+                };
+                network_handle.inner_handle().start_listening(worker_address).await?;
+                bootstrap_peers.into_keys().for_each(|key| {
+                    manager.dial_peer_bls(
+                        network_handle.inner_handle().clone(),
+                        key,
+                        startup_spawner.clone(),
+                    );
+                });
+                Ok(())
+            })
+            .await?;
         // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
         // they are subscribed per-epoch in `spawn_primary_network_for_epoch` against a
         // committee-restricted publisher set (alongside `primary_topic`), and intentionally not
@@ -1056,8 +1133,6 @@ where
             );
         }
 
-        // Do a sanity check, request any pack files for complete epochs we are missing.
-        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
         // Note, these workers will just go dormant once we have caught up- that's ok.
         for i in 0..3 {
@@ -1080,6 +1155,10 @@ where
                 },
             );
         }
+        // Request missing pack files only after spawning the workers: the bounded epoch request
+        // queue needs live consumers so a backlog larger than its capacity cannot block startup.
+        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
+
         // Fire up a app scoped task to fetch rencent consensus.
         // This will not be used by CVVs but won't hurt anything and
         // will be used when not active or catching up and needs to

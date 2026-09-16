@@ -935,6 +935,9 @@ where
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
             }
+            NetworkCommand::EstablishedPeerCount { reply } => {
+                send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
+            }
             NetworkCommand::ConnectedPeers { reply } => {
                 let peers = self
                     .swarm
@@ -2063,39 +2066,45 @@ where
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
             }
             PutRecordRate::Allowed => {
-                if let Some((key, value)) = self.peer_record_valid(&record) {
-                    // verify record signature and ensure publisher matches record's network key
+                self.peer_record_valid(&record).map(|(key, value)| {
+                    let is_newer = self.is_newer_record(&record);
+                    trace!(target: "network-kad", "Got record {key} {value:?}");
+
+                    // Confirm before the fallible store write, including for equal or older records.
+                    // The peer manager never reads the store, keeps relays committee-gated, checks
+                    // committee freshness, and requires source to match a non-committee identity.
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .add_self_advertised_peer(source, key, value.info);
 
                     // store latest node records
-                    if self.is_newer_record(&record) {
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .store_mut()
-                            .put(record)
-                            .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
-                        trace!(target: "network-kad", "Got record {key} {value:?}");
-                        // a peer pushing its own record over its own connection (source == the
-                        // record's network identity) also confirms its identity so a live
-                        // non-committee connection (e.g. an nvv in the gossip mesh) is retained;
-                        // relayed and non-self records stay committee-gated (issue #827).
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .add_self_advertised_peer(source, key, value.info);
+                    if is_newer {
+                        // Capacity is remotely triggerable. Match the add-provider path instead of
+                        // propagating expected rejections to the run loop's per-event error log.
+                        self.swarm.behaviour_mut().kademlia.store_mut().put(record).unwrap_or_else(
+                            |error| match error {
+                                kad::store::Error::MaxRecords => {
+                                    debug!(target: "network-kad", ?source, "dropping inbound kad record: store at capacity");
+                                }
+                                kad::store::Error::ValueTooLarge | kad::store::Error::MaxProvidedKeys => {
+                                    warn!(target: "network-kad", ?source, ?error, "dropping inbound kad record");
+                                }
+                            },
+                        );
                     } else {
                         // A peer republishing a slightly stale (but signature-valid) record is
                         // expected after restarts and benign. The local store keeps the newer
                         // version. Log only; no penalty.
                         trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
                     }
-                } else {
+                }).unwrap_or_else(|| {
                     warn!(target: "network-kad", "Received invalid peer record!");
 
                     // assess penalty for invalid peer record
                     trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
                     self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
-                }
+                });
             }
         }
 

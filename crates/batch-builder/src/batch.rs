@@ -38,6 +38,20 @@ pub struct BatchBuilderOutput {
     pub(crate) peer_deferred: usize,
 }
 
+/// Build a batch on the blocking pool, including transaction encoding and sender balance reads.
+///
+/// The caller awaits this task before proposing the batch and keeps at most one build in flight.
+pub(crate) fn spawn_batch_build<P: TxPool + Send + 'static>(
+    args: BatchBuilderArgs<P>,
+    worker_id: WorkerId,
+    base_fee: u64,
+) -> tokio::task::JoinHandle<BatchBuilderOutput> {
+    // `spawn_blocking` does not carry the caller's tracing span onto the blocking thread;
+    // re-enter `propose-batch` so the build's log lines keep worker_id/base_fee/epoch.
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(|| build_batch(args, worker_id, base_fee)))
+}
+
 /// Construct an TN batch using the best transactions from the pool.
 ///
 /// Returns the [`BatchBuilderOutput`] and cannot fail. The batch continues to add
@@ -298,6 +312,73 @@ mod tests {
         );
         assert_eq!(output.batch.transactions(), std::slice::from_ref(&raw));
         assert_eq!(output.peer_deferred, 0);
+    }
+
+    /// A pool that rejects batch selection or balance reads on the async runtime thread.
+    struct ThreadCheckedPool {
+        /// Transactions and balances used by the real batch construction logic.
+        pool: TestPool,
+        /// The sole async runtime thread, which synchronous pool work must leave free.
+        runtime_thread: std::thread::ThreadId,
+    }
+
+    impl TxPool for ThreadCheckedPool {
+        fn best_transactions(&self) -> tn_reth::BestTxns {
+            assert_ne!(std::thread::current().id(), self.runtime_thread);
+            self.pool.best_transactions()
+        }
+
+        fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+            self.pool.remove_eip4844_txs(blobs);
+        }
+
+        fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+            self.pool.remove_unsupported_txs(txs);
+        }
+
+        fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+            assert_ne!(std::thread::current().id(), self.runtime_thread);
+            self.pool.get_account_balances(addresses)
+        }
+
+        /// Record a validated peer batch in the wrapped pool.
+        fn record_peer_batch(&self, hashes: &[TxHash]) {
+            self.pool.record_peer_batch(hashes);
+        }
+
+        /// Check peer deferrals off the async runtime thread during batch selection.
+        fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+            assert_ne!(std::thread::current().id(), self.runtime_thread);
+            self.pool.is_peer_deferred(hash)
+        }
+    }
+
+    /// Batch selection and sender balance reads run off the runtime thread and finish before
+    /// the caller receives the batch and its optimistic account update.
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_build_offloads_pool_work() -> Result<(), tokio::task::JoinError> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut factory = TransactionFactory::new();
+        let sender = factory.address();
+        let transaction =
+            factory.create_eip1559_encoded(chain, None, 100, None, U256::from(1), Bytes::new());
+        let balance = U256::from(1_000_000_000_000_000_000u128);
+        let pool = TestPool::new(std::slice::from_ref(&transaction)).with_balance(sender, balance);
+        let cost = pool.total_cost();
+        let pool = ThreadCheckedPool { pool, runtime_thread: std::thread::current().id() };
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
+
+        let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred } =
+            spawn_batch_build(args, 0, MIN_PROTOCOL_BASE_FEE).await?;
+
+        assert_eq!(batch.transactions, vec![transaction]);
+        assert_eq!(mined_transactions.len(), 1);
+        assert_eq!(changed_accounts.len(), 1);
+        assert_eq!(peer_deferred, 0);
+        assert!(changed_accounts.iter().any(|account| {
+            account.address == sender && account.nonce == 1 && account.balance == balance - cost
+        }));
+        Ok(())
     }
 
     /// A transaction a validated peer batch already carries must not be packed again here: the
