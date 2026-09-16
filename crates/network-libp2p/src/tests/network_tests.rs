@@ -3260,6 +3260,47 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An operator can set `rpc` on a bootstrap peer entry (YAML/CLI, deserialized as a full
+/// [`P2pNode`]). The `AddBootstrapPeers` handler must carry that endpoint into the peer
+/// manager's stub instead of dropping it, so a node can forward transactions to the
+/// configured endpoint before the peer's own record is ever learned.
+#[tokio::test]
+async fn test_bootstrap_peer_config_rpc_is_retained() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+    use std::collections::BTreeMap;
+    use tn_types::P2pNode;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    peer1.start_listening(config_1.primary_address()).await?;
+
+    // peer2 is only a bootstrap entry here; its network is never started
+    let bootstrap_bls = peer2.config.key_config().primary_public_key();
+    let rpc = RpcInfo {
+        http: "https://bootstrap.example:8545/".parse().expect("http url"),
+        ws: Some("wss://bootstrap.example:8546/".parse().expect("ws url")),
+    };
+    let bootstrap = P2pNode {
+        network_address: peer2.config.primary_address(),
+        network_key: peer2.config.primary_networkkey(),
+        rpc: Some(rpc.clone()),
+    };
+    peer1.add_bootstrap_peers(BTreeMap::from([(bootstrap_bls, bootstrap)])).await?;
+
+    // the configured endpoint resolves directly from the stub ...
+    assert_eq!(peer1.get_validator_rpc(bootstrap_bls).await?, Some(rpc.clone()));
+
+    // ... and is reported for the peer once it sits in the current committee
+    peer1.update_committees(Default::default(), [bootstrap_bls].into(), Default::default()).await?;
+    assert_eq!(peer1.get_all_validator_rpcs().await?, vec![(bootstrap_bls, rpc)]);
+
+    Ok(())
+}
+
 /// A pre-upgrade kad record (no `rpc` field) is signed over the legacy,
 /// un-domained encoding. After the domain-binding fix (GHSA-cc64-wfq5-56ph) that
 /// signature no longer verifies against this node's `(chain, role)` domain, so

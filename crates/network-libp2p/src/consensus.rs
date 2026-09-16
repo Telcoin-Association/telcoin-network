@@ -855,7 +855,9 @@ where
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
                 // exists, e.g. restored unpinned from persistence), but never overwrite an
-                // existing record with the config-derived stub
+                // existing record with the config-derived stub. an rpc endpoint the operator
+                // configured for the peer is carried through so it is usable before the peer's
+                // own record is learned; `cache_known_peer` strips it if malformed
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
                     peer.add_bootstrap_peer(
@@ -864,7 +866,7 @@ where
                             pubkey: info.network_key,
                             multiaddrs: vec![info.network_address],
                             timestamp: now(),
-                            rpc: None,
+                            rpc: info.rpc,
                         },
                     );
                 }
