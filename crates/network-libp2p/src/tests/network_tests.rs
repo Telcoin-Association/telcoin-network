@@ -3260,6 +3260,135 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The late-joiner ordering of [`test_advertise_rpc_via_kad`]: the nvv pins the target as a
+/// bootstrap-style stub and connects FIRST, so target's one-shot rpc-bearing record push
+/// lands while the nvv's committee set is still empty, and only THEN is the committee seeded.
+///
+/// This is what a node joining a running network with a cold datadir actually sees in
+/// production: `AddBootstrapPeers` pins a stub for every validator, each validator pushes its
+/// record on first connect, and the worker swarm's committee slots are seeded afterwards from
+/// epoch state. The sibling test seeds the committee before connecting and so never exercises
+/// this window. The advertised rpc must still be resolvable afterwards — either because the
+/// pushed record was admitted for the pinned key, or because the stub is chased via kad once
+/// the committee is known.
+#[tokio::test]
+async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+
+    let num_network_peers = 5;
+
+    // Set up multiple peers with the default config
+    let (mut target_peer, mut committee, _) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(num_network_peers).unwrap(),
+            None,
+        );
+
+    // inject an RPC descriptor into target peer's signed node record before spawn —
+    // simulates a validator that configured an `rpc` endpoint.
+    let rpc = RpcInfo {
+        http: "https://node1.example:8545/".parse().expect("http url"),
+        ws: Some("wss://node1.example:8546/".parse().expect("ws url")),
+    };
+    let mut target_network = target_peer.network.take().expect("target network is some");
+    let mut target_info = target_network.node_record.info.clone();
+    target_info.rpc = Some(rpc.clone());
+    let chain_id = target_peer.config.network_config().libp2p_config().chain_id;
+    let target_signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
+    let target_signature =
+        target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
+    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+    let target_peer_addr = target_peer.config.primary_address();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?id, ?res, "network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer_addr.clone()).await?;
+
+    // spawn the rest of the committee, connect each to target
+    for peer in committee.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        let id = peer.config.authority().as_ref().expect("authority").id();
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?id, ?res, "network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_trusted_peer_and_dial(
+                target_peer_bls,
+                target_peer_net.clone(),
+                target_peer_addr.clone(),
+            )
+            .await?;
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
+    }
+
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // spawn the 6th non-validator peer
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: nvv_config, network_handle: nvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("nvv network run failed!");
+    });
+    nvv.start_listening(nvv_config.primary_address()).await?;
+
+    // pin target as an operator stub and connect BEFORE the committee is seeded: this is the
+    // bootstrap-stub path (`add_trusted_peer_and_dial` pins and inserts a config stub, exactly
+    // like `AddBootstrapPeers`), and target's record push arrives on this first connection
+    nvv.add_trusted_peer_and_dial(
+        target_peer_bls,
+        target_peer_net.clone(),
+        target_peer_addr.clone(),
+    )
+    .await?;
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(5), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
+    // let target's self-advertised push land while the nvv's committee set is still empty
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // only now does the nvv learn the committee from epoch state
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
+
+    // ask the network to locate every committee member via kad
+    let authorities: Vec<BlsPublicKey> =
+        committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
+    nvv.find_authorities(authorities.clone()).await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // snapshot the advertised RPCs known on the NVV; only the target advertised
+    let mut all = nvv.get_all_validator_rpcs().await?;
+    all.sort_by_key(|(bls, _)| *bls);
+    assert_eq!(all.len(), 1, "exactly one advertised rpc expected; got {all:?}");
+    let (key, advertised) = &all[0];
+    assert_eq!(*key, target_peer_bls);
+    assert_eq!(*advertised, rpc);
+
+    // direct lookup for the advertising peer matches
+    assert_eq!(nvv.get_validator_rpc(target_peer_bls).await?, Some(rpc));
+    // and a non-advertising peer returns None
+    let other_bls = committee[0].config.key_config().primary_public_key();
+    assert_eq!(nvv.get_validator_rpc(other_bls).await?, None);
+
+    Ok(())
+}
+
 /// An operator can set `rpc` on a bootstrap peer entry (YAML/CLI, deserialized as a full
 /// [`P2pNode`]). The `AddBootstrapPeers` handler must carry that endpoint into the peer
 /// manager's stub instead of dropping it, so a node can forward transactions to the
