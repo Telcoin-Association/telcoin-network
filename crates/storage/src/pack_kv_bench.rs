@@ -17,11 +17,13 @@
 //!
 //! ## Columns
 //! Point-ops table: `pack-hdx` (mmap `msync` log keyed by `HdxIndex`), `pack-btree` (same log keyed
-//! by `BtreeIndex`), `mdbx-durable` (real fsync-on-commit via `TN_TEST_MDBX_SYNC=durable`, set by
+//! by `BtreeIndex`), `tndb` (the pack-file-backed [`Database`](crate::tndb::TnDatabase) — an
+//! append-log of values keyed by a `BtreeIndex`, driven through the typed table API),
+//! `mdbx-durable` (real fsync-on-commit via `TN_TEST_MDBX_SYNC=durable`, set by
 //! the bench — the apples-to-apples durability comparison), and `mdbx-nosync` (`SafeNoSync`, the
 //! `#[cfg(test)]` default — its delta vs `mdbx-durable` is MDBX's own fsync cost).
-//! Sorted table (digest omitted): `pack-btree` (ordered scan over the B+tree leaf chain, fetching
-//! each value) and `mdbx` (ordered scan over the MDBX cursor, `iter` / `skip_to`).
+//! Sorted table (digest omitted): `pack-btree` and `tndb` (ordered scans over the B+tree leaf
+//! chain, fetching each value) and `mdbx` (ordered scan over the MDBX cursor, `iter` / `skip_to`).
 //!
 //! ## Rows (per value size)
 //! - `write_bulk` — `N_BULK` inserts then **one** durability barrier (bulk-load throughput).
@@ -37,6 +39,10 @@
 //!   (the sorted table) at some point-lookup cost. Neither pack has cross-key atomic transactions —
 //!   a feature MDBX has that a replacement would need to add. Values use `PackCompression::None`.
 //! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; the packs use `msync`.
+//! - Unlike the raw `pack-*` columns (which msync only the WAL, rebuilding the index on recovery),
+//!   `tndb` is a full typed `Database`: its `commit` durably syncs **both** the value log and the
+//!   B+tree index, and its values carry an extra `encode` (bcs) layer — so `tndb` measures the
+//!   higher-level store, not just the raw pack.
 
 use std::{
     hash::BuildHasherDefault,
@@ -45,18 +51,18 @@ use std::{
 };
 
 use tempfile::TempDir;
-use tn_types::B256;
+use tn_types::{Database, DbTx as _, DbTxMut as _, Table, TableHint, B256};
 
-use crate::archive::{
-    btree_index::BtreeIndex,
-    digest_index::HdxIndex,
-    fxhasher::FxHasher,
-    index::Index as _,
-    pack::{Pack, PackCompression},
+use crate::{
+    archive::{
+        btree_index::BtreeIndex,
+        digest_index::HdxIndex,
+        fxhasher::FxHasher,
+        index::Index as _,
+        pack::{Pack, PackCompression},
+    },
+    tndb::TnDatabase,
 };
-
-#[cfg(feature = "reth-libmdbx")]
-use tn_types::{Database, DbTx as _, DbTxMut as _, Table, TableHint};
 
 #[cfg(feature = "reth-libmdbx")]
 use crate::mdbx::database::{MdbxDatabase, MEGABYTE};
@@ -256,20 +262,76 @@ impl SortedKvStore for PackBtreeKv {
     }
 }
 
-// ---- MDBX KV (feature-gated) ----
+// ---- typed-Database KV: a shared table driven through the `Database` trait ----
 
-/// Point-KV table: 32-byte key -> byte blob, on the durable `Epoch` route.
-#[cfg(feature = "reth-libmdbx")]
+/// Point-KV table: 32-byte key -> byte blob, on the durable `Epoch` route (shared by the `tndb`
+/// and MDBX columns).
 #[derive(Debug)]
 struct KvTable;
 
-#[cfg(feature = "reth-libmdbx")]
 impl Table for KvTable {
     type Key = B256;
     type Value = Vec<u8>;
     const NAME: &'static str = "kv";
     const HINT: TableHint = TableHint::Epoch;
 }
+
+// ---- tndb KV: the pack-file-backed `Database` (append-log values + sorted B+tree index) ----
+
+struct TnKv {
+    db: TnDatabase,
+}
+
+impl TnKv {
+    fn open(dir: &Path) -> Self {
+        let db = TnDatabase::open(dir).expect("open tndb");
+        db.open_table::<KvTable>().expect("open table");
+        Self { db }
+    }
+}
+
+impl KvStore for TnKv {
+    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+        let mut txn = self.db.write_txn().expect("write_txn");
+        for (k, v) in items {
+            txn.insert::<KvTable>(k, v).expect("insert");
+        }
+        txn.commit().expect("commit"); // durably syncs the value log + the index
+    }
+
+    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+        for (k, v) in items {
+            let mut txn = self.db.write_txn().expect("write_txn");
+            txn.insert::<KvTable>(k, v).expect("insert");
+            txn.commit().expect("commit");
+        }
+    }
+
+    fn read_rand(&mut self, keys: &[B256]) -> usize {
+        let txn = self.db.read_txn().expect("read_txn");
+        let mut hits = 0;
+        for k in keys {
+            if txn.get::<KvTable>(k).expect("get").is_some() {
+                hits += 1;
+            }
+        }
+        hits
+    }
+}
+
+impl SortedKvStore for TnKv {
+    fn scan_all(&mut self) -> usize {
+        // The B+tree index yields keys in order; `iter` fetches each value from the log.
+        self.db.iter::<KvTable>().count()
+    }
+
+    fn range_scan(&mut self, lo: B256, hi: B256) -> usize {
+        // `skip_to` seeks to the first key >= lo; take while below hi for a `[lo, hi)` scan.
+        self.db.skip_to::<KvTable>(&lo).expect("skip_to").take_while(|(k, _)| *k < hi).count()
+    }
+}
+
+// ---- MDBX KV (feature-gated) ----
 
 #[cfg(feature = "reth-libmdbx")]
 struct MdbxKv {
@@ -481,6 +543,8 @@ fn pack_vs_mdbx_bench() {
     cols.push(("pack-hdx", column(PackKv::open)));
     println!("  running pack-btree ...");
     cols.push(("pack-btree", column(PackBtreeKv::open)));
+    println!("  running tndb ...");
+    cols.push(("tndb", column(TnKv::open)));
 
     #[cfg(feature = "reth-libmdbx")]
     {
@@ -491,7 +555,7 @@ fn pack_vs_mdbx_bench() {
     }
 
     let legend = format!(
-        "legend: pack-hdx = mmap append-log + hash digest index; pack-btree = same log + sorted B+tree index (both msync barrier; the log is the WAL so the index is not synced). mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync. write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier msyncs the data log vs MDBX's single env commit."
+        "legend: pack-hdx = mmap append-log + hash digest index; pack-btree = same log + sorted B+tree index (both msync barrier; the log is the WAL so the index is not synced). tndb = the pack-file Database (append-log + B+tree index) via the typed table API — its commit syncs BOTH the log and the index. mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync. write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier msyncs the data log vs MDBX's single env commit."
     );
     print_table(
         "=== pack-file KV vs MDBX — point ops (ms; lower is better) ===",
@@ -510,6 +574,7 @@ fn pack_vs_mdbx_bench() {
     let sorted_rows = sorted_row_labels();
     let mut sorted_cols: Vec<(&str, Vec<Duration>)> = Vec::new();
     sorted_cols.push(("pack-btree", column_sorted(PackBtreeKv::open, lo, hi)));
+    sorted_cols.push(("tndb", column_sorted(TnKv::open, lo, hi)));
     #[cfg(feature = "reth-libmdbx")]
     {
         sorted_cols.push(("mdbx", column_sorted(|p| MdbxKv::open(p, false), lo, hi)));
