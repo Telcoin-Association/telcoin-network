@@ -36,7 +36,7 @@
 use tn_types::B256;
 
 use crate::archive::{
-    crc::{add_crc32, check_crc, crc_is_zero, crc_state, zero_crc, CrcState},
+    crc::{add_crc32, add_crc32_nonzero, check_crc, crc_is_zero, crc_state, zero_crc, CrcState},
     data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
@@ -347,7 +347,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             hdx_file.write_all(bloom.data())?;
             let bucket_size = header.bucket_size() as usize;
             let mut single_bucket = vec![0_u8; bucket_size];
-            add_crc32(&mut single_bucket[..]);
+            // Fresh main buckets are classified by `crc_state` (the open-time first-bucket guard
+            // and `bucket_crc_scan`), so stamp them never-zero to keep `Valid` disjoint
+            // from the all-zero dirty marker — a genuine crc of 0 must not be re-read
+            // as dirty.
+            add_crc32_nonzero(&mut single_bucket[..]);
             // Write buckets in large chunks to avoid 100k individual syscalls.
             // All buckets are identical (zeros + CRC32), so tile a chunk buffer.
             let chunk_buckets = 1024.min(header.buckets as usize);
@@ -892,6 +896,17 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Write the bloom filter to its fixed region (immediately after the header). Split out from
     /// the header write so [`Self::ordered_sync`] can make the bloom durable *before*
     /// publishing the header, which carries the `data_file_length` commit marker.
+    ///
+    /// NOTE (residual integrity gap): unlike each hash bucket, the bloom region carries no
+    /// CRC/length attestation and `files_consistent` does not cover it. At-rest corruption
+    /// confined to the bloom on an otherwise cleanly-sealed index (valid header marker +
+    /// first-bucket CRC) is therefore not detected, and yields a bloom false-negative — a
+    /// present digest reported `NotFound`, since the bloom fronts and short-circuits negative
+    /// lookups before the buckets. This is rare (bit-rot localized to this region on a sealed
+    /// file) and non-destructive: the data log stays the source of truth and any full index
+    /// rebuild (`db repair`, or any `files_consistent` failure) restores the bloom. Attesting
+    /// it would be an on-disk format change (version bump), deliberately deferred to keep the
+    /// format stable.
     fn write_bloom(&mut self) -> Result<(), io::Error> {
         self.hdx_file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.hdx_file.write_all(self.bloom.data())?;
@@ -942,7 +957,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let pos = self.bucket_pos(bucket);
             if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
                 if crc_is_zero(buffer) {
-                    add_crc32(buffer);
+                    // Main buckets are classified by `crc_state`; stamp never-zero so a genuine crc
+                    // of 0 is not re-read as the all-zero dirty marker.
+                    add_crc32_nonzero(buffer);
                 }
             }
         }

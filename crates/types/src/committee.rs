@@ -1079,17 +1079,6 @@ impl CommitteeBuilder {
         self.authorities.insert(protocol_key, authority);
     }
 
-    /// Add a bootstrap server to the committee builder.
-    pub fn add_bootstrap_server(
-        &mut self,
-        protocol_key: BlsPublicKey,
-        primary_node: P2pNode,
-        worker_nodes: Vec<P2pNode>,
-    ) {
-        let bootstrap = BootstrapServer::new(primary_node, worker_nodes);
-        self.bootstrap_server.insert(protocol_key, bootstrap);
-    }
-
     /// Build the [Committee].
     pub fn build(self) -> Committee {
         Committee::new(self.authorities, self.epoch, self.bootstrap_server, self.num_workers)

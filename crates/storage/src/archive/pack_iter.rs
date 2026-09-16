@@ -146,8 +146,16 @@ where
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
-        // On-disk frame consumed: 4-byte size prefix + payload + 4-byte CRC.
-        *pos += 4 + val_size as u64 + 4;
+        // On-disk frame consumed: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors
+        // the offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above
+        // plus real mmap file-size limits already make an overflow impossible, so this only
+        // formalizes it.
+        *pos = pos.checked_add(4 + val_size as u64 + 4).ok_or_else(|| {
+            FetchError::IO(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack record position overflow",
+            ))
+        })?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);

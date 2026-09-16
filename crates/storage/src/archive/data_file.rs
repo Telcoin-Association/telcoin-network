@@ -450,10 +450,14 @@ impl MmapDataFile {
     /// Drop the current mapping, resize the physical file to `new_len`, and re-map it (leaving it
     /// unmapped when `new_len == 0`). Never holds a mapping past EOF.
     fn remap(&mut self, new_len: u64) -> io::Result<()> {
-        self.backing = Backing::Empty; // release any existing map before resizing
+        // release any existing map before resizing
+        self.backing = Backing::Empty;
+        // Keep `capacity` consistent with `backing`: with no live mapping, a `set_len`/`map_mut`
+        // failure below must leave `capacity == 0` rather than a stale value that lies about the
+        // mapping size. Restored to `new_len` only once the new map is installed.
+        self.capacity = 0;
         self.file.set_len(new_len)?;
         if new_len == 0 {
-            self.capacity = 0;
             return Ok(());
         }
         // SAFETY: single-writer model; the file was sized to `new_len` immediately above.
@@ -794,7 +798,12 @@ impl Write for MmapDataFile {
             WriteMode::Append => self.end,
             WriteMode::Random => self.seek_pos,
         };
-        self.ensure_capacity(start + n)?;
+        // Checked add: in `WriteMode::Random` `start` is the caller-controlled seek position, so
+        // guard the end offset rather than wrap/panic — matching the overflow-hardened `seek`.
+        let write_end = start.checked_add(n).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "write offset overflows u64")
+        })?;
+        self.ensure_capacity(write_end)?;
         let start_us = start as usize;
         match &mut self.backing {
             Backing::Rw(map) => map[start_us..start_us + buf.len()].copy_from_slice(buf),
@@ -831,22 +840,30 @@ impl Drop for MmapDataFile {
         if self.read_only {
             return;
         }
-        // Clean close: msync, truncate away the padding, then append an 8-byte clean-close sentinel
-        // and fsync so the on-disk file is exactly `end` data bytes plus the sentinel and durable —
-        // a reopen validates the sentinel, strips it back to `end`, and knows the file was sealed.
-        // A 0-length file is left empty (nothing to seal).
-        if let Err(e) = self.flush_dirty(true) {
-            if !std::thread::panicking() {
-                tracing::error!("MmapDataFile: failed to msync on drop: {e}");
+        // Clean close: msync, truncate away the padding, then (only if the msync succeeded) append
+        // an 8-byte clean-close sentinel and fsync so the on-disk file is exactly `end` data bytes
+        // plus the sentinel and durable — a reopen validates the sentinel, strips it back to `end`,
+        // and knows the file was sealed. A 0-length file is left empty (nothing to seal).
+        let flushed = match self.flush_dirty(true) {
+            Ok(()) => true,
+            Err(e) => {
+                if !std::thread::panicking() {
+                    tracing::error!("MmapDataFile: failed to msync on drop: {e}");
+                }
+                false
             }
-        }
+        };
         self.backing = Backing::Empty; // unmap before truncating
         if let Err(e) = self.file.set_len(self.end) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to truncate on drop: {e}");
             }
         }
-        if self.end > 0 {
+        // Only stamp the clean-close sentinel when the tail msync succeeded. If it failed we cannot
+        // vouch for the durability of the `[flushed_end, end)` tail, so leave the file unsentineled
+        // and let the next open take the recovery/heal path rather than trust a possibly-short
+        // tail.
+        if flushed && self.end > 0 {
             let sentinel = clean_close_sentinel(self.end);
             if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
                 if !std::thread::panicking() {

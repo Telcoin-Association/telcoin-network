@@ -14,7 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use super::run_epoch::retry_provider_faults;
+use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::{collections::BTreeSet, path::Path, time::Duration};
@@ -526,6 +526,9 @@ where
     /// removal) runs on tokio's blocking pool ([`tokio::task::spawn_blocking`]), never on a
     /// runtime worker thread. The one pre-spawn removal below goes through the same offload,
     /// since `run_epoch` awaits this method on the epoch-close critical path.
+    /// Successful publication applies the optional completed-bundle retention limit on the
+    /// blocking pool. Publication and pruning are serialized across completion tasks; an older
+    /// completion outside the newest retained epochs is skipped before its atomic rename.
     pub(super) async fn export_epoch_state(
         &self,
         primary: &PrimaryNode<DB>,
@@ -601,6 +604,7 @@ where
         // this returns.
         let consensus_chain = self.consensus_chain.clone();
         let consensus_bus = self.consensus_bus.clone();
+        let state_export_retention = self.state_export_retention.clone();
 
         // The previous boundary's published bundle, if any: lets the completion task build the
         // records/certs bundle by copy + single append instead of a full 0..=N rebuild. It can be
@@ -722,25 +726,18 @@ where
                                 return Ok(());
                             }
 
-                            match std::fs::rename(&tmp_dir, &final_dir) {
-                                Ok(()) => {
-                                    // Durably publish the atomic rename: fsync the parent dir so the
-                                    // new directory entry survives a crash (the rename is atomic vs
-                                    // observers, but not durable on its own).
-                                    if let Some(parent) = final_dir.parent().map(Path::to_path_buf) {
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            std::fs::File::open(&parent).and_then(|d| d.sync_all())
-                                        })
-                                        .await;
-                                    }
-                                    info!(
-                                        target: "tn::snapshot",
-                                        epoch,
-                                        block = outcome.block.number,
-                                        accounts = outcome.stats.account_count,
-                                        path = ?final_dir,
-                                        "exported epoch state + consensus + records + certs"
-                                    );
+                            match state_export_retention.publish(tmp_dir.clone(), epoch).await {
+                                Ok(PublishOutcome::Published) => info!(
+                                    target: "tn::snapshot",
+                                    epoch,
+                                    block = outcome.block.number,
+                                    accounts = outcome.stats.account_count,
+                                    path = ?final_dir,
+                                    "exported epoch state + consensus + records + certs"
+                                ),
+                                Ok(PublishOutcome::Superseded) => {
+                                    info!(target: "tn::snapshot", epoch, "skipped state export publication: newer bundles fill the retention window");
+                                    remove_tmp_export(&tmp_dir, epoch).await;
                                 }
                                 Err(e) => {
                                     error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
