@@ -1375,10 +1375,12 @@ async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
 async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
     let mut peer_manager = create_test_peer_manager(None);
 
-    // a current-committee member with a known record that advertises no rpc
+    // a current-committee member whose own signed record, learned via kad, advertises no rpc.
+    // the record must be network-learned (not an operator stub): a stub says nothing about
+    // what the peer advertises and is chased, whereas a learned rpc-less record is final
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
-    peer_manager.add_known_peer(bls, random_network_info());
     peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    peer_manager.add_discovered_peer(bls, random_network_info());
     // isolate the call under test from anything update_committees emitted
     collect_all_events(&mut peer_manager);
 
@@ -1387,12 +1389,12 @@ async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
         peer_manager.current_committee_rpcs().is_empty(),
         "member without advertised rpc must be excluded"
     );
-    // ... and its record is known, so no futile re-discovery is triggered
+    // ... and its record is learned, so no futile re-discovery is triggered
     let events = collect_all_events(&mut peer_manager);
     let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
     assert!(
         missing_events.is_empty(),
-        "a known record without rpc must not trigger discovery from the snapshot call"
+        "a learned record without rpc must not trigger discovery from the snapshot call"
     );
 }
 
@@ -1419,6 +1421,139 @@ async fn test_current_committee_rpcs_triggers_discovery_for_missing_records() {
         missing_events.first().unwrap(),
         PeerEvent::MissingAuthorities(missing) if *missing == [unknown_bls]
     );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_rediscovers_members_held_as_bootstrap_stub() {
+    // A bootstrap stub is a config-derived dial hint, not the peer's advertisement record: it
+    // carries no rpc and says nothing about whether the peer advertises one. A current member
+    // held only as a stub must be chased exactly like an unknown member, and the chase must go
+    // quiet once the real record lands.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([59; 32])).public();
+
+    // the cold-store bootstrap stub for a current-committee member
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // the stub has no rpc to report ...
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "bootstrap stub has no rpc to report"
+    );
+    // ... and, being unlearned, re-triggers kad discovery for the member
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "expect one missing authorities event for the stub");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [bls]
+    );
+
+    // the peer's real record arrives via kad: the snapshot converges and the chase stops
+    let (real, rpc) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, real);
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "learned record's rpc must be returned"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.is_empty(), "a learned record must not be re-discovered");
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_no_rediscovery_for_learned_record_without_rpc() {
+    // Chasing is keyed on "is the record learned?", not "does it carry an rpc?": a validator
+    // that genuinely advertises nothing must not cause kad churn, including one whose stub was
+    // replaced by an rpc-less learned record.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([61; 32])).public();
+
+    // the member starts as a bootstrap stub, so it is chased ...
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    // ... until its own signed record arrives, advertising no rpc
+    peer_manager.add_discovered_peer(bls, random_network_info());
+    collect_all_events(&mut peer_manager);
+
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without advertised rpc must be excluded"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "a learned record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_find_authorities_chases_bootstrap_stubs() {
+    // `find_authorities` shares the unlearned predicate with `trigger_missing_authorities`: a
+    // bootstrap stub is reported as missing until the peer's own record replaces it.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([67; 32])).public();
+
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    collect_all_events(&mut peer_manager);
+
+    // the stub is chased
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "find_authorities emits one event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [bls]
+    );
+
+    // the peer's real record arrives via kad (admitted because the key is now a committee member)
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+    let (real, _) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, real);
+
+    // `find_authorities` always emits one event; its payload is now empty
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "find_authorities emits one event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_peer_does_not_mark_learned_record_as_stub() {
+    // `add_bootstrap_peer` never overwrites an existing record, so it must not mark a learned
+    // record as a stub either: doing so would make discovery chase a record it already holds.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([71; 32])).public();
+
+    // the member's own record is learned first (e.g. a warm kad store)
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    let (learned, rpc) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, learned);
+    collect_all_events(&mut peer_manager);
+
+    // then the operator's bootstrap config lands for the same key
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    assert!(!peer_manager.stub_records.contains(&bls), "learned record must stay learned");
+    assert!(peer_manager.pinned_peers.contains(&bls), "bootstrap peer must be pinned");
+
+    // the learned rpc is still reported and the member is not chased
+    assert_eq!(peer_manager.current_committee_rpcs(), vec![(bls, rpc)]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.is_empty(), "a learned record must not be re-discovered");
 }
 
 #[tokio::test]
