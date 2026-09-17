@@ -483,7 +483,10 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    // The observer may still be syncing startup epoch records after the validators are ready.
+    wait_until_blocking(Duration::from_secs(45), "observer RPC ready", || {
+        Ok(get_block_number(obs_url).is_ok())
+    })?;
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
