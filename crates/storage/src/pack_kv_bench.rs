@@ -19,11 +19,12 @@
 //! Point-ops table: `pack-hdx` (mmap `msync` log keyed by `HdxIndex`), `pack-btree` (same log keyed
 //! by `BtreeIndex`), `tndb` (the pack-file-backed [`Database`](crate::tndb::TnDatabase) — an
 //! append-log of values keyed by a `BtreeIndex`, driven through the typed table API),
-//! `mdbx-durable` (real fsync-on-commit via `TN_TEST_MDBX_SYNC=durable`, set by
+//! `mem` (the in-memory [`MemDatabase`](crate::mem_db::MemDatabase) baseline — a sorted `BTreeMap`,
+//! no disk), `mdbx-durable` (real fsync-on-commit via `TN_TEST_MDBX_SYNC=durable`, set by
 //! the bench — the apples-to-apples durability comparison), and `mdbx-nosync` (`SafeNoSync`, the
 //! `#[cfg(test)]` default — its delta vs `mdbx-durable` is MDBX's own fsync cost).
-//! Sorted table (digest omitted): `pack-btree` and `tndb` (ordered scans over the B+tree leaf
-//! chain, fetching each value) and `mdbx` (ordered scan over the MDBX cursor, `iter` / `skip_to`).
+//! Sorted table (digest omitted): `pack-btree`, `tndb`, and `mem` (ordered scans, fetching each
+//! value) and `mdbx` (ordered scan over the MDBX cursor, `iter` / `skip_to`).
 //!
 //! ## Rows (per value size)
 //! - `write_bulk` — `N_BULK` inserts then **one** durability barrier (bulk-load throughput).
@@ -61,6 +62,7 @@ use crate::{
         index::Index as _,
         pack::{Pack, PackCompression},
     },
+    mem_db::MemDatabase,
     tndb::TnDatabase,
 };
 
@@ -331,6 +333,61 @@ impl SortedKvStore for TnKv {
     }
 }
 
+// ---- in-memory KV: the `MemDatabase` baseline (sorted `BTreeMap`, no disk) ----
+
+struct MemKv {
+    db: MemDatabase,
+}
+
+impl MemKv {
+    fn open(_dir: &Path) -> Self {
+        // In-memory: the bench dir is unused, and `commit` is a no-op, so the "durable" rows are a
+        // pure in-memory structure cost — a lower bound for the disk-backed stores.
+        let db = MemDatabase::new();
+        db.open_table::<KvTable>().expect("open table");
+        Self { db }
+    }
+}
+
+impl KvStore for MemKv {
+    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+        let mut txn = self.db.write_txn().expect("write_txn");
+        for (k, v) in items {
+            txn.insert::<KvTable>(k, v).expect("insert");
+        }
+        txn.commit().expect("commit");
+    }
+
+    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+        for (k, v) in items {
+            let mut txn = self.db.write_txn().expect("write_txn");
+            txn.insert::<KvTable>(k, v).expect("insert");
+            txn.commit().expect("commit");
+        }
+    }
+
+    fn read_rand(&mut self, keys: &[B256]) -> usize {
+        let txn = self.db.read_txn().expect("read_txn");
+        let mut hits = 0;
+        for k in keys {
+            if txn.get::<KvTable>(k).expect("get").is_some() {
+                hits += 1;
+            }
+        }
+        hits
+    }
+}
+
+impl SortedKvStore for MemKv {
+    fn scan_all(&mut self) -> usize {
+        self.db.iter::<KvTable>().count()
+    }
+
+    fn range_scan(&mut self, lo: B256, hi: B256) -> usize {
+        self.db.skip_to::<KvTable>(&lo).expect("skip_to").take_while(|(k, _)| *k < hi).count()
+    }
+}
+
 // ---- MDBX KV (feature-gated) ----
 
 #[cfg(feature = "reth-libmdbx")]
@@ -545,6 +602,8 @@ fn pack_vs_mdbx_bench() {
     cols.push(("pack-btree", column(PackBtreeKv::open)));
     println!("  running tndb ...");
     cols.push(("tndb", column(TnKv::open)));
+    println!("  running mem ...");
+    cols.push(("mem", column(MemKv::open)));
 
     #[cfg(feature = "reth-libmdbx")]
     {
@@ -575,6 +634,7 @@ fn pack_vs_mdbx_bench() {
     let mut sorted_cols: Vec<(&str, Vec<Duration>)> = Vec::new();
     sorted_cols.push(("pack-btree", column_sorted(PackBtreeKv::open, lo, hi)));
     sorted_cols.push(("tndb", column_sorted(TnKv::open, lo, hi)));
+    sorted_cols.push(("mem", column_sorted(MemKv::open, lo, hi)));
     #[cfg(feature = "reth-libmdbx")]
     {
         sorted_cols.push(("mdbx", column_sorted(|p| MdbxKv::open(p, false), lo, hi)));
