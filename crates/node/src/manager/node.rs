@@ -1279,7 +1279,7 @@ where
         //
 
         // create one long-running swarm per configured worker
-        // the per-epoch code still drives worker 0 only (#557 loops over worker components)
+        // Epoch entry activates the on-chain worker prefix of these process-lifetime swarms.
         self.worker_network_handles = workers
             .into_iter()
             .map(|PreparedWorkerNetwork { worker_id, p2p, event_stream }| {
