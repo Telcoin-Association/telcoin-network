@@ -9,11 +9,13 @@
 //! `AuthorityIdentifier` is `Arc<[u8; 32]>` — 8 bytes in memory but 32 encoded), so the length is
 //! taken from `encode_key(key).len()` and the index is created lazily on the first insert.
 //!
-//! This is step one: a functional implementation modeled on `mem_db`.  Later steps cover pack
-//! compaction on clear, warm-start reads before the first insert, streaming (non-collecting)
-//! iterators, and durability-barrier tuning.
+//! This is step one: a functional implementation modeled on `mem_db`.  Scans are lazy in the
+//! expensive part (value fetch/decode is deferred per `next()`), though the index positions are
+//! still walked up front.  Later steps cover pack compaction on clear, warm-start reads before the
+//! first insert, fully-streaming index scans, and durability-barrier tuning.
 
 use std::{
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,7 +25,7 @@ use parking_lot::Mutex;
 use tn_types::{decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
 
 use crate::archive::{
-    btree_index::BtreeIndex,
+    btree_index::{BtreeIndex, BtreeIter},
     error::fetch::FetchError,
     pack::{Pack, PackCompression},
 };
@@ -118,35 +120,88 @@ fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
     if let Some(table) = store.get(T::NAME) {
         let mut table = table.lock();
         table.data.commit()?;
-        if let Some(idx) = table.idx.as_mut() {
+        /*XXXXif let Some(idx) = table.idx.as_mut() {
             idx.sync()?;
-        }
+        }*/
     }
     Ok(())
 }
 
-/// Collect a table's `(key, value)` pairs selected by `select` (an index-iterator builder) into a
-/// sorted vec.  Positions are drained from the index first so its borrow ends before the log is
-/// read (both live behind one `MutexGuard`).  Eager collection is the step-one choice; streaming is
-/// a later step.
-fn collect_entries<T, F>(store: &StoreType, select: F) -> Vec<(T::Key, T::Value)>
+/// How to build the underlying [`BtreeIndex`] iterator for a scan.  A trait rather than a closure
+/// so the returned iterator can borrow the `&mut BtreeIndex` argument — the elided return lifetime
+/// a closure bound can't express.
+trait MakeIter {
+    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError>;
+}
+
+/// Ascending scan over every entry.
+struct Forward;
+impl MakeIter for Forward {
+    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
+        idx.iter()
+    }
+}
+
+/// Descending scan over every entry.
+struct Reverse;
+impl MakeIter for Reverse {
+    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
+        idx.rev_iter()
+    }
+}
+
+/// Ascending scan from `key_bytes` (inclusive) to the end.
+struct FromKey(Vec<u8>);
+impl MakeIter for FromKey {
+    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
+        idx.range(self.0..)
+    }
+}
+
+/// A lazy [`DBIter`] over one table.  The `(key_bytes, position)` pairs are walked from the B+tree
+/// index up front (cheap), but each value is fetched from the log and decoded on demand in `next()`
+/// — deferring the expensive fetch/decode/decompress so early-terminating consumers don't pay for
+/// values they never read.  (A fully streaming index walk is blocked by the self-referential borrow
+/// of a live `BtreeIter` over the locked table; a snapshotted position stays valid because the log
+/// is append-only, so a concurrent remove/clear never invalidates it.)
+struct TnDbIter<T: Table> {
+    table: Arc<Mutex<TnTable>>,
+    positions: std::vec::IntoIter<(Vec<u8>, u64)>,
+    casper: PhantomData<T>,
+}
+
+impl<T: Table> Iterator for TnDbIter<T> {
+    type Item = (T::Key, T::Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key_bytes, pos) = self.positions.next()?;
+        // End the scan on a read error (see `Database::iter`).
+        let value_bytes = self.table.lock().data.fetch(pos).ok()?;
+        Some((decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes)))
+    }
+}
+
+/// A lazy, sorted iterator over a table's `(key, value)` pairs: it walks the B+tree index iterator
+/// built by `maker` for the `(key, position)` pairs, then decodes the key and fetches + decodes the
+/// value per `next()`.  Yields an empty iterator when the table is absent, has no index yet, or the
+/// scan cannot be positioned.
+fn collect_entries<'a, T, M>(store: &StoreType, maker: M) -> DBIter<'static, T>
 where
     T: Table,
-    F: FnOnce(&mut BtreeIndex) -> Result<Vec<(Vec<u8>, u64)>, FetchError>,
+    M: MakeIter,
 {
-    let Some(table) = store.get(T::NAME) else { return Vec::new() };
-    let mut table = table.lock();
-    let positions = match table.idx.as_mut() {
-        Some(idx) => select(idx).unwrap_or_default(),
-        None => Vec::new(),
+    let table = match store.get(T::NAME) {
+        Some(table) => Arc::clone(&table),
+        None => return Box::new(std::iter::empty()),
     };
-    let mut out = Vec::with_capacity(positions.len());
-    for (key_bytes, pos) in positions {
-        if let Ok(value_bytes) = table.data.fetch(pos) {
-            out.push((decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes)));
+    let positions: Vec<(Vec<u8>, u64)> = {
+        let mut guard = table.lock();
+        match guard.idx.as_mut() {
+            Some(idx) => maker.make(idx).and_then(|it| it.collect()).unwrap_or_default(),
+            None => Vec::new(),
         }
-    }
-    out
+    };
+    Box::new(TnDbIter::<T> { table, positions: positions.into_iter(), casper: PhantomData })
 }
 
 /// Fetch the single `(key, value)` a one-shot index lookup lands on.
@@ -301,18 +356,15 @@ impl Database for TnDatabase {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        Box::new(collect_entries::<T, _>(&self.store, |idx| idx.iter()?.collect()).into_iter())
+        collect_entries::<T, _>(&self.store, Forward)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        let key_bytes = encode_key(key);
-        let entries =
-            collect_entries::<T, _>(&self.store, move |idx| idx.range(key_bytes..)?.collect());
-        Ok(Box::new(entries.into_iter()))
+        Ok(collect_entries::<T, _>(&self.store, FromKey(encode_key(key))))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        Box::new(collect_entries::<T, _>(&self.store, |idx| idx.rev_iter()?.collect()).into_iter())
+        collect_entries::<T, _>(&self.store, Reverse)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
