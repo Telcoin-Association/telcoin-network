@@ -38,8 +38,8 @@ use tn_types::{
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Multiaddr,
-    P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    NetworkPublicKey, P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager,
+    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -88,6 +88,22 @@ struct PreparedWorkerNetwork<Events> {
     p2p: P2pNode,
     /// The persistent event stream at the same index as the worker configuration.
     event_stream: Events,
+}
+
+/// Reject an advertised primary identity that differs from the loaded keystore before spawning
+/// any process-lifetime network.
+fn check_primary_network_key(
+    network_key: &NetworkPublicKey,
+    key_config: &KeyConfig,
+) -> eyre::Result<()> {
+    let expected = key_config.primary_network_public_key();
+    eyre::ensure!(
+        *network_key == expected,
+        "node config `node_info.p2p_info.primary.network_key` does not match the key derived \
+         from the loaded BLS keystore (expected {expected}, found {network_key}): set this entry \
+         to the expected value"
+    );
+    Ok(())
 }
 
 /// Reject multi-worker layouts before the fork, before checking local capacity at either entry
@@ -945,7 +961,7 @@ where
                 let worker_address = if worker_id == DEFAULT_WORKER_ID {
                     Self::parse_listener_address_for_swarm(
                         "WORKER_LISTENER_MULTIADDR",
-                        node_info.p2p_info.primary.network_key.clone(),
+                        manager.key_config.worker_network_public_key(worker_id),
                         configured_address,
                     )?
                 } else {
@@ -1210,7 +1226,8 @@ where
     /// The configured worker count must be at least the raw chain count at the previous epoch's
     /// closing block (genesis for epoch 0) before any swarm is created. This includes fresh genesis
     /// where accumulator catchup is a no-op. Worker RPC descriptors and event streams validate
-    /// together.
+    /// together. The configured primary identity must match the loaded keystore before either
+    /// primary or worker swarm construction.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
@@ -1218,6 +1235,10 @@ where
         epoch: Epoch,
         on_chain_workers: usize,
     ) -> eyre::Result<()> {
+        check_primary_network_key(
+            &self.builder.tn_config.node_info.p2p_info.primary.network_key,
+            &self.key_config,
+        )?;
         let workers = prepare_worker_networks(
             &self.builder.tn_config.node_info.p2p_info.workers,
             &self.worker_event_streams,
@@ -1653,6 +1674,36 @@ mod tests {
     /// Reproducible keys for checking the identity assigned to each prepared swarm.
     fn worker_key_config() -> KeyConfig {
         KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1315)))
+    }
+
+    /// A primary key derived from the loaded keystore passes startup validation.
+    #[test]
+    fn check_primary_network_key_accepts_matching_key() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        check_primary_network_key(&keys.primary_network_public_key(), &keys)
+    }
+
+    /// Worker keys and primary keys from another keystore fail with pasteable replacement keys.
+    #[test]
+    fn check_primary_network_key_rejects_mismatched_keys() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let other_keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1374)));
+        let expected = keys.primary_network_public_key();
+        [keys.worker_network_public_key(DEFAULT_WORKER_ID), other_keys.primary_network_public_key()]
+            .into_iter()
+            .try_for_each(|network_key| -> eyre::Result<()> {
+                let error = check_primary_network_key(&network_key, &keys)
+                    .err()
+                    .ok_or_else(|| eyre!("expected mismatched primary network key"))?;
+                let message = error.to_string();
+                assert!(message.contains("node_info.p2p_info.primary.network_key"));
+                assert!(message.contains(&format!("expected {expected}, found {network_key}")));
+                assert!(message.contains("set this entry to the expected value"));
+                assert_eq!(serde_json::to_value(&expected)?, expected.to_string());
+                assert_eq!(serde_json::to_value(&network_key)?, network_key.to_string());
+                Ok(())
+            })
     }
 
     /// Give each worker a distinct advertised address, derived network key, and RPC endpoint.
