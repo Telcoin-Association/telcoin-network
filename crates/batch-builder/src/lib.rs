@@ -419,12 +419,13 @@ impl BatchBuilder {
         loop {
             // refresh the pending-pool gauge on every wake, gated or not: operators watch it
             // exactly while a backoff or an in-flight build is holding the gate closed
-            self.metrics.pending_pool_transactions.set(self.pool.pool_size().pending as f64);
+            let pending = self.pool.pool_size().pending;
+            self.metrics.pending_pool_transactions.set(pending as f64);
             // only propose one block at a time; a live refusal backoff also holds the gate
             // closed, so a canonical-state wake-up cannot bypass it (issue #1145)
             let backing_off = self.refusal_backoff_holds();
             if self.pending_task.is_none() && !defer_build && !backing_off {
-                if self.pool.pending_transactions().is_empty() {
+                if pending == 0 {
                     // reset interval to wake up after some time
                     //
                     // only need to reset here if there is no pending block being built
