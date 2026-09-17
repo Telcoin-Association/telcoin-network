@@ -855,7 +855,9 @@ where
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
                 // exists, e.g. restored unpinned from persistence), but never overwrite an
-                // existing record with the config-derived stub
+                // existing record with the config-derived stub. an rpc endpoint the operator
+                // configured for the peer is carried through so it is usable before the peer's
+                // own record is learned; `cache_known_peer` strips it if malformed
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
                     peer.add_bootstrap_peer(
@@ -864,7 +866,7 @@ where
                             pubkey: info.network_key,
                             multiaddrs: vec![info.network_address],
                             timestamp: now(),
-                            rpc: None,
+                            rpc: info.rpc,
                         },
                     );
                 }
@@ -2071,8 +2073,11 @@ where
                     trace!(target: "network-kad", "Got record {key} {value:?}");
 
                     // Confirm before the fallible store write, including for equal or older records.
-                    // The peer manager never reads the store, keeps relays committee-gated, checks
-                    // committee freshness, and requires source to match a non-committee identity.
+                    // The peer manager never reads the store. It caches the record for a committee
+                    // member or a pinned (operator-provisioned) key, relays included, with the
+                    // freshness check waived only while the entry is still a config stub; for any
+                    // other key it only confirms the sender's own identity and requires source to
+                    // match the advertised one.
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
