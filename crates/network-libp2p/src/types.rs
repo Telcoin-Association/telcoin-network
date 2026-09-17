@@ -418,10 +418,15 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
     },
-    /// Collection of this node's connected peers.
+    /// Peer IDs connected or currently being dialed by the peer manager.
     ConnectedPeerIds {
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Number of established peers available to `SendRequestAny`.
+    EstablishedPeerCount {
+        /// Reply to caller, excluding pending dials.
+        reply: oneshot::Sender<usize>,
     },
     /// Collection of this node's connected peers.
     ConnectedPeers {
@@ -682,11 +687,24 @@ where
         published.await?.map_err(Into::into)
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Count peers connected or currently being dialed by the peer manager.
+    ///
+    /// Pending dials may not support requests yet. Use [`Self::established_peer_count`] for
+    /// readiness checks.
     pub async fn connected_peer_count(&self) -> NetworkResult<usize> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
         Ok(peers.await?.len())
+    }
+
+    /// Count established peers in the queue used by [`Self::send_request_any`], excluding dials
+    /// that have not established a connection yet.
+    ///
+    /// This is a snapshot: a peer can disconnect before a subsequent request is sent.
+    pub async fn established_peer_count(&self) -> NetworkResult<usize> {
+        let (reply, count) = oneshot::channel();
+        self.sender.send(NetworkCommand::EstablishedPeerCount { reply }).await?;
+        count.await.map_err(Into::into)
     }
 
     /// Retrieve a collection of connected peers.

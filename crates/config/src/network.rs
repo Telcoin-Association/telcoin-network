@@ -3,8 +3,8 @@
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, time::Duration};
-use tn_types::{Round, WorkerId};
+use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
+use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -24,9 +24,38 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// The hostname for the validator.
     hostname: String,
+    /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
+    ///
+    /// A nonempty map replaces the genesis bootstrap set in full; entries are never merged.
+    /// An empty or absent map preserves the genesis fallback. A CLI override takes precedence
+    /// over this map, with an explicitly empty override selecting the genesis fallback.
+    /// Committee membership and gossip publisher authorization remain derived from chain state.
+    bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl NetworkConfig {
+    /// Return the configured bootstrap dial hints.
+    pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
+        &self.bootstrap_peers
+    }
+
+    /// Select bootstrap dial hints: CLI override, then network config, then genesis.
+    ///
+    /// The selected override or config map replaces genesis in full when nonempty. An empty
+    /// selected map falls back to genesis, including when the CLI explicitly supplies `{}`.
+    pub fn resolve_bootstrap_peers(
+        &self,
+        genesis: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        let configured = cli_override.unwrap_or(&self.bootstrap_peers);
+        if configured.is_empty() {
+            genesis.clone()
+        } else {
+            configured.clone()
+        }
+    }
+
     /// Return a reference to the [SyncConfig].
     pub fn sync_config(&self) -> &SyncConfig {
         &self.sync_config
@@ -150,9 +179,20 @@ pub struct LibP2pConfig {
     pub kad_record_ttl: Duration,
     /// How often this node republishes its own kademlia records.
     ///
-    /// Must be < `kad_record_ttl`, otherwise records expire before they are
-    /// refreshed.
+    /// Must be nonzero to give republication a positive cadence. Must also be <
+    /// `kad_record_ttl`, otherwise records expire before they are refreshed.
     pub kad_publication_interval: Duration,
+    /// How often this node replicates every stored record (its own and others') to the
+    /// `replication_factor` closest peers.
+    ///
+    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
+    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
+    /// so the value is a deliberate choice rather than an inherited libp2p default; the
+    /// default matches the libp2p default (1h).
+    ///
+    /// Exactly zero panics libp2p's replication job on the first swarm poll. Must also be <
+    /// `kad_record_ttl`, otherwise other publishers' records expire before they are re-replicated.
+    pub kad_replication_interval: Duration,
     /// The chain id, used to namespace every libp2p wire protocol and gossip
     /// topic so nodes on different chains never negotiate a connection or share
     /// a gossip mesh.
@@ -166,6 +206,39 @@ pub struct LibP2pConfig {
 }
 
 impl LibP2pConfig {
+    /// Reject kad cadences that would panic the network task or break record persistence.
+    ///
+    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
+    /// equal to the current time, triggering its unconditional assertion on the first swarm
+    /// poll. Publication and replication must also occur before records expire. Validate at
+    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
+    /// configuration error before either critical network task starts.
+    pub fn validate(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.kad_replication_interval.is_zero(),
+            "LibP2pConfig.kad_replication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_replication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_replication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are re-replicated",
+            self.kad_replication_interval,
+            self.kad_record_ttl,
+        );
+        eyre::ensure!(
+            !self.kad_publication_interval.is_zero(),
+            "LibP2pConfig.kad_publication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_publication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_publication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are refreshed",
+            self.kad_publication_interval,
+            self.kad_record_ttl,
+        );
+        Ok(())
+    }
+
     /// Return the primary gossip topic for `chain_id`.
     pub fn primary_topic(chain_id: u64) -> String {
         format!("tn-primary-{chain_id}")
@@ -200,6 +273,7 @@ impl Default for LibP2pConfig {
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            kad_replication_interval: Duration::from_secs(60 * 60),
             // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
             chain_id: 0,
         }
@@ -560,6 +634,108 @@ impl ScoreConfig {
 mod tests {
     use super::*;
 
+    /// Use the checked-in genesis peers so fixtures exercise real key decoding.
+    fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
+        serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
+            .map(|committee| committee.bootstrap_servers())
+            .map_err(Into::into)
+    }
+
+    /// Network config round-trips every worker and peer in the current bootstrap format.
+    #[test]
+    fn bootstrap_peers_yaml_round_trips_multiple_workers() -> eyre::Result<()> {
+        let mut peers = bootstrap_fixture()?;
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(peers.values().all(|server| server.num_workers() == 2));
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        let yaml = serde_yaml::to_string(&config)?;
+        let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+        assert_eq!(parsed.bootstrap_peers(), &peers);
+        Ok(())
+    }
+
+    /// Missing files, absent keys, and explicit empty maps preserve the genesis fallback.
+    #[test]
+    fn bootstrap_peers_default_and_legacy_configs_use_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let dir = tempfile::tempdir()?;
+        let missing = NetworkConfig::read_config(&dir.path().to_path_buf())?;
+        assert!(missing.bootstrap_peers().is_empty());
+        assert_eq!(missing.resolve_bootstrap_peers(&genesis, None), genesis);
+
+        let mut legacy = serde_yaml::to_value(NetworkConfig::default())?;
+        assert!(legacy
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected network config mapping"))?
+            .remove(&serde_yaml::Value::String("bootstrap_peers".into()))
+            .is_some());
+        ["{}".to_owned(), "bootstrap_peers: {}".to_owned(), serde_yaml::to_string(&legacy)?]
+            .into_iter()
+            .try_for_each(|yaml| -> eyre::Result<()> {
+                let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+                assert!(parsed.bootstrap_peers().is_empty());
+                assert_eq!(parsed.resolve_bootstrap_peers(&genesis, None), genesis);
+                Ok(())
+            })
+    }
+
+    /// The map inherits BootstrapServer's legacy single-worker reader.
+    #[test]
+    fn bootstrap_peers_accept_legacy_worker_shape() -> eyre::Result<()> {
+        let expected = bootstrap_fixture()?;
+        let mut peers = serde_yaml::to_value(&expected)?;
+        peers
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected peer map"))?
+            .iter_mut()
+            .try_for_each(|(_, server)| -> eyre::Result<()> {
+                let worker = server
+                    .get("workers")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .and_then(|workers| workers.first())
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("expected a worker"))?;
+                let server =
+                    server.as_mapping_mut().ok_or_else(|| eyre::eyre!("expected server map"))?;
+                assert!(server.remove(&serde_yaml::Value::String("workers".into())).is_some());
+                server.insert(serde_yaml::Value::String("worker".into()), worker);
+                Ok(())
+            })?;
+        let mut config = serde_yaml::Mapping::new();
+        config.insert(serde_yaml::Value::String("bootstrap_peers".into()), peers);
+        let parsed: NetworkConfig = serde_yaml::from_value(serde_yaml::Value::Mapping(config))?;
+        assert_eq!(parsed.bootstrap_peers(), &expected);
+        assert!(parsed.bootstrap_peers().values().all(|server| server.num_workers() == 1));
+        Ok(())
+    }
+
+    /// A nonempty configured map replaces all genesis peers, including colliding entries.
+    #[test]
+    fn bootstrap_peers_config_replaces_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let mut peers: BTreeMap<_, _> = genesis.clone().into_iter().take(1).collect();
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(genesis.len() > peers.len());
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, None), peers);
+        Ok(())
+    }
+
+    /// CLI peers win over YAML; an explicitly empty CLI map restores genesis.
+    #[test]
+    fn bootstrap_peers_cli_override_has_precedence() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let configured = genesis.clone().into_iter().take(1).collect();
+        let mut cli: BTreeMap<_, _> = genesis.clone().into_iter().skip(1).collect();
+        cli.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(!cli.is_empty());
+        let config = NetworkConfig { bootstrap_peers: configured, ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&cli)), cli);
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&BTreeMap::new())), genesis);
+        Ok(())
+    }
+
     #[test]
     fn empty_yaml_deserializes_to_default() {
         let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
@@ -570,6 +746,10 @@ mod tests {
         assert_eq!(
             parsed.libp2p_config.kad_publication_interval,
             default.libp2p_config.kad_publication_interval
+        );
+        assert_eq!(
+            parsed.libp2p_config.kad_replication_interval,
+            default.libp2p_config.kad_replication_interval
         );
         assert_eq!(parsed.peer_config.target_num_peers, default.peer_config.target_num_peers);
         assert_eq!(
@@ -629,6 +809,7 @@ hostname: "my-validator"
         // missing new fields fall back to defaults
         assert_eq!(parsed.libp2p_config.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.libp2p_config.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.libp2p_config.kad_replication_interval, default.kad_replication_interval);
 
         // entirely-missing sub-sections also default
         assert_eq!(parsed.peer_config.target_num_peers, PeerConfig::default().target_num_peers);
@@ -653,6 +834,10 @@ hostname: "my-validator"
             mapping.remove(&serde_yaml::Value::String("kad_publication_interval".into())).is_some(),
             "kad_publication_interval must be present in the default serialization"
         );
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_replication_interval".into())).is_some(),
+            "kad_replication_interval must be present in the default serialization"
+        );
         let legacy = serde_yaml::to_string(&value).expect("serialize stripped value");
 
         let parsed: LibP2pConfig =
@@ -660,8 +845,87 @@ hostname: "my-validator"
 
         assert_eq!(parsed.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.kad_replication_interval, default.kad_replication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    /// The shipped kad cadences must pass startup validation.
+    #[test]
+    fn default_libp2p_config_validates() -> eyre::Result<()> {
+        LibP2pConfig::default().validate()
+    }
+
+    /// Positive cadences strictly below the TTL remain valid at the upper boundary.
+    #[test]
+    fn libp2p_config_accepts_intervals_below_ttl() -> eyre::Result<()> {
+        LibP2pConfig {
+            kad_record_ttl: Duration::from_secs(2),
+            kad_replication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            kad_publication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding replication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_replication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_replication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_replication_interval")
+                    }),
+                    "replication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding publication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_publication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_publication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_publication_interval")
+                    }),
+                    "publication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// A zero record TTL cannot satisfy either positive cadence.
+    #[test]
+    fn libp2p_config_rejects_zero_record_ttl() {
+        let config = LibP2pConfig { kad_record_ttl: Duration::ZERO, ..Default::default() };
+        assert!(
+            config.validate().is_err_and(|error| error.to_string().contains("kad_record_ttl")),
+            "a zero record TTL must fail with an error naming the TTL",
+        );
+    }
+
+    /// Operator-provided zero durations deserialize but fail the startup cadence guard.
+    #[test]
+    fn libp2p_config_rejects_zero_intervals_from_yaml() -> eyre::Result<()> {
+        ["kad_replication_interval", "kad_publication_interval"].into_iter().try_for_each(|field| {
+            let yaml = format!("libp2p_config:\n  {field}: {{secs: 0, nanos: 0}}\n");
+            let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+            assert!(
+                parsed.libp2p_config().validate().is_err_and(|error| {
+                    error.to_string().contains(&format!("LibP2pConfig.{field}"))
+                }),
+                "a deserialized zero {field} must fail with a field-named error",
+            );
+            Ok(())
+        })
     }
 
     #[test]

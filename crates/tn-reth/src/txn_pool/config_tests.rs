@@ -125,12 +125,12 @@ async fn priority_fee_is_rejected_at_startup() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A pool cannot admit transactions larger than the batch protocol can carry.
+/// A pool cannot admit transactions larger than any supported epoch's batch limit.
 #[tokio::test]
 async fn byte_limit_cannot_exceed_batch_limit() -> eyre::Result<()> {
     let directory = TempDir::new()?;
     let tasks = TaskManager::default();
-    let maximum = max_batch_size(0);
+    let maximum = min_batch_size();
     let configured = maximum + 1;
     let limit_arg = configured.to_string();
     let result = configured_pool(

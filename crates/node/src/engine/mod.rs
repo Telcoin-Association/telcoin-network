@@ -12,7 +12,7 @@
 
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
 use tn_config::Config;
 use tn_exex::ExExInstallFn;
 use tn_reth::{
@@ -23,8 +23,9 @@ use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -55,6 +56,10 @@ pub struct TnBuilder {
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
+    /// Maximum completed export bundles to retain, or unlimited when absent.
+    ///
+    /// Only applied when `enable_state_export` is set.
+    state_export_keep: Option<NonZeroUsize>,
     /// Watch executed batches for cross-producer transaction re-packing (issue #1259) when set.
     ///
     /// Default off: a node that does not opt in builds no window and hashes nothing.
@@ -68,9 +73,61 @@ pub struct TnBuilder {
     /// node-level task manager, each with its own bounded notification channel of
     /// the given capacity.
     pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
+    /// Optional process-local bootstrap dial hints, taking precedence over the network config.
+    /// An explicitly empty map selects the genesis fallback.
+    bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
 }
 
 impl TnBuilder {
+    /// Create a builder with the required execution configuration and database.
+    ///
+    /// Metrics, health checks, state exports, and the repack monitor are disabled. Export
+    /// retention is unlimited, and no execution extensions are registered.
+    /// No bootstrap override is configured.
+    pub fn new(node_config: RethConfig, tn_config: Config, reth_db: RethDb) -> Self {
+        Self {
+            node_config,
+            tn_config,
+            metrics: None,
+            healthcheck: None,
+            enable_state_export: false,
+            state_export_keep: None,
+            enable_repack_monitor: false,
+            reth_db,
+            exex_fns: Vec::new(),
+            bootstrap_peers: None,
+        }
+    }
+
+    /// Set the maximum completed export bundles to retain, or leave retention unlimited.
+    ///
+    /// This limit is only applied when `enable_state_export` is set.
+    pub fn with_state_export_keep(mut self, keep: Option<NonZeroUsize>) -> Self {
+        self.state_export_keep = keep;
+        self
+    }
+
+    /// Return the maximum completed export bundles to retain, or `None` for unlimited.
+    ///
+    /// This limit is only applied when `enable_state_export` is set.
+    pub fn state_export_keep(&self) -> Option<NonZeroUsize> {
+        self.state_export_keep
+    }
+
+    /// Set the process-local bootstrap override without persisting it to disk.
+    pub fn with_bootstrap_peers(
+        mut self,
+        peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> Self {
+        self.bootstrap_peers = peers;
+        self
+    }
+
+    /// Return the process-local bootstrap override, if supplied.
+    pub fn bootstrap_peers(&self) -> Option<&BTreeMap<BlsPublicKey, BootstrapServer>> {
+        self.bootstrap_peers.as_ref()
+    }
+
     /// Register an Execution Extension (ExEx) plugin.
     ///
     /// ExExes are long-running tasks that receive notifications about the full

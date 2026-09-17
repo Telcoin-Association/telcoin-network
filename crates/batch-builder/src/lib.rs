@@ -92,7 +92,7 @@ struct RefusalBackoff {
     refusals: u32,
 }
 
-/// Type alias for the blocking task that locks the tx pool and builds the next batch.
+/// Receiver for the async task that awaits a blocking batch build and the worker's seal result.
 type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 
 /// The type that builds blocks for workers to propose.
@@ -103,8 +103,8 @@ type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 ///     - tries to build the next batch when there transactions are available
 #[derive(Debug)]
 pub struct BatchBuilder {
-    /// Single active future that executes consensus output on a blocking thread and then returns
-    /// the result through a oneshot channel.
+    /// Single active task that awaits batch construction on the blocking pool, proposes it, and
+    /// returns the seal result through a oneshot channel.
     pending_task: Option<BuildResult>,
     /// The transaction pool with pending transactions.
     pool: WorkerTxPool,
@@ -213,80 +213,107 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred } =
+                match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
+                    Ok(output) => output,
+                    Err(e) => {
+                        error!(target: "worker::batch_builder", ?e, "blocking batch build failed");
+                        // Surface the join error to the run loop. A dropped sender is misreported
+                        // as `AckChannelClosed`, and the task manager discards a non-critical
+                        // task's `Err` without logging it.
+                        let _ = result.send(Err(BatchBuilderError::BlockingTask(e)));
+                        return Ok(());
+                    }
+                };
+
+            // report the transactions this build left to an in-flight peer batch (issue #1329)
+            metrics
+                .peer_deferred_txs_total
+                .increment(u64::try_from(peer_deferred).unwrap_or(u64::MAX));
             // Canonical updates can drain the pending pool after the run loop's build gate.
-            // Selection can also skip every candidate. Neither case should reach the worker.
+            // Selection can also skip every candidate, including peer-deferred transactions
+            // (issue #1329). Peers reject empty batches, so record the deferral metric above
+            // but send nothing to the worker in every empty-build case.
             if batch.transactions().is_empty() {
-                let _ = result.send(Ok(BuildOutcome::Empty));
+                debug!(
+                    target: "worker::batch_builder",
+                    peer_deferred,
+                    "transaction selection produced an empty batch; sealing nothing"
+                );
+                result.send(Ok(BuildOutcome::Empty)).err().into_iter().for_each(|e| {
+                    error!(target: "worker::batch_builder", ?e, "failed to send no-work outcome to block builder task");
+                });
+                Ok(())
             } else {
-            let batch = batch.seal_slow();
-            span.record("batch", batch.digest().to_string());
+                let batch = batch.seal_slow();
+                span.record("batch", batch.digest().to_string());
 
-            // forward to worker and wait for ack that quorum was reached
-            if let Err(e) = to_worker.send((batch, ack)).await {
-                error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
-                // try to return error if worker channel closed
-                let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
-                return Err(e.into());
-            }
+                // forward to worker and wait for ack that quorum was reached
+                if let Err(e) = to_worker.send((batch, ack)).await {
+                    error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
+                    // try to return error if worker channel closed
+                    let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
+                    return Err(e.into());
+                }
 
-            // wait for worker to ack quorum reached then update pool with mined transactions
-            match rx.await {
-                Ok(res) => {
-                    // measures build + broadcast + quorum, regardless of outcome
-                    metrics.seal_duration_seconds.record(seal_start.elapsed());
-                    match res {
-                        Ok(_) => {
-                            debug!(target: "worker::batch-builder", ?res, "received ack");
-                            metrics.batches_sealed_total.increment(1);
-                            // signal to Self that this task is complete
-                            if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
-                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                // wait for worker to ack quorum reached then update pool with mined txs
+                match rx.await {
+                    Ok(res) => {
+                        // measures build + broadcast + quorum, regardless of outcome
+                        metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        match res {
+                            Ok(_) => {
+                                debug!(target: "worker::batch-builder", ?res, "received ack");
+                                metrics.batches_sealed_total.increment(1);
+                                // signal to Self that this task is complete
+                                if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
+                                    error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                                }
                             }
-                        }
-                        Err(error) => {
-                            metrics.record_seal_failure(worker_id, &error);
-                            let converted = match error {
-                                BlockSealError::FatalDBFailure => {
-                                    // fatal - return error
-                                    Err(BatchBuilderError::FatalDBFailure)
-                                }
-                                // The observer refusal is expected steady state whenever no
-                                // committee endpoint is reachable, so the per-attempt line
-                                // stays at debug; the run loop owns the state-change-gated
-                                // logging and the retry backoff (issue #1145).
-                                BlockSealError::NotValidator => {
-                                    debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
-                                    Ok(BuildOutcome::Refused)
-                                }
-                                BlockSealError::QuorumRejected
-                                | BlockSealError::AntiQuorum
-                                | BlockSealError::Timeout
-                                | BlockSealError::FailedToReport
-                                | BlockSealError::FailedQuorum => {
-                                    error!(target: "worker::batch_builder", ?error, "error while sealing batch");
-                                    // potentially non-fatal error
-                                    //
-                                    // NOTE: this will apply no changes to transaction pool
-                                    Ok(BuildOutcome::Failed)
-                                }
-                            };
+                            Err(error) => {
+                                metrics.record_seal_failure(worker_id, &error);
+                                let converted = match error {
+                                    BlockSealError::FatalDBFailure => {
+                                        // fatal - return error
+                                        Err(BatchBuilderError::FatalDBFailure)
+                                    }
+                                    // The observer refusal is expected steady state whenever
+                                    // no committee endpoint is reachable, so the per-attempt
+                                    // line stays at debug; the run loop owns the
+                                    // state-change-gated logging and the retry backoff
+                                    // (issue #1145).
+                                    BlockSealError::NotValidator => {
+                                        debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
+                                        Ok(BuildOutcome::Refused)
+                                    }
+                                    BlockSealError::QuorumRejected
+                                    | BlockSealError::AntiQuorum
+                                    | BlockSealError::Timeout
+                                    | BlockSealError::FailedToReport
+                                    | BlockSealError::FailedQuorum => {
+                                        error!(target: "worker::batch_builder", ?error, "error while sealing batch");
+                                        // potentially non-fatal error
+                                        //
+                                        // NOTE: this applies no changes to transaction pool
+                                        Ok(BuildOutcome::Failed)
+                                    }
+                                };
 
-                            if let Err(e) = result.send(converted) {
-                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                                if let Err(e) = result.send(converted) {
+                                    error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
-                    if let Err(e) = result.send(Err(e.into())) {
-                        error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                    Err(e) => {
+                        error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
+                        if let Err(e) = result.send(Err(e.into())) {
+                            error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                        }
                     }
                 }
+                Ok(())
             }
-            }
-            Ok(())
         }.instrument(span_clone));
 
         // return oneshot channel for receiving completion status
@@ -477,14 +504,14 @@ impl BatchBuilder {
                     // update pool to remove mined transactions
                     //
                     // The pool derives its pending fee from the shared per-worker container, so
-                    // a stale `last_canonical_update` — at an epoch boundary, the previous
-                    // epoch's closing block — cannot reprice the pool (issue #1262).
+                    // a stale `last_canonical_update` (at an epoch boundary, the previous
+                    // epoch's closing block) cannot reprice the pool (issue #1262).
                     self.pool.update_canonical_state(
                         &self.last_canonical_update,
                         Some(u128::MAX), // set max fee for blobs
                         mined_transactions,
                         changed_accounts,
-                    );
+                    ).await?;
 
                     // loop again to check for any other pending transactions
                     // and possibly start building the next block
@@ -518,7 +545,7 @@ mod tests {
         payload::BuildArguments,
         recover_raw_transaction,
         test_utils::{create_committee_from_state, TransactionFactory},
-        ForwardTargetPolicy, RethChainSpec, WorkerRpcForwarder,
+        ForwardTargetPolicy, RethChainSpec, TxPool as _, WorkerRpcForwarder,
     };
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
@@ -565,21 +592,24 @@ mod tests {
                 )
                 .await;
 
-            // Match the run loop's gate, then spawn without yielding. This single-threaded
-            // runtime cannot poll the build task before the synchronous canonical update below.
+            // Match the run loop's gate, then drain the pending pool before starting the build.
+            // Await maintenance so the blocking build deterministically observes the empty pool.
             assert_eq!(txpool.pending_transactions().len(), 1);
-            let done = batch_builder.spawn_execution_task();
-            txpool.update_canonical_state(
-                &batch_builder.last_canonical_update,
-                None,
-                vec![],
-                vec![ChangedAccount {
-                    address: tx_factory.address(),
-                    nonce: 0,
-                    balance: U256::ZERO,
-                }],
-            );
+            txpool
+                .update_canonical_state(
+                    &batch_builder.last_canonical_update,
+                    None,
+                    vec![],
+                    vec![ChangedAccount {
+                        address: tx_factory.address(),
+                        nonce: 0,
+                        balance: U256::ZERO,
+                    }],
+                )
+                .await
+                .map_err(std::io::Error::other)?;
             assert!(txpool.pending_transactions().is_empty());
+            let done = batch_builder.spawn_execution_task();
 
             let outcome = tokio::select! {
                 outcome = done => outcome
@@ -597,16 +627,19 @@ mod tests {
 
             // Make the same transaction affordable before the loop consumes the empty result.
             // This also proves that an empty build did not remove it from the pool.
-            txpool.update_canonical_state(
-                &batch_builder.last_canonical_update,
-                None,
-                vec![],
-                vec![ChangedAccount {
-                    address: tx_factory.address(),
-                    nonce: 0,
-                    balance: U256::from(1_000_000_000_u64),
-                }],
-            );
+            txpool
+                .update_canonical_state(
+                    &batch_builder.last_canonical_update,
+                    None,
+                    vec![],
+                    vec![ChangedAccount {
+                        address: tx_factory.address(),
+                        nonce: 0,
+                        balance: U256::from(1_000_000_000_u64),
+                    }],
+                )
+                .await
+                .map_err(std::io::Error::other)?;
             assert_eq!(txpool.pending_transactions().len(), 1);
             let (result, done) = oneshot::channel();
             result
@@ -1107,6 +1140,79 @@ mod tests {
         TestTools { tx_factory, execution_components, task_manager }
     }
 
+    /// A pool whose every pending transaction is already carried by a validated peer batch must
+    /// seal nothing (issue #1329).
+    ///
+    /// This is the steady state the deferral window creates on a validator whose whole pool sits
+    /// in a peer's in-flight batch: the build gate sees a non-empty pending pool, the build
+    /// defers every transaction, and the resulting batch has no transactions. Sending it would
+    /// earn a fatal penalty from every peer (`BatchValidationError::EmptyBatch`), so the task
+    /// reports [`BuildOutcome::Empty`] and sends nothing to the worker.
+    ///
+    /// Deterministic: the build task is awaited to completion, so a batch sent to the worker
+    /// would already sit in the channel when `try_recv` runs.
+    #[tokio::test]
+    async fn test_all_deferred_pool_seals_nothing() {
+        let tmp_dir = TempDir::new().unwrap();
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
+        let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
+        let address = Address::from(U160::from(33));
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+
+        let batch_builder = BatchBuilder::new(
+            &reth_env,
+            txpool.clone(),
+            to_worker,
+            address,
+            Duration::from_millis(1),
+            task_manager.get_spawner(),
+            0,
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        )
+        .expect("batch builder");
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let transaction = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let hash = tx_factory.submit_tx_to_pool(transaction.clone(), txpool.clone()).await;
+        assert_eq!(&hash, transaction.hash());
+        assert_eq!(txpool.pool_size().pending, 1, "the build gate sees a pending transaction");
+
+        // a peer batch this node validated already carries the pool's only pending transaction
+        txpool.record_peer_batch(&[hash]);
+        assert!(txpool.is_peer_deferred(&hash));
+
+        // await the build task itself: no sleeps, no polling of the run loop. The timeout is a
+        // failure detector, not a wait: a build that seals reaches the ack wait and never
+        // resolves, so it must surface as a failed assertion rather than a hung test.
+        let outcome = timeout(Duration::from_secs(5), batch_builder.spawn_execution_task())
+            .await
+            .expect("the build task finishes without waiting on a seal ack")
+            .expect("build task reports its outcome")
+            .expect("an all-deferred build is not a fatal error");
+
+        assert_matches!(outcome, BuildOutcome::Empty);
+        assert!(
+            from_batch_builder.try_recv().is_err(),
+            "an empty batch must never reach the worker"
+        );
+        assert_eq!(
+            txpool.pool_size().pending,
+            1,
+            "the transaction stays pending for a later build"
+        );
+    }
+
     /// Test all possible errors from the worker while trying to reach quorum from peers.
     ///
     /// Non-fatal errors return empty vecs of mined transactions.
@@ -1284,9 +1390,9 @@ mod tests {
         assert_eq!(pending_pool_len, 7);
     }
 
-    /// Test transactions are mined from the pool.
+    /// Test transactions are mined from the pool after post-quorum maintenance completes.
     #[tokio::test]
-    async fn test_pool_updates_after_txs_mined() {
+    async fn test_pool_updates_after_txs_mined() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let TestTools { mut tx_factory, execution_components, task_manager } =
             get_test_tools(tmp_dir.path());
@@ -1403,12 +1509,16 @@ mod tests {
         let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
         assert_eq!(tx.hash(), &expected_tx_hash);
 
-        // yield to try and give pool a chance to update
-        tokio::task::yield_now().await;
+        // Wait for the acknowledged batch's blocking pool update to remove the mined transactions.
+        tn_test_utils::wait_until(duration, "mined transactions removed from pool", || async {
+            Ok(txpool.pool_size().pending == 0)
+        })
+        .await?;
 
         // assert all transactions mined
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
+        Ok(())
     }
 
     /// Regression test for issue #1262: after a mined batch the pool update must install the

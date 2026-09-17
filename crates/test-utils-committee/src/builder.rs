@@ -4,12 +4,12 @@ use crate::WorkerFixture;
 
 use super::{AuthorityFixture, CommitteeFixture};
 use rand::{rngs::StdRng, SeedableRng};
-use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
+use std::{collections::BTreeMap, marker::PhantomData, net::Ipv4Addr, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, NetworkKeypair, P2pNode,
-    TimestampSec, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, P2pNode, Protocol,
+    TimestampSec, WorkerId, DEFAULT_WORKER_ID, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -60,8 +60,7 @@ where
 {
     /// Set the number of workers every authority runs (defaults to one).
     ///
-    /// Worker 0 uses the authority's [KeyConfig] worker network key; every further worker
-    /// gets a fresh network keypair.
+    /// Every worker uses the authority's [KeyConfig] network key for its worker id.
     pub fn number_of_workers(mut self, number_of_workers: NonZeroUsize) -> Self {
         self.number_of_workers = number_of_workers;
         self
@@ -155,23 +154,29 @@ where
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let randomize_ports = self.randomize_ports;
-            let worker_address = move || -> Multiaddr {
-                let port = if randomize_ports {
-                    get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
+            // Placeholder workers use distinct loopback hosts without reserving fixed ports.
+            // Randomized workers retain allocator-claimed ports on 127.0.0.1.
+            let worker_address = move |worker_id: WorkerId| -> Multiaddr {
+                let (ip, port) = if randomize_ports {
+                    (
+                        Ipv4Addr::LOCALHOST,
+                        get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT),
+                    )
                 } else {
-                    0
+                    let [high, low] = worker_id.to_be_bytes();
+                    (Ipv4Addr::new(127, high, low, 1), 0)
                 };
-                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap()
+                Multiaddr::empty()
+                    .with(Protocol::Ip4(ip))
+                    .with(Protocol::Udp(port))
+                    .with(Protocol::QuicV1)
             };
-            // worker 0 carries the key config's worker key; further workers get fresh keys
-            let worker_nodes: Vec<P2pNode> = (0..self.number_of_workers.get())
+            // Advertise the same derived identity each worker swarm uses to authenticate.
+            let worker_nodes: Vec<P2pNode> = (0..=WorkerId::MAX)
+                .take(self.number_of_workers.get())
                 .map(|worker_id| {
-                    let key = if worker_id == 0 {
-                        key_config.worker_network_public_key(DEFAULT_WORKER_ID)
-                    } else {
-                        NetworkKeypair::generate_ed25519().public().into()
-                    };
-                    (worker_address(), key).into()
+                    let key = key_config.worker_network_public_key(worker_id);
+                    (worker_address(worker_id), key).into()
                 })
                 .collect();
             let authority = Authority::new_for_test(
