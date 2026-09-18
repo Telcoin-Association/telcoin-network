@@ -1,9 +1,41 @@
-//! Unit tests for network types.rs
+//! Unit tests for the signed node record.
 
-use super::{NetworkType, NodeRecord, RecordDomain, RpcInfo};
-use crate::common::create_multiaddr;
-use tn_config::KeyConfig;
-use tn_types::{BlsKeypair, BlsSigner};
+use crate::{NetworkType, NodeRecord, RecordDomain};
+use libp2p::Multiaddr;
+use tn_types::{
+    BlsKeypair, BlsPublicKey, BlsSignature, NetworkKeypair, NetworkPublicKey, RpcInfo, Signer as _,
+};
+
+/// A well-formed multiaddr for record tests; the address itself is never dialed.
+fn create_multiaddr(_ip: Option<std::net::IpAddr>) -> Multiaddr {
+    "/ip4/127.0.0.1/tcp/8000".parse().expect("static multiaddr parses")
+}
+
+/// The key material a validator signs a record with: its BLS keypair and the network identity
+/// the record advertises. Mirrors the slice of the node's `KeyConfig` the record path uses so
+/// these tests need no dependency on the node's config crate.
+struct KeyConfig {
+    bls: BlsKeypair,
+    network: NetworkPublicKey,
+}
+
+impl KeyConfig {
+    fn new_with_testing_key(bls: BlsKeypair) -> Self {
+        Self { bls, network: NetworkKeypair::generate_ed25519().public().into() }
+    }
+
+    fn primary_public_key(&self) -> BlsPublicKey {
+        *self.bls.public()
+    }
+
+    fn primary_network_public_key(&self) -> NetworkPublicKey {
+        self.network.clone()
+    }
+
+    fn request_signature_direct(&self, data: &[u8]) -> BlsSignature {
+        self.bls.sign(data)
+    }
+}
 
 #[test]
 fn test_node_record() {

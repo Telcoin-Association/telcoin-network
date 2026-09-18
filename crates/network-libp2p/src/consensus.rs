@@ -12,8 +12,8 @@ use crate::{
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
-        RecordDomain, ResponseChannel, RpcInfo,
+        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
+        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -78,20 +78,7 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// records reach the store, whose larger value limit is not the effective wire bound.
 const MAX_KAD_PACKET_SIZE: usize = 16 * 1024;
 
-/// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
-///
-/// A legitimate node advertises exactly one address per record (see `get_peer_record`). A record
-/// exceeding the cap is rejected at validation, bounding the attacker-chosen address data admitted
-/// per record before it can accumulate on the peer entry (GHSA-29v6-gvv5-45gx). The cap is tied to
-/// the per-peer set cap `MAX_MULTIADDRS_PER_PEER`, so validation and storage agree on how many
-/// addresses one peer may present: a single validated record contributes at most as many addresses
-/// as the store keeps for a peer, and the set cap is what bounds accumulation across repeated
-/// records. Folding a record into an entry that already holds a connection form replaces that
-/// form; that only trims the peer-exchange payload built from the entry.
-///
-/// The same cap bounds the address list of a kad provider record before it is written to the
-/// consensus database (`KadStore::add_provider`, issue #1185).
-pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
+pub(crate) use tn_node_record::MAX_ADVERTISED_MULTIADDRS;
 
 /// Freshness of a validated incoming record relative to the locally stored value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
