@@ -59,8 +59,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, min_batch_size, Address, EnvKzgSettings, Recovered,
-    SealedBlock, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
+    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, EnvKzgSettings,
+    Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
@@ -642,9 +642,11 @@ impl WorkerTxPool {
     /// Pool maintenance runs on the blocking executor because it can hold pool locks and
     /// process many transactions. Awaiting it preserves the caller's update ordering and
     /// reports a blocking-task failure instead of continuing with an incomplete pool update.
+    /// Only the tip header is needed; retaining it avoids copying a block's transactions on
+    /// the calling async thread.
     pub async fn update_canonical_state(
         &self,
-        new_tip: &SealedBlock,
+        new_tip: &SealedHeader,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
@@ -652,17 +654,38 @@ impl WorkerTxPool {
         let pool = self.clone();
         let new_tip = new_tip.clone();
         tokio::task::spawn_blocking(move || {
-            let update = CanonicalStateUpdate {
-                new_tip: &new_tip,
-                pending_block_base_fee: pool.2.base_fee(),
+            // Reth's pool and validator only read header fields from the tip. This synthetic
+            // block satisfies that API without copying a body and stays inside this closure.
+            let new_tip = SealedBlock::from_sealed_parts(new_tip, BlockBody::default());
+            pool.apply_canonical_update(
+                &new_tip,
                 pending_block_blob_fee,
-                changed_accounts,
                 mined_transactions,
-                update_kind: PoolUpdateKind::Commit,
-            };
-            pool.0.on_canonical_state_change(update);
+                changed_accounts,
+            );
         })
         .await
+    }
+
+    /// Apply a canonical update synchronously on the blocking executor.
+    ///
+    /// Both maintenance paths read the current epoch's base fee here, when the update is applied.
+    fn apply_canonical_update(
+        &self,
+        new_tip: &SealedBlock,
+        pending_block_blob_fee: Option<u128>,
+        mined_transactions: Vec<TxHash>,
+        changed_accounts: Vec<ChangedAccount>,
+    ) {
+        let update = CanonicalStateUpdate {
+            new_tip,
+            pending_block_base_fee: self.2.base_fee(),
+            pending_block_blob_fee,
+            changed_accounts,
+            mined_transactions,
+            update_kind: PoolUpdateKind::Commit,
+        };
+        self.0.on_canonical_state_change(update);
     }
 
     /// Return pending transactions.
@@ -677,38 +700,41 @@ impl WorkerTxPool {
 
     /// This method is called when a canonical state update is received.
     ///
-    /// Await the pool update before the maintenance task receives another notification.
+    /// Collect account changes and mined hashes on the blocking executor, borrowing the tip
+    /// from the shared chain. Await completion before receiving another notification.
     async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
-        trace!(target: "worker::block-builder", ?update, "canon state update from engine");
+        let pool = self.clone();
+        tokio::task::spawn_blocking(move || {
+            trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
-        // update pool based with canonical tip update
-        let (blocks, state) = update.inner();
-        let tip = blocks.tip();
+            let (blocks, state) = update.inner();
+            let tip = blocks.tip();
 
-        // collect all accounts that changed in last round of consensus
-        let changed_accounts: Vec<ChangedAccount> = state
-            .accounts_iter()
-            .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
-            .map(|(address, acc)| ChangedAccount {
-                address,
-                nonce: acc.nonce,
-                balance: acc.balance,
-            })
-            .collect();
+            // Collect all accounts that changed in the last round of consensus.
+            let changed_accounts: Vec<ChangedAccount> = state
+                .accounts_iter()
+                .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
+                .map(|(address, acc)| ChangedAccount {
+                    address,
+                    nonce: acc.nonce,
+                    balance: acc.balance,
+                })
+                .collect();
 
-        debug!(target: "block-builder", ?changed_accounts);
+            debug!(target: "block-builder", ?changed_accounts);
 
-        // collect tx hashes to remove any transactions from this pool that were mined
-        let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+            // Collect hashes to remove transactions mined in this canonical update.
+            let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
 
-        debug!(target: "block-builder", ?mined_transactions);
+            debug!(target: "block-builder", ?mined_transactions);
 
-        self.update_canonical_state(
-            tip.sealed_block(),
-            Some(u128::MAX), // set max fee for blobs
-            mined_transactions,
-            changed_accounts,
-        )
+            pool.apply_canonical_update(
+                tip.sealed_block(),
+                Some(u128::MAX), // set max fee for blobs
+                mined_transactions,
+                changed_accounts,
+            );
+        })
         .await
     }
 
@@ -1459,10 +1485,10 @@ mod tests {
 
         // The genesis header carries the chain's default fee. It must differ from EPOCH_FEE,
         // or the assertion below could not distinguish the container from the tip header.
-        let genesis_block = reth_env.chainspec().sealed_genesis_block();
-        assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
+        let genesis_header = reth_env.chainspec().sealed_genesis_header();
+        assert_ne!(genesis_header.base_fee_per_gas, Some(EPOCH_FEE));
 
-        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]).await?;
+        pool.update_canonical_state(&genesis_header, Some(u128::MAX), vec![], vec![]).await?;
 
         assert_eq!(
             pool.block_info().pending_basefee,
@@ -1482,7 +1508,7 @@ mod tests {
         let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
         let pool = reth_env
             .init_txn_pool_without_maintenance(BaseFeeContainer::new(MIN_PROTOCOL_BASE_FEE))?;
-        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        let genesis_header = reth_env.chainspec().sealed_genesis_header();
         pool.set_block_info(RethBlockInfo { pending_basefee: 0, ..pool.block_info() });
 
         // Keep validator tasks on the outer runtime so they cannot occupy the sole blocking
@@ -1502,7 +1528,7 @@ mod tests {
                 ready.await?;
 
                 let update =
-                    pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+                    pool.update_canonical_state(&genesis_header, Some(u128::MAX), vec![], vec![]);
                 tokio::pin!(update);
                 let first_poll = futures::poll!(&mut update);
                 let fee_before_release = pool.block_info().pending_basefee;
