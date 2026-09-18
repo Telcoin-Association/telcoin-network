@@ -85,11 +85,22 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
-    // The catch-up log survives a transition that completes before RPC starts or between polls.
-    // Only delayed restarts are required to cross the GC window and enter catch-up.
+    let mut child2 = start_validator_with_args(
+        2,
+        bin,
+        temp_path,
+        rpc_port2,
+        test,
+        2,
+        &["--log.stdout.filter", "subscriber=info"],
+    );
+    // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
+    // the node passes through the transient `CvvInactive` mode. Its subscriber log retains
+    // evidence even if catch-up finishes before an RPC poll sees that mode. The short-downtime
+    // restart never crosses the GC window and never demotes, so it is gated out here.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        assert_entered_catchup(test).inspect_err(|e| {
+        let [_, _, restarted_node, _] = client_urls;
+        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
         })?;
@@ -173,11 +184,23 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
-    // Require retained evidence of catch-up, including when the transient inactive mode has
-    // already ended by the time RPC becomes available.
+    let mut child2 = start_validator_with_args(
+        2,
+        bin,
+        temp_path,
+        rpc_port2,
+        test,
+        2,
+        &["--log.stdout.filter", "subscriber=info"],
+    );
+    // Lagged delayed restart: the downtime is past the GC window, so the restarted validator
+    // rejoins via the follow/catch-up path and passes through the transient `CvvInactive` mode
+    // before catching up. Check its current mode or retained subscriber log before the balance
+    // checks below. This path is only ever exercised with the delayed downtime, but gate on the
+    // floor for parity with `run_restart_tests1`.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        assert_entered_catchup(test).inspect_err(|e| {
+        let [_, _, restarted_node, _] = client_urls;
+        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests_lagged1");
         })?;
@@ -263,7 +286,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rounds. The `min_secs` floor alone does not guarantee it: at the nominal ~500ms/round cadence a
 /// 25s downtime spans ~50 rounds (safe), but on a loaded runner where idle rounds stretch past
 /// ~1.67s/round a 25s wait covers fewer than 15 rounds, the killed node never demotes, and
-/// `assert_entered_catchup` fails. To close that, the delayed tests also gate on peer
+/// `assert_observed_cvv_inactive` fails. To close that, the delayed tests also gate on peer
 /// progress: each consensus header wraps one committed sub-dag whose leader round strictly exceeds
 /// its predecessor's, so a peer header-number delta of D guarantees the live DAG round climbed by
 /// at least D past the kill point. Requiring `(RESTART_TEST_GC_DEPTH - 10) + 3` = 18 headers thus
@@ -335,22 +358,41 @@ const RESTART_TEST_GC_DEPTH: u32 = 25;
 /// CI while cutting ~35s per test vs the previous fixed 60s floor.
 const RESTART_TEST_DOWNTIME_SECS: u64 = 25;
 
-/// Require the restarted validator's catch-up transition in its fresh process logs.
+/// Maximum wait for evidence that a delayed restart entered the inactive catch-up path.
+const CVV_INACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Assert the restarted validator entered [`NodeMode::CvvInactive`] while catching up.
 ///
-/// The primary network handler emits this warning when it demotes an active validator to
-/// `CvvInactive`. Reading the log retains the evidence even if catch-up finishes before the first
-/// RPC response. `setup_log_dir` truncates these run-2 files before spawning the restarted node,
-/// so a previous process or test invocation cannot satisfy the assertion.
-fn assert_entered_catchup(test: &str) -> eyre::Result<()> {
-    let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs").join(test);
-    wait_until_blocking(Duration::from_secs(30), "restarted validator entered catch-up", || {
-        ["node2-run2.log", "node2-run2.stderr.log"]
-            .into_iter()
-            .try_fold(false, |seen, file| {
-                std::fs::read_to_string(log_dir.join(file))
-                    .map(|log| seen || log.contains("we are behind, go to catchup mode!"))
-            })
-            .map_err(Into::into)
+/// Catch-up can finish between RPC polls, including before the first successful RPC response.
+/// Sample the live mode once, then wait for the subscriber entry logged exclusively by that mode's
+/// branch in `spawn_subscriber`. Both callers restart instance 2 as run 2 with `subscriber=info`,
+/// and `setup_log_dir` truncates this process's log before spawning it, so an earlier run cannot
+/// satisfy the assertion. Merely reaching `CvvActive` without either piece of evidence still fails.
+fn assert_observed_cvv_inactive(node: &str, test: &str) -> eyre::Result<()> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let log_path = Path::new(&manifest_dir).join("test_logs").join(test).join("node2-run2.log");
+    let observed_inactive = matches!(get_node_mode(node), Ok(NodeMode::CvvInactive));
+    wait_until_blocking(
+        CVV_INACTIVE_TIMEOUT,
+        &format!(
+            "restarted node {node} to enter CvvInactive (catch-up log: {})",
+            log_path.display()
+        ),
+        || {
+            if observed_inactive {
+                Ok(true)
+            } else {
+                std::fs::read(&log_path)
+                    .map(|log| {
+                        String::from_utf8_lossy(&log)
+                            .contains("Starting subscriber: Catch up and rejoin")
+                    })
+                    .map_err(Report::from)
+            }
+        },
+    )
+    .inspect(|()| {
+        info!(target: "restart-test", "observed restarted node {node} in CvvInactive during catch-up");
     })
 }
 

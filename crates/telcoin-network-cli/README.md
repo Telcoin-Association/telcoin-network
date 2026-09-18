@@ -76,6 +76,8 @@ The `--bls-passphrase-source` global flag controls how the BLS private key is en
 
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
 
+The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
+
 ### Generated files
 
 After running `keytool generate`, the data directory contains:
@@ -474,6 +476,8 @@ Inbound (must be open):
 | 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
 
 Outbound: Unrestricted UDP for QUIC connections to peers.
+
+These are application port requirements, not a complete production perimeter. The node does not configure host firewall rules. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#firewall-configuration) for the recommended validator, sentry, observer, and management separation. Never create firewall rules from DHT or peer exchange data.
 
 ## Consensus parameters
 
