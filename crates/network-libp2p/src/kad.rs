@@ -1294,10 +1294,13 @@ mod test {
         );
 
         // A self-provide under the published key is what the republish job enumerates.
+        // Production `start_providing` stores it with `expires: None` (libp2p
+        // `ProviderRecord::new`), so model that row exactly: `None` must survive the
+        // `KadProviderRow` round trip and pass the expiry filters.
         let ours = ProviderRecord {
             key: published_key,
             provider: local_peer_id,
-            expires: Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)),
+            expires: None,
             addresses: vec![],
         };
         kad_store.add_provider(ours).expect("add our provider record");
@@ -1305,6 +1308,7 @@ mod test {
             kad_store.provided().map(|record| record.into_owned()).collect();
         assert_eq!(provided.len(), 1, "provided() enumerates the self-provide");
         assert_eq!(provided[0].provider, local_peer_id);
+        assert!(provided[0].expires.is_none(), "expires: None survives the round trip");
     }
 
     /// Expired records must be filtered from `get()` and `records()` even though
