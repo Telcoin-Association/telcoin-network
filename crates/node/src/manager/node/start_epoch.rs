@@ -851,10 +851,11 @@ where
 
     /// Decide this epoch's [`NodeMode`] and publish it to [`ConsensusBus::node_mode`].
     ///
-    /// An existing `CvvInactive` state is sticky and returned as-is — a node syncing to rejoin
+    /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
-    /// `Observer` if it is not in this committee (or is configured observer-only), and
-    /// `CvvActive` if it is. `CvvActive` is optimistic: the node assumes it is caught up and is
+    /// `Observer` if it is not in this committee, is configured observer-only, or a newer epoch
+    /// record excludes it from the committee. A locally eligible node otherwise starts as
+    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is
     /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
     /// [`ConsensusBus`] before returning.
     async fn identify_node_mode(
@@ -883,12 +884,21 @@ where
             "failed to READ the consensus store while priming consensus state: this is a \
              storage error, not a missing record - do NOT delete the chain-data directories",
         )?;
-        let mode = if !in_committee || self.builder.tn_config.observer {
+        let initial_mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else {
             // Assume we are caught up, will be demoted to inactive if this is not true...
             NodeMode::CvvActive
         };
+        // Apply the same record-tip veto as startup so stale execution state cannot restore a
+        // validator that has rotated out. A record older than this committee cannot veto admission.
+        let record = self.consensus_chain.epochs().latest_record().await;
+        let mode = super::node_mode_from_epoch_record(
+            initial_mode,
+            consensus_config.committee().epoch(),
+            &self.key_config.primary_public_key(),
+            record.as_ref(),
+        );
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");
         // update consensus bus

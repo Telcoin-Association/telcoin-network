@@ -2,18 +2,20 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
-    get_block_number, get_key, get_latest_consensus_header_number, get_node_info, get_node_mode,
-    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
-    start_validator, start_validator_with_args, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
+    get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
+    get_node_mode, get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel,
+    start_observer, start_validator, start_validator_with_args, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::Report;
+use jsonrpsee::rpc_params;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use std::{
+    cell::RefCell,
     path::Path,
     process::Child,
     time::{Duration, Instant},
@@ -94,12 +96,16 @@ fn run_restart_tests1(
         2,
         &["--log.stdout.filter", "subscriber=info"],
     );
+    let [_, _, restarted_node, _] = client_urls;
+    wait_for_restarted_rpc(&mut child2, restarted_node, test).inspect_err(|e| {
+        kill_child(&mut child2);
+        error!(target: "restart-test", ?e, "restarted node did not become RPC-ready");
+    })?;
     // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
     // the node passes through the transient `CvvInactive` mode. Its subscriber log retains
     // evidence even if catch-up finishes before an RPC poll sees that mode. The short-downtime
     // restart never crosses the GC window and never demotes, so it is gated out here.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        let [_, _, restarted_node, _] = client_urls;
         assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
@@ -128,6 +134,26 @@ fn run_restart_tests1(
         kill_child(&mut child2);
     })?;
     Ok(child2)
+}
+
+/// Wait for the restarted validator's RPC endpoint without spending the balance retry budget.
+///
+/// Use the same startup bound as `network_advancing`, and fail immediately if the child exits.
+/// RPC readiness does not imply catch-up; the caller still checks balances and canonical blocks.
+fn wait_for_restarted_rpc(child: &mut Child, node: &str, test: &str) -> eyre::Result<()> {
+    let child = RefCell::new(child);
+    let description = format!(
+        "restarted validator RPC at {node} (logs: test_logs/{test}/node2-run2.log and \
+         node2-run2.stderr.log)"
+    );
+    wait_until_blocking(Duration::from_secs(45), &description, || {
+        child.try_borrow_mut()?.try_wait()?.map_or(Ok(()), |status| {
+            eyre::bail!("{description}: child exited before RPC was ready: {status}")
+        })?;
+        let response: eyre::Result<String> =
+            call_rpc(node, "eth_blockNumber", rpc_params![], 0, "restart readiness");
+        Ok(response.is_ok())
+    })
 }
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -502,7 +528,12 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    // The observer may still be syncing startup epoch records after the validators are ready.
+    wait_until_blocking(Duration::from_secs(45), "observer RPC ready", || {
+        // A single block-number request avoids the block-fetch helper's nested retries.
+        Ok(call_rpc::<String, _, _>(obs_url, "eth_blockNumber", rpc_params![], 0, "readiness")
+            .is_ok())
+    })?;
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
