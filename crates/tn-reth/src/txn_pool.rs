@@ -46,7 +46,7 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use reth_transaction_pool::{
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
-        PoolError,
+        PoolError, PoolTransactionError,
     },
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
@@ -59,11 +59,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, Address, BlsPublicKey, EnvKzgSettings, Recovered,
-    SealedBlock, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
+    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlsPublicKey, EnvKzgSettings,
+    Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
 };
-use tokio::time::MissedTickBehavior;
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio::{task::JoinError, time::MissedTickBehavior};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -72,6 +72,7 @@ use crate::{
     forward::{FORWARD_BATCH_BUDGET, FORWARD_PENDING_LIFETIME, REQUEUE_GRACE},
     forward_pending::{PendingForwards, RetentionLimits, SubmissionHead},
     metrics::{ForwarderMetrics, RETH_METRICS},
+    peer_batch::PeerBatchTxs,
     traits::TelcoinNode,
     PoolTxn, PoolTxnId,
 };
@@ -86,6 +87,37 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 /// reload event, which is the next notification or the [`RELOAD_RETRY_INTERVAL`] tick,
 /// whichever comes first.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// A transaction-pool setting incompatible with TN's batch or fee policy.
+#[derive(Debug, PartialEq, Eq)]
+enum TxPoolConfigError {
+    /// A transaction admitted at this byte limit could never fit in a batch.
+    InputLimitExceedsBatch {
+        /// The operator's per-transaction byte limit.
+        configured: usize,
+        /// The batch protocol's byte limit.
+        maximum: usize,
+    },
+    /// TN has no priority fee market and does not support a pool priority fee floor.
+    MinimumPriorityFee,
+}
+
+impl std::fmt::Display for TxPoolConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLimitExceedsBatch { configured, maximum } => write!(
+                f,
+                "--txpool.max-tx-input-bytes {configured} exceeds TN's batch byte limit {maximum}"
+            ),
+            Self::MinimumPriorityFee => write!(
+                f,
+                "--txpool.minimum-priority-fee is unsupported on TN: omit this flag to accept zero-tip transactions"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TxPoolConfigError {}
 
 /// Interval at which the maintenance loop re-arms the residual dirty-sender reload between
 /// canonical-state notifications.
@@ -164,6 +196,14 @@ pub trait TxPool {
     /// acquire the state provider itself degrades the WHOLE set to that conservative zero, so
     /// implementations log it before degrading.
     fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256>;
+    /// Remember `hashes` as packed by a peer batch this node has just validated.
+    ///
+    /// The builder skips a remembered hash for
+    /// [`PEER_BATCH_DEFER_TTL`](crate::PEER_BATCH_DEFER_TTL) so this node does not pack a copy
+    /// of a transaction a peer is already proposing.
+    fn record_peer_batch(&self, hashes: &[TxHash]);
+    /// Return true if `hash` is still deferred by a validated peer batch.
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool;
 }
 
 /// A telcoin network transaction pool.
@@ -178,6 +218,9 @@ pub struct WorkerTxPool(
     /// The shared per-worker base-fee container: the single source of the pool's pending base
     /// fee (issue #1262).
     BaseFeeContainer,
+    /// The transactions this node has seen inside a validated peer batch, deferred by the
+    /// builder while that peer batch is in flight (issue #1329).
+    PeerBatchTxs,
     /// Observer transactions awaiting canonical inclusion, shared across epoch forwarders.
     Arc<Mutex<PendingForwards<TxHash, BlsPublicKey, B256>>>,
 );
@@ -191,7 +234,7 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
-    /// Create a new instance of `Self` and spawn its canonical-state maintenance task.
+    /// Create a pool and spawn canonical-state maintenance and queued-transaction expiry.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -202,6 +245,7 @@ impl WorkerTxPool {
         let this =
             Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
+        this.spawn_expiry_task(task_spawner);
         Ok(this)
     }
 
@@ -217,6 +261,23 @@ impl WorkerTxPool {
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
+        // The pool and validator survive epoch changes, so admission must fit the smallest
+        // batch limit across all supported epochs. Non-blob reth validation measures the full
+        // EIP-2718 encoding, just like the batch protocol.
+        let maximum = min_batch_size();
+        (node_config.txpool.max_tx_input_bytes <= maximum).then_some(()).ok_or(
+            TxPoolConfigError::InputLimitExceedsBatch {
+                configured: node_config.txpool.max_tx_input_bytes,
+                maximum,
+            },
+        )?;
+        // A configured floor would conflict with TN's zero-tip fee policy (#1340).
+        node_config
+            .txpool
+            .minimum_priority_fee
+            .is_none()
+            .then_some(())
+            .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let forward_limits = RetentionLimits::new(
@@ -248,6 +309,9 @@ impl WorkerTxPool {
         // RPC boundary (issue #1160).
         .set_tx_fee_cap(node_config.rpc.rpc_tx_fee_cap)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
+        // These limits live on reth's validator, so Pool::eth_pool cannot apply them.
+        .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
+        .with_max_tx_gas_limit(node_config.txpool.max_tx_gas_limit)
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
         .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
@@ -282,8 +346,55 @@ impl WorkerTxPool {
             transaction_pool,
             blockchain_provider.clone(),
             base_fee,
+            PeerBatchTxs::default(),
             Arc::new(Mutex::new(PendingForwards::new(forward_limits))),
         ))
+    }
+
+    /// Spawn the critical task that expires parked transactions even when the chain is idle.
+    ///
+    /// Match reth's queued-lifetime sweep and local-origin exemptions. A zero lifetime
+    /// means expire on the next sweep; clamp only the timer period to avoid a zero-period
+    /// panic or a busy loop. Pending transactions never expire through this task.
+    /// A panic or unexpected exit must shut down the node, like canonical-state maintenance,
+    /// rather than silently leave the pool running without its configured age limit.
+    fn spawn_expiry_task(&self, task_spawner: &TaskSpawner) {
+        let pool = self.clone();
+        let period = self.0.config().max_queued_lifetime.max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        task_spawner.spawn_critical_task("queued txn pool expiry", async move {
+            IntervalStream::new(interval)
+                .for_each(move |_| {
+                    pool.evict_stale_transactions(Instant::now());
+                    futures::future::ready(())
+                })
+                .await;
+            Err(TaskError::from_message(
+                "queued txn pool expiry task ended: interval stream closed",
+            ))
+        });
+    }
+
+    /// Remove expired queued and basefee transactions using the pool's configured lifetime.
+    ///
+    /// Reth timestamps admission with `std::time::Instant`; accepting `now` explicitly
+    /// keeps boundary tests deterministic. Local and private origins retain reth's
+    /// exemption unless `--txpool.nolocals` is set. Blob transactions cannot enter this pool.
+    fn evict_stale_transactions(&self, now: Instant) {
+        let config = self.0.config();
+        let stale = self
+            .0
+            .queued_transactions()
+            .into_iter()
+            .filter(|tx| {
+                (tx.origin.is_external() || config.local_transactions_config.no_exemptions)
+                    && now.saturating_duration_since(tx.timestamp) >= config.max_queued_lifetime
+            })
+            .map(|tx| *tx.hash())
+            .collect();
+        let removed = self.0.remove_transactions(stale);
+        RETH_METRICS.record_txpool_expired_transactions(removed.len());
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -327,6 +438,7 @@ impl WorkerTxPool {
     /// ones; acknowledged transactions require canonical output progress before becoming
     /// eligible.
     ///
+    /// Canonical pool updates finish before the next maintenance event is processed.
     /// The chunk reload is awaited inline, so a tick can never start a second reload while
     /// one is in flight; ticks that would fire during a reload are pushed back a full
     /// `retry_interval` ([`MissedTickBehavior::Delay`]).
@@ -354,14 +466,13 @@ impl WorkerTxPool {
         let mut dirty_addresses = AddressSet::default();
         while let Some(event) = events.next().await {
             let newly_dirty = match event {
-                MaintenanceEvent::Update(update) => update
-                    .map(|notification| {
-                        self.apply_canon_notification(notification);
+                MaintenanceEvent::Update(update) => match update {
+                    Ok(notification) => {
+                        self.apply_canon_notification(notification).await?;
                         AddressSet::default()
-                    })
-                    .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
-                        self.mark_drifted(missed)
-                    }),
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(missed)) => self.mark_drifted(missed),
+                },
                 MaintenanceEvent::RetryTick => AddressSet::default(),
                 // `take_while` ends the stream at `Closed`, so this arm never runs; a
                 // plain value keeps the match total (no panic in a critical task).
@@ -401,7 +512,7 @@ impl WorkerTxPool {
     pub(crate) fn pending_forwards(
         &self,
     ) -> MutexGuard<'_, PendingForwards<TxHash, BlsPublicKey, B256>> {
-        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.4.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Reserve retained bytes before a successful forwarding admission lets the builder prune them.
@@ -460,19 +571,25 @@ impl WorkerTxPool {
             .await;
     }
 
-    /// Apply one canonical-state notification to the pool.
-    fn apply_canon_notification(&self, notification: CanonStateNotification) {
+    /// Apply one canonical-state notification, awaiting pool maintenance before the next one.
+    async fn apply_canon_notification(
+        &self,
+        notification: CanonStateNotification,
+    ) -> Result<(), JoinError> {
         match notification {
-            CanonStateNotification::Commit { new } => self.process_canon_state_update(new),
+            CanonStateNotification::Commit { new } => self.process_canon_state_update(new).await,
             // TN never reorgs: consensus output only extends the canonical chain, so a
             // Reorg notification here is a bug upstream. Skip it rather than panic . . .
             // this runs inside a critical task, and aborting it would take down the
             // whole node over a pool-maintenance miss.
-            CanonStateNotification::Reorg { .. } => warn!(
-                target: "txpool",
-                "unexpected canonical state notification (TN never reorgs); skipping \
-                 transaction pool update"
-            ),
+            CanonStateNotification::Reorg { .. } => {
+                warn!(
+                    target: "txpool",
+                    "unexpected canonical state notification (TN never reorgs); skipping \
+                     transaction pool update"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -605,27 +722,31 @@ impl WorkerTxPool {
     /// for the current epoch. At an epoch boundary the canonical tip is the previous epoch's
     /// closing block and its header carries the old epoch's fee, so tip headers must never set
     /// the pool's fee (issue #1262).
-    pub fn update_canonical_state(
+    ///
+    /// Pool maintenance runs on the blocking executor because it can hold pool locks and
+    /// process many transactions. Awaiting it preserves the caller's update ordering and
+    /// reports a blocking-task failure instead of continuing with an incomplete pool update.
+    pub async fn update_canonical_state(
         &self,
         new_tip: &SealedBlock,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
-    ) {
-        // create canonical state update
-        let update = CanonicalStateUpdate {
-            new_tip,
-            pending_block_base_fee: self.2.base_fee(),
-            pending_block_blob_fee,
-            changed_accounts,
-            mined_transactions,
-            update_kind: PoolUpdateKind::Commit,
-        };
-
-        // TODO: should this be a spawned blocking task?
-        //
-        // update pool to remove mined transactions
-        self.0.on_canonical_state_change(update);
+    ) -> Result<(), JoinError> {
+        let pool = self.clone();
+        let new_tip = new_tip.clone();
+        tokio::task::spawn_blocking(move || {
+            let update = CanonicalStateUpdate {
+                new_tip: &new_tip,
+                pending_block_base_fee: pool.2.base_fee(),
+                pending_block_blob_fee,
+                changed_accounts,
+                mined_transactions,
+                update_kind: PoolUpdateKind::Commit,
+            };
+            pool.0.on_canonical_state_change(update);
+        })
+        .await
     }
 
     /// Return pending transactions.
@@ -640,8 +761,8 @@ impl WorkerTxPool {
 
     /// This method is called when a canonical state update is received.
     ///
-    /// Trigger the maintenance task to update pool before building the next block.
-    fn process_canon_state_update(&self, update: Arc<Chain>) {
+    /// Await the pool update before the maintenance task receives another notification.
+    async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
         trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
         // update pool based with canonical tip update
@@ -674,13 +795,13 @@ impl WorkerTxPool {
 
         debug!(target: "block-builder", ?mined_transactions);
 
-        // sync fn so self will block until all pool updates are complete
         self.update_canonical_state(
             tip.sealed_block(),
             Some(u128::MAX), // set max fee for blobs
             mined_transactions,
             changed_accounts,
-        );
+        )
+        .await
     }
 
     /// Return the current status of the pool.
@@ -751,6 +872,14 @@ impl WorkerTxPool {
     pub fn pool_size(&self) -> PoolSize {
         self.0.pool_size()
     }
+
+    /// The shared window of transactions seen inside a validated peer batch.
+    ///
+    /// The batch validator records into this window and the batch builder reads it, so a
+    /// transaction a peer is already proposing is not packed again here (issue #1329).
+    pub fn peer_batch_txs(&self) -> &PeerBatchTxs {
+        &self.3
+    }
 }
 
 impl TxPool for WorkerTxPool {
@@ -801,6 +930,14 @@ impl TxPool for WorkerTxPool {
                 (*address, balance)
             })
             .collect()
+    }
+
+    fn record_peer_batch(&self, hashes: &[TxHash]) {
+        self.3.record(hashes)
+    }
+
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+        self.3.is_deferred(hash)
     }
 }
 
@@ -859,6 +996,45 @@ impl BestTxns {
             ),
         );
     }
+
+    /// Skip a transaction a validated peer batch already carries.
+    ///
+    /// Marking it invalid for this build also skips the sender's later nonces: a nonce-gapped
+    /// copy would only be skipped at execution, after paying for batch space and a vote round.
+    /// The transaction stays in the pool and is packed normally once the deferral expires (or
+    /// leaves the pool with the peer batch's execution), so this is not a rejection.
+    pub fn peer_deferred(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::Other(Box::new(PeerBatchDeferred)),
+        );
+    }
+}
+
+/// The pool error reported when the builder skips a transaction already packed by a validated
+/// peer batch (issue #1329).
+///
+/// This is a local scheduling decision, not a judgement about the transaction: `is_bad_transaction`
+/// is false, so no peer is penalized and the transaction stays poolable.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PeerBatchDeferred;
+
+impl std::fmt::Display for PeerBatchDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transaction deferred: already packed by a validated peer batch")
+    }
+}
+
+impl std::error::Error for PeerBatchDeferred {}
+
+impl PoolTransactionError for PeerBatchDeferred {
+    fn is_bad_transaction(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl Iterator for BestTxns {
@@ -889,6 +1065,9 @@ pub fn recover_pooled_transaction(
     let pooled = EthPooledTransaction::try_from_consensus(recovered)?;
     Ok(pooled)
 }
+
+#[cfg(test)]
+mod config_tests;
 
 #[cfg(test)]
 mod tests {
@@ -959,7 +1138,7 @@ mod tests {
         );
         let notification =
             tokio::time::timeout(Duration::from_secs(5), notifications.recv()).await??;
-        pool.apply_canon_notification(notification);
+        pool.apply_canon_notification(notification).await?;
         assert_eq!(
             pool.pending_forwards().ready(Instant::now() + FORWARD_PENDING_LIFETIME, 1),
             (vec![], 0),
@@ -1431,7 +1610,7 @@ mod tests {
     /// base fee must not overwrite the pool's pending base fee. The pending fee always comes
     /// from the worker's shared [`BaseFeeContainer`].
     #[tokio::test]
-    async fn test_canonical_update_cannot_clobber_epoch_base_fee() {
+    async fn test_canonical_update_cannot_clobber_epoch_base_fee() -> Result<(), JoinError> {
         const EPOCH_FEE: u64 = MIN_PROTOCOL_BASE_FEE + 1234;
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
@@ -1446,13 +1625,65 @@ mod tests {
         let genesis_block = reth_env.chainspec().sealed_genesis_block();
         assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
 
-        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]).await?;
 
         assert_eq!(
             pool.block_info().pending_basefee,
             EPOCH_FEE,
             "a canonical tip from the previous epoch must not clobber the epoch base fee",
         );
+        Ok(())
+    }
+
+    /// A saturated blocking executor keeps canonical maintenance pending while the async
+    /// executor makes progress, and completion guarantees that the pool update was applied.
+    #[tokio::test]
+    async fn test_canonical_update_awaits_blocking_pool_work() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+        let pool = reth_env
+            .init_txn_pool_without_maintenance(BaseFeeContainer::new(MIN_PROTOCOL_BASE_FEE))?;
+        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        pool.set_block_info(RethBlockInfo { pending_basefee: 0, ..pool.block_info() });
+
+        // Keep validator tasks on the outer runtime so they cannot occupy the sole blocking
+        // slot used by this test's independent runtime.
+        tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()?;
+            runtime.block_on(async {
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    blocked.recv()
+                });
+                ready.await?;
+
+                let update =
+                    pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+                tokio::pin!(update);
+                let first_poll = futures::poll!(&mut update);
+                let fee_before_release = pool.block_info().pending_basefee;
+
+                // Release before assertions so a regression cannot strand the blocking task
+                // and prevent the test runtime from shutting down.
+                release.send(())?;
+                blocker.await??;
+                assert!(first_poll.is_pending(), "canonical work must yield to the executor");
+                assert_eq!(fee_before_release, 0, "queued pool work must not run inline");
+
+                update.await?;
+                assert_eq!(pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+                Ok(())
+            })
+        })
+        .await??;
+        Ok(())
     }
 
     #[test]
