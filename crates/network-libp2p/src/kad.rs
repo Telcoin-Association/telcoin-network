@@ -227,7 +227,7 @@ const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 /// handler in `ConsensusNetwork` queries it, and [`KadStore`] uses it as `node_key` so
 /// [`RecordStore::provided`] enumerates the row `start_providing` actually wrote (issue
 /// #1331).
-pub fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
+pub(crate) fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
     RecordKey::new(primary_public_key)
 }
 
