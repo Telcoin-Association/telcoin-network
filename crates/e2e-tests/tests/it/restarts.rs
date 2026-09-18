@@ -15,6 +15,7 @@ use nix::{
     unistd::Pid,
 };
 use std::{
+    cell::RefCell,
     path::Path,
     process::Child,
     time::{Duration, Instant},
@@ -95,12 +96,16 @@ fn run_restart_tests1(
         2,
         &["--log.stdout.filter", "subscriber=info"],
     );
+    let [_, _, restarted_node, _] = client_urls;
+    wait_for_restarted_rpc(&mut child2, restarted_node, test).inspect_err(|e| {
+        kill_child(&mut child2);
+        error!(target: "restart-test", ?e, "restarted node did not become RPC-ready");
+    })?;
     // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
     // the node passes through the transient `CvvInactive` mode. Its subscriber log retains
     // evidence even if catch-up finishes before an RPC poll sees that mode. The short-downtime
     // restart never crosses the GC window and never demotes, so it is gated out here.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        let [_, _, restarted_node, _] = client_urls;
         assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
@@ -129,6 +134,26 @@ fn run_restart_tests1(
         kill_child(&mut child2);
     })?;
     Ok(child2)
+}
+
+/// Wait for the restarted validator's RPC endpoint without spending the balance retry budget.
+///
+/// Use the same startup bound as `network_advancing`, and fail immediately if the child exits.
+/// RPC readiness does not imply catch-up; the caller still checks balances and canonical blocks.
+fn wait_for_restarted_rpc(child: &mut Child, node: &str, test: &str) -> eyre::Result<()> {
+    let child = RefCell::new(child);
+    let description = format!(
+        "restarted validator RPC at {node} (logs: test_logs/{test}/node2-run2.log and \
+         node2-run2.stderr.log)"
+    );
+    wait_until_blocking(Duration::from_secs(45), &description, || {
+        child.try_borrow_mut()?.try_wait()?.map_or(Ok(()), |status| {
+            eyre::bail!("{description}: child exited before RPC was ready: {status}")
+        })?;
+        let response: eyre::Result<String> =
+            call_rpc(node, "eth_blockNumber", rpc_params![], 0, "restart readiness");
+        Ok(response.is_ok())
+    })
 }
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
