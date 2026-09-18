@@ -318,12 +318,12 @@ impl BtreeIndex {
     }
 
     /// Return an owned copy of page `p` for iteration (one copy per leaf hop).
-    pub(super) fn fetch_page(&mut self, p: u32) -> Result<Vec<u8>, FetchError> {
+    pub(super) fn fetch_page(&self, p: u32) -> Result<Vec<u8>, FetchError> {
         Ok(self.page(p)?.to_vec())
     }
 
     /// Descend to the leaf page that would contain `key`.
-    pub(super) fn find_leaf(&mut self, key: &[u8]) -> Result<u32, FetchError> {
+    pub(super) fn find_leaf(&self, key: &[u8]) -> Result<u32, FetchError> {
         let node = self.node;
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
@@ -585,7 +585,7 @@ impl BtreeIndex {
     }
 
     /// Load the file position for `key`, or [`FetchError::NotFound`].
-    pub fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+    pub fn load(&self, key: &[u8]) -> Result<u64, FetchError> {
         debug_assert_eq!(
             key.len(),
             self.node.ksize(),
@@ -597,7 +597,7 @@ impl BtreeIndex {
     }
 
     /// True if the index contains `key`.
-    pub fn contains(&mut self, key: &[u8]) -> bool {
+    pub fn contains(&self, key: &[u8]) -> bool {
         self.load(key).is_ok()
     }
 
@@ -655,7 +655,7 @@ impl Index<[u8; 32], u64> for BtreeIndex {
     }
 
     fn load(&mut self, key: [u8; 32]) -> Result<u64, FetchError> {
-        self.load(&key)
+        BtreeIndex::load(self, &key)
     }
 
     fn sync(&mut self) -> Result<(), CommitError> {
@@ -674,8 +674,8 @@ impl BtreeIndex {
     }
 
     /// Load the file position for a `B256` digest (see [`BtreeIndex::load`]).
-    pub fn load_digest(&mut self, key: B256) -> Result<u64, FetchError> {
-        self.load(&key.0)
+    pub fn load_digest(&self, key: B256) -> Result<u64, FetchError> {
+        BtreeIndex::load(self, &key.0)
     }
 
     /// Remove a `B256` digest key (see [`BtreeIndex::remove`]).
@@ -798,7 +798,7 @@ mod tests {
         drop(idx);
 
         // Reopen read-only and re-verify persistence across the split-heavy tree.
-        let mut idx: BtreeIndex =
+        let idx: BtreeIndex =
             BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
         assert_eq!(idx.len(), 1_000_000);
         for i in (0..1_000_000u64).step_by(7) {
@@ -1061,7 +1061,7 @@ mod tests {
         }
 
         // Reopen read-only with the same key size: values persist and iterate in sorted order.
-        let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 16, true).expect("reopen ro");
+        let idx = BtreeIndex::open_btx_file(&dir, &data_header, 16, true).expect("reopen ro");
         assert_eq!(idx.ksize(), 16);
         for i in 0..2_000u64 {
             assert_eq!(idx.load(&key(i)).expect("load"), i);

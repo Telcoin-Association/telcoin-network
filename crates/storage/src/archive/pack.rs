@@ -2,7 +2,7 @@
 //! other nodes.
 
 use serde::{de::DeserializeOwned, Serialize};
-use tn_types::{encode_into_buffer, try_decode};
+use tn_types::{encode_into_buffer, try_decode, try_decode_from_read};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
@@ -19,7 +19,7 @@ use std::{
     fmt::Debug,
     fs::{self, File},
     hash::Hasher as _,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, Write},
     marker::PhantomData,
     path::Path,
 };
@@ -71,18 +71,18 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
-        self.inner.fetch(pos)
+    pub fn fetch(&self, pos: u64) -> Result<V, FetchError> {
+        self.inner.read_record(pos)
     }
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
-    pub fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+    pub fn read_bytes(&self, start_pos: u64, end_pos: u64) -> Result<&[u8], FetchError> {
         self.inner.read_bytes(start_pos, end_pos)
     }
 
     /// Read the record size (with crc32) at position.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    pub fn record_size(&mut self, pos: u64) -> Result<u32, FetchError> {
+    pub fn record_size(&self, pos: u64) -> Result<u32, FetchError> {
         self.inner.record_size(pos)
     }
 
@@ -292,13 +292,8 @@ where
         self.data_file.opened_unclean()
     }
 
-    /// Fetch the value stored at key.  Will return an error if not found.
-    fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
-        self.read_record(pos)
-    }
-
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
-    fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+    fn read_bytes(&self, start_pos: u64, end_pos: u64) -> Result<&[u8], FetchError> {
         // Validate the range against the file length before allocating so a corrupt or
         // oversized bound (the position index has no per-record CRC) errors instead of
         // triggering a huge up-front allocation that would only fail at read_exact.
@@ -308,9 +303,7 @@ where
                 "read_bytes range out of bounds",
             )));
         }
-        let mut bytes = vec![0; (end_pos - start_pos) as usize];
-        self.data_file.seek(SeekFrom::Start(start_pos))?;
-        self.data_file.read_exact(&mut bytes[..])?;
+        let bytes = self.data_file.slice(start_pos, (end_pos - start_pos) as usize).unwrap_or(&[]);
         Ok(bytes)
     }
 
@@ -476,7 +469,7 @@ where
     }
 
     fn record_size_bytes<'a>(
-        &'a mut self,
+        &'a self,
         position: u64,
         crc32_hasher: &mut crc32fast::Hasher,
     ) -> Result<(usize, &'a [u8]), FetchError> {
@@ -497,42 +490,22 @@ where
                 )))
             }
         } else {
-            self.data_file.seek(SeekFrom::Start(position))?;
-            let mut val_size_buf = [0_u8; 4];
-            self.data_file.read_exact(&mut val_size_buf)?;
-            crc32_hasher.update(&val_size_buf);
-            let val_size = u32::from_le_bytes(val_size_buf);
-            if val_size > MAX_RECORD_SIZE {
-                return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-            }
-            self.value_buffer.resize(val_size as usize + 4, 0);
-            self.data_file.read_exact(&mut self.value_buffer[..])?;
-            Ok((val_size as usize, &self.value_buffer[..]))
+            Err(FetchError::IO(io::Error::new(io::ErrorKind::Other, "Unable to get mmap slice.")))
         }
     }
 
     /// Read the record at position.
     /// Returns the (key, value) tuple
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
-        // The record `bytes` (in `read_record_into`) borrow `self` on the zero-copy path, so the
-        // reusable decompression buffer cannot be borrowed from `self` during the decode. Move it
-        // out and back; `mem::take` preserves its capacity, so there is still no per-read
-        // allocation.
-        let mut compression_buffer = std::mem::take(&mut self.compression_buffer);
-        let result = self.read_record_into(position, &mut compression_buffer);
-        self.compression_buffer = compression_buffer;
+    fn read_record(&self, position: u64) -> Result<V, FetchError> {
+        let result = self.read_record_into(position);
         result
     }
 
     /// Body of [`Self::read_record`], with the reusable decompression buffer passed in (see the
     /// note there) so the record `bytes` can be decoded/decompressed straight from where they
     /// were read (the mmap map for the zero-copy path) without a borrow conflict.
-    fn read_record_into(
-        &mut self,
-        position: u64,
-        compression_buffer: &mut Vec<u8>,
-    ) -> Result<V, FetchError> {
+    fn read_record_into(&self, position: u64) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
         let compression = self.header.compression;
         let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
@@ -544,30 +517,27 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer: &[u8] = match compression {
+        match compression {
             // The value bytes only — `bytes` is `[value | crc]`, so drop the trailing 4-byte CRC.
-            PackCompression::None => &bytes[0..val_size],
+            PackCompression::None => {
+                let val = try_decode(&bytes[0..val_size])
+                    .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
+                Ok(val)
+            }
             PackCompression::ZStd => {
                 let mut decoder = zstd::stream::read::Decoder::new(&bytes[0..val_size])?;
                 decoder.window_log_max(24)?;
-                compression_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(compression_buffer)?;
-                if compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                &compression_buffer[..]
+                let limited = decoder.take(MAX_RECORD_SIZE as u64);
+                let val = try_decode_from_read(limited)
+                    .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
+                Ok(val)
             }
-        };
-        let val =
-            try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
-        Ok(val)
+        }
     }
 
     /// Read the record size (with crc32) at position.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn record_size(&mut self, position: u64) -> Result<u32, FetchError> {
+    fn record_size(&self, position: u64) -> Result<u32, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
         let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
         crc32_hasher.update(&bytes[0..val_size]);
@@ -840,7 +810,7 @@ impl PackCompression {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::{fs::OpenOptions, io::SeekFrom};
 
     use serde::Deserialize;
     use tempfile::TempDir;
@@ -1040,7 +1010,7 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         drop(db);
 
-        let mut db: TestPack =
+        let db: TestPack =
             Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
                 .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
@@ -1272,7 +1242,7 @@ mod tests {
     fn test_zstd_decompression_bomb_fetch() {
         let (tmp_dir, pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
-        let mut pack: TestPack =
+        let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
@@ -1322,7 +1292,7 @@ mod tests {
     fn test_zstd_corrupt_frame_fetch() {
         let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
-        let mut pack: TestPack =
+        let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}

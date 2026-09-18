@@ -24,7 +24,7 @@ const NEED_PREV: usize = usize::MAX;
 /// [`BtreeIndex::rev_range`], and [`BtreeIndex::prefix`].
 #[derive(Debug)]
 pub struct BtreeIter<'a> {
-    index: &'a mut BtreeIndex,
+    index: &'a BtreeIndex,
     /// Page geometry (key size) copied from the index, to decode leaf buffers.
     node: Node,
     /// Owned copy of the current leaf page (empty until initialized).
@@ -42,7 +42,7 @@ pub struct BtreeIter<'a> {
 
 impl<'a> BtreeIter<'a> {
     fn new(
-        index: &'a mut BtreeIndex,
+        index: &'a BtreeIndex,
         reverse: bool,
         lower: Bound<Vec<u8>>,
         upper: Bound<Vec<u8>>,
@@ -224,12 +224,12 @@ impl Iterator for BtreeIter<'_> {
 
 impl BtreeIndex {
     /// Ascending iterator over all `(key, position)` entries.
-    pub fn iter(&mut self) -> Result<BtreeIter<'_>, FetchError> {
+    pub fn iter(&self) -> Result<BtreeIter<'_>, FetchError> {
         BtreeIter::new(self, false, Bound::Unbounded, Bound::Unbounded)
     }
 
     /// Descending iterator over all `(key, position)` entries.
-    pub fn rev_iter(&mut self) -> Result<BtreeIter<'_>, FetchError> {
+    pub fn rev_iter(&self) -> Result<BtreeIter<'_>, FetchError> {
         BtreeIter::new(self, true, Bound::Unbounded, Bound::Unbounded)
     }
 
@@ -239,7 +239,7 @@ impl BtreeIndex {
     /// unbounded `..` needs the element type spelled out (e.g. `range::<[u8; 32], _>(..)`) or use
     /// [`BtreeIndex::iter`].
     pub fn range<T: AsRef<[u8]>, R: RangeBounds<T>>(
-        &mut self,
+        &self,
         bounds: R,
     ) -> Result<BtreeIter<'_>, FetchError> {
         let (lower, upper) = clone_bounds(&bounds);
@@ -248,7 +248,7 @@ impl BtreeIndex {
 
     /// Descending iterator over the entries whose keys fall within `bounds`.
     pub fn rev_range<T: AsRef<[u8]>, R: RangeBounds<T>>(
-        &mut self,
+        &self,
         bounds: R,
     ) -> Result<BtreeIter<'_>, FetchError> {
         let (lower, upper) = clone_bounds(&bounds);
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn test_archive_btx_iter_empty() {
         let tmp = TempDir::with_prefix("test_archive_btx_iter_empty").expect("temp dir");
-        let mut idx = open(&tmp.path().join("idx"));
+        let idx = open(&tmp.path().join("idx"));
         assert_eq!(idx.iter().expect("iter").count(), 0);
         assert_eq!(idx.rev_iter().expect("rev_iter").count(), 0);
         assert_eq!(idx.range(bkey(0)..bkey(10)).expect("range").count(), 0);

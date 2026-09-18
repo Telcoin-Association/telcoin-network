@@ -1956,7 +1956,7 @@ impl Inner {
             .data
             .read_bytes(output_start, output_end)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        Ok(bytes)
+        Ok(bytes.to_vec())
     }
 
     /// Return the byte offset in the data file just past the end of the consensus output for

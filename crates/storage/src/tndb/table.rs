@@ -16,21 +16,17 @@
 //! `recv` — unlike `tokio`'s — never panics inside a runtime). The actor thread is a plain
 //! `std::thread`, so `blocking_recv` there is correct.
 
-// Step one: the handle is not yet wired into `TnDatabase`, so its methods look unused in a non-test
-// build. Remove once `database.rs` adopts it.
-#![allow(dead_code)]
-
 use std::{
     path::PathBuf,
     sync::{
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, SyncSender},
         Arc,
     },
     thread::JoinHandle,
 };
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot::{self, Sender};
 
 use crate::archive::{
     btree_index::BtreeIndex,
@@ -53,6 +49,8 @@ pub(crate) enum ScanKind {
     Reverse,
     /// Ascending from the given key bytes (inclusive) to the end.
     From(Vec<u8>),
+    /// Descending over the entries whose keys are strictly less than the given key bytes.
+    RevFrom(Vec<u8>),
 }
 
 /// Thread-owned table state: the append-only value log plus its sorted key index (created lazily on
@@ -83,9 +81,9 @@ impl Inner {
         Ok(())
     }
 
-    fn get(&mut self, key: &[u8]) -> eyre::Result<Option<Vec<u8>>> {
+    fn get(&self, key: &[u8]) -> eyre::Result<Option<Vec<u8>>> {
         // Resolve the position under the index borrow, then read the value from the log.
-        let pos = match self.idx.as_mut() {
+        let pos = match self.idx.as_ref() {
             Some(idx) => match idx.load(key) {
                 Ok(pos) => pos,
                 Err(FetchError::NotFound) => return Ok(None),
@@ -96,8 +94,8 @@ impl Inner {
         Ok(Some(self.data.fetch(pos)?))
     }
 
-    fn contains(&mut self, key: &[u8]) -> eyre::Result<bool> {
-        Ok(self.idx.as_mut().is_some_and(|idx| idx.contains(key)))
+    fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
+        Ok(self.idx.as_ref().is_some_and(|idx| idx.contains(key)))
     }
 
     fn remove(&mut self, key: &[u8]) -> eyre::Result<bool> {
@@ -132,13 +130,14 @@ impl Inner {
     /// Stream `(key_bytes, value_bytes)` over `out` in key order.  Split-borrowing `data`/`idx`
     /// keeps the live B+tree iterator (over `idx`) and the value fetch (from `data`) disjoint, so
     /// values stream lazily; a dropped receiver (`send` error) stops the walk early.
-    fn scan(&mut self, kind: ScanKind, out: &SyncSender<(Vec<u8>, Vec<u8>)>) {
+    fn scan(&self, kind: ScanKind, out: &SyncSender<(Vec<u8>, Vec<u8>)>) {
         let Inner { data, idx, .. } = self;
-        let Some(idx) = idx.as_mut() else { return };
+        let Some(idx) = idx.as_ref() else { return };
         let iter = match kind {
             ScanKind::Forward => idx.iter(),
             ScanKind::Reverse => idx.rev_iter(),
             ScanKind::From(from) => idx.range(from..),
+            ScanKind::RevFrom(from) => idx.rev_range(..from),
         };
         let Ok(iter) = iter else { return };
         for item in iter {
@@ -167,9 +166,9 @@ enum TableMessage {
 
 /// A cheap `Clone` handle to a table actor.  Every method sends a command to the table's dedicated
 /// thread and blocks on the reply — callers never hold a lock.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TnTable {
-    tx: UnboundedSender<TableMessage>,
+    tx: mpsc::Sender<TableMessage>,
     /// The actor thread's join handle, taken by the last handle's `Drop` for a clean, durable
     /// close.
     join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -183,7 +182,7 @@ impl TnTable {
         let data =
             Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)?;
         let inner = Inner { dir, data, idx: None };
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = mpsc::channel();
         let join = std::thread::Builder::new()
             .name("tndb-table".into())
             .spawn(move || run_table_loop(inner, rx))?;
@@ -192,9 +191,9 @@ impl TnTable {
 
     /// Send a command with a fresh reply channel and block on the reply.
     fn send_recv<T>(&self, make: impl FnOnce(Sender<T>) -> TableMessage) -> eyre::Result<T> {
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = oneshot::channel();
         self.tx.send(make(reply)).map_err(|_| eyre::eyre!("tndb table actor stopped"))?;
-        rx.recv().map_err(|_| eyre::eyre!("tndb table actor dropped the reply"))
+        rx.blocking_recv().map_err(|_| eyre::eyre!("tndb table actor dropped the reply"))
     }
 
     /// Insert (or overwrite) `key → value`.
@@ -232,7 +231,8 @@ impl TnTable {
         self.send_recv(|reply| TableMessage::IsEmpty { reply })
     }
 
-    /// Number of entries.
+    /// Number of entries. (Part of the table API; not currently used by `TnDatabase`.)
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> eyre::Result<usize> {
         self.send_recv(|reply| TableMessage::Len { reply })
     }
@@ -261,7 +261,7 @@ impl Drop for TnTable {
 
 /// The iterator returned by [`TnTable::scan`]: it pulls streamed items from the actor thread.
 pub(crate) struct TnTableScan {
-    rx: Receiver<(Vec<u8>, Vec<u8>)>,
+    rx: mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Iterator for TnTableScan {
@@ -274,8 +274,8 @@ impl Iterator for TnTableScan {
 }
 
 /// The actor loop: owns `inner` and serves commands until shutdown, then clean-closes.
-fn run_table_loop(mut inner: Inner, mut rx: UnboundedReceiver<TableMessage>) {
-    while let Some(msg) = rx.blocking_recv() {
+fn run_table_loop(mut inner: Inner, rx: mpsc::Receiver<TableMessage>) {
+    while let Ok(msg) = rx.recv() {
         match msg {
             TableMessage::Insert { key, value, reply } => {
                 let _ = reply.send(inner.insert(key, value));

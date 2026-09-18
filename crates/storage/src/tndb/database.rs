@@ -1,226 +1,110 @@
-//! A [`Database`] backed by pack files, each keyed by a sorted [`BtreeIndex`].
+//! A [`Database`] backed by per-table actors ([`TnTable`]): each table owns an append-only value
+//! log plus a sorted B+tree index on its own thread, so operations take no lock — the store maps a
+//! table name to that table's `TnTable` handle (a cheap `Clone` channel sender).
 //!
-//! Each table is a directory (`<base>/<NAME>`) holding an append-only value log (`data`, a
-//! [`Pack`]) plus a sorted key→position index (`btx/`, a [`BtreeIndex`]).  Keys are encoded with
-//! `encode_key` (binary-sortable) and values with `encode` (bcs), exactly as in [`crate::mem_db`];
-//! a lookup resolves `key → position` in the index, then reads the value from the log.
+//! This module is the typed layer, modeled on [`crate::mem_db`]: keys are encoded with `encode_key`
+//! (binary-sortable) and values with `encode` (bcs); each op sends the encoded bytes to the table's
+//! actor and decodes the reply.  The index's fixed key length is `encode_key(key).len()` —
+//! `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is `Arc<[u8; 32]>`, 8 bytes in
+//! memory but 32 encoded).
 //!
-//! The index needs a fixed key byte-length.  `size_of::<T::Key>()` is *not* reliable (e.g.
-//! `AuthorityIdentifier` is `Arc<[u8; 32]>` — 8 bytes in memory but 32 encoded), so the length is
-//! taken from `encode_key(key).len()` and the index is created lazily on the first insert.
-//!
-//! This is step one: a functional implementation modeled on `mem_db`.  Scans are lazy in the
-//! expensive part (value fetch/decode is deferred per `next()`), though the index positions are
-//! still walked up front.  Later steps cover pack compaction on clear, warm-start reads before the
-//! first insert, fully-streaming index scans, and durability-barrier tuning.
+//! Scans stream lazily off the table actor.  Not yet covered: pack compaction on clear, warm-start
+//! reads before the first insert, and durability-barrier tuning.
 
 use std::{
-    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use tn_types::{decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
 
-use crate::archive::{
-    btree_index::{BtreeIndex, BtreeIter},
-    error::fetch::FetchError,
-    pack::{Pack, PackCompression},
-};
+use super::table::{ScanKind, TnTable};
 
-/// Pack/index format version for tndb tables.
-const PACK_VERSION: u16 = 1;
-
-/// One named table: an append-only value log ([`Pack`]) plus its sorted key index
-/// ([`BtreeIndex`], created lazily on first insert once the encoded key length is known).
-#[derive(Debug)]
-struct TnTable {
-    /// Table directory (`<base>/<NAME>`), holding the `data` log and the `btx/` index.
-    dir: PathBuf,
-    data: Pack<Vec<u8>>,
-    idx: Option<BtreeIndex>,
-}
-
-impl TnTable {
-    /// The index, created (with key byte length `ksize`) on first use.  On reopen of an existing
-    /// table directory this reopens the on-disk index, whose header records the same `ksize`.
-    fn index_mut(&mut self, ksize: u16) -> eyre::Result<&mut BtreeIndex> {
-        if self.idx.is_none() {
-            let idx =
-                BtreeIndex::open_btx_file(self.dir.join("btx"), self.data.header(), ksize, false)?;
-            self.idx = Some(idx);
-        }
-        Ok(self.idx.as_mut().expect("index just created"))
-    }
-}
-
-type StoreType = DashMap<&'static str, Arc<Mutex<TnTable>>>;
+type StoreType = DashMap<&'static str, TnTable>;
 
 // ---- shared table operations (used by both the `Database` and the txn impls) ----
+//
+// Each op clones the table's actor handle out of the `DashMap` and drops the shard `Ref` before the
+// (blocking) round-trip, so no lock is held across a table operation.
+//
+// NOTE: a table actor serves one scan at a time, so a caller must drain or drop an iterator
+// (`iter`/`reverse_iter`/`skip_to`) before issuing another blocking op on the *same* table from the
+// same thread — an unconsumed scan keeps the actor busy.
 
-/// Look up a key: encode it, resolve its position in the index, then read+decode the value.
+/// Clone the table's actor handle out of the store, dropping the `DashMap` shard lock.
+fn handle(store: &StoreType, name: &'static str) -> Option<TnTable> {
+    store.get(name).map(|h| h.clone())
+}
+
+/// Look up a key: read its value bytes from the table, then decode.
 fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-    let Some(table) = store.get(T::NAME) else { return Ok(None) };
-    let key_bytes = encode_key(key);
-    let mut table = table.lock();
-    // Resolve the position under the index borrow, then release it before touching the log.
-    let pos = match table.idx.as_mut() {
-        Some(idx) => match idx.load(&key_bytes) {
-            Ok(pos) => pos,
-            Err(FetchError::NotFound) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        },
-        None => return Ok(None),
-    };
-    let value_bytes = table.data.fetch(pos)?;
-    Ok(Some(decode::<T::Value>(&value_bytes)))
+    let Some(table) = handle(store, T::NAME) else { return Ok(None) };
+    Ok(table.get(encode_key(key))?.map(|bytes| decode::<T::Value>(&bytes)))
 }
 
-/// Append the value to the log and record `key → position` in the index (no durability flush;
-/// callers flush explicitly). The index is created on first insert from the encoded key length.
+/// Insert `key → value` (no durability flush; callers flush explicitly).
 fn insert<T: Table>(store: &StoreType, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-    let Some(table) = store.get(T::NAME) else { return Ok(()) };
-    let key_bytes = encode_key(key);
-    let value_bytes = encode(value);
-    let mut table = table.lock();
-    let pos = table.data.append(&value_bytes)?;
-    let ksize = key_bytes.len() as u16;
-    table.index_mut(ksize)?.save(&key_bytes, pos)?;
-    Ok(())
+    match handle(store, T::NAME) {
+        Some(table) => table.insert(encode_key(key), encode(value)),
+        None => Ok(()),
+    }
 }
 
-/// Remove a key from the index (the value's log bytes are left as unreferenced garbage; pack
-/// compaction is a later step).
+/// Remove a key (its log bytes are left as unreferenced garbage; pack compaction is a later step).
 fn remove<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<()> {
-    if let Some(table) = store.get(T::NAME) {
-        let key_bytes = encode_key(key);
-        let mut table = table.lock();
-        if let Some(idx) = table.idx.as_mut() {
-            idx.remove(&key_bytes)?;
-        }
+    if let Some(table) = handle(store, T::NAME) {
+        table.remove(encode_key(key))?;
     }
     Ok(())
 }
 
-/// Reset a table's index to empty (the log's bytes become unreferenced garbage until compaction).
+/// Reset a table to empty (its log bytes become unreferenced garbage until compaction).
 fn clear_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    if let Some(table) = store.get(T::NAME) {
-        let mut table = table.lock();
-        if let Some(idx) = table.idx.as_mut() {
-            idx.rebuild_from(std::iter::empty::<(Vec<u8>, u64)>())?;
-        }
+    match handle(store, T::NAME) {
+        Some(table) => table.clear(),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// Flush a table's log and index to disk.
+/// Durably persist a table's value log.
 fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    if let Some(table) = store.get(T::NAME) {
-        let mut table = table.lock();
-        table.data.commit()?;
-        /*XXXXif let Some(idx) = table.idx.as_mut() {
-            idx.sync()?;
-        }*/
-    }
-    Ok(())
-}
-
-/// How to build the underlying [`BtreeIndex`] iterator for a scan.  A trait rather than a closure
-/// so the returned iterator can borrow the `&mut BtreeIndex` argument — the elided return lifetime
-/// a closure bound can't express.
-trait MakeIter {
-    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError>;
-}
-
-/// Ascending scan over every entry.
-struct Forward;
-impl MakeIter for Forward {
-    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
-        idx.iter()
+    match handle(store, T::NAME) {
+        Some(table) => table.flush(),
+        None => Ok(()),
     }
 }
 
-/// Descending scan over every entry.
-struct Reverse;
-impl MakeIter for Reverse {
-    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
-        idx.rev_iter()
+/// True if the table contains `key`.
+fn contains_key<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<bool> {
+    match handle(store, T::NAME) {
+        Some(table) => table.contains(encode_key(key)),
+        None => Ok(false),
     }
 }
 
-/// Ascending scan from `key_bytes` (inclusive) to the end.
-struct FromKey(Vec<u8>);
-impl MakeIter for FromKey {
-    fn make(self, idx: &mut BtreeIndex) -> Result<BtreeIter<'_>, FetchError> {
-        idx.range(self.0..)
+/// True if the table is empty (or absent / unreadable).
+fn is_empty<T: Table>(store: &StoreType) -> bool {
+    handle(store, T::NAME).and_then(|table| table.is_empty().ok()).unwrap_or(false)
+}
+
+/// A lazy, key-ordered [`DBIter`] streamed straight off the table actor.
+fn scan<T: Table>(store: &StoreType, kind: ScanKind) -> DBIter<'static, T> {
+    match handle(store, T::NAME) {
+        Some(table) => Box::new(table.scan(kind).map(|(key_bytes, value_bytes)| {
+            (decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes))
+        })),
+        None => Box::new(std::iter::empty()),
     }
 }
 
-/// A lazy [`DBIter`] over one table.  The `(key_bytes, position)` pairs are walked from the B+tree
-/// index up front (cheap), but each value is fetched from the log and decoded on demand in `next()`
-/// — deferring the expensive fetch/decode/decompress so early-terminating consumers don't pay for
-/// values they never read.  (A fully streaming index walk is blocked by the self-referential borrow
-/// of a live `BtreeIter` over the locked table; a snapshotted position stays valid because the log
-/// is append-only, so a concurrent remove/clear never invalidates it.)
-struct TnDbIter<T: Table> {
-    table: Arc<Mutex<TnTable>>,
-    positions: std::vec::IntoIter<(Vec<u8>, u64)>,
-    casper: PhantomData<T>,
-}
-
-impl<T: Table> Iterator for TnDbIter<T> {
-    type Item = (T::Key, T::Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (key_bytes, pos) = self.positions.next()?;
-        // End the scan on a read error (see `Database::iter`).
-        let value_bytes = self.table.lock().data.fetch(pos).ok()?;
-        Some((decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes)))
-    }
-}
-
-/// A lazy, sorted iterator over a table's `(key, value)` pairs: it walks the B+tree index iterator
-/// built by `maker` for the `(key, position)` pairs, then decodes the key and fetches + decodes the
-/// value per `next()`.  Yields an empty iterator when the table is absent, has no index yet, or the
-/// scan cannot be positioned.
-fn collect_entries<'a, T, M>(store: &StoreType, maker: M) -> DBIter<'static, T>
-where
-    T: Table,
-    M: MakeIter,
-{
-    let table = match store.get(T::NAME) {
-        Some(table) => Arc::clone(&table),
-        None => return Box::new(std::iter::empty()),
-    };
-    let positions: Vec<(Vec<u8>, u64)> = {
-        let mut guard = table.lock();
-        match guard.idx.as_mut() {
-            Some(idx) => maker.make(idx).and_then(|it| it.collect()).unwrap_or_default(),
-            None => Vec::new(),
-        }
-    };
-    Box::new(TnDbIter::<T> { table, positions: positions.into_iter(), casper: PhantomData })
-}
-
-/// Fetch the single `(key, value)` a one-shot index lookup lands on.
-fn single_entry<T, F>(store: &StoreType, select: F) -> Option<(T::Key, T::Value)>
-where
-    T: Table,
-    F: FnOnce(&mut BtreeIndex) -> Option<(Vec<u8>, u64)>,
-{
-    let table = store.get(T::NAME)?;
-    let mut table = table.lock();
-    let (key_bytes, pos) = match table.idx.as_mut() {
-        Some(idx) => select(idx)?,
-        None => return None,
-    };
-    let value_bytes = table.data.fetch(pos).ok()?;
+/// The single `(key, value)` a one-shot scan lands on (its first item).
+fn first_of<T: Table>(store: &StoreType, kind: ScanKind) -> Option<(T::Key, T::Value)> {
+    let (key_bytes, value_bytes) = handle(store, T::NAME)?.scan(kind).next()?;
     Some((decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes)))
 }
 
-/// A [`Database`] backed by per-table pack files + sorted B+tree indexes.
+/// A [`Database`] backed by per-table actors ([`super::table::TnTable`]).
 #[derive(Clone, Debug)]
 pub struct TnDatabase {
     store: Arc<StoreType>,
@@ -276,13 +160,11 @@ impl DbTxMut for TnDbTxMut {
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // Durably flush every table's log + index.
-        for table in self.store.iter() {
-            let mut table = table.lock();
-            table.data.commit()?;
-            /*XXXXif let Some(idx) = table.idx.as_mut() {
-                idx.sync()?;
-            }*/
+        // Durably flush every table's log.  Clone the handles out first so no shard lock is held
+        // across a (blocking) flush.
+        let tables: Vec<TnTable> = self.store.iter().map(|entry| entry.value().clone()).collect();
+        for table in tables {
+            table.flush()?;
         }
         Ok(())
     }
@@ -300,11 +182,7 @@ impl Database for TnDatabase {
         Self: 'txn;
 
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        let dir = self.base.join(T::NAME);
-        std::fs::create_dir_all(&dir)?;
-        let data =
-            Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)?;
-        self.store.insert(T::NAME, Arc::new(Mutex::new(TnTable { dir, data, idx: None })));
+        self.store.insert(T::NAME, TnTable::open(self.base.join(T::NAME))?);
         Ok(())
     }
 
@@ -317,14 +195,7 @@ impl Database for TnDatabase {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            let mut table = table.lock();
-            if let Some(idx) = table.idx.as_mut() {
-                return Ok(idx.contains(&key_bytes));
-            }
-        }
-        Ok(false)
+        contains_key::<T>(&self.store, key)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
@@ -348,33 +219,28 @@ impl Database for TnDatabase {
     }
 
     fn is_empty<T: Table>(&self) -> bool {
-        if let Some(table) = self.store.get(T::NAME) {
-            let table = table.lock();
-            return table.idx.as_ref().is_none_or(|idx| idx.is_empty());
-        }
-        false
+        is_empty::<T>(&self.store)
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        collect_entries::<T, _>(&self.store, Forward)
+        scan::<T>(&self.store, ScanKind::Forward)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        Ok(collect_entries::<T, _>(&self.store, FromKey(encode_key(key))))
+        Ok(scan::<T>(&self.store, ScanKind::From(encode_key(key))))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        collect_entries::<T, _>(&self.store, Reverse)
+        scan::<T>(&self.store, ScanKind::Reverse)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        let key_bytes = encode_key(key);
-        // The greatest entry strictly less than `key` (descending scan of the open-below range).
-        single_entry::<T, _>(&self.store, move |idx| idx.rev_range(..key_bytes).ok()?.next()?.ok())
+        // The greatest entry strictly less than `key`.
+        first_of::<T>(&self.store, ScanKind::RevFrom(encode_key(key)))
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        single_entry::<T, _>(&self.store, |idx| idx.rev_iter().ok()?.next()?.ok())
+        first_of::<T>(&self.store, ScanKind::Reverse)
     }
 }
 
