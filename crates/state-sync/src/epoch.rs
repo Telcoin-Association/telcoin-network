@@ -4,7 +4,10 @@
 use tn_test_utils as _;
 
 use futures::StreamExt as _;
-use std::{future::Future, time::Duration};
+use std::{
+    future::{ready, Future},
+    time::Duration,
+};
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordValidation};
@@ -20,50 +23,51 @@ const STARTUP_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Give each startup pass one background retry interval to make database progress.
 const STARTUP_SYNC_PASS_TIMEOUT: Duration = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
 
-/// Collect epoch records before the first epoch starts, returning the latest observed stored epoch.
+/// Cadence for checking whether a startup dial has established a connection.
+const STARTUP_PEER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cursor and injected operations carried between startup collection passes.
+struct StartupSyncState<Collect, Progress> {
+    /// Last collected epoch, or the predecessor of the certified prefix after a capped pass.
+    last_epoch: Epoch,
+    /// A completed pass to compare against the next result when detecting quiescence.
+    previous_pass: Option<Epoch>,
+    /// Fetch and validate records from the current cursor.
+    collect: Collect,
+    /// Read the first epoch without a historical certificate.
+    progress: Progress,
+}
+
+/// Collect epoch records before the first epoch starts.
 ///
 /// The caller must seed the trusted genesis committee before calling this function and start the
 /// background record collector afterward. Records use the same locally anchored validation as
-/// background collection. Network failures never fail startup: collection stops with no established
-/// peers, two equal consecutive pass results, a capped pass without certified-prefix progress,
-/// shutdown, or a thirty-second deadline. Each pass has a five-second cap, so a cohort whose peers
-/// cannot yet serve certificates can start without waiting for the full deadline.
+/// background collection. Peer readiness is polled until a connection is established. Network
+/// failures never fail startup: two equal consecutive pass results, a capped pass without
+/// certified-prefix progress, shutdown, or a thirty-second deadline stop collection. The deadline
+/// includes the peer wait. Each pass has a five-second cap, so connected peers that cannot yet
+/// serve certificates do not consume the full deadline.
 pub async fn sync_epoch_records_to_tip(
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
     node_shutdown: Noticer,
-) -> Epoch {
-    let latest_epoch = parking_lot::Mutex::new(0);
+) {
     drive_epoch_record_sync(
-        async {
-            let epoch =
-                consensus_chain.epochs().latest_record().await.map_or(0, |record| record.epoch);
-            *latest_epoch.lock() = epoch;
-            primary_handle.inner_handle().established_peer_count().await.unwrap_or(0)
-        },
+        || async { primary_handle.inner_handle().established_peer_count().await.unwrap_or(0) },
         |epoch| collect_epoch_records(epoch, consensus_chain, primary_handle, consensus_bus),
         || async {
             // This cached scan also detects certificate backfill below the latest stored record,
             // including replacement of the dummy epoch 0 with a certified record.
-            let prefix = consensus_chain
+            consensus_chain
                 .epochs()
                 .first_missing_historical_cert(Epoch::MAX)
                 .await
-                .unwrap_or(Epoch::MAX);
-            let epoch =
-                consensus_chain.epochs().latest_record().await.map_or(0, |record| record.epoch);
-            *latest_epoch.lock() = epoch;
-            prefix
+                .unwrap_or(Epoch::MAX)
         },
         node_shutdown,
     )
     .await;
-
-    // Refresh the stored tip inside the bounded future, including after a capped pass. Reading it
-    // here would add an unbounded actor round trip after the deadline or shutdown has already
-    // fired.
-    latest_epoch.into_inner()
 }
 
 /// Drive startup collection with independently bounded passes and a process-wide stop condition.
@@ -71,40 +75,45 @@ pub async fn sync_epoch_records_to_tip(
 /// `progress` returns the first epoch without a certificate, so a capped pass continues only when
 /// it extended the certified prefix. Separate scheduling from transport to exercise repair,
 /// stalled peers, and shutdown deterministically.
-async fn drive_epoch_record_sync<Collect, Progress>(
-    peer_count: impl Future<Output = usize>,
+async fn drive_epoch_record_sync<Peers, Collect, Progress>(
+    peer_count: impl FnMut() -> Peers,
     collect: impl FnMut(Epoch) -> Collect,
     progress: impl FnMut() -> Progress,
     shutdown: impl Future<Output = ()>,
 ) where
+    Peers: Future<Output = usize>,
     Collect: Future<Output = Epoch>,
     Progress: Future<Output = Epoch>,
 {
     let sync = async {
-        if peer_count.await > 0 {
-            futures::stream::unfold(
-                (0, None, collect, progress),
-                |(last_epoch, previous_pass, mut collect, mut progress)| async move {
-                    let before = progress().await;
-                    let collected = tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep(STARTUP_SYNC_PASS_TIMEOUT) => None,
-                        epoch = collect(last_epoch) => Some(epoch),
-                    };
-                    // A backward step repairs an anchor; only equality establishes quiescence.
-                    let quiescent = collected.is_some_and(|epoch| previous_pass == Some(epoch));
-                    let after = progress().await;
-                    let stalled = collected.is_none() && after == before;
-                    let next_epoch = collected.unwrap_or_else(|| after.saturating_sub(1));
-                    // Keep the outer deadline and shutdown responsive for immediately ready passes.
-                    tokio::task::yield_now().await;
-                    (!quiescent && !stalled)
-                        .then_some(((), (next_epoch, collected, collect, progress)))
-                },
-            )
-            .count()
+        futures::stream::repeat_with(peer_count)
+            .then(std::convert::identity)
+            .take_while(|peers| ready(*peers == 0))
+            .for_each(|_| tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL))
             .await;
-        }
+
+        futures::stream::unfold(
+            StartupSyncState { last_epoch: 0, previous_pass: None, collect, progress },
+            |mut state| async move {
+                let before = (state.progress)().await;
+                let collected = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(STARTUP_SYNC_PASS_TIMEOUT) => None,
+                    epoch = (state.collect)(state.last_epoch) => Some(epoch),
+                };
+                // A backward step repairs an anchor; only equality establishes quiescence.
+                let quiescent = collected.is_some_and(|epoch| state.previous_pass == Some(epoch));
+                let after = (state.progress)().await;
+                let stalled = collected.is_none() && after == before;
+                state.last_epoch = collected.unwrap_or_else(|| after.saturating_sub(1));
+                state.previous_pass = collected;
+                // Keep the outer deadline and shutdown responsive for immediately ready passes.
+                tokio::task::yield_now().await;
+                (!quiescent && !stalled).then_some(((), state))
+            },
+        )
+        .for_each(|()| ready(()))
+        .await;
     };
     tokio::select! {
         biased;
@@ -520,16 +529,15 @@ mod tests {
         );
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        let reached =
-            sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
-        assert_eq!(reached, 1);
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(1));
         assert!(!chain.epochs().contains_dummy_epoch0().await);
         assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((record1, Some(cert1))));
         Ok(())
     }
 
     /// Pending dials cannot make an isolated node fetch a record, even if the mock could serve it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn startup_sync_zero_peers_preserves_dummy() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let authorities: Vec<_> = fixture.authorities().collect();
@@ -547,9 +555,8 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(0, (record, cert))]), peer, 0);
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        let reached =
-            sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
-        assert_eq!(reached, 0);
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(0));
         assert!(chain.epochs().contains_dummy_epoch0().await);
         Ok(())
     }

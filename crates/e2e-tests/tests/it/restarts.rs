@@ -2,13 +2,14 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
-    get_block_number, get_key, get_latest_consensus_header_number, get_node_info, get_node_mode,
-    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
-    start_validator, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
+    get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
+    get_node_mode, get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel,
+    start_observer, start_validator, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::Report;
+use jsonrpsee::rpc_params;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -485,7 +486,9 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     network_advancing(client_urls)?;
     // The observer may still be syncing startup epoch records after the validators are ready.
     wait_until_blocking(Duration::from_secs(45), "observer RPC ready", || {
-        Ok(get_block_number(obs_url).is_ok())
+        // A single block-number request avoids the block-fetch helper's nested retries.
+        Ok(call_rpc::<String, _, _>(obs_url, "eth_blockNumber", rpc_params![], 0, "readiness")
+            .is_ok())
     })?;
 
     let key = get_key("test-source");
