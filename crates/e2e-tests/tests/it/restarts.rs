@@ -5,7 +5,7 @@ use crate::common::{
     address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
     get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
     get_node_mode, get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel,
-    start_observer, start_validator, WEI_PER_TEL,
+    start_observer, start_validator, start_validator_with_args, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::Report;
@@ -86,14 +86,22 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
+    let mut child2 = start_validator_with_args(
+        2,
+        bin,
+        temp_path,
+        rpc_port2,
+        test,
+        2,
+        &["--log.stdout.filter", "subscriber=info"],
+    );
     // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
-    // the node passes through the transient `CvvInactive` mode. Observe it now, before
-    // `get_positive_balance_with_retry` below blocks until the node is fully caught up (by which
-    // point it is `CvvActive` again). The short-downtime restart never crosses the GC window and
-    // never demotes, so it is gated out here.
+    // the node passes through the transient `CvvInactive` mode. Its subscriber log retains
+    // evidence even if catch-up finishes before an RPC poll sees that mode. The short-downtime
+    // restart never crosses the GC window and never demotes, so it is gated out here.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        assert_observed_cvv_inactive(&client_urls[2]).inspect_err(|e| {
+        let [_, _, restarted_node, _] = client_urls;
+        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
         })?;
@@ -173,14 +181,23 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
+    let mut child2 = start_validator_with_args(
+        2,
+        bin,
+        temp_path,
+        rpc_port2,
+        test,
+        2,
+        &["--log.stdout.filter", "subscriber=info"],
+    );
     // Lagged delayed restart: the downtime is past the GC window, so the restarted validator
     // rejoins via the follow/catch-up path and passes through the transient `CvvInactive` mode
-    // before catching up. Observe it now, before the balance-catch-up waits below (which only
-    // return once the node is `CvvActive` again). This path is only ever exercised with the
-    // delayed downtime, but gate on the floor for parity with `run_restart_tests1`.
+    // before catching up. Check its current mode or retained subscriber log before the balance
+    // checks below. This path is only ever exercised with the delayed downtime, but gate on the
+    // floor for parity with `run_restart_tests1`.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        assert_observed_cvv_inactive(&client_urls[2]).inspect_err(|e| {
+        let [_, _, restarted_node, _] = client_urls;
+        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
             kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests_lagged1");
         })?;
@@ -333,40 +350,42 @@ const RESTART_TEST_GC_DEPTH: u32 = 25;
 /// CI while cutting ~35s per test vs the previous fixed 60s floor.
 const RESTART_TEST_DOWNTIME_SECS: u64 = 25;
 
-/// Number of times [`assert_observed_cvv_inactive`] samples a restarted node's mode (~250ms
-/// apart), bounding the catch-up observation window to ~30s.
-const CVV_INACTIVE_POLL_ATTEMPTS: usize = 120;
+/// Maximum wait for evidence that a delayed restart entered the inactive catch-up path.
+const CVV_INACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Assert a restarted validator was observed in [`NodeMode::CvvInactive`] at least once while
-/// catching up.
+/// Assert the restarted validator entered [`NodeMode::CvvInactive`] while catching up.
 ///
-/// Only the *delayed* restart tests use this. A validator offline long enough to fall outside the
-/// garbage-collection window (see [`wait_for_downtime`]) cannot rejoin live consensus and instead
-/// takes the follow/catch-up path, which demotes it to `CvvInactive` until it has synced past the
-/// GC window and then promotes it back to `CvvActive`. That `CvvInactive` state is therefore
-/// transient, so we poll the node's mode rapidly right after restart and short-circuit on the
-/// first sighting via [`Iterator::any`]. The window is deliberately generous because the exact
-/// demotion instant races both RPC startup and network sync; a poll that fails while the RPC is
-/// briefly down (mid-restart) counts as "not yet observed" rather than fatal. The check is
-/// non-vacuous: if the node never enters `CvvInactive` (the follow path never ran) every sample
-/// misses and this returns an error instead of silently passing.
-fn assert_observed_cvv_inactive(node: &str) -> eyre::Result<()> {
-    let observed_inactive = (0..CVV_INACTIVE_POLL_ATTEMPTS).any(|attempt| {
-        // Sample immediately on the first attempt (the demotion may already be visible), then pace
-        // subsequent samples ~4x/sec across the catch-up window.
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        matches!(get_node_mode(node), Ok(NodeMode::CvvInactive))
-    });
-    if observed_inactive {
+/// Catch-up can finish between RPC polls, including before the first successful RPC response.
+/// Sample the live mode once, then wait for the subscriber entry logged exclusively by that mode's
+/// branch in `spawn_subscriber`. Both callers restart instance 2 as run 2 with `subscriber=info`,
+/// and `setup_log_dir` truncates this process's log before spawning it, so an earlier run cannot
+/// satisfy the assertion. Merely reaching `CvvActive` without either piece of evidence still fails.
+fn assert_observed_cvv_inactive(node: &str, test: &str) -> eyre::Result<()> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let log_path = Path::new(&manifest_dir).join("test_logs").join(test).join("node2-run2.log");
+    let observed_inactive = matches!(get_node_mode(node), Ok(NodeMode::CvvInactive));
+    wait_until_blocking(
+        CVV_INACTIVE_TIMEOUT,
+        &format!(
+            "restarted node {node} to enter CvvInactive (catch-up log: {})",
+            log_path.display()
+        ),
+        || {
+            if observed_inactive {
+                Ok(true)
+            } else {
+                std::fs::read(&log_path)
+                    .map(|log| {
+                        String::from_utf8_lossy(&log)
+                            .contains("Starting subscriber: Catch up and rejoin")
+                    })
+                    .map_err(Report::from)
+            }
+        },
+    )
+    .inspect(|()| {
         info!(target: "restart-test", "observed restarted node {node} in CvvInactive during catch-up");
-        Ok(())
-    } else {
-        Err(Report::msg(format!(
-            "restarted node {node} was never observed in CvvInactive during catch-up window"
-        )))
-    }
+    })
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {

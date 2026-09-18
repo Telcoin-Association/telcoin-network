@@ -1293,6 +1293,41 @@ mod test {
         assert!(kad_store.get(&fresh.key).is_some(), "fresh record retained");
     }
 
+    /// Replacing a record refreshes expiry without consuming another slot, even at capacity.
+    #[test]
+    fn test_kad_put_refreshes_expiry_at_capacity() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
+            .into_iter()
+            .try_for_each(|network_type| -> eyre::Result<()> {
+                let mut store =
+                    KadStore::new(db.clone(), PeerId::random(), &key_config, network_type);
+                store.config.max_records = 1;
+                let instant = Instant::now();
+                let mut record = test_record(false);
+                record.expires = Some(instant + Duration::from_secs(60));
+                store.put(record.clone())?;
+                let first_expiry = store
+                    .get(&record.key)
+                    .and_then(|stored| stored.expires)
+                    .ok_or_else(|| eyre::eyre!("initial expiry"))?;
+                record.expires = Some(instant + Duration::from_secs(120));
+                store.put(record.clone())?;
+                let stored =
+                    store.get(&record.key).ok_or_else(|| eyre::eyre!("refreshed record"))?;
+                assert_eq!(stored.value, record.value);
+                assert_eq!(stored.publisher, record.publisher);
+                assert!(stored
+                    .expires
+                    .is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+                assert_eq!(store.num_records, 1);
+                assert_eq!(store.records().count(), 1);
+                Ok(())
+            })
+    }
+
     /// Test that we do not count duplicate puts against our max records.
     #[test]
     fn test_kad_put_limit() {
