@@ -1100,10 +1100,10 @@ mod test {
         test_rec(&rec2, &kad_store);
         test_rec(&rec3, &kad_store);
 
-        let key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let key = node_record_key(&key_config.primary_public_key());
         let provider = PeerId::random();
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
-        // Make manually to use our node key as key.
+        // Built by hand so the key is this store's `node_key` (the slot `provided()` reads).
         let provider_rec1 = ProviderRecord { key, provider, expires, addresses: vec![] };
         let provider = PeerId::random();
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
