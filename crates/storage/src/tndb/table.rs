@@ -75,14 +75,16 @@ impl Inner {
     }
 
     fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) -> eyre::Result<()> {
-        let pos = self.data.append(&value)?;
+        let pos = self.data.append_raw(&value)?;
         let ksize = key.len() as u16;
         self.index_mut(ksize)?.save(&key, pos)?;
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> eyre::Result<Option<Vec<u8>>> {
-        // Resolve the position under the index borrow, then read the value from the log.
+    fn get_with<R>(&self, key: &[u8], decode: impl FnOnce(&[u8]) -> R) -> eyre::Result<Option<R>> {
+        // Resolve the position under the index borrow, then decode the value straight from the
+        // log's mmap (via `record_bytes`) while the caller's read lock is held -- no intermediate
+        // `Vec`.
         let pos = match self.idx.as_ref() {
             Some(idx) => match idx.load(key) {
                 Ok(pos) => pos,
@@ -91,7 +93,7 @@ impl Inner {
             },
             None => return Ok(None),
         };
-        Ok(Some(self.data.fetch(pos)?))
+        Ok(Some(decode(self.data.record_bytes(pos)?)))
     }
 
     fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
@@ -142,8 +144,10 @@ impl Inner {
         let Ok(iter) = iter else { return };
         for item in iter {
             let Ok((key_bytes, pos)) = item else { break };
-            let Ok(value_bytes) = data.fetch(pos) else { break };
-            if out.send((key_bytes, value_bytes)).is_err() {
+            // The item is sent across the channel, so the value must be owned: copy it out of the
+            // mmap via the raw byte-log read paired with `append_raw`.
+            let Ok(value_bytes) = data.record_bytes(pos) else { break };
+            if out.send((key_bytes, value_bytes.to_vec())).is_err() {
                 break;
             }
         }
@@ -192,9 +196,15 @@ impl TnTable {
         self.inner.write().insert(key, value)
     }
 
-    /// Read the value for `key`, or `None` if absent.
-    pub(crate) fn get(&self, key: Vec<u8>) -> eyre::Result<Option<Vec<u8>>> {
-        self.inner.read().get(&key)
+    /// Read the value for `key` and map its bytes with `decode`, or `None` if absent. `decode` runs
+    /// while the read lock is held, so it can borrow the value straight from the log's mmap (via
+    /// [`Pack::record_bytes`]) without an intermediate `Vec`.
+    pub(crate) fn get_with<R>(
+        &self,
+        key: &[u8],
+        decode: impl FnOnce(&[u8]) -> R,
+    ) -> eyre::Result<Option<R>> {
+        self.inner.read().get_with(key, decode)
     }
 
     /// True if `key` is present.
@@ -311,10 +321,10 @@ mod test {
         // Point reads.
         for i in 0..100u64 {
             let (k, v) = kv(i);
-            assert_eq!(table.get(k.clone()).expect("get"), Some(v));
+            assert_eq!(table.get_with(&k, |b| b.to_vec()).expect("get"), Some(v));
             assert!(table.contains(k).expect("contains"));
         }
-        assert_eq!(table.get(kv(999).0).expect("get miss"), None);
+        assert_eq!(table.get_with(&kv(999).0, |b| b.to_vec()).expect("get miss"), None);
         assert!(!table.contains(kv(999).0).expect("contains miss"));
 
         // Ordered scans.
@@ -354,8 +364,16 @@ mod test {
         let table = TnTable::open(dir).expect("reopen");
         let (k100, v100) = kv(100);
         table.insert(k100.clone(), v100.clone()).expect("insert after reopen");
-        assert_eq!(table.get(k100).expect("get new"), Some(v100));
-        assert_eq!(table.get(kv(20).0).expect("get old"), Some(kv(20).1), "old value persisted");
-        assert_eq!(table.get(kv(7).0).expect("get removed"), None, "removal persisted");
+        assert_eq!(table.get_with(&k100, |b| b.to_vec()).expect("get new"), Some(v100));
+        assert_eq!(
+            table.get_with(&kv(20).0, |b| b.to_vec()).expect("get old"),
+            Some(kv(20).1),
+            "old value persisted"
+        );
+        assert_eq!(
+            table.get_with(&kv(7).0, |b| b.to_vec()).expect("get removed"),
+            None,
+            "removal persisted"
+        );
     }
 }

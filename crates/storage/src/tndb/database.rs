@@ -40,7 +40,8 @@ fn handle(store: &StoreType, name: &'static str) -> Option<TnTable> {
 /// Look up a key: read its value bytes from the table, then decode.
 fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     let Some(table) = handle(store, T::NAME) else { return Ok(None) };
-    Ok(table.get(encode_key(key))?.map(|bytes| decode::<T::Value>(&bytes)))
+    // Decode `T::Value` straight from the log's mmap under the read lock (no intermediate `Vec`).
+    table.get_with(&encode_key(key), |bytes| decode::<T::Value>(bytes))
 }
 
 /// Insert `key → value` (no durability flush; callers flush explicitly).
