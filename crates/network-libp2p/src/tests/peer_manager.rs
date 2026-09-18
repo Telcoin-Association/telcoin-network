@@ -1432,16 +1432,19 @@ async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
     );
 }
 
+/// A signed record without RPC resolves a bootstrap stub and stops metadata discovery.
 #[tokio::test]
 async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
     let mut peer_manager = create_test_peer_manager(None);
 
-    // a current-committee member whose own signed record, learned via kad, advertises no rpc.
-    // the record must be network-learned (not an operator stub): a stub says nothing about
-    // what the peer advertises and is chased, whereas a learned rpc-less record is final
+    // A configured dial hint is upgraded by a record that actually advertises no RPC.
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+    let record = random_network_info();
+    peer_manager.add_bootstrap_peer(bls, record.clone());
     peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
-    peer_manager.add_discovered_peer(bls, random_network_info());
+    peer_manager.add_discovered_peer(bls, record.clone());
+    // Reapplying bootstrap configuration must not turn a resolved record back into a stub.
+    peer_manager.add_bootstrap_peer(bls, record);
     // isolate the call under test from anything update_committees emitted
     collect_all_events(&mut peer_manager);
 
@@ -1456,6 +1459,78 @@ async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
     assert!(
         missing_events.is_empty(),
         "a learned record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+/// All operator-provisioned insertion paths leave signed metadata eligible for discovery.
+#[tokio::test]
+async fn test_current_committee_rpcs_fetches_provisioned_records() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([25; 32]);
+    let bootstrap = *BlsKeypair::generate(&mut rng).public();
+    let explicit = *BlsKeypair::generate(&mut rng).public();
+    let trusted = *BlsKeypair::generate(&mut rng).public();
+    let current = HashSet::from([bootstrap, explicit, trusted]);
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    peer_manager.add_bootstrap_peer(bootstrap, random_network_info());
+    peer_manager.add_known_peer(explicit, random_network_info());
+    peer_manager.add_trusted_peer_and_dial(trusted, random_network_info(), reply);
+    peer_manager.update_committees(HashSet::new(), current.clone(), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    assert!(peer_manager.current_committee_rpcs().is_empty());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys)
+                if keys.iter().copied().collect::<HashSet<_>>() == current
+        )),
+        "configured dial hints must not suppress signed-record discovery"
+    );
+}
+
+/// A late observer can fetch an older signed record after learning only bootstrap dial hints.
+#[tokio::test]
+async fn test_current_committee_rpcs_upgrades_late_bootstrap_record() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([26; 32])).public();
+    let (mut record, rpc) = random_network_info_with_rpc();
+    record.timestamp = 5_000;
+    let mut bootstrap = record.clone();
+    bootstrap.timestamp = 10_000;
+    bootstrap.rpc = None;
+    peer_manager.add_bootstrap_peer(bls, bootstrap.clone());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    assert!(peer_manager.current_committee_rpcs().is_empty());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys) if keys.as_slice() == [bls]
+        )),
+        "the late observer must request the validator's signed RPC advertisement"
+    );
+
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys) if keys.as_slice() == [bls]
+        )),
+        "explicit authority discovery must also upgrade configured dial hints"
+    );
+
+    peer_manager.add_discovered_peer(bls, record);
+    peer_manager.add_bootstrap_peer(bls, bootstrap);
+    assert_eq!(peer_manager.current_committee_rpcs(), vec![(bls, rpc)]);
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        !events.iter().any(|event| matches!(event, PeerEvent::MissingAuthorities(_))),
+        "a resolved bootstrap record must stop triggering metadata discovery"
     );
 }
 
