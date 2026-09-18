@@ -86,11 +86,14 @@ async fn drive_epoch_record_sync<Peers, Collect, Progress>(
     Progress: Future<Output = Epoch>,
 {
     let sync = async {
-        futures::stream::repeat_with(peer_count)
-            .then(std::convert::identity)
-            .take_while(|peers| ready(*peers == 0))
-            .for_each(|_| tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL))
-            .await;
+        // Await each borrowed peer query inside the polling future. Passing it through
+        // `then(identity)` prevents `Send` inference for node startup on Rust 1.94.
+        futures::stream::unfold(peer_count, |mut peer_count| async move {
+            Some((peer_count().await, peer_count))
+        })
+        .take_while(|peers| ready(*peers == 0))
+        .for_each(|_| tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL))
+        .await;
 
         futures::stream::unfold(
             StartupSyncState { last_epoch: 0, previous_pass: None, collect, progress },
