@@ -283,7 +283,11 @@ impl RethEnv {
                 network,
                 self.inner.evm_config.clone(),
             ),
-            self.node_config().rpc.eth_config(),
+            // RPC transaction pool insertion batching is configured by the txpool CLI args.
+            self.node_config()
+                .rpc
+                .eth_config()
+                .max_batch_size(self.node_config().txpool.max_batch_size),
         )
         .build();
 
