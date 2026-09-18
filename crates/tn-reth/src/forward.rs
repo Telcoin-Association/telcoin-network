@@ -27,12 +27,12 @@
 //!   ([`ForwarderMetrics::record_rejection_overridden`]). Endpoint-local failures (timeout,
 //!   transport error, full pool, internal error, a refusal tied to one validator's own pool
 //!   contents or admission config) fall through to the next advertised validator, and "already
-//!   known" counts as delivered. A first delivery also keeps the walk going until a second distinct
-//!   validator accepts (issue #1366), so a lone validator cannot stop forwarding by claiming
-//!   success and dropping the transaction. A delivery survives later rejections, chain exhaustion
-//!   and the budget expiring. This is bounded redundancy, not an inclusion or quorum guarantee: two
-//!   colluding validators, or no reachable honest fallback within the budget, can still prevent
-//!   inclusion.
+//!   known" counts as accepted. The first acceptance ends this walk. The observer retains the
+//!   signed transaction and watches canonical inclusion: after three newer consensus outputs omit
+//!   it, the pool makes a retry to a different validator eligible (issue #1366). Accepting
+//!   validators are remembered across retries. Retention uses the pool's count and byte limits and
+//!   expires after [`FORWARD_PENDING_LIFETIME`]. Inclusion still depends on a reachable honest
+//!   validator and protocol progress; an acknowledgement alone cannot establish it.
 //! - The dial target is chosen by a committee member, not by this node. The endpoint arrives inside
 //!   a BLS-signed node record, so an arbitrary network peer cannot inject one, but a committee
 //!   member can still advertise any host it likes and every observer will dial it unattended.
@@ -55,6 +55,7 @@ use crate::{
     recover_raw_transaction, WorkerTxPool,
 };
 use alloy::{
+    primitives::keccak256,
     providers::{Provider as _, RootProvider},
     rpc::{
         client::RpcClient,
@@ -70,6 +71,7 @@ use rand::{seq::SliceRandom as _, Rng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroU64,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -104,8 +106,12 @@ const FORWARD_TX_BUDGET: Duration = Duration::from_secs(15);
 /// Sized to clear a healthy full batch with room to spare rather than to be tight: the forward
 /// loop is sequential, so a gas-full batch at a few tens of milliseconds per transaction is
 /// already tens of seconds of legitimate work. Transactions still unforwarded when it elapses
-/// are abandoned and counted, which forwarding being best-effort permits.
-const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
+/// return to the pool; retained state also recovers interrupted tasks within its overall lifetime.
+pub(crate) const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
+
+/// Retain at most one initial batch budget plus one further budget for inclusion-aware retries.
+/// Acknowledgements and retries cannot refresh this lifetime.
+pub(crate) const FORWARD_PENDING_LIFETIME: Duration = FORWARD_BATCH_BUDGET.saturating_mul(2);
 
 /// Bounds how many `forward-txns` tasks may be alive at once across every clone of one
 /// forwarder.
@@ -183,7 +189,7 @@ const UNREACHABLE_COOLDOWN: Duration = Duration::from_secs(30);
 /// lands before that prune hands the transactions straight back to it and loses them. One
 /// second is orders of magnitude above the channel hops the prune path spends, and one batch
 /// cadence, so it costs the recovery nothing observable while closing the race.
-const REQUEUE_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const REQUEUE_GRACE: Duration = Duration::from_secs(1);
 
 /// The JSON-RPC code reth answers with for both chain-wide verdicts and the node-local refusals
 /// in [`NODE_LOCAL_MESSAGES`] (`EthRpcErrorCode::InvalidInput`). The message carve-out is scoped
@@ -450,11 +456,11 @@ pub struct WorkerRpcForwarder {
     /// node-wide rather than per-clone. A permit is taken before the spawn and moved into the
     /// task, so capacity comes back when a forward actually finishes.
     forwards_in_flight: Arc<Semaphore>,
-    /// The worker's own transaction pool, where a forward task returns every transaction that
-    /// got no verdict (issue #1145). The batch builder prunes a batch's transactions as mined
-    /// the moment the batch is admitted, so an admitted-then-undelivered transaction is
-    /// otherwise in no pool and no table. `None` means there is no pool to return them to
-    /// (tests); undelivered transactions are then dropped as before, with the same warnings.
+    /// The worker's own transaction pool, which retains admitted forwards until inclusion or
+    /// expiry and requeues eligible retries. The batch builder prunes a batch's transactions as
+    /// mined the moment the batch is admitted, so an admitted-then-undelivered transaction is
+    /// otherwise in no pool and no table. `None` disables retention and requeueing for isolated
+    /// transport tests; the production constructor always supplies the worker's pool.
     requeue_pool: Option<WorkerTxPool>,
 }
 
@@ -465,9 +471,19 @@ impl std::fmt::Debug for WorkerRpcForwarder {
 }
 
 impl WorkerRpcForwarder {
+    /// Set the inclusion window for this worker's retained transactions. The default is three
+    /// executed consensus outputs. A zero-output speculative retransmission cannot be configured.
+    pub fn with_retry_outputs(self, outputs: NonZeroU64) -> Self {
+        self.requeue_pool.as_ref().into_iter().for_each(|pool| {
+            pool.pending_forwards().set_retry_outputs(outputs);
+        });
+        self
+    }
+
     /// Create a new forwarder that runs forwards on `task_spawner` and dials only the advertised
     /// hosts `policy` admits. `requeue_pool` is the worker's own transaction pool, where a
-    /// forward task returns transactions that got no verdict; `None` drops them as before.
+    /// forward task retains transactions for inclusion monitoring and returns eligible retries.
+    /// `None` disables retention in isolated transport tests.
     ///
     /// Registering the forwarder's counters here means a node that never sheds still exports
     /// them from start, so an absent series stays distinguishable from a broken exporter.
@@ -637,7 +653,13 @@ impl WorkerRpcForwarder {
                 // Route by sender so all transactions from one account land on the same
                 // validator (matches `submit_txn_if_mine`), then fall back to any endpoint.
                 let owner = owning_validator(tx, committee_size, &committee_slots);
-                let ordered = owner.into_iter().chain(fallbacks.iter().cloned());
+                let hash = keccak256(tx);
+                let accepted_by = requeue_pool
+                    .as_ref()
+                    .map(|pool| pool.pending_forwards().accepted_by(&hash))
+                    .unwrap_or_default();
+                let had_acceptance = !accepted_by.is_empty();
+                let ordered = remaining_targets(owner, &fallbacks, &accepted_by);
 
                 // Bound the whole fallback chain for this transaction: even if every advertised
                 // validator accepts the connection but never answers, one transaction cannot cost
@@ -666,8 +688,25 @@ impl WorkerRpcForwarder {
                 let outcome = expired_walk_outcome(chain, &held_verdict);
 
                 match outcome {
-                    ForwardOutcome::Delivered => delivered += 1,
+                    ForwardOutcome::Delivered(validator) => {
+                        delivered += 1;
+                        requeue_pool.as_ref().into_iter().for_each(|pool| {
+                            pool.pending_forwards().accepted(&hash, *validator);
+                        });
+                    }
+                    ForwardOutcome::Rejected(_) | ForwardOutcome::NoEndpointReached
+                        if had_acceptance =>
+                    {
+                        // Earlier acknowledgements remain pending until inclusion or expiry.
+                        // Exhausting fresh endpoints never resets the route to a known censor.
+                        requeue_pool.as_ref().into_iter().for_each(|pool| {
+                            pool.pending_forwards().defer(&hash);
+                        });
+                    }
                     ForwardOutcome::Rejected(reason) => {
+                        requeue_pool.as_ref().into_iter().for_each(|pool| {
+                            pool.pending_forwards().remove(&hash);
+                        });
                         rejected += 1;
                         warn!(
                             target: "worker::forward",
@@ -797,6 +836,9 @@ impl WorkerRpcForwarder {
 /// so an epoch-boundary abort of the task cannot erase requeues that already happened.
 async fn requeue_one(pool: Option<&WorkerTxPool>, ready_at: Instant, tx: Vec<u8>) -> usize {
     tokio::time::sleep_until(ready_at).await;
+    let hash = keccak256(&tx);
+    pool.into_iter()
+        .for_each(|pool| pool.pending_forwards().reinserting(&hash, std::time::Instant::now()));
     let added = OptionFuture::from(pool.and_then(|pool| {
         recover_raw_transaction(&tx)
             .ok()
@@ -807,6 +849,10 @@ async fn requeue_one(pool: Option<&WorkerTxPool>, ready_at: Instant, tx: Vec<u8>
     if added {
         ForwarderMetrics::record_txns_requeued(1);
     }
+    pool.into_iter().for_each(|pool| {
+        let present = added || pool.get(&hash).is_some();
+        pool.pending_forwards().reinserted(&hash, present);
+    });
     usize::from(added)
 }
 
@@ -875,14 +921,28 @@ impl TxnForwarder for WorkerRpcForwarder {
                     false
                 },
                 move |permit| {
-                    self.spawn_forward(
-                        permit,
-                        transactions,
-                        committee_slots,
-                        committee_size,
-                        providers,
-                    );
-                    true
+                    let retained = if self.requeue_pool.is_some() {
+                        self.requeue_pool.as_ref().and_then(|pool| pool.admit_forwards(transactions))
+                    } else {
+                        Some(transactions)
+                    };
+                    if retained.is_none() {
+                        ForwarderMetrics::record_batch_shed();
+                        ForwarderMetrics::record_txns_dropped(ForwardDropReason::BatchShed, queued_total);
+                        warn!(target: "worker::forward", "cannot retain forwarding batch; leaving it pooled");
+                    }
+                    retained.is_some_and(|transactions| {
+                        if !transactions.is_empty() {
+                            self.spawn_forward(
+                                permit,
+                                transactions,
+                                committee_slots,
+                                committee_size,
+                                providers,
+                            );
+                        }
+                        true
+                    })
                 },
             )
         })
@@ -917,6 +977,15 @@ fn shuffled_fallbacks(mut fallbacks: Vec<BlsPublicKey>, rng: &mut impl Rng) -> V
     // allocation rather than staging the list through a map.
     fallbacks.shuffle(rng);
     fallbacks
+}
+
+/// Route a later submission only to validators that have not already acknowledged this transaction.
+fn remaining_targets<'a>(
+    owner: Option<BlsPublicKey>,
+    fallbacks: &'a [BlsPublicKey],
+    accepted_by: &'a BTreeSet<BlsPublicKey>,
+) -> impl Iterator<Item = BlsPublicKey> + 'a {
+    owner.into_iter().chain(fallbacks.iter().copied()).filter(|key| !accepted_by.contains(key))
 }
 
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
@@ -954,17 +1023,15 @@ fn owning_validator(
 /// censoring rejection needs from one validator to two; it is hardening against a single liar,
 /// not a quorum guarantee.
 ///
-/// A first acceptance also walks on (issue #1366): a validator can claim success and drop the
-/// transaction just as easily as it can fabricate a rejection. Two distinct accepting validators
-/// stop the walk, including "already known" replies. Once any validator accepts, later rejections
-/// cannot erase that delivery or stop attempts to reach a second accepting validator. The first
-/// acceptance replaces any held rejection in `held`, so cancellation preserves delivery too.
+/// A first acceptance ends the walk, including "already known". The pool retains the transaction
+/// and permits a different validator's submission only after its inclusion window elapses. The
+/// accepting identity replaces any held rejection, so retries can exclude that validator.
 ///
-/// The healthy path costs two sends. Every validator is still tried at most once under the same
-/// send, transaction and batch budgets. Exhaustion or expiry after just one acceptance still
-/// reports delivery, including for a one-validator committee. This protects against one lying
-/// success when an honest fallback is reachable within the budget; it does not prove inclusion
-/// or protect against two colluding validators.
+/// The healthy path costs one send. Every validator is tried at most once per walk under the
+/// existing send, transaction and batch budgets. Canonical inclusion retires the retained payload;
+/// missing inclusion permits later walks that exclude earlier acknowledging validators. Retention
+/// expires after its overall lifetime, so inclusion still requires progress and a reachable honest
+/// validator within that bound.
 ///
 /// The walk also carries the endpoint demotion of issue #1145: an endpoint already recorded in
 /// `unreachable` is skipped, a send that produced no JSON-RPC verdict demotes its endpoint -
@@ -1036,22 +1103,13 @@ async fn walk_fallback_chain(
                                      the rejecting validator answered from divergent state or is byzantine"
                                 );
                             }
-                            HeldVerdict::Delivered => {}
+                            HeldVerdict::Delivered(_) => {}
                         });
-                        // Bank the first acceptance before another await, so a budget cut during
-                        // redundant forwarding cannot turn a delivery into a drop or requeue.
+                        // Stop after one acceptance. The pool watches actual inclusion before
+                        // making a submission to another validator eligible.
                         *held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some(HeldVerdict::Delivered);
-                        if pending_verdict == Some(HeldVerdict::Delivered) {
-                            Err(ForwardOutcome::Delivered)
-                        } else {
-                            Ok(Some(HeldVerdict::Delivered))
-                        }
-                    }
-                    // A prior acceptance wins over any number of subsequent rejections, and a
-                    // rejecting fallback cannot prevent the next redundant delivery attempt.
-                    Disposition::Rejected(_) if pending_verdict == Some(HeldVerdict::Delivered) => {
-                        Ok(pending_verdict)
+                            Some(HeldVerdict::Delivered(Box::new(key)));
+                        Err(ForwardOutcome::Delivered(Box::new(key)))
                     }
                     Disposition::Rejected(reason) => {
                         // A second considered rejection confirms the held one. The `tried` set
@@ -1122,11 +1180,11 @@ async fn walk_fallback_chain(
         .unwrap_or_else(|verdict| verdict)
 }
 
-/// A verdict retained while the walk seeks a second distinct validator's acceptance or rejection.
+/// A verdict retained while a rejected transaction seeks a second validator's opinion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HeldVerdict {
     /// One validator accepted the transaction; subsequent rejections cannot erase it.
-    Delivered,
+    Delivered(Box<BlsPublicKey>),
     /// One validator rejected the transaction before any validator accepted it.
     Rejected {
         /// The validator whose rejection a later acceptance would contradict.
@@ -1141,7 +1199,7 @@ impl HeldVerdict {
     /// Preserve the verdict when the walk exhausts its validators or its budget.
     fn into_outcome(self) -> ForwardOutcome {
         match self {
-            Self::Delivered => ForwardOutcome::Delivered,
+            Self::Delivered(validator) => ForwardOutcome::Delivered(validator),
             Self::Rejected { reason, .. } => ForwardOutcome::Rejected(reason),
         }
     }
@@ -1193,9 +1251,9 @@ enum Disposition {
 /// Terminal result of forwarding one transaction across the ordered validators.
 #[derive(Debug, PartialEq, Eq)]
 enum ForwardOutcome {
-    /// Two distinct validators accepted it (or already had it), or one did before the chain
-    /// exhausted its endpoints or budget. An RPC acceptance does not prove inclusion.
-    Delivered,
+    /// One validator accepted it or already had it. Its identity is retained for retry rotation;
+    /// the acknowledgement does not prove inclusion.
+    Delivered(Box<BlsPublicKey>),
     /// Two validators independently gave a considered rejection - or one did and no further
     /// validator was reachable to confirm or contradict it - so the chain stopped without
     /// delivery.
@@ -2044,7 +2102,7 @@ mod tests {
         })?;
         let snapshot = snapshotter.snapshot().into_vec();
 
-        assert_eq!(outcome, ForwardOutcome::Delivered);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
         assert_eq!(owner_hits.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
         assert_eq!(counter(&snapshot, "tn_reth.forwarded_rejections_overridden_total"), Some(1));
@@ -2164,13 +2222,28 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, ForwardOutcome::Delivered);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
         Ok(())
     }
 
-    /// Exercise a fabricated acceptance with a duplicate owner and an unadvertised validator
-    /// in the walk. Only two distinct accepting validators should receive the transaction.
-    async fn assert_redundant_delivery(first_reply: &'static str) -> eyre::Result<()> {
+    /// Exercise two false acknowledgements through real RPCs, advancing only after three outputs.
+    async fn assert_inclusion_aware_delivery(first_reply: &'static str) -> eyre::Result<()> {
+        use crate::forward_pending::{PendingForwards, RetentionLimits, SubmissionHead};
+
+        let now = std::time::Instant::now();
+        let tx = vec![0_u8; 32];
+        let hash = keccak256(&tx);
+        let mut pending = PendingForwards::new(RetentionLimits::new(1, 4096));
+        assert!(pending
+            .admit(
+                vec![(hash, tx.clone())],
+                SubmissionHead::new(0, Some(0)),
+                now,
+                FORWARD_BATCH_BUDGET,
+                FORWARD_PENDING_LIFETIME,
+                REQUEUE_GRACE,
+            )
+            .is_some());
         let owner_hits = Arc::new(AtomicUsize::new(0));
         let fallback_hits = Arc::new(AtomicUsize::new(0));
         let untouched_hits = Arc::new(AtomicUsize::new(0));
@@ -2197,36 +2270,169 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, ForwardOutcome::Delivered);
+        let validator = delivery_validator(outcome)?;
+        pending.accepted(&hash, validator);
         assert_eq!(owner_hits.load(Ordering::SeqCst), 1, "a validator is tried only once");
         assert_eq!(
             fallback_hits.load(Ordering::SeqCst),
-            1,
-            "a claimed success cannot stop forwarding"
+            0,
+            "an acknowledgement starts an inclusion window"
         );
-        assert_eq!(untouched_hits.load(Ordering::SeqCst), 0, "two acceptances stop the walk");
+        assert_eq!(untouched_hits.load(Ordering::SeqCst), 0);
         assert_eq!(
             *held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-            Some(HeldVerdict::Delivered)
+            Some(HeldVerdict::Delivered(Box::new(validator)))
+        );
+
+        pending.committed(1, 1_u64, []);
+        pending.committed(2, 2_u64, []);
+        assert!(pending.ready(now + REQUEUE_GRACE, 1).0.is_empty());
+        pending.committed(3, 3_u64, []);
+        let (ready, _) = pending.ready(now + REQUEUE_GRACE, 1);
+        assert_eq!(ready, vec![(hash, tx.clone())]);
+        assert!(pending
+            .admit(
+                ready,
+                SubmissionHead::new(3, Some(3)),
+                now + REQUEUE_GRACE,
+                FORWARD_BATCH_BUDGET,
+                FORWARD_PENDING_LIFETIME,
+                REQUEUE_GRACE,
+            )
+            .is_some());
+        let accepted_by = pending.accepted_by(&hash);
+        let outcome = walk_fallback_chain(
+            &tx,
+            remaining_targets(keys.first().copied(), &keys, &accepted_by),
+            &providers,
+            &Mutex::new(None),
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+        pending.accepted(&hash, delivery_validator(outcome)?);
+        assert_eq!(owner_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(untouched_hits.load(Ordering::SeqCst), 0);
+
+        (4..=6).for_each(|output| pending.committed(output, output, []));
+        let (ready, _) = pending.ready(now + REQUEUE_GRACE * 2, 1);
+        assert_eq!(ready, vec![(hash, tx.clone())]);
+        assert!(pending
+            .admit(
+                ready,
+                SubmissionHead::new(6, Some(6)),
+                now + REQUEUE_GRACE * 2,
+                FORWARD_BATCH_BUDGET,
+                FORWARD_PENDING_LIFETIME,
+                REQUEUE_GRACE,
+            )
+            .is_some());
+        let accepted_by = pending.accepted_by(&hash);
+        let outcome = walk_fallback_chain(
+            &tx,
+            remaining_targets(keys.first().copied(), &keys, &accepted_by),
+            &providers,
+            &Mutex::new(None),
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+        pending.accepted(&hash, delivery_validator(outcome)?);
+        assert_eq!(owner_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(untouched_hits.load(Ordering::SeqCst), 1);
+        pending.committed(7, 7, [hash]);
+        (8..=10).for_each(|output| pending.committed(output, output, []));
+        assert!(pending.ready(now + REQUEUE_GRACE * 3, 1).0.is_empty());
+        Ok(())
+    }
+
+    /// Production admission retains an RPC acceptance and suppresses a duplicate client submission.
+    #[tokio::test]
+    async fn accepted_forward_is_retained_and_duplicate_admission_is_suppressed() -> eyre::Result<()>
+    {
+        use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+        use tn_types::{
+            gas_accumulator::BaseFeeContainer, test_genesis, Address, Bytes, Encodable2718 as _,
+            GenesisAccount, U256,
+        };
+
+        let directory = tempfile::TempDir::new()?;
+        let manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let genesis = test_genesis().extend_accounts([(
+            factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let environment =
+            RethEnv::new_for_temp_chain(chain.clone(), directory.path(), &manager, None)?;
+        let pool = environment.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let hash = *tx.hash();
+        let bytes = tx.encoded_2718();
+        let (url, hits) = counting_ok_endpoint()?;
+        let key = test_key(1);
+        let rpcs = vec![(key, test_rpc(&url)?)];
+        let forwarder = WorkerRpcForwarder::new(
+            manager.get_spawner(),
+            ForwardTargetPolicy::AllowPrivate,
+            Some(pool.clone()),
+        );
+        assert!(forwarder.forward_txns(vec![bytes.clone()], vec![key], rpcs.clone()));
+        let drained = timeout(
+            Duration::from_secs(5),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await??;
+        drop(drained);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.pending_forwards().accepted_by(&hash), BTreeSet::from([key]));
+        assert!(forwarder.forward_txns(vec![bytes], vec![key], rpcs));
+        let drained = timeout(
+            Duration::from_secs(5),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await??;
+        drop(drained);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an outstanding acknowledgement must suppress duplicates"
         );
         Ok(())
     }
 
-    /// A validator answering success without retaining the transaction cannot suppress the
-    /// send to a second distinct validator (issue #1366).
-    #[tokio::test]
-    async fn a_claimed_delivery_is_redundantly_forwarded() -> eyre::Result<()> {
-        assert_redundant_delivery(DELIVERY_BODY).await
+    /// Extract the successful validator while reporting unexpected RPC outcomes as test failures.
+    fn delivery_validator(outcome: ForwardOutcome) -> eyre::Result<BlsPublicKey> {
+        match outcome {
+            ForwardOutcome::Delivered(validator) => Ok(*validator),
+            ForwardOutcome::Rejected(reason) => Err(eyre::eyre!("unexpected rejection: {reason}")),
+            ForwardOutcome::NoEndpointReached => Err(eyre::eyre!("no validator accepted")),
+        }
     }
 
-    /// Fabricating "already known" must not bypass the redundant delivery rule either.
+    /// False success cannot suppress later submissions when canonical outputs omit the transaction.
     #[tokio::test]
-    async fn an_already_known_reply_is_redundantly_forwarded() -> eyre::Result<()> {
-        assert_redundant_delivery(ALREADY_KNOWN_BODY).await
+    async fn a_claimed_delivery_retries_after_missing_inclusion() -> eyre::Result<()> {
+        assert_inclusion_aware_delivery(DELIVERY_BODY).await
     }
 
-    /// Rejections and endpoint failures after an acceptance cannot stop the walk before its
-    /// second acceptance or erase the delivery if the remaining endpoints are exhausted.
+    /// An "already known" acknowledgement starts the same inclusion window as ordinary success.
+    #[tokio::test]
+    async fn an_already_known_reply_retries_after_missing_inclusion() -> eyre::Result<()> {
+        assert_inclusion_aware_delivery(ALREADY_KNOWN_BODY).await
+    }
+
+    /// The healthy path finishes without waiting for failing or rejecting fallback endpoints.
     #[tokio::test]
     async fn a_delivery_survives_failing_fallbacks() -> eyre::Result<()> {
         let fallback_hits = Arc::new(AtomicUsize::new(0));
@@ -2252,10 +2458,10 @@ mod tests {
             &Mutex::new(EndpointCache::default()),
         )
         .await;
-        assert_eq!(outcome, ForwardOutcome::Delivered);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
 
-        // The same failures without a second accepting endpoint retain the first delivery.
+        // Removing the last fallback also leaves the first acceptance sufficient for this send.
         let outcome = walk_fallback_chain(
             &[0_u8; 32],
             keys.iter().take(keys.len().saturating_sub(1)).copied(),
@@ -2265,11 +2471,11 @@ mod tests {
             &Mutex::new(EndpointCache::default()),
         )
         .await;
-        assert_eq!(outcome, ForwardOutcome::Delivered);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
         Ok(())
     }
 
-    /// A single advertised validator still reports delivery when no redundant target exists.
+    /// A single advertised validator reports its acceptance to the inclusion tracker.
     #[tokio::test]
     async fn a_single_validator_delivery_still_stands() -> eyre::Result<()> {
         let (endpoint, hits) = counting_ok_endpoint()?;
@@ -2283,15 +2489,14 @@ mod tests {
             &Mutex::new(EndpointCache::default()),
         )
         .await;
-        assert_eq!(outcome, ForwardOutcome::Delivered);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
-    /// Cancellation during a redundant send retains the actual walk's first acceptance,
-    /// replacing the earlier rejection. Synchronize on the last connection, not elapsed time.
+    /// An acceptance after a rejection completes before a hanging fallback is contacted.
     #[tokio::test]
-    async fn a_budget_cut_walk_preserves_delivery_over_a_rejection() -> eyre::Result<()> {
+    async fn an_acceptance_finishes_before_a_hanging_fallback() -> eyre::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let (connected, received) = tokio::sync::oneshot::channel();
@@ -2320,14 +2525,12 @@ mod tests {
             &cache,
         );
         tokio::pin!(walk);
-        tokio::select! {
-            outcome = &mut walk => eyre::bail!("walk stopped before redundant send: {outcome:?}"),
-            started = received => started?,
-        }
-        let cut = timeout(Duration::ZERO, &mut walk).await;
+        let outcome = tokio::select! {
+            outcome = &mut walk => outcome,
+            _started = received => eyre::bail!("a fallback was contacted before the inclusion window"),
+        };
         hanging.abort();
-        eyre::ensure!(cut.is_err(), "the unanswered redundant send must exhaust its budget");
-        assert_eq!(expired_walk_outcome(cut, &held), ForwardOutcome::Delivered);
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
         Ok(())
     }
 
@@ -2686,17 +2889,17 @@ mod tests {
     }
 
     /// The fallbacks dialed vary across forwards: the shuffle, not the key sort, picks the
-    /// two validators that receive each transaction.
+    /// first validator that receives each transaction.
     ///
     /// Three counting endpoints and 64 single-transaction forwards whose transaction
-    /// recovers no owner. Each forward shuffles afresh and delivers to its first two
-    /// fallbacks, so together the dials must reach every endpoint. Without the shuffle all
-    /// 64 forwards land on the same two endpoints. A uniform shuffle leaves some endpoint
-    /// undialed with chance 3 * (1/3)^64, under 1e-30: not a pinned
+    /// recovers no owner. Each forward shuffles afresh and delivers to its first fallback,
+    /// so together the dials must reach every endpoint. Without the shuffle all
+    /// 64 forwards land on the same endpoint. A uniform shuffle leaves some endpoint
+    /// undialed with chance at most 3 * (2/3)^64, under 1e-10: not a pinned
     /// counter's certainty, but far below any infrastructure failure rate, and each
-    /// forward holds two instant local dials, so no timing budget couples in either.
+    /// forward holds one instant local dial, so no timing budget couples in either.
     #[tokio::test]
-    async fn spawned_forwards_spread_redundant_dials_across_fallbacks() -> eyre::Result<()> {
+    async fn spawned_forwards_spread_single_dials_across_fallbacks() -> eyre::Result<()> {
         let (url_one, hits_one) = counting_ok_endpoint()?;
         let (url_two, hits_two) = counting_ok_endpoint()?;
         let (url_three, hits_three) = counting_ok_endpoint()?;
@@ -2714,7 +2917,7 @@ mod tests {
             .collect::<eyre::Result<Vec<_>>>()?;
 
         // 64 one-transaction forwards: no owner is recovered from the zeroed bytes, so each
-        // forward's first two fallbacks each take one dial. 64 is also
+        // forward's first fallback takes one dial. 64 is also
         // [`MAX_CONCURRENT_FORWARDS`], so even a worst case of all forwards in flight at
         // once sheds nothing. The permit drain is what awaits the spawned tasks (capacity
         // only returns when a forward finishes).
@@ -2733,7 +2936,7 @@ mod tests {
             hits_two.load(Ordering::Relaxed),
             hits_three.load(Ordering::Relaxed),
         ];
-        assert_eq!(counts.iter().sum::<usize>(), 128, "every delivery stops at two distinct dials");
+        assert_eq!(counts.iter().sum::<usize>(), 64, "every delivery stops at one dial");
         assert!(counts.iter().all(|count| *count > 0), "an endpoint was never dialed: {counts:?}");
         Ok(())
     }
