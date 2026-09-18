@@ -1,20 +1,19 @@
-//! A single tndb table — a [`Pack`] value log plus its sorted [`BtreeIndex`] — encapsulated as an
-//! **actor on its own dedicated thread**, mirroring [`crate::consensus_pack`]'s model.
-//!
-//! Callers hold a cheap `Clone` [`TnTable`] handle and interact by message passing, so a table is
-//! accessed **without holding a lock**: a later step lets [`crate::tndb::TnDatabase`] store these
-//! handles directly (replacing today's `Arc<Mutex<..>>` store). This file is byte-oriented
+//! A single tndb table — a [`Pack`] value log plus its sorted [`BtreeIndex`] — as a cheap `Clone`
+//! [`TnTable`] handle.  It is a **hybrid**: point ops lock a shared [`Inner`] directly (no
+//! cross-thread hop), while ordered scans run on a dedicated thread.  This file is byte-oriented
 //! (`Vec<u8>` keys and values); the typed `encode`/`decode` stays in `database.rs`.
 //!
-//! Because the thread owns the `Pack` and `BtreeIndex` directly (no lock guard), a scan can
-//! split-borrow the two fields and **stream** the B+tree iterator's values over a channel with
-//! backpressure — no self-referential struct, and no eager position walk.
+//! Point reads/writes take the `RwLock<Inner>` — a shared read lock for reads (`&self`:
+//! `get`/`contains`/…), an exclusive write lock for writes (`&mut self`: `insert`/`remove`/…) — so
+//! an uncontended op costs a lock, not a thread round-trip. (An earlier pure-actor version routed
+//! every op through a channel, which was ~2–3× slower for point ops.)
 //!
-//! Channels avoid a new dependency and work from both sync tests and the async node: commands use a
-//! `tokio` unbounded MPSC (its `send` is synchronous and never panics in a runtime, and the sender
-//! is `Send + Sync + Clone`), while each reply uses a `std::sync::mpsc` channel (its blocking
-//! `recv` — unlike `tokio`'s — never panics inside a runtime). The actor thread is a plain
-//! `std::thread`, so `blocking_recv` there is correct.
+//! A scan needs a live `BtreeIter` borrowing the index, which can't be handed back as a
+//! self-referential iterator; so scans run on a dedicated thread that takes a read lock and
+//! **streams** the `(key, value)` pairs over a bounded channel with backpressure (dropping the
+//! consumer stops the walk).  A scan therefore holds a read lock for its duration: concurrent point
+//! reads are fine, but a point write to the *same* table waits until the scan is drained or dropped
+//! — so a caller must not hold an unconsumed scan across a write of the same table on one thread.
 
 use std::{
     path::PathBuf,
@@ -25,8 +24,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use parking_lot::Mutex;
-use tokio::sync::oneshot::{self, Sender};
+use parking_lot::{Mutex, RwLock};
 
 use crate::archive::{
     btree_index::BtreeIndex,
@@ -53,8 +51,10 @@ pub(crate) enum ScanKind {
     RevFrom(Vec<u8>),
 }
 
-/// Thread-owned table state: the append-only value log plus its sorted key index (created lazily on
-/// the first insert, once the encoded key length is known).
+/// Table state — the append-only value log plus its sorted key index (created lazily on the first
+/// insert, once the encoded key length is known).  Shared behind an `RwLock`: reads (`&self`) take
+/// a read lock, writes (`&mut self`) an exclusive write lock.
+#[derive(Debug)]
 struct Inner {
     /// Table directory holding the `data` log and the `btx/` index.
     dir: PathBuf,
@@ -150,26 +150,23 @@ impl Inner {
     }
 }
 
-/// A command sent to a table's actor thread; each request carries its reply channel.
-enum TableMessage {
-    Insert { key: Vec<u8>, value: Vec<u8>, reply: Sender<eyre::Result<()>> },
-    Get { key: Vec<u8>, reply: Sender<eyre::Result<Option<Vec<u8>>>> },
-    Contains { key: Vec<u8>, reply: Sender<eyre::Result<bool>> },
-    Remove { key: Vec<u8>, reply: Sender<eyre::Result<bool>> },
-    Clear { reply: Sender<eyre::Result<()>> },
-    Flush { reply: Sender<eyre::Result<()>> },
-    IsEmpty { reply: Sender<bool> },
-    Len { reply: Sender<usize> },
+/// A request sent to a table's scan thread (point ops bypass it and lock `Inner` directly).
+enum ScanRequest {
+    /// Stream the given scan's `(key, value)` pairs over `out`.
     Scan { kind: ScanKind, out: SyncSender<(Vec<u8>, Vec<u8>)> },
+    /// Stop the scan thread (sent by the last handle's `Drop`).
     Shutdown,
 }
 
-/// A cheap `Clone` handle to a table actor.  Every method sends a command to the table's dedicated
-/// thread and blocks on the reply — callers never hold a lock.
+/// A cheap `Clone` handle to a table.  Point ops lock the shared [`Inner`] directly (a read lock
+/// for reads, a write lock for writes); ordered scans are streamed by a dedicated thread.
 #[derive(Clone, Debug)]
 pub(crate) struct TnTable {
-    tx: mpsc::Sender<TableMessage>,
-    /// The actor thread's join handle, taken by the last handle's `Drop` for a clean, durable
+    /// The table state, locked per operation — no cross-thread hop for point reads/writes.
+    inner: Arc<RwLock<Inner>>,
+    /// Requests to the scan thread (which shares `inner`).
+    scan_tx: mpsc::Sender<ScanRequest>,
+    /// The scan thread's join handle, taken by the last handle's `Drop` for a clean, durable
     /// close.
     join: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -181,85 +178,80 @@ impl TnTable {
         std::fs::create_dir_all(&dir)?;
         let data =
             Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)?;
-        let inner = Inner { dir, data, idx: None };
-        let (tx, rx) = mpsc::channel();
+        let inner = Arc::new(RwLock::new(Inner { dir, data, idx: None }));
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let scan_inner = Arc::clone(&inner);
         let join = std::thread::Builder::new()
-            .name("tndb-table".into())
-            .spawn(move || run_table_loop(inner, rx))?;
-        Ok(Self { tx, join: Arc::new(Mutex::new(Some(join))) })
-    }
-
-    /// Send a command with a fresh reply channel and block on the reply.
-    fn send_recv<T>(&self, make: impl FnOnce(Sender<T>) -> TableMessage) -> eyre::Result<T> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(make(reply)).map_err(|_| eyre::eyre!("tndb table actor stopped"))?;
-        rx.blocking_recv().map_err(|_| eyre::eyre!("tndb table actor dropped the reply"))
+            .name("tndb-table-scan".into())
+            .spawn(move || run_scan_loop(scan_inner, scan_rx))?;
+        Ok(Self { inner, scan_tx, join: Arc::new(Mutex::new(Some(join))) })
     }
 
     /// Insert (or overwrite) `key → value`.
     pub(crate) fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> eyre::Result<()> {
-        self.send_recv(|reply| TableMessage::Insert { key, value, reply })?
+        self.inner.write().insert(key, value)
     }
 
     /// Read the value for `key`, or `None` if absent.
     pub(crate) fn get(&self, key: Vec<u8>) -> eyre::Result<Option<Vec<u8>>> {
-        self.send_recv(|reply| TableMessage::Get { key, reply })?
+        self.inner.read().get(&key)
     }
 
     /// True if `key` is present.
     pub(crate) fn contains(&self, key: Vec<u8>) -> eyre::Result<bool> {
-        self.send_recv(|reply| TableMessage::Contains { key, reply })?
+        self.inner.read().contains(&key)
     }
 
     /// Remove `key`; returns whether it was present.
     pub(crate) fn remove(&self, key: Vec<u8>) -> eyre::Result<bool> {
-        self.send_recv(|reply| TableMessage::Remove { key, reply })?
+        self.inner.write().remove(&key)
     }
 
     /// Reset the table to empty (index rebuilt empty; log bytes orphaned until compaction).
     pub(crate) fn clear(&self) -> eyre::Result<()> {
-        self.send_recv(|reply| TableMessage::Clear { reply })?
+        self.inner.write().clear()
     }
 
     /// Durably persist the value log.
     pub(crate) fn flush(&self) -> eyre::Result<()> {
-        self.send_recv(|reply| TableMessage::Flush { reply })?
+        self.inner.write().flush()
     }
 
     /// True if the table has no entries.
     pub(crate) fn is_empty(&self) -> eyre::Result<bool> {
-        self.send_recv(|reply| TableMessage::IsEmpty { reply })
+        Ok(self.inner.read().is_empty())
     }
 
     /// Number of entries. (Part of the table API; not currently used by `TnDatabase`.)
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> eyre::Result<usize> {
-        self.send_recv(|reply| TableMessage::Len { reply })
+        Ok(self.inner.read().len())
     }
 
-    /// A lazy, key-ordered iterator over `(key_bytes, value_bytes)`.  The actor streams items over
-    /// a bounded channel; dropping the returned iterator stops the scan.  If the actor is gone
-    /// the iterator is simply empty.
+    /// A lazy, key-ordered iterator over `(key_bytes, value_bytes)`.  The scan thread streams items
+    /// over a bounded channel (holding a read lock); dropping the returned iterator stops the scan.
+    /// If the scan thread is gone the iterator is simply empty.
     pub(crate) fn scan(&self, kind: ScanKind) -> TnTableScan {
         let (out, rx) = mpsc::sync_channel(SCAN_CHANNEL_CAP);
-        let _ = self.tx.send(TableMessage::Scan { kind, out });
+        let _ = self.scan_tx.send(ScanRequest::Scan { kind, out });
         TnTableScan { rx }
     }
 }
 
 impl Drop for TnTable {
     fn drop(&mut self) {
-        // The last live handle shuts the actor down and waits for its clean, durable close.
+        // The last live handle stops the scan thread and joins it, so the scan thread releases its
+        // `inner` clone; this handle's `inner` is then the last ref, and dropping it clean-closes.
         if Arc::strong_count(&self.join) == 1 {
             if let Some(handle) = self.join.lock().take() {
-                let _ = self.tx.send(TableMessage::Shutdown);
+                let _ = self.scan_tx.send(ScanRequest::Shutdown);
                 let _ = handle.join();
             }
         }
     }
 }
 
-/// The iterator returned by [`TnTable::scan`]: it pulls streamed items from the actor thread.
+/// The iterator returned by [`TnTable::scan`]: it pulls streamed items from the scan thread.
 pub(crate) struct TnTableScan {
     rx: mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
 }
@@ -268,45 +260,23 @@ impl Iterator for TnTableScan {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // `Err` means the scan finished (the actor dropped its sender).
+        // `Err` means the scan finished (the scan thread dropped its sender).
         self.rx.recv().ok()
     }
 }
 
-/// The actor loop: owns `inner` and serves commands until shutdown, then clean-closes.
-fn run_table_loop(mut inner: Inner, rx: mpsc::Receiver<TableMessage>) {
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            TableMessage::Insert { key, value, reply } => {
-                let _ = reply.send(inner.insert(key, value));
-            }
-            TableMessage::Get { key, reply } => {
-                let _ = reply.send(inner.get(&key));
-            }
-            TableMessage::Contains { key, reply } => {
-                let _ = reply.send(inner.contains(&key));
-            }
-            TableMessage::Remove { key, reply } => {
-                let _ = reply.send(inner.remove(&key));
-            }
-            TableMessage::Clear { reply } => {
-                let _ = reply.send(inner.clear());
-            }
-            TableMessage::Flush { reply } => {
-                let _ = reply.send(inner.flush());
-            }
-            TableMessage::IsEmpty { reply } => {
-                let _ = reply.send(inner.is_empty());
-            }
-            TableMessage::Len { reply } => {
-                let _ = reply.send(inner.len());
-            }
-            TableMessage::Scan { kind, out } => inner.scan(kind, &out),
-            TableMessage::Shutdown => break,
+/// The scan thread: shares `inner` (via the `RwLock`) and streams scans until shutdown.  Point ops
+/// never reach here — they lock `inner` on the caller's thread.
+fn run_scan_loop(inner: Arc<RwLock<Inner>>, rx: mpsc::Receiver<ScanRequest>) {
+    while let Ok(req) = rx.recv() {
+        match req {
+            // Hold a read lock only for the duration of the scan (concurrent reads OK; writes
+            // wait).
+            ScanRequest::Scan { kind, out } => inner.read().scan(kind, &out),
+            ScanRequest::Shutdown => break,
         }
     }
-    // Dropping `inner` clean-closes: `Pack` seals the log and `BtreeIndex`'s `Drop` syncs the
-    // index.
+    // Drop this thread's `inner` clone; the last handle's `Drop` then clean-closes the table.
     drop(inner);
 }
 
