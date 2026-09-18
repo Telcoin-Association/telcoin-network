@@ -21,6 +21,28 @@ use crate::archive::{
 /// an upper bound on memory allocations for a record.
 pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Decompress a zstd record `compressed` payload into `out`, enforcing the in-memory
+/// `MAX_RECORD_SIZE` cap on the decompressed size. Shared by the iterator decompression sites
+/// (sync + async `read_record_file`), which own a reusable buffer and so can materialize the
+/// decompressed output and report `RequestedDecompressSizeTooLarge`. (The `&self` `fetch` path
+/// instead streams the decode with no buffer -- see `PackInner::read_record_into`.) Clears `out`
+/// first and returns a borrow of it.
+pub(crate) fn decompress_checked<'a>(
+    compressed: &[u8],
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8], FetchError> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    decoder.window_log_max(24)?;
+    out.clear();
+    // +1 lets us detect overflow vs. natural EOF
+    let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+    limited.read_to_end(out)?;
+    if out.len() as u64 > MAX_RECORD_SIZE as u64 {
+        return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
+    }
+    Ok(out)
+}
+
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
@@ -160,22 +182,11 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match compression {
-            PackCompression::None => buffer,
-            PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
-                decompress_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
-                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                decompress_buffer
-            }
+        let decoded: &[u8] = match compression {
+            PackCompression::None => &buffer[..],
+            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer)?,
         };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        try_decode::<V>(decoded).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 }
 
@@ -311,22 +322,11 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match compression {
-            PackCompression::None => buffer,
-            PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
-                decompress_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
-                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                decompress_buffer
-            }
+        let decoded: &[u8] = match compression {
+            PackCompression::None => &buffer[..],
+            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer)?,
         };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        try_decode::<V>(decoded).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 
     /// Return the next V when available.

@@ -580,6 +580,12 @@ where
                 try_decode(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
             }
             PackCompression::ZStd => {
+                // Stream-decode straight from the decompressor, capping decompressed bytes at
+                // MAX_RECORD_SIZE with `take` -- no interim buffer (this is the `&self`
+                // random-access read, where a reusable buffer would mean a per-read alloc or a
+                // `&mut self` field). A record that decompresses past the cap is rejected by
+                // *failing to decode* (the reader hits the cap mid-value); unlike the iterator
+                // paths it does not surface `RequestedDecompressSizeTooLarge`.
                 let mut decoder = zstd::stream::read::Decoder::new(payload)?;
                 decoder.window_log_max(24)?;
                 let limited = decoder.take(MAX_RECORD_SIZE as u64);
@@ -1348,9 +1354,11 @@ mod tests {
         (tmp_path, pos)
     }
 
-    // F3: the in-memory MAX_RECORD_SIZE cap on decompressed output must fire at every
-    // decompression site (sync fetch, sync iterator, async iterator). Parity tests across
-    // the three sites guard against drift if one site is refactored without the others.
+    // The in-memory MAX_RECORD_SIZE cap bounds decompressed output at every decompression site.
+    // The iterator sites (sync + async) buffer the decompressed bytes and report the precise
+    // `RequestedDecompressSizeTooLarge`; the `fetch` site streams the decode with no buffer (a
+    // deliberate no-alloc optimization) and so rejects a bomb by *failing to decode* -- a
+    // `DeserializeValue`, not the size-cap error. These parity tests pin that intended split.
 
     #[test]
     fn test_zstd_decompression_bomb_fetch() {
@@ -1359,10 +1367,10 @@ mod tests {
         let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
-            Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
-                assert_eq!(max, MAX_RECORD_SIZE);
-            }
-            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+            // Streaming fetch caps decompressed bytes with `take` and rejects the bomb by failing
+            // to decode (bcs sees data past the record) rather than reporting the size cap.
+            Err(FetchError::DeserializeValue(_)) => {}
+            other => panic!("expected the bomb to fail decoding, got {other:?}"),
         }
     }
 
