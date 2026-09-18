@@ -1140,7 +1140,7 @@ where
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
-                let record_key = kad::RecordKey::new(&key);
+                let record_key = node_record_key(&key);
                 let record = self
                     .swarm
                     .behaviour_mut()
@@ -1820,7 +1820,7 @@ where
                 // non-committee re-arms the key.
                 for bls_key in missing {
                     if self.kad_record_queries.values().all(|q| q.request != bls_key) {
-                        let key = kad::RecordKey::new(&bls_key);
+                        let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
                     } else {

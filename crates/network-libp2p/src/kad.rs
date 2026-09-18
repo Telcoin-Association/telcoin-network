@@ -221,9 +221,10 @@ const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 /// raw bytes of its primary BLS public key.
 ///
 /// This is deliberately *not* the BCS encoding of the key, which would prepend a ULEB128
-/// length prefix and land on a different row. Every producer and consumer of a node's
-/// record key must go through this function: `ConsensusNetwork::get_peer_record` publishes
-/// under it, the lookups by BLS key query it, and [`KadStore`] uses it as `node_key` so
+/// length prefix and land on a different row. Every production producer and consumer of a
+/// node's record key goes through this function so they cannot drift apart:
+/// `ConsensusNetwork::get_peer_record` publishes under it, the `MissingAuthorities`
+/// handler in `ConsensusNetwork` queries it, and [`KadStore`] uses it as `node_key` so
 /// [`RecordStore::provided`] enumerates the row `start_providing` actually wrote (issue
 /// #1331).
 pub fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
