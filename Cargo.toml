@@ -3,6 +3,7 @@ members = [
     # common
     "bin/telcoin-network",
     "bin/worker-gateway",
+    "bin/node-record-api",
     "crates/config",
     "crates/engine",
     "crates/exex",
@@ -243,7 +244,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
 ] }
-# worker-gateway http server (bin/worker-gateway)
+# http edge servers (bin/worker-gateway, bin/node-record-api)
 axum = { version = "0.8.6", default-features = false }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = [
@@ -255,6 +256,7 @@ hyper-util = { version = "0.1", default-features = false, features = [
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = [
     "timeout",
+    "cors",
 ] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
 const-str = "0.5.6"

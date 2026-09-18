@@ -12260,6 +12260,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-node-record-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "eyre",
+ "futures",
+ "hex",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "socket2 0.6.3",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tn-config",
+ "tn-kad-client",
+ "tn-metrics",
+ "tn-network-libp2p",
+ "tn-node-record",
+ "tn-storage",
+ "tn-test-utils",
+ "tn-types",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "url",
+]
+
+[[package]]
 name = "tn-primary"
 version = "0.1.0"
 dependencies = [

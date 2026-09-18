@@ -1,0 +1,76 @@
+[package]
+name = "tn-node-record-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP/JSON directory of validators' DHT-advertised JSON-RPC endpoints for Telcoin Network."
+
+[[bin]]
+name = "node-record-api"
+path = "src/main.rs"
+
+[dependencies]
+# cli + runtime
+clap = { workspace = true, features = ["derive", "env"] }
+eyre = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "macros",
+    "io-util",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std"] }
+
+# http server + json-rpc client
+axum = { workspace = true, features = ["json", "tokio", "http1", "matched-path"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower-http = { workspace = true }
+# the workspace `reqwest` has no TLS backend; rustls is required for `https://` rpc urls and is
+# already in the dependency graph through alloy/reth, so this enables no new crate
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
+
+# metrics
+metrics = { workspace = true }
+
+# config + serde
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+url = { workspace = true }
+humantime = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+# telcoin
+tn-kad-client = { workspace = true }
+tn-metrics = { workspace = true }
+tn-node-record = { workspace = true }
+tn-types = { workspace = true }
+
+# `TCP_USER_TIMEOUT` on accepted connections (see `server::set_tcp_user_timeout`);
+# the socket option is Linux-family only, so the dependency is too.
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+socket2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `ServiceExt::oneshot` for driving the router in-process
+tower = { workspace = true, features = ["util"] }
+# a real worker swarm for `tests/live_dht.rs`
+tn-network-libp2p = { workspace = true }
+tn-config = { workspace = true, features = ["test-utils"] }
+tn-storage = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
+
+[lints]
+workspace = true
