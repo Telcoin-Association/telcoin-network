@@ -1304,6 +1304,7 @@ mod test {
             addresses: vec![],
         };
         kad_store.add_provider(ours).expect("add our provider record");
+        kad_store.db.sync_persist();
         let provided: Vec<ProviderRecord> =
             kad_store.provided().map(|record| record.into_owned()).collect();
         assert_eq!(provided.len(), 1, "provided() enumerates the self-provide");
