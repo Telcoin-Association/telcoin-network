@@ -20,6 +20,7 @@ use crate::{
     engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
     worker::worker_task_manager_name,
 };
+use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
     collections::HashSet,
     future::{ready, Future},
@@ -337,7 +338,7 @@ where
         );
 
         // create primary and worker nodes
-        let (primary, worker_node) = self
+        let (primary, worker_nodes) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
@@ -353,7 +354,10 @@ where
         let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
-        let mut worker = worker_node.new_worker().await?;
+        let mut workers = futures::stream::iter(&worker_nodes)
+            .then(|worker_node| worker_node.new_worker())
+            .try_collect::<Vec<_>>()
+            .await?;
         let current_epoch = primary.current_committee().await.epoch();
         let (current_consensus_epoch, _, _) = self.consensus_bus.published_consensus_num_hash();
         if current_epoch < current_consensus_epoch {
@@ -390,22 +394,26 @@ where
             self.epoch_boundary,
         );
 
-        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-        // start batch builder
-        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-
-        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
-        engine
-            .start_batch_builder(
-                worker.id(),
-                worker.batches_tx(),
-                &batch_builder_task_spawner,
-                gas_accumulator.base_fee(worker.id()).base_fee(),
-                current_epoch,
-            )
+        // Drain the previous cache once, before any new builder can write this epoch's batches.
+        self.orphan_batches(&epoch_task_manager, engine.clone(), workers.clone(), current_epoch)
             .await?;
 
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)
+        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
+        futures::stream::iter(&mut workers)
+            .then(|worker| {
+                worker.spawn_batch_builder(
+                    &worker_task_manager_name(worker.id()),
+                    &epoch_task_manager,
+                );
+                engine.start_batch_builder(
+                    worker.id(),
+                    worker.batches_tx(),
+                    &batch_builder_task_spawner,
+                    gas_accumulator.base_fee(worker.id()).base_fee(),
+                    current_epoch,
+                )
+            })
+            .try_collect::<()>()
             .await?;
 
         // update tasks
