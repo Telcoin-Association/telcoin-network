@@ -1240,7 +1240,9 @@ mod tests {
     /// preserved); SafeL2 seeds `threshold = 1` and the EIP-161 contract nonce; the governance
     /// proxy's slot 0 flipped to SafeL2 and its handler slot to the canonical
     /// CompatibilityFallbackHandler while its code, balance, account nonce, owner count,
-    /// threshold, and an owner linked-list entry are byte-identical; and the fork block's
+    /// threshold, and an owner linked-list entry are byte-identical; the Safe Singleton
+    /// Factory's deployer EOA moves from nonce 0 to the mainnet-genesis nonce-1 marker while
+    /// staying code-free; and the fork block's
     /// `state_root` is identical across two independent executions. All post-fork reads go
     /// through a fresh `StateProvider` over the canonicalized chain — the same path a
     /// restarted node takes to read the migrated state back.
@@ -1275,6 +1277,12 @@ mod tests {
             suite_address("CompatibilityFallbackHandler"),
         );
         let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+        // mirrors `SAFE_SINGLETON_FACTORY_DEPLOYER` in `block.rs::apply_governance_safe_fork`.
+        // Mainnet genesis allocates it `nonce: 0x1, balance: 0x0` with no code, marking its
+        // nonce-0 presigned factory-deployment transaction as spent; adiri never ran that
+        // transaction, so the fork writes the marker to close the last parity leaf.
+        const SAFE_SINGLETON_FACTORY_DEPLOYER: Address =
+            alloy::primitives::address!("0xE1CB04A0fA36DdD16a06ea828007E35e1a3cBC37");
 
         // fork fires when the concluding epoch + 1 == FORK_EPOCH
         let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
@@ -1307,6 +1315,14 @@ mod tests {
             assert!(
                 pre.account_code(&safe_l2)?.is_none(),
                 "pre-fork genesis must not deploy SafeL2"
+            );
+            assert_eq!(
+                pre.basic_account(&SAFE_SINGLETON_FACTORY_DEPLOYER)?
+                    .map(|account| account.nonce)
+                    .unwrap_or_default(),
+                0,
+                "pre-fork genesis must leave the singleton-factory deployer EOA at nonce 0 \
+                 (unallocated, or allocated without the mainnet marker)"
             );
             let owner_entry = pre
                 .storage(GOVERNANCE_SAFE_ADDRESS, owner_slot)?
@@ -1351,6 +1367,23 @@ mod tests {
             post.basic_account(&safe_l2)?.expect("SafeL2 account exists post-fork").nonce,
             1,
             "etched SafeL2 must carry the EIP-161 contract-account nonce"
+        );
+
+        // the singleton-factory deployer EOA carries the mainnet-genesis marker, nonce-only
+        let deployer_account = post
+            .basic_account(&SAFE_SINGLETON_FACTORY_DEPLOYER)?
+            .expect("the fork must materialize the singleton-factory deployer EOA");
+        assert_eq!(
+            deployer_account.nonce, 1,
+            "the fork must mark the singleton-factory deployer's presigned deployment as spent"
+        );
+        assert!(
+            deployer_account.bytecode_hash.is_none(),
+            "the deployer marker is nonce-only: its account leaf must carry no code hash"
+        );
+        assert!(
+            post.account_code(&SAFE_SINGLETON_FACTORY_DEPLOYER)?.is_none(),
+            "the deployer marker is nonce-only: the EOA must stay code-free"
         );
 
         // governance proxy: exactly two slots moved, everything else byte-identical

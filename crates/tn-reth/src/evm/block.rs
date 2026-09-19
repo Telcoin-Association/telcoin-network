@@ -1157,7 +1157,12 @@ where
     ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's pinned
     ///   code hash AND on slot 0 still holding the L1 singleton. Owners, threshold, the Safe nonce,
     ///   and the TEL balance are untouched (preserved by omission — only changed slots enter the
-    ///   bundle).
+    ///   bundle). The handler slot itself is written unconditionally — it is a slot the fork
+    ///   defines — and an owner-installed third-party handler is recorded at `warn!` rather than
+    ///   aborting the boundary;
+    /// - **mark** the Safe Singleton Factory's deployer EOA at nonce 1, the one mainnet-genesis
+    ///   leaf adiri would otherwise lack because it never ran the presigned deployment transaction.
+    ///   Nonce-only and monotonic, so it neither disturbs a live account nor rewinds under replay.
     ///
     /// Fires exactly once, from the epoch-closing block that concludes
     /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` (one-shot `==` trigger in `finish`). No system call
@@ -1173,6 +1178,7 @@ where
     fn apply_governance_safe_fork(&mut self) -> TnRethResult<()> {
         // revm `Database` trait provides `basic`/`storage`; imported anonymously to avoid
         // clashing with the `alloy_evm::Database` already in module scope.
+        use alloy::primitives::address;
         use reth_revm::{
             state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorage, EvmStorageSlot},
             Database as _,
@@ -1196,7 +1202,7 @@ where
         // fails (or passes) in lockstep, and a failure aborts the block with no partial
         // migration. Reading via `basic` also loads each account into the `State` cache, which
         // the commit below requires even for absent accounts.
-        let mut staged: Vec<(Address, Account)> = Vec::with_capacity(suite.len() + 1);
+        let mut staged: Vec<(Address, Account)> = Vec::with_capacity(suite.len() + 2);
         for install in suite {
             let current = self
                 .evm
@@ -1324,8 +1330,23 @@ where
             )));
         }
         // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, derived exactly as the Safe source
-        // does; read (not gated — unset on the live chain, and an already-canonical value
-        // would simply drop out of the changeset via the `is_changed` filter)
+        // does. Unlike the two gates above, this slot is deliberately NOT fail-closed: the
+        // migration is entitled to own it, so all three reachable pre-states are written
+        // through rather than aborting the block.
+        // - **unset** (`U256::ZERO`) — the live chain's state, and the reason the write exists at
+        //   all: SafeL2 routes unknown selectors through the handler, so the proxy needs the
+        //   canonical one before it runs on the L2 singleton.
+        // - **already canonical** — the write is a no-op and drops straight out of the changeset
+        //   via the `is_changed` filter, so the `state_root` is unaffected.
+        // - **a third-party handler** — reachable at any time: `setFallbackHandler` is `authorized`
+        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot between the
+        //   arming PR and the boundary. The fork overwrites it anyway. Aborting would stall the
+        //   entire fleet on the epoch-closing block over a slot the migration defines, and the
+        //   canonical handler is the value the post-fork SafeL2 stack expects; getting the intended
+        //   storage and bytecode in place is what the boundary is for. The overwrite is loud rather
+        //   than silent — the `warn!` below records the displaced address alongside its
+        //   replacement, so the prior value stays recoverable from the node record and the owners
+        //   can re-install it afterwards with an ordinary `execTransaction`.
         let handler_slot = U256::from_be_bytes(
             alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
         );
@@ -1333,6 +1354,16 @@ where
             self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, handler_slot).map_err(|e| {
                 TnRethError::EVMCustom(format!("governance safe handler slot read failed: {e}"))
             })?;
+        let canonical_handler = U256::from_be_bytes(fallback_handler.into_word().0);
+        if current_handler != U256::ZERO && current_handler != canonical_handler {
+            tracing::warn!(
+                target: "engine",
+                displaced_handler = %current_handler,
+                canonical_handler = %canonical_handler,
+                "governance safe fork overwriting a non-canonical fallback handler: the \
+                 displaced value is recorded here and can be re-installed by owner action",
+            );
+        }
         let governance_storage: EvmStorage = [
             (
                 U256::ZERO,
@@ -1342,14 +1373,7 @@ where
                     0,
                 ),
             ),
-            (
-                handler_slot,
-                EvmStorageSlot::new_changed(
-                    current_handler,
-                    U256::from_be_bytes(fallback_handler.into_word().0),
-                    0,
-                ),
-            ),
+            (handler_slot, EvmStorageSlot::new_changed(current_handler, canonical_handler, 0)),
         ]
         .into_iter()
         .collect();
@@ -1365,6 +1389,63 @@ where
             },
         ));
 
+        /// Safe Singleton Factory deployer EOA.
+        ///
+        /// Mainnet genesis allocates this account `nonce: 0x1, balance: 0x0` with no code, to
+        /// mark its nonce-0 presigned deployment transaction as spent — the same treatment
+        /// every other deployer EOA in that alloc receives (see
+        /// `tn-contracts/deployments/genesis/canonical-bytecode/README.md`, "Nonces are set as
+        /// if the deployments happened"). Note this one is not a Nick's-method keyless address:
+        /// Safe holds the key and signs one deployment transaction per chain, which is why the
+        /// marker has to be written rather than earned by replaying a public transaction.
+        const SAFE_SINGLETON_FACTORY_DEPLOYER: Address =
+            address!("0xE1CB04A0fA36DdD16a06ea828007E35e1a3cBC37");
+
+        // Adiri never ran that presigned transaction, so the etch above installs the factory
+        // without its deployer marker and post-fork adiri would differ from mainnet genesis by
+        // exactly this one state-trie leaf. Touch the nonce here to close the gap. Nonce-only:
+        // balance, code, and any storage pass through untouched (empty storage map + plain
+        // `Touched`, the same shape as the code-only swaps above).
+        //
+        // Deliberately not fail-closed, for the same reason as the handler slot: an unexpected
+        // occupant is worth a record, not a fleet-wide halt on the epoch-closing block. Raising
+        // the nonce of an account that somehow carries code is harmless — it neither disturbs
+        // that code nor its storage — whereas aborting would sacrifice the whole migration over
+        // a leaf with no bearing on the Safe stack's behavior.
+        //
+        // `.max(1)` rather than `= 1` so the write is monotonic. A nonce is only ever raised by
+        // execution, so clamping up preserves determinism under replay: a node re-executing
+        // this block over state where the account has already moved past 1 (a live transaction,
+        // or a re-run against already-forked state) lands on the same value every other node
+        // does, instead of rewinding the leaf and deriving a different `state_root`.
+        let deployer = self
+            .evm
+            .db_mut()
+            .basic(SAFE_SINGLETON_FACTORY_DEPLOYER)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!(
+                    "safe singleton factory deployer account read failed: {e}"
+                ))
+            })?
+            .unwrap_or_default();
+        if !deployer.is_empty_code_hash() {
+            tracing::warn!(
+                target: "engine",
+                address = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+                found_code_hash = %deployer.code_hash,
+                "governance safe fork marking the singleton-factory deployer nonce over an \
+                 account that unexpectedly carries code: code and storage are left untouched",
+            );
+        }
+        staged.push((
+            SAFE_SINGLETON_FACTORY_DEPLOYER,
+            Account {
+                info: AccountInfo { nonce: deployer.nonce.max(1), ..deployer },
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
         self.evm.db_mut().commit(EvmState::from_iter(staged));
 
         tracing::info!(
@@ -1372,8 +1453,9 @@ where
             installed = suite.len(),
             singleton = %safe_l2_singleton,
             handler = %fallback_handler,
-            "governance safe fork applied: canonical Safe v1.4.1 suite installed, governance \
-             proxy migrated to SafeL2",
+            factory_deployer = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+            "governance safe fork applied: canonical Safe v1.4.1 suite installed, singleton \
+             factory deployer nonce marked, governance proxy migrated to SafeL2",
         );
         Ok(())
     }
@@ -2383,6 +2465,93 @@ mod tests {
         assert!(
             format!("{err:#}").contains("already carries code"),
             "abort must come from the etch-target gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must OVERWRITE a third-party fallback handler, not abort.
+    ///
+    /// This is the deliberate asymmetry with the two gates exercised above, and it lives
+    /// beside them so the contrast is readable in one place: the proxy's code hash and slot 0
+    /// fail closed, while the fallback-handler slot is one the migration defines and therefore
+    /// writes through every reachable pre-state.
+    ///
+    /// The slot is genuinely owner-mutable between the arming PR and the boundary —
+    /// `FallbackManager.setFallbackHandler` is `authorized` (`msg.sender == address(this)`),
+    /// so a quorum of the live 3-of-7 Safe can point it anywhere, including at an address with
+    /// no code. `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
+    /// unset -> canonical transition that the committed genesis fixture exhibits; nothing else
+    /// in the tree seeds a non-zero pre-state, so without this test the overwrite branch is
+    /// unexercised.
+    ///
+    /// Asserts: with a third-party handler pre-seeded in the governance proxy's handler slot,
+    /// the fork boundary block still executes, the handler slot lands on the canonical
+    /// `CompatibilityFallbackHandler`, and the rest of the migration (slot 0 -> SafeL2) is
+    /// unaffected. The displaced value is surfaced at `warn!` by `apply_governance_safe_fork`
+    /// so it stays recoverable from the node record.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_overwrites_third_party_fallback_handler() -> eyre::Result<()>
+    {
+        use reth_provider::StateProvider as _;
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        // by name, not by index: the suite's row order is coupled to the vendored bytecode
+        // list, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+        let canonical_handler = suite_address("CompatibilityFallbackHandler");
+        let safe_l2 = suite_address("SafeL2");
+
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`
+        let handler_slot: B256 = alloy::primitives::keccak256(b"fallback_manager.handler.address");
+        // an owner-installed handler that is neither unset nor canonical. Code-free on purpose:
+        // `setFallbackHandler` requires no code at the target, so this is a state the live Safe
+        // can actually reach
+        let third_party = Address::with_last_byte(0xbe);
+
+        let mut genesis = tn_types::test_genesis();
+        let proxy = genesis
+            .alloc
+            .get_mut(&GOVERNANCE_SAFE_ADDRESS)
+            .expect("testnet genesis must allocate the governance proxy");
+        let mut storage = proxy.storage.clone().unwrap_or_default();
+        // fixture guard: the committed genesis leaves the slot unset, so the seed below is the
+        // only thing separating this case from the happy path
+        assert!(
+            storage.insert(handler_slot, third_party.into_word()).is_none(),
+            "committed genesis must leave the governance proxy's handler slot unset"
+        );
+        proxy.storage = Some(storage);
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork third-party handler");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect("a third-party fallback handler must not abort the fork boundary");
+
+        // read back through a fresh `StateProvider` over the canonicalized chain
+        let post = env.latest()?;
+        let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, handler_slot)?,
+            Some(as_slot_value(canonical_handler)),
+            "the fork must displace a third-party handler with the canonical one"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+            Some(as_slot_value(safe_l2)),
+            "the rest of the migration must complete: slot 0 still flips to SafeL2"
         );
 
         Ok(())
