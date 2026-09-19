@@ -113,5 +113,9 @@ adiri = ["faucet", "tn-types/adiri"]
 # Required before any storage-v2 / `StorageSettings` experimentation.
 rocksdb = ["reth/rocksdb"]
 
+[[bench]]
+name = "output_overlay"
+harness = false
+
 [lints]
 workspace = true
