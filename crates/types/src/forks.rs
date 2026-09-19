@@ -888,8 +888,10 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// same shape as [`CONSENSUS_REGISTRY_FORK_EPOCH`]), bringing live adiri's Safe stack to parity
 /// with mainnet genesis:
 /// - **etch** the eleven [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] contracts adiri lacks (SafeL2 +
-///   fallback handler + libraries + both migration helpers + the singleton factory), each gated on
-///   the target address holding no code;
+///   fallback handler + libraries + both migration helpers + the singleton factory), forcing the
+///   canonical bytes over whatever the address holds — empty on the live chain, already canonical
+///   if someone deployed the suite through the singleton factory, and an unknown occupant only at
+///   `warn!` rather than a fleet-wide abort;
 /// - **swap** the two recompiled deployments — the `Safe` singleton and the `SafeProxyFactory` — to
 ///   the canonical bytes, each gated fail-closed on its pre-fork pin
 ///   ([`SAFE_SINGLETON_PRE_FORK_CODE_HASH`], [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]), preserving
@@ -905,8 +907,9 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// first transaction ever. Adiri governance sits at nonce 2, so no transaction it can ever sign
 /// performs the migration; `SafeMigration.migrateL2Singleton` has no nonce guard but leaves the
 /// missing suite and the recompiled factory in place. The fork does the whole job atomically
-/// behind the fail-closed gates above (every gate is a pure function of committed state, so the
-/// fleet passes or aborts in lockstep).
+/// behind the gates above — fail-closed wherever a pin vouches for a storage layout the write
+/// preserves (every gate is a pure function of committed state, so the fleet passes or aborts in
+/// lockstep).
 ///
 /// Scope: adiri-only, like every constant in this family — mainnet genesis already carries the
 /// full canonical suite with governance on SafeL2, so non-adiri builds exclude the mechanism
