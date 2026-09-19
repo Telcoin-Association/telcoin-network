@@ -32,7 +32,7 @@ pub struct Config {
     /// The [Genesis] for the node.
     pub genesis: Genesis,
 
-    /// Is this an observer node?
+    /// Deprecated compatibility flag with no effect. Node role follows committee membership.
     pub observer: bool,
 
     /// Spawn ExEx tasks (and the ExEx manager) as critical tasks.
