@@ -51,6 +51,10 @@ help:
 	@echo "make test-e2e-forked" ;
 	@echo "    :::> Run the e2e suite with the seed-signature, PREVRANDAO and leader-seeded-ordering forks armed from genesis." ;
 	@echo ;
+	@echo "make test-e2e-governance-safe" ;
+	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
+	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -145,6 +149,26 @@ build-e2e-bin:
 # A named cargo profile emits into target/<profile>/, so the `e2e` profile binary lands here.
 E2E_BIN := $(E2E_TARGET_ROOT)/e2e/telcoin-network
 
+# Target root for the ADIRI e2e node binary. Derived from E2E_TARGET_ROOT so a developer's
+# CARGO_TARGET_DIR is honored identically, and NESTED inside it rather than placed beside it so
+# the directory inherits the existing `target/` ignore rule and `cargo clean` sweeps both. It has
+# to be a separate root: the adiri build enables a different feature set across the whole graph,
+# so sharing E2E_TARGET_ROOT would make every switch between lanes rebuild everything and would
+# leave `target/e2e/telcoin-network` holding whichever feature set ran last — with no way for a
+# lane consuming TN_BIN_PATH to tell.
+E2E_TARGET_ROOT_ADIRI := $(E2E_TARGET_ROOT)/adiri-e2e
+
+# Build the node binary WITH `adiri`, the only build that carries the governance-Safe fork (see
+# test-e2e-governance-safe below). `tn-storage/test-utils` is a dependency-feature spec and
+# `adiri` is the selected bin package's own feature; both resolve on one --features list.
+.PHONY: build-e2e-bin-adiri
+build-e2e-bin-adiri:
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils,adiri --target-dir "$(E2E_TARGET_ROOT_ADIRI)" ;
+
+# Location of the binary built by build-e2e-bin-adiri. Same expression pairing as E2E_BIN above,
+# so the producing and the consuming path cannot diverge.
+E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
+
 # Seed-signature fork epoch for the e2e lanes (#1032). Defaults to u32::MAX so the default
 # lanes run the fork DORMANT (wire-identical to pre-fork mainnet); non-adiri builds are
 # otherwise active from genesis. Override for a fork-active lane:
@@ -190,14 +214,32 @@ TN_PREVRANDAO_FORK_EPOCH ?= 4294967295
 # leader_seeded_ordering_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_LEADER_SEEDED_ORDERING_FORK_EPOCH ?= 0
 
-# Governance-Safe fork epoch for the e2e lanes. Same shape as the fork variables above and
-# armed independently of every one of them: defaults to u32::MAX so the default lanes run the
-# fork DORMANT (the state live adiri carries). Override for a fork-active lane:
-#   TN_GOVERNANCE_SAFE_FORK_EPOCH=2 make test-epochs
-# Only test-utils builds consult it (tn_types::forks::governance_safe_fork_epoch_override).
+# Governance-Safe fork epoch for the e2e lanes. Defaults to u32::MAX so every lane below runs
+# the fork DORMANT (the state live adiri carries). UNLIKE the four variables above it cannot arm
+# the fork on those lanes at all: the entire mechanism — governance_safe_fork_epoch,
+# apply_governance_safe_fork, and the boundary trigger in tn-reth's `finish` — is
+# #[cfg(feature = "adiri")], with no unconditional entry point, and `build-e2e-bin` builds the
+# node binary WITHOUT `adiri`. On the test-restarts/test-epochs/test-e2e/test-e2e-forked binaries
+# the fork is therefore compiled out and this variable only decorates the child's startup log.
+# The one invocation that arms it is `make test-e2e-governance-safe` below, which runs the adiri
+# e2e binary and supplies its own TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH. Arming this variable on a
+# lane below is now a named test failure rather than a silent no-op — see
+# crates/e2e-tests/tests/it/governance_safe_fork.rs.
+# BOTH test-utils and adiri are required to consult it
+# (tn_types::forks::governance_safe_fork_epoch_override, reached only through the adiri-only
+# governance_safe_fork_epoch).
 # Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
 # governance_safe_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_GOVERNANCE_SAFE_FORK_EPOCH ?= 4294967295
+
+# The fork epoch `test-e2e-governance-safe` ARMS, on the adiri binary that can execute it. 2 puts
+# the boundary in the epoch-closing block that concludes epoch 1, so the lane observes genesis
+# (pre-fork) and the tip (post-fork) inside a short run. Deliberately a SECOND variable rather
+# than an override of the one above: that keeps a default lane from arming the fork through this
+# value and keeps a `TN_GOVERNANCE_SAFE_FORK_EPOCH=...` on the command line from disarming this
+# lane. The test rejects 0 (the `concluding epoch + 1 ==` trigger can never match it) and refuses
+# a value large enough to outrun the test budget.
+TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH ?= 2
 
 # run restart integration tests
 test-restarts: build-e2e-bin
@@ -227,6 +269,35 @@ test-e2e: build-e2e-bin
 # command-line assignments override the `?=` defaults above.
 test-e2e-forked:
 	$(MAKE) test-e2e TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 ;
+
+# run the governance-Safe fork e2e test with the fork ARMED on spawned node processes. The only
+# invocation that executes this fork outside the in-process adiri unit suites, and the reason
+# TN_GOVERNANCE_SAFE_FORK_EPOCH is not simply inert: every lane above builds without `adiri`,
+# which compiles the whole mechanism out.
+#
+# Not recursive through test-e2e (the way test-e2e-forked is) because it consumes a different
+# binary: TN_BIN_PATH comes from E2E_BIN_ADIRI, built by the dependency above into its own
+# target root.
+#
+# TN_E2E_ADIRI_BIN=1 is the marker the test reads to tell this lane from a default one.
+# `make test-e2e` selects every #[ignore] test in the package (`--run-ignored ignored-only`),
+# including this one, while TN_BIN_PATH points at the non-adiri binary; an `e2e-tests` cargo
+# feature would not help, because that lane also passes `--all-features`. Without the marker the
+# test skips with a warning naming this target; with it, every pre- and post-fork assertion is
+# hard, so a marked run whose fork state is missing FAILS. Arming TN_GOVERNANCE_SAFE_FORK_EPOCH
+# without the marker is a hard failure too, which is what stops the (previously advertised, and
+# false) `TN_GOVERNANCE_SAFE_FORK_EPOCH=2 make test-e2e` form from looking like it did something.
+#
+# All four sibling fork variables are pinned explicitly rather than left to the build: an adiri
+# build compiles DIFFERENT defaults for every one of them (383/407/...) than a default build, so
+# forwarding the same values the lanes above use is what keeps this lane differing from
+# `test-epochs` in exactly one dimension — the governance-Safe fork. (adiri also compiles in
+# CONSENSUS_REGISTRY_FORK_EPOCH = 407 and ADIRI_DUP_BATCH_EPOCH = 160; the first is far outside a
+# 3-epoch run, the second only changes duplicate-batch attribution, which this lane never
+# produces.) The test itself runs at chain id 2017, which an adiri binary requires and every
+# other lane must not use.
+test-e2e-governance-safe: build-e2e-bin-adiri
+	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
