@@ -707,18 +707,32 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
 /// mismatch that is otherwise invisible in the logs.
 ///
 /// Only variables that parsed are listed, so an entry means "pinned here", absence means "using
-/// this build's own fork point". Values latch on first read like the individual overrides do.
+/// this build's own fork point". A row is carried here under the same cfg as the gate that
+/// consumes it, so absence also covers a fork this build cannot honor at all: reporting one would
+/// name a pin nothing reads. [`governance_safe_fork_epoch`] is `adiri`-only, so its row is too,
+/// and a non-adiri `test-utils` binary inheriting `TN_GOVERNANCE_SAFE_FORK_EPOCH` from a Makefile
+/// lane stays silent about it rather than warn-logging a schedule change that never happens. Every
+/// entry is therefore genuinely in force on the build that printed it. Values latch on first read
+/// like the individual overrides do.
 pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
     #[cfg(feature = "test-utils")]
     {
+        // Carried under its consumer's cfg per the paragraph above. An attribute cannot sit on an
+        // array element, so the row joins the unconditional ones as a chained `Option`.
+        #[cfg(feature = "adiri")]
+        let governance_safe =
+            Some(("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()));
+        #[cfg(not(feature = "adiri"))]
+        let governance_safe: Option<(&'static str, Option<Epoch>)> = None;
+
         [
             ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
             ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
-            ("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()),
         ]
         .into_iter()
+        .chain(governance_safe)
         .filter_map(|(var, fork_epoch)| fork_epoch.map(|fork_epoch| (var, fork_epoch)))
         .collect()
     }
@@ -1387,9 +1401,11 @@ mod tests {
     /// `*_override_is_inert_when_unset` test needs a variable-free process, and the same loud
     /// failure if one latched first.
     ///
-    /// The `pinned` list below must name every fork that has a `test-utils` override; a fork added
-    /// to [`fork_epoch_overrides`] but not here fails the length assert only in a process that
-    /// exports it.
+    /// The `pinned` list below must name every fork that has a `test-utils` override, each under
+    /// the same cfg [`fork_epoch_overrides`] carries it: a fork whose gate is `adiri`-only is
+    /// listed only under `adiri`, because only an `adiri` build reports it. A fork added to
+    /// [`fork_epoch_overrides`] but not here — or carrying a cfg there that is not mirrored here —
+    /// fails the length assert only in a process that exports it.
     #[test]
     fn fork_epoch_overrides_lists_only_the_pins_in_force() {
         #[cfg(not(feature = "test-utils"))]
@@ -1400,7 +1416,15 @@ mod tests {
         #[cfg(feature = "test-utils")]
         {
             let reported = fork_epoch_overrides();
-            let pinned = [
+            // Mirrors the cfg on the governance-Safe row in `fork_epoch_overrides`, restated
+            // rather than shared so this stays an independent statement of what it reports.
+            #[cfg(feature = "adiri")]
+            let governance_safe =
+                Some(("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()));
+            #[cfg(not(feature = "adiri"))]
+            let governance_safe: Option<(&'static str, Option<Epoch>)> = None;
+
+            let pinned: Vec<_> = [
                 ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
                 ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
                 ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
@@ -1408,12 +1432,14 @@ mod tests {
                     "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
                     leader_seeded_ordering_fork_epoch_override(),
                 ),
-                ("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()),
-            ];
-            pinned.into_iter().for_each(|(var, fork_epoch)| {
+            ]
+            .into_iter()
+            .chain(governance_safe)
+            .collect();
+            pinned.iter().for_each(|(var, fork_epoch)| {
                 assert_eq!(
-                    reported.iter().find(|(name, _)| *name == var).map(|(_, epoch)| *epoch),
-                    fork_epoch,
+                    reported.iter().find(|(name, _)| name == var).map(|(_, epoch)| *epoch),
+                    *fork_epoch,
                     "{var} must be reported exactly when it is pinned, at the pinned value",
                 );
             });
