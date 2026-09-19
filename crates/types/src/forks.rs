@@ -923,7 +923,13 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// (b) the three pre-fork pins still match the live deployments (a mismatch means adiri's Safe
 /// state moved since 2026-08-28 — reassess before arming, do not update pins to make gates
 /// pass). Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
-/// [`governance_safe_fork_epoch_override`]) so e2e lanes can run the fork active.
+/// [`governance_safe_fork_epoch_override`]). Honoring it also takes `adiri`: every piece of this
+/// fork is behind that feature and `make build-e2e-bin` omits it, so the variable is inert on the
+/// default e2e lanes. `make test-e2e-governance-safe` is the one invocation that arms it on
+/// spawned nodes — it builds the `adiri` e2e binary and runs
+/// `crates/e2e-tests/tests/it/governance_safe_fork.rs`, which rewrites its genesis into the live
+/// adiri pre-fork Safe state and asserts the transition over RPC. Arming the variable on any other
+/// lane is a named test failure there rather than a silent no-op.
 pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = u32::MAX;
 
 /// This build's effective governance-Safe fork epoch: the `TN_GOVERNANCE_SAFE_FORK_EPOCH`

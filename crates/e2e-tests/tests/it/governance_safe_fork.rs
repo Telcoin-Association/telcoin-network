@@ -271,15 +271,18 @@ fn assert_pre_fork_alloc(genesis: &Genesis) -> eyre::Result<()> {
          GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH: the fork's migration gate would fail closed"
     );
 
-    // every OTHER suite row is an etch target, and the etch refuses an address that holds code
+    // Every OTHER suite row is an etch target and must start empty. Not because the etch would
+    // refuse an occupied address — it forces the canonical bytes over whatever is there — but
+    // because the post-fork assertions could not tell an installed contract from one the fixture
+    // already carried.
     for (name, address, _) in GOVERNANCE_SAFE_FORK_CANONICAL_SUITE {
         if address == safe || address == factory {
             continue;
         }
         eyre::ensure!(
             code_hash(address) == B256::ZERO,
-            "genesis etch target {name} ({address}) already carries code: the fork's etch gate \
-             would fail closed"
+            "genesis etch target {name} ({address}) already carries code, so the post-fork \
+             assertion could not prove the fork installed it"
         );
     }
 
