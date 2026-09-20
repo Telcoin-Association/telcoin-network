@@ -171,8 +171,9 @@ pub trait TxPool {
     fn best_transactions(&self) -> BestTxns;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
-    /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
-    /// pool, along with their descendants.
+    /// Remove transactions unsupported by the batch protocol, along with their descendants.
+    /// This includes non-allowlisted EIP-2718 types and transactions exceeding a whole batch's
+    /// gas or encoded-byte limit.
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
     /// Return the canonical balances of `addresses` as of the latest committed block.
     ///
