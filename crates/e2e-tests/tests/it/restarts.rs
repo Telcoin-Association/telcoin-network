@@ -8,7 +8,7 @@ use crate::common::{
     start_validator, start_validator_with_args, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
-use eyre::Report;
+use eyre::{Report, WrapErr as _};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -127,6 +127,10 @@ fn run_restart_tests1(
         error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
         kill_child(&mut child2);
     })?;
+    wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "restarted validator did not rejoin active consensus");
+        kill_child(&mut child2);
+    })?;
     Ok(child2)
 }
 
@@ -217,8 +221,10 @@ fn run_restart_tests_lagged1(
         return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
     }
 
-    info!(target: "restart-test", "testing blocks same again in restart_tests1");
-
+    wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "lagged validator did not rejoin active consensus");
+        kill_child(&mut child2);
+    })?;
     Ok(child2)
 }
 
@@ -280,15 +286,15 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rounds. The `min_secs` floor alone does not guarantee it: at the nominal ~500ms/round cadence a
 /// 25s downtime spans ~50 rounds (safe), but on a loaded runner where idle rounds stretch past
 /// ~1.67s/round a 25s wait covers fewer than 15 rounds, the killed node never demotes, and
-/// `assert_observed_cvv_inactive` flakes. To close that, the delayed tests also gate on peer
+/// `assert_observed_cvv_inactive` fails. To close that, the delayed tests also gate on peer
 /// progress: each consensus header wraps one committed sub-dag whose leader round strictly exceeds
 /// its predecessor's, so a peer header-number delta of D guarantees the live DAG round climbed by
 /// at least D past the kill point. Requiring `(RESTART_TEST_GC_DEPTH - 10) + 3` = 18 headers thus
 /// guarantees the killed node is strictly more than 15 rounds behind (demotion fires) no matter how
 /// slow CI is. Consensus headers advance on idle rounds (empty sub-dags still commit; that is why
 /// this tracks the consensus chain, not the EVM block height), so the count keeps climbing
-/// throughout the downtime. The time `cap` (`min_secs * 2 + 30`) stays the fail-safe that surfaces
-/// a genuinely wedged network downstream instead of hanging here. The short rejoin test
+/// throughout the downtime. The time `cap` (`min_secs * 2 + 30`) fails the test if the network
+/// does not make the required progress. The short rejoin test
 /// (`min_secs = 2`) uses `min_round_gap = 1` and intentionally stays inside the GC window (live
 /// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
 fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
@@ -303,7 +309,7 @@ fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<(
     let start_height = peer_height();
     let start = Instant::now();
     let floor = Duration::from_secs(min_secs);
-    // Fail-safe cap so a genuinely stalled network surfaces downstream instead of hanging here.
+    // Fail if a stalled network cannot establish the required gap before restart.
     let cap = Duration::from_secs(min_secs * 2 + 30);
     // Only the delayed restart tests (min_secs >= RESTART_TEST_DOWNTIME_SECS) must guarantee the
     // killed node crosses the `gc_depth - 10` demotion threshold; the short rejoin test
@@ -328,8 +334,11 @@ fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<(
             return Ok(());
         }
         if elapsed >= cap {
-            info!(target: "restart-test", ?elapsed, "wait_for_downtime hit fail-safe cap; proceeding");
-            return Ok(());
+            return Err(Report::msg(format!(
+                "downtime did not establish a consensus header gap of {min_round_gap}: \
+                 start={start_height:?}, latest={:?}, elapsed={elapsed:?}",
+                peer_height()
+            )));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -385,6 +394,15 @@ fn assert_observed_cvv_inactive(node: &str, test: &str) -> eyre::Result<()> {
     .inspect(|()| {
         info!(target: "restart-test", "observed restarted node {node} in CvvInactive during catch-up");
     })
+}
+
+/// Wait for a stable membership-derived role, with the URL and expected role in timeout errors.
+fn wait_for_node_mode(node: &str, expected: NodeMode) -> eyre::Result<()> {
+    wait_until_blocking(
+        Duration::from_secs(30),
+        &format!("node {node} entered {expected:?}"),
+        || Ok(get_node_mode(node).is_ok_and(|mode| mode == expected)),
+    )
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
@@ -502,25 +520,21 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    client_urls.iter().try_for_each(|url| wait_for_node_mode(url, NodeMode::CvvActive))?;
+    wait_for_node_mode(obs_url, NodeMode::Observer)?;
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 
     test_blocks_same(client_urls)?;
-    // Send to observer, validator confirms.
-    send_and_confirm(obs_url, &client_urls[2], &key, to_account, 0)?;
+    // Establish live consensus and observer execution before testing forwarding. RPC can be
+    // available while the observer is still starting its worker and synchronizing with peers.
+    send_and_confirm(&client_urls[0], obs_url, &key, to_account, 0)
+        .wrap_err("validator transfer did not execute on the observer")?;
 
-    // After the first transaction, EL block 1 exists on all validators. Wait for the observer
-    // to sync to that block before reading state from it — the observer starts at genesis and
-    // may not have caught up yet, which would cause the basefee baseline to be 0.
-    // Use client_urls[2] since send_and_confirm already verified that validator's state,
-    // guaranteeing it has executed the TX block. client_urls[0] may lag slightly.
-    let target_block = get_block_number(&client_urls[2])?;
-    wait_for_block(obs_url, target_block)?;
-
-    // Send to observer, validator confirms- second time.
-    send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)?;
+    // Send to observer, validator confirms. Repeat with the next nonce below.
+    send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)
+        .wrap_err("first observer-forwarded transfer did not execute on the validator")?;
 
     // Wait for the observer to sync the second transaction's block before reading
     // its baseline balance. client_urls[3] confirmed the second tx, so use its
@@ -528,8 +542,10 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     let target_block = get_block_number(&client_urls[3])?;
     wait_for_block(obs_url, target_block)?;
 
-    // Send to a validator, observer sees transfer.
-    send_and_confirm(&client_urls[0], obs_url, &key, to_account, 2)?;
+    send_and_confirm(obs_url, &client_urls[2], &key, to_account, 2)
+        .wrap_err("second observer-forwarded transfer did not execute on the validator")?;
+    let target_block = get_block_number(&client_urls[2])?;
+    wait_for_block(obs_url, target_block)?;
 
     test_blocks_same(client_urls)?;
     Ok(())
@@ -563,7 +579,11 @@ fn test_restarts_observer() -> eyre::Result<()> {
         // endpoints; without this each seal is refused with NotValidator and the txns
         // stay pending in the observer's pool until an endpoint is discoverable.
         advertise_worker_rpc(&temp_path, i, rpc_port)?;
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
+        // A seated validator must remain active even when a legacy launch command has the flag.
+        let extra_args: &[&str] = if i == 0 { &["--observer"] } else { &[] };
+        guard.push(start_validator_with_args(
+            i, &bin, &temp_path, rpc_port, "observer", 0, extra_args,
+        ));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");

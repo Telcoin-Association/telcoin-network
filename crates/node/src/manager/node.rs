@@ -694,11 +694,10 @@ where
 {
     /// Construct the manager and its process-lifetime state.
     ///
-    /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
-    /// `Observer` mode when configured as an observer), and loads bootstrap servers from the
-    /// genesis committee. Network handles are left `None` until [`run`](Self::run) spawns the
-    /// networks. Panics if the consensus chain cannot be opened, since that is unrecoverable at
-    /// startup.
+    /// Opens the consensus chain, builds the application-scoped consensus bus, and loads bootstrap
+    /// servers from the genesis committee. Network handles are left `None` until [`run`](Self::run)
+    /// spawns the networks. Panics if the consensus chain cannot be opened, since that is
+    /// unrecoverable at startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -725,10 +724,6 @@ where
 
         let consensus_bus =
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
-        if builder.tn_config.observer {
-            // Don't risk keeping the default CVV active mode...
-            consensus_bus.node_mode().send_replace(NodeMode::Observer);
-        }
         // one event stream per configured worker, indexed by worker id
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
             .map(|_| QueChannel::new())
