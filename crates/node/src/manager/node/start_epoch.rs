@@ -1130,7 +1130,6 @@ mod tests {
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
         let mut config = Config::default_for_test();
-        config.observer = true;
         config.node_info.p2p_info.workers = (0..2)
             .map(|worker_id| {
                 Ok(P2pNode {
@@ -1176,6 +1175,10 @@ mod tests {
             NetworkConfig::default(),
         )?;
         let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
+        // Identify the role before worker startup, as create_consensus does in production.
+        let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
+        let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        assert!(mode.is_observer(), "fixture must start as an observer");
         manager.worker_network_handles = (0..2)
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
