@@ -853,8 +853,8 @@ where
     ///
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
-    /// `Observer` if it is not in this committee, is configured observer-only, or a newer epoch
-    /// record excludes it from the committee. A locally eligible node otherwise starts as
+    /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
+    /// committee. A locally eligible node otherwise starts as
     /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is
     /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
     /// [`ConsensusBus`] before returning.
@@ -884,7 +884,7 @@ where
             "failed to READ the consensus store while priming consensus state: this is a \
              storage error, not a missing record - do NOT delete the chain-data directories",
         )?;
-        let initial_mode = if !in_committee || self.builder.tn_config.observer {
+        let initial_mode = if !in_committee {
             NodeMode::Observer
         } else {
             // Assume we are caught up, will be demoted to inactive if this is not true...

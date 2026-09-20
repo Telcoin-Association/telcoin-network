@@ -694,11 +694,10 @@ where
 {
     /// Construct the manager and its process-lifetime state.
     ///
-    /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
-    /// `Observer` mode when configured as an observer), and loads bootstrap servers from the
-    /// genesis committee. Network handles are left `None` until [`run`](Self::run) spawns the
-    /// networks. Panics if the consensus chain cannot be opened, since that is unrecoverable at
-    /// startup.
+    /// Opens the consensus chain, builds the application-scoped consensus bus, and loads bootstrap
+    /// servers from the genesis committee. Network handles are left `None` until [`run`](Self::run)
+    /// spawns the networks. Panics if the consensus chain cannot be opened, since that is
+    /// unrecoverable at startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -725,10 +724,6 @@ where
 
         let consensus_bus =
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
-        if builder.tn_config.observer {
-            // Don't risk keeping the default CVV active mode...
-            consensus_bus.node_mode().send_replace(NodeMode::Observer);
-        }
         // one event stream per configured worker, indexed by worker id
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
             .map(|_| QueChannel::new())
@@ -1033,9 +1028,7 @@ where
         // a mid-epoch governance burn must not change the startup membership decision.
         let (committee, ..) = self.get_committee_with_epoch_start_info(&engine).await?;
         let public_key = self.key_config.primary_public_key();
-        let initial_mode = if !self.builder.tn_config.observer
-            && committee.authority_by_key(&public_key).is_some()
-        {
+        let initial_mode = if committee.authority_by_key(&public_key).is_some() {
             // Committee dials run concurrently with bounded epoch-record synchronization.
             committee
                 .bls_keys()
