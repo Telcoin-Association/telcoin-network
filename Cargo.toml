@@ -3,6 +3,7 @@ members = [
     # common
     "bin/telcoin-network",
     "bin/worker-gateway",
+    "bin/node-record-api",
     "crates/config",
     "crates/engine",
     "crates/exex",
@@ -14,6 +15,8 @@ members = [
     "crates/types",
     "crates/network-types",
     "crates/network-libp2p",
+    "crates/node-record",
+    "crates/kad-client",
     "crates/state-sync",
     "crates/tn-metrics",
     "crates/tn-reth",
@@ -180,6 +183,8 @@ tn-reth = { path = "./crates/tn-reth" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }
+tn-node-record = { path = "./crates/node-record" }
+tn-kad-client = { path = "./crates/kad-client" }
 tn-network-types = { path = "./crates/network-types" }
 tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }

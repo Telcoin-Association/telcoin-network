@@ -1,0 +1,21 @@
+[package]
+name = "tn-node-record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+description = "Signed Telcoin node records and chain-scoped network protocol names"
+
+[dependencies]
+tn-types = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[lints]
+workspace = true

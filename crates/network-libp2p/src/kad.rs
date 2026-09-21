@@ -811,6 +811,7 @@ mod test {
     use tn_types::{decode, encode, BlsKeypair};
 
     use super::*;
+    use crate::types::NetworkTypeExt;
 
     fn test_record(expire_past: bool) -> Record {
         let key_config =

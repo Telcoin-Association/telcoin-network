@@ -1,5 +1,8 @@
 //! Tests networking using libp2p between peers.
 
+#[path = "kad_client.rs"]
+mod kad_client;
+
 use super::*;
 use crate::{
     common::{

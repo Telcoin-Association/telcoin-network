@@ -1,26 +1,31 @@
-//! Unit tests for network types.rs
+//! Tests for the shared node record wire format and signature domains.
 
 use super::{NetworkType, NodeRecord, RecordDomain, RpcInfo};
-use crate::common::create_multiaddr;
-use tn_config::KeyConfig;
-use tn_types::{BlsKeypair, BlsSigner};
+use libp2p::{identity::Keypair, multiaddr::Protocol, Multiaddr};
+use std::net::Ipv4Addr;
+use tn_types::{BlsKeypair, NetworkPublicKey, Signer};
 
+/// A fixed advertised address; these tests never open a socket.
+fn multiaddr() -> Multiaddr {
+    Multiaddr::empty()
+        .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+        .with(Protocol::Udp(9000))
+        .with(Protocol::QuicV1)
+}
+
+/// A built record verifies only against its signing key.
 #[test]
 fn test_node_record() {
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
     let domain = RecordDomain::new(2017, NetworkType::Primary);
 
     // build a valid node record
-    let node_record = NodeRecord::build(
-        domain,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        None,
-        |data| key_config.request_signature_direct(data),
-    );
+    let node_record = NodeRecord::build(domain, network_key.clone(), multiaddr, None, |data| {
+        bls_keypair.sign(data)
+    });
     let (bls_pubkey, record) =
         node_record.clone().verify(domain, &pubkey).expect("valid node record");
 
@@ -38,10 +43,10 @@ fn test_node_record() {
 fn test_node_record_with_rpc_roundtrip() {
     use tn_types::{decode, encode};
 
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
 
     let domain = RecordDomain::new(2017, NetworkType::Primary);
 
@@ -50,13 +55,10 @@ fn test_node_record_with_rpc_roundtrip() {
         ws: Some("wss://a.example:8546/".parse().expect("ws url")),
     };
 
-    let node_record = NodeRecord::build(
-        domain,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        Some(rpc.clone()),
-        |data| key_config.request_signature_direct(data),
-    );
+    let node_record =
+        NodeRecord::build(domain, network_key.clone(), multiaddr, Some(rpc.clone()), |data| {
+            bls_keypair.sign(data)
+        });
 
     // encode and decode round-trip preserves rpc and stays verifiable
     let bytes = encode(&node_record);
@@ -92,18 +94,18 @@ fn test_legacy_record_compat_decode_and_verify() {
         signature: BlsSignature,
     }
 
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
     let domain = RecordDomain::new(2017, NetworkType::Primary);
 
     let old_info = OldNetworkInfo {
-        pubkey: key_config.primary_network_public_key(),
+        pubkey: network_key.clone(),
         multiaddrs: vec![multiaddr.clone()],
         timestamp: now(),
     };
-    let signature = key_config.request_signature_direct(&encode(&old_info));
+    let signature = bls_keypair.sign(&encode(&old_info));
     let legacy_bytes = encode(&OldNodeRecord { info: old_info, signature });
 
     // compat decode falls back to the legacy layout with rpc defaulted
@@ -124,13 +126,10 @@ fn test_legacy_record_compat_decode_and_verify() {
 
     // current-layout, domain-scoped bytes decode and verify under the matching domain
     let rpc = RpcInfo { http: "https://a.example:8545/".parse().expect("http url"), ws: None };
-    let current = NodeRecord::build(
-        domain,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        Some(rpc.clone()),
-        |data| key_config.request_signature_direct(data),
-    );
+    let current =
+        NodeRecord::build(domain, network_key.clone(), multiaddr, Some(rpc.clone()), |data| {
+            bls_keypair.sign(data)
+        });
     let current_bytes = encode(&current);
     let decoded = NodeRecord::try_decode_compat(&current_bytes).expect("current bytes decode");
     assert_eq!(decoded.info.rpc, Some(rpc));
@@ -150,23 +149,19 @@ fn test_legacy_record_compat_decode_and_verify() {
 fn test_cross_role_replay_rejected() {
     use tn_types::encode;
 
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
 
     let chain = 2017;
     let worker_domain = RecordDomain::new(chain, NetworkType::Worker(0));
     let primary_domain = RecordDomain::new(chain, NetworkType::Primary);
 
     // sign for the worker(0) network
-    let record = NodeRecord::build(
-        worker_domain,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        None,
-        |data| key_config.request_signature_direct(data),
-    );
+    let record = NodeRecord::build(worker_domain, network_key.clone(), multiaddr, None, |data| {
+        bls_keypair.sign(data)
+    });
 
     // in-memory path: verifies under the SAME worker domain, rejected under primary
     assert!(record.clone().verify(worker_domain, &pubkey).is_some());
@@ -181,17 +176,14 @@ fn test_cross_role_replay_rejected() {
 /// Sibling workers must reject each other's records even with the same chain and BLS key.
 #[test]
 fn test_cross_worker_replay_rejected() {
-    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
-    let pubkey = key_config.primary_public_key();
+    let bls_keypair = BlsKeypair::generate(&mut rand::rng());
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
+    let pubkey = *bls_keypair.public();
     let worker_0 = RecordDomain::new(2017, NetworkType::Worker(0));
     let worker_1 = RecordDomain::new(2017, NetworkType::Worker(1));
-    let record = NodeRecord::build(
-        worker_0,
-        key_config.primary_network_public_key(),
-        create_multiaddr(None),
-        None,
-        |data| key_config.request_signature_direct(data),
-    );
+    let record = NodeRecord::build(worker_0, network_key.clone(), multiaddr(), None, |data| {
+        bls_keypair.sign(data)
+    });
     assert!(record.clone().verify(worker_0, &pubkey).is_some());
     assert!(record.clone().verify(worker_1, &pubkey).is_none());
     let bytes = tn_types::encode(&record);
@@ -206,10 +198,10 @@ fn test_cross_worker_replay_rejected() {
 fn test_cross_chain_replay_rejected() {
     use tn_types::encode;
 
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
 
     // two distinct chain ids
     let chain_a = 2017;
@@ -218,13 +210,9 @@ fn test_cross_chain_replay_rejected() {
     let domain_b = RecordDomain::new(chain_b, NetworkType::Primary);
 
     // sign for chain_a
-    let record = NodeRecord::build(
-        domain_a,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        None,
-        |data| key_config.request_signature_direct(data),
-    );
+    let record = NodeRecord::build(domain_a, network_key.clone(), multiaddr, None, |data| {
+        bls_keypair.sign(data)
+    });
 
     // verifies under chain_a, rejected under chain_b
     assert!(record.clone().verify(domain_a, &pubkey).is_some());
@@ -242,19 +230,15 @@ fn test_cross_chain_replay_rejected() {
 fn test_node_record_without_rpc_roundtrip() {
     use tn_types::{decode, encode};
 
-    let multiaddr = create_multiaddr(None);
+    let multiaddr = multiaddr();
     let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
-    let key_config = KeyConfig::new_with_testing_key(bls_keypair);
+    let network_key: NetworkPublicKey = Keypair::generate_ed25519().public().into();
     let domain = RecordDomain::new(2017, NetworkType::Primary);
 
-    let node_record = NodeRecord::build(
-        domain,
-        key_config.primary_network_public_key(),
-        multiaddr,
-        None,
-        |data| key_config.request_signature_direct(data),
-    );
+    let node_record = NodeRecord::build(domain, network_key.clone(), multiaddr, None, |data| {
+        bls_keypair.sign(data)
+    });
     let bytes = encode(&node_record);
     let decoded: NodeRecord = decode(&bytes);
     assert!(decoded.info.rpc.is_none());

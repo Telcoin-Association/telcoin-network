@@ -12,12 +12,14 @@ mod types;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
-// the per-peer address cap also bounds the addresses a signed record may advertise
-pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
 
 // visibility for tests
 #[cfg(test)]
 pub(crate) use score::GLOBAL_SCORE_CONFIG;
+
+/// Per-peer storage cap used by the cap-consistency regression tests.
+#[cfg(test)]
+pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
 
 /// Shared production thresholds used by the consensus call-site regression tests.
 #[cfg(test)]

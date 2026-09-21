@@ -1,0 +1,39 @@
+[package]
+name = "tn-node-record-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "HTTP directory of verified Telcoin DHT node records"
+
+[[bin]]
+name = "node-record-api"
+path = "src/main.rs"
+
+[dependencies]
+tn-kad-client = { workspace = true }
+tn-node-record = { workspace = true }
+tn-types = { workspace = true }
+libp2p = { workspace = true }
+axum = { workspace = true, features = ["json", "tokio", "http1"] }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "net", "time", "sync", "signal", "macros"] }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
