@@ -50,7 +50,23 @@ use crate::{
 };
 
 /// Current version for new pack files.
-pub const PACK_VERSION: u16 = 1;
+///
+/// v2 is byte-identical to v1 on disk (header-first record layout); the sole difference is that a
+/// v2 file carries the 8-byte clean-close sentinel the data-file layer appends on a clean shutdown,
+/// whereas v0 and v1 predate the sentinel and never have one. Writing new packs as v2 is what lets
+/// a missing sentinel be read as a genuine "not cleanly closed" signal: a pre-sentinel pack (v0/v1)
+/// is recognized by its version and trusted via the length / WAL cross-checks instead (see
+/// [`SENTINEL_MIN_VERSION`] and `Inner::files_consistent`).
+pub const PACK_VERSION: u16 = 2;
+
+/// First pack version whose files carry the clean-close sentinel.
+///
+/// A file whose on-disk version is below this predates the sentinel (the buffered backend never
+/// wrote one), so the *absence* of a sentinel is normal and must not be read as an unclean
+/// shutdown; such packs are validated by the cross-file length checks and, on the writable door, by
+/// WAL replay — exactly how pre-mmap `main` treated them. Kept distinct from [`PACK_VERSION`] so a
+/// later version bump cannot silently drop the sentinel gate for v2.
+const SENTINEL_MIN_VERSION: u16 = 2;
 
 /// Metadata for an Epoch.  Should always be the first record in a consensus pack.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
@@ -852,6 +868,15 @@ impl Inner {
     /// cases the length checks alone miss — e.g. a crash that left a file exactly at capacity,
     /// where physical == logical == the index markers yet the tail record may be torn.
     ///
+    /// The sentinel is a v2-format feature. Pre-sentinel packs (v0/v1, below
+    /// [`SENTINEL_MIN_VERSION`]) never carried one — the buffered backend wrote physical == logical
+    /// with no trailing sentinel — so for them a missing sentinel is expected and must not force
+    /// recovery. The gate below is therefore applied only to v2+ files; a legacy pack falls through
+    /// to the length cross-checks alone, which is exactly the length-only test pre-mmap `main`
+    /// used, so an existing datadir opens as it did before the sentinel existed. Real damage in
+    /// a legacy pack still trips the length checks here (and, on the writable door, WAL
+    /// replay).
+    ///
     /// The length comparisons below remain as a secondary cross-file integrity check: even a sealed
     /// pack is only consistent if the data length agrees with what both digest indexes and the
     /// position index attest.
@@ -861,11 +886,14 @@ impl Inner {
         consensus_digests: &HdxIndex,
         batch_digests: &HdxIndex,
     ) -> bool {
-        // Primary gate: any file that was not cleanly sealed forces recovery.
-        if data.opened_unclean()
-            || consensus_pos_idx.opened_unclean()
-            || consensus_digests.opened_unclean()
-            || batch_digests.opened_unclean()
+        // Primary gate: any *sentinel-era* (v2+) file that was not cleanly sealed forces recovery.
+        // Pre-sentinel packs (v0/v1) never wrote a sentinel, so a missing one is not an unclean
+        // signal for them — they rely on the length cross-checks below instead.
+        if data.version() >= SENTINEL_MIN_VERSION
+            && (data.opened_unclean()
+                || consensus_pos_idx.opened_unclean()
+                || consensus_digests.opened_unclean()
+                || batch_digests.opened_unclean())
         {
             return false;
         }
@@ -899,9 +927,11 @@ impl Inner {
     /// (incomplete) output. Damage anywhere but the final record cannot be a clean tail and is
     /// reported as [`PackError::CorruptPack`].
     ///
-    /// v1 (header-first) format only: `open_static` rejects an inconsistent read-only pack rather
-    /// than healing, so recovery only runs on the writable append opens, which are always current
-    /// format.
+    /// Header-first (v1/v2) format only. `open_static` rejects an inconsistent read-only pack
+    /// rather than healing, so recovery only runs on the writable append opens. Those may open
+    /// a legacy v1 pack (the in-flight epoch at upgrade) as well as current v2 packs; both
+    /// replay identically. An inconsistent v0 (batches-first) pack cannot be replayed and is
+    /// rejected up front with a re-sync message — see the guard below.
     fn recover_pack<P: AsRef<Path>>(
         data: &mut Pack<PackRecord>,
         base_dir: P,
@@ -914,6 +944,22 @@ impl Inner {
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
         let base_dir = base_dir.as_ref();
+        // `replay_wal` below understands only the v1/v2 header-first layout. A *consistent* v0 pack
+        // never reaches here — the length cross-checks in `files_consistent` pass for it without a
+        // sentinel — so the only way to arrive holding a v0 pack is an inconsistent one: a v0 log
+        // the mmap backend appended to and then crashed, leaving padding or a torn tail. Replaying
+        // its batches-first records as v1 would misread them as mid-log corruption, so surface an
+        // honest error instead. Unreachable in practice: the current (appendable) epoch after an
+        // upgrade is v1, and every v0 pack on disk is a sealed static epoch opened read-only via
+        // `open_static` (which never calls this).
+        if data.version() == 0 {
+            return Err(PackError::CorruptPack(format!(
+                "epoch pack {} is a pre-mmap v0 (batches-first) log left inconsistent after an \
+                 unclean shutdown; it cannot be rebuilt by replay and must be re-synced from peers. \
+                 Do NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+                base_dir.display(),
+            )));
+        }
         // Recovery replays the whole data-file WAL, so it can take time proportional to pack size.
         // Log the start (and the completion below) so a slow recovery is observable rather than a
         // silent stall at startup.
@@ -1613,12 +1659,23 @@ impl Inner {
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
+        // Materialize the imported epoch in the SOURCE stream's format, not the local current
+        // format. The bytes written must stay byte-identical to what the peer sent so a peer still
+        // on a pre-sentinel build can read this epoch back verbatim when we later serve it (the
+        // golden-legacy byte-identity tests pin exactly this). A brand-new local epoch created via
+        // `open_append` is stamped the current `PACK_VERSION`; a replicated epoch keeps its origin
+        // version. Reject a source newer than this build understands rather than mis-parsing it
+        // with current-format logic.
+        let import_version = stream_iter.version();
+        if import_version > PACK_VERSION {
+            return Err(PackError::InvalidVersion(PACK_VERSION, import_version));
+        }
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
             false,
             PackCompression::ZStd,
-            PACK_VERSION,
+            import_version,
         )?;
         let epoch_meta = if let Some(meta) = next_output_record(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
@@ -2296,7 +2353,9 @@ pub(crate) async fn decode_output_bytes(
     let reader = BufReader::new(cursor);
     match version {
         0 => bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee).await,
-        1 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
+        // v2 shares v1's header-first on-disk layout (it differs only in the data-file sentinel),
+        // so both decode identically here.
+        1 | 2 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
         _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
@@ -2344,7 +2403,8 @@ pub(crate) async fn serve_output_bytes(
             }
             Ok(bytes)
         }
-        1 => Ok(bytes),
+        // v2 is header-first like v1, so the raw bytes are already in serve format.
+        1 | 2 => Ok(bytes),
         _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
@@ -4225,9 +4285,27 @@ pub(crate) mod test {
         previous_epoch: &EpochRecord,
         n: u64,
     ) {
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open pack");
+        build_test_pack_version(temp_dir, committee, chain, previous_epoch, n, PACK_VERSION).await;
+    }
+
+    /// Build `n` sequential outputs into a fresh pack stamped with an explicit data-file `version`
+    /// and persist the data log. v0/v1 exercise the pre-sentinel legacy formats a pre-mmap build
+    /// wrote; the current `PACK_VERSION` (v2) is the sentinel-era format.
+    async fn build_test_pack_version(
+        temp_dir: &TempDir,
+        committee: &Committee,
+        chain: &Arc<RethChainSpec>,
+        previous_epoch: &EpochRecord,
+        n: u64,
+        version: u16,
+    ) {
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch.clone(),
+            committee.clone(),
+            version,
+        )
+        .expect("open pack");
         let mut parent = ConsensusHeader::default().digest();
         for i in 0..n {
             let output =
@@ -4238,10 +4316,11 @@ pub(crate) mod test {
         pack.persist().await.expect("persist");
     }
 
-    /// The clean-close sentinel is the *definitive* consistency gate: a pack whose lengths all
-    /// still agree (physical == logical == index markers) but which lost its data-file sentinel
-    /// is treated as inconsistent. `open_static` refuses it (CorruptPack); `open_append_exists`
-    /// recovers it.
+    /// For a current-version (v2) pack the clean-close sentinel is the *definitive* consistency
+    /// gate: a pack whose lengths all still agree (physical == logical == index markers) but which
+    /// lost its data-file sentinel is treated as inconsistent. `open_static` refuses it
+    /// (CorruptPack); `open_append_exists` recovers it. (A pre-sentinel v0/v1 pack has no sentinel
+    /// to lose — see `test_open_static_accepts_sentinelless_legacy_pack`.)
     #[tokio::test]
     async fn test_missing_sentinel_forces_recovery_even_when_lengths_agree() {
         let temp_dir = TempDir::with_prefix("test_missing_sentinel").expect("temp dir");
@@ -4275,6 +4354,108 @@ pub(crate) mod test {
                 pack.get_consensus_output(i).await.is_ok(),
                 "output {i} must read back after recovery"
             );
+        }
+    }
+
+    /// Migration (finding #3): a pack written before the clean-close sentinel existed (v0/v1) has
+    /// no sentinel on disk, so the pre-sentinel version must be recognized and the missing
+    /// sentinel treated as normal rather than as an unclean shutdown. `open_static` — the
+    /// read-only door that serves sealed epochs to syncing peers and backs restart-time state
+    /// restore — must open such a pack instead of returning `CorruptPack`, and must not rewrite
+    /// the file. The cross-file length checks still carry the integrity guarantee (exactly the
+    /// length-only test pre-mmap `main` used).
+    #[tokio::test]
+    async fn test_open_static_accepts_sentinelless_legacy_pack() {
+        for version in [0_u16, 1] {
+            let temp_dir = TempDir::with_prefix("test_legacy_static").expect("temp dir");
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let committee = fixture.committee();
+            let previous_epoch = test_previous_epoch(&committee);
+            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
+                .await;
+
+            // Synthesize the pre-PR on-disk shape: strip the 8-byte clean-close sentinel the
+            // current build appends on close, leaving a bare v{0,1} data file just as
+            // the buffered backend wrote it (physical == logical, no sentinel).
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            let len_before = {
+                let f = OpenOptions::new().write(true).open(&data_path).expect("open data");
+                let len = f.metadata().expect("meta").len();
+                let stripped = len - crate::archive::data_file::SENTINEL_LEN;
+                f.set_len(stripped).expect("strip sentinel");
+                stripped
+            };
+
+            // The read-only door must accept it. Before the version gate this returned CorruptPack
+            // for every pre-upgrade epoch, halting peer sync and restart-time state restore.
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).unwrap_or_else(|e| {
+                panic!("open_static must accept a sentinel-less v{version} pack, got {e:?}")
+            });
+            for i in 1..=3 {
+                assert!(
+                    pack.get_consensus_output(i).await.is_ok(),
+                    "v{version} output {i} must read back through the read-only door"
+                );
+            }
+
+            // A read-only open must not have re-sealed or otherwise rewritten the data file.
+            let len_after = std::fs::metadata(&data_path).expect("meta").len();
+            assert_eq!(len_after, len_before, "open_static must not mutate a v{version} pack");
+        }
+    }
+
+    /// New packs are written at the current `PACK_VERSION`, the sentinel-era format: a freshly
+    /// built, cleanly-closed pack reports a version at or above [`SENTINEL_MIN_VERSION`] and opens
+    /// through the read-only door — which for a sentinel-era pack only succeeds when the
+    /// clean-close sentinel is present, so this also proves the pack was sealed.
+    #[tokio::test]
+    async fn test_fresh_pack_is_sentinel_version_and_sealed() {
+        let temp_dir = TempDir::with_prefix("test_fresh_sentinel").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("a cleanly-closed current-version pack opens read-only");
+        assert_eq!(pack.version, PACK_VERSION, "a fresh pack must be written at PACK_VERSION");
+        assert!(
+            pack.version >= super::SENTINEL_MIN_VERSION,
+            "PACK_VERSION must be a sentinel-era version so new packs get crash detection"
+        );
+    }
+
+    /// The v0 (batches-first) legacy format cannot be rebuilt by the header-first WAL replay, so an
+    /// *inconsistent* v0 pack opened for append is rejected with an honest re-sync message rather
+    /// than mis-replayed as v1 corruption. (A *consistent* v0 pack opens fine — it never reaches
+    /// replay; see `test_open_static_accepts_sentinelless_legacy_pack`.)
+    #[tokio::test]
+    async fn test_recover_rejects_inconsistent_v0_pack() {
+        let temp_dir = TempDir::with_prefix("test_v0_recover").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
+
+        // Force inconsistency the writable door cannot short-circuit past: drop the sidecar indexes
+        // so `files_consistent` fails and `recover_pack` is entered. For v1/v2 that replays the
+        // WAL; for v0 the guard must fire first.
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        for name in ["idx", "hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
+        }
+
+        match ConsensusPack::open_append_exists(temp_dir.path(), 0) {
+            Err(super::PackError::CorruptPack(msg)) => assert!(
+                msg.contains("v0"),
+                "an inconsistent v0 pack must be rejected with the honest v0 re-sync message, got: {msg}"
+            ),
+            other => panic!(
+                "open_append_exists on an inconsistent v0 pack must return CorruptPack, got {other:?}"
+            ),
         }
     }
 
@@ -6688,19 +6869,23 @@ pub(crate) mod test {
         outputs
     }
 
-    /// Write the fixture pack through the normal write path (`open_append` +
-    /// `save_consensus_output`) into `dir` and return the resulting `data` file bytes.
+    /// Write the fixture pack through the normal write path (`save_consensus_output`) into `dir`,
+    /// pinned to the pre-fork data-file version, and return the resulting `data` file bytes.
     ///
     /// On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated encoder emits the legacy committee
     /// layout, which `tn_types`' differentials prove is byte-identical to the pre-#554 derive. A
     /// pack this writes at that epoch therefore IS a pre-fork pack, byte for byte — which is what
-    /// makes freezing its output a fixture of history rather than of this build.
+    /// makes freezing its output a fixture of history rather than of this build. The version is
+    /// pinned to v1 explicitly: `open_append` now stamps the current `PACK_VERSION` (v2, which adds
+    /// the clean-close sentinel) into fresh files, so regenerating through the version-pinning door
+    /// keeps the fixture a faithful pre-sentinel artifact.
     #[cfg(feature = "adiri")]
     async fn write_legacy_pack(dir: &std::path::Path) -> Vec<u8> {
         let committee = legacy_pack_committee();
         let previous_epoch = legacy_pack_previous_epoch(&committee);
-        let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
-            .expect("open fixture pack for append");
+        let pack =
+            ConsensusPack::open_append_version(dir, previous_epoch.clone(), committee.clone(), 1)
+                .expect("open fixture pack for append");
         for output in legacy_pack_outputs(&committee, &previous_epoch) {
             pack.save_consensus_output(output).await.expect("save fixture output");
         }
@@ -6876,7 +7061,10 @@ pub(crate) mod test {
         {
             let pack = ConsensusPack::open_append_exists(bare.path(), LEGACY_PACK_EPOCH)
                 .expect("warm restart against a bare frozen pre-fork data file");
-            assert_eq!(pack.version, PACK_VERSION, "frozen pack version moved");
+            // The frozen fixture is a v1 (pre-sentinel) pack and must stay one. `PACK_VERSION` has
+            // since advanced to v2 for newly written packs, so pin the literal pre-fork version
+            // here rather than comparing against the moving current version.
+            assert_eq!(pack.version, 1, "frozen pack version moved");
             assert!(!pack.is_static(), "a warm-restart handle is writable");
             assert_legacy_pack_committee(&pack);
             pack.persist().await.expect("persist");
