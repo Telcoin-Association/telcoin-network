@@ -1044,8 +1044,9 @@ mod tests {
     /// code (exactly `MIN_PROTOCOL_BASE_FEE` for the untouched genesis config); `MAX_STRATEGY()`
     /// flips from the old build's hard-coded `1` to `0` (the appended, unset slot — the
     /// documented post-swap governance-runbook state); and the fork block's `state_root` is
-    /// identical across two independent executions (determinism — every node re-derives the
-    /// same root).
+    /// identical across independently constructed fixtures and executions, matching a committed
+    /// golden root across processes. The block hash also pins fixture inputs that only affect
+    /// the header of this empty block, such as the beneficiary and mix hash.
     ///
     /// NOTE: the fixture is the LIVE pre-fork deployment, pinned by
     /// `tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` and its tn-types pin test. If
@@ -1056,18 +1057,32 @@ mod tests {
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_consensus_registry_fork_swaps_code_and_migrates() -> eyre::Result<()> {
-        // pre-fork fixture: old registry code + validator storage, no per-status sets
-        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
-        let genesis_header = chain.sealed_genesis_header();
-
         // fork fires when the concluding epoch + 1 == FORK_EPOCH
-        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH.saturating_sub(1);
 
-        // one payload, cloned across both executions, so the determinism check compares
-        // byte-identical inputs (`new_for_test` otherwise randomizes
-        // beneficiary/mix_hash/digest per call)
-        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
-        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+        // Pre-fork fixture: old registry code and storage, with every variable input pinned.
+        // Reconstruct it for each execution so fixture nondeterminism is also observable.
+        let fixture = || {
+            let chain: Arc<RethChainSpec> =
+                Arc::new(tn_types::test_genesis_at(1_700_000_000).into());
+            let output = crate::test_utils::consensus_output_for_tests_at(
+                2,
+                concluding_epoch,
+                1,
+                true,
+                1_700_000_001,
+            );
+            let payload = TNPayload::new_for_test_with(
+                chain.sealed_genesis_header(),
+                &output,
+                Address::repeat_byte(0x11),
+                B256::repeat_byte(0x22),
+                B256::repeat_byte(0x33),
+            );
+            (chain, payload)
+        };
+        let (chain, payload) = fixture();
+        let genesis_header = chain.sealed_genesis_header();
 
         // --- env 1: pre-fork state must NOT answer the new-ABI eligible-count call (old code) ---
         let tmp1 = TempDir::new().unwrap();
@@ -1106,6 +1121,23 @@ mod tests {
         let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
         let header = block.recovered_block.clone_sealed_header();
         let produced_state_root = header.state_root;
+
+        // These commitments cover the pre-fork genesis, fork writes, and explicit fixture inputs.
+        // Update them only after reviewing an intentional change to those inputs or writes.
+        assert_eq!(
+            produced_state_root,
+            alloy::primitives::b256!(
+                "6ebe20f1d09d70ec5abbbdefa738ca96f4af88f96569a8f68a102de77d539c0d"
+            ),
+            "fork block state_root must match its golden commitment"
+        );
+        assert_eq!(
+            header.hash(),
+            alloy::primitives::b256!(
+                "d7d460937455334b589c6978d6bf1589d7789ceedf6f4f6e026548541ab2f97d"
+            ),
+            "fork block hash must match its golden commitment"
+        );
 
         // --- post-fork: new code is live and the sets are migrated ---
         {
@@ -1215,12 +1247,19 @@ mod tests {
         // --- determinism: an independent execution of the identical block yields the same root ---
         let tmp2 = TempDir::new().unwrap();
         let tm2 = TaskManager::new("fork test env2");
-        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
-        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        let (chain2, payload2) = fixture();
+        let env2 = RethEnv::new_for_temp_chain(chain2, tmp2.path(), &tm2, None)?;
+        assert_eq!(payload2.parent_header, payload.parent_header, "fixture genesis must be stable");
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
         assert_eq!(
             block2.recovered_block.clone_sealed_header().state_root,
             produced_state_root,
             "fork block state_root must be identical across independent executions"
+        );
+        assert_eq!(
+            block2.recovered_block.clone_sealed_header().hash(),
+            header.hash(),
+            "fixture block must be stable"
         );
 
         Ok(())
