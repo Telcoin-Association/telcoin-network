@@ -301,11 +301,14 @@ impl Inner {
 
         if !read_only {
             // Repair: if the pack was extended past what the index tracked (e.g. crash mid-write),
-            // truncate back to the last known-good boundary.
+            // roll the logical end back to the last known-good boundary. `rewind_to` (not
+            // `truncate`) keeps the mmap capacity and opens no read-only-mmap SIGBUS window,
+            // matching the consensus pack's save rollback; the save loop appends into
+            // the retained capacity.
             let pack_len = data.file_len();
             let idx_len = digest_idx.data_file_length();
             if pack_len > idx_len && idx_len >= DATA_HEADER_BYTES as u64 {
-                data.truncate(idx_len)?;
+                data.rewind_to(idx_len);
             }
             // On a brand-new file the index's tracked length starts at DATA_HEADER_BYTES (the
             // pack header size). Sync it if it hasn't been set yet.

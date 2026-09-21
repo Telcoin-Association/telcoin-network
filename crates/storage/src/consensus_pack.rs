@@ -978,8 +978,10 @@ impl Inner {
         )?;
 
         // Drop any incomplete/torn tail so the log ends exactly at the last complete output.
+        // `rewind_to` (not `truncate`) keeps the mmap capacity and opens no read-only-mmap SIGBUS
+        // window -- the same primitive `rollback_output` uses to undo a partial append below.
         if consistent_end < data.file_len() {
-            data.truncate(consistent_end)?;
+            data.rewind_to(consistent_end);
         }
         // Reconcile the digest indexes' tracked data length with the (possibly truncated) log so
         // `files_consistent` holds on the next open even if no save follows this recovery.
@@ -1400,7 +1402,7 @@ impl Inner {
             // always has a durable meta, which is what lets the torn-meta path above
             // fail instead of repair.
             if pack_len > DATA_HEADER_BYTES as u64 {
-                data.truncate(DATA_HEADER_BYTES as u64)?;
+                data.rewind_to(DATA_HEADER_BYTES as u64);
             }
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
@@ -5969,6 +5971,65 @@ pub(crate) mod test {
             .await
             .expect("recovered output reads back through the static path");
         assert_eq!(output.number(), 1, "static read must return the recovered output");
+    }
+
+    /// The header-only recovery must also handle a *padded* header-only file: a crash right after
+    /// pack creation can leave the data file grown to its mmap capacity (zero-padded past the
+    /// 28-byte header) with no clean-close sentinel -- unlike the exactly-header-sized file the
+    /// sibling test uses. `open_append` must roll the logical end back to the header (via
+    /// `rewind_to`) and append the meta, rather than mistake the padding for a torn record. This is
+    /// the only test that reaches the `pack_len > DATA_HEADER_BYTES` trim in the header-only
+    /// branch.
+    #[tokio::test]
+    async fn test_open_append_recovers_padded_header_only_file() {
+        let temp_dir = TempDir::with_prefix("test_cp_padded_header_only").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Write the data header, then LEAK the pack (skip the clean-close Drop) so the file keeps
+        // its mmap capacity padding and gets no sentinel -- the on-disk shape of a crash between
+        // the header write and the first (meta) append.
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&base_dir).expect("create epoch dir");
+        let data_path = base_dir.join(Inner::DATA_NAME);
+        {
+            let mut raw: Pack<PackRecord> =
+                Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("raw pack");
+            raw.commit().expect("commit header");
+            std::mem::forget(raw); // no clean close: no truncate, no sentinel
+        }
+        let padded_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            padded_len > DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN,
+            "setup must leave a padded, unsentineled header-only file (got {padded_len} bytes)"
+        );
+
+        // open_append must reach the header-only branch, roll the padding back, and append the
+        // meta.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("padded header-only file must recover");
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist");
+        }
+
+        // Reopen read-only: the meta + output are durable and consistent.
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after recovery");
+        assert_eq!(
+            pack.get_consensus_output(1).await.expect("recovered output").number(),
+            1,
+            "static read must return the recovered output",
+        );
     }
 
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
