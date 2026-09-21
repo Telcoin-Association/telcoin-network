@@ -28,6 +28,7 @@ use crate::{
     EngineToPrimaryRpc,
 };
 use eyre::{eyre, OptionExt, WrapErr as _};
+use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
@@ -51,7 +52,7 @@ use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader, TaskManager, TaskSpawner,
+    EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader, TaskManager, TaskSpawner, WorkerId,
     DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
@@ -183,14 +184,14 @@ where
         ))
     }
 
-    /// Build the epoch's [`PrimaryNode`] and [`WorkerNode`] and their per-epoch networks.
+    /// Build the epoch's [`PrimaryNode`], all its [`WorkerNode`] instances, and their networks.
     ///
     /// These components are short-lived: they exist only for the current epoch and are torn
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
     /// committee keys — resolved by `run_epoch`'s batched read pinned to `epoch_start_header` —
     /// are threaded in so peers from the outgoing committee are not banned during the handover.
     ///
-    /// After both nodes are up, the next two committees' validator keys are prefetched through
+    /// After all nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
     /// those epochs arrive — a best-effort warm-up whose failure is intentionally ignored.
     #[allow(clippy::too_many_arguments)]
@@ -203,7 +204,7 @@ where
         consensus_config: ConsensusConfig<DB>,
         epoch_start_header: &SealedHeader,
         previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
+    ) -> eyre::Result<(PrimaryNode<DB>, Vec<WorkerNode<DB>>)> {
         // create config for consensus
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
 
@@ -225,7 +226,7 @@ where
             authority_id: public_key.into(),
             execution_address: self.builder.tn_config.node_info.execution_address,
             primary_network_key: self.key_config.primary_network_public_key(),
-            // the node record only advertises worker 0 for now (#557)
+            // The worker-specific fields are filled in when each RPC server starts.
             worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
             primary_external_address: self
                 .builder
@@ -244,8 +245,7 @@ where
         };
         let engine_to_primary =
             EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone(), node_info);
-        // only spawns one worker for now
-        let worker = self
+        let workers = self
             .spawn_worker_node_components(
                 &consensus_config,
                 engine,
@@ -282,11 +282,20 @@ where
             .inner_handle()
             .find_authorities(prefetches.iter().copied().collect())
             .await;
-        let worker_handle = worker.network_handle().await;
-        // Attempt to pre-load the next couple of committee's network info.
-        let _ =
-            worker_handle.inner_handle().find_authorities(prefetches.into_iter().collect()).await;
-        Ok((primary, worker))
+        // Every swarm resolves future committees using its own worker lane.
+        futures::stream::iter(&workers)
+            .for_each(|worker| {
+                let prefetches = &prefetches;
+                async move {
+                    let worker_handle = worker.network_handle().await;
+                    let _ = worker_handle
+                        .inner_handle()
+                        .find_authorities(prefetches.iter().copied().collect())
+                        .await;
+                }
+            })
+            .await;
+        Ok((primary, workers))
     }
 
     /// Assemble the per-epoch [`ConsensusConfig`] from state pinned to the previous epoch's
@@ -421,16 +430,11 @@ where
         PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync)
     }
 
-    /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].
+    /// Construct every worker in the committee's on-chain worker range, in id order.
     ///
-    /// Only worker id [`tn_types::DEFAULT_WORKER_ID`] is driven for now (#557 adds the loop).
-    /// That worker's [`WorkerNetworkHandle`] on the [`EpochManager`] is re-pointed at this
-    /// epoch's task spawner and epoch number before anything else, so batch reporting runs
-    /// under the epoch-scoped lifetime.
-    ///
-    /// The engine's worker components are initialized whenever the engine reports no workers yet,
-    /// including after replay closes an epoch before reaching [`create_consensus`]. Otherwise the
-    /// worker network tasks are respawned so they pick up the new epoch task spawner.
+    /// Refresh each active handle before creating its pool, RPC server, validator and network.
+    /// Sequential initialization preserves the engine's contiguous worker indexing. Extra
+    /// configured swarms stay idle until a future epoch activates their ids.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
@@ -440,9 +444,58 @@ where
         engine_to_primary: EngineToPrimaryRpc,
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
+    ) -> eyre::Result<Vec<WorkerNode<DB>>> {
+        self.worker_network_handles
+            .iter_mut()
+            .take(consensus_config.committee().number_of_workers())
+            .for_each(|handle| {
+                handle.update_task_spawner(epoch_task_spawner.clone());
+                handle.update_epoch(consensus_config.committee().epoch());
+            });
+
+        // Follow mode changes while workers initialize and wait for network peers.
+        let engine_for_sync_status = engine.clone();
+        let mut rx_node_mode = self.consensus_bus.node_mode().subscribe();
+        epoch_task_spawner.spawn_task("Worker RPC Sync Status", async move {
+            loop {
+                let syncing = node_mode_is_syncing(*rx_node_mode.borrow_and_update());
+                engine_for_sync_status.set_workers_syncing(syncing).await;
+                if rx_node_mode.changed().await.is_err() {
+                    break Ok(());
+                }
+            }
+        });
+
+        let workers = futures::stream::iter(consensus_config.committee().worker_ids())
+            .then(|worker_id| {
+                self.spawn_worker_node(
+                    worker_id,
+                    consensus_config,
+                    engine,
+                    engine_to_primary.clone(),
+                    &gas_accumulator,
+                    previous_committee_keys.clone(),
+                )
+            })
+            .try_collect()
+            .await?;
+
+        Ok(workers)
+    }
+
+    /// Initialize one worker's persistent components and attach its epoch-scoped tasks.
+    ///
+    /// Test initialization per id so activating a new worker after startup creates its pool
+    /// and RPC server without reopening the existing workers' listeners.
+    async fn spawn_worker_node(
+        &self,
+        worker_id: WorkerId,
+        consensus_config: &ConsensusConfig<DB>,
+        engine: &ExecutionNode,
+        mut engine_to_primary: EngineToPrimaryRpc,
+        gas_accumulator: &GasAccumulator,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<WorkerNode<DB>> {
-        // only support one worker for now (with id 0) - otherwise, loop here
-        let worker_id = DEFAULT_WORKER_ID;
         // The worker's shared base-fee container and a u64 snapshot of its current value. The
         // pool receives the live container so its pending fee tracks the accumulator across
         // epoch boundaries (issue #1262). The snapshot serves the batch validator and the
@@ -454,21 +507,27 @@ where
         // the quote survives worker-count changes (#1282).
         let worker_base_fee = gas_accumulator.worker_base_fee(worker_id);
 
-        // update the network handle's task spawner for reporting batches in the epoch
         {
             let network_handle = self
                 .worker_network_handles
-                .get_mut(usize::from(worker_id))
+                .get(usize::from(worker_id))
                 .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?;
 
-            network_handle.update_task_spawner(epoch_task_spawner.clone());
-            network_handle.update_epoch(consensus_config.committee().epoch());
             // initialize worker components on startup
             // This will use the new epoch_task_spawner and epoch on network_handle.
             // Also initialize if workers are empty: this happens when the first epoch returns
             // early from replay_missed_consensus (epoch boundary hit) before create_consensus
             // is reached, leaving workers uninitialized.
-            if !engine.are_workers_initialized().await {
+            if !engine.is_worker_initialized(worker_id).await {
+                engine_to_primary.node_info.worker_network_key =
+                    self.key_config.worker_network_public_key(worker_id);
+                engine_to_primary.node_info.worker_external_address = self
+                    .builder
+                    .tn_config
+                    .node_info
+                    .worker_network_address(worker_id)
+                    .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
+                    .clone();
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -481,7 +540,7 @@ where
             } else {
                 // We updated our epoch task spawner so make sure worker network tasks are
                 // restarted.
-                engine.respawn_worker_network_tasks(network_handle.clone()).await;
+                engine.respawn_worker_network_tasks(worker_id, network_handle.clone()).await?;
             }
         }
 
@@ -490,29 +549,17 @@ where
         // covers the respawn path, where initialization is skipped.
         engine.set_worker_base_fee(worker_id, base_fee).await?;
 
-        // Mirror the node's consensus catch-up state into every worker's RPC network shim
-        // so the stock `eth_syncing` handler stops reporting a catching-up node as fully
-        // synced (issue #1231). Epoch-scoped like the shim's peer-count task: it dies with
-        // this epoch's task manager and is respawned here on rollover, re-reading the mode
-        // `identify_node_mode` published for the epoch.
-        let engine_for_sync_status = engine.clone();
-        let mut rx_node_mode = self.consensus_bus.node_mode().subscribe();
-        epoch_task_spawner.spawn_task("Worker RPC Sync Status", async move {
-            loop {
-                let syncing = node_mode_is_syncing(*rx_node_mode.borrow_and_update());
-                engine_for_sync_status.set_workers_syncing(syncing).await;
-                if rx_node_mode.changed().await.is_err() {
-                    // The watch sender dropped: consensus is shutting down, end cleanly.
-                    break Ok(());
-                }
-            }
-        });
+        // A newly created RPC shim may not have existed when the mode watcher last ran.
+        engine
+            .set_workers_syncing(node_mode_is_syncing(self.consensus_bus.current_node_mode()))
+            .await;
 
         let network_handle = self
             .worker_network_handles
             .get(usize::from(worker_id))
             .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?
             .clone();
+        let epoch_task_spawner = network_handle.get_task_spawner().clone();
 
         let validator = engine
             .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
@@ -759,7 +806,7 @@ where
     /// (issue #804).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
-        &mut self,
+        &self,
         consensus_config: &ConsensusConfig<DB>,
         worker_id: &u16,
         validator: Arc<dyn BatchValidation>,
@@ -1045,53 +1092,15 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
 
 /// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
 ///
-/// Governance may change the chain count while the process retains its original swarms. A mismatch
-/// only warns while this version starts epoch components for worker zero alone. Once #557 starts
-/// components for every worker, a local shortfall will need recovery before participation.
-/// Above one, the answer depends on the
-/// multi-workers fork ([`tn_types::forks::multi_workers_fork_active`]), evaluated at the epoch
-/// being entered, the
-/// same epoch carried inside the [`Committee`] this count is about to be stamped onto, so the gate
-/// here and the gate the encoder consults cannot disagree:
-///
-/// - pre-fork the legacy committee layout has no field to carry a worker count, so the encoder
-///   refuses the value. Halting here turns that into a diagnosable epoch-entry failure instead of a
-///   panic from the first pack write, which is the only thing the node could do about it anyway:
-///   the count is chain state and cannot be talked down locally.
-/// - post-fork the count is representable and epoch entry proceeds. It still warns because this
-///   node version starts epoch components only for worker [`DEFAULT_WORKER_ID`]: header payloads
-///   keyed to higher worker ids validate, but nothing local produces them yet.
+/// Governance may activate any prefix of the locally configured swarms. A shortfall fails
+/// before consensus starts, using the same fork and capacity checks as process startup.
+/// Operators can provision surplus swarms before an increase without activating them early.
 fn check_committee_worker_count(
     epoch: Epoch,
     num_workers: NonZeroUsize,
     configured_workers: usize,
 ) -> eyre::Result<()> {
-    super::check_worker_count_fork(epoch, num_workers.get(), configured_workers)?;
-    eyre::ensure!(configured_workers != 0, "epoch entry requires a configured worker zero");
-    if configured_workers != num_workers.get() {
-        warn!(
-            target: "epoch-manager",
-            epoch,
-            configured = configured_workers,
-            on_chain = num_workers.get(),
-            "local worker swarm count disagrees with chain state; continuing with worker 0 epoch \
-             components. Update `node_info.p2p_info.workers` before restarting"
-        );
-    }
-    if num_workers.get() == 1 {
-        return Ok(());
-    }
-
-    warn!(
-        target: "epoch-manager",
-        epoch,
-        num_workers,
-        spawned_worker = DEFAULT_WORKER_ID,
-        "committee runs multiple workers but this node version starts epoch components only for \
-         worker {DEFAULT_WORKER_ID}: \
-         ids >= 1 are accepted by header validation but not produced locally"
-    );
-    Ok(())
+    super::check_configured_worker_count(epoch, num_workers.get(), configured_workers)
 }
 
 #[cfg(test)]
@@ -1100,6 +1109,184 @@ mod tests {
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
     use std::num::NonZeroUsize;
+
+    /// The epoch startup path initializes every worker, then reuses its RPC and pool on re-entry.
+    #[cfg(not(feature = "adiri"))]
+    #[tokio::test]
+    async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use jsonrpsee::core::client::ClientT as _;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_network_libp2p::types::NetworkCommand;
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{BlsKeypair, P2pNode};
+
+        tn_reth::init_reth_defaults();
+        let temp = tempfile::TempDir::new()?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
+        let mut config = Config::default_for_test();
+        config.node_info.p2p_info.workers = (0..2)
+            .map(|worker_id| {
+                Ok(P2pNode {
+                    network_address: format!("/ip4/127.0.0.1/udp/{}/quic-v1", 19000 + worker_id)
+                        .parse()?,
+                    network_key: keys.worker_network_public_key(worker_id),
+                    rpc: None,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre!("two workers"))?;
+        let committee = CommitteeFixture::builder(MemDatabase::default)
+            .build()
+            .committee()
+            .with_num_workers(count);
+        let datadir = temp.path().to_path_buf();
+        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
+        let chain = Arc::new(config.chain_spec());
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            &datadir,
+            true,
+            chain,
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        let network_tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let reth_env =
+            RethEnv::new(&node_config, &network_tasks, reth_db.clone(), None, accumulator.clone())?;
+        let builder = TnBuilder::new(node_config, config.clone(), reth_db);
+        let engine = ExecutionNode::new(&builder, reth_env)?;
+        let db = MemDatabase::default();
+        let consensus_config = ConsensusConfig::new_with_committee_for_test(
+            config,
+            db.clone(),
+            keys.clone(),
+            committee,
+            NetworkConfig::default(),
+        )?;
+        let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
+        // Identify the role before worker startup, as create_consensus does in production.
+        let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
+        let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        assert!(mode.is_observer(), "fixture must start as an observer");
+        manager.worker_network_handles = (0..2)
+            .map(|worker_id| {
+                let (sender, receiver) = mpsc::channel(128);
+                network_tasks.spawn_task("test worker commands", async move {
+                    tokio_stream::wrappers::ReceiverStream::new(receiver)
+                        .for_each(|command| async move {
+                            if let NetworkCommand::EstablishedPeerCount { reply } = command {
+                                let _ = reply.send(1);
+                            } else if let NetworkCommand::Unsubscribe { reply, .. } = command {
+                                let _ = reply.send(false);
+                            } else if let NetworkCommand::ConnectedPeerIds { reply } = command {
+                                let _ = reply.send(Default::default());
+                            }
+                        })
+                        .await;
+                    Ok(())
+                });
+                WorkerNetworkHandle::new(
+                    NetworkHandle::new(sender),
+                    network_tasks.get_spawner(),
+                    worker_id,
+                    0,
+                    consensus_config.chain_id(),
+                )
+            })
+            .collect();
+        let key = manager.key_config.public_key();
+        let rpc = EngineToPrimaryRpc::new(
+            manager.consensus_bus.clone(),
+            manager.consensus_chain.clone(),
+            RpcNodeInfo {
+                chain_id: consensus_config.chain_id(),
+                name: "multi-worker test".to_owned(),
+                bls_public_key: key,
+                authority_id: key.into(),
+                execution_address: manager.builder.tn_config.node_info.execution_address,
+                primary_network_key: manager.key_config.primary_network_public_key(),
+                worker_network_key: manager.key_config.worker_network_public_key(0),
+                primary_external_address: manager
+                    .builder
+                    .tn_config
+                    .node_info
+                    .primary_network_address()
+                    .clone(),
+                worker_external_address: consensus_config
+                    .worker_address(0)
+                    .ok_or_else(|| eyre!("worker zero address"))?,
+                version: "test",
+            },
+        );
+        accumulator.base_fee(0).set_base_fee(100_000_001);
+        accumulator.base_fee(1).set_base_fee(100_000_002);
+        let mut epoch_tasks = TaskManager::default();
+        let workers = manager
+            .spawn_worker_node_components(
+                &consensus_config,
+                &engine,
+                epoch_tasks.get_spawner(),
+                rpc.clone(),
+                accumulator.clone(),
+                HashSet::new(),
+            )
+            .await?;
+        let ids =
+            futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
+        assert_eq!(ids, vec![0, 1]);
+        let rpc_one = engine.worker_http_local_address(&1).await?;
+        assert!(rpc_one.is_some());
+        let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
+        let info: serde_json::Value = client.request("tn_info", jsonrpsee::rpc_params![]).await?;
+        assert_eq!(
+            info.get("worker_network_key"),
+            Some(&serde_json::to_value(manager.key_config.worker_network_public_key(1))?),
+        );
+        assert_eq!(
+            info.get("worker_external_address"),
+            Some(&serde_json::to_value(consensus_config.worker_address(1))?),
+        );
+        assert_eq!(
+            engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
+            100_000_002
+        );
+
+        drop(workers);
+        epoch_tasks.update_tasks();
+        epoch_tasks.abort_all_tasks();
+        epoch_tasks.wait_for_task_shutdown().await;
+        drop(epoch_tasks);
+        let next_tasks = TaskManager::default();
+        accumulator.base_fee(1).set_base_fee(100_000_003);
+        let restarted = manager
+            .spawn_worker_node_components(
+                &consensus_config,
+                &engine,
+                next_tasks.get_spawner(),
+                rpc,
+                accumulator,
+                HashSet::new(),
+            )
+            .await?;
+        assert_eq!(restarted.len(), 2);
+        assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
+        assert_eq!(
+            engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
+            100_000_003
+        );
+        Ok(())
+    }
 
     /// Both the initial readiness probe and its retry must use established connections. A zero
     /// snapshot keeps startup pending until a later probe observes an established peer.
@@ -1196,7 +1383,7 @@ mod tests {
     }
 
     /// Default builds have the multi-worker layout active from genesis, so a count above one is
-    /// representable and entry proceeds (with a warning about worker-0-only epoch components).
+    /// representable and entry proceeds when enough swarms are configured.
     #[cfg(not(feature = "adiri"))]
     #[test]
     fn post_fork_epoch_entry_allows_multiple_workers() -> eyre::Result<()> {
@@ -1210,16 +1397,27 @@ mod tests {
         check_committee_worker_count(u32::MAX, NonZeroUsize::MIN, 3)
     }
 
-    /// Post-fork governance can change the chain count without restarting worker-zero components.
+    /// Post-fork governance can activate any configured prefix without restarting the process.
     #[test]
     fn epoch_entry_allows_changed_worker_count() -> eyre::Result<()> {
         let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
-        [1, 2, 3]
+        [2, 3]
             .into_iter()
             .try_for_each(|configured| check_committee_worker_count(u32::MAX, count, configured))
     }
 
-    /// Warning-only mismatches never permit an empty local worker configuration.
+    /// A chain count above local capacity must fail before starting partial consensus machinery.
+    #[test]
+    fn epoch_entry_rejects_worker_capacity_shortfall() -> eyre::Result<()> {
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        let error = check_committee_worker_count(u32::MAX, count, 1)
+            .err()
+            .ok_or_else(|| eyre::eyre!("two active workers require two configured swarms"))?;
+        assert!(error.to_string().contains("configure at least the worker count"));
+        Ok(())
+    }
+
+    /// Epoch entry never permits an empty local worker configuration.
     #[test]
     fn epoch_entry_rejects_missing_worker_zero() {
         assert!(check_committee_worker_count(0, NonZeroUsize::MIN, 0).is_err());

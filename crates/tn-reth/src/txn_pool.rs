@@ -226,6 +226,18 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
+    /// Set this epoch's fee in both the pool and its canonical-update fee handle.
+    ///
+    /// A worker that is removed and later reactivated gets a new accumulator slot. Its
+    /// persistent pool still holds the old container, so update that container too before
+    /// canonical maintenance can overwrite the pool's pending fee with a stale value.
+    pub fn set_epoch_base_fee(&self, base_fee: u64) {
+        self.2.set_base_fee(base_fee);
+        let mut block_info = self.block_info();
+        block_info.pending_basefee = base_fee;
+        self.set_block_info(block_info);
+    }
+
     /// Create a pool and spawn canonical-state maintenance and queued-transaction expiry.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
