@@ -461,12 +461,11 @@ impl ConsensusPack {
 
         // Force a rebuild when `open_static` opened clean: a length-consistent corrupt digest
         // bucket passes `files_consistent`, so the append open's `recover_pack` would
-        // early-return and leave it untouched. Remove the derived digest indexes so the
-        // open must rebuild them from the data-log WAL. The position index is kept so
-        // `recover_pack`'s `attested_end` (the torn-tail safety watermark) stays correct.
-        // After the `!apply` return above, so a dry run writes nothing. Every other
-        // repairable case has `open_static` already failing, so `recover_pack` runs on its
-        // own and the indexes are left in place.
+        // early-return and leave it untouched. Remove the derived digest indexes so the open must
+        // rebuild them from the data-log WAL (`recover_pack` then wipes and rebuilds every index
+        // anyway). After the `!apply` return above, so a dry run writes nothing. Every other
+        // repairable case has `open_static` already failing, so `recover_pack` runs on its own and
+        // the indexes are left in place.
         if opens_clean {
             let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
             for name in [Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME] {
@@ -924,41 +923,30 @@ impl Inner {
             dir = %base_dir.display(),
             "pack opened unclean or inconsistent; replaying data-file WAL to recover"
         );
-        // Highest record end either index attests as durably indexed: the digest index's
-        // `data_file_length` (the commit marker written last on an index sync) and the position
-        // index's last `output_end`. Indexes sync on a clean close, not on every `persist()`, so
-        // the data WAL can legitimately run *past* this with unacked appends -- a torn record out
-        // there is the normal mmap out-of-order-writeback tail, safe to drop even if later records
-        // still decode. But a tear that leaves the recovered prefix ending *below* an attested
-        // record end means an acked record was lost -- real corruption. Capture both before the
-        // indexes are reset just below. (A fresh/rebuilt index reports `DATA_HEADER_BYTES`, so the
-        // guard degrades to "trust the WAL, truncate at the first tear".)
-        let attested_end = {
-            let digest_end = consensus_digests.data_file_length();
-            let pos_end = if consensus_pos_idx.is_empty() {
-                DATA_HEADER_BYTES as u64
-            } else {
-                consensus_pos_idx
-                    .load(consensus_pos_idx.len() as u64 - 1)
-                    .map(|p| p.output_end)
-                    .unwrap_or(DATA_HEADER_BYTES as u64)
-            };
-            digest_end.max(pos_end)
-        };
-        // Validate before mutating. The mid-log-corruption guard (in `replay_wal`) is gated on
-        // `attested_end`, which is derived from the very indexes this function is about to discard.
-        // So a recovery that detects corruption must NOT have touched those indexes yet: otherwise
-        // the failed attempt persists a *reduced* watermark — a position index truncated to the
-        // pre-corruption prefix plus a fresh digest index whose `data_file_length` was never
-        // re-stamped — and a retry (a plain node restart, or `db repair`) recomputes a lower
-        // `attested_end`, skips the guard, and silently truncates the committed records the guard
-        // exists to protect. Pass 1 replays the log read-only (no index is touched); only once it
-        // proves the log is clean up to a truncatable tail do we discard and rebuild in pass 2.
-        Self::replay_wal(data, base_dir, attested_end, None)?;
+        // Pass 1 -- validate the data-log WAL ALONE (no index is read or written). A detected
+        // corruption returns `CorruptPack` without mutating on-disk state, so a retry re-derives
+        // the same verdict from the unchanged log. `replay_wal` returns the end of the last
+        // complete output and rejects a tear that has a later *complete output* after it:
+        // an output written past the tear can only exist if the earlier one was durably
+        // committed first, so the damage is corruption, not the single unacked in-flight
+        // tail. (Production persists after every output, so at most one output is ever
+        // unacked at the physical tail -- see `persist`.)
+        let consistent_end = Self::replay_wal(data, base_dir, None)?;
+
+        // Close the one gap the probe cannot see from structure alone: at-rest corruption of the
+        // LAST committed output with nothing decodable after it. `persist()` writes a best-effort
+        // tail commit marker recording the durable acked end, index-free; because it is stamped
+        // AFTER the data msync it can never sit ahead of durable data, so a replay that stops below
+        // it means acked data was damaged. A missing/stale marker just falls back to the probe.
+        if let Some(committed_end) = data.committed_end() {
+            if consistent_end < committed_end {
+                return Err(Self::corrupt_pack(base_dir));
+            }
+        }
 
         // Validation passed: the data log is authoritative, so discard the (stale/damaged) indexes
-        // and start fresh. The digest indexes are directories (index.hdx + index.odx), so remove
-        // the whole directory.
+        // and rebuild. The digest indexes are directories (index.hdx + index.odx), so remove the
+        // whole directory.
         consensus_pos_idx.truncate_all()?;
         drop(consensus_digests);
         drop(batch_digests);
@@ -967,13 +955,11 @@ impl Inner {
         let (mut consensus_digests, mut batch_digests) =
             Self::open_digest_indexes(base_dir, data.header(), false)?;
 
-        // Pass 2: replay again, this time writing every recovered position/digest into the fresh
-        // indexes. Validation already ruled out mid-log corruption, so this returns the
-        // authoritative consistent end that the rebuilt indexes reflect.
+        // Pass 2: replay again, writing every recovered position/digest into the fresh indexes.
+        // The data log is unchanged between passes, so this returns the same `consistent_end`.
         let consistent_end = Self::replay_wal(
             data,
             base_dir,
-            attested_end,
             Some((&mut consensus_pos_idx, &mut consensus_digests, &mut batch_digests)),
         )?;
 
@@ -1000,22 +986,27 @@ impl Inner {
     }
 
     /// Replay the data-log WAL once, returning the byte offset just past the last complete output
-    /// (`consistent_end`) and applying the mid-log-corruption guard against `attested_end`.
+    /// (`consistent_end`) and rejecting mid-log corruption from the data alone (no index is read).
+    ///
+    /// A torn/incomplete output ends the consistent prefix. It is truncatable UNLESS a later,
+    /// well-formed OUTPUT (`output_after_tear`) decodes past the tear: production persists after
+    /// every output, so at most one output is ever unacked at the tail, and a *complete* output
+    /// past the tear can only exist if the earlier one was durably committed first -- so its
+    /// damage is at-rest corruption of committed data ([`PackError::CorruptPack`]), not the
+    /// single unacked in-flight tail. (At-rest corruption of the last output with nothing after
+    /// it is covered by the commit marker in [`Self::recover_pack`].)
     ///
     /// When `sink` is `None` the log is only *validated* — no index is touched — so a detected
-    /// corruption returns [`PackError::CorruptPack`] without mutating any on-disk state. That is
-    /// what lets [`Self::recover_pack`] validate before it discards the indexes: the durable
-    /// watermark `attested_end` is derived from cannot regress across a failed recovery, so a retry
-    /// (a node restart or `db repair`) re-detects the same corruption instead of silently
-    /// truncating the committed records past it. When `sink` is `Some`, each recovered output's
-    /// header/batch digests and position are written into the provided indexes (the rebuild pass).
+    /// corruption returns without mutating any on-disk state and a retry re-derives the same
+    /// verdict from the unchanged log. When `sink` is `Some`, each recovered output's
+    /// header/batch digests and position are written into the provided indexes (the rebuild
+    /// pass).
     ///
     /// Uses `logical_position` (advanced only by whole record frames), never the physical
     /// `position`, so the returned offset can never land mid-record even after a torn read.
     fn replay_wal(
         data: &Pack<PackRecord>,
         base_dir: &Path,
-        attested_end: u64,
         mut sink: Option<(&mut PositionIndex<IndexPositions>, &mut HdxIndex, &mut HdxIndex)>,
     ) -> Result<u64, PackError> {
         let mut iter = data.raw_iter().map_err(DataFileOpen)?;
@@ -1069,10 +1060,11 @@ impl Inner {
                     }
                     if torn {
                         // Incomplete output ends the consistent prefix. Dropping it is safe unless
-                        // the tear sits within acked data *and* readable records survive past it
-                        // (mid-log corruption, not the final record). Past the attested watermark
-                        // it is an unacked out-of-order-writeback tail, so skip the scan entirely.
-                        if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                        // a later well-formed OUTPUT decodes past the tear
+                        // -- that output was written after this one was
+                        // durably committed, so the damage is corruption of
+                        // committed data, not the single unacked in-flight tail.
+                        if Self::output_after_tear(&mut iter) {
                             return Err(Self::corrupt_pack(base_dir));
                         }
                         break; // consistent_end still marks the end of the last complete output
@@ -1087,12 +1079,12 @@ impl Inner {
                     consistent_end = output_end;
                 }
                 // A torn record where the next output's header would start. The last complete
-                // output is already finalized; this ends the consistent prefix. It is only fatal
-                // when the tear sits within acked data *and* readable records survive past it
-                // (mid-log corruption); past the attested watermark it is an unacked tail, safe to
-                // drop.
+                // output is already finalized; this ends the consistent prefix.
+                // Fatal only when a later well-formed OUTPUT still decodes past the
+                // tear (corruption of committed data); otherwise it is the unacked
+                // in-flight tail, safe to drop.
                 Some(Err(_)) => {
-                    if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                    if Self::output_after_tear(&mut iter) {
                         return Err(Self::corrupt_pack(base_dir));
                     }
                     break;
@@ -1155,21 +1147,36 @@ impl Inner {
         ))
     }
 
-    /// After recovery hits a damaged record *within acked data*, decide whether the rest of the log
-    /// is a clean torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn
-    /// tail yields only unreadable garbage until EOF; if any later record still decodes then valid
-    /// data survived past the damage, so the damaged record was not the final one. Only consulted
-    /// when the tear is at/below the attested watermark -- past it, an unacked
-    /// out-of-order-writeback tail is expected to hold decodable records and is truncated
-    /// without this scan.
-    fn tail_is_torn(
+    /// After recovery hits a torn/incomplete output, decide whether the rest of the log is a clean
+    /// unacked tail (safe to truncate) or corruption of committed data (an error). Because
+    /// production persists after every output, at most one output is ever unacked at the tail,
+    /// so its leftovers are only its own `Batch` records — never a new `Consensus` header. A
+    /// decodable `Consensus` header past the tear therefore means a *later output* was written,
+    /// which can only have happened after the earlier one was durably committed: the earlier
+    /// damage is corruption.
+    ///
+    /// Returns `true` (corruption) iff a later output header decodes before EOF; stray batches, a
+    /// stray meta, and CRC-failed frames are skipped. The `position` no-forward-progress guard
+    /// (mirrors `pack_validate::probe_decodable_after`) stops a size-prefix-past-EOF from spinning.
+    fn output_after_tear(
         iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
     ) -> bool {
+        let mut last_pos = iter.position().unwrap_or(u64::MAX);
         loop {
             match iter.next() {
-                None => return true,
-                Some(Ok(_)) => return false,
-                Some(Err(_)) => continue,
+                None => return false,
+                // A later output began → an output was written past the tear → corruption.
+                Some(Ok(PackRecord::Consensus(_))) => return true,
+                // A stray batch/meta of the torn in-flight output: not a new output; keep scanning.
+                Some(Ok(_)) => last_pos = iter.position().unwrap_or(u64::MAX),
+                Some(Err(_)) => {
+                    let pos = iter.position().unwrap_or(u64::MAX);
+                    if pos <= last_pos {
+                        return false; // no forward progress (extent past EOF): nothing readable
+                                      // after
+                    }
+                    last_pos = pos;
+                }
             }
         }
     }
@@ -1828,9 +1835,8 @@ impl Inner {
         self.data.rewind_to(data_start);
         self.consensus_pos_idx.rewind_to_len(pos_idx_start);
         // 0 can never equal the real data length (always >= DATA_HEADER_BYTES), so
-        // `files_consistent` always triggers the WAL rebuild; it also leaves
-        // `recover_pack`'s attested_end = max(0, pos_end) = pos_end (the true watermark),
-        // so recovery validation stays correct.
+        // `files_consistent` always fails and the next open runs `recover_pack`, which rebuilds
+        // every index from the (rewound) data-log WAL.
         const FORCE_INDEX_REBUILD: u64 = 0;
         self.consensus_digests.set_data_file_length(FORCE_INDEX_REBUILD);
         self.batch_digests.set_data_file_length(FORCE_INDEX_REBUILD);
@@ -1926,6 +1932,13 @@ impl Inner {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             // Note, we don't sync indexes.  The data file acts as a WAL we can use to clean up and
             // rebuild if we crash and it causes corruption.
+            //
+            // Stamp the commit marker AFTER the data msync so it can never point past durable data
+            // (fail-safe). It is a plain 16-byte mmap write in the capacity padding with NO extra
+            // sync — best-effort, flushed by OS writeback / the next grow — so it adds nothing to
+            // the persist hot path. `recover_pack` uses it to catch at-rest corruption
+            // of the last committed output that the structural WAL probe cannot see.
+            self.data.stamp_commit_marker();
         }
         Ok(())
     }
@@ -5055,14 +5068,13 @@ pub(crate) mod test {
         );
     }
 
-    /// R1 regression: a *failed* recovery must not corrupt the state a *retry* depends on. The
-    /// first open correctly rejects mid-log corruption (the position index attests outputs 2/3
-    /// as committed while output 2 is torn). Before the fix, that first attempt truncated the
-    /// position index to output 1 and recreated a fresh, low-watermark digest index *before*
-    /// the guard fired; a second open (a plain node restart, or `db repair`) then recomputed a
-    /// lower `attested_end`, skipped the guard, and silently truncated the committed outputs 2
-    /// and 3 while returning `Ok`. Both attempts must reject, and the data bytes must survive
-    /// untouched.
+    /// R1 regression: a *failed* recovery must be idempotent and non-destructive. Recovery
+    /// validates the data-log WAL (index-free) BEFORE it touches any index or truncates the
+    /// log, so a detected corruption returns without mutating on-disk state and a retry (a
+    /// plain node restart, or `db repair`) re-derives the SAME reject from the unchanged log.
+    /// Here output 2 is torn with output 3 decodable after it (corruption of committed data);
+    /// both attempts must reject with `CorruptPack`, and the data bytes must survive untouched
+    /// across both.
     #[tokio::test]
     async fn test_failed_recovery_preserves_data_on_retry() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -5098,8 +5110,9 @@ pub(crate) mod test {
             f.seek(SeekFrom::Start(boundary + 20)).expect("seek back");
             f.write_all(&byte).expect("write");
         }
-        // Force recovery by dropping the digest indexes; the position index remains and attests
-        // outputs 2/3, so the tear is (correctly) mid-log corruption, not an unacked tail.
+        // Force recovery by dropping the digest indexes (so `files_consistent` fails). Detection is
+        // index-free: output 3 decoding past the torn output 2 is corruption regardless of what any
+        // index says.
         for name in ["hash", "bhash"] {
             std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
         }
@@ -5133,26 +5146,27 @@ pub(crate) mod test {
         );
     }
 
-    /// The mmap backend ends `persist()` at an `msync` only, and the kernel may write dirty pages
-    /// back out of order, so a power loss can leave `[k good][k+1 torn][k+2 good]` in the region
-    /// past the last index sync -- an unacked tail, not committed data. Recovery must truncate it
-    /// and let the node start, not reject the pack because a record still decodes after the tear.
-    /// (Before the fix, `tail_is_torn` saw the decodable `k+2` and returned `CorruptPack`, bricking
-    /// startup on the normal mmap power-loss shape.) The mid-log-corruption test above is the
-    /// mirror image: it keeps the position index, which attests outputs 2/3 as committed, so the
-    /// same byte-level damage is (correctly) fatal there.
+    /// Index-free corruption detection (the #5 regression). `persist()` acks the DATA (msync)
+    /// without syncing indexes, so after a crash the indexes are stale; the old
+    /// `attested_end`-from-indexes watermark then collapsed and *silently truncated* committed
+    /// outputs. Here output 2 is damaged at rest but output 3 — a complete LATER output — still
+    /// decodes past the tear. With EVERY index deleted (the post-crash state and proof no index is
+    /// consulted), `output_after_tear` sees output 3's header: an output written past the tear
+    /// implies output 2 was durably committed first, so this is corruption of committed data and
+    /// recovery must reject it, not drop outputs 2-3.
     #[tokio::test]
-    async fn test_recover_truncates_unacked_torn_tail_with_later_good_record() {
+    async fn test_recover_corruption_before_a_later_output_is_index_free() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-        let temp_dir = TempDir::with_prefix("test_recover_unacked_tail").expect("temp dir");
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_index_free_corrupt").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
         build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
 
-        // End of output 1 is the last consistent point once output 2 is torn.
+        // End of output 1 is where a naive replay stops once output 2 is torn.
         let output1_end = {
             let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
             pack.consensus_output_end(1).await.expect("output 1 end")
@@ -5163,7 +5177,7 @@ pub(crate) mod test {
         assert!(full_len > output1_end, "outputs 2 and 3 must extend past output 1");
 
         // Corrupt a byte inside output 2's header payload (past the 4-byte size prefix, so the
-        // framing stays intact and output 3 still decodes AFTER the damage).
+        // framing stays intact and output 3 — a complete later output — still decodes AFTER it).
         {
             let mut f =
                 OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
@@ -5174,44 +5188,120 @@ pub(crate) mod test {
             f.seek(SeekFrom::Start(output1_end + 20)).expect("seek back");
             f.write_all(&byte).expect("write");
         }
-        // Reset every index so recovery runs with no attested watermark past output 1 -- the
-        // on-disk state a real crash leaves, since indexes sync on a clean close, not on
-        // `persist()`. With nothing attesting outputs 2/3, the torn region is an unacked tail.
+        // Delete EVERY index (the post-crash state, and proof the detection needs no index at all).
         for name in ["hash", "bhash", "idx"] {
             std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
         }
 
-        // Recovery must accept the pack (truncate the torn tail) rather than brick startup.
+        // A later complete output decodes past the tear → committed data was damaged → reject.
+        let result =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "corruption before a later committed output must be rejected, got {result:?}"
+        );
+        // A rejected recovery mutates nothing, so the data log is untouched.
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            full_len,
+            "a rejected recovery must not truncate the data log"
+        );
+    }
+
+    /// Build `n` outputs and `persist()` (which stamps the tail commit marker) via the `Inner`,
+    /// then leak it so no clean close runs — an unclean data file with the marker intact on
+    /// disk. Returns the end offset of output `n-1` (the last complete boundary once output
+    /// `n`'s header is torn).
+    fn build_unclean_pack_with_marker(
+        temp_dir: &TempDir,
+        committee: &Committee,
+        chain: &Arc<RethChainSpec>,
+        previous_epoch: &EpochRecord,
+        n: u64,
+    ) -> u64 {
+        let mut inner =
+            Inner::open_append(temp_dir.path(), previous_epoch, committee.clone(), PACK_VERSION)
+                .expect("open_append inner");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..n {
+            let output =
+                make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            inner.save_consensus_output(&output).expect("save output");
+        }
+        inner.persist().expect("persist stamps the marker");
+        let prev_end = inner.output_end_for_consensus(n - 1).expect("boundary");
+        std::mem::forget(inner); // unclean exit: skip the clean close so the marker survives
+        prev_end
+    }
+
+    /// Flip one byte at `pos` in the file at `path` (corruption at rest).
+    fn corrupt_byte_at(path: &std::path::Path, pos: u64) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut f = OpenOptions::new().read(true).write(true).open(path).expect("open data");
+        f.seek(SeekFrom::Start(pos)).expect("seek");
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).expect("read");
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(pos)).expect("seek back");
+        f.write_all(&byte).expect("write");
+    }
+
+    /// The tail commit marker closes the residual the structural probe cannot see: at-rest
+    /// corruption of the LAST committed output with nothing decodable after it. The marker records
+    /// the durable acked end, so a WAL replay that stops below it means committed data was damaged.
+    #[tokio::test]
+    async fn test_recover_last_output_corruption_caught_by_commit_marker() {
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_marker_last_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Unclean pack; the marker records committed_end == output 3's end.
+        let output2_end =
+            build_unclean_pack_with_marker(&temp_dir, &committee, &chain, &previous_epoch, 3);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Corrupt output 3's header (past its 4-byte size prefix): replay stops at output 2 and no
+        // complete output decodes after, so only the marker can flag it.
+        corrupt_byte_at(&data_path, output2_end + 20);
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee);
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "the commit marker must catch at-rest corruption of the last output, got {result:?}"
+        );
+    }
+
+    /// Fail-safe degrade: with the marker cleared (a power loss that lost the best-effort write),
+    /// the same last-output corruption is indistinguishable from an unacked torn tail, so
+    /// recovery truncates it rather than raising a false error (the pre-marker / probe-only
+    /// behavior).
+    #[tokio::test]
+    async fn test_recover_last_output_corruption_without_marker_truncates() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let temp_dir = TempDir::with_prefix("test_marker_last_nomark").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let output2_end =
+            build_unclean_pack_with_marker(&temp_dir, &committee, &chain, &previous_epoch, 3);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        corrupt_byte_at(&data_path, output2_end + 20);
+        // Clear the marker (zero the last 16 bytes of the padded, unclean file).
         {
-            let pack = ConsensusPack::open_append(
-                temp_dir.path(),
-                previous_epoch.clone(),
-                committee.clone(),
-            )
-            .expect("unacked torn tail must recover, not brick startup");
-            pack.persist().await.expect("persist after recovery");
+            let mut f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open");
+            f.seek(SeekFrom::End(-16)).expect("seek end");
+            f.write_all(&[0u8; 16]).expect("clear marker");
         }
 
-        // The log is truncated back to the end of output 1; outputs 2 and 3 are dropped.
-        // Recovery truncates the logical data to output 1's end; the clean close then re-appends
-        // the 8-byte sentinel, so the physical file is `output1_end + SENTINEL_LEN`.
-        let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
-        assert_eq!(
-            recovered_len,
-            output1_end + crate::archive::data_file::SENTINEL_LEN,
-            "recovery must truncate the torn tail back to the last complete output before the tear"
-        );
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
-            .expect("recovered pack must open read-only and pass files_consistent");
-        assert_eq!(
-            pack.get_consensus_output(1).await.expect("output 1 survives").number(),
-            1,
-            "the last complete output before the tear must read back"
-        );
-        assert!(
-            pack.get_consensus_output(2).await.is_err(),
-            "the torn output 2 (and everything after) must be gone"
-        );
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee)
+            .expect("without the marker, recovery truncates the torn last output");
+        assert!(pack.get_consensus_output(2).await.is_ok(), "output 2 survives");
+        assert!(pack.get_consensus_output(3).await.is_err(), "torn output 3 truncated");
     }
 
     /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with

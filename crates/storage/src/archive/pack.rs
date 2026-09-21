@@ -206,6 +206,20 @@ where
         self.inner.data_file.rewind_to(new_len);
     }
 
+    /// The durable acked-data watermark recovered from the tail commit marker of an unclean pack,
+    /// if present (see [`MmapDataFile::committed_end`]). `None` on a clean/fresh open. Recovery
+    /// uses it as an index-free way to detect at-rest corruption of the last committed record.
+    pub fn committed_end(&self) -> Option<u64> {
+        self.inner.data_file.committed_end()
+    }
+
+    /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync
+    /// record of the acked frontier (see [`MmapDataFile::stamp_commit_marker`]). Call AFTER
+    /// [`Self::commit`] so the marker can never be ahead of durable data.
+    pub fn stamp_commit_marker(&mut self) {
+        self.inner.data_file.stamp_commit_marker();
+    }
+
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
