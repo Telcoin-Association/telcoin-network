@@ -207,26 +207,6 @@ where
                 .await?
                 .apply(&gas_accumulator);
         }
-        // Produce a "dummy" epoch 0 EpochRecord if missing.
-        // This will let us use simple code to find any epoch including 0 at startup.
-        if !self.consensus_chain.epochs().contains_epoch(0).await {
-            if committee.epoch() != 0 {
-                return Err(eyre::eyre!(
-                    "We have epoch 0 in our database if we are past epoch 0, on {}",
-                    committee.epoch()
-                ));
-            }
-            // No keys for epoch 0, fix that.
-            // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
-            let next_committee = committee.clone();
-            let epoch_rec =
-                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
-            // Save the "dummy" record, should be overwritten once epoch 0 closes.
-            // This will NOT be signed.
-            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
-        }
-
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
