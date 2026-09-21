@@ -569,12 +569,11 @@ pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> 
 
 /// Retrieve a node's current consensus participation mode ([`NodeMode`]) over RPC.
 ///
-/// Reads the live mode (via `tn_nodeMode`), so repeated calls can observe transient modes such as
-/// [`NodeMode::CvvInactive`] while a restarted node catches up. A node whose RPC is not yet up
-/// (e.g. mid-restart) surfaces as an `Err` here rather than panicking; `call_rpc`'s own retries
-/// absorb brief unavailability.
+/// Reads the live mode via `tn_nodeMode`. A node whose RPC is not yet up returns an error
+/// immediately, leaving retry timing to the caller's bounded wait. A current-mode query cannot
+/// establish whether a transient mode occurred between calls.
 pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
-    call_rpc(node, "tn_nodeMode", rpc_params![], 10, "tn_nodeMode")
+    call_rpc(node, "tn_nodeMode", rpc_params![], 0, "tn_nodeMode")
 }
 
 /// Scrape the metrics endpoint with a raw HTTP GET (no client dependencies).

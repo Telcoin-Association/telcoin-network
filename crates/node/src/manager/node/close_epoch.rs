@@ -146,7 +146,7 @@ where
     /// before they are included in a certificate. Their transactions would be
     /// lost otherwise, so we reintroduce them. An active CVV re-injects each
     /// transaction into its worker's mempool to be repackaged next epoch; a
-    /// non-CVV is not building batches, so it disburses the batch directly.
+    /// non-CVV disburses each batch through the worker identified by its batch header.
     ///
     /// [`OurNodeBatchesCache`] is read and then immediately cleared: the cached
     /// batches are now defunct since their contents are back in flight. Recovery
@@ -156,7 +156,7 @@ where
         &mut self,
         epoch_task_manager: &TaskManager,
         engine: ExecutionNode,
-        worker: Worker<DB, QuorumWaiter>,
+        workers: Vec<Worker<DB, QuorumWaiter>>,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // Collect any batches from this epoch that never made it to the consensus chain.
@@ -188,8 +188,13 @@ where
                         // transactions, and the table that held them was cleared above, so fall
                         // back to the CVV shape and let the batch builder repackage them
                         // (issue #1145).
-                        let disbursed = worker.disburse_txns(batch.clone().seal(digest)).await;
-                        if disbursed.is_err() {
+                        let disbursed = futures::future::OptionFuture::from(
+                            workers.get(usize::from(batch.worker_id)).map(|worker| {
+                                worker.disburse_txns(batch.clone().seal(digest))
+                            }),
+                        )
+                        .await;
+                        if disbursed.is_none_or(|result| result.is_err()) {
                             repool_batch_txns(&pools, &batch).await;
                         }
                     }

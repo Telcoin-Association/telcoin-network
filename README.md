@@ -26,9 +26,13 @@ Generate a config and keys for your observer node:
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
 Start your observer node:
-`target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
+
+Node role is derived from committee membership: a key outside the current committee runs as an
+observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
+chain.
 
 ### Run a validator
 
