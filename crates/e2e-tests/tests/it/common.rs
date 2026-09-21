@@ -26,6 +26,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fmt::Debug,
+    io::{Read, Write},
+    net::TcpStream,
     ops::RangeInclusive,
     path::Path,
     process::{Child, ExitStatus},
@@ -572,6 +574,16 @@ pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> 
 /// establish whether a transient mode occurred between calls.
 pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
     call_rpc(node, "tn_nodeMode", rpc_params![], 0, "tn_nodeMode")
+}
+
+/// Scrape the metrics endpoint with a raw HTTP GET (no client dependencies).
+pub(crate) fn scrape_metrics(addr: &str) -> eyre::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 /// Query a node's highest consensus chain block height.

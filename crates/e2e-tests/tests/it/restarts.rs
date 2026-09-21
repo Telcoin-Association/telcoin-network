@@ -4,8 +4,9 @@ use super::common::{kill_child, ProcessGuard};
 use crate::common::{
     address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
     get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
-    get_node_mode, get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel,
-    start_observer, start_validator, start_validator_with_args, WEI_PER_TEL,
+    get_node_mode, get_positive_balance_with_retry, network_advancing, scrape_metrics,
+    send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
+    WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::{Report, WrapErr as _};
@@ -86,7 +87,9 @@ fn run_restart_tests1(
     }
 
     info!(target: "restart-test", "restarting child2...");
-    // Restart
+    let metrics_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let mut child2 = start_validator_with_args(
         2,
         bin,
@@ -94,21 +97,19 @@ fn run_restart_tests1(
         rpc_port2,
         test,
         2,
-        &["--log.stdout.filter", "subscriber=info"],
+        &["--metrics", &metrics_addr],
     );
     let [_, _, restarted_node, _] = client_urls;
     wait_for_restarted_rpc(&mut child2, restarted_node, test).inspect_err(|e| {
         kill_child(&mut child2);
         error!(target: "restart-test", ?e, "restarted node did not become RPC-ready");
     })?;
-    // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
-    // the node passes through the transient `CvvInactive` mode. Its subscriber log retains
-    // evidence even if catch-up finishes before an RPC poll sees that mode. The short-downtime
-    // restart never crosses the GC window and never demotes, so it is gated out here.
+    // The new process's counter retains evidence of the follow/catch-up path even when the
+    // transient CvvInactive mode ends before the first RPC poll. Short restarts need not sync.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
+        wait_for_restart_catch_up(restarted_node, &metrics_addr).inspect_err(|e| {
             kill_child(&mut child2);
-            error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
+            error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests1");
         })?;
     }
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
@@ -161,8 +162,7 @@ fn wait_for_restarted_rpc(child: &mut Child, node: &str, test: &str) -> eyre::Re
 }
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
-/// This versoin is intended to leave the restarted node in a lagged (not caught up state)
-/// in order to exercise more restart code.
+/// The node misses a transfer while offline, then must apply it during catch-up after restarting.
 fn run_restart_tests_lagged1(
     client_urls: &[String; 4],
     child2: &mut Child,
@@ -188,6 +188,18 @@ fn run_restart_tests_lagged1(
         error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
     })?;
 
+    // Verify the old balance before shutdown. Catch-up may apply the missed transfer before the
+    // restarted node serves its first balance query.
+    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
+        .inspect_err(|e| {
+            kill_child(child2);
+            error!(target: "restart-test", ?e, "failed to get balance before shutdown");
+        })?;
+    if 10 * WEI_PER_TEL != bal {
+        kill_child(child2);
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
+    }
+
     info!(target: "restart-test", "killing child2...");
     kill_child(child2);
     info!(target: "restart-test", "child2 dead :D waiting out downtime...");
@@ -209,7 +221,9 @@ fn run_restart_tests_lagged1(
     get_balance_above_with_retry(&client_urls[0], &to_account.to_string(), expected - 1)?;
 
     info!(target: "restart-test", "restarting child2...");
-    // Restart
+    let metrics_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let mut child2 = start_validator_with_args(
         2,
         bin,
@@ -217,29 +231,15 @@ fn run_restart_tests_lagged1(
         rpc_port2,
         test,
         2,
-        &["--log.stdout.filter", "subscriber=info"],
+        &["--metrics", &metrics_addr],
     );
-    // Lagged delayed restart: the downtime is past the GC window, so the restarted validator
-    // rejoins via the follow/catch-up path and passes through the transient `CvvInactive` mode
-    // before catching up. Check its current mode or retained subscriber log before the balance
-    // checks below. This path is only ever exercised with the delayed downtime, but gate on the
-    // floor for parity with `run_restart_tests1`.
+    // Require state sync and a return to active consensus, even if catch-up finished before RPC
+    // became available. Gate on the delayed downtime for parity with run_restart_tests1.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        let [_, _, restarted_node, _] = client_urls;
-        assert_observed_cvv_inactive(restarted_node, test).inspect_err(|e| {
+        wait_for_restart_catch_up(&client_urls[2], &metrics_addr).inspect_err(|e| {
             kill_child(&mut child2);
-            error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests_lagged1");
+            error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
         })?;
-    }
-    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
-        .inspect_err(|e| {
-            kill_child(&mut child2);
-            error!(target: "restart-test", ?e, "failed to get positive balance with retry in restart_tests1");
-        })?;
-    if 10 * WEI_PER_TEL != bal {
-        error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
-        kill_child(&mut child2);
-        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
     let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
     if expected != bal {
@@ -312,7 +312,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rounds. The `min_secs` floor alone does not guarantee it: at the nominal ~500ms/round cadence a
 /// 25s downtime spans ~50 rounds (safe), but on a loaded runner where idle rounds stretch past
 /// ~1.67s/round a 25s wait covers fewer than 15 rounds, the killed node never demotes, and
-/// `assert_observed_cvv_inactive` fails. To close that, the delayed tests also gate on peer
+/// `wait_for_restart_catch_up` times out. To close that, the delayed tests also gate on peer
 /// progress: each consensus header wraps one committed sub-dag whose leader round strictly exceeds
 /// its predecessor's, so a peer header-number delta of D guarantees the live DAG round climbed by
 /// at least D past the kill point. Requiring `(RESTART_TEST_GC_DEPTH - 10) + 3` = 18 headers thus
@@ -384,42 +384,72 @@ const RESTART_TEST_GC_DEPTH: u32 = 25;
 /// CI while cutting ~35s per test vs the previous fixed 60s floor.
 const RESTART_TEST_DOWNTIME_SECS: u64 = 25;
 
-/// Maximum wait for evidence that a delayed restart entered the inactive catch-up path.
-const CVV_INACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Assert the restarted validator entered [`NodeMode::CvvInactive`] while catching up.
+/// Wait for a restarted CVV to apply state-sync headers and return to active consensus.
 ///
-/// Catch-up can finish between RPC polls, including before the first successful RPC response.
-/// Sample the live mode once, then wait for the subscriber entry logged exclusively by that mode's
-/// branch in `spawn_subscriber`. Both callers restart instance 2 as run 2 with `subscriber=info`,
-/// and `setup_log_dir` truncates this process's log before spawning it, so an earlier run cannot
-/// satisfy the assertion. Merely reaching `CvvActive` without either piece of evidence still fails.
-fn assert_observed_cvv_inactive(node: &str, test: &str) -> eyre::Result<()> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-    let log_path = Path::new(&manifest_dir).join("test_logs").join(test).join("node2-run2.log");
-    let observed_inactive = matches!(get_node_mode(node), Ok(NodeMode::CvvInactive));
+/// The metrics endpoint belongs to the fresh process, so its cumulative applied-header counter
+/// proves this restart exercised the follow/catch-up path. Unlike the transient CvvInactive mode,
+/// that evidence remains available after catch-up finishes, including before the first RPC poll.
+fn wait_for_restart_catch_up(node: &str, metrics_addr: &str) -> eyre::Result<()> {
     wait_until_blocking(
-        CVV_INACTIVE_TIMEOUT,
-        &format!(
-            "restarted node {node} to enter CvvInactive (catch-up log: {})",
-            log_path.display()
-        ),
+        Duration::from_secs(30),
+        &format!("restarted node {node} to apply state-sync headers and return to CvvActive"),
         || {
-            if observed_inactive {
-                Ok(true)
-            } else {
-                std::fs::read(&log_path)
-                    .map(|log| {
-                        String::from_utf8_lossy(&log)
-                            .contains("Starting subscriber: Catch up and rejoin")
-                    })
-                    .map_err(Report::from)
-            }
+            Ok(scrape_metrics(metrics_addr).is_ok_and(|metrics| {
+                get_node_mode(node).is_ok_and(|mode| restart_catch_up_complete(mode, &metrics))
+            }))
         },
     )
-    .inspect(|()| {
-        info!(target: "restart-test", "observed restarted node {node} in CvvInactive during catch-up");
-    })
+}
+
+/// Require both durable evidence of applied state-sync headers and current CVV participation.
+fn restart_catch_up_complete(mode: NodeMode, metrics: &str) -> bool {
+    mode == NodeMode::CvvActive
+        && metrics.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some("tn_state_sync_headers_fetched_total")
+                && fields
+                    .next()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(|count| count.is_finite() && count > 0.0)
+        })
+}
+
+/// Catch-up may finish before the first mode poll; its cumulative counter must still prove it ran.
+#[test]
+fn test_restart_catch_up_complete_before_first_poll() {
+    let metrics = "# TYPE tn_state_sync_headers_fetched_total counter\n\
+                   tn_state_sync_headers_fetched_total 18\n\
+                   tn_node_mode{mode=\"cvv_inactive\"} 0\n\
+                   tn_node_mode{mode=\"cvv_active\"} 1\n";
+    assert!(restart_catch_up_complete(NodeMode::CvvActive, metrics));
+}
+
+/// An active node alone cannot prove the restart exercised the follow/catch-up path.
+#[test]
+fn test_restart_catch_up_requires_applied_headers() {
+    [
+        "",
+        "# TYPE tn_state_sync_headers_fetched_total counter\n",
+        "tn_state_sync_headers_fetched_total 0\n",
+        "tn_state_sync_headers_fetched_total -1\n",
+        "tn_state_sync_headers_fetched_total NaN\n",
+        "tn_state_sync_headers_fetched_total inf\n",
+        "tn_state_sync_headers_fetched_total invalid\n",
+        "tn_state_sync_headers_fetched_total_created 18\n",
+        "other_tn_state_sync_headers_fetched_total 18\n",
+    ]
+    .into_iter()
+    .for_each(|metrics| {
+        assert!(!restart_catch_up_complete(NodeMode::CvvActive, metrics), "{metrics}");
+    });
+}
+
+/// Applied headers do not suffice until the restarted validator rejoins active consensus.
+#[test]
+fn test_restart_catch_up_requires_active_cvv() {
+    [NodeMode::CvvInactive, NodeMode::Observer].into_iter().for_each(|mode| {
+        assert!(!restart_catch_up_complete(mode, "tn_state_sync_headers_fetched_total 18\n"));
+    });
 }
 
 /// Wait for a stable membership-derived role, with the URL and expected role in timeout errors.
