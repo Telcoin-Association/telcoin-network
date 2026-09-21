@@ -134,6 +134,7 @@ impl ExecutionNodeInner {
     }
 
     /// Initialize the worker's transaction pool and public RPC.
+    /// Peer tracking is attached separately when the worker enters an epoch.
     /// Must call this function in accending worker_id order or will panic,
     /// for instance call for worker id 0, then 1, etc.
     ///
@@ -144,7 +145,6 @@ impl ExecutionNodeInner {
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
-        network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
         worker_base_fee: WorkerBaseFee,
@@ -156,7 +156,6 @@ impl ExecutionNodeInner {
 
         let network = WorkerNetwork::new(
             self.reth_env.chainspec(),
-            network_handle,
             self.tn_config.version,
             self.reth_env.clone(),
         );

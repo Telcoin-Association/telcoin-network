@@ -920,6 +920,32 @@ where
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
         self.try_restore_state(&engine).await?;
 
+        // Pin startup membership and fees to the epoch's closing block before exposing RPC.
+        // Catchup restores gas usage, while epoch entry normally supplies these fees later.
+        // Epoch 0 keeps the protocol-minimum defaults because it has no preceding close.
+        let (committee, _, _, epoch_start_header) =
+            self.get_committee_with_epoch_start_info(&engine).await?;
+        if committee.epoch() > 0 {
+            read_base_fees_for_entered_epoch(
+                &engine.get_reth_env().await,
+                committee.epoch(),
+                &epoch_start_header,
+            )
+            .await?
+            .apply(&gas_accumulator);
+        }
+
+        // Bind worker 0's RPC before either startup synchronization or epoch peer waits. Its
+        // network shim reports syncing until the first epoch publishes the node's mode.
+        engine
+            .initialize_worker_components(
+                DEFAULT_WORKER_ID,
+                self.engine_to_primary_rpc(&engine).await?,
+                gas_accumulator.base_fee(DEFAULT_WORKER_ID),
+                gas_accumulator.worker_base_fee(DEFAULT_WORKER_ID),
+            )
+            .await?;
+
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
         // #765). Genesis is the single source of truth; this one value is read by the
@@ -1040,9 +1066,8 @@ where
         // seed the dummy, sync records, seed the mode, then start background collection. The
         // re-vote hook must never see the uncertifiable dummy, and the two record
         // collectors must not race.
-        // This pinned read uses committee.yaml at genesis and the epoch-start state afterward;
-        // a mid-epoch governance burn must not change the startup membership decision.
-        let (committee, ..) = self.get_committee_with_epoch_start_info(&engine).await?;
+        // Reuse the committee pinned before RPC startup, so a mid-epoch governance burn cannot
+        // change the startup membership decision.
         let public_key = self.key_config.primary_public_key();
         let initial_mode = if committee.authority_by_key(&public_key).is_some() {
             // Committee dials run concurrently with bounded epoch-record synchronization.

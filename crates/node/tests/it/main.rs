@@ -278,10 +278,6 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
         None,
     )?;
 
-    // keep the task manager alive for the test so the worker RPC + network tasks keep running.
-    let task_manager = TaskManager::default();
-    let network_handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
     let worker_id: WorkerId = 0;
     // a deliberately non-MIN value: proves the pool doesn't hardcodes MIN_PROTOCOL_BASE_FEE.
     let base_fee = MIN_PROTOCOL_BASE_FEE + 1234;
@@ -291,7 +287,6 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
     execution_node
         .initialize_worker_components(
             worker_id,
-            network_handle,
             NoopEngineToPrimary,
             gas_accumulator.base_fee(worker_id),
             gas_accumulator.worker_base_fee(worker_id),
@@ -349,7 +344,6 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
     futures::stream::iter(0..2)
         .then(|worker_id| {
             let engine = &engine;
-            let task_manager = &task_manager;
             let accumulator = &accumulator;
             async move {
                 let fee = MIN_PROTOCOL_BASE_FEE + 1000 * (u64::from(worker_id) + 1);
@@ -358,7 +352,6 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
                 engine
                     .initialize_worker_components(
                         worker_id,
-                        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
                         NoopEngineToPrimary,
                         accumulator.base_fee(worker_id),
                         accumulator.worker_base_fee(worker_id),
