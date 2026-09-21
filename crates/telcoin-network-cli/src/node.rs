@@ -73,10 +73,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(1..=200))]
     pub instance: Option<u16>,
 
-    /// Deprecated and ignored. Node role is derived from committee membership.
-    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false, hide = true)]
-    pub observer: bool,
-
     /// Export each epoch's final execution state to a snapshot pack under
     /// `consensus-db/state_exports/epoch-{N}/`.
     ///
@@ -154,15 +150,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
-        if self.observer {
-            warn!(
-                target: "cli",
-                "--observer is deprecated and ignored (Telcoin-Association/telcoin-network#1355). \
-                 Node role is derived from committee membership. To take a validator out of \
-                 consensus, exit it on chain."
-            );
-        }
-
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives; several fork constants document this log
         // as their only in-protocol detection for a mismatched binary. Every epoch-gated adiri
@@ -229,19 +216,18 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         }
 
         // overwrite all genesis if `genesis` was passed to CLI
-        let tn_config = if let Some(chain) = self.chain.take() {
-            info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
-            match chain {
-                NamedChain::Adiri | NamedChain::TestNet => {
-                    Config::load_adiri(&tn_datadir, self.observer, SHORT_VERSION)?
+        let tn_config = self.chain.take().map_or_else(
+            || Config::load(&tn_datadir, SHORT_VERSION),
+            |chain| {
+                info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
+                match chain {
+                    NamedChain::Adiri | NamedChain::TestNet => {
+                        Config::load_adiri(&tn_datadir, SHORT_VERSION)
+                    }
+                    NamedChain::MainNet => Config::load_mainnet(&tn_datadir, SHORT_VERSION),
                 }
-                NamedChain::MainNet => {
-                    Config::load_mainnet(&tn_datadir, self.observer, SHORT_VERSION)?
-                }
-            }
-        } else {
-            Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
-        };
+            },
+        )?;
         #[cfg(not(feature = "adiri"))]
         if tn_config.genesis().config.chain_id == 2017 {
             // If we are trying to start an Adiri node without the adiri feature flag then error
@@ -268,7 +254,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let Self {
             chain: _, // Used above
             bootstrap_peers,
-            observer: _, // Used above
             metrics,
             enable_state_export,
             state_export_keep,
@@ -352,15 +337,14 @@ mod tests {
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
 
-    /// Legacy observer commands still parse, but neither help view advertises the ignored flag.
+    /// The removed observer flag is rejected and absent from both help views.
     #[test]
-    fn deprecated_observer_flag_parses_but_is_hidden() -> eyre::Result<()> {
+    fn removed_observer_flag_is_rejected() -> eyre::Result<()> {
         use clap::CommandFactory as _;
 
-        let default = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
-        let legacy = NodeCommand::<NoArgs>::try_parse_from(["node", "--observer"])?;
-        assert!(!default.observer);
-        assert!(legacy.observer);
+        NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        let legacy = NodeCommand::<NoArgs>::try_parse_from(["node", "--observer"]);
+        assert_eq!(legacy.err().map(|error| error.kind()), Some(ErrorKind::UnknownArgument));
         let mut command = NodeCommand::<NoArgs>::command();
         assert!(!command.render_help().to_string().contains("--observer"));
         assert!(!command.render_long_help().to_string().contains("--observer"));
