@@ -1188,7 +1188,7 @@ impl Inner {
     /// Sentinel pack-header tag for the certs file.
     const CERT_PACK_EPOCH: u64 = 1;
 
-    /// Truncate records and its indexes back to a consistent state.
+    /// Trim records and its indexes back to a consistent state.
     fn heal_records(
         records: &mut Pack<EpochRecord>,
         epoch_idx: &mut PositionIndex<u64>,
@@ -1197,7 +1197,7 @@ impl Inner {
         let records_len = records.file_len();
         let digest_final = record_digests.data_file_length();
         if records_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            records.truncate(digest_final)?;
+            records.rewind_to(digest_final);
         }
         let records_len = records.file_len();
         if !epoch_idx.is_empty() {
@@ -1220,13 +1220,28 @@ impl Inner {
                 idx -= 1;
             }
             if new_len != records_len {
-                records.truncate(new_len)?;
+                records.rewind_to(new_len);
             }
+        }
+        // A header-only log left at mmap capacity by an unclean close: nothing was ever appended,
+        // so neither the digest marker (== DATA_HEADER_BYTES) nor the position index (empty, or
+        // just wiped above because every entry was zero capacity-padding) bounds the log, and
+        // `raw_iter` would decode the zero padding as a CRC-failing 0-size record. Roll the logical
+        // end back to the header (INV1) with `rewind_to` — no physical truncate/remap (no SIGBUS
+        // window; keeps capacity so a first append doesn't re-grow), matching the consensus pack's
+        // save rollback. Content-gated (not `opened_unclean()`-gated) so a log whose padding a
+        // prior failed open already sealed under a sentinel heals too; `any_content_after`
+        // never trims real bytes.
+        if epoch_idx.is_empty()
+            && records.file_len() > DATA_HEADER_BYTES as u64
+            && !records.any_content_after(DATA_HEADER_BYTES as u64)
+        {
+            records.rewind_to(DATA_HEADER_BYTES as u64);
         }
         Ok(())
     }
 
-    /// Truncate the certs file back to a consistent state.
+    /// Trim the certs file back to a consistent state.
     fn heal_certs(
         certs: &mut Pack<EpochCertificate>,
         cert_digests: &HdxIndex,
@@ -1234,7 +1249,14 @@ impl Inner {
         let certs_len = certs.file_len();
         let digest_final = cert_digests.data_file_length();
         if certs_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            certs.truncate(digest_final)?;
+            certs.rewind_to(digest_final);
+        } else if certs_len > DATA_HEADER_BYTES as u64
+            && !certs.any_content_after(DATA_HEADER_BYTES as u64)
+        {
+            // Header-only padding: no cert was ever appended (see `heal_records`). Roll the logical
+            // end back to the header with `rewind_to` so a clean close does not seal 1 MiB of
+            // padding.
+            certs.rewind_to(DATA_HEADER_BYTES as u64);
         }
         Ok(())
     }
@@ -1771,7 +1793,7 @@ mod test {
         archive::pack::DATA_HEADER_BYTES,
         epoch_records::{
             epoch_committee_valid, CertifiedRecordError, EpochDbError, EpochRecordDb,
-            EpochRecordValidation, CERTS_NAME, RECORDS_NAME,
+            EpochRecordValidation, Inner, CERTS_NAME, RECORDS_NAME,
         },
     };
 
@@ -2269,6 +2291,37 @@ mod test {
             let back = db.record_by_epoch(record.epoch).await.expect("record by epoch after close");
             assert_eq!(back.digest(), record.digest());
         }
+    }
+
+    #[test]
+    fn test_fresh_unclean_reopen_heals_header_only_padding() {
+        // Regression for the crash where a fresh (never-appended) EpochRecordDb, grown to mmap
+        // capacity (1 MiB) on the header write, could not reopen after an unclean exit: heal left
+        // the zero padding in place and `EpochRecordDb::open`'s raw_iter decoded it as a
+        // CRC-failing 0-size record, so the node could not restart.
+        let dir = TempDir::with_prefix("test_fresh_unclean_reopen").expect("temp dir");
+
+        // Create the packs (writes headers, grows files to 1 MiB) then skip Drop to model a crash
+        // before any clean close — no sentinel is written, so the reopen sees padded files.
+        let inner = Inner::open_append(dir.path(), 0).expect("fresh open_append");
+        std::mem::forget(inner);
+
+        // With the fix the padding is trimmed and the reopen succeeds (was: CorruptDb / crc
+        // mismatch).
+        let db = EpochRecordDb::open(dir.path()).expect("reopen after unclean fresh exit");
+        drop(db); // clean close seals both packs at the header
+
+        // Both packs are back to header + sentinel — no 1 MiB of sealed padding (also covers #22's
+        // never-appended certs case). Mirrors the drop-then-stat assertion in
+        // `test_epoch_record_db`.
+        let sealed = DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN;
+        for name in [RECORDS_NAME, CERTS_NAME] {
+            let len = std::fs::metadata(dir.path().join(name)).expect("stat").len();
+            assert_eq!(len, sealed, "{name} not trimmed to header");
+        }
+
+        // Idempotent: a second reopen still succeeds.
+        EpochRecordDb::open(dir.path()).expect("second reopen");
     }
 
     /// Generate a deterministic test BLS public key from a seed.
