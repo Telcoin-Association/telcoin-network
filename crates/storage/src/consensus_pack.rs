@@ -2326,6 +2326,15 @@ fn check_header_expectation(
     header: &ConsensusHeader,
     expectation: HeaderExpectation,
 ) -> Result<(), PackError> {
+    // A sub-dag names its leader as its last header; an empty one has no leader, so every
+    // `leader()`-derived accessor (`leader_epoch`, `nonce`, `commit_timestamp`, `Display`, ...)
+    // would panic. A committed output always names a leader, so reject a peer-supplied empty
+    // sub-dag here -- the single decode chokepoint both `iter_to_output` and
+    // `iter_to_output_legacy` pass through before any leader access -- rather than let it reach
+    // `save_consensus_output` and panic the critical import task.
+    if header.sub_dag.is_empty() {
+        return Err(PackError::EmptySubDag);
+    }
     match expectation {
         HeaderExpectation::None => Ok(()),
         HeaderExpectation::Digest(expected) => {
@@ -2906,6 +2915,10 @@ pub enum PackError {
         /// The digest that was actually received in the stream.
         got: ConsensusHeaderDigest,
     },
+    /// A decoded consensus header carried a sub-dag with no headers, and therefore no leader.
+    /// Every `leader()`-derived accessor panics on such a value, so it is rejected at decode
+    /// time; a legitimately committed output always names its leader as its last header.
+    EmptySubDag,
 }
 
 impl PackError {
@@ -2984,6 +2997,9 @@ impl Display for PackError {
             }
             PackError::UnexpectedConsensusDigest { expected, got } => {
                 write!(f, "Consensus header digest mismatch: expected {expected}, got {got}")
+            }
+            PackError::EmptySubDag => {
+                write!(f, "consensus header carries an empty sub-dag (no leader)")
             }
         }
     }
@@ -6511,6 +6527,114 @@ pub(crate) mod test {
             ConsensusPack::open_append_exists(target.path(), 0).is_err(),
             "the rejected meta was appended anyway"
         );
+    }
+
+    /// Finding #6: a decoded consensus header whose sub-dag has no headers (hence no leader) must
+    /// be rejected at the decode chokepoint, not turned into an output that panics the moment
+    /// any `leader()`-derived accessor is touched. `bytes_to_output` is the per-output decode
+    /// path used to serve/receive a single output (`request_consensus_output`). Without the
+    /// guard this returns `Ok` with a leaderless output that later panics; with it the decode
+    /// fails cleanly.
+    #[tokio::test]
+    async fn test_bytes_to_output_rejects_empty_subdag() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_empty_subdag").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // A well-framed header carrying an empty sub-dag: decodable, but leaderless.
+        let header = ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![]),
+            number: 1,
+            extra: Default::default(),
+        };
+        assert!(header.sub_dag.is_empty(), "the crafted sub-dag must be empty");
+
+        let path = temp_dir.path().join("empty_subdag");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            pack.commit().expect("commit");
+        }
+        // bytes_to_output uses open_partial (no header) so feed the records past the data header.
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::EmptySubDag)),
+            "an empty sub-dag must be rejected as EmptySubDag, got {res:?}"
+        );
+    }
+
+    /// Finding #6: the same empty sub-dag arriving over an epoch-sync stream must not panic the
+    /// (critical) import task. `stream_import` decodes each output through the same chokepoint, so
+    /// a hostile empty sub-dag is rejected with `EmptySubDag` before `save_consensus_output`
+    /// calls `leader_epoch()`. The output's parent link is the expected genesis parent, so
+    /// without the guard the import reaches `leader_epoch()` and this test panics instead of
+    /// erroring.
+    #[tokio::test]
+    async fn test_stream_import_rejects_empty_subdag() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_import_empty_subdag").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append meta");
+            pack.append(&PackRecord::Consensus(Box::new(ConsensusHeader {
+                parent_hash: previous_epoch.final_consensus.hash,
+                sub_dag: CommittedSubDag::new_with_headers_for_test(vec![]),
+                number: 1,
+                extra: Default::default(),
+            })))
+            .expect("append empty-sub-dag output");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_import_empty_subdag_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an empty sub-dag must be rejected, not imported");
+        assert!(matches!(err, PackError::EmptySubDag), "got {err:?}");
     }
 
     /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes

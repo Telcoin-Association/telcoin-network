@@ -127,6 +127,14 @@ pub enum PackIssue {
         /// Human-readable description of the mismatch.
         detail: String,
     },
+    /// A consensus header carries a sub-dag with no headers, and therefore no leader. A committed
+    /// output always names its leader as its last header, so this is structural corruption; every
+    /// `leader()`-derived accessor would panic on it. The importer rejects the same shape with
+    /// `PackError::EmptySubDag`.
+    EmptySubDag {
+        /// Consensus number of the offending header.
+        number: u64,
+    },
 }
 
 /// Overall verdict for a pack file.
@@ -624,6 +632,12 @@ fn verify_v0_data(
                     }
                 }
 
+                // A committed output always names a leader (its last header); an empty sub-dag is
+                // structural corruption that would panic every leader()-derived accessor.
+                if consensus_header.sub_dag.is_empty() {
+                    issues.push(PackIssue::EmptySubDag { number });
+                }
+
                 // 2. Every referenced batch must be present in *this* header's group. The global
                 // set is not yet complete here (a referenced batch may appear later in the file),
                 // so record the issue with a placeholder class and resolve it after the loop.
@@ -778,6 +792,11 @@ fn verify_v1_data(
 /// resolved in [`finalize_report`] once every digest in the file is known.
 fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mut BoundedIssues) {
     let number = header.number;
+    // A committed output always names a leader (its last header); an empty sub-dag is structural
+    // corruption that would panic every leader()-derived accessor.
+    if header.sub_dag.is_empty() {
+        issues.push(PackIssue::EmptySubDag { number });
+    }
     let collected_set: HashSet<BlockHash> = collected.iter().copied().collect();
 
     // Every referenced batch must be present in this header's group.
@@ -875,6 +894,7 @@ impl Display for PackValidationReport {
         let mut unsorted = 0usize;
         let mut non_sequential = 0usize;
         let mut meta = 0usize;
+        let mut empty_subdag = 0usize;
         for issue in &self.issues {
             match issue {
                 PackIssue::ChainBreak { .. } => chain_breaks += 1,
@@ -886,6 +906,7 @@ impl Display for PackValidationReport {
                 PackIssue::UnsortedBatches { .. } => unsorted += 1,
                 PackIssue::NonSequentialConsensusNumber { .. } => non_sequential += 1,
                 PackIssue::EpochMetaMismatch { .. } => meta += 1,
+                PackIssue::EmptySubDag { .. } => empty_subdag += 1,
             }
         }
 
@@ -944,6 +965,7 @@ impl Display for PackValidationReport {
         writeln!(f, "  unsorted batch groups:  {unsorted}")?;
         writeln!(f, "  non-sequential numbers: {non_sequential}")?;
         writeln!(f, "  epoch meta mismatches:  {meta}")?;
+        writeln!(f, "  empty sub-dags:         {empty_subdag}")?;
 
         if self.issues.is_empty() {
             return Ok(());
@@ -971,6 +993,9 @@ impl Display for PackValidationReport {
                     writeln!(f, "  consensus {found}  NON-SEQUENTIAL  (expected {expected})")?
                 }
                 PackIssue::EpochMetaMismatch { detail } => writeln!(f, "  EPOCH META     {detail}")?,
+                PackIssue::EmptySubDag { number } => {
+                    writeln!(f, "  consensus {number}  EMPTY SUB-DAG")?
+                }
             }
         }
         if self.issues.len() > MAX_ROWS {

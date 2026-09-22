@@ -1141,6 +1141,7 @@ impl PrimaryNetworkHandle {
                 | PackError::TooManyBatches(_)
                 | PackError::CorruptPack(_)
                 | PackError::UnexpectedConsensusDigest { .. }
+                | PackError::EmptySubDag
                 | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
