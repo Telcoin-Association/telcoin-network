@@ -472,14 +472,6 @@ impl Driver {
             Err(kad::GetRecordError::NotFound { .. }) => {
                 self.finish_lookup(id, Terminal::Finished(stats));
             }
-            Err(kad::GetRecordError::QuorumFailed { records, .. }) => {
-                // unreachable for a quorum-less `get_record`, but the copies it would carry are
-                // still worth folding rather than dropping
-                for kad::PeerRecord { record, peer } in &records {
-                    self.accept_copy(id, record, *peer);
-                }
-                self.finish_lookup(id, Terminal::Finished(stats));
-            }
             Err(kad::GetRecordError::Timeout { .. }) => {
                 self.finish_lookup(id, Terminal::Timeout);
             }
