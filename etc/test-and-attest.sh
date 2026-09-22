@@ -139,8 +139,20 @@ case "$E2E_TARGET_ROOT" in
     *) E2E_TARGET_ROOT="$(pwd)/$E2E_TARGET_ROOT" ;;
 esac
 cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$E2E_TARGET_ROOT"
+# test_governance_safe_fork is excluded from this lane because here it can only skip: this
+# binary is built without `adiri`, which compiles the governance-Safe fork out, so
+# test_governance_safe_fork_boundary returns early and nextest reports PASS. Excluding it keeps
+# a skip from reading as a pass; the dedicated lane below is where it actually runs.
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
-    cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
+    cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features \
+    -E 'not test(test_governance_safe_fork)'
+
+# The governance-Safe fork lane: the only end-to-end execution of that fork (no CI workflow
+# runs it), and the default lane above cannot stand in for it, since there
+# test_governance_safe_fork_boundary skips while reporting PASS. The target builds a separate
+# adiri node binary under <target>/adiri-e2e, arms the fork at TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH
+# (default 2) and runs the test at chain id 2017. Costs one extra adiri e2e build.
+make test-e2e-governance-safe
 
 echo "all checks passed - submitting attestation on-chain..."
 
