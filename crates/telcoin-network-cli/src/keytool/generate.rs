@@ -5,9 +5,10 @@ use crate::{
     keytool::{pop::PopArgs, set_rpc::build_worker_rpc},
 };
 use clap::{value_parser, Args, Subcommand};
+use std::{collections::HashSet, net::UdpSocket};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
 use tn_types::{
-    get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol, RpcInfo, DEFAULT_WORKER_ID,
+    Address, BlsPublicKey, Multiaddr, P2pNode, Protocol, RpcInfo, WorkerId, DEFAULT_WORKER_ID,
 };
 use tracing::info;
 use url::Url;
@@ -78,12 +79,12 @@ pub enum NodeType {
     Pop(PopArgs),
 }
 
+/// Options for generating a node identity and its worker network records.
 #[derive(Debug, Clone, Args)]
 pub struct KeygenArgs {
-    /// The number of workers for the primary.
-    /// Currently workers MUST be 1.
-    #[arg(long, value_name = "workers", global = true, default_value_t = 1, value_parser = value_parser!(u16).range(..=4))]
-    pub workers: u16,
+    /// Number of workers to provision, with consecutive IDs starting at 0.
+    #[arg(long, value_name = "COUNT", global = true, default_value_t = 1, value_parser = value_parser!(u32).range(1..=u64::from(WorkerId::MAX) + 1))]
+    pub workers: u32,
 
     /// Overwrite existing keys, if present.
     ///
@@ -132,12 +133,13 @@ pub struct KeygenArgs {
     #[arg(long, value_name = "MULTIADDR", env = "TN_EXTERNAL_PRIMARY_ADDR")]
     pub external_primary_addr: Option<Multiaddr>,
 
-    /// List of external multiaddrs for the workers p2p networks, comma seperated. Must be quic-v1
+    /// List of external multiaddrs for the workers p2p networks, comma separated. Must be quic-v1
     /// and udp. Recommended do not include p2p protocol id - the CLI will add this.
     /// For example: /ip4/[HOST1]/udp/[PORT1]/quic-v1,
     ///
     /// If not set each worker will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused
     /// port for PORT. This default is only useful for tests (including a local testnet).
+    /// When supplied, provide exactly one distinct listen address per worker, in worker ID order.
     ///
     /// NOTE: the node's [Protocol::P2p] is automatically added to the Multiaddr and does not need
     /// to be provided.
@@ -149,20 +151,33 @@ pub struct KeygenArgs {
     )]
     pub external_worker_addrs: Option<Vec<Multiaddr>>,
 
-    /// Optional HTTP(S) JSON-RPC endpoint to advertise to peers (e.g. https://validator.example.com:8545/).
+    /// Optional HTTP(S) JSON-RPC endpoint for worker 0 (e.g. https://validator.example.com:8545/).
     ///
     /// Recorded in node-info.yaml so wallets/dapps can discover where to submit transactions -
-    /// equivalent to running `keytool set-rpc` after generation. Omit to advertise no endpoint.
+    /// equivalent to running `keytool set-rpc --worker-id 0` after generation. Omit to advertise
+    /// no endpoint. Configure other workers with `keytool set-rpc --worker-id N --http URL`.
     #[arg(long = "rpc-http", value_name = "URL", value_parser = clap_url_parser)]
     pub rpc_http: Option<Url>,
 
-    /// Optional WebSocket JSON-RPC endpoint (e.g. wss://validator.example.com:8546/). Requires
-    /// `--rpc-http`.
+    /// Optional WebSocket JSON-RPC endpoint for worker 0 (e.g. wss://validator.example.com:8546/).
+    /// Requires `--rpc-http`.
     #[arg(long = "rpc-ws", value_name = "URL", value_parser = clap_url_parser, requires = "rpc_http")]
     pub rpc_ws: Option<Url>,
 }
 
+/// Reserve a local UDP port until every network address has been allocated.
+///
+/// Keeping the sockets open prevents the OS from returning the same port for another worker.
+fn local_network_address(sockets: &mut Vec<UdpSocket>) -> eyre::Result<Multiaddr> {
+    let socket = UdpSocket::bind(("127.0.0.1", 0))?;
+    let port = socket.local_addr()?.port();
+    let address = format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse()?;
+    sockets.push(socket);
+    Ok(address)
+}
+
 impl KeygenArgs {
+    /// Populate the primary and every worker with the identity derived from the same keystore.
     fn update_keys(&self, node_info: &mut NodeInfo, key_config: &KeyConfig) -> eyre::Result<()> {
         set_proof_of_possession(node_info, key_config, self.address)?;
 
@@ -175,58 +190,76 @@ impl KeygenArgs {
             )
         });
 
-        // network keypair for authority
+        // Reserve default ports across the primary and all workers until the layout is complete.
+        let mut sockets = Vec::new();
         let network_publickey = key_config.primary_network_public_key();
         node_info.p2p_info.primary.network_key = network_publickey.clone();
-        node_info.p2p_info.primary.network_address =
-            if let Some(primary_addr) = &self.external_primary_addr {
-                primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                    eyre::eyre!("Primary address already contains a different P2P protocol")
-                })?
-            } else {
-                let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                let addr: Multiaddr =
-                    format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
-                addr.with(Protocol::P2p(network_publickey.into()))
-            };
+        node_info.p2p_info.primary.network_address = self
+            .external_primary_addr
+            .as_ref()
+            .map_or_else(|| local_network_address(&mut sockets), |addr| Ok(addr.clone()))?
+            .with_p2p(network_publickey.into())
+            .map_err(|_| {
+                eyre::eyre!("Primary address already contains a different P2P protocol")
+            })?;
 
         info!(target: "tn::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
-        // network keypair for workers (keytool still generates a single worker entry)
-        let network_publickey = key_config.worker_network_public_key(DEFAULT_WORKER_ID);
-        let worker = node_info
-            .p2p_info
-            .worker_mut(DEFAULT_WORKER_ID)
-            .ok_or_else(|| eyre::eyre!("node info has no worker {DEFAULT_WORKER_ID}"))?;
-        worker.network_key = network_publickey.clone();
-        worker.network_address = if let Some(worker_addrs) = &self.external_worker_addrs {
-            if let Some(worker_addr) = worker_addrs.first() {
-                worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                    eyre::eyre!("worker address already contains a different P2P protocol")
-                })?
-            } else {
-                let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                let addr: Multiaddr =
-                    format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
-                addr.with(Protocol::P2p(network_publickey.into()))
-            }
-        } else {
-            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-            let addr: Multiaddr =
-                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
-            addr.with(Protocol::P2p(network_publickey.into()))
-        };
-
-        info!(target: "tn::generate_keys", worker=?worker.network_address, "updating worker external network address");
+        node_info.p2p_info.workers = (0..=WorkerId::MAX)
+            .take(usize::try_from(self.workers)?)
+            .map(|worker_id| {
+                let network_key = key_config.worker_network_public_key(worker_id);
+                let network_address = self
+                    .external_worker_addrs
+                    .as_ref()
+                    .and_then(|addrs| addrs.get(usize::from(worker_id)))
+                    .map_or_else(|| local_network_address(&mut sockets), |addr| Ok(addr.clone()))?
+                    .with_p2p(network_key.clone().into())
+                    .map_err(|_| {
+                        eyre::eyre!("worker {worker_id} address already contains a different P2P protocol")
+                    })?;
+                info!(target: "tn::generate_keys", worker_id, worker=?network_address, "updating worker external network address");
+                Ok(P2pNode { network_key, network_address, rpc: None })
+            })
+            .collect::<eyre::Result<_>>()?;
 
         Ok(())
     }
 
     /// Validate the CLI arguments before any keys are generated or written.
     fn validate(&self) -> eyre::Result<()> {
-        if self.workers != 1 {
-            return Err(eyre::eyre!("Only supports a single worker at this time!"));
-        }
+        eyre::ensure!(
+            (1..=u32::from(WorkerId::MAX) + 1).contains(&self.workers),
+            "worker count must be between 1 and {}",
+            u32::from(WorkerId::MAX) + 1
+        );
+        self.external_worker_addrs
+            .as_ref()
+            .map(|addrs| -> eyre::Result<()> {
+                eyre::ensure!(
+                    addrs.len() == usize::try_from(self.workers)?,
+                    "--external-worker-addrs must contain exactly {} addresses (one per worker)",
+                    self.workers
+                );
+                let mut addresses = HashSet::with_capacity(addrs.len());
+                addrs.iter().try_for_each(|addr| {
+                    // QUIC ignores trailing peer IDs when binding the listen socket.
+                    let end = addr.iter().enumerate().fold(0, |end, (index, protocol)| {
+                        if matches!(protocol, Protocol::P2p(_)) {
+                            end
+                        } else {
+                            index + 1
+                        }
+                    });
+                    let listen_address: Multiaddr = addr.iter().take(end).collect();
+                    eyre::ensure!(
+                        addresses.insert(listen_address),
+                        "--external-worker-addrs contains duplicate listen addresses: {addr}"
+                    );
+                    Ok(())
+                })
+            })
+            .transpose()?;
         Ok(())
     }
 
@@ -239,15 +272,6 @@ impl KeygenArgs {
         worker_rpc: Option<RpcInfo>,
     ) -> eyre::Result<()> {
         let mut node_info = NodeInfo::default();
-        /* Uncomment when multi-worker support is enabled
-        if self.workers > 1 {
-            node_info.p2p_info.worker_index.0 = Vec::with_capacity(self.workers as usize);
-            for _ in 0..self.workers {
-                node_info.p2p_info.worker_index.0.push(WorkerInfo::default());
-            }
-        }
-        */
-
         self.update_keys(&mut node_info, key_config)?;
 
         // execution address is set inside `set_proof_of_possession` (called by `update_keys`);

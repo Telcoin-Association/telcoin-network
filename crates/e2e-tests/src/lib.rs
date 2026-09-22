@@ -117,26 +117,46 @@ pub fn create_validator_info(
     address: &str,
     passphrase: Option<String>,
 ) -> eyre::Result<()> {
-    let datadir = dir.to_path_buf();
+    create_validator_info_with_workers(dir, address, passphrase, 1)
+}
 
-    // keytool
-    let keys_command =
-        CommandParser::<KeyArgs>::parse_from(["tn", "generate", "validator", "--address", address]);
-    keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)?;
-
-    Ok(())
+/// Generate all validator worker records through the same CLI arguments operators use.
+fn create_validator_info_with_workers(
+    dir: &Path,
+    address: &str,
+    passphrase: Option<String>,
+    workers: usize,
+) -> eyre::Result<()> {
+    let workers = workers.to_string();
+    let keys_command = CommandParser::<KeyArgs>::try_parse_from([
+        "tn",
+        "generate",
+        "validator",
+        "--address",
+        address,
+        "--workers",
+        &workers,
+    ])?;
+    keys_command.args.execute_insecure(dir.to_path_buf(), passphrase, INSECURE_TEST_KDF_ROUNDS)
 }
 
 /// Execute observer config inside tempdir
-fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
+fn create_observer_info(
+    datadir: PathBuf,
+    passphrase: Option<String>,
+    workers: usize,
+) -> eyre::Result<()> {
+    let workers = workers.to_string();
     // keytool
-    let keys_command = CommandParser::<KeyArgs>::parse_from([
+    let keys_command = CommandParser::<KeyArgs>::try_parse_from([
         "tn",
         "generate",
         "observer",
         "--address",
         "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    ]);
+        "--workers",
+        &workers,
+    ])?;
     keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)
 }
 
@@ -167,6 +187,7 @@ pub fn config_local_testnet_with_epoch_duration(
 /// Each entry is a `"WORKER_ID:STRATEGY:VALUE"` string, where `STRATEGY` is `0` for EIP-1559
 /// (`VALUE` = target gas) or `1` for a static fee (`VALUE` = fee in wei). Entries must cover
 /// contiguous worker ids starting at 0 (the genesis ceremony validates this).
+/// Validators and the observer provision that many worker records through `keytool generate`.
 ///
 /// When `worker_fee_configs` is empty this is identical to
 /// [`config_local_testnet_with_epoch_duration`]: the genesis CLI default
@@ -226,20 +247,22 @@ fn config_local_testnet_inner(
     let shared_genesis_dir = temp_path.join("shared-genesis");
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
-    // create validator info and copy to shared genesis dir
-    for (v, addr) in validators.iter() {
+    // The fee configuration and generated identities describe the same worker prefix.
+    let workers = worker_fee_configs.len().max(1);
+    validators.iter().try_for_each(|(v, addr)| -> eyre::Result<()> {
         let dir = temp_path.join(v);
         // init genesis ceremony to create committee files
-        create_validator_info(&dir, addr, passphrase.clone())?;
+        create_validator_info_with_workers(&dir, addr, passphrase.clone(), workers)?;
 
         // copy to shared genesis dir
         std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
-    }
+        Ok(())
+    })?;
 
     // Create an observer config.
     let dir = temp_path.join("observer");
     // init config ceremony for observer
-    create_observer_info(dir, passphrase.clone())?;
+    create_observer_info(dir, passphrase.clone(), workers)?;
 
     // create committee from shared genesis dir
     let mut genesis_args: Vec<String> = vec![
