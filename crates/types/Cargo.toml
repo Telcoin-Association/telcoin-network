@@ -52,7 +52,13 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
-test-utils = ["tracing-subscriber", "clap"]
+test-utils = [
+    "dep:tracing-subscriber",
+    "tracing-subscriber/fmt",
+    "tracing-subscriber/env-filter",
+    "dep:clap",
+    "clap/derive",
+]
 adiri = []
 
 [lints]
