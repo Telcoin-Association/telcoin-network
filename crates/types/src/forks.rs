@@ -411,7 +411,7 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 
 #[cfg(feature = "adiri")]
 /// First epoch whose [`Committee`](crate::Committee) is bcs-encoded in the multi-worker layout
-/// (#554).
+/// (issue #554).
 ///
 /// Two fields move at this boundary, both inside the `Committee` value itself:
 /// - each `BootstrapServer` writes `workers`, a length-prefixed sequence of `P2pNode`, where the
@@ -423,38 +423,58 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 /// worker's first byte as a sequence length. `Committee` is embedded in `EpochMeta`, the first
 /// record of every consensus pack, so an un-gated layout change bricks decode of every pack
 /// already on disk: an adiri node restarting on the new build cannot read its own history. Below
-/// this epoch the encoder writes the legacy single-worker shape byte-identically to the pre-#554
-/// binary, so packs stay readable in both directions across a mixed fleet.
+/// this epoch the encoder writes the legacy single-worker shape byte-identically to the
+/// pre-multi-worker (#554) binary, so packs stay readable in both directions across a mixed fleet.
 ///
 /// The gate ([`multi_workers_fork_active`]) always reads the epoch carried inside the value being
 /// encoded or decoded — never node-local committee state — so mixed-epoch containers (pack
 /// records, epoch records, state-sync payloads) decode correctly at any nesting depth and
 /// historical digests are preserved end to end.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 570: every committee of epoch 570 or later is encoded in
+/// the multi-worker layout. Measured boundary: Tue 2026-09-29 08:32 UTC (03:32 CDT). Derived by
+/// binary-searching first-block timestamps over epochs 536→544 on the live chain (mean epoch
+/// length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block 408941
+/// on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup so
+/// operators can diff it across the fleet; a compile-time constant that differs between binaries
+/// has no other in-protocol detection.
 ///
-/// Arming constraint: the concrete epoch must be at least [`CONSENSUS_REGISTRY_FORK_EPOCH`]
-/// (407). Committees below 407 are structurally single-worker — the deployed pre-fork registry
-/// exposes no governance path that raises the worker count — so the legacy layout is lossless
-/// for every epoch this gate leaves dormant. From 407 onward that guarantee becomes operational
-/// rather than structural: the worker count must stay at one until this fork epoch has begun, or
-/// a multi-worker committee gets written in a layout that cannot represent it.
+/// Re-verify at merge and at tag time. If epoch 570 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so committees at or past the constant that the fleet already wrote in the
+/// legacy layout would not decode under this build.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since it writes and reads the legacy layout for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch begins. A
-/// straggler still on an old build past the boundary fails to decode post-fork committees loudly
-/// and drops out rather than silently diverging.
+/// Arming constraint (compile-time asserted below): the epoch must be at least
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] (407). Committees below 407 are structurally single-worker —
+/// the deployed pre-fork registry exposes no governance path that raises the worker count — so the
+/// legacy layout is lossless for every epoch this gate leaves dormant. From 407 onward that
+/// guarantee becomes operational rather than structural: the on-chain worker count must stay at
+/// one until epoch 570 begins, or a multi-worker committee gets written in a layout that cannot
+/// represent it.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build is not cut off at this boundary: with a single worker it keeps running past it on
+/// its own legacy-layout packs and never decodes a peer's committee. It fails only when it must
+/// fetch an epoch pack for an epoch at or past the constant from an upgraded peer, or serve one
+/// to it, because the post-fork `EpochMeta` record does not decode on the old binary and the
+/// legacy record does not decode on the new one.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the multi-worker layout is active from
 /// genesis and this constant does not exist there.
-pub const MULTI_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
+pub const MULTI_WORKERS_FORK_EPOCH: Epoch = 570;
+
+/// Compile-time enforcement of the arming constraint documented on
+/// [`MULTI_WORKERS_FORK_EPOCH`]: a retarget that sets this fork below
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] fails to compile instead of leaving the ordering to a
+/// reader's arithmetic.
+#[cfg(feature = "adiri")]
+const _: () = assert!(MULTI_WORKERS_FORK_EPOCH >= CONSENSUS_REGISTRY_FORK_EPOCH);
 
 /// Whether the [`Committee`](crate::Committee) of `epoch` is bcs-encoded in the multi-worker
-/// layout (#554).
+/// layout (issue #554).
 ///
 /// Gates both directions of serialization. Callers MUST pass the epoch carried inside the value
 /// being encoded or decoded (the committee's own epoch, the epoch of the pack record being read),
@@ -486,20 +506,15 @@ pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
 /// because the two forks arm independently and must never be tied to one constant.
 ///
 /// Unchanged from [`MULTI_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
-/// carries pre-#554 packs on disk) stays dormant until the constant is lowered, and every other
-/// build is active from genesis. The genesis default rests on an assumption worth stating: no
-/// non-adiri network holds packs written by a pre-#554 binary, so no such build ever has to read
-/// the legacy single-worker layout. A non-adiri deployment that predates #554 would need its own
-/// dormant period here instead.
+/// carries pre-multi-worker (#554) packs on disk) stays dormant before
+/// [`MULTI_WORKERS_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other build is
+/// active from genesis. The genesis default rests on an assumption worth stating: no non-adiri
+/// network holds packs written by a pre-multi-worker (#554) binary, so no such build ever has to
+/// read the legacy single-worker layout. A non-adiri deployment that predates the multi-worker
+/// layout (#554) would need its own dormant period here instead.
 #[inline]
 const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "MULTI_WORKERS_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= MULTI_WORKERS_FORK_EPOCH
     }
@@ -1533,14 +1548,14 @@ mod tests {
     /// Pin the multi-workers gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
-    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// for the seed-signature gate: "dormant before `MULTI_WORKERS_FORK_EPOCH`" holds only under
     /// `adiri`. Every other build — including the default one that produces both the shipped node
     /// binary and the e2e binary — is active from genesis, so epoch 1 already uses the
     /// multi-worker layout there.
     ///
     /// Asserts against [`multi_workers_build_fork_active`], the override-free decision, so the
     /// result does not depend on whether `test-utils` was unified into this build. The grid is
-    /// derived from the constant, so arming the fork does not require editing this test.
+    /// derived from the constant, so retargeting the fork does not require editing this test.
     #[test]
     fn multi_workers_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
