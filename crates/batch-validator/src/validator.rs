@@ -361,6 +361,37 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Each worker accepts its own otherwise-valid batch and rejects every other worker's batch.
+    #[tokio::test]
+    async fn test_multi_worker_batch_validation_isolation() -> std::io::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        (0..3).for_each(|validator_worker| {
+            let validator = BatchValidator { worker_id: validator_worker, ..validator.clone() };
+            (0..3).for_each(|batch_worker| {
+                // Reseal after changing the ID so a digest mismatch cannot mask the worker check.
+                let batch = Batch { worker_id: batch_worker, ..batch.clone() }.seal_slow();
+                let result = validator.validate_batch(batch);
+                if validator_worker == batch_worker {
+                    assert!(result.is_ok(), "worker {validator_worker}: {result:?}");
+                } else {
+                    assert_matches!(
+                        result,
+                        Err(BatchValidationError::InvalidWorkerId {
+                            expected_worker_id,
+                            worker_id,
+                        }) if expected_worker_id == validator_worker && worker_id == batch_worker
+                    );
+                }
+            });
+        });
+        Ok(())
+    }
+
     //#[tokio::test]
     // This is not checked currently, leaving test for bit to make sure we want this.
     // This check will lead to occasional false errors and should not be critical since
