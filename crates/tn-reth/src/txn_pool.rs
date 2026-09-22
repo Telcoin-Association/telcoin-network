@@ -1016,6 +1016,9 @@ pub fn recover_pooled_transaction(
 mod config_tests;
 
 #[cfg(test)]
+mod canonical_update_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
