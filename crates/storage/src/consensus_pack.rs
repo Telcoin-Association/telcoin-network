@@ -413,7 +413,8 @@ impl ConsensusPack {
         epoch: Epoch,
         apply: bool,
     ) -> Result<EpochRepair, PackError> {
-        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+        let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        let data_file = epoch_dir.join(Inner::DATA_NAME);
         // Healthy requires BOTH a clean read-only open AND full validation. `open_static` proves
         // the seal, cross-file lengths, final position entry, and the FIRST digest-index
         // bucket's CRC — but it does NOT scan the other buckets or the data stream, so on
@@ -471,6 +472,31 @@ impl ConsensusPack {
             },
         };
 
+        // Prove the data-log WAL replays BEFORE wiping any index -- the same validate-before-mutate
+        // discipline `recover_pack` uses (pass 1). Only needed when `open_static` opened clean:
+        // then `recover_pack`'s `files_consistent` early-return would skip its own
+        // validation, so the wipe below is repair_epoch's own and must be proven here too.
+        // A structurally unrebuildable log (a v0 batches-first pack, or a v1/v2
+        // malformation the physical classifier misses) is reported `Unrepairable` with
+        // nothing changed -- so the pack still opens read-only afterwards -- and the dry
+        // run reports the same verdict the apply would. `replay_wal(.., None)` reads only
+        // the data log via `raw_iter`, never the (possibly corrupt) index.
+        if opens_clean {
+            let data = Pack::<PackRecord>::open(
+                &data_file,
+                epoch as u64,
+                true,
+                PackCompression::ZStd,
+                PACK_VERSION,
+            )?;
+            if let Err(e) = Inner::replay_wal(&data, &epoch_dir, None) {
+                return Ok(EpochRepair::Unrepairable(format!(
+                    "epoch {epoch}: the data log cannot be replayed to rebuild its indexes ({e}); \
+                     nothing was changed. Re-sync the epoch from peers."
+                )));
+            }
+        }
+
         if !apply {
             return Ok(EpochRepair::WouldRepair(plan));
         }
@@ -479,11 +505,11 @@ impl ConsensusPack {
         // bucket passes `files_consistent`, so the append open's `recover_pack` would
         // early-return and leave it untouched. Remove the derived digest indexes so the open must
         // rebuild them from the data-log WAL (`recover_pack` then wipes and rebuilds every index
-        // anyway). After the `!apply` return above, so a dry run writes nothing. Every other
-        // repairable case has `open_static` already failing, so `recover_pack` runs on its own and
-        // the indexes are left in place.
+        // anyway). The WAL was proven replayable above, so this wipe is always followed by a
+        // successful rebuild. After the `!apply` return above, so a dry run writes nothing. Every
+        // other repairable case has `open_static` already failing, so `recover_pack` runs on its
+        // own and the indexes are left in place.
         if opens_clean {
-            let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
             for name in [Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME] {
                 match std::fs::remove_dir_all(epoch_dir.join(name)) {
                     Ok(()) => {}
@@ -5156,6 +5182,74 @@ pub(crate) mod test {
             "after repair the pack must validate clean"
         );
         assert_pack_reads_back(&temp_dir, 3).await;
+    }
+
+    /// Finding #4: `repair_epoch` must PROVE the data-log WAL replays before wiping the digest
+    /// indexes. A pack that opens read-only clean but whose log cannot be rebuilt — here a sealed
+    /// v0 (batches-first) pack, which the header-first `replay_wal` cannot replay — must be
+    /// reported `Unrepairable` with nothing changed, so it still opens afterwards. Without the
+    /// guard the wipe happens first and `open_static` then fails on every later open. The dry
+    /// run must predict the same verdict as the apply.
+    #[tokio::test]
+    async fn test_repair_epoch_unrebuildable_preserves_indexes() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        const HDX_BUCKET: usize = 16 + (32 + 8) * 32;
+
+        let temp_dir = TempDir::with_prefix("test_repair_unrebuildable").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // A sealed v0 pack opens read-only clean post-migration, but its batches-first log cannot
+        // be replayed by the header-first `replay_wal`.
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
+
+        // Corrupt a non-first bucket so `open_static` (first-bucket-only) still succeeds but full
+        // validation fails, driving repair_epoch into the opens-clean-but-invalid branch.
+        {
+            let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
+            let n = bytes.len();
+            bytes[n - HDX_BUCKET + 12] ^= 0xFF;
+            std::fs::write(&hdx_path, &bytes).expect("write hdx");
+        }
+
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
+            "the corrupt non-first bucket must still pass the read-only open (the bug setup)"
+        );
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Invalid,
+            "the full validator must flag the corrupt bucket"
+        );
+
+        // Dry run must predict the apply verdict: Unrepairable, not WouldRepair.
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
+            .await
+            .expect("dry run must not err");
+        assert!(
+            matches!(dry, EpochRepair::Unrepairable(_)),
+            "an unreplayable v0 pack must be Unrepairable on a dry run, got {dry:?}"
+        );
+
+        // Apply must also report Unrepairable AND must not have wiped the indexes.
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("apply must not err");
+        assert!(
+            matches!(applied, EpochRepair::Unrepairable(_)),
+            "an unreplayable v0 pack must be Unrepairable on apply, got {applied:?}"
+        );
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
+            "repair must not have wiped the indexes: open_static must still succeed after an \
+             Unrepairable apply"
+        );
     }
 
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
