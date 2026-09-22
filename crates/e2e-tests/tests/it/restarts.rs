@@ -713,7 +713,7 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let temp = tempfile::TempDir::new()?;
-    config_local_testnet(temp.path(), Some("cold_genesis".to_string()), None)?;
+    config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
         get_available_tcp_port("127.0.0.1")
