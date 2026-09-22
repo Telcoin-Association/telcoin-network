@@ -53,7 +53,7 @@ Two shorthands used throughout:
    and the `close_epoch_for_last_batch(i)` boundary (`primary/output.rs:240-244`) are both indexed
    off the digest deque while the transactions are indexed off the batch vectors, so unequal lengths
    mean the epoch-close system calls fire on the wrong block or on none. Under `adiri` the check is
-   relaxed for epochs `<= ADIRI_DUP_BATCH_EPOCH` (160, `tn-types` `forks.rs:46`) so testnet can
+   relaxed for epochs `<= ADIRI_DUP_BATCH_EPOCH` (160, `tn-types` `forks.rs`) so testnet can
    replay a historical duplicate-batch bug.
 2. **Digest index bounds** (`:188-190`), `TnEngineError::NextBlockDigestMissing`. Fires when the
    deque is *shorter* than the flattened batches. The count check above rejects that condition
@@ -76,10 +76,19 @@ in its blocking task instead of returning a `TnEngineError`; the dropped oneshot
 
 ### Digest ↔ batch positional alignment is emergent, not asserted here
 
-The engine pairs the *i*-th flattened batch with the *i*-th digest in the deque: the digest becomes
-the block's `ommers_hash` and `mix_hash = output_digest ^ batch_digest`. **This crate never verifies
-that pairing** — it does not re-derive `batch.digest()` at all, only compares counts. The property
-comes from two walks over the same source in `Subscriber::fetch_batches`:
+The engine pairs the *i*-th flattened batch with the *i*-th digest in the deque.
+The digest becomes the block's `ommers_hash`, and the index and digest together go to `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs:310`, called from `crates/engine/src/payload_builder.rs:238`), which returns the block's `mix_hash` (EVM `PREVRANDAO`).
+That function has two arms, chosen by `prevrandao_seed_active` (`tn-types` `forks.rs`) on the committing leader's epoch, which also requires the seed-signature fork:
+
+- the legacy arm, `output_digest ^ batch_digest`, runs on `adiri` epochs below `PREVRANDAO_FORK_EPOCH` (574).
+  It is kept byte-identical so replayed testnet history reproduces the same headers.
+  The empty epoch-closing block passes a zero batch digest (`:161`), so its `mix_hash` is the bare output digest.
+- the seed-chain fold, `seeded_prev_randao` (`primary/output.rs:324`), runs on `adiri` from epoch 574 and on every non-`adiri` build, mainnet included, from genesis.
+  It computes `keccak256("TN_PREVRANDAO_V1" || seed chain value || consensus block number || batch index)`, integers as little-endian `u64`, where the seed chain value is `committee_shuffle_seed()` as of this commit.
+  The batch digest is not an input, so after the fork a mispaired digest corrupts only `ommers_hash`.
+
+**This crate never verifies that pairing**: it does not re-derive `batch.digest()` at all, only compares counts.
+The property comes from two walks over the same source in `Subscriber::fetch_batches`:
 
 - `crates/consensus/executor/src/subscriber.rs:447-452` pushes every `header.payload()` key, in
   order, across `sub_dag.headers()`, into the `batch_digests` deque.

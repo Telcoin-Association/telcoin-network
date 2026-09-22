@@ -2389,12 +2389,12 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         // Independent oracle for the mix hash: recompose the exact bytes by hand for whichever
         // derivation this build's fork schedule selects, rather than trusting
         // `ConsensusOutput::prev_randao` to check itself. Gated on the same predicate the engine
-        // dispatches on, so the oracle stays correct under `--features adiri` (dormant: legacy
-        // XOR) and default features (active: seeded).
+        // dispatches on, so the oracle stays correct under `--features adiri` (epoch 0 is below
+        // the epoch 574 PREVRANDAO fork: legacy XOR) and default features (seeded from genesis).
         //
         // That shared dispatch is also the oracle's limit: it is independent on byte layout only,
-        // so a regression in the predicate itself moves both sides together. Default builds carry
-        // no dormant period, so pin their arm outright rather than leaving it to the dispatch.
+        // so a regression in the predicate itself moves both sides together. Default builds have
+        // no pre-fork window, so pin their arm outright rather than leaving it to the dispatch.
         #[cfg(not(feature = "adiri"))]
         assert!(
             tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()),
