@@ -716,10 +716,14 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     config_local_testnet(temp.path(), Some("cold_genesis".to_string()), None)?;
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
-        get_available_tcp_port("127.0.0.1")?,
-        get_available_tcp_port("127.0.0.1")?,
-        get_available_tcp_port("127.0.0.1")?,
-        get_available_tcp_port("127.0.0.1")?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 0"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 1"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 2"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 3"))?,
     ];
     let client_urls = rpc_ports.map(|port| format!("http://127.0.0.1:{port}"));
     let [alone_port, ..] = rpc_ports;
