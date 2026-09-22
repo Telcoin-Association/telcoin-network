@@ -457,34 +457,53 @@ where
         version: u16,
     ) -> Result<(MmapDataFile, DataHeader), LoadHeaderError> {
         let mut data_file = MmapDataFile::open(path, ro)?;
-        let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
+        let header = Self::init_header(&mut data_file, uid_idx, compression, version, ro)?;
         Ok((data_file, header))
     }
 
-    /// Write a fresh [`DataHeader`] to an empty file, or load and validate an existing one, then
-    /// flush.
+    /// Write a fresh [`DataHeader`] to an empty (or never-written) file, or load and validate an
+    /// existing one, then flush.
     fn init_header(
         data_file: &mut MmapDataFile,
         uid_idx: u64,
         compression: PackCompression,
         version: u16,
+        read_only: bool,
     ) -> Result<DataHeader, LoadHeaderError> {
         let file_end = data_file.data_file_end();
-        let header = if file_end == 0 {
+        // A file with a physical size but all-zero logical bytes was sized by a first write
+        // (`grow_to`'s ftruncate + fsync) that crashed before the header reached disk. It is
+        // semantically unwritten — the same "all-zero == unwritten" rule the pack applies to
+        // records — so treat it as fresh rather than feeding zeros to `load_header` (which fails
+        // with a bare CRC error no door can classify). `is_unwritten` is gated on `opened_unclean`
+        // since a clean close always leaves a non-zero trailing sentinel.
+        let never_written = file_end != 0 && data_file.opened_unclean() && data_file.is_unwritten();
+        if file_end == 0 || (never_written && !read_only) {
+            if never_written {
+                // Reset the sized-but-unwritten file to empty; this discards only zeros, so it is a
+                // fresh initialization, not a repair of any committed data.
+                data_file.set_len(0)?;
+            }
             let header = DataHeader::new(uid_idx, compression, version);
             header.write_header(data_file)?;
-            header
-        } else {
-            let header = DataHeader::load_header(data_file, uid_idx)?;
-            if header.version() > version {
-                // Do not allow a newer version than we request but allow an older.
-                return Err(LoadHeaderError::InvalidVersion);
-            }
-            if header.appnum() != 1 {
-                return Err(LoadHeaderError::InvalidAppNum);
-            }
-            header
-        };
+            // Make the header durable (msync + fsync) NOW, before anything can observe the pack.
+            // Otherwise a crash after `grow_to`'s zero-fsync but before the meta commit leaves an
+            // all-zero file; syncing here narrows that window and keeps a fresh header on disk.
+            data_file.sync_disk()?;
+            return Ok(header);
+        } else if never_written {
+            // Read-only door: it cannot re-initialize, so surface a classifiable, actionable error
+            // instead of a bare CRC failure.
+            return Err(LoadHeaderError::Unwritten);
+        }
+        let header = DataHeader::load_header(data_file, uid_idx)?;
+        if header.version() > version {
+            // Do not allow a newer version than we request but allow an older.
+            return Err(LoadHeaderError::InvalidVersion);
+        }
+        if header.appnum() != 1 {
+            return Err(LoadHeaderError::InvalidAppNum);
+        }
         data_file.flush()?;
         Ok(header)
     }

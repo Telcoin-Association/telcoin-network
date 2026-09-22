@@ -405,6 +405,23 @@ impl MmapDataFile {
         self.opened_unclean
     }
 
+    /// True iff the file has a physical size but every logical byte is zero — the signature of a
+    /// first write whose `grow_to` ftruncate+fsync sized the file (to `DEFAULT_INITIAL_SIZE`) but
+    /// whose header never reached disk before a crash. Such a file is semantically *unwritten*
+    /// (the same "all-zero == unwritten" rule the pack applies to records), not corrupt. Only
+    /// meaningful on an [`Self::opened_unclean`] file: a clean close always leaves a non-zero
+    /// trailing sentinel, so a sealed file is never all-zero.
+    ///
+    /// The scan is bounded to `opts.initial_size` — a never-written file is exactly that first-grow
+    /// size, and growing past it requires writing (a non-zero header first), so a larger all-zero
+    /// file is not a first-write artifact ("something else is wrong"). Bounding here both excludes
+    /// that case and keeps a pathological large all-zero file from bogging down the open.
+    pub fn is_unwritten(&self) -> bool {
+        self.end != 0
+            && self.end <= self.opts.initial_size
+            && self.slice(0, self.end as usize).is_some_and(|b| b.iter().all(|&x| x == 0))
+    }
+
     /// The durable acked-data watermark recovered from the tail commit marker of an unclean file,
     /// if a valid one was found at open. `None` on clean/fresh opens or when no valid marker
     /// survived (best-effort). Recovery uses it as an index-free way to detect at-rest

@@ -426,6 +426,16 @@ impl ConsensusPack {
                 pack.close().await;
                 true
             }
+            // An all-zero `data` file (a first write that sized the file but crashed before the
+            // header was durable) is unwritten, not repairable: there is nothing to rebuild.
+            // Report it with an actionable message rather than letting the classifier surface a
+            // bare open error.
+            Err(e) if e.is_unwritten_data_file() => {
+                return Ok(EpochRepair::Unrepairable(format!(
+                    "epoch {epoch}: the data file is all zeros (an interrupted first write); \
+                     remove `epoch-{epoch}/` -- it is recreated on the next epoch transition."
+                )));
+            }
             Err(_) => false,
         };
         let validates_clean = matches!(
@@ -3013,6 +3023,22 @@ impl PackError {
                 )
         )
     }
+
+    /// True iff this is the "unwritten data file" open error: the `data` file has a physical size
+    /// but is all zeros — a first write that sized the file (ftruncate + fsync) but crashed before
+    /// the header was durable. There is nothing to rebuild; `repair_epoch` maps this to an
+    /// actionable `Unrepairable`, and read-only doors surface it so the operator can remove the
+    /// pack directory (a writable open reinitializes it in place).
+    pub fn is_unwritten_data_file(&self) -> bool {
+        matches!(
+            self,
+            PackError::Open(open_error)
+                if matches!(
+                    open_error.as_ref(),
+                    OpenError::DataFileOpen(LoadHeaderError::Unwritten)
+                )
+        )
+    }
 }
 
 impl Error for PackError {}
@@ -5249,6 +5275,110 @@ pub(crate) mod test {
             ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
             "repair must not have wiped the indexes: open_static must still succeed after an \
              Unrepairable apply"
+        );
+    }
+
+    /// Finding #7: a fresh pack whose first write sized the `data` file to 1 MiB of zeros but
+    /// crashed before the header was durable is *unwritten*, not corrupt. A writable `open_append`
+    /// must reinitialize it in place (so the node stops crash-looping at `new_epoch`) rather than
+    /// failing with a bare CRC error.
+    #[tokio::test]
+    async fn test_open_append_reinitializes_unwritten_file() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_append").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Simulate the crash: an epoch dir with a 1 MiB all-zero `data` file.
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("write zeros");
+
+        // Writable open reinitializes the unwritten file and behaves like a fresh pack.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open_append must reinitialize an all-zero data file");
+        let output =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        pack.save_consensus_output(output).await.expect("save output");
+        pack.persist().await.expect("persist");
+        pack.close().await;
+
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after reinit");
+        assert!(pack.get_consensus_output(1).await.is_ok(), "output must read back after reinit");
+    }
+
+    /// Finding #7: a read-only door cannot reinitialize, so it must surface the all-zero file as a
+    /// classifiable, actionable error rather than a bare "invalid crc32 checksum".
+    #[tokio::test]
+    async fn test_open_static_rejects_unwritten_file() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_static").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("write zeros");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("read-only open of an all-zero file must fail");
+        assert!(err.is_unwritten_data_file(), "must be classified as unwritten, got {err:?}");
+        assert!(
+            err.to_string().contains("all zeros"),
+            "the error must be actionable (mention 'all zeros'), got: {err}"
+        );
+    }
+
+    /// Finding #7 (refinement): only a file up to the first-grow size (`initial_size` = 1 MiB) is
+    /// treated as unwritten. A larger all-zero file is not a first-write artifact (growing past the
+    /// first allocation requires writing a non-zero header first), so it must NOT be classified as
+    /// unwritten — it falls through to the normal corrupt-header path, and the zero-scan never runs
+    /// over it.
+    #[tokio::test]
+    async fn test_oversized_zero_file_is_not_unwritten() {
+        let temp_dir = TempDir::with_prefix("test_oversized_zero").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        // One byte past the 1 MiB first-grow size.
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; (1 << 20) + 1])
+            .expect("write zeros");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("read-only open of an oversized all-zero file must fail");
+        assert!(
+            !err.is_unwritten_data_file(),
+            "a file larger than the first grow must NOT be classified as unwritten, got {err:?}"
+        );
+    }
+
+    /// Finding #7: `db repair` on an all-zero file reports `Unrepairable` (there is nothing to
+    /// rebuild) with an actionable message, and does NOT mutate the file (no sealing the zeros into
+    /// an 8-byte sentinel, which would erase the forensic signal).
+    #[tokio::test]
+    async fn test_repair_epoch_unwritten_is_unrepairable() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_repair").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        std::fs::write(&data_path, vec![0_u8; 1 << 20]).expect("write zeros");
+
+        for apply in [false, true] {
+            let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect("repair must not err");
+            match res {
+                EpochRepair::Unrepairable(msg) => assert!(
+                    msg.contains("all zeros"),
+                    "an unwritten file must be Unrepairable with an actionable message, got: {msg}"
+                ),
+                other => {
+                    panic!("an unwritten file must be Unrepairable (apply={apply}), got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("stat").len(),
+            1 << 20,
+            "repair must not mutate the unwritten data file"
         );
     }
 
