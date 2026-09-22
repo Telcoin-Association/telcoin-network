@@ -3,7 +3,6 @@
 use super::*;
 use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
 use rand::{rngs::StdRng, SeedableRng as _};
-use reth_chainspec::EthChainSpec as _;
 use reth_transaction_pool::error::PoolErrorKind;
 use std::collections::BTreeSet;
 use tempfile::TempDir;
