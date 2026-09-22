@@ -564,38 +564,41 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 ///   two headers is credited to whichever header comes first in sequence and dropped from the
 ///   second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork permutes exactly that
 ///   sequence, so arming it at or below the cutoff would change replayed attribution on adiri, a
-///   resync divergence rather than just a reordering. The epoch-setting PR is the place this bites,
-///   and that PR will not be looking at the dup-batch interaction; the assert makes it look.
+///   resync divergence rather than just a reordering. A retarget of the constant is the place this
+///   bites, and a retarget will not be looking at the dup-batch interaction; the assert makes it
+///   look.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 567: every commit whose leader carries epoch 567 or later
+/// takes the seeded intra-round order. Measured boundary: Mon 2026-09-28 14:32 UTC (09:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup
+/// so operators can diff it across the fleet; a compile-time constant that differs between
+/// binaries has no other in-protocol detection.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since the legacy order stays in force for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
-/// begins. A straggler still on an old build past the boundary orders the same certificates
-/// differently, executes them in a different sequence, and forks away from the upgraded fleet
-/// at its next commit. That divergence is loud (its executed state stops matching the fleet's)
-/// but it is a fork, not a decode error, so the fleet must be fully upgraded before the epoch
-/// is armed.
+/// Re-verify at merge and at tag time. If epoch 567 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so commits the fleet already executed in the legacy order at or past the
+/// constant would replay in the seeded order on this build and diverge from canonical history.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary orders the same certificates differently, executes them in a
+/// different sequence, and forks away from the upgraded fleet at its next commit. That divergence
+/// is loud (its executed state stops matching the fleet's) but it is a fork, not a decode error,
+/// so the fleet must be fully upgraded before the fork epoch begins.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the seeded order is active from genesis
 /// and this constant does not exist there.
-pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
+pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = 567;
 
 /// Compile-time enforcement of the first arming constraint documented on
-/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a rollout PR that sets this fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires (the [`leader_seeded_ordering_active`] conjunct).
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a retarget that sets this fork below the seed fork
+/// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
+/// fires (the [`leader_seeded_ordering_active`] conjunct).
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while LEADER_SEEDED_ORDERING_FORK_EPOCH is the `u32::MAX` \
-              placeholder; once the rollout PR lowers the constant the comparison becomes \
-              live and this expectation flags itself for removal"
-)]
 const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Compile-time enforcement of the second arming constraint documented on
@@ -652,17 +655,12 @@ fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
 /// independently and must never be tied to one constant.
 ///
 /// Unchanged from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]'s documented contract: adiri (testnet,
-/// which carries legacy-ordered commits in its history) stays dormant until the constant is
-/// lowered, and every other build is active from genesis.
+/// which carries legacy-ordered commits in its history) stays dormant before
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other
+/// build is active from genesis.
 #[inline]
 const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "LEADER_SEEDED_ORDERING_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not \
-                  `==`) is the gate the future epoch-setting PR relies on, and this expectation \
-                  flags itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= LEADER_SEEDED_ORDERING_FORK_EPOCH
     }
@@ -1598,14 +1596,14 @@ mod tests {
     /// implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`]
-    /// states for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds
-    /// only under `adiri`. Every other build, including the default one that produces both the
-    /// shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
+    /// states for the seed-signature gate: "dormant before `LEADER_SEEDED_ORDERING_FORK_EPOCH`"
+    /// holds only under `adiri`. Every other build, including the default one that produces both
+    /// the shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
     /// orders sub-DAGs with the leader-seeded tie-break there.
     ///
     /// Asserts against [`leader_seeded_ordering_build_fork_active`], the override-free
     /// decision, so the result does not depend on whether `test-utils` was unified into this
-    /// build. The grid is derived from the constant, so arming the fork does not require
+    /// build. The grid is derived from the constant, so retargeting the fork does not require
     /// editing this test.
     #[test]
     fn leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract() {
@@ -1666,6 +1664,60 @@ mod tests {
                 "the public gate must be exactly the fail-closed conjunction at epoch {epoch}",
             );
         });
+    }
+
+    /// The public leader-seeded gate, seed conjunct included, flips exactly at the compiled
+    /// adiri boundary: closed at the last pre-fork epoch even though the seed fork is already
+    /// active there, open from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`], and closed at
+    /// [`SEED_SIGNATURE_FORK_EPOCH`], where the seed conjunct alone holds.
+    ///
+    /// [`leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract`] pins the
+    /// override-free fork point; this pins [`leader_seeded_ordering_active`], the decision
+    /// `order_dag` consults. That gate reads the test overrides, so the test first proves neither
+    /// fork is pinned in this process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn leader_seeded_ordering_public_gate_flips_at_the_compiled_adiri_boundary() {
+        // the overrides latch process-wide, so a pin exported to this process moves the flip
+        // away from the compiled constants; fail loudly rather than assert a schedule this
+        // process is not running
+        let pinned: Vec<_> = fork_epoch_overrides()
+            .into_iter()
+            .filter(|(var, _)| {
+                matches!(
+                    *var,
+                    "TN_SEED_SIGNATURE_FORK_EPOCH" | "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH"
+                )
+            })
+            .collect();
+        assert!(
+            pinned.is_empty(),
+            "this test asserts the compiled adiri schedule and needs a process without \
+             TN_SEED_SIGNATURE_FORK_EPOCH or TN_LEADER_SEEDED_ORDERING_FORK_EPOCH set: \
+             {pinned:?}",
+        );
+
+        let fork = LEADER_SEEDED_ORDERING_FORK_EPOCH;
+        let last_pre_fork = fork - 1;
+        assert!(
+            seed_signature_active(last_pre_fork),
+            "the seed fork must already be active at epoch {last_pre_fork}, so only the fork \
+             point can hold the gate closed there",
+        );
+        assert!(
+            !leader_seeded_ordering_active(last_pre_fork),
+            "epoch {last_pre_fork} precedes LEADER_SEEDED_ORDERING_FORK_EPOCH and must keep the \
+             legacy order",
+        );
+        assert!(
+            leader_seeded_ordering_active(fork),
+            "epoch {fork} is LEADER_SEEDED_ORDERING_FORK_EPOCH and must take the seeded order",
+        );
+        assert!(
+            !leader_seeded_ordering_active(SEED_SIGNATURE_FORK_EPOCH),
+            "the seed fork epoch {SEED_SIGNATURE_FORK_EPOCH} precedes the leader-seeded fork and \
+             must keep the legacy order",
+        );
     }
 
     /// Sentinel selecting the child dispatch of
