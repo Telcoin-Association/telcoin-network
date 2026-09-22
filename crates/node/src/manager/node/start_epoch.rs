@@ -39,7 +39,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkCon
 use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, StateSynchronizer,
+    ConsensusBus, ConsensusBusApp, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
     system_calls::{
@@ -50,14 +50,39 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
-    CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader, TaskManager, TaskSpawner, WorkerId,
-    DEFAULT_WORKER_ID,
+    gas_accumulator::GasAccumulator, Address, AuthorityIdentifier, BatchValidation, BlsPublicKey,
+    BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader,
+    TaskManager, TaskSpawner, WorkerId,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Worker-independent RPC state shared while initializing an epoch's workers.
+///
+/// Each worker supplies its own network identity before constructing a complete [`RpcNodeInfo`].
+#[derive(Clone)]
+struct WorkerRpcContext {
+    /// Consensus channels used by the worker's RPC adapter.
+    consensus_bus: ConsensusBusApp,
+    /// Chain id shared by all workers.
+    chain_id: u64,
+    /// Version of the running software.
+    version: &'static str,
+    /// Configured name of the node.
+    name: String,
+    /// BLS public key identifying the node.
+    bls_public_key: BlsPublicKey,
+    /// Authority identifier derived from the node's BLS key.
+    authority_id: AuthorityIdentifier,
+    /// Execution address receiving the node's consensus rewards.
+    execution_address: Address,
+    /// Public key identifying the primary network.
+    primary_network_key: NetworkPublicKey,
+    /// External address of the primary network.
+    primary_external_address: Multiaddr,
+}
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -219,38 +244,28 @@ where
             .await?;
 
         let public_key = self.key_config.public_key();
-        let node_info = RpcNodeInfo {
+        let rpc_context = WorkerRpcContext {
+            consensus_bus: consensus_bus_app,
             chain_id: engine.get_reth_env().await.chainspec().chain_id(),
             name: self.builder.tn_config.node_info.name.clone(),
             bls_public_key: public_key,
             authority_id: public_key.into(),
             execution_address: self.builder.tn_config.node_info.execution_address,
             primary_network_key: self.key_config.primary_network_public_key(),
-            // The worker-specific fields are filled in when each RPC server starts.
-            worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
             primary_external_address: self
                 .builder
                 .tn_config
                 .node_info
                 .primary_network_address()
                 .clone(),
-            worker_external_address: self
-                .builder
-                .tn_config
-                .node_info
-                .worker_network_address(DEFAULT_WORKER_ID)
-                .ok_or_eyre("no worker network address in node info")?
-                .clone(),
             version: self.version_str,
         };
-        let engine_to_primary =
-            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone(), node_info);
         let workers = self
             .spawn_worker_node_components(
                 &consensus_config,
                 engine,
                 epoch_task_manager.get_spawner(),
-                engine_to_primary,
+                rpc_context,
                 gas_accumulator,
                 previous_committee_keys,
             )
@@ -441,7 +456,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
-        engine_to_primary: EngineToPrimaryRpc,
+        rpc_context: WorkerRpcContext,
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<Vec<WorkerNode<DB>>> {
@@ -472,7 +487,7 @@ where
                     worker_id,
                     consensus_config,
                     engine,
-                    engine_to_primary.clone(),
+                    rpc_context.clone(),
                     &gas_accumulator,
                     previous_committee_keys.clone(),
                 )
@@ -492,7 +507,7 @@ where
         worker_id: WorkerId,
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
-        mut engine_to_primary: EngineToPrimaryRpc,
+        rpc_context: WorkerRpcContext,
         gas_accumulator: &GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<WorkerNode<DB>> {
@@ -519,15 +534,29 @@ where
             // early from replay_missed_consensus (epoch boundary hit) before create_consensus
             // is reached, leaving workers uninitialized.
             if !engine.is_worker_initialized(worker_id).await {
-                engine_to_primary.node_info.worker_network_key =
-                    self.key_config.worker_network_public_key(worker_id);
-                engine_to_primary.node_info.worker_external_address = self
-                    .builder
-                    .tn_config
-                    .node_info
-                    .worker_network_address(worker_id)
-                    .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
-                    .clone();
+                let node_info = RpcNodeInfo {
+                    chain_id: rpc_context.chain_id,
+                    name: rpc_context.name,
+                    bls_public_key: rpc_context.bls_public_key,
+                    authority_id: rpc_context.authority_id,
+                    execution_address: rpc_context.execution_address,
+                    primary_network_key: rpc_context.primary_network_key,
+                    worker_network_key: self.key_config.worker_network_public_key(worker_id),
+                    primary_external_address: rpc_context.primary_external_address,
+                    worker_external_address: self
+                        .builder
+                        .tn_config
+                        .node_info
+                        .worker_network_address(worker_id)
+                        .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
+                        .clone(),
+                    version: rpc_context.version,
+                };
+                let engine_to_primary = EngineToPrimaryRpc::new(
+                    rpc_context.consensus_bus,
+                    self.consensus_chain.clone(),
+                    node_info,
+                );
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -1216,29 +1245,22 @@ mod tests {
             })
             .collect();
         let key = manager.key_config.public_key();
-        let rpc = EngineToPrimaryRpc::new(
-            manager.consensus_bus.clone(),
-            manager.consensus_chain.clone(),
-            RpcNodeInfo {
-                chain_id: consensus_config.chain_id(),
-                name: "multi-worker test".to_owned(),
-                bls_public_key: key,
-                authority_id: key.into(),
-                execution_address: manager.builder.tn_config.node_info.execution_address,
-                primary_network_key: manager.key_config.primary_network_public_key(),
-                worker_network_key: manager.key_config.worker_network_public_key(0),
-                primary_external_address: manager
-                    .builder
-                    .tn_config
-                    .node_info
-                    .primary_network_address()
-                    .clone(),
-                worker_external_address: consensus_config
-                    .worker_address(0)
-                    .ok_or_else(|| eyre!("worker zero address"))?,
-                version: "test",
-            },
-        );
+        let rpc_context = WorkerRpcContext {
+            consensus_bus: manager.consensus_bus.clone(),
+            chain_id: consensus_config.chain_id(),
+            name: "multi-worker test".to_owned(),
+            bls_public_key: key,
+            authority_id: key.into(),
+            execution_address: manager.builder.tn_config.node_info.execution_address,
+            primary_network_key: manager.key_config.primary_network_public_key(),
+            primary_external_address: manager
+                .builder
+                .tn_config
+                .node_info
+                .primary_network_address()
+                .clone(),
+            version: "test",
+        };
         accumulator.base_fee(0).set_base_fee(100_000_001);
         accumulator.base_fee(1).set_base_fee(100_000_002);
         let mut epoch_tasks = TaskManager::default();
@@ -1247,7 +1269,7 @@ mod tests {
                 &consensus_config,
                 &engine,
                 epoch_tasks.get_spawner(),
-                rpc.clone(),
+                rpc_context.clone(),
                 accumulator.clone(),
                 HashSet::new(),
             )
@@ -1284,7 +1306,7 @@ mod tests {
                 &consensus_config,
                 &engine,
                 next_tasks.get_spawner(),
-                rpc,
+                rpc_context,
                 accumulator,
                 HashSet::new(),
             )
