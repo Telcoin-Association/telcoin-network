@@ -20,6 +20,7 @@ use crate::{
     engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
     worker::worker_task_manager_name,
 };
+use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
     collections::HashSet,
     future::{ready, Future},
@@ -48,12 +49,11 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 ///
 /// The manager's loop (`run_epochs` in the `node` module) passes one in to start an epoch and gets
 /// one back describing the boundary that was crossed, then feeds that returned mode into the next
-/// iteration. Two behaviors gate on it: whether to replay missed consensus on entry
-/// ([`RunEpochMode::replay_consensus`]) and whether this is the one-time process startup
-/// ([`RunEpochMode::initial_epoch`]).
+/// iteration. It determines whether to replay missed consensus on entry
+/// ([`RunEpochMode::replay_consensus`]). Network bring-up has already completed before the loop.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum RunEpochMode {
-    /// First epoch after process start. Triggers the one-time network init and a consensus replay,
+    /// First epoch after process start. Triggers a consensus replay,
     /// since output validated before the previous shutdown may still need to reach the engine.
     Initial,
     /// The epoch was re-entered for the same committee because the node's role changed mid-epoch
@@ -79,13 +79,6 @@ impl RunEpochMode {
             RunEpochMode::Initial | RunEpochMode::NewEpoch => true,
         }
     }
-
-    /// Whether this is the process's first epoch. Used as one input to the network-first-init
-    /// decision; the actual gate also accounts for the replay-and-close restart path, which can
-    /// defer real network setup past the [`RunEpochMode::Initial`] iteration.
-    fn initial_epoch(&self) -> bool {
-        matches!(self, RunEpochMode::Initial)
-    }
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -110,10 +103,7 @@ where
     ///    replayed output before going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
     ///    components. The previous and next committees' keys are resolved first in ONE batched read
-    ///    pinned to the epoch-start header and threaded into both steps as parameters. The one-time
-    ///    per-process network setup is gated on `network_first_init`, which is driven by
-    ///    `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
-    ///    return above can defer setup to a following iteration without skipping it.
+    ///    pinned to the epoch-start header and threaded into both steps as parameters.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
@@ -217,26 +207,6 @@ where
                 .await?
                 .apply(&gas_accumulator);
         }
-        // Produce a "dummy" epoch 0 EpochRecord if missing.
-        // This will let us use simple code to find any epoch including 0 at startup.
-        if !self.consensus_chain.epochs().contains_epoch(0).await {
-            if committee.epoch() != 0 {
-                return Err(eyre::eyre!(
-                    "We have epoch 0 in our database if we are past epoch 0, on {}",
-                    committee.epoch()
-                ));
-            }
-            // No keys for epoch 0, fix that.
-            // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
-            let next_committee = committee.clone();
-            let epoch_rec =
-                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
-            // Save the "dummy" record, should be overwritten once epoch 0 closes.
-            // This will NOT be signed.
-            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
-        }
-
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
@@ -347,22 +317,11 @@ where
             gas_accumulator.num_workers(),
         );
 
-        // The networks need their one-time, per-process setup (start listening, register bootstrap
-        // peers) on the first iteration that actually reaches `create_consensus`. This is usually
-        // the `Initial` epoch, but the replay above can return early before
-        // `create_consensus` on a restart that replays-and-closes an epoch boundary, so the first
-        // real setup then happens on a following `NewEpoch` iteration. Drive the decision off
-        // whether the network has actually been set up yet (not off `RunEpochMode::Initial`) so the
-        // setup is never skipped on that restart path. (Committee slots are set every epoch
-        // regardless via `update_committees`.)
-        let network_first_init = epoch_mode.initial_epoch() || !self.network_initialized;
-
         // create primary and worker nodes
-        let (primary, worker_node) = self
+        let (primary, worker_nodes) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
-                network_first_init,
                 gas_accumulator.clone(),
                 consensus_bus.clone(),
                 consensus_config.clone(),
@@ -370,14 +329,15 @@ where
                 previous_committee_keys,
             )
             .await?;
-        // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
-        self.network_initialized = true;
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
         let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
-        let mut worker = worker_node.new_worker().await?;
+        let mut workers = futures::stream::iter(&worker_nodes)
+            .then(|worker_node| worker_node.new_worker())
+            .try_collect::<Vec<_>>()
+            .await?;
         let current_epoch = primary.current_committee().await.epoch();
         let (current_consensus_epoch, _, _) = self.consensus_bus.published_consensus_num_hash();
         if current_epoch < current_consensus_epoch {
@@ -414,22 +374,26 @@ where
             self.epoch_boundary,
         );
 
-        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-        // start batch builder
-        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-
-        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
-        engine
-            .start_batch_builder(
-                worker.id(),
-                worker.batches_tx(),
-                &batch_builder_task_spawner,
-                gas_accumulator.base_fee(worker.id()).base_fee(),
-                current_epoch,
-            )
+        // Drain the previous cache once, before any new builder can write this epoch's batches.
+        self.orphan_batches(&epoch_task_manager, engine.clone(), workers.clone(), current_epoch)
             .await?;
 
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)
+        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
+        futures::stream::iter(&mut workers)
+            .then(|worker| {
+                worker.spawn_batch_builder(
+                    &worker_task_manager_name(worker.id()),
+                    &epoch_task_manager,
+                );
+                engine.start_batch_builder(
+                    worker.id(),
+                    worker.batches_tx(),
+                    &batch_builder_task_spawner,
+                    gas_accumulator.base_fee(worker.id()).base_fee(),
+                    current_epoch,
+                )
+            })
+            .try_collect::<()>()
             .await?;
 
         // update tasks

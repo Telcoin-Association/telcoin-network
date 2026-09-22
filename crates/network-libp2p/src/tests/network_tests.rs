@@ -22,6 +22,67 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Query both public counts while processing only commands, leaving swarm progress under the
+/// test's control so a pending dial cannot race a handshake or a dial failure.
+async fn query_peer_counts(
+    network: &mut ConsensusNetworkMemoryDB<TestWorkerRequest, TestWorkerResponse>,
+) -> eyre::Result<(usize, usize)> {
+    let handle = network.network_handle();
+    let (counts, processed) = tokio::join!(
+        async {
+            Ok::<_, eyre::Report>((
+                handle.connected_peer_count().await?,
+                handle.established_peer_count().await?,
+            ))
+        },
+        async {
+            let command = network.commands.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            network.process_command(command)?;
+            let command = network.commands.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            network.process_command(command)?;
+            Ok::<_, eyre::Report>(())
+        }
+    );
+    processed?;
+    counts
+}
+
+/// Readiness excludes pending dials, tracks the request-routing queue after connection, and
+/// returns to zero when the established peer disconnects.
+#[tokio::test]
+async fn established_peer_count_excludes_pending_dials() -> eyre::Result<()> {
+    use libp2p::{core::Endpoint, swarm::ConnectionId};
+
+    let TestTypes { mut peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let peer_id = *peer2.network.swarm.local_peer_id();
+    let addr = peer2.config.primary_address();
+    assert_eq!(query_peer_counts(network).await?, (0, 0));
+
+    // Exercise the same registration hook as a kademlia-initiated dial, without polling the swarm.
+    network.swarm.behaviour_mut().peer_manager.handle_pending_outbound_connection(
+        ConnectionId::new_unchecked(1),
+        Some(peer_id),
+        std::slice::from_ref(&addr),
+        Endpoint::Dialer,
+    )?;
+    assert_eq!(query_peer_counts(network).await?, (1, 0));
+    let (reply, response) = oneshot::channel();
+    network.process_command(NetworkCommand::SendRequestAny {
+        request: TestWorkerRequest::MissingBatches(Vec::new()),
+        reply,
+    })?;
+    assert_matches!(response.await?, Err(NetworkError::NoPeers));
+
+    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr))?;
+    assert_eq!(query_peer_counts(network).await?.1, 1);
+
+    network.process_peer_manager_event(PeerEvent::PeerDisconnected(peer_id))?;
+    assert_eq!(query_peer_counts(network).await?.1, 0);
+    Ok(())
+}
+
 /// Building a consensus config with a peer-score config whose `min_score > max_score` must fail
 /// at construction, before any `PeerManager`/`Score` exists. This pins the startup wiring of
 /// `ScoreConfig::validate` into `ConsensusConfig::new_with_committee`: without that call the bad
@@ -2757,6 +2818,304 @@ async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result
     Ok(())
 }
 
+/// Periodic signing publishes newer records to an already connected peer without reconnecting.
+#[tokio::test]
+async fn test_own_record_refresh_reaches_peer() -> eyre::Result<()> {
+    let mut config = NetworkConfig::default();
+    config.libp2p_config_mut().kad_publication_interval = Duration::from_secs(1);
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(config);
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let peer2_addr = peer2.config.primary_address();
+    let peer2_net = peer2.config.primary_networkkey();
+    let initial_timestamp = peer2.network.node_record.info.timestamp;
+    let peer1_addr = peer1.config.primary_address();
+    let handle1 = peer1.network_handle;
+    let handle2 = peer2.network_handle;
+    let task1 = tokio::spawn(peer1.network.run());
+    let task2 = tokio::spawn(peer2.network.run());
+
+    let result = async {
+        handle1.start_listening(peer1_addr).await?;
+        handle2.start_listening(peer2_addr.clone()).await?;
+        handle1.add_trusted_peer_and_dial(peer2_bls, peer2_net, peer2_addr).await?;
+        wait_until(Duration::from_secs(10), "first re-signed record reaches peer", || async {
+            Ok(handle1.kad_store_get(peer2_bls).await?.is_some_and(|record| {
+                NodeRecord::try_decode_compat(&record.value)
+                    .is_some_and(|value| value.info.timestamp > initial_timestamp)
+            }))
+        })
+        .await?;
+        let first = handle1.kad_store_get(peer2_bls).await?.ok_or_else(|| eyre!("first record"))?;
+        let first_value = NodeRecord::try_decode_compat(&first.value)
+            .ok_or_else(|| eyre!("first node record"))?;
+        wait_until(Duration::from_secs(10), "second re-signed record reaches peer", || async {
+            Ok(handle1.kad_store_get(peer2_bls).await?.is_some_and(|record| {
+                NodeRecord::try_decode_compat(&record.value)
+                    .is_some_and(|value| value.info.timestamp > first_value.info.timestamp)
+            }))
+        })
+        .await?;
+        let own = handle2.kad_store_get(peer2_bls).await?.ok_or_else(|| eyre!("own record"))?;
+        assert!(own.expires.is_none(), "periodic signing must preserve local non-expiry");
+        eyre::Ok(())
+    }
+    .await;
+
+    task1.abort();
+    task2.abort();
+    let _ = tokio::join!(task1, task2);
+    result
+}
+
+/// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
+#[tokio::test]
+async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let mut record = peer2.network.get_peer_record();
+    let instant = std::time::Instant::now();
+    record.expires = Some(instant + Duration::from_secs(60));
+    network.process_kad_put_request(source, record.clone())?;
+    let first_expiry = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .and_then(|stored| stored.expires)
+        .ok_or_else(|| eyre!("initial expiry"))?;
+
+    record.expires = Some(instant + Duration::from_secs(120));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .ok_or_else(|| eyre!("refreshed record"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+
+    // A replicated copy with less remaining TTL must not undo the refresh.
+    let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
+    record.expires = Some(instant + Duration::from_secs(90));
+    network.process_kad_put_request(source, record.clone())?;
+    let retained_expiry = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .and_then(|stored| stored.expires)
+        .ok_or_else(|| eyre!("retained expiry"))?;
+    assert!(refreshed_expiry.saturating_duration_since(retained_expiry) < Duration::from_secs(1));
+    Ok(())
+}
+
+/// Older and equal-timestamp conflicting records neither replace stored bytes nor penalize peers.
+#[tokio::test]
+async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let source = *peer2.network.swarm.local_peer_id();
+    let current = peer2.network.get_peer_record();
+    network.process_kad_put_request(source, current.clone())?;
+    let score = network.swarm.behaviour().peer_manager.peer_score(&source);
+    assert!(score.is_some(), "publisher must be tracked for the score assertion");
+
+    [true, false].into_iter().try_for_each(|older| -> eyre::Result<()> {
+        let mut info = peer2.network.node_record.info.clone();
+        if older {
+            info.timestamp = info.timestamp.saturating_sub(1);
+        } else {
+            info.multiaddrs = vec!["/ip4/192.0.2.1/udp/54321/quic-v1".parse()?];
+        }
+        let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+        let bytes =
+            encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+        let signature = peer2.config.key_config().request_signature_direct(&bytes);
+        let candidate = kad::Record {
+            value: encode(&NodeRecord { info, signature }),
+            expires: Some(std::time::Instant::now() + Duration::from_secs(120)),
+            ..current.clone()
+        };
+        assert!(network.peer_record_valid(&candidate).is_some(), "valid candidate: older={older}");
+        network.process_kad_put_request(source, candidate)?;
+        let stored = network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&current.key)
+            .ok_or_else(|| eyre!("current record"))?
+            .into_owned();
+        assert_eq!(stored.value, current.value);
+        assert!(stored.expires.is_none(), "stale input must not update expiry");
+        assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), score);
+        Ok(())
+    })
+}
+
+/// A relayed copy must not prevent its owner from confirming its identity with the same record.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_equal_record_after_relay() -> eyre::Result<()> {
+    check_kad_self_advertisement_after_relay(0)
+}
+
+/// An older self-advertisement still proves identity without replacing a newer stored record.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_older_record_after_relay() -> eyre::Result<()> {
+    check_kad_self_advertisement_after_relay(1)
+}
+
+/// A saturated kad store must not prevent an authenticated owner from confirming its identity.
+#[tokio::test]
+async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Result<()> {
+    use tn_types::Signer as _;
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = *peer2.network.swarm.local_peer_id();
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let domain = RecordDomain::new(
+        peer1.config.network_config().libp2p_config().chain_id,
+        NetworkType::Primary,
+    );
+    let max_records = kad::store::MemoryStoreConfig::default().max_records;
+    let mut rng = StdRng::from_seed([7; 32]);
+
+    // Two valid records per relay stay below both the per-source message limit and the
+    // tracked-source cap. Fill the real store through the inbound handler without confirming
+    // any of the non-committee identities advertised by these relays.
+    std::iter::repeat_with(PeerId::random)
+        .flat_map(|source| std::iter::repeat_n(source, 2))
+        .take(max_records)
+        .try_for_each(|source| -> eyre::Result<()> {
+            let bls = BlsKeypair::generate(&mut rng);
+            let netkey = NetworkKeypair::generate_ed25519();
+            let record = NodeRecord::build(
+                domain,
+                netkey.public().into(),
+                create_multiaddr(None),
+                None,
+                |data| bls.sign(data),
+            );
+            network.process_kad_put_request(
+                source,
+                kad::Record {
+                    key: kad::RecordKey::new(bls.public()),
+                    value: encode(&record),
+                    publisher: Some(netkey.public().to_peer_id()),
+                    expires: None,
+                },
+            )?;
+            assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+            Ok(())
+        })?;
+    assert_eq!(network.swarm.behaviour_mut().kademlia.store_mut().records().count(), max_records);
+
+    let self_record = peer2.network.get_peer_record();
+    assert_eq!(
+        network.record_freshness(&self_record),
+        RecordFreshness::Newer,
+        "owner key must be absent from the full store"
+    );
+    assert_matches!(
+        network.swarm.behaviour_mut().kademlia.store_mut().put(self_record.clone()),
+        Err(kad::store::Error::MaxRecords)
+    );
+
+    let relay = PeerId::random();
+    let relay_result = network.process_kad_put_request(relay, self_record.clone());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), None);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
+
+    let owner_result = network.process_kad_put_request(owner, self_record.clone());
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&owner),
+        Some(owner_bls),
+        "an authenticated self-advertisement must confirm identity regardless of store capacity"
+    );
+    relay_result?;
+    owner_result?;
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
+    let store = network.swarm.behaviour_mut().kademlia.store_mut();
+    assert_eq!(store.records().count(), max_records);
+    assert!(store.get(&self_record.key).is_none(), "confirmation must not bypass the store cap");
+    Ok(())
+}
+
+/// Exercise relay, self-advertisement, and replay through the inbound handler with a signed record.
+fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = *peer2.network.swarm.local_peer_id();
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let relay = PeerId::random();
+    let stored_record = peer2.network.get_peer_record();
+
+    // The network has no tracked committee. Replication can deliver this authentic record
+    // before the owner's connection, but the relay cannot confirm either peer's identity.
+    network.process_kad_put_request(relay, stored_record.clone())?;
+    network.process_kad_put_request(relay, stored_record.clone())?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), None);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
+    assert_eq!(
+        network.record_freshness(&stored_record),
+        RecordFreshness::Identical,
+        "the relay must have populated the store"
+    );
+
+    // Sign the equal or older timestamp using the same domain as a primary node record.
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+    let mut info = peer2.network.node_record.info.clone();
+    info.timestamp = info.timestamp.saturating_sub(timestamp_lag);
+    let signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+    let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
+    peer2.network.node_record = NodeRecord { info, signature };
+    let self_record = peer2.network.get_peer_record();
+    assert!(network.peer_record_valid(&self_record).is_some());
+    assert_ne!(network.record_freshness(&self_record), RecordFreshness::Newer);
+
+    network.process_kad_put_request(owner, self_record.clone())?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&owner),
+        Some(owner_bls),
+        "an authenticated self-advertisement must confirm identity regardless of store freshness"
+    );
+
+    // A repeat must retain identity, reputation, and the stored signed value.
+    network.swarm.behaviour_mut().peer_manager.process_penalty(owner, Penalty::Mild);
+    let score = network.swarm.behaviour().peer_manager.peer_score(&owner);
+    assert!(score.is_some());
+    network.process_kad_put_request(owner, self_record)?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), Some(owner_bls));
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&owner), score);
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&stored_record.key)
+        .ok_or_else(|| eyre!("the relayed record must remain stored"))?;
+    assert_eq!(stored.key, stored_record.key);
+    assert_eq!(stored.value, stored_record.value);
+    assert_eq!(stored.publisher, stored_record.publisher);
+    Ok(())
+}
+
+/// A newer signed record replaces a previously stored record for the same publisher.
 #[tokio::test]
 async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let TestTypes { peer1, mut peer2, .. } =
@@ -3051,6 +3410,186 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     // and a non-advertising peer returns None
     let other_bls = committee[0].config.key_config().primary_public_key();
     assert_eq!(nvv.get_validator_rpc(other_bls).await?, None);
+
+    Ok(())
+}
+
+/// The late-joiner ordering of [`test_advertise_rpc_via_kad`]: the nvv pins the target as a
+/// bootstrap-style stub and connects FIRST, so target's one-shot rpc-bearing record push
+/// lands while the nvv's committee set is still empty, and only THEN is the committee seeded.
+///
+/// This is what a node joining a running network with a cold datadir actually sees in
+/// production: `AddBootstrapPeers` pins a stub for every validator, each validator pushes its
+/// record on first connect, and the worker swarm's committee slots are seeded afterwards from
+/// epoch state. The sibling test seeds the committee before connecting and so never exercises
+/// this window. The pushed record must be admitted for the pinned key while the committee set
+/// is still empty (checked before the seed — otherwise the stub re-discovery that follows
+/// `update_committees` would recover the record from the nvv's own kad store and mask a
+/// regression of that admission), and the advertised rpc must remain resolvable after the
+/// committee is seeded.
+#[tokio::test]
+async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+
+    let num_network_peers = 5;
+
+    // Set up multiple peers with the default config
+    let (mut target_peer, mut committee, _) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(num_network_peers).unwrap(),
+            None,
+        );
+
+    // inject an RPC descriptor into target peer's signed node record before spawn —
+    // simulates a validator that configured an `rpc` endpoint.
+    let rpc = RpcInfo {
+        http: "https://node1.example:8545/".parse().expect("http url"),
+        ws: Some("wss://node1.example:8546/".parse().expect("ws url")),
+    };
+    let mut target_network = target_peer.network.take().expect("target network is some");
+    let mut target_info = target_network.node_record.info.clone();
+    target_info.rpc = Some(rpc.clone());
+    let chain_id = target_peer.config.network_config().libp2p_config().chain_id;
+    let target_signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
+    let target_signature =
+        target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
+    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+    let target_peer_addr = target_peer.config.primary_address();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?id, ?res, "network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer_addr.clone()).await?;
+
+    // spawn the rest of the committee, connect each to target
+    for peer in committee.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        let id = peer.config.authority().as_ref().expect("authority").id();
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?id, ?res, "network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_trusted_peer_and_dial(
+                target_peer_bls,
+                target_peer_net.clone(),
+                target_peer_addr.clone(),
+            )
+            .await?;
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
+    }
+
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // spawn the 6th non-validator peer
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: nvv_config, network_handle: nvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("nvv network run failed!");
+    });
+    nvv.start_listening(nvv_config.primary_address()).await?;
+
+    // pin target as an operator stub and connect BEFORE the committee is seeded: this is the
+    // bootstrap-stub path (`add_trusted_peer_and_dial` pins and inserts a config stub, exactly
+    // like `AddBootstrapPeers`), and target's record push arrives on this first connection
+    nvv.add_trusted_peer_and_dial(
+        target_peer_bls,
+        target_peer_net.clone(),
+        target_peer_addr.clone(),
+    )
+    .await?;
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(5), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
+    // let target's self-advertised push land while the nvv's committee set is still empty
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // the push must be admitted for the pinned key NOW, while no committee slot is seeded;
+    // without this check the stub re-discovery after `update_committees` recovers the record
+    // from the nvv's own kad store and masks a regression of the pinned-key admission
+    assert_eq!(
+        nvv.get_validator_rpc(target_peer_bls).await?,
+        Some(rpc.clone()),
+        "pushed record must be cached for the pinned key before the committee is seeded"
+    );
+
+    // only now does the nvv learn the committee from epoch state
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
+
+    // ask the network to locate every committee member via kad
+    let authorities: Vec<BlsPublicKey> =
+        committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
+    nvv.find_authorities(authorities.clone()).await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // snapshot the advertised RPCs known on the NVV; only the target advertised
+    let mut all = nvv.get_all_validator_rpcs().await?;
+    all.sort_by_key(|(bls, _)| *bls);
+    assert_eq!(all.len(), 1, "exactly one advertised rpc expected; got {all:?}");
+    let (key, advertised) = &all[0];
+    assert_eq!(*key, target_peer_bls);
+    assert_eq!(*advertised, rpc);
+
+    // direct lookup for the advertising peer matches
+    assert_eq!(nvv.get_validator_rpc(target_peer_bls).await?, Some(rpc));
+    // and a non-advertising peer returns None
+    let other_bls = committee[0].config.key_config().primary_public_key();
+    assert_eq!(nvv.get_validator_rpc(other_bls).await?, None);
+
+    Ok(())
+}
+
+/// An operator can set `rpc` on a bootstrap peer entry (YAML/CLI, deserialized as a full
+/// [`P2pNode`]). The `AddBootstrapPeers` handler must carry that endpoint into the peer
+/// manager's stub instead of dropping it, so a node can forward transactions to the
+/// configured endpoint before the peer's own record is ever learned.
+#[tokio::test]
+async fn test_bootstrap_peer_config_rpc_is_retained() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+    use std::collections::BTreeMap;
+    use tn_types::P2pNode;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    peer1.start_listening(config_1.primary_address()).await?;
+
+    // peer2 is only a bootstrap entry here; its network is never started
+    let bootstrap_bls = peer2.config.key_config().primary_public_key();
+    let rpc = RpcInfo {
+        http: "https://bootstrap.example:8545/".parse().expect("http url"),
+        ws: Some("wss://bootstrap.example:8546/".parse().expect("ws url")),
+    };
+    let bootstrap = P2pNode {
+        network_address: peer2.config.primary_address(),
+        network_key: peer2.config.primary_networkkey(),
+        rpc: Some(rpc.clone()),
+    };
+    peer1.add_bootstrap_peers(BTreeMap::from([(bootstrap_bls, bootstrap)])).await?;
+
+    // the configured endpoint resolves directly from the stub ...
+    assert_eq!(peer1.get_validator_rpc(bootstrap_bls).await?, Some(rpc.clone()));
+
+    // ... and is reported for the peer once it sits in the current committee
+    peer1.update_committees(Default::default(), [bootstrap_bls].into(), Default::default()).await?;
+    assert_eq!(peer1.get_all_validator_rpcs().await?, vec![(bootstrap_bls, rpc)]);
 
     Ok(())
 }

@@ -6,13 +6,23 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
+    thread::available_parallelism,
+};
 use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
-use tn_types::{Genesis, B256, MAINNET_GENESIS};
+use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+/// Parse bootstrap dial hints using the same map and legacy worker decoding as NetworkConfig.
+fn parse_bootstrap_peers(
+    raw: &str,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, serde_yaml::Error> {
+    serde_yaml::from_str(raw)
+}
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -32,6 +42,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Join a named telcoin network (for instance test or main net).
     #[arg(long, value_name = "NAMED_TN_NETWORK", verbatim_doc_comment)]
     pub chain: Option<NamedChain>,
+
+    /// Bootstrap dial hints as a YAML or JSON map keyed by BLS public key.
+    ///
+    /// Replaces network-config bootstrap_peers for this process only. A nonempty map replaces
+    /// all genesis seeds; an explicit '{}' selects the genesis fallback. Each entry contains
+    /// primary and workers (a list). Committee membership still comes from chain state.
+    #[arg(long, value_name = "MAP", value_parser = parse_bootstrap_peers, allow_hyphen_values = true)]
+    bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
 
     /// Enable Prometheus consensus metrics.
     ///
@@ -55,15 +73,25 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(1..=200))]
     pub instance: Option<u16>,
 
-    /// Is this an observer node?  True if set, an observer will never be in the committee
-    /// but will follow consensus and provide node RPC access.
-    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
+    /// Deprecated and ignored. Node role is derived from committee membership.
+    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false, hide = true)]
     pub observer: bool,
 
     /// Export each epoch's final execution state to a snapshot pack under
     /// `consensus-db/state_exports/epoch-{N}/`.
+    ///
+    /// Each epoch writes a full execution-state copy. Retention is unlimited by default and can
+    /// fill the data volume; use --state-export-keep N to limit the number of completed bundles.
     #[arg(long, global = true, default_value_t = false)]
     pub enable_state_export: bool,
+
+    /// Keep the newest N completed state-export bundles (N must be at least 1).
+    ///
+    /// Only applies with --enable-state-export. Unset keeps all bundles. Each epoch exports the
+    /// full execution state, so unlimited retention can fill the data volume. This limits bundle
+    /// count, not bytes. Use N >= 2 to retain a previous bundle during overlapping exports.
+    #[arg(long, global = true, value_name = "N")]
+    state_export_keep: Option<NonZeroUsize>,
 
     /// Watch executed batches for cross-producer transaction re-packing (issue #1259).
     ///
@@ -126,6 +154,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
+        if self.observer {
+            warn!(
+                target: "cli",
+                "--observer is deprecated and ignored (Telcoin-Association/telcoin-network#1355). \
+                 Node role is derived from committee membership. To take a validator out of \
+                 consensus, exit it on chain."
+            );
+        }
+
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives; several fork constants document this log
         // as their only in-protocol detection for a mismatched binary. Every epoch-gated adiri
@@ -140,6 +177,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
             leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
+            governance_safe_fork_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
@@ -228,10 +266,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
+            chain: _, // Used above
+            bootstrap_peers,
             observer: _, // Used above
             metrics,
             enable_state_export,
+            state_export_keep,
             enable_repack_monitor,
             instance,
             with_unused_ports,
@@ -253,16 +293,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder = TnBuilder {
-            node_config,
-            tn_config,
-            metrics,
-            healthcheck,
-            enable_state_export,
-            enable_repack_monitor,
-            reth_db,
-            exex_fns: vec![],
-        };
+        let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
+            .with_state_export_keep(state_export_keep)
+            .with_bootstrap_peers(bootstrap_peers);
+        builder.metrics = metrics;
+        builder.healthcheck = healthcheck;
+        builder.enable_state_export = enable_state_export;
+        builder.enable_repack_monitor = enable_repack_monitor;
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
@@ -315,6 +352,72 @@ mod tests {
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
 
+    /// Legacy observer commands still parse, but neither help view advertises the ignored flag.
+    #[test]
+    fn deprecated_observer_flag_parses_but_is_hidden() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        let default = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        let legacy = NodeCommand::<NoArgs>::try_parse_from(["node", "--observer"])?;
+        assert!(!default.observer);
+        assert!(legacy.observer);
+        let mut command = NodeCommand::<NoArgs>::command();
+        assert!(!command.render_help().to_string().contains("--observer"));
+        assert!(!command.render_long_help().to_string().contains("--observer"));
+        Ok(())
+    }
+
+    /// The CLI accepts the same multi-worker map as network-config, in YAML or JSON form.
+    #[test]
+    fn bootstrap_peers_cli_parses_yaml_and_json() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        [serde_yaml::to_string(&peers)?, serde_json::to_string(&peers)?].into_iter().try_for_each(
+            |raw| -> eyre::Result<()> {
+                let command = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])?;
+                assert_eq!(command.bootstrap_peers, Some(peers.clone()));
+                Ok(())
+            },
+        )
+    }
+
+    /// An omitted option and an explicit empty override retain distinct precedence semantics.
+    #[test]
+    fn bootstrap_peers_cli_distinguishes_absent_and_empty() -> eyre::Result<()> {
+        let absent = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(absent.bootstrap_peers, None);
+        let empty = NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", "{}"])?;
+        assert_eq!(empty.bootstrap_peers, Some(BTreeMap::new()));
+        Ok(())
+    }
+
+    /// Invalid keys and empty worker lists fail at argument parsing, before node startup.
+    #[test]
+    fn bootstrap_peers_cli_rejects_invalid_entries() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        peers.values_mut().for_each(|server| server.workers.clear());
+        ["{invalid-key: {}}".to_owned(), serde_yaml::to_string(&peers)?].into_iter().for_each(
+            |raw| {
+                let result = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])
+                .map(|_| ())
+                .map_err(|error| error.kind());
+                assert_eq!(result, Err(ErrorKind::ValueValidation));
+            },
+        );
+        Ok(())
+    }
+
     /// Parse `--instance <raw>` through the node command and return the parsed value, or the
     /// clap error kind that rejected it.
     fn parse_instance(raw: &str) -> Result<Option<u16>, ErrorKind> {
@@ -339,6 +442,39 @@ mod tests {
         assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
         let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
         assert!(matches!(absent, Ok(None)));
+    }
+
+    /// Retention defaults to unlimited, accepts positive counts, and rejects zero.
+    ///
+    /// A retention setting alone does not enable exports.
+    #[test]
+    fn state_export_keep_parses_optional_nonzero_limit() -> Result<(), clap::Error> {
+        let command = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(command.state_export_keep, None);
+        assert!(!command.enable_state_export);
+
+        let parsed = NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", "0"])
+            .map(|command| command.state_export_keep)
+            .map_err(|error| error.kind());
+        assert_eq!(parsed, Err(ErrorKind::ValueValidation));
+
+        [("1", 1), ("2", 2), ("10", 10)].into_iter().try_for_each(|(raw, expected)| {
+            let command =
+                NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", raw])?;
+            assert_eq!(command.state_export_keep.map(NonZeroUsize::get), Some(expected));
+            assert!(!command.enable_state_export);
+            Ok::<(), clap::Error>(())
+        })?;
+
+        let enabled = NodeCommand::<NoArgs>::try_parse_from([
+            "node",
+            "--enable-state-export",
+            "--state-export-keep",
+            "2",
+        ])?;
+        assert_eq!(enabled.state_export_keep.map(NonZeroUsize::get), Some(2));
+        assert!(enabled.enable_state_export);
+        Ok(())
     }
 
     /// A faucet build configured with the canonical mainnet genesis must refuse to start.

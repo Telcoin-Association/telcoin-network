@@ -120,15 +120,33 @@ top-level CLI global like `--datadir`):
 
 ```
 telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
-  --datadir DATADIR --enable-state-export
+  --datadir DATADIR --enable-state-export --state-export-keep 2
 ```
 
 A `DATADIR/consensus-db/state_exports/epoch-{N}/` directory appears only for epochs whose export
 succeeds — not every epoch produces one. The epoch must be certificate-complete (every epoch `0..=N`
 has its certificate) and fee-resumable, and an export is skipped for several reasons (a still-pending
 tip certificate, an un-resumable snapshot, or a transient I/O error). Watch the `tn::snapshot` log
-target to see which epochs were exported or skipped. Copy the `epoch-{N}` directory you want to
-bootstrap from to the new node's machine.
+target to see which epochs were exported or skipped.
+
+`--state-export-keep N` retains the newest `N` completed bundles, deleting older completed bundles
+after a successful export and when an export-enabled node starts. `N` must be at least 1; omitting
+the option preserves unlimited retention. The option has no effect without `--enable-state-export`.
+Cleanup failures are logged and retried on later passes, so filesystem errors can leave more than
+`N` bundles. A late-finishing export is skipped if `N` newer completed bundles already exist.
+Use `N >= 2` to keep a previous bundle available during overlapping exports. `N = 1` is valid, but an
+overlapping export may need to rebuild its records and certificates if pruning removes its previous
+bundle before it is opened.
+
+Each completed bundle contains a full execution-state copy for its epoch. Retention limits the
+number of bundles, not their size, and a temporary export also needs space while it is written.
+Unlimited retention can fill the data volume as the state and the number of exports grow. Monitor
+free space even with a finite limit. The `tn_state_export_completed_bundles` gauge reports the
+completed bundle count observed by retention maintenance.
+
+Copy the `epoch-{N}` directory you want to bootstrap from outside `consensus-db/state_exports/`
+before the next pruning pass, then transfer that copy to the new node's machine. Bundles left under
+the export root can be deleted by retention while a copy or import is in progress.
 
 ### 2. Initializing a new node from a bundle
 
@@ -155,9 +173,13 @@ Start the node normally against the same datadir (configured with keys/identity 
 only adds chain state):
 
 ```
-telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask \
+telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
   --datadir NEW_DATADIR
 ```
+
+Node role is derived from committee membership, including after an import. A key outside the current
+committee runs as an observer without any role flag. `--observer` is deprecated and ignored; to take
+a validator out of consensus, exit it on chain.
 
 On startup the node reads the slot hint, opens epoch N's consensus pack, and begins syncing *forward*
 from epoch N — downloading and verifying newer epoch records and consensus output via the metadata

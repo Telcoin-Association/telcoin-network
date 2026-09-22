@@ -169,8 +169,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                         format!("{}-{}", name, key_config.primary_public_key().to_short_string())
                     } else if let Some(instance) = command.instance {
                         format!(
-                            "{}-{}-{}",
-                            if command.observer { "observer" } else { "node" },
+                            "node-{}-{}",
                             instance,
                             key_config.primary_public_key().to_short_string()
                         )
