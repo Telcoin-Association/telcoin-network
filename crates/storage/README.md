@@ -105,10 +105,14 @@ type is `Send + Sync + Clone`.
 
 The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_validate`) uphold:
 
-- **INV1 — recover from truncation.** A torn/partial trailing record or trailing padding is truncated
-  back to the last complete output; the node continues. `recover_pack` replays the WAL, tracks
-  `consistent_end`, and truncates the tail; `attested_end` + `tail_is_torn` distinguish an *unacked*
-  torn tail (safe to drop) from a tear *below* durably-acked data (real corruption ⇒ error).
+- **INV1 — recover from truncation, error on corruption.** In an *unclean* (crash-interrupted) log a
+  torn/partial trailing record or trailing padding is truncated back to the last complete output and
+  the node continues; in a *cleanly-sealed* log the clean-close sentinel proves the log is complete,
+  so **any** CRC failure is at-rest corruption and a hard `CorruptPack`. `recover_pack` replays the
+  WAL index-free, tracks `consistent_end`, and decides truncate-vs-error from the data alone: a torn
+  tail is truncatable unless a later complete *output* decodes past it (`output_after_tear`) —
+  committed data, so it errors — and a best-effort commit marker (written by `persist()` to the mmap
+  capacity tail) catches at-rest corruption of the last committed output.
 - **INV2 — headers & meta are clean-or-error.** The `DataHeader` and the leading `EpochMeta` are
   expected present and correct; a corrupt/torn one is an **error** surfaced to the operator, **never
   repaired**. The meta is fsync'd the instant it is written, so a torn meta is not a normal state.
@@ -120,7 +124,8 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   bounded to the logical length.
 
 `pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail` /
-`TornMetaEmpty` (truncatable) or `CorruptMetaWithData` / `MidLogCorruption` (data loss ⇒ re-sync).
+`TornMetaEmpty` (truncatable) or `CorruptMetaWithData` / `MidLogCorruption` / `CorruptSealedRecord`
+(data loss ⇒ re-sync).
 
 ### 6. `consensus.rs` — `ConsensusChain` (full consensus store)
 

@@ -173,6 +173,11 @@ pub enum CorruptionKind {
     /// A record is unreadable and complete records still follow: mid-log corruption. The damaged
     /// record and everything after it are lost.
     MidLogCorruption,
+    /// A record failed its CRC in a cleanly-SEALED pack. The clean-close sentinel proves the log
+    /// was complete when it was sealed, so this is at-rest corruption (bit rot), not a
+    /// torn/unacked tail — even though nothing decodes after it. Data loss for this record
+    /// (and anything after).
+    CorruptSealedRecord,
 }
 
 impl CorruptionKind {
@@ -209,6 +214,9 @@ impl Display for PhysicalCorruption {
             CorruptionKind::MidLogCorruption => {
                 "mid-log corruption (readable records follow the damage)"
             }
+            CorruptionKind::CorruptSealedRecord => {
+                "corrupt committed record in a cleanly-sealed pack (bit rot, not a torn tail)"
+            }
         };
         writeln!(f, "PHYSICAL CORRUPTION: {summary}")?;
         writeln!(f, "  first bad record offset:        {} bytes", self.offset)?;
@@ -231,7 +239,9 @@ impl Display for PhysicalCorruption {
                 "SAFE — `recover_pack` truncates this unacked tail automatically on the next \
                  append-open; no action needed."
             ),
-            CorruptionKind::CorruptMetaWithData | CorruptionKind::MidLogCorruption => writeln!(
+            CorruptionKind::CorruptMetaWithData
+            | CorruptionKind::MidLogCorruption
+            | CorruptionKind::CorruptSealedRecord => writeln!(
                 f,
                 "DATA LOSS — the damaged records cannot be recovered locally. Replace this epoch by \
                  re-syncing it from peers (state-sync). Do NOT delete the chain-data directories \
@@ -475,6 +485,10 @@ pub fn classify_physical_corruption(
     let pack =
         Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
     let data_end = pack.file_len();
+    // A cleanly-sealed pack (clean-close sentinel present) is complete by construction, so a torn
+    // trailing record cannot be an unacked tail — it is at-rest corruption (bit rot) of committed
+    // data. Only an *unclean* pack can hold a truncatable torn tail.
+    let sealed = !pack.opened_unclean();
     let mut iter = pack.raw_iter().map_err(|e| PackError::ReadError(e.to_string()))?;
 
     let mut records_ok_before: u64 = 0;
@@ -489,10 +503,10 @@ pub fn classify_physical_corruption(
                 // ambiguity tracked as the deferred size-prefix-checksum item; classification is
                 // best-effort for that case.
                 if offset < data_end {
-                    let kind = if records_ok_before == 0 {
-                        CorruptionKind::TornMetaEmpty
-                    } else {
-                        CorruptionKind::TornTrailingTail
+                    let kind = match (records_ok_before == 0, sealed) {
+                        (true, _) => CorruptionKind::TornMetaEmpty,
+                        (false, true) => CorruptionKind::CorruptSealedRecord,
+                        (false, false) => CorruptionKind::TornTrailingTail,
                     };
                     return Ok(Some(PhysicalCorruption {
                         kind,
@@ -515,16 +529,18 @@ pub fn classify_physical_corruption(
                     // record 0 is the epoch meta
                     (true, false) => CorruptionKind::TornMetaEmpty,
                     (true, true) => CorruptionKind::CorruptMetaWithData,
-                    // This verdict is intentionally `attested_end`-agnostic: it cannot see the
-                    // index-synced durable watermark `recover_pack` uses, so an *unacked*
-                    // out-of-order mmap writeback (a torn tail above the acked
-                    // data with a decodable record after the gap) is
-                    // conservatively reported as `MidLogCorruption` even though
-                    // `recover_pack` would safely truncate it. That is the safe direction, never
-                    // the reverse — `repair_epoch`'s apply path re-runs
-                    // `recover_pack` (the authority) for the truncatable
-                    // verdicts, so real below-acked corruption is still caught.
+                    // This `MidLogCorruption` verdict is intentionally watermark-agnostic: the
+                    // classifier does not replay the output structure or read the commit marker
+                    // `recover_pack` uses, so an *unacked* out-of-order mmap writeback (a torn tail
+                    // with a decodable record after the gap) is conservatively reported here even
+                    // though `recover_pack` would safely truncate it. That is the safe direction,
+                    // never the reverse — `repair_epoch`'s apply path re-runs `recover_pack` (the
+                    // authority), which is index-free, so real below-acked corruption is still
+                    // caught.
                     (false, true) => CorruptionKind::MidLogCorruption,
+                    // A torn trailing record with nothing after: an unacked tail in an unclean log,
+                    // but bit rot in a sealed one (the seal proves the log was already complete).
+                    (false, false) if sealed => CorruptionKind::CorruptSealedRecord,
                     (false, false) => CorruptionKind::TornTrailingTail,
                 };
                 return Ok(Some(PhysicalCorruption {

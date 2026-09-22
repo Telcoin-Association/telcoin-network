@@ -479,6 +479,15 @@ impl ConsensusPack {
                         c.offset
                     )));
                 }
+                CorruptionKind::CorruptSealedRecord => {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: a committed record failed its CRC in a cleanly-sealed pack \
+                         at offset {}; the clean-close sentinel proves the log was complete, so this \
+                         is at-rest corruption (bit rot), not a truncatable tail. Re-sync the epoch \
+                         from peers.",
+                        c.offset
+                    )));
+                }
             },
         };
 
@@ -1078,6 +1087,10 @@ impl Inner {
     /// single unacked in-flight tail. (At-rest corruption of the last output with nothing after
     /// it is covered by the commit marker in [`Self::recover_pack`].)
     ///
+    /// A *cleanly-sealed* log (`!opened_unclean()`) is complete by construction — the clean-close
+    /// sentinel is written only after the tail is msync'd and truncated to `end` — so it can hold
+    /// no torn tail: ANY tear during replay is at-rest corruption and a hard `CorruptPack`.
+    ///
     /// When `sink` is `None` the log is only *validated* — no index is touched — so a detected
     /// corruption returns without mutating any on-disk state and a retry re-derives the same
     /// verdict from the unchanged log. When `sink` is `Some`, each recovered output's
@@ -1092,6 +1105,12 @@ impl Inner {
         mut sink: Option<(&mut PositionIndex<IndexPositions>, &mut HdxIndex, &mut HdxIndex)>,
     ) -> Result<u64, PackError> {
         let mut iter = data.raw_iter().map_err(DataFileOpen)?;
+        // A cleanly-sealed log (clean-close sentinel present) is complete by construction — the
+        // seal is written only after the tail is msync'd and truncated to `end`. So it can
+        // hold no torn tail: ANY replay tear is at-rest corruption (bit rot), a hard
+        // `CorruptPack`. Only an *unclean* (crash-interrupted) log can have a truncatable
+        // tail, decided below.
+        let sealed = !data.opened_unclean();
         // 0-based local index of the output within this pack (mirrors `save_consensus_output`).
         let mut idx: u64 = 0;
         // Byte offset just past the last fully-recovered record (the EpochMeta or a complete
@@ -1141,12 +1160,12 @@ impl Inner {
                         }
                     }
                     if torn {
-                        // Incomplete output ends the consistent prefix. Dropping it is safe unless
-                        // a later well-formed OUTPUT decodes past the tear
-                        // -- that output was written after this one was
-                        // durably committed, so the damage is corruption of
-                        // committed data, not the single unacked in-flight tail.
-                        if Self::output_after_tear(&mut iter) {
+                        // Incomplete output ends the consistent prefix. In a sealed log any tear is
+                        // corruption. In an unclean log, dropping it is safe unless a later
+                        // well-formed OUTPUT decodes past the tear -- that output was written after
+                        // this one was durably committed, so the damage is corruption of committed
+                        // data, not the single unacked in-flight tail.
+                        if sealed || Self::output_after_tear(&mut iter) {
                             return Err(Self::corrupt_pack(base_dir));
                         }
                         break; // consistent_end still marks the end of the last complete output
@@ -1161,12 +1180,12 @@ impl Inner {
                     consistent_end = output_end;
                 }
                 // A torn record where the next output's header would start. The last complete
-                // output is already finalized; this ends the consistent prefix.
-                // Fatal only when a later well-formed OUTPUT still decodes past the
-                // tear (corruption of committed data); otherwise it is the unacked
-                // in-flight tail, safe to drop.
+                // output is already finalized; this ends the consistent prefix. In a sealed log any
+                // tear is corruption. In an unclean log it is fatal only when a later well-formed
+                // OUTPUT still decodes past the tear (corruption of committed data); otherwise it
+                // is the unacked in-flight tail, safe to drop.
                 Some(Err(_)) => {
-                    if Self::output_after_tear(&mut iter) {
+                    if sealed || Self::output_after_tear(&mut iter) {
                         return Err(Self::corrupt_pack(base_dir));
                     }
                     break;
@@ -6053,6 +6072,97 @@ pub(crate) mod test {
         assert_eq!(c.kind, CorruptionKind::CorruptMetaWithData);
         assert!(!c.kind.is_truncatable(), "corrupt meta with data behind it is not truncatable");
         assert!(c.decodable_after);
+    }
+
+    /// A CRC failure in the FINAL record of a cleanly-SEALED pack is at-rest corruption (bit rot),
+    /// not a truncatable tail — the clean-close sentinel proves the log was complete. `db validate`
+    /// must classify it `CorruptSealedRecord` (data loss), NOT `TornTrailingTail` ("SAFE").
+    #[tokio::test]
+    async fn test_classify_physical_corruption_corrupt_sealed_record() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Flip a payload byte of the LAST record (past its size prefix, before its CRC): the record
+        // framing and the clean-close sentinel stay intact, so the pack is still SEALED and nothing
+        // decodes after the damage.
+        corrupt_byte_at(&data_path, output3_end - 8);
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::CorruptSealedRecord);
+        assert!(!c.kind.is_truncatable(), "a corrupt record in a sealed pack is not truncatable");
+        assert!(!c.decodable_after, "nothing decodes after the last record");
+    }
+
+    /// `db repair --force` (and its dry run) must NOT truncate a sealed pack's bit-rotted committed
+    /// output — it reports `Unrepairable` and leaves the data untouched.
+    #[tokio::test]
+    async fn test_repair_epoch_sealed_corrupt_record_is_unrepairable() {
+        let temp_dir = TempDir::with_prefix("test_repair_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+        corrupt_byte_at(&data_path, output3_end - 8);
+
+        for apply in [false, true] {
+            let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect("repair must not err");
+            assert!(
+                matches!(outcome, EpochRepair::Unrepairable(_)),
+                "sealed bit-rot must be Unrepairable (apply={apply}), got {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::metadata(&data_path).expect("metadata").len(),
+                full_len,
+                "an unrepairable pack must not be truncated (apply={apply})"
+            );
+        }
+    }
+
+    /// The recovery authority itself refuses a sealed pack's corrupt record (guard, not just the
+    /// CLI messaging): with the digest indexes deleted `files_consistent` fails and
+    /// `recover_pack` replays the WAL, where the sealed-log guard errors instead of truncating.
+    #[tokio::test]
+    async fn test_recover_pack_refuses_sealed_corrupt_record() {
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        corrupt_byte_at(&data_path, output3_end - 8);
+        // Delete the digest indexes so `files_consistent` fails and `recover_pack` replays the WAL.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
+        }
+        let result = ConsensusPack::open_append_exists(temp_dir.path(), 0);
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "recover_pack must refuse a sealed pack's corrupt record, got {result:?}"
+        );
     }
 
     /// A pack whose first record is torn (a crash mid meta append left only part of the size
