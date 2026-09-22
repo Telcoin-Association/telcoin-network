@@ -39,12 +39,14 @@ use crate::traits::TelcoinNode;
 
 mod cursors;
 mod sorted_runs;
+mod storage_cursor;
 
 #[cfg(test)]
 mod tests;
 
 use cursors::RunCursorFactory;
 use sorted_runs::SortedTrieRuns;
+use storage_cursor::OverlayCursorFactory;
 
 /// Geometrically compacted trie deltas for the blocks built within one consensus output.
 ///
@@ -77,6 +79,20 @@ impl OutputTrieOverlay {
         self.runs.extend(Arc::clone(&trie_data.hashed_state), Arc::clone(&trie_data.trie_updates));
     }
 
+    /// Feed pre-sorted deltas to the production accumulator for allocation benchmarks.
+    ///
+    /// Accepts the same shared data as [`Self::extend_from_block`] without requiring
+    /// unrelated block metadata in the benchmark fixture.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn extend_sorted(
+        &mut self,
+        state: Arc<reth_trie::HashedPostStateSorted>,
+        nodes: Arc<reth_trie::updates::TrieUpdatesSorted>,
+    ) {
+        self.runs.extend(state, nodes);
+    }
+
     /// Compute a block's state root and trie updates with layered in-memory cursors
     /// over a read-only database transaction.
     ///
@@ -88,6 +104,9 @@ impl OutputTrieOverlay {
     /// current > newer runs > older runs > database, including destroyed-account (`None`) and
     /// wiped-storage shadowing - pinned by the differential tests in
     /// `tests/it/trie_overlay.rs`.
+    /// Storage emptiness is checked across the complete overlay before consulting the
+    /// raw database, so newer zeros shadow older values without changing Reth's exact
+    /// choice between a deleted-trie marker and individual node removals.
     pub fn layered_root_with_updates<TX: DbTx>(
         &self,
         tx: &TX,
@@ -97,8 +116,13 @@ impl OutputTrieOverlay {
         let current_sorted = current.into_sorted();
         Ok(StateRoot::new(
             RunCursorFactory::new(DatabaseTrieCursorFactory::new(tx), &self.runs),
-            HashedPostStateCursorFactory::new(
-                RunCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &self.runs),
+            OverlayCursorFactory::new(
+                HashedPostStateCursorFactory::new(
+                    RunCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &self.runs),
+                    &current_sorted,
+                ),
+                DatabaseHashedCursorFactory::new(tx),
+                &self.runs,
                 &current_sorted,
             ),
         )

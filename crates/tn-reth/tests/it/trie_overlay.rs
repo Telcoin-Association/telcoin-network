@@ -49,7 +49,7 @@ fn rand_contract(rng: &mut StdRng) -> Account {
 /// Covers every hazard class the layered-cursor composition must shadow correctly:
 /// overlapping keys across blocks, destroyed accounts (`None` tombstones), storage
 /// wiped in one block and re-created in a later one, wipe-and-set within a single
-/// delta, and an empty delta.
+/// delta, an empty delta, and zeroing every slot without an explicit wipe.
 fn seeded_deltas(rng: &mut StdRng) -> Vec<HashedPostState> {
     let a0 = rand_b256(rng);
     let a1 = rand_b256(rng);
@@ -106,6 +106,11 @@ fn seeded_deltas(rng: &mut StdRng) -> Vec<HashedPostState> {
             ]),
         // block 7: destroy a2, touch a1 again
         HashedPostState::default().with_accounts([(a2, None), (a1, Some(rand_account(rng)))]),
+        // block 8: zero all c1 slots while older non-zero writes remain in the run stack.
+        HashedPostState::default().with_storages([(
+            c1,
+            HashedStorage::from_iter(false, [(s0, U256::ZERO), (s1, U256::ZERO), (s2, U256::ZERO)]),
+        )]),
     ]
 }
 

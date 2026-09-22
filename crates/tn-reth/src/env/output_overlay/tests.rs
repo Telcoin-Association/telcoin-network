@@ -1,6 +1,8 @@
 //! Regression tests for geometric compaction and layered cursor equivalence.
 
-use super::{cursors::RunCursorFactory, sorted_runs::SortedTrieRuns};
+use super::{
+    cursors::RunCursorFactory, sorted_runs::SortedTrieRuns, storage_cursor::OverlayCursorFactory,
+};
 use reth_db::DatabaseError;
 use reth_primitives_traits::Account;
 use reth_trie::{
@@ -102,9 +104,9 @@ fn deltas() -> Vec<HashedPostState> {
 #[test]
 fn run_roots_match_flattened_oracle_across_compaction_boundaries(
 ) -> Result<(), reth_provider::ProviderError> {
+    // No permanent non-zero slot may mask a newer delta zeroing the last overlay slot.
     let base = HashedPostState::default()
-        .with_accounts([(key(1), Some(Account::default())), (key(3), Some(Account::default()))])
-        .with_storages([(key(1), HashedStorage::from_iter(false, [(key(9), U256::from(99))]))]);
+        .with_accounts([(key(1), Some(Account::default())), (key(3), Some(Account::default()))]);
     let base_prefixes = base.construct_prefix_sets().freeze();
     let base = base.into_sorted();
     let (_, base_nodes) = StateRoot::new(
@@ -126,11 +128,19 @@ fn run_roots_match_flattened_oracle_across_compaction_boundaries(
                 InMemoryTrieCursorFactory::new(NoopTrieCursorFactory::default(), &base_nodes),
                 &runs,
             ),
-            HashedPostStateCursorFactory::new(
-                RunCursorFactory::new(
-                    HashedPostStateCursorFactory::new(NoopHashedCursorFactory::default(), &base),
-                    &runs,
+            OverlayCursorFactory::new(
+                HashedPostStateCursorFactory::new(
+                    RunCursorFactory::new(
+                        HashedPostStateCursorFactory::new(
+                            NoopHashedCursorFactory::default(),
+                            &base,
+                        ),
+                        &runs,
+                    ),
+                    &current,
                 ),
+                HashedPostStateCursorFactory::new(NoopHashedCursorFactory::default(), &base),
+                &runs,
                 &current,
             ),
         )
@@ -181,4 +191,88 @@ fn storage_cursor_retargets_all_layers() -> Result<(), DatabaseError> {
     assert!(cursor.is_storage_empty()?);
     assert_eq!(cursor.seek(B256::ZERO)?, None);
     Ok(())
+}
+
+/// Match the flat predicate with shadowed DB rows, wipes, live slots, and address changes.
+#[test]
+fn storage_emptiness_matches_flattened_overlay() -> Result<(), DatabaseError> {
+    [false, true].into_iter().try_for_each(|database_populated| {
+        [false, true].into_iter().try_for_each(|run_wiped| {
+            [false, true].into_iter().try_for_each(|current_wiped| {
+                [U256::ZERO, U256::from(33)].into_iter().try_for_each(|new_value| {
+                    let base = HashedPostState::default()
+                        .with_storages([key(1), key(2)].into_iter().filter_map(|address| {
+                            database_populated.then_some((
+                                address,
+                                HashedStorage::from_iter(false, [(key(1), U256::from(99))]),
+                            ))
+                        }))
+                        .into_sorted();
+                    let mut runs = SortedTrieRuns::default();
+                    [
+                        HashedPostState::default().with_storages([(
+                            key(1),
+                            HashedStorage::from_iter(
+                                run_wiped,
+                                [(key(1), U256::from(11)), (key(2), U256::from(22))],
+                            ),
+                        )]),
+                        HashedPostState::default(),
+                        HashedPostState::default().with_storages([(
+                            key(1),
+                            HashedStorage::from_iter(false, [(key(1), U256::ZERO)]),
+                        )]),
+                    ]
+                    .into_iter()
+                    .for_each(|delta| runs.extend(Arc::new(delta.into_sorted()), Arc::default()));
+                    let current = HashedPostState::default()
+                        .with_storages([(
+                            key(1),
+                            HashedStorage::from_iter(
+                                current_wiped,
+                                [(key(2), U256::ZERO), (key(3), new_value)],
+                            ),
+                        )])
+                        .into_sorted();
+                    let mut merged = HashedPostState::default().into_sorted();
+                    runs.iter().for_each(|run| merged.extend_ref_and_sort(run.state()));
+                    merged.extend_ref_and_sort(&current);
+                    let database = HashedPostStateCursorFactory::new(
+                        NoopHashedCursorFactory::default(),
+                        &base,
+                    );
+                    let factory = OverlayCursorFactory::new(
+                        HashedPostStateCursorFactory::new(
+                            RunCursorFactory::new(database.clone(), &runs),
+                            &current,
+                        ),
+                        database.clone(),
+                        &runs,
+                        &current,
+                    );
+                    let oracle_factory = HashedPostStateCursorFactory::new(database, &merged);
+                    let mut cursor = factory.hashed_storage_cursor(key(1))?;
+                    let mut oracle = oracle_factory.hashed_storage_cursor(key(1))?;
+                    [key(1), key(2), key(3), key(1)].into_iter().try_for_each(|address| {
+                        cursor.set_hashed_address(address);
+                        oracle.set_hashed_address(address);
+                        assert_eq!(cursor.is_storage_empty()?, oracle.is_storage_empty()?);
+                        assert_eq!(cursor.seek(B256::ZERO)?, oracle.seek(B256::ZERO)?);
+                        (0..3).try_for_each(|_| -> Result<(), DatabaseError> {
+                            assert_eq!(cursor.next()?, oracle.next()?);
+                            Ok(())
+                        })?;
+                        cursor.reset();
+                        oracle.reset();
+                        // Reth's reset clears wipe flags; rebind before a new account scan.
+                        cursor.set_hashed_address(address);
+                        oracle.set_hashed_address(address);
+                        assert_eq!(cursor.is_storage_empty()?, oracle.is_storage_empty()?);
+                        assert_eq!(cursor.seek(B256::ZERO)?, oracle.seek(B256::ZERO)?);
+                        Ok(())
+                    })
+                })
+            })
+        })
+    })
 }

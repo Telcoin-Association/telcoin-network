@@ -1,4 +1,9 @@
 //! Compare cumulative allocations of the former merge path and production sorted runs.
+//!
+//! Run with `cargo bench -p tn-reth --bench output_overlay --features bench-internals`.
+
+// A bench binary links every dependency and dev-dependency of its crate but uses only a few.
+#![allow(unused_crate_dependencies)]
 
 use reth_primitives_traits::Account;
 use reth_trie::{updates::TrieUpdatesSorted, HashedPostState, HashedPostStateSorted, Nibbles};
@@ -11,11 +16,8 @@ use std::{
     },
     time::Instant,
 };
+use tn_reth::OutputTrieOverlay;
 use tn_types::{B256, U256};
-
-#[path = "../src/env/output_overlay/sorted_runs.rs"]
-mod sorted_runs;
-use sorted_runs::SortedTrieRuns;
 
 /// Enable allocation accounting only during one measured accumulation.
 static MEASURING: AtomicBool = AtomicBool::new(false);
@@ -120,6 +122,10 @@ fn main() {
         |workload| {
             [64, 128, 256, 512, 1024].into_iter().for_each(|blocks| {
                 let deltas = inputs(workload, blocks, 32);
+                // Snapshot of the pre-#1381 OutputTrieOverlay::extend_from_block:
+                // two Arc::make_mut + extend_ref_and_sort calls per block. The original
+                // was replaced by this PR; see commit 08a50783, at
+                // crates/tn-reth/src/env/output_overlay.rs, using Reth v1.11.3.
                 let old = measure(|| {
                     let mut state = Arc::new(HashedPostStateSorted::default());
                     let mut nodes = Arc::new(TrieUpdatesSorted::default());
@@ -130,15 +136,11 @@ fn main() {
                     black_box((state, nodes));
                 });
                 let geometric = measure(|| {
-                    let mut runs = SortedTrieRuns::default();
-                    deltas
-                        .iter()
-                        .for_each(|(state, nodes)| runs.extend(state.clone(), nodes.clone()));
-                    black_box(
-                        runs.iter()
-                            .map(|run| run.state().accounts.len() + run.nodes().total_len())
-                            .sum::<usize>(),
-                    );
+                    let mut overlay = OutputTrieOverlay::default();
+                    deltas.iter().for_each(|(state, nodes)| {
+                        overlay.extend_sorted(state.clone(), nodes.clone())
+                    });
+                    black_box(overlay);
                 });
                 println!("{workload:?},{blocks},32,former,{},{}", old.0, old.1);
                 println!("{workload:?},{blocks},32,geometric,{},{}", geometric.0, geometric.1);

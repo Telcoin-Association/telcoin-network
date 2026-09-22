@@ -51,7 +51,7 @@ pub(super) struct SortedTrieRuns {
 
 impl SortedTrieRuns {
     /// Borrow the runs in precedence order, oldest first.
-    pub(super) fn iter(&self) -> impl Iterator<Item = &TrieRun> {
+    pub(super) fn iter(&self) -> impl DoubleEndedIterator<Item = &TrieRun> {
         self.runs.iter()
     }
 
