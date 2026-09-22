@@ -130,6 +130,16 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// window is treated as failed and another peer (or the legacy path) is tried.
 const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Overall bound on importing a streamed epoch pack, on top of the per-record timeout — the
+/// epoch-pack analogue of [`MISSING_CERTS_RESPONSE_TIMEOUT`]. Without it a Byzantine peer that
+/// `Ack`s and then drips valid records just inside the per-record timeout keeps the import alive
+/// indefinitely, pinning the critical fetch worker and the `.inproc` `ImportPath` sentinel that
+/// makes every other fetcher skip the epoch until an operator restarts (finding #10). This caps the
+/// whole post-`Ack` import; on elapse the import future is dropped, the sentinel clears, and the
+/// epoch becomes retryable against another peer. Set above the responder's own 200s serve budget
+/// (`SEND_SYNC_PACK_TIMEOUT`) so it can never truncate a pack a peer could legitimately serve.
+const EPOCH_PACK_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Timeout for reading the opening request frame of an inbound sync stream, and the
 /// bound on every best-effort trailing write (shed `Deny`, malformed `Err`). A peer
 /// that opens a sync stream but never sends its request, or applies receive
@@ -1107,7 +1117,18 @@ impl PrimaryNetworkHandle {
                         })
                         .boxed()
                 };
-                import.await
+                // Cap the whole post-`Ack` import: a peer that drips valid records just inside the
+                // per-record timeout must not pin the import (and its critical worker + `.inproc`
+                // sentinel) indefinitely. On elapse the `import` future is dropped, unwinding
+                // `stream_import` so its `ImportPath` guard clears the sentinel and the epoch is
+                // retryable against another peer.
+                match tokio::time::timeout(EPOCH_PACK_IMPORT_TIMEOUT, import).await {
+                    Ok(result) => result,
+                    Err(_) => Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
+                        "epoch pack import exceeded the {}s overall deadline",
+                        EPOCH_PACK_IMPORT_TIMEOUT.as_secs(),
+                    )))),
+                }
             }
             // sync-capable, but shedding load or lacking the pack: try next peer
             SyncFrame::Deny(reason) => Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(
@@ -1142,6 +1163,10 @@ impl PrimaryNetworkHandle {
                 | PackError::CorruptPack(_)
                 | PackError::UnexpectedConsensusDigest { .. }
                 | PackError::EmptySubDag
+                // A non-advancing / gapped / over-`final` consensus number over an import stream is
+                // peer misbehavior (both return sites are on the peer-import path); charge Severe so a
+                // peer that wedges an import with a non-advancing chain is banned (finding #10).
+                | PackError::InvalidConsensusNumber(_, _)
                 | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
@@ -1156,7 +1181,6 @@ impl PrimaryNetworkHandle {
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
-                | PackError::InvalidConsensusNumber(_, _)
                 | PackError::ConsensusNumberAlreadyAdded
                 | PackError::ConsensusNumberTooLow
                 | PackError::InvalidVersion(_, _)

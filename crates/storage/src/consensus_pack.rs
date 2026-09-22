@@ -1749,6 +1749,17 @@ impl Inner {
                     final_consensus_number,
                 ));
             }
+            // A streamed import builds a fresh pack strictly in order: the next output MUST be
+            // exactly the next consensus number. A repeat or gap is peer misbehavior --
+            // not the idempotent local replay `save_consensus_output` tolerates (`idx <
+            // len` there) -- so reject it here. Otherwise a non-advancing parent-linked
+            // chain is accepted-and-ignored forever and pins the import (see finding
+            // #10); `InvalidConsensusNumber` charges the peer a Severe penalty.
+            let expected =
+                pack.epoch_meta.start_consensus_number + pack.consensus_pos_idx.len() as u64;
+            if consensus_number != expected {
+                return Err(PackError::InvalidConsensusNumber(expected, consensus_number));
+            }
             parent_digest_expectation = HeaderExpectation::Parent(output.digest());
             pack.save_consensus_output(&output)?;
         }
@@ -6635,6 +6646,75 @@ pub(crate) mod test {
         .await
         .expect_err("an empty sub-dag must be rejected, not imported");
         assert!(matches!(err, PackError::EmptySubDag), "got {err:?}");
+    }
+
+    /// Finding #10: a streamed import builds a fresh pack strictly in order, so a header whose
+    /// number does not advance must be rejected — not accepted-and-ignored. Here two outputs
+    /// share number 1 with a valid parent link, so only the number is wrong. Without the
+    /// advancement check the second is a silent no-op (`save_consensus_output`'s idempotent
+    /// `idx < len` path) and an endless such chain pins the import forever; with it, the second
+    /// output is `InvalidConsensusNumber` (a Severe peer penalty), so this returns `Err`
+    /// instead of `Ok`.
+    #[tokio::test]
+    async fn test_stream_import_rejects_non_advancing_number() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_non_advancing").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Two batch-less outputs (a leader header, no payload) that both claim number 1. The
+        // second's parent link is the first's digest, so the parent-chain check passes and
+        // ONLY the number is wrong.
+        let leader_header = Certificate::default().header().clone();
+        let header1 = ConsensusHeader {
+            parent_hash: previous_epoch.final_consensus.hash,
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![leader_header.clone()]),
+            number: 1,
+            extra: Default::default(),
+        };
+        let header2 = ConsensusHeader {
+            parent_hash: header1.digest(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![leader_header]),
+            number: 1,
+            extra: Default::default(),
+        };
+
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append meta");
+            pack.append(&PackRecord::Consensus(Box::new(header1))).expect("append output 1");
+            pack.append(&PackRecord::Consensus(Box::new(header2))).expect("append repeat output");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_non_advancing_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a non-advancing consensus number must be rejected, not accepted-and-ignored");
+        assert!(matches!(err, PackError::InvalidConsensusNumber(2, 1)), "got {err:?}");
     }
 
     /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
