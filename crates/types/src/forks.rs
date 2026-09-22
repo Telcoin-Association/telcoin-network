@@ -915,14 +915,36 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// full canonical suite with governance on SafeL2, so non-adiri builds exclude the mechanism
 /// entirely.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Arming (standard hard-fork rule): deploy
-/// the gate-capable build fleet-wide first — safe indefinitely while dormant — then land a
-/// dedicated epoch-setting PR fleet-wide before the fork epoch begins, re-verifying against the
-/// live chain that (a) the chosen epoch is still in the future (the one-shot trigger cannot
-/// fire retroactively; if the boundary has passed, raise the constant in the same PR), and
-/// (b) the three pre-fork pins still match the live deployments (a mismatch means adiri's Safe
-/// state moved since 2026-08-28 — reassess before arming, do not update pins to make gates
-/// pass). Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
+/// Armed for adiri (chain 2017) at epoch 554, so the migration executes one boundary earlier, in
+/// the epoch-closing block of 553. Measured boundary: Fri 2026-09-25 08:32 UTC (03:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 554 has begun, raise the constant in the same PR:
+/// the trigger (`concluding_epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH`) cannot fire retroactively,
+/// so the live fleet would skip the migration for good while a node replaying that boundary on
+/// this build applies it and diverges from canonical history. The const assert below rejects only
+/// a value at or below [`CONSENSUS_REGISTRY_FORK_EPOCH`]; a stale epoch above that floor still
+/// compiles, so this re-verification is the guard.
+///
+/// Live pre-fork state, re-read on 2026-09-22 (first sampled 2026-08-28): the three pre-fork pins
+/// ([`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`], [`SAFE_SINGLETON_PRE_FORK_CODE_HASH`],
+/// [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]) match the live deployments; the governance proxy's
+/// slot 0 holds the L1 `Safe` singleton and its fallback-handler slot is unset; the Safe nonce
+/// is 2; the Safe Singleton Factory deployer's nonce is 0; all eleven etch targets are empty;
+/// and the registry carries the post-fork code (the epoch-407 fork ran). A mismatch at
+/// re-verification means adiri's Safe state moved: reassess before tagging, and do not update
+/// pins to make gates pass.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553 executes; a
+/// node still on 5f1c0b49 closes that epoch without the migration and diverges from the canonical
+/// chain.
+///
+/// Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
 /// [`governance_safe_fork_epoch_override`]). Honoring it also takes `adiri`: every piece of this
 /// fork is behind that feature and `make build-e2e-bin` omits it, so the variable is inert on the
 /// default e2e lanes. `make test-e2e-governance-safe` is the one invocation that arms it on
@@ -930,7 +952,15 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// `crates/e2e-tests/tests/it/governance_safe_fork.rs`, which rewrites its genesis into the live
 /// adiri pre-fork Safe state and asserts the transition over RPC. Arming the variable on any other
 /// lane is a named test failure there rather than a silent no-op.
-pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = u32::MAX;
+pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = 554;
+
+/// Compile-time floor for [`GOVERNANCE_SAFE_FORK_EPOCH`]: adiri has already crossed
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`], so a value at or below it would be a retroactive
+/// arming, and a one-shot `==` trigger can never fire for a boundary that has already closed.
+/// Only this floor is machine-checked; whether the armed epoch is still in the future is the
+/// manual re-verification documented on the constant.
+#[cfg(feature = "adiri")]
+const _: () = assert!(GOVERNANCE_SAFE_FORK_EPOCH > CONSENSUS_REGISTRY_FORK_EPOCH);
 
 /// This build's effective governance-Safe fork epoch: the `TN_GOVERNANCE_SAFE_FORK_EPOCH`
 /// override when compiled with `test-utils` and set, otherwise
@@ -1157,17 +1187,21 @@ mod tests {
 
     /// The governance-Safe fork trigger is one-shot: with the concluding epoch `e`, the
     /// boundary fires iff `e + 1 == GOVERNANCE_SAFE_FORK_EPOCH` — exactly once, never
-    /// retroactively, and (unlike the `>=` layout gates) never for any later epoch. With the
-    /// `u32::MAX` placeholder the `checked_add` overflow also keeps a concluding epoch of
-    /// `u32::MAX` itself from firing, so the dormant constant can never trigger twice.
+    /// retroactively, and (unlike the `>=` layout gates) never for any later epoch. On adiri the
+    /// fork fires only in the epoch-closing block that concludes epoch 553, the boundary that opens
+    /// [`GOVERNANCE_SAFE_FORK_EPOCH`]; the boundary before it, the one after it, and every later
+    /// one stay silent. The closure mirrors the trigger in `tn-reth::evm::block`, `checked_add`
+    /// included: a concluding epoch of `u32::MAX` has no successor, so it neither fires nor
+    /// overflows.
     #[cfg(feature = "adiri")]
     #[test]
     fn governance_safe_fork_boundary_is_one_shot() {
         let fires =
             |concluding: Epoch| concluding.checked_add(1) == Some(GOVERNANCE_SAFE_FORK_EPOCH);
 
-        // dormant placeholder: only the (unreachable) u32::MAX - 1 boundary fires
-        for concluding in [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH] {
+        for concluding in
+            [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH, u32::MAX]
+        {
             assert!(!fires(concluding), "concluding epoch {concluding} must not fire the fork");
         }
         assert!(
