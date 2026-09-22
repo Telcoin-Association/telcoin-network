@@ -64,10 +64,20 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| !tx.is_eip4844());
         self.by_id.retain(|_, tx| !tx.is_eip4844());
     }
-    fn remove_unsupported_txs(&mut self, _txs: Vec<TxHash>) {
-        // remove non-allowlisted transaction types from the transactions vec and btreemap
-        self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
-        self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        // Match the production pool: remove the supplied hashes and their descendants,
+        // including allowlisted transaction types that exceed a whole-batch capacity limit.
+        let removed: Vec<_> = self
+            .transactions
+            .iter()
+            .filter(|tx| txs.contains(tx.hash()))
+            .map(|tx| (tx.sender_id(), tx.nonce()))
+            .collect();
+        let retain = |tx: &Arc<PoolTxn>| {
+            removed.iter().all(|(sender, nonce)| *sender != tx.sender_id() || *nonce > tx.nonce())
+        };
+        self.transactions.retain(retain);
+        self.by_id.retain(|_, tx| retain(tx));
     }
     fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
         addresses
@@ -80,6 +90,33 @@ impl TxPool for TestPool {
     }
     fn is_peer_deferred(&self, hash: &TxHash) -> bool {
         self.peer_batch_txs.is_deferred(hash)
+    }
+}
+
+#[cfg(test)]
+impl TxPool for &mut TestPool {
+    fn best_transactions(&self) -> tn_reth::BestTxns {
+        (**self).best_transactions()
+    }
+
+    fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+        (**self).remove_eip4844_txs(blobs);
+    }
+
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        (**self).remove_unsupported_txs(txs);
+    }
+
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        (**self).get_account_balances(addresses)
+    }
+
+    fn record_peer_batch(&self, hashes: &[TxHash]) {
+        (**self).record_peer_batch(hashes);
+    }
+
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+        (**self).is_peer_deferred(hash)
     }
 }
 

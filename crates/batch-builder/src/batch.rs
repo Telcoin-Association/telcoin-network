@@ -88,6 +88,7 @@ pub fn build_batch<P: TxPool>(
     let mut mined_transactions = Vec::new();
     let mut blob_transactions = Vec::new();
     let mut unsupported_transactions = Vec::new();
+    let mut unpackable_transactions = Vec::new();
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
     let mut sender_costs: HashMap<Address, U256> = HashMap::new();
     let mut peer_deferred: usize = 0;
@@ -101,7 +102,8 @@ pub fn build_batch<P: TxPool>(
         let deferred_by_peer = pool.is_peer_deferred(pool_tx.hash());
 
         // ensure block has capacity (in gas) for this transaction
-        let exceeds_gas_limit = total_possible_gas + pool_tx.gas_limit() > gas_limit;
+        // Compare against remaining capacity so an oversized gas limit cannot overflow a sum.
+        let exceeds_gas_limit = pool_tx.gas_limit() > gas_limit.saturating_sub(total_possible_gas);
 
         // either guard skips the transaction:
         // - the tx could exceed max gas limit for the block
@@ -112,7 +114,13 @@ pub fn build_batch<P: TxPool>(
         // before continuing loop. For the deferral that is deliberate: a later nonce from the
         // same sender would land nonce-gapped and only be skipped at execution.
         if deferred_by_peer || exceeds_gas_limit {
-            if deferred_by_peer {
+            if pool_tx.gas_limit() > gas_limit {
+                // This transaction cannot fit even an empty batch. Remove it from the pool
+                // so it and its sender's later nonces are not skipped indefinitely.
+                best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
+                debug!(target: "worker::batch_builder", ?pool_tx, "removing tx whose gas limit exceeds the batch limit");
+                unpackable_transactions.push(*pool_tx.hash());
+            } else if deferred_by_peer {
                 best_txs.peer_deferred(&pool_tx);
                 peer_deferred = peer_deferred.saturating_add(1);
                 debug!(target: "worker::batch_builder", ?pool_tx, "deferring tx already packed by a validated peer batch");
@@ -158,13 +166,19 @@ pub fn build_batch<P: TxPool>(
         let encoded = tx.into_inner().encoded_2718();
 
         // ensure the batch has capacity (in bytes) for this transaction
-        if total_bytes_size + encoded.len() > max_size {
+        if encoded.len() > max_size.saturating_sub(total_bytes_size) {
             // the tx could exceed the max byte size for the batch
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
             best_txs.max_batch_size(&pool_tx, encoded.len(), max_size);
-            debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
+            if encoded.len() > max_size {
+                // Use the validator's encoded-byte measurement for the whole-batch limit too.
+                unpackable_transactions.push(*pool_tx.hash());
+                debug!(target: "worker::batch_builder", ?pool_tx, "removing tx whose encoded size exceeds the batch limit");
+            } else {
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
+            }
             continue;
         }
 
@@ -199,6 +213,10 @@ pub fn build_batch<P: TxPool>(
 
     // remove any non-allowlisted transaction types that were submitted
     pool.remove_unsupported_txs(unsupported_transactions);
+
+    // Remove transactions that cannot fit the current epoch's limits, along with descendants.
+    // Transactions that only exceed the remaining capacity stay available for later batches.
+    pool.remove_unsupported_txs(unpackable_transactions);
 
     // construct changed_accounts for the optimistic pool update
     //
@@ -251,6 +269,124 @@ mod tests {
     use std::sync::Arc;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{test_genesis, BatchBuilderArgs, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
+
+    /// Sign an allowlisted transaction with explicit capacity requirements, bypassing admission
+    /// guards so the builder's defense against a changed epoch limit can be exercised directly.
+    fn capacity_transaction(
+        factory: &mut TransactionFactory,
+        gas_limit: u64,
+        input_size: usize,
+    ) -> Vec<u8> {
+        factory
+            .create_explicit_eip1559(
+                None,
+                None,
+                None,
+                None,
+                Some(gas_limit),
+                Some(Address::ZERO),
+                Some(U256::ZERO),
+                Some(Bytes::from(vec![0; input_size])),
+                None,
+            )
+            .encoded_2718()
+    }
+
+    /// Snapshot the pending transactions without consuming the test pool.
+    fn pending_encoded(pool: &TestPool) -> Vec<Vec<u8>> {
+        pool.best_transactions().map(|tx| tx.to_consensus().into_inner().encoded_2718()).collect()
+    }
+
+    /// An unpackable transaction and its descendants leave the pool, while another sender is
+    /// still packed. Putting the valid sender first also exercises a nonzero cumulative total.
+    fn assert_unpackable_transaction_removed(gas_limit: u64, input_size: usize) {
+        let mut invalid_sender = TransactionFactory::new();
+        let mut valid_sender = TransactionFactory::new_random();
+        let valid = capacity_transaction(&mut valid_sender, 21_000, 0);
+        let invalid = capacity_transaction(&mut invalid_sender, gas_limit, input_size);
+        assert!(gas_limit > max_batch_gas(0) || invalid.len() > max_batch_size(0));
+        let successor = capacity_transaction(&mut invalid_sender, 21_000, 0);
+        let mut pool = TestPool::new(&[valid.clone(), invalid, successor]);
+
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        assert_eq!(output.batch.transactions, vec![valid.clone()]);
+        assert_eq!(output.mined_transactions.len(), 1);
+        assert_eq!(output.changed_accounts.len(), 1);
+        assert_eq!(
+            output.changed_accounts.first().map(|account| account.address),
+            Some(valid_sender.address())
+        );
+        assert_eq!(pending_encoded(&pool), vec![valid]);
+
+        // Removing the one mined transaction drains the pool; repeated builds cannot encounter
+        // the rejected sender again. This sender has no descendants to remove here.
+        pool.remove_unsupported_txs(output.mined_transactions);
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        assert!(build_batch(args, 0, MIN_PROTOCOL_BASE_FEE).batch.transactions.is_empty());
+    }
+
+    /// A gas limit above the whole batch is evicted, including one that would overflow an
+    /// additive capacity check after an unrelated transaction has already been packed.
+    #[test]
+    fn unpackable_gas_transactions_are_removed() {
+        [max_batch_gas(0) + 1, u64::MAX]
+            .into_iter()
+            .for_each(|gas_limit| assert_unpackable_transaction_removed(gas_limit, 0));
+    }
+
+    /// Encoded bytes above the whole batch are evicted even for an allowlisted transaction.
+    #[test]
+    fn unpackable_byte_transactions_are_removed() {
+        assert_unpackable_transaction_removed(max_batch_gas(0) / 2, max_batch_size(0));
+    }
+
+    /// Transactions blocked only by remaining capacity stay pending with their descendants and
+    /// can be packed once the unrelated transaction filling the first batch has been removed.
+    fn assert_capacity_deferral(first: Vec<u8>, deferred: Vec<u8>, successor: Vec<u8>) {
+        let all = vec![first.clone(), deferred.clone(), successor.clone()];
+        let mut pool = TestPool::new(&all);
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        assert_eq!(output.batch.transactions, vec![first]);
+        assert_eq!(pending_encoded(&pool), all);
+        pool.remove_unsupported_txs(output.mined_transactions);
+
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        assert_eq!(output.batch.transactions, vec![deferred, successor]);
+    }
+
+    /// Exactly the whole gas limit is valid; a different sender blocked by that full batch
+    /// remains available for the next build, together with its later nonce.
+    #[test]
+    fn cumulative_gas_capacity_only_defers_transactions() {
+        let mut first_sender = TransactionFactory::new();
+        let mut deferred_sender = TransactionFactory::new_random();
+        let first = capacity_transaction(&mut first_sender, max_batch_gas(0), 0);
+        let deferred = capacity_transaction(&mut deferred_sender, 21_000, 0);
+        let successor = capacity_transaction(&mut deferred_sender, 21_000, 0);
+        assert_capacity_deferral(first, deferred, successor);
+    }
+
+    /// Individually packable encoded transactions exceeding the byte cap together are deferred
+    /// rather than evicted. Their gas total stays below the gas cap to isolate byte accounting.
+    #[test]
+    fn cumulative_byte_capacity_only_defers_transactions() {
+        let mut first_sender = TransactionFactory::new();
+        let mut deferred_sender = TransactionFactory::new_random();
+        let first =
+            capacity_transaction(&mut first_sender, max_batch_gas(0) / 4, max_batch_size(0) / 2);
+        let deferred =
+            capacity_transaction(&mut deferred_sender, max_batch_gas(0) / 4, max_batch_size(0) / 2);
+        let successor = capacity_transaction(&mut deferred_sender, 21_000, 0);
+        assert!(first.len() <= max_batch_size(0));
+        assert!(deferred.len() + successor.len() <= max_batch_size(0));
+        assert!(first.len() + deferred.len() > max_batch_size(0));
+        assert_capacity_deferral(first, deferred, successor);
+    }
 
     /// A pool that rejects batch selection or balance reads on the async runtime thread.
     struct ThreadCheckedPool {
