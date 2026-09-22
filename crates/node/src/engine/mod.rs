@@ -290,7 +290,7 @@ impl ExecutionNode {
         self.internal.read().await.workers.get(worker_id as usize).is_some()
     }
 
-    /// Batch maker
+    /// Start the worker's batch builder for the epoch.
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -299,10 +299,8 @@ impl ExecutionNode {
         base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
-        let mut guard = self.internal.write().await;
-        guard
-            .start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
-            .await
+        let guard = self.internal.read().await;
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
     }
 
     /// Batch validator
