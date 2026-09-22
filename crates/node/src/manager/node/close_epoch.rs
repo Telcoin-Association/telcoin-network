@@ -115,24 +115,105 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
     }
 }
 
-/// Hand every transaction in `batch` back to its worker's mempool.
+/// Whether an orphaned batch can be removed from the durable recovery cache.
+#[derive(Debug, PartialEq, Eq)]
+enum OrphanBatchRecovery {
+    /// Forwarding accepted the batch, or an active pool considered every transaction.
+    Complete,
+    /// No active pool was available; retain the batch for the next recovery attempt.
+    Retry,
+}
+
+/// Hand every transaction in `batch` back to an active worker's mempool.
 ///
-/// This is the CVV recovery shape: the pool feeds the batch builder, so the transactions
-/// re-enter the normal build/seal/retry loop instead of being dropped. A transaction whose
-/// bytes no longer recover, or that the pool refuses, is dropped exactly as before: at epoch
-/// close there is no better destination for it.
-async fn repool_batch_txns(pools: &[tn_reth::WorkerTxPool], batch: &tn_types::Batch) {
+/// Pools can outlive their workers, so only the current epoch's `active_workers` are eligible.
+/// A removed worker falls back to worker 0. Invalid or refused transactions are logged and
+/// discarded under the pool's normal validation rules; a missing pool leaves the batch cached.
+async fn repool_batch_txns(
+    pools: &[tn_reth::WorkerTxPool],
+    active_workers: usize,
+    batch: &Batch,
+) -> OrphanBatchRecovery {
     use futures::StreamExt as _;
-    let pool = pools.get(usize::from(batch.worker_id));
-    futures::stream::iter(batch.transactions())
-        .filter_map(|tx_bytes| async move { recover_raw_transaction(tx_bytes).ok() })
-        .for_each(|recovered| async {
-            let _ = futures::future::OptionFuture::from(
-                pool.map(|pool| pool.add_recovered_transaction_external(recovered)),
-            )
+    let worker_id = usize::from(batch.worker_id);
+    let pool = pools.get(worker_id).filter(|_| worker_id < active_workers).or_else(|| {
+        warn!(target: "epoch-manager", worker_id, active_workers, pools = pools.len(),
+            transactions = batch.transactions().len(),
+            "orphaned batch has no active worker pool; trying worker 0");
+        pools.first().filter(|_| active_workers > 0)
+    });
+    futures::future::OptionFuture::from(pool.map(|pool| async move {
+        futures::stream::iter(batch.transactions())
+            .filter_map(|tx_bytes| async move {
+                recover_raw_transaction(tx_bytes)
+                    .inspect_err(|error| {
+                        debug!(target: "epoch-manager", worker_id, ?error,
+                            "invalid orphaned transaction");
+                    })
+                    .ok()
+            })
+            .for_each(|recovered| async move {
+                let _ =
+                    pool.add_recovered_transaction_external(recovered).await.inspect_err(|error| {
+                        debug!(target: "epoch-manager", worker_id, ?error,
+                            "pool refused an orphaned transaction");
+                    });
+            })
             .await;
-        })
-        .await;
+        OrphanBatchRecovery::Complete
+    }))
+    .await
+    .unwrap_or_else(|| {
+        error!(target: "epoch-manager", worker_id, active_workers,
+            transactions = batch.transactions().len(),
+            "no active pool for an orphaned batch; retaining it for recovery");
+        OrphanBatchRecovery::Retry
+    })
+}
+
+/// Recover a pre-builder snapshot, removing only entries whose recovery has finished.
+///
+/// Cancellation leaves the current and remaining batches durable. Only snapshotted digests
+/// are removed; callers must finish recovery before builders can reuse those digests.
+async fn recover_orphan_batches<DB, Recover, Recovery>(
+    consensus_db: &DB,
+    orphan_batches: Vec<(BlockHash, Batch)>,
+    mut recover: Recover,
+) -> eyre::Result<()>
+where
+    DB: TNDatabase,
+    Recover: FnMut(BlockHash, Batch) -> Recovery,
+    Recovery: std::future::Future<Output = OrphanBatchRecovery>,
+{
+    use futures::{StreamExt as _, TryStreamExt as _};
+    let batches = orphan_batches.len();
+    let (processed_batches, processed_transactions) = futures::stream::iter(orphan_batches)
+        .map(Ok)
+        .try_fold(
+            (0usize, 0usize),
+            |(processed_batches, processed_transactions), (digest, batch)| {
+                let transactions = batch.transactions().len();
+                let recovery = recover(digest, batch);
+                async move {
+                    match recovery.await {
+                        OrphanBatchRecovery::Complete => {
+                            consensus_db.remove::<OurNodeBatchesCache>(&digest)?;
+                            Ok::<_, eyre::Report>((
+                                processed_batches + 1,
+                                processed_transactions + transactions,
+                            ))
+                        }
+                        OrphanBatchRecovery::Retry => {
+                            Ok((processed_batches, processed_transactions))
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+    info!(target: "epoch-manager", batches, processed_batches, processed_transactions,
+        "Finished processing orphaned batches");
+    Ok(())
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -142,65 +223,64 @@ where
 {
     /// Recover our own batches that never reached the consensus chain.
     ///
-    /// Batches get orphaned when the epoch changes — or the node restarts —
+    /// Batches get orphaned when the epoch changes, or the node restarts,
     /// before they are included in a certificate. Their transactions would be
     /// lost otherwise, so we reintroduce them. An active CVV re-injects each
-    /// transaction into its worker's mempool to be repackaged next epoch; a
+    /// transaction into an active worker's mempool to be repackaged; a
     /// non-CVV disburses each batch through the worker identified by its batch header.
     ///
-    /// [`OurNodeBatchesCache`] is read and then immediately cleared: the cached
-    /// batches are now defunct since their contents are back in flight. Recovery
-    /// runs as a spawned task on the epoch [`TaskManager`] so it does not block
-    /// the rest of teardown.
+    /// Finish local recovery before starting batch builders, removing each cached entry only
+    /// after handling it. This prevents a builder from recreating the same digest during a
+    /// same-epoch restart before its old entry is removed. Network delivery remains in the
+    /// background. Cancellation leaves unfinished batches available for the next attempt.
     pub(super) async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
         &mut self,
-        epoch_task_manager: &TaskManager,
         engine: ExecutionNode,
         workers: Vec<Worker<DB, QuorumWaiter>>,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // Collect any batches from this epoch that never made it to the consensus chain.
-        let mut orphan_batches: Vec<(BlockHash, Batch)> =
+        let orphan_batches: Vec<(BlockHash, Batch)> =
             // Any batches in this table were created by us but never made it to consensus.
             self.consensus_db.iter::<OurNodeBatchesCache>().collect();
-        // We have what we need so clear our Batch cache now.
-        // We are reintroducing the transactions so these batches are now defunct.
-        self.consensus_db.clear_table::<OurNodeBatchesCache>()?;
         if !orphan_batches.is_empty() {
             let consensus_bus = self.consensus_bus.clone();
+            let consensus_db = self.consensus_db.clone();
             let span =
                 info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
             span.record("epoch", epoch.to_string());
-            epoch_task_manager.spawn_task("Orphaned Batches", async move {
-                info!(target: "epoch-manager", "Re-introducing orphaned batches {} transactions", orphan_batches.len());
+            async move {
                 let pools = engine.get_all_worker_transaction_pools().await;
                 let is_cvv = consensus_bus.is_active_cvv();
-                for (digest, batch) in orphan_batches.drain(..) {
-                    // Loop through any orphaned batches and resubmit it's transactions.
-                    // This is most likely because of epoch changes but could be caused by a restart as
-                    // well.
-                    if is_cvv {
-                        // Put the txns back into the mempool.
-                        repool_batch_txns(&pools, &batch).await;
-                    } else {
-                        // If we are not a CVV then go ahead and disburse the txns from the batch directly.
-                        // A refused disbursal (issue #1132) means no forward task owns these
-                        // transactions, and the table that held them was cleared above, so fall
-                        // back to the CVV shape and let the batch builder repackage them
-                        // (issue #1145).
-                        let disbursed = futures::future::OptionFuture::from(
-                            workers.get(usize::from(batch.worker_id)).map(|worker| {
+                recover_orphan_batches(&consensus_db, orphan_batches, |digest, batch| {
+                    let pools = &pools;
+                    let workers = &workers;
+                    async move {
+                        if is_cvv {
+                            repool_batch_txns(pools, workers.len(), &batch).await
+                        } else {
+                            let worker = workers.get(usize::from(batch.worker_id)).or_else(|| {
+                                warn!(target: "epoch-manager", worker_id = batch.worker_id,
+                                    active_workers = workers.len(),
+                                    "orphaned batch names an inactive worker; re-pooling instead of disbursing");
+                                None
+                            });
+                            let disbursed = futures::future::OptionFuture::from(worker.map(|worker| {
                                 worker.disburse_txns(batch.clone().seal(digest))
-                            }),
-                        )
-                        .await;
-                        if disbursed.is_none_or(|result| result.is_err()) {
-                            repool_batch_txns(&pools, &batch).await;
+                            }))
+                            .await;
+                            if disbursed.is_some_and(|result| result.inspect_err(|error| {
+                                debug!(target: "epoch-manager", worker_id = batch.worker_id, ?error,
+                                    "orphaned batch disbursal refused; re-pooling");
+                            }).is_ok()) {
+                                OrphanBatchRecovery::Complete
+                            } else {
+                                repool_batch_txns(pools, workers.len(), &batch).await
+                            }
                         }
                     }
-                }
-                Ok(())
-            }.instrument(span));
+                }).await
+            }.instrument(span).await?;
         } else {
             info!(target: "epoch-manager", "No batches leftover");
         }
@@ -886,7 +966,131 @@ fn boundary_consensus_digest(
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use tn_types::{BlsKeypair, ExecHeader, B256};
+    use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_types::{
+        gas_accumulator::BaseFeeContainer, test_genesis, Address, BlsKeypair, Bytes,
+        Encodable2718 as _, ExecHeader, GenesisAccount, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
+    };
+
+    /// Re-pool a funded transaction and verify that exactly the expected pool receives it.
+    async fn assert_orphan_pool_routing(
+        worker_id: WorkerId,
+        active_workers: usize,
+        pool_count: usize,
+        expected_pool: usize,
+    ) -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let genesis = test_genesis().extend_accounts([(
+            factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: std::sync::Arc<RethChainSpec> = std::sync::Arc::new(genesis.into());
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &task_manager, None)?;
+        let pools = (0..pool_count)
+            .map(|_| env.init_txn_pool(BaseFeeContainer::default()))
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let transaction = factory.create_eip1559(
+            chain,
+            None,
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        );
+        let hash = *transaction.hash();
+        let batch = Batch {
+            worker_id,
+            transactions: vec![b"invalid transaction".to_vec(), transaction.encoded_2718()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            repool_batch_txns(&pools, active_workers, &batch).await,
+            OrphanBatchRecovery::Complete
+        );
+        pools.iter().enumerate().for_each(|(index, pool)| {
+            assert_eq!(pool.get(&hash).is_some(), index == expected_pool);
+        });
+        Ok(())
+    }
+
+    /// A restart after a worker-count decrease re-pools the removed worker's batch into worker 0.
+    #[tokio::test]
+    async fn orphan_recovery_missing_worker_uses_worker_zero() -> eyre::Result<()> {
+        assert_orphan_pool_routing(1, 1, 1, 0).await
+    }
+
+    /// An old pool still in memory must not receive transactions when its worker is dormant.
+    #[tokio::test]
+    async fn orphan_recovery_dormant_worker_uses_worker_zero() -> eyre::Result<()> {
+        assert_orphan_pool_routing(1, 1, 2, 0).await
+    }
+
+    /// Recovery preserves the destination when the original worker is still active.
+    #[tokio::test]
+    async fn orphan_recovery_active_worker_keeps_its_pool() -> eyre::Result<()> {
+        assert_orphan_pool_routing(1, 2, 2, 1).await
+    }
+
+    /// Failure to find any active pool keeps the durable batch available for another attempt.
+    #[tokio::test]
+    async fn orphan_recovery_without_pools_retains_batch() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = tn_storage::open_db(tmp.path());
+        let digest = B256::repeat_byte(1);
+        let batch = Batch::default();
+        db.insert::<OurNodeBatchesCache>(&digest, &batch)?;
+
+        recover_orphan_batches(&db, vec![(digest, batch.clone())], |_, batch| async move {
+            repool_batch_txns(&[], 1, &batch).await
+        })
+        .await?;
+
+        assert_eq!(db.get::<OurNodeBatchesCache>(&digest)?, Some(batch));
+        Ok(())
+    }
+
+    /// Cancellation removes completed work only, preserving interrupted and newly authored batches.
+    #[tokio::test]
+    async fn orphan_recovery_cancellation_preserves_unfinished_and_new_batches() -> eyre::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let db = tn_storage::open_db(tmp.path());
+        let completed = B256::repeat_byte(1);
+        let interrupted = B256::repeat_byte(2);
+        let new_batch = B256::repeat_byte(3);
+        let batch = Batch::default();
+        db.insert::<OurNodeBatchesCache>(&completed, &batch)?;
+        db.insert::<OurNodeBatchesCache>(&interrupted, &batch)?;
+        let snapshot = vec![(completed, batch.clone()), (interrupted, batch.clone())];
+        db.insert::<OurNodeBatchesCache>(&new_batch, &batch)?;
+
+        let mut recovery =
+            Box::pin(recover_orphan_batches(&db, snapshot, |digest, _| async move {
+                if digest == completed {
+                    OrphanBatchRecovery::Complete
+                } else {
+                    std::future::pending().await
+                }
+            }));
+        assert!(futures::poll!(recovery.as_mut()).is_pending());
+        drop(recovery);
+
+        assert!(!db.contains_key::<OurNodeBatchesCache>(&completed)?);
+        assert!(db.contains_key::<OurNodeBatchesCache>(&interrupted)?);
+        assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
+
+        recover_orphan_batches(&db, vec![(interrupted, batch)], |_, _| async {
+            OrphanBatchRecovery::Complete
+        })
+        .await?;
+        assert!(!db.contains_key::<OurNodeBatchesCache>(&interrupted)?);
+        assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
+        Ok(())
+    }
 
     /// Deterministic BLS public keys, one per seed byte.
     fn keys(seeds: std::ops::Range<u8>) -> Vec<BlsPublicKey> {
