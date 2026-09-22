@@ -12,10 +12,10 @@
 //! client that stops or trickles its reads while a response body streams to it): a
 //! transport-stall deadline (`TCP_USER_TIMEOUT`) and a hard cap on total connection lifetime.
 //!
-//! Layer order on the router is load-bearing: `rate_limit → CorsLayer → TimeoutLayer →
-//! DefaultBodyLimit → routes`. Rate limiting runs first so an over-limit request is shed before
-//! anything else is spent on it; CORS sits outside the timeout so a `408` still carries the
-//! browser's headers.
+//! Layer order on the router is load-bearing: `CorsLayer → rate_limit → TimeoutLayer →
+//! DefaultBodyLimit → routes`. CORS is outermost so every early response (the limiter's `429`, the
+//! timeout's `408`) carries the browser's headers, and a preflight is answered before it reaches
+//! the limiter; rate limiting comes next so an over-limit request is shed before the route runs.
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
@@ -85,7 +85,7 @@ pub struct ServerLimits {
 /// `request_deadline` bounds each whole request; the bare `408` the timeout layer produces is
 /// rewritten into the daemon's JSON error so the "always JSON" contract holds.
 /// `max_request_bytes` caps the buffered request body (the API is `GET`-only, so this is small).
-/// When `rate_limiters` is present it is installed as the outermost layer.
+/// When `rate_limiters` is present it is installed just inside CORS.
 pub fn router(
     routes: Router,
     request_deadline: Duration,
@@ -95,13 +95,15 @@ pub fn router(
     let router = routes
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
-        .layer(map_response(envelope_request_timeout))
-        .layer(cors_layer());
-    // Add the rate-limit layer last so it runs first.
-    match rate_limiters {
+        .layer(map_response(envelope_request_timeout));
+    let router = match rate_limiters {
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
         None => router,
-    }
+    };
+    // Add CORS last so it is outermost: every early response (the limiter's 429, the timeout's
+    // 408) carries the browser's headers, and the browser's preflight `OPTIONS` is answered by
+    // `CorsLayer` directly so it never consumes rate-limit budget.
+    router.layer(cors_layer())
 }
 
 /// CORS for a public, read-only API: any origin, the safe methods only, and never credentials
@@ -407,6 +409,45 @@ mod tests {
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         let body: serde_json::Value = second.json().await.expect("json");
         assert_eq!(body["error"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn over_limit_429_carries_cors_headers() {
+        // Same burst-1 global limit: the first request exhausts the budget, so the
+        // cross-origin second one is rejected and must still be readable by the browser.
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (addr, _shutdown) = spawn(test_app(Some(limiters))).await;
+
+        let client = Client::new();
+        let first = client.get(format!("http://{addr}/v1/records")).send().await.expect("send");
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = client
+            .get(format!("http://{addr}/v1/records"))
+            .header("origin", "https://site.example")
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers().get("access-control-allow-origin").expect("allow-origin"), "*");
+        let body: serde_json::Value = second.json().await.expect("json");
+        assert_eq!(body["error"], "rate_limited");
+
+        let preflight = client
+            .request(Method::OPTIONS, format!("http://{addr}/v1/records"))
+            .header("origin", "https://site.example")
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .expect("send");
+        // Preflights are answered by `CorsLayer` and never reach the limiter.
+        assert_ne!(preflight.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(preflight.status().is_success(), "{}", preflight.status());
     }
 
     #[tokio::test]
