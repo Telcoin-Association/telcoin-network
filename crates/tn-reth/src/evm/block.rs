@@ -2428,6 +2428,76 @@ mod tests {
         Ok(())
     }
 
+    /// The governance-Safe fork must fire only from the block that closes
+    /// `GOVERNANCE_SAFE_FORK_EPOCH - 1`, never from a neighbouring epoch close.
+    ///
+    /// On adiri the fork epoch is 554, so the one-shot `==` trigger in `finish` fires in the
+    /// block that closes epoch 553. The positive control for this execution path is
+    /// `test_governance_safe_fork_overwrites_third_party_fallback_handler` below, which drives
+    /// that close and shows the migration landing. Here two epoch closes run over the pre-fork
+    /// `test_genesis()` fixture, each on a fresh chain: concluding epoch 552
+    /// (`GOVERNANCE_SAFE_FORK_EPOCH - 2`) and concluding epoch 554 (`GOVERNANCE_SAFE_FORK_EPOCH`).
+    /// After each, the governance proxy's slot 0 must still hold the pre-fork L1 `Safe`
+    /// singleton and the canonical `SafeL2` address must still have no code.
+    ///
+    /// Mutations caught: a `>=` trigger (`concluding + 1 >= 554`) fires at concluding epoch
+    /// 554; an off-by-one that fires a close early (`concluding + 2 == 554`) fires at
+    /// concluding epoch 552, and one that drops the `+ 1` (`concluding == 554`) fires at
+    /// concluding epoch 554.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_does_not_fire_off_boundary() -> eyre::Result<()> {
+        use reth_provider::StateProvider as _;
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        let fork_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH;
+        // `finish` compares against the effective fork epoch; a test-utils override would move
+        // the boundary away from the constant this test brackets
+        assert_eq!(
+            tn_types::forks::governance_safe_fork_epoch(),
+            fork_epoch,
+            "TN_GOVERNANCE_SAFE_FORK_EPOCH must not override the fork epoch in this lane"
+        );
+
+        // by name, not by index: the table's row order is coupled to the vendored bytecode
+        // list, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+        let (safe_l1, safe_l2) = (suite_address("Safe"), suite_address("SafeL2"));
+        let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+
+        // one close either side of the boundary close (`fork_epoch - 1`)
+        for concluding_epoch in [fork_epoch - 2, fork_epoch] {
+            let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+            let genesis_header = chain.sealed_genesis_header();
+            let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+            let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+            let tmp = TempDir::new().unwrap();
+            let tm = TaskManager::new("governance fork off boundary");
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+            if let Err(e) = execute_payload_and_update_canonical_chain(&env, payload, vec![]) {
+                panic!("concluding epoch {concluding_epoch}: the close must execute, got: {e:#}");
+            }
+
+            let post = env.latest()?;
+            assert_eq!(
+                post.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+                Some(as_slot_value(safe_l1)),
+                "concluding epoch {concluding_epoch}: governance proxy slot 0 must stay on the \
+                 pre-fork L1 Safe singleton"
+            );
+            assert!(
+                post.account_code(&safe_l2)?.is_none(),
+                "concluding epoch {concluding_epoch}: SafeL2 must have no code off the boundary"
+            );
+        }
+
+        Ok(())
+    }
+
     /// The governance-Safe fork must fail closed over an unexpected pre-fork swap target.
     ///
     /// The `Safe` singleton account is overwritten with the post-fork registry artifact bytes

@@ -4180,14 +4180,22 @@ pub(crate) mod test {
         }
     }
 
-    /// The frozen pack's committee: two authorities, each with a single-worker bootstrap server.
+    /// The frozen pack's committee: [`legacy_pack_committee_at`] pinned to [`LEGACY_PACK_EPOCH`].
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_committee() -> Committee {
+        legacy_pack_committee_at(LEGACY_PACK_EPOCH)
+    }
+
+    /// The fixture committee at `epoch`: two authorities, each with a single-worker bootstrap
+    /// server.
     ///
     /// Two is the minimum — `CommitteeInner::load` asserts a committee larger than one — and the
     /// point of the fixture is the wire layout, not the quorum math, so it stays at the minimum to
     /// keep the frozen vector small. One worker per server is the only shape the legacy layout can
-    /// express at all.
+    /// express at all. Only `epoch` varies, so the same members can be written on either side of
+    /// the multi-workers fork.
     #[cfg(feature = "adiri")]
-    fn legacy_pack_committee() -> Committee {
+    fn legacy_pack_committee_at(epoch: Epoch) -> Committee {
         use std::collections::BTreeMap;
 
         use tn_types::{Address, Authority, BootstrapServer};
@@ -4205,10 +4213,11 @@ pub(crate) mod test {
                 ),
             );
         }
-        Committee::new_for_test(authorities, LEGACY_PACK_EPOCH, bootstrap_servers)
+        Committee::new_for_test(authorities, epoch, bootstrap_servers)
     }
 
-    /// The previous epoch's record the frozen pack links to.
+    /// The previous epoch's record the frozen pack links to (or, for a fixture committee at another
+    /// epoch, the record of the epoch before the committee's own).
     ///
     /// Every field here is frozen INTO the pack: `open_append` copies `final_state` and
     /// `final_consensus` into the `EpochMeta` and derives `start_consensus_number` from them, and
@@ -4218,7 +4227,7 @@ pub(crate) mod test {
     #[cfg(feature = "adiri")]
     fn legacy_pack_previous_epoch(committee: &Committee) -> EpochRecord {
         EpochRecord {
-            epoch: LEGACY_PACK_EPOCH - 1,
+            epoch: committee.epoch() - 1,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             final_state: tn_types::BlockNumHash::new(4_242, tn_types::B256::repeat_byte(0x5E)),
@@ -4248,8 +4257,8 @@ pub(crate) mod test {
     ) -> ConsensusOutput {
         use tn_types::Signer as _;
 
-        let batch =
-            Batch::new_for_test(vec![vec![tag; 8]], ExecHeader::default(), 0, LEGACY_PACK_EPOCH);
+        let epoch = committee.epoch();
+        let batch = Batch::new_for_test(vec![vec![tag; 8]], ExecHeader::default(), 0, epoch);
         let authorities = committee.authorities();
         let authority = authorities
             .get(usize::from(tag) % authorities.len())
@@ -4258,7 +4267,7 @@ pub(crate) mod test {
         let header = HeaderBuilder::default()
             .author(authority.id())
             .round(u32::from(tag))
-            .epoch(LEGACY_PACK_EPOCH)
+            .epoch(epoch)
             .created_at(u64::from(tag))
             .seed_signature(seed_signature)
             .with_payload_batch(&batch, 0_u16)
@@ -4302,25 +4311,41 @@ pub(crate) mod test {
         outputs
     }
 
-    /// Write the fixture pack through the normal write path (`open_append` +
+    /// Write the fixture pack at `epoch` through the normal write path (`open_append` +
     /// `save_consensus_output`) into `dir` and return the resulting `data` file bytes.
     ///
-    /// On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated encoder emits the legacy committee
-    /// layout, which `tn_types`' differentials prove is byte-identical to the pre-#554 derive. A
-    /// pack this writes at that epoch therefore IS a pre-fork pack, byte for byte — which is what
-    /// makes freezing its output a fixture of history rather than of this build.
+    /// The fixture committee and outputs at `epoch`, linked to the synthetic record of `epoch - 1`
+    /// from [`legacy_pack_previous_epoch`]. On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated
+    /// encoder emits the legacy committee layout, which `tn_types`' differentials prove is
+    /// byte-identical to the pre-multi-worker (#554) derive. A pack this writes at that epoch
+    /// therefore IS a pre-fork pack, byte for byte — which is what makes freezing its output a
+    /// fixture of history rather than of this build. At any other pre-fork epoch it writes the same
+    /// fixture in the same legacy layout.
     #[cfg(feature = "adiri")]
-    async fn write_legacy_pack(dir: &std::path::Path) -> Vec<u8> {
-        let committee = legacy_pack_committee();
+    async fn write_legacy_pack(dir: &std::path::Path, epoch: Epoch) -> Vec<u8> {
+        let committee = legacy_pack_committee_at(epoch);
         let previous_epoch = legacy_pack_previous_epoch(&committee);
+        write_fixture_pack(dir, &previous_epoch, committee).await
+    }
+
+    /// Write the fixture outputs for `committee` into a pack at `committee.epoch()` linked to
+    /// `previous_epoch`, through `open_append` + `save_consensus_output`, and return the resulting
+    /// `data` file bytes.
+    #[cfg(feature = "adiri")]
+    async fn write_fixture_pack(
+        dir: &std::path::Path,
+        previous_epoch: &EpochRecord,
+        committee: Committee,
+    ) -> Vec<u8> {
+        let epoch = committee.epoch();
         let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
             .expect("open fixture pack for append");
-        for output in legacy_pack_outputs(&committee, &previous_epoch) {
+        for output in legacy_pack_outputs(&committee, previous_epoch) {
             pack.save_consensus_output(output).await.expect("save fixture output");
         }
         pack.persist().await.expect("persist fixture pack");
         drop(pack);
-        std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
+        std::fs::read(dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME))
             .expect("read fixture data file")
     }
 
@@ -4449,7 +4474,7 @@ pub(crate) mod test {
         );
 
         let first = TempDir::with_prefix("golden_legacy_pack_a").expect("temp dir");
-        let bytes = write_legacy_pack(first.path()).await;
+        let bytes = write_legacy_pack(first.path(), LEGACY_PACK_EPOCH).await;
         assert_eq!(
             tn_types::hex::encode(&bytes),
             GOLDEN_LEGACY_PACK_HEX,
@@ -4460,7 +4485,7 @@ pub(crate) mod test {
         // clock or OS-assigned port leaked into the fixture
         let second = TempDir::with_prefix("golden_legacy_pack_b").expect("temp dir");
         assert_eq!(
-            write_legacy_pack(second.path()).await,
+            write_legacy_pack(second.path(), LEGACY_PACK_EPOCH).await,
             bytes,
             "the fixture pack is not reproducible"
         );
@@ -4654,6 +4679,317 @@ pub(crate) mod test {
         assert_eq!(report.batch_count, 2, "frozen batch record count moved");
         assert_eq!(report.first_consensus_number, Some(LEGACY_PACK_FIRST_CONSENSUS));
         assert_eq!(report.last_consensus_number, Some(LEGACY_PACK_LAST_CONSENSUS));
+    }
+
+    /// The fixture committee's authorities keyed by BLS key, as both committee layouts carry them.
+    #[cfg(feature = "adiri")]
+    fn committee_authorities_by_key(
+        committee: &Committee,
+    ) -> std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::Authority> {
+        committee
+            .authorities()
+            .into_iter()
+            .map(|authority| (*authority.protocol_key(), authority))
+            .collect()
+    }
+
+    /// `committee`'s bcs bytes in the legacy single-worker layout, built from plain serde tuples
+    /// instead of the gated encoder: `authorities ++ epoch ++ bootstrap_servers`, each bootstrap
+    /// server as `primary ++ worker` with no worker count, and no `num_workers`.
+    ///
+    /// bcs frames neither structs nor tuples, so a tuple of the fields in declaration order encodes
+    /// exactly as the struct does. Nothing here consults
+    /// [`multi_workers_fork_active`](tn_types::forks::multi_workers_fork_active), so the mirror
+    /// cannot move with a mutated gate.
+    #[cfg(feature = "adiri")]
+    fn legacy_committee_layout(committee: &Committee) -> Vec<u8> {
+        use std::collections::BTreeMap;
+
+        use tn_types::{BlsPublicKey, P2pNode};
+
+        let bootstrap_servers: BTreeMap<BlsPublicKey, (P2pNode, P2pNode)> = committee
+            .bootstrap_servers()
+            .into_iter()
+            .map(|(key, server)| {
+                let [worker] = server.workers.as_slice() else {
+                    panic!("the legacy layout holds exactly one worker per bootstrap server");
+                };
+                (key, (server.primary.clone(), worker.clone()))
+            })
+            .collect();
+        tn_types::encode(&(
+            committee_authorities_by_key(committee),
+            committee.epoch(),
+            bootstrap_servers,
+        ))
+    }
+
+    /// `committee`'s bcs bytes in the multi-worker layout, built the same gate-free way:
+    /// `authorities ++ epoch ++ bootstrap_servers ++ num_workers`, each bootstrap server as
+    /// `primary ++ ULEB128(n) ++ n workers` (the [`BootstrapServer`](tn_types::BootstrapServer)
+    /// derive), and `num_workers` as the 8-byte little-endian integer bcs writes for a `usize`.
+    #[cfg(feature = "adiri")]
+    fn multi_worker_committee_layout(committee: &Committee) -> Vec<u8> {
+        let num_workers =
+            u64::try_from(committee.number_of_workers()).expect("a worker count fits in a u64");
+        tn_types::encode(&(
+            committee_authorities_by_key(committee),
+            committee.epoch(),
+            committee.bootstrap_servers(),
+            num_workers,
+        ))
+    }
+
+    /// One read door's view of a fork-chain pack: the fixture committee at `epoch`, stored in the
+    /// wire `layout` expected on its side of the fork, serving exactly `outputs`.
+    #[cfg(feature = "adiri")]
+    async fn assert_fork_chain_pack(
+        pack: &ConsensusPack,
+        epoch: Epoch,
+        layout: &[u8],
+        outputs: &[ConsensusOutput],
+    ) {
+        let expected = legacy_pack_committee_at(epoch);
+        assert_eq!(pack.epoch(), epoch, "pack epoch moved");
+        assert_eq!(
+            *pack.committee(),
+            expected,
+            "epoch {epoch}: the meta holds a different committee"
+        );
+        assert_eq!(
+            pack.committee().bootstrap_servers(),
+            expected.bootstrap_servers(),
+            "epoch {epoch}: the meta holds different bootstrap servers"
+        );
+        assert_eq!(
+            pack.committee().number_of_workers(),
+            1,
+            "epoch {epoch}: the fixture committee is single-worker on both sides of the fork"
+        );
+        assert_eq!(
+            tn_types::hex::encode(tn_types::encode(pack.committee())),
+            tn_types::hex::encode(layout),
+            "epoch {epoch}: the stored committee is in the wrong wire layout for its side of the \
+             multi-workers fork"
+        );
+        for output in outputs {
+            let read_back = pack.get_consensus_output(output.number()).await.unwrap_or_else(|e| {
+                panic!("epoch {epoch}: read output {} back: {e}", output.number())
+            });
+            compare_outputs(&read_back, output);
+        }
+    }
+
+    /// CHAIN (adiri): two linked fixture packs straddling the multi-workers fork — epoch 569
+    /// (`MULTI_WORKERS_FORK_EPOCH - 1`, pre-fork) and epoch 570 (the fork epoch, post-fork) — each
+    /// written through the normal write path and read back through every door.
+    ///
+    /// The gate is `>=`, so the 569 pack must store its committee in the legacy single-worker
+    /// layout and the 570 pack in the multi-worker layout. A swapped gate (one keyed to another
+    /// fork's epoch, such as the leader-seeded ordering fork's 567, or fork constants swapped
+    /// with each other) or an off-by-one gate (`>` for `>=`, or a fork epoch one off) writes
+    /// the wrong layout on one side of the boundary, and this test fails on that side: through
+    /// the epoch pin and the anti-vacuity asserts, and independently through the gate-free
+    /// layout mirrors, which also catch an encoder that ignores the gate.
+    ///
+    /// Raw file bytes cannot be compared across the boundary: the data header's uid derives from
+    /// the epoch, every record is zstd-compressed and crc-framed, the nested headers and
+    /// batches carry the epoch into their digests, and the 570 pack's linkage fields point at
+    /// the 569 pack. So the cross-boundary comparison is on decoded structures: each pack's
+    /// committee, re-encoded, must equal a gate-free mirror of its layout
+    /// ([`legacy_committee_layout`], [`multi_worker_committee_layout`]). Against the 569
+    /// committee, the 570 committee's bytes have the epoch bumped, one ULEB128 worker-count
+    /// byte before each bootstrap server's worker, and the 8-byte `num_workers` field after
+    /// `bootstrap_servers` (inside the `EpochMeta` record, just before
+    /// `start_consensus_number`). The worker-count bytes are there because the bootstrap map is
+    /// the frozen fixture's, not empty: that keeps the 569 pack identical to the pack
+    /// `write_legacy_pack` writes at 569.
+    ///
+    /// Also pins the committee-epoch check at the boundary: a peer's `EpochMeta { epoch: 570, .. }`
+    /// carrying the 569 committee decodes cleanly (the committee's own epoch selects the legacy
+    /// layout), so only `verify_epoch_meta` stands between it and an imported pack.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_pack_chain_crosses_multi_workers_fork() {
+        use tn_types::{forks, hex};
+
+        use crate::{
+            consensus_pack::{EpochMeta, PackError},
+            pack_validate::{validate_pack_file, Verdict},
+        };
+
+        const FORK: Epoch = forks::MULTI_WORKERS_FORK_EPOCH;
+        assert_eq!(
+            FORK, 570,
+            "the adiri multi-workers fork epoch moved; retarget this test's doc comment with it"
+        );
+        let pre = FORK - 1;
+        assert!(
+            !forks::multi_workers_fork_active(pre),
+            "epoch {pre} must be PRE-fork; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, \
+             or is the gate off by one?"
+        );
+        assert!(
+            forks::multi_workers_fork_active(FORK),
+            "epoch {FORK} must be POST-fork; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, \
+             or is the gate off by one?"
+        );
+
+        let chain = TempDir::with_prefix("pack_chain_multi_workers_fork").expect("temp dir");
+        let data_file =
+            |epoch: Epoch| chain.path().join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+
+        // the pre-fork pack: the legacy fixture at 569, linked to its synthetic 568 record
+        let pre_committee = legacy_pack_committee_at(pre);
+        let pre_previous = legacy_pack_previous_epoch(&pre_committee);
+        let pre_outputs = legacy_pack_outputs(&pre_committee, &pre_previous);
+        let pre_bytes = write_legacy_pack(chain.path(), pre).await;
+
+        // the post-fork pack: the same members at 570, linked to the record closing the 569 pack
+        let last_pre = pre_outputs.last().expect("the fixture writes two outputs");
+        let pre_record = EpochRecord {
+            epoch: pre,
+            committee: pre_committee.bls_keys().iter().copied().collect(),
+            next_committee: pre_committee.bls_keys().iter().copied().collect(),
+            final_state: tn_types::BlockNumHash::new(8_888, tn_types::B256::repeat_byte(0x6E)),
+            final_consensus: ConsensusNumHash::new(last_pre.number(), last_pre.digest()),
+            ..Default::default()
+        };
+        let post_committee = legacy_pack_committee_at(FORK);
+        let post_outputs = legacy_pack_outputs(&post_committee, &pre_record);
+        let post_last = post_outputs.last().expect("the fixture writes two outputs").number();
+        let post_bytes =
+            write_fixture_pack(chain.path(), &pre_record, post_committee.clone()).await;
+
+        // the cross-boundary delta, spelled out on the gate-free mirrors
+        let pre_layout = legacy_committee_layout(&pre_committee);
+        let post_layout = multi_worker_committee_layout(&post_committee);
+        let servers = post_committee.bootstrap_servers().len();
+        assert_eq!(servers, 2, "the fixture committee has one bootstrap server per authority");
+        assert_eq!(
+            post_layout.len(),
+            pre_layout.len() + servers + 8,
+            "the multi-worker committee adds one worker-count byte per bootstrap server and the \
+             8-byte num_workers field, and nothing else"
+        );
+        assert_eq!(
+            post_layout[post_layout.len() - 8..],
+            1_u64.to_le_bytes(),
+            "the multi-worker committee must end in num_workers = 1"
+        );
+
+        // warm restart and historical reads, on each side of the fork
+        for (epoch, layout, outputs) in
+            [(pre, &pre_layout, &pre_outputs), (FORK, &post_layout, &post_outputs)]
+        {
+            {
+                let pack = ConsensusPack::open_append_exists(chain.path(), epoch)
+                    .unwrap_or_else(|e| panic!("warm restart of the epoch {epoch} pack: {e}"));
+                assert!(!pack.is_static(), "a warm-restart handle is writable");
+                assert_fork_chain_pack(&pack, epoch, layout, outputs).await;
+                pack.persist().await.expect("persist");
+            }
+            let pack = ConsensusPack::open_static(chain.path(), epoch)
+                .unwrap_or_else(|e| panic!("read-only open of the epoch {epoch} pack: {e}"));
+            assert!(pack.is_static(), "open_static must yield a read-only handle");
+            assert_fork_chain_pack(&pack, epoch, layout, outputs).await;
+        }
+        for (epoch, bytes) in [(pre, &pre_bytes), (FORK, &post_bytes)] {
+            assert_eq!(
+                hex::encode(std::fs::read(data_file(epoch)).expect("reread data file")),
+                hex::encode(bytes),
+                "a read door rewrote the epoch {epoch} pack"
+            );
+        }
+
+        // the offline validator, with the full linkage: the 570 pack against the 569 record
+        for (epoch, previous) in [(pre, &pre_previous), (FORK, &pre_record)] {
+            let report = validate_pack_file(&data_file(epoch), epoch, Some(previous))
+                .unwrap_or_else(|e| panic!("validate the epoch {epoch} pack: {e}"));
+            assert_eq!(
+                report.verdict,
+                Verdict::Valid,
+                "the epoch {epoch} pack must validate clean: {:?}",
+                report.issues
+            );
+            assert_eq!(report.epoch, epoch);
+            assert_eq!(
+                report.start_consensus_number,
+                previous.final_consensus.number + 1,
+                "epoch {epoch}: start_consensus_number does not follow the previous record"
+            );
+            assert_eq!(report.consensus_count, 2, "epoch {epoch}: consensus record count");
+        }
+
+        // peer epoch sync of the post-fork pack
+        let import =
+            TempDir::with_prefix("pack_chain_multi_workers_fork_import").expect("temp dir");
+        let source = import.path().join("peer_stream");
+        std::fs::write(&source, &post_bytes).expect("write peer stream");
+        {
+            let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+            let pack = ConsensusPack::stream_import(
+                import.path(),
+                stream,
+                FORK,
+                &pre_record,
+                post_last,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("stream import of the post-fork pack");
+            pack.persist().await.expect("persist imported pack");
+            assert_fork_chain_pack(&pack, FORK, &post_layout, &post_outputs).await;
+        }
+        assert_eq!(
+            hex::encode(
+                std::fs::read(import.path().join(format!("epoch-{FORK}")).join(Inner::DATA_NAME))
+                    .expect("read imported data file")
+            ),
+            hex::encode(&post_bytes),
+            "importing the post-fork pack rewrote its bytes"
+        );
+
+        // negative: a 570 meta carrying the 569 committee, with every linkage field correct
+        let hostile =
+            TempDir::with_prefix("pack_chain_multi_workers_fork_hostile").expect("temp dir");
+        let source = hostile.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, u64::from(FORK), false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: FORK,
+                committee: pre_committee.clone(),
+                start_consensus_number: pre_record.final_consensus.number + 1,
+                genesis_exec_state: pre_record.final_state,
+                genesis_consensus: pre_record.final_consensus,
+            }))
+            .expect("append hostile meta");
+            pack.commit().expect("commit peer stream");
+        }
+        let target =
+            TempDir::with_prefix("pack_chain_multi_workers_fork_hostile_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            FORK,
+            &pre_record,
+            post_last,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an epoch-570 meta carrying the epoch-569 committee must not import");
+        assert!(matches!(err, PackError::InvalidEpoch(epoch, _) if epoch == FORK), "got {err:?}");
+        assert!(
+            err.to_string().contains(&format!("committee is for epoch {pre}")),
+            "a different check rejected the import: {err}"
+        );
+        assert!(
+            ConsensusPack::open_append_exists(target.path(), FORK).is_err(),
+            "the rejected meta was appended anyway"
+        );
     }
 
     /// PIN (non-adiri): the frozen pre-fork bytes are indecodable in a build whose multi-workers

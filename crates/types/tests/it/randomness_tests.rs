@@ -447,3 +447,224 @@ async fn test_epoch_seed_message_binds_round() {
         "this round's signature must not verify against the next round's message"
     );
 }
+
+/// P-G1: `PREVRANDAO` at the concrete adiri fork boundary. Epoch 574 (`PREVRANDAO_FORK_EPOCH`)
+/// is the first epoch whose executed blocks derive `PREVRANDAO` from the epoch seed chain, and
+/// epoch 573 is the last one on the legacy `output_digest ^ batch_digest` arm. Both epochs are
+/// derived from the constant, so the numbers here are documentation only.
+///
+/// At 574 two sequential commits are built, `C1` folding the epoch root and `C2` folding `C1`'s
+/// value. Every `PREVRANDAO` their outputs produce (batch indices 0 and 1, and the empty
+/// epoch-closing block's `prev_randao(0, B256::ZERO)`) is recomputed here from literal bytes as
+/// `keccak256("TN_PREVRANDAO_V1" || this commit's fold || number as LE u64 || index as LE u64)`,
+/// with the fold itself rebuilt by [`independent_fold`] over [`independent_root`]. At 573 the
+/// leader header is seed-signed, so the seed conjunct of `prevrandao_seed_active` holds and only
+/// the PREVRANDAO fork point can keep the block on the legacy arm, which must replay the XOR
+/// byte-identically.
+///
+/// Catches:
+/// - a gate at `F + 1` or a `>` comparison: 574 stays on the legacy arm and every seeded
+///   expectation fails;
+/// - a swapped constant (the gate reading `SEED_SIGNATURE_FORK_EPOCH`, or firing one epoch early):
+///   573 flips onto the seeded arm and the legacy replay fails;
+/// - hashing the previous commit's chain value instead of this commit's: `C2` must not reproduce
+///   the value `C1`'s fold would give at `C2`'s number and index.
+#[cfg(feature = "adiri")]
+#[tokio::test]
+async fn prev_randao_at_concrete_fork_boundary_uses_this_commits_fold() {
+    use tn_types::{forks::prevrandao_seed_active, ConsensusHeaderDigest, ConsensusOutput};
+
+    /// The post-fork `PREVRANDAO` recomputed INDEPENDENTLY of the production helper, for the same
+    /// reason as `independent_fold`: domain tag, seed chain value, then the consensus block number
+    /// and batch index as little-endian `u64`s.
+    fn independent_prev_randao(seed: B256, number: u64, batch_index: u64) -> B256 {
+        let preimage: Vec<u8> = b"TN_PREVRANDAO_V1"
+            .iter()
+            .copied()
+            .chain(seed.as_slice().iter().copied())
+            .chain(number.to_le_bytes())
+            .chain(batch_index.to_le_bytes())
+            .collect();
+        keccak256(preimage)
+    }
+
+    let post_fork: Epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH;
+    let pre_fork: Epoch = post_fork - 1;
+
+    // anti-vacuity tripwire, mirroring the unit-level keeper in `output.rs`: an ambient override
+    // moves the gate off the compiled schedule, and both halves below would then land on one arm
+    assert!(
+        !prevrandao_seed_active(pre_fork),
+        "epoch {pre_fork} must still be on the legacy PREVRANDAO arm; is \
+         TN_PREVRANDAO_FORK_EPOCH set in the environment, or was the fork point moved below it?"
+    );
+    assert!(
+        prevrandao_seed_active(post_fork),
+        "epoch {post_fork} must take the seeded PREVRANDAO arm (`>=`, not `>`); is \
+         TN_PREVRANDAO_FORK_EPOCH or TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?"
+    );
+
+    let batch_digests = [B256::repeat_byte(0x5A), B256::repeat_byte(0xA5)];
+    let number: u64 = 1_000;
+
+    // Epoch F - 1: one seed-signed commit, still on the legacy arm.
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(pre_fork).build();
+    let committee = fixture.committee();
+    let leader = fixture.first_authority().header_with_round(&committee, 1);
+    let seed_signature =
+        leader.seed_signature().expect("the seed fork precedes the PREVRANDAO fork on adiri");
+    let pre_fold = independent_fold(independent_root(pre_fork), leader.round(), seed_signature);
+    let cert = fixture.certificate(&leader);
+    let sub_dag = CommittedSubDag::new(
+        vec![cert.clone()],
+        cert,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(pre_fork),
+    );
+    let output = ConsensusOutput::new(
+        sub_dag.clone(),
+        ConsensusHeaderDigest::default(),
+        number,
+        false,
+        batch_digests.into(),
+        Vec::new(),
+    );
+    let output_digest = B256::from(output.digest());
+    for (index, digest) in batch_digests.into_iter().enumerate() {
+        let randao = output.prev_randao(index, digest);
+        assert_eq!(
+            randao,
+            output_digest ^ digest,
+            "epoch {pre_fork} must replay the legacy XOR byte-identically at index {index}"
+        );
+        assert_ne!(
+            randao,
+            independent_prev_randao(pre_fold, number, index as u64),
+            "epoch {pre_fork} must not take the seeded arm at index {index}"
+        );
+    }
+    let closing =
+        ConsensusOutput::new_closed_with_subdag(sub_dag, ConsensusHeaderDigest::default(), number);
+    assert_eq!(
+        closing.prev_randao(0, B256::ZERO),
+        B256::from(closing.digest()),
+        "epoch {pre_fork}'s empty closing block must reduce to the bare consensus header digest"
+    );
+
+    // Epoch F: C1 folds the epoch root, C2 folds C1's value.
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(post_fork).build();
+    let committee = fixture.committee();
+    let root = EpochSeedChainValue::epoch_root(post_fork);
+    assert_eq!(
+        root.into_inner(),
+        independent_root(post_fork),
+        "the epoch root must be the domain separated hash of the epoch alone"
+    );
+
+    let leader_1 = fixture.first_authority().header_with_round(&committee, 1);
+    let fold_1 = independent_fold(
+        independent_root(post_fork),
+        leader_1.round(),
+        leader_1.seed_signature().expect("seed signature present for fork-active epoch"),
+    );
+    let cert_1 = fixture.certificate(&leader_1);
+    let sub_dag_1 = CommittedSubDag::new(
+        vec![cert_1.clone()],
+        cert_1,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        root,
+    );
+
+    let leader_2 = fixture.last_authority().header_with_round(&committee, 2);
+    let fold_2 = independent_fold(
+        fold_1,
+        leader_2.round(),
+        leader_2.seed_signature().expect("seed signature present for fork-active epoch"),
+    );
+    let cert_2 = fixture.certificate(&leader_2);
+    let sub_dag_2 = CommittedSubDag::new(
+        vec![cert_2.clone()],
+        cert_2,
+        1,
+        ReputationScores::new(&committee),
+        Some(sub_dag_1.clone()),
+        sub_dag_1.seed_chain_value(),
+    );
+    assert_ne!(fold_1, fold_2, "the seed chain must advance from C1 to C2");
+
+    let output_1 = ConsensusOutput::new(
+        sub_dag_1,
+        ConsensusHeaderDigest::default(),
+        number,
+        false,
+        batch_digests.into(),
+        Vec::new(),
+    );
+    let output_2 = ConsensusOutput::new(
+        sub_dag_2.clone(),
+        output_1.digest(),
+        number + 1,
+        false,
+        batch_digests.into(),
+        Vec::new(),
+    );
+    for (index, digest) in batch_digests.into_iter().enumerate() {
+        let batch_index = index as u64;
+        let randao_1 = output_1.prev_randao(index, digest);
+        assert_eq!(
+            randao_1,
+            independent_prev_randao(fold_1, number, batch_index),
+            "C1 at epoch {post_fork} must hash its own fold at index {index}"
+        );
+        assert_ne!(
+            randao_1,
+            B256::from(output_1.digest()) ^ digest,
+            "the legacy XOR must not be in play for C1 at epoch {post_fork}"
+        );
+
+        let randao_2 = output_2.prev_randao(index, digest);
+        assert_eq!(
+            randao_2,
+            independent_prev_randao(fold_2, number + 1, batch_index),
+            "C2 at epoch {post_fork} must hash its own fold at index {index}"
+        );
+        assert_ne!(
+            randao_2,
+            independent_prev_randao(fold_1, number + 1, batch_index),
+            "C2 must not hash C1's chain value: the fold must advance per commit"
+        );
+        assert_ne!(
+            randao_2,
+            B256::from(output_2.digest()) ^ digest,
+            "the legacy XOR must not be in play for C2 at epoch {post_fork}"
+        );
+    }
+
+    // The empty epoch-closing block: the engine calls `prev_randao(0, B256::ZERO)` on a closing
+    // output with no batches.
+    let closing = ConsensusOutput::new_closed_with_subdag(sub_dag_2, output_1.digest(), number + 1);
+    assert!(
+        closing.close_epoch() && closing.batch_digests().is_empty(),
+        "the closing output must be the empty epoch-closing shape"
+    );
+    let empty_close = closing.prev_randao(0, B256::ZERO);
+    assert_eq!(
+        empty_close,
+        independent_prev_randao(fold_2, number + 1, 0),
+        "the empty closing block at epoch {post_fork} must hash the closing commit's fold"
+    );
+    assert_ne!(
+        empty_close,
+        independent_prev_randao(fold_1, number + 1, 0),
+        "the empty closing block must not hash the previous commit's chain value"
+    );
+    assert_ne!(
+        empty_close,
+        B256::from(closing.digest()),
+        "the empty closing block at epoch {post_fork} must not fall back to the bare header digest"
+    );
+}

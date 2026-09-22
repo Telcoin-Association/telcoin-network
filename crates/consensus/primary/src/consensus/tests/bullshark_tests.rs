@@ -16,7 +16,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
+    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochDigest, EpochRecord,
     ExecHeader, Header, HeaderDigest, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver,
     TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
@@ -1915,5 +1915,167 @@ fn child_order_dag_wrapper_observes_dormant_gate() {
         wrapper, seeded,
         "the arms must disagree here, or the equality above is vacuous and this child cannot \
          tell which arm the wrapper took",
+    );
+}
+
+/// Sentinel selecting the child dispatch of
+/// [`order_dag_wrapper_flips_at_the_pinned_fork_epoch`]: a dedicated variable rather than the
+/// fork overrides themselves, so a lane-exported `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` or
+/// `TN_SEED_SIGNATURE_FORK_EPOCH` cannot be mistaken for a child spawn.
+const TN_TEST_ORDER_DAG_FORK_FLIP_CHILD: &str = "TN_TEST_ORDER_DAG_FORK_FLIP_CHILD";
+
+/// The leader-seeded ordering fork epoch [`order_dag_wrapper_flips_at_the_pinned_fork_epoch`]
+/// pins in its child's env: epoch 6 is the last pre-fork epoch and epoch 7 the first post-fork
+/// one.
+const PINNED_LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = 7;
+
+/// Builds the [`seeded_ordering_state`] shape at `epoch`: an optimal DAG over rounds 1..=6 for
+/// `committee`, every certificate stamped `epoch`. Returns the populated state and its round-6
+/// certificate authored by `ids[0]`.
+///
+/// The leader is picked by author, not by digest, because fixture digests are random per run:
+/// two calls over the same committee then commit a leader at the same position, and the two
+/// states differ only in the epoch their certificates carry.
+fn epoch_ordering_state(
+    committee: &Committee,
+    ids: &[AuthorityIdentifier],
+    epoch: Epoch,
+) -> (ConsensusState, Certificate) {
+    let genesis =
+        Certificate::genesis(committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _next_parents) =
+        make_certificates_with_epoch(committee, 1..=6, epoch, &genesis, ids);
+
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(gc_depth);
+    certificates.iter().for_each(|certificate| {
+        state.try_insert(certificate).unwrap();
+    });
+    let author = ids.first().expect("the fixture committee is non-empty");
+    let leader = certificates
+        .iter()
+        .find(|certificate| certificate.round() == 6 && certificate.origin() == author)
+        .cloned()
+        .expect("the leader's author proposed at round 6");
+    (state, leader)
+}
+
+/// Production-wrapper fork-boundary pin (#1260): with the leader-seeded ordering fork pinned at
+/// epoch 7, `order_dag` must take the legacy arm for an epoch-6 leader and the seeded arm for an
+/// epoch-7 leader, and the fork must change the order: the arms disagree on the epoch-7 commit.
+///
+/// [`order_dag_wrapper_consults_the_fork_gate`] proves the wrapper consults the gate at all, but
+/// every certificate there shares one epoch. Here the two leaders sit on either side of the
+/// boundary over same-shape DAGs and one committee, so the only input that differs between the
+/// two calls is the epoch inside the leader. A hardcoded arm, an off-by-one at the boundary, or
+/// a gate keyed on anything but `leader.epoch()` fails one of the two equalities.
+///
+/// This parent spawns THIS test binary with `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=7` and
+/// `TN_SEED_SIGNATURE_FORK_EPOCH=0` in the child's env: both overrides latch in process-wide
+/// `OnceLock`s, so the pinned schedule needs its own process. Pinning the seed fork at genesis
+/// keeps the `seed_signature_active` conjunct of `leader_seeded_ordering_active` true on both
+/// sides, so the flip is the ordering fork's alone, and it makes the child's schedule the same
+/// with or without the adiri feature. The child's harness output must report exactly one passed
+/// test: a drifted name would match nothing and still exit 0, so exit status alone would be a
+/// vacuous pass.
+#[test]
+fn order_dag_wrapper_flips_at_the_pinned_fork_epoch() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let name = child_test_name("child_order_dag_wrapper_observes_pinned_fork_boundary");
+    let mut command = std::process::Command::new(exe);
+    command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+    command.env(TN_TEST_ORDER_DAG_FORK_FLIP_CHILD, "1");
+    command.env(
+        "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
+        PINNED_LEADER_SEEDED_ORDERING_FORK_EPOCH.to_string(),
+    );
+    command.env("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    let output = command.output().expect("spawn child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+/// Child of [`order_dag_wrapper_flips_at_the_pinned_fork_epoch`], spawned with the
+/// leader-seeded ordering fork pinned at epoch 7 and the seed-signature fork at genesis: the
+/// wrapper must emit exactly the legacy sequence for the epoch-6 leader and exactly the seeded
+/// sequence for the epoch-7 leader. The arms must disagree on each side, or the matching
+/// equality is vacuous and cannot tell which arm the wrapper took.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, the seeded permutation
+/// reproduces the legacy order on all five four-certificate rounds of one commit with
+/// probability at most (1 / 24)^5, under 2e-7, so the two inequalities together fail
+/// spuriously with probability under 4e-7 per run.
+#[test]
+#[ignore = "spawned by order_dag_wrapper_flips_at_the_pinned_fork_epoch with a controlled env"]
+fn child_order_dag_wrapper_observes_pinned_fork_boundary() {
+    assert!(
+        std::env::var_os(TN_TEST_ORDER_DAG_FORK_FLIP_CHILD).is_some(),
+        "this child runs only under order_dag_wrapper_flips_at_the_pinned_fork_epoch, which pins \
+         the fork overrides in the spawn env; running it directly proves nothing about the \
+         wrapper",
+    );
+    // Both overrides latch in process-wide `OnceLock`s, so a child launched WITHOUT them in its
+    // env cannot observe the pinned schedule. Fail loudly rather than assert a property this
+    // process cannot hold; a silent skip here would read as a pass.
+    assert_eq!(
+        tn_types::forks::leader_seeded_ordering_fork_epoch_override(),
+        Some(PINNED_LEADER_SEEDED_ORDERING_FORK_EPOCH),
+        "this child requires TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=7 latched from its spawn env; \
+         the override is OnceLock-latched, so it cannot be set after startup",
+    );
+    assert_eq!(
+        tn_types::forks::seed_signature_fork_epoch_override(),
+        Some(0),
+        "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=0 latched from its spawn env, so the \
+         seed-signature conjunct holds on both sides of the ordering fork",
+    );
+
+    // GIVEN same-shape DAGs at the last pre-fork epoch and at the fork epoch, over one
+    // committee, each with its round-6 leader authored by the same authority
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let pre_fork = PINNED_LEADER_SEEDED_ORDERING_FORK_EPOCH - 1;
+    let (state_6, leader_6) = epoch_ordering_state(&committee, &ids, pre_fork);
+    let (state_7, leader_7) =
+        epoch_ordering_state(&committee, &ids, PINNED_LEADER_SEEDED_ORDERING_FORK_EPOCH);
+    assert_eq!(leader_6.origin(), leader_7.origin(), "both leaders share one author");
+    assert_seeded_arm_observable(&leader_6);
+    assert_seeded_arm_observable(&leader_7);
+
+    let digests = |ordered: &[Certificate]| ordered.iter().map(|x| x.digest()).collect::<Vec<_>>();
+
+    // WHEN
+    let wrapper_6 = digests(&utils::order_dag(&leader_6, &state_6));
+    let legacy_6 = digests(&utils::order_dag_inner(&leader_6, &state_6, false));
+    let seeded_6 = digests(&utils::order_dag_inner(&leader_6, &state_6, true));
+    let wrapper_7 = digests(&utils::order_dag(&leader_7, &state_7));
+    let legacy_7 = digests(&utils::order_dag_inner(&leader_7, &state_7, false));
+    let seeded_7 = digests(&utils::order_dag_inner(&leader_7, &state_7, true));
+
+    // THEN one epoch below the fork, the wrapper takes the legacy arm
+    assert_ne!(
+        seeded_6, legacy_6,
+        "the arms must disagree at epoch 6, or the pre-fork equality below is vacuous",
+    );
+    assert_eq!(
+        wrapper_6, legacy_6,
+        "order_dag must stay on the legacy arm one epoch below the pinned fork, digest for digest",
+    );
+    // AND at the fork epoch, the wrapper takes the seeded arm
+    assert_eq!(
+        wrapper_7, seeded_7,
+        "order_dag must take the seeded arm at the pinned fork epoch, digest for digest",
+    );
+    // AND the fork changes the order the wrapper emits
+    assert_ne!(
+        seeded_7, legacy_7,
+        "the fork must change the commit order at epoch 7, or the post-fork equality above is \
+         vacuous",
     );
 }

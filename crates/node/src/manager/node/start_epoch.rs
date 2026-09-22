@@ -1401,6 +1401,39 @@ mod tests {
         check_committee_worker_count(0, count, 2)
     }
 
+    /// Epoch entry flips at the adiri multi-worker fork (`MULTI_WORKERS_FORK_EPOCH`, 570), not one
+    /// epoch earlier.
+    ///
+    /// Each case pairs the committee-derived worker count with the configured swarm count. The
+    /// committee count is a `NonZeroUsize`, so its minimum is one active worker. Paired with two
+    /// configured swarms it still trips the pre-fork gate, which needs one worker on both sides.
+    /// From the fork epoch both cases enter, and a two-worker committee on one swarm fails the
+    /// capacity check instead. The epochs come from the constant, so a retarget keeps the bracket
+    /// in place.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn epoch_entry_worker_gate_brackets_the_fork() -> eyre::Result<()> {
+        let fork = tn_types::forks::MULTI_WORKERS_FORK_EPOCH;
+        let pre_fork =
+            fork.checked_sub(1).ok_or_else(|| eyre::eyre!("fork epoch must follow genesis"))?;
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre::eyre!("nonzero worker count"))?;
+        [(count, 2), (NonZeroUsize::MIN, 2)].into_iter().try_for_each(
+            |(on_chain, configured)| -> eyre::Result<()> {
+                let err = check_committee_worker_count(pre_fork, on_chain, configured)
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("expected rejection one epoch before the fork"))?;
+                let expected = format!("not active at epoch {pre_fork}");
+                assert!(err.to_string().contains(&expected), "{err}");
+                check_committee_worker_count(fork, on_chain, configured)
+            },
+        )?;
+        let error = check_committee_worker_count(fork, count, 1)
+            .err()
+            .ok_or_else(|| eyre::eyre!("two active workers require two configured swarms"))?;
+        assert!(error.to_string().contains("configure at least the worker count"), "{error}");
+        Ok(())
+    }
+
     /// A governance decrease to one worker leaves surplus swarms without blocking epoch entry.
     #[test]
     fn single_worker_epoch_entry_allows_extra_configured_workers() -> eyre::Result<()> {
