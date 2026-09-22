@@ -713,6 +713,9 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let temp = tempfile::TempDir::new()?;
+    let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs/cold_genesis");
+    let peer_readiness_wait = Duration::from_millis(500) * 240;
+    let startup_sync_wait = Duration::from_secs(30);
     config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
@@ -737,12 +740,14 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
         );
         let check_alive = || {
             child.try_borrow_mut()?.try_wait()?.map_or(Ok(()), |status| {
-                eyre::bail!("cold-genesis validator exited: {status} (test_logs/cold_genesis/)")
+                eyre::bail!("cold-genesis validator exited: {status} ({})", log_dir.display())
             })
         };
+        // Startup sync and primary-network readiness run before the worker creates its RPC
+        // server. With no peers, allow both waits to expire plus process-startup headroom.
         wait_until_blocking(
-            Duration::from_secs(45),
-            "cold-genesis RPC ready without peers (test_logs/cold_genesis/)",
+            startup_sync_wait + peer_readiness_wait + Duration::from_secs(45),
+            &format!("cold-genesis RPC ready without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
                 Ok(call_rpc::<String, _, _>(
@@ -759,11 +764,11 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
         // Primary and worker readiness each wait 240 x 500ms. Observe beyond both waits plus the
         // 30s startup-sync deadline, even if every stage spends its entire allowance without peers.
         // Start this window after RPC is ready so slow process startup cannot shorten it.
-        let observation = Duration::from_millis(500) * 240 * 2 + Duration::from_secs(30);
+        let observation = peer_readiness_wait * 2 + startup_sync_wait;
         let started = Instant::now();
         wait_until_blocking(
             observation + Duration::from_secs(30),
-            "cold-genesis RPC stays available without peers (test_logs/cold_genesis/)",
+            &format!("cold-genesis RPC stays available without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
                 call_rpc::<String, _, _>(
