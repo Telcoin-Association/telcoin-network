@@ -30,7 +30,7 @@ use tn_storage::{
 use tn_types::{
     deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
-    SealedHeader, TaskManager, TnReceiver,
+    SealedHeader, TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -969,8 +969,8 @@ mod tests {
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
         gas_accumulator::BaseFeeContainer, test_genesis, Address, BlsKeypair, Bytes,
-        Encodable2718 as _, ExecHeader, GenesisAccount, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
-        U256,
+        Encodable2718 as _, ExecHeader, GenesisAccount, TaskManager, WorkerId, B256,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Re-pool a funded transaction and verify that exactly the expected pool receives it.
