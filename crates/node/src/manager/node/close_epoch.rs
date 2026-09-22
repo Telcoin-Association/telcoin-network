@@ -1067,6 +1067,8 @@ mod tests {
         db.insert::<OurNodeBatchesCache>(&interrupted, &batch)?;
         let snapshot = vec![(completed, batch.clone()), (interrupted, batch.clone())];
         db.insert::<OurNodeBatchesCache>(&new_batch, &batch)?;
+        // Exercise cancellation with both the snapshot and the later insert persisted.
+        db.persist::<OurNodeBatchesCache>().await?;
 
         let mut recovery =
             Box::pin(recover_orphan_batches(&db, snapshot, |digest, _| async move {
@@ -1079,6 +1081,8 @@ mod tests {
         assert!(futures::poll!(recovery.as_mut()).is_pending());
         drop(recovery);
 
+        // Cache deletions must reach the persistent layer before checking their absence.
+        db.persist::<OurNodeBatchesCache>().await?;
         assert!(!db.contains_key::<OurNodeBatchesCache>(&completed)?);
         assert!(db.contains_key::<OurNodeBatchesCache>(&interrupted)?);
         assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
@@ -1087,6 +1091,7 @@ mod tests {
             OrphanBatchRecovery::Complete
         })
         .await?;
+        db.persist::<OurNodeBatchesCache>().await?;
         assert!(!db.contains_key::<OurNodeBatchesCache>(&interrupted)?);
         assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
         Ok(())
