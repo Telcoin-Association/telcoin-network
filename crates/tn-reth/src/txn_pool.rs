@@ -28,8 +28,8 @@
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
 
-use alloy::primitives::map::AddressSet;
-use futures::{stream, Stream, StreamExt as _};
+use alloy::primitives::{keccak256, map::AddressSet, B256};
+use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
@@ -40,7 +40,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
     CanonStateSubscriptions as _, Chain, ChangedAccount, StateProviderBox,
-    StateProviderFactory as _,
+    StateProviderFactory as _, TransactionsProvider as _,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -55,20 +55,27 @@ use reth_transaction_pool::{
 use std::{
     collections::HashMap,
     pin::pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, EnvKzgSettings,
-    Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner, TransactionSigned, TxHash, U256,
+    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
+    EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner,
+    TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    error::TnRethResult, evm::TnEvmConfig, metrics::RETH_METRICS, peer_batch::PeerBatchTxs,
-    traits::TelcoinNode, PoolTxn, PoolTxnId,
+    error::TnRethResult,
+    evm::TnEvmConfig,
+    forward::{FORWARD_BATCH_BUDGET, FORWARD_PENDING_LIFETIME, REQUEUE_GRACE},
+    forward_pending::{PendingForwards, RetentionLimits, SubmissionHead},
+    metrics::{ForwarderMetrics, RETH_METRICS},
+    peer_batch::PeerBatchTxs,
+    traits::TelcoinNode,
+    PoolTxn, PoolTxnId,
 };
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
@@ -215,6 +222,8 @@ pub struct WorkerTxPool(
     /// The transactions this node has seen inside a validated peer batch, deferred by the
     /// builder while that peer batch is in flight (issue #1329).
     PeerBatchTxs,
+    /// Observer transactions awaiting canonical inclusion, shared across epoch forwarders.
+    Arc<Mutex<PendingForwards<TxHash, BlsPublicKey, B256>>>,
 );
 
 impl From<WorkerTxPool>
@@ -284,6 +293,10 @@ impl WorkerTxPool {
             .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
+        let forward_limits = RetentionLimits::new(
+            pool_config.pending_limit.max_txs,
+            pool_config.pending_limit.max_size,
+        );
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
         let validator = TransactionValidationTaskExecutor::eth_builder(
             blockchain_provider.clone(),
@@ -342,7 +355,13 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee, PeerBatchTxs::default()))
+        Ok(Self(
+            transaction_pool,
+            blockchain_provider.clone(),
+            base_fee,
+            PeerBatchTxs::default(),
+            Arc::new(Mutex::new(PendingForwards::new(forward_limits))),
+        ))
     }
 
     /// Spawn the critical task that expires parked transactions even when the chain is idle.
@@ -428,7 +447,9 @@ impl WorkerTxPool {
     /// `Lagged`, and reloads dirty senders in chunks of `max_reload`. A `retry_interval`
     /// tick re-arms the reload between notifications, so a residual dirty set drains at
     /// the retry cadence even when notification traffic goes quiet after the volume spike that
-    /// built it (issue #1304). A tick with no dirty senders is a no-op.
+    /// built it (issue #1304). Each event also expires retained forwards and requeues eligible
+    /// ones; acknowledged transactions require canonical output progress before becoming
+    /// eligible.
     ///
     /// Canonical pool updates finish before the next maintenance event is processed.
     /// The chunk reload is awaited inline, so a tick can never start a second reload while
@@ -495,8 +516,72 @@ impl WorkerTxPool {
                     retained
                 })
             };
+            self.retry_forwarded(Instant::now(), max_reload).await;
         }
         Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
+    }
+
+    /// Access the pool-owned forwarding state without holding the lock across provider I/O.
+    pub(crate) fn pending_forwards(
+        &self,
+    ) -> MutexGuard<'_, PendingForwards<TxHash, BlsPublicKey, B256>> {
+        self.4.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reserve retained bytes before a successful forwarding admission lets the builder prune them.
+    /// Reading the actual canonical head keeps queued historical notifications out of the window.
+    pub(crate) fn admit_forwards(&self, transactions: Vec<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+        let head = self.1.canonical_in_memory_state().get_canonical_head();
+        self.pending_forwards().admit(
+            transactions.into_iter().map(|tx| (keccak256(&tx), tx)).collect(),
+            SubmissionHead::new(head.number, head.parent_beacon_block_root),
+            Instant::now(),
+            FORWARD_BATCH_BUDGET,
+            FORWARD_PENDING_LIFETIME,
+            REQUEUE_GRACE,
+        )
+    }
+
+    /// Return eligible forwards to the ordinary pool after checking canonical inclusion locally.
+    /// The existing maintenance batch limit also bounds provider reads and validations per event.
+    async fn retry_forwarded(&self, now: Instant, limit: usize) {
+        let (ready, expired) = self.pending_forwards().ready(now, limit);
+        if expired > 0 {
+            ::metrics::counter!("tn_reth.forwarded_txns_expired_total")
+                .increment(u64::try_from(expired).unwrap_or(u64::MAX));
+            warn!(target: "worker::forward", expired, "forward inclusion tracking expired");
+        }
+        stream::iter(ready)
+            .for_each(|(hash, bytes)| async move {
+                let provider = self.1.clone();
+                let included = tokio::task::spawn_blocking(move || provider.transaction_by_hash(hash))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| {
+                        result.map(|transaction| transaction.is_some()).map_err(|error| error.to_string())
+                    });
+                if included.as_ref().is_ok_and(|included| *included) {
+                    self.pending_forwards().remove(&hash);
+                } else if included.is_err() {
+                    self.pending_forwards().retry_later(&hash);
+                    warn!(target: "worker::forward", ?included, "cannot check forwarded transaction inclusion");
+                } else {
+                    let added = OptionFuture::from(
+                        recover_raw_transaction(&bytes)
+                            .ok()
+                            .map(|transaction| self.add_recovered_transaction_external(transaction)),
+                    )
+                    .await
+                    .is_some_and(|result| result.is_ok());
+                    if added {
+                        ForwarderMetrics::record_txns_requeued(1);
+                    }
+                    // A new batch may already own the inserted transaction by this point.
+                    let present = added || self.0.get(&hash).is_some();
+                    self.pending_forwards().reinserted(&hash, present);
+                }
+            })
+            .await;
     }
 
     /// Apply one canonical-state notification, awaiting pool maintenance before the next one.
@@ -737,6 +822,14 @@ impl WorkerTxPool {
 
             // Collect hashes to remove transactions mined in this canonical update.
             let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+
+            tip.parent_beacon_block_root.into_iter().for_each(|output| {
+                pool.pending_forwards().committed(
+                    tip.number,
+                    output,
+                    mined_transactions.iter().copied(),
+                );
+            });
 
             debug!(target: "block-builder", ?mined_transactions);
 
@@ -1054,6 +1147,77 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
+    }
+
+    /// A real canonical notification retires retained forwarding state independently of pool
+    /// pruning.
+    #[tokio::test]
+    async fn forwarded_inclusion_retires_retained_state() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, reth_env, _background_pool) =
+            funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        let mut notifications = pool.1.subscribe_to_canonical_state();
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded])?;
+        assert!(
+            pool.1.transaction_by_hash(hash)?.is_some(),
+            "the transaction must really be included"
+        );
+        let notification =
+            tokio::time::timeout(Duration::from_secs(5), notifications.recv()).await??;
+        pool.apply_canon_notification(notification).await?;
+        assert_eq!(
+            pool.pending_forwards().ready(Instant::now() + FORWARD_PENDING_LIFETIME, 1),
+            (vec![], 0),
+            "canonical inclusion must remove the retained record before expiry",
+        );
+        Ok(())
+    }
+
+    /// An eligible retained payload returns to the real pool and can be admitted for its next send.
+    #[tokio::test]
+    async fn missing_inclusion_requeues_the_retained_payload() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, reth_env, _background_pool) =
+            funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        pool.pending_forwards().defer(&hash);
+        (1_u8..=3).for_each(|output| {
+            pool.pending_forwards().committed(u64::from(output), B256::repeat_byte(output), []);
+        });
+        assert!(pool.get(&hash).is_none());
+        pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
+        assert!(pool.get(&hash).is_some(), "the original signed payload must return to the pool");
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded]));
+        Ok(())
     }
 
     #[test]
