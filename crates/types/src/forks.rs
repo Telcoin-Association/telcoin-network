@@ -297,14 +297,30 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// always has; it does not make `PREVRANDAO` unbiasable. See
 /// [`EpochSeedChainValue`](crate::EpochSeedChainValue) on accepted last-actor bias.
 ///
-/// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
-/// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
-/// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting
-/// PR fleet-wide before the fork epoch begins. The rollout PR MUST set a value at or above
-/// the live adiri epoch plus deployment margin, and at or above
-/// [`SEED_SIGNATURE_FORK_EPOCH`]: [`prevrandao_seed_active`] additionally requires
-/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork
-/// fires instead of hashing the forkable legacy leader-aggregate seed (#1032).
+/// Armed for adiri (chain 2017) at epoch 574: every block executed for a commit whose leader
+/// carries epoch 574 or later derives `PREVRANDAO` from the seed chain. Measured boundary: Wed
+/// 2026-09-30 08:33 UTC (03:33 CDT). Derived by binary-searching first-block timestamps over
+/// epochs 536→544 on the live chain (mean epoch length 21,602 s, σ 58 s, so about 6.001 h per
+/// epoch), snapshotted at epoch 544 / block 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 574 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so blocks the fleet already executed with the XOR derivation at or past the
+/// constant would replay with a different `mix_hash` on this build and diverge from canonical
+/// history.
+///
+/// Arming constraint (compile-time asserted below): the epoch must be at or above
+/// [`SEED_SIGNATURE_FORK_EPOCH`]. [`prevrandao_seed_active`] additionally requires
+/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork fires
+/// instead of hashing the forkable legacy leader-aggregate seed (#1032).
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary keeps the XOR derivation, computes a different `mix_hash` for
+/// every block from the fork epoch on, and forks away from the upgraded fleet at its first
+/// post-fork block.
 ///
 /// Pre-fork epochs keep the XOR derivation byte-identical so replaying already-executed
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
@@ -320,19 +336,12 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// commit. This fork promotes that bias into an opcode contracts can read; contracts that
 /// need unbiasable randomness must not use `PREVRANDAO` alone.
 #[cfg(feature = "adiri")]
-pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
+pub const PREVRANDAO_FORK_EPOCH: Epoch = 574;
 
-/// Compile-time enforcement of the rollout-order contract documented on
-/// [`PREVRANDAO_FORK_EPOCH`]: a rollout PR that sets the PREVRANDAO fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires.
+/// Compile-time enforcement of the arming constraint documented on [`PREVRANDAO_FORK_EPOCH`]:
+/// a retarget that sets the PREVRANDAO fork below the seed fork fails to compile instead of
+/// shipping a gate that silently stays dormant until the seed fork fires.
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while PREVRANDAO_FORK_EPOCH is the `Epoch::MAX` placeholder; \
-              once the rollout PR lowers the constant the comparison becomes live and this \
-              expectation flags itself for removal"
-)]
 const _: () = assert!(PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Whether executed blocks of `epoch` derive `PREVRANDAO` from the epoch seed chain (#1247).
@@ -374,12 +383,6 @@ fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
 #[inline]
 const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "PREVRANDAO_FORK_EPOCH is an `Epoch::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= PREVRANDAO_FORK_EPOCH
     }
