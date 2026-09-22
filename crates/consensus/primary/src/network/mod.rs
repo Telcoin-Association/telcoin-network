@@ -1163,6 +1163,9 @@ impl PrimaryNetworkHandle {
                 | PackError::CorruptPack(_)
                 | PackError::UnexpectedConsensusDigest { .. }
                 | PackError::EmptySubDag
+                // An oversized batch over an import stream is peer misbehavior (the batch validator
+                // caps legitimate batches at `max_batch_size`); charge Severe (finding #10 OOM).
+                | PackError::BatchTooLarge { .. }
                 // A non-advancing / gapped / over-`final` consensus number over an import stream is
                 // peer misbehavior (both return sites are on the peer-import path); charge Severe so a
                 // peer that wedges an import with a non-advancing chain is banned (finding #10).

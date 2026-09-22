@@ -17,8 +17,8 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    gas_accumulator::RewardsCounter, max_batch_size, AuthorityIdentifier, Batch, BlockHash,
+    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
     B256, MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
@@ -2570,6 +2570,17 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                         digest
                     )));
                 }
+                // Bound per-output buffering by the same measure the batch validator enforces at
+                // production/gossip (`validate_batch_size_bytes`): the raw transaction-byte sum
+                // against the epoch's `max_batch_size`. A record may be up to MAX_RECORD_SIZE
+                // (16 MiB), but a legitimate batch is far smaller, so without this an attacker's
+                // oversized batches inflate `available_batches` ~16x (finding #10 OOM). Rejecting
+                // before the insert keeps only batches within the limit buffered.
+                let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
+                let max = max_batch_size(committee.epoch());
+                if batch_bytes > max {
+                    return Err(PackError::BatchTooLarge { size: batch_bytes, max });
+                }
                 referenced_batches.insert(digest);
                 available_batches.insert(digest, batch);
                 digest_count += 1;
@@ -2671,6 +2682,15 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 batch_records += 1;
                 if batch_records > max_batches {
                     return Err(PackError::TooManyBatches(max_batches));
+                }
+                // Same per-batch byte cap as the v1 path (`iter_to_output`): reject a batch whose
+                // transaction bytes exceed the epoch's `max_batch_size` before buffering it, so an
+                // oversized-batch flood cannot inflate `available_batches` toward OOM (finding
+                // #10).
+                let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
+                let max = max_batch_size(committee.epoch());
+                if batch_bytes > max {
+                    return Err(PackError::BatchTooLarge { size: batch_bytes, max });
                 }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
@@ -2930,6 +2950,16 @@ pub enum PackError {
     /// Every `leader()`-derived accessor panics on such a value, so it is rejected at decode
     /// time; a legitimately committed output always names its leader as its last header.
     EmptySubDag,
+    /// A `Batch` record in an import stream carried more transaction bytes than the epoch's
+    /// `max_batch_size`. Legitimate batches are capped at production/gossip by the batch
+    /// validator, so this is peer misbehavior; rejecting it bounds per-output buffering to a
+    /// legitimate size.
+    BatchTooLarge {
+        /// The offending batch's transaction-byte total.
+        size: usize,
+        /// The per-epoch limit (`max_batch_size`) it exceeded.
+        max: usize,
+    },
 }
 
 impl PackError {
@@ -3011,6 +3041,9 @@ impl Display for PackError {
             }
             PackError::EmptySubDag => {
                 write!(f, "consensus header carries an empty sub-dag (no leader)")
+            }
+            PackError::BatchTooLarge { size, max } => {
+                write!(f, "batch of {size} transaction bytes exceeds the {max}-byte limit")
             }
         }
     }
@@ -3778,6 +3811,134 @@ pub(crate) mod test {
         )
         .await;
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
+    }
+
+    /// Finding #10 (OOM): the batch buffer in `iter_to_output` is bounded only by count, not bytes,
+    /// so a `Batch` whose transaction bytes exceed `max_batch_size(epoch)` must be rejected — the
+    /// same limit the batch validator enforces at production/gossip — rather than buffered at up to
+    /// `MAX_RECORD_SIZE` (16 MiB) each. Without the cap this decodes `Ok`; with it,
+    /// `BatchTooLarge`.
+    #[tokio::test]
+    async fn test_iter_to_output_rejects_oversized_batch() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_oversized_batch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // One batch whose single transaction is one byte over the epoch's limit; well under the
+        // 16 MiB record cap, so it decodes and reaches the byte check rather than being rejected as
+        // an oversized record.
+        let oversized = Batch::new_for_test(
+            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
+            ExecHeader::default(),
+            0,
+            committee.epoch(),
+        );
+
+        // A leader header that references exactly that batch (so the output declares one batch and
+        // the decoder reaches the buffering loop).
+        let authority = committee.authorities();
+        let authority = authority.first().expect("committee has authorities");
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority.id());
+        leader.update_header_for_test(
+            HeaderBuilder::from_header(leader.header())
+                .with_payload_batch(&oversized, 0_u16)
+                .build(),
+        );
+        leader.update_header_epoch_for_test(committee.epoch());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let header = ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag,
+            number: 1,
+            extra: Default::default(),
+        };
+
+        // v1 stream: header first, then the oversized batch record.
+        let path = temp_dir.path().join("oversized");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            pack.append(&PackRecord::Batch(oversized)).expect("append oversized batch");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::BatchTooLarge { .. })),
+            "an oversized batch must be rejected as BatchTooLarge, got {res:?}"
+        );
+    }
+
+    /// Finding #10 (OOM), v0 path: `iter_to_output_legacy` buffers batches (which in v0 arrive
+    /// before the header) with the same count-only bound, so the per-batch byte cap applies here
+    /// too — and fires as the oversized batch is read, before any consensus header.
+    #[tokio::test]
+    async fn test_iter_to_output_legacy_rejects_oversized_batch() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output_legacy, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_oversized_batch_v0").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // One batch one byte over the epoch's limit.
+        let oversized = Batch::new_for_test(
+            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
+            ExecHeader::default(),
+            0,
+            committee.epoch(),
+        );
+
+        // v0 is batches-first, so a single batch record is enough to reach the byte check.
+        let path = temp_dir.path().join("oversized_v0");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Batch(oversized)).expect("append oversized batch");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output_legacy(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::BatchTooLarge { .. })),
+            "an oversized v0 batch must be rejected as BatchTooLarge, got {res:?}"
+        );
     }
 
     /// A `ConsensusOutput` that references more than the old fixed 1000-batch cap but stays within
