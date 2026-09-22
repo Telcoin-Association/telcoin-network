@@ -37,9 +37,9 @@ use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Multiaddr,
-    P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
+    Multiaddr, NetworkPublicKey, P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError,
+    TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -88,6 +88,22 @@ struct PreparedWorkerNetwork<Events> {
     p2p: P2pNode,
     /// The persistent event stream at the same index as the worker configuration.
     event_stream: Events,
+}
+
+/// Reject an advertised primary identity that differs from the loaded keystore before spawning
+/// any process-lifetime network.
+fn check_primary_network_key(
+    network_key: &NetworkPublicKey,
+    key_config: &KeyConfig,
+) -> eyre::Result<()> {
+    let expected = key_config.primary_network_public_key();
+    eyre::ensure!(
+        *network_key == expected,
+        "node config `node_info.p2p_info.primary.network_key` does not match the key derived \
+         from the loaded BLS keystore (expected {expected}, found {network_key}): set this entry \
+         to the expected value"
+    );
+    Ok(())
 }
 
 /// Reject multi-worker layouts before the fork, before checking local capacity at either entry
@@ -694,11 +710,10 @@ where
 {
     /// Construct the manager and its process-lifetime state.
     ///
-    /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
-    /// `Observer` mode when configured as an observer), and loads bootstrap servers from the
-    /// genesis committee. Network handles are left `None` until [`run`](Self::run) spawns the
-    /// networks. Panics if the consensus chain cannot be opened, since that is unrecoverable at
-    /// startup.
+    /// Opens the consensus chain, builds the application-scoped consensus bus, and loads bootstrap
+    /// servers from the genesis committee. Network handles are left `None` until [`run`](Self::run)
+    /// spawns the networks. Panics if the consensus chain cannot be opened, since that is
+    /// unrecoverable at startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -725,10 +740,6 @@ where
 
         let consensus_bus =
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
-        if builder.tn_config.observer {
-            // Don't risk keeping the default CVV active mode...
-            consensus_bus.node_mode().send_replace(NodeMode::Observer);
-        }
         // one event stream per configured worker, indexed by worker id
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
             .map(|_| QueChannel::new())
@@ -777,14 +788,18 @@ where
 
     /// Build the process-lifetime components, then drive the epoch loop until shutdown.
     ///
-    /// Startup proceeds in order: create the execution engine and start it, heal any
+    /// Startup proceeds in order: create and start the execution engine, bind the healthcheck and
+    /// metrics endpoints, then heal any
     /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
-    /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
-    /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
+    /// (`RethEnv::heal_finalized_to_persisted_tip`, before anything reads the marker), recover
+    /// the [`GasAccumulator`] via [`catchup_accumulator`], restore execution state with
+    /// [`try_restore_state`](Self::try_restore_state), and spawn the long-running p2p networks
     /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
-    /// listeners, schedule process-lifetime bootstrap dials, spawn the epoch-record and vote
-    /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
-    /// and spawn the engine-update task. It then launches the epoch pack fetch workers before
+    /// p2p listeners, schedule process-lifetime bootstrap dials, spawn the vote collector, and
+    /// re-vote durable records. Read the epoch-start-pinned committee, seed the in-memory epoch-0
+    /// anchor if needed, then poll for peers and sync epoch records within `STARTUP_SYNC_TIMEOUT`.
+    /// Seed the node-mode watch using both committee views before spawning the background record
+    /// collector and the engine-update task. It then launches the epoch pack fetch workers before
     /// requesting any missing epoch pack files, followed by the recent-consensus fetch task.
     ///
     /// Finally it selects over two futures: the node task manager running to exit, and the epoch
@@ -854,6 +869,37 @@ where
                 engine_update_tx,
             )
             .await?;
+
+        // Bind operator endpoints before any startup synchronization waits for peers.
+        if let Some(port) = self.builder.healthcheck {
+            let engine = engine.clone();
+            let worker_ready = move || {
+                let engine = engine.clone();
+                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
+            };
+            let _ =
+                HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;
+        }
+
+        // Propagate metrics bind errors because the operator requested this endpoint.
+        if let Some(addr) = self.builder.metrics {
+            let db = self.reth_db.clone();
+            let hooks = tn_metrics::MetricsHooks::default()
+                .with_hook(move || tn_reth::report_db_metrics(&db));
+            tn_metrics::start_metrics_server(
+                addr,
+                &node_task_manager.get_spawner(),
+                self.version_str,
+                hooks,
+            )
+            .await?;
+
+            tn_primary::spawn_bus_metrics_mirror(
+                &self.consensus_bus,
+                &node_task_manager.get_spawner(),
+                self.node_shutdown.subscribe(),
+            );
+        }
 
         // Heal a finalized marker left lagging the persisted canonical tip by a pre-fix
         // version (which committed blocks and the marker in separate transactions) BEFORE
@@ -945,7 +991,7 @@ where
                 let worker_address = if worker_id == DEFAULT_WORKER_ID {
                     Self::parse_listener_address_for_swarm(
                         "WORKER_LISTENER_MULTIADDR",
-                        node_info.p2p_info.primary.network_key.clone(),
+                        manager.key_config.worker_network_public_key(worker_id),
                         configured_address,
                     )?
                 } else {
@@ -971,15 +1017,6 @@ where
         // #912. `worker_batch_topic` follows the same per-epoch pattern in
         // `spawn_worker_network_for_epoch`, and is additionally gated on node mode: only
         // committee validators subscribe, observers unsubscribe (issue #960).
-        state_sync::spawn_epoch_record_collector(
-            self.consensus_chain.clone(),
-            primary_network_handle.clone(),
-            self.consensus_bus.clone(),
-            node_task_manager.get_spawner(),
-            self.node_shutdown.subscribe(),
-        )
-        .await?;
-
         spawn_epoch_vote_collector(
             self.consensus_chain.clone(),
             self.consensus_bus.clone(),
@@ -988,13 +1025,6 @@ where
             node_task_manager.get_spawner(),
             self.node_shutdown.clone(),
         );
-
-        seed_node_mode_on_startup(
-            self.consensus_chain.epochs(),
-            self.consensus_bus.node_mode(),
-            &self.key_config.primary_public_key(),
-        )
-        .await;
 
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed
         // only by the in-memory `epoch_record_watch`, so a record that a previous process
@@ -1005,6 +1035,73 @@ where
             self.consensus_bus.epoch_record_watch(),
         )
         .await;
+
+        // Startup ordering is load-bearing: subscribe the vote collector, re-vote durable records,
+        // seed the dummy, sync records, seed the mode, then start background collection. The
+        // re-vote hook must never see the uncertifiable dummy, and the two record
+        // collectors must not race.
+        // This pinned read uses committee.yaml at genesis and the epoch-start state afterward;
+        // a mid-epoch governance burn must not change the startup membership decision.
+        let (committee, ..) = self.get_committee_with_epoch_start_info(&engine).await?;
+        let public_key = self.key_config.primary_public_key();
+        let initial_mode = if committee.authority_by_key(&public_key).is_some() {
+            // Committee dials run concurrently with bounded epoch-record synchronization.
+            committee
+                .bls_keys()
+                .iter()
+                .copied()
+                .filter(|key| *key != public_key && !self.bootstrap_servers.contains_key(key))
+                .for_each(|key| {
+                    self.dial_peer_bls(
+                        primary_network_handle.inner_handle().clone(),
+                        key,
+                        node_task_spawner.clone(),
+                    );
+                });
+            NodeMode::CvvActive
+        } else {
+            NodeMode::Observer
+        };
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
+            eyre::ensure!(
+                committee.epoch() == 0,
+                "We have epoch 0 in our database if we are past epoch 0, on {}",
+                committee.epoch()
+            );
+            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            // This in-memory anchor is neither persisted nor signed and is replaced at epoch close.
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
+        }
+
+        state_sync::sync_epoch_records_to_tip(
+            &self.consensus_chain,
+            &primary_network_handle,
+            &self.consensus_bus,
+            self.node_shutdown.subscribe(),
+        )
+        .await;
+        info!(target: "epoch-manager", "startup epoch record sync finished");
+
+        seed_node_mode_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.node_mode(),
+            &public_key,
+            committee.epoch(),
+            initial_mode,
+        )
+        .await;
+
+        state_sync::spawn_epoch_record_collector(
+            self.consensus_chain.clone(),
+            primary_network_handle.clone(),
+            self.consensus_bus.clone(),
+            node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        )
+        .await?;
 
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
@@ -1096,42 +1193,6 @@ where
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
-        // spawn node healthcheck service if enabled
-        if let Some(port) = self.builder.healthcheck {
-            // probe worker 0's readiness per request; capture the engine handle
-            let engine = engine.clone();
-            let worker_ready = move || {
-                let engine = engine.clone();
-                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
-            };
-            let _ =
-                HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;
-        }
-
-        // spawn prometheus metrics endpoint if enabled
-        //
-        // bind errors are propagated (unlike healthcheck) - the operator explicitly
-        // requested the endpoint, so failing to serve it should fail startup
-        if let Some(addr) = self.builder.metrics {
-            let db = self.reth_db.clone();
-            let hooks = tn_metrics::MetricsHooks::default()
-                .with_hook(move || tn_reth::report_db_metrics(&db));
-            tn_metrics::start_metrics_server(
-                addr,
-                &node_task_manager.get_spawner(),
-                self.version_str,
-                hooks,
-            )
-            .await?;
-
-            // mirror consensus watch channels (rounds, heights, node mode) into gauges
-            tn_primary::spawn_bus_metrics_mirror(
-                &self.consensus_bus,
-                &node_task_manager.get_spawner(),
-                self.node_shutdown.subscribe(),
-            );
-        }
-
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
         // Note, these workers will just go dormant once we have caught up- that's ok.
         for i in 0..3 {
@@ -1210,7 +1271,8 @@ where
     /// The configured worker count must be at least the raw chain count at the previous epoch's
     /// closing block (genesis for epoch 0) before any swarm is created. This includes fresh genesis
     /// where accumulator catchup is a no-op. Worker RPC descriptors and event streams validate
-    /// together.
+    /// together. The configured primary identity must match the loaded keystore before either
+    /// primary or worker swarm construction.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
@@ -1218,6 +1280,10 @@ where
         epoch: Epoch,
         on_chain_workers: usize,
     ) -> eyre::Result<()> {
+        check_primary_network_key(
+            &self.builder.tn_config.node_info.p2p_info.primary.network_key,
+            &self.key_config,
+        )?;
         let workers = prepare_worker_networks(
             &self.builder.tn_config.node_info.p2p_info.workers,
             &self.worker_event_streams,
@@ -1279,7 +1345,7 @@ where
         //
 
         // create one long-running swarm per configured worker
-        // the per-epoch code still drives worker 0 only (#557 loops over worker components)
+        // Epoch entry activates the on-chain worker prefix of these process-lifetime swarms.
         self.worker_network_handles = workers
             .into_iter()
             .map(|PreparedWorkerNetwork { worker_id, p2p, event_stream }| {
@@ -1562,27 +1628,53 @@ fn check_restore_consistency(
     Ok(())
 }
 
-/// Seed the mode watch once at startup, before metrics and the epoch loop read it.
+/// Reconcile a locally derived role with the newest known epoch-record committee.
 ///
-/// A stored record closes an epoch, so its `next_committee` determines the initial role.
-/// Empty storage leaves the watch untouched, including its notification state. Membership is
-/// optimistic: only the epoch loop may demote a validator to `CvvInactive`. Keep this outside
-/// that loop so a later epoch does not overwrite a demotion.
+/// A record closes its epoch, so `next_committee` belongs to the following epoch. A record at or
+/// ahead of the local committee can veto validator status; an older record cannot veto a later
+/// admission. Records never promote a local observer or overwrite an inactive validator.
+fn node_mode_from_epoch_record(
+    initial_mode: NodeMode,
+    local_epoch: Epoch,
+    public_key: &BlsPublicKey,
+    record: Option<&EpochRecord>,
+) -> NodeMode {
+    match initial_mode {
+        NodeMode::Observer | NodeMode::CvvInactive => initial_mode,
+        NodeMode::CvvActive => {
+            let eligible = record.is_none_or(|record| {
+                record.epoch.saturating_add(1) < local_epoch
+                    || record.next_committee.contains(public_key)
+            });
+            if eligible {
+                NodeMode::CvvActive
+            } else {
+                NodeMode::Observer
+            }
+        }
+    }
+}
+
+/// Publish the startup role after checking the epoch-start-pinned committee and synced records.
+///
+/// Missing records preserve the local decision. An unchanged mode does not notify watchers.
 async fn seed_node_mode_on_startup(
     db: &EpochRecordDb,
     node_mode: &watch::Sender<NodeMode>,
     public_key: &BlsPublicKey,
+    local_epoch: Epoch,
+    initial_mode: NodeMode,
 ) {
     let record = db.latest_record().await;
+    let selected =
+        node_mode_from_epoch_record(initial_mode, local_epoch, public_key, record.as_ref());
     node_mode.send_if_modified(|mode| {
-        record.is_some_and(|record| {
-            *mode = if record.next_committee.contains(public_key) {
-                NodeMode::CvvActive
-            } else {
-                NodeMode::Observer
-            };
+        if std::mem::discriminant(mode) != std::mem::discriminant(&selected) {
+            *mode = selected;
             true
-        })
+        } else {
+            false
+        }
     });
 }
 
@@ -1620,12 +1712,12 @@ mod tests {
         db.persist().await?;
 
         let (retiring_mode, retiring_rx) = watch::channel(NodeMode::CvvActive);
-        seed_node_mode_on_startup(&db, &retiring_mode, &retiring_key).await;
+        seed_node_mode_on_startup(&db, &retiring_mode, &retiring_key, 0, NodeMode::CvvActive).await;
         assert!(matches!(*retiring_rx.borrow(), NodeMode::Observer));
         assert!(retiring_rx.has_changed()?);
 
         let (joining_mode, joining_rx) = watch::channel(NodeMode::Observer);
-        seed_node_mode_on_startup(&db, &joining_mode, &joining_key).await;
+        seed_node_mode_on_startup(&db, &joining_mode, &joining_key, 2, NodeMode::CvvActive).await;
         assert!(matches!(*joining_rx.borrow(), NodeMode::CvvActive));
         assert!(joining_rx.has_changed()?);
         Ok(())
@@ -1639,20 +1731,79 @@ mod tests {
         let public_key = worker_key_config().primary_public_key();
 
         let (default_mode, default_rx) = watch::channel(NodeMode::default());
-        seed_node_mode_on_startup(&db, &default_mode, &public_key).await;
+        seed_node_mode_on_startup(&db, &default_mode, &public_key, 0, NodeMode::CvvActive).await;
         assert!(matches!(*default_rx.borrow(), NodeMode::CvvActive));
         assert!(!default_rx.has_changed()?);
 
         let (observer_mode, observer_rx) = watch::channel(NodeMode::Observer);
-        seed_node_mode_on_startup(&db, &observer_mode, &public_key).await;
+        seed_node_mode_on_startup(&db, &observer_mode, &public_key, 0, NodeMode::Observer).await;
         assert!(matches!(*observer_rx.borrow(), NodeMode::Observer));
         assert!(!observer_rx.has_changed()?);
         Ok(())
     }
 
+    /// Record membership can veto stale local eligibility but never grant eligibility by itself.
+    #[test]
+    fn epoch_record_mode_respects_committee_precedence() {
+        let public_key = worker_key_config().primary_public_key();
+        let removed = EpochRecord { epoch: 5, committee: vec![public_key], ..Default::default() };
+        let admitted =
+            EpochRecord { epoch: 5, next_committee: vec![public_key], ..Default::default() };
+        let terminal = EpochRecord { epoch: Epoch::MAX, ..Default::default() };
+        [
+            (NodeMode::CvvActive, 2, Some(&removed), NodeMode::Observer),
+            (NodeMode::CvvActive, 6, Some(&removed), NodeMode::Observer),
+            (NodeMode::CvvActive, 7, Some(&removed), NodeMode::CvvActive),
+            (NodeMode::CvvActive, 6, Some(&admitted), NodeMode::CvvActive),
+            (NodeMode::Observer, 2, Some(&admitted), NodeMode::Observer),
+            (NodeMode::CvvInactive, 2, Some(&removed), NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 0, None, NodeMode::CvvActive),
+            (NodeMode::CvvActive, Epoch::MAX, Some(&terminal), NodeMode::Observer),
+        ]
+        .into_iter()
+        .for_each(|(initial, epoch, record, expected)| {
+            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, record);
+            assert_eq!(
+                std::mem::discriminant(&mode),
+                std::mem::discriminant(&expected),
+                "{mode:?}"
+            );
+        });
+    }
+
     /// Reproducible keys for checking the identity assigned to each prepared swarm.
     fn worker_key_config() -> KeyConfig {
         KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1315)))
+    }
+
+    /// A primary key derived from the loaded keystore passes startup validation.
+    #[test]
+    fn check_primary_network_key_accepts_matching_key() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        check_primary_network_key(&keys.primary_network_public_key(), &keys)
+    }
+
+    /// Worker keys and primary keys from another keystore fail with pasteable replacement keys.
+    #[test]
+    fn check_primary_network_key_rejects_mismatched_keys() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let other_keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1374)));
+        let expected = keys.primary_network_public_key();
+        [keys.worker_network_public_key(DEFAULT_WORKER_ID), other_keys.primary_network_public_key()]
+            .into_iter()
+            .try_for_each(|network_key| -> eyre::Result<()> {
+                let error = check_primary_network_key(&network_key, &keys)
+                    .err()
+                    .ok_or_else(|| eyre!("expected mismatched primary network key"))?;
+                let message = error.to_string();
+                assert!(message.contains("node_info.p2p_info.primary.network_key"));
+                assert!(message.contains(&format!("expected {expected}, found {network_key}")));
+                assert!(message.contains("set this entry to the expected value"));
+                assert_eq!(serde_json::to_value(&expected)?, expected.to_string());
+                assert_eq!(serde_json::to_value(&network_key)?, network_key.to_string());
+                Ok(())
+            })
     }
 
     /// Give each worker a distinct advertised address, derived network key, and RPC endpoint.

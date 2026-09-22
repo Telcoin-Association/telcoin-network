@@ -346,6 +346,21 @@ fn classify_system_call_log(log: &Log) -> SystemCallLog<'_> {
 }
 
 // alloy-evm
+/// One account the governance-Safe fork installs: canonical runtime bytecode for a canonical
+/// cross-chain address, an optional pre-fork pin when the address is an in-place swap of a
+/// live recompiled deployment (`None` means a fresh etch, which forces its canonical bytes over
+/// whatever the address holds), and the storage slots a fresh etch must seed (constructor
+/// effects the etched code never runs).
+#[cfg(feature = "adiri")]
+struct GovernanceSafeForkInstall {
+    name: &'static str,
+    address: Address,
+    bytecode: reth_revm::bytecode::Bytecode,
+    code_hash: B256,
+    pre_fork_code_hash: Option<B256>,
+    storage: &'static [(U256, U256)],
+}
+
 impl<'db, Evm, Spec, R, DB> TNBlockExecutor<Evm, Spec, R>
 where
     DB: Database + 'db,
@@ -1028,6 +1043,454 @@ where
         Ok(())
     }
 
+    /// The canonical Safe v1.4.1 suite the governance-Safe fork installs, decoded once from
+    /// the vendored byte-exact Ethereum-mainnet captures embedded at compile time.
+    ///
+    /// Row order, addresses, and hashes come from
+    /// `tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`; every decoded byte string is
+    /// asserted against its pinned hash at materialization, so a drifted or corrupt vendored
+    /// file is a corrupt build — uniform across the fleet — not a live-node runtime condition;
+    /// hence panics rather than fallible returns, on the same terms as
+    /// [`Self::consensus_registry_runtime_code`]. (The tn-types pin test
+    /// `test_governance_safe_fork_canonical_suite_pinned` checks the identical property in
+    /// default-feature CI.)
+    #[cfg(feature = "adiri")]
+    fn governance_safe_fork_suite() -> &'static [GovernanceSafeForkInstall] {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+
+        /// The vendored canonical runtime bytes, in
+        /// `GOVERNANCE_SAFE_FORK_CANONICAL_SUITE` row order — the same files mainnet genesis
+        /// etches (`tn-contracts/deployments/genesis/canonical-bytecode/`, provenance in its
+        /// README).
+        const VENDORED_HEX: [&str; 13] = [
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/Safe.hex"),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeProxyFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/CompatibilityFallbackHandler.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Setup.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSend.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSendCallOnly.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SignMessageLib.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/CreateCall.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SimulateTxAccessor.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeSingletonFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeMigration.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Migration.hex"
+            ),
+        ];
+
+        /// SafeL2's `threshold` slot (4) seeds 1, replicating the constructor the etched code
+        /// never runs; without it anyone could `setup()`-hijack the fresh singleton. The Safe
+        /// singleton needs no row: its slot 4 = 1 came from the live recompile's constructor
+        /// and survives the code-only swap.
+        const SAFE_L2_THRESHOLD_STORAGE: &[(U256, U256)] =
+            &[(U256::from_limbs([4, 0, 0, 0]), U256::from_limbs([1, 0, 0, 0]))];
+
+        static SUITE: LazyLock<Vec<GovernanceSafeForkInstall>> = LazyLock::new(|| {
+            tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+                .iter()
+                .zip(VENDORED_HEX)
+                .map(|((name, address, expected_hash), hex)| {
+                    let raw = alloy::hex::decode(hex.trim())
+                        .unwrap_or_else(|e| panic!("vendored {name}.hex is valid hex: {e}"));
+                    let bytecode = Bytecode::new_raw(raw.into());
+                    let code_hash = bytecode.hash_slow();
+                    assert_eq!(
+                        code_hash, *expected_hash,
+                        "{name}: vendored canonical bytecode must hash to its \
+                         GOVERNANCE_SAFE_FORK_CANONICAL_SUITE pin",
+                    );
+                    let pre_fork_code_hash = match *name {
+                        "Safe" => Some(tn_types::forks::SAFE_SINGLETON_PRE_FORK_CODE_HASH),
+                        "SafeProxyFactory" => {
+                            Some(tn_types::forks::SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH)
+                        }
+                        _ => None,
+                    };
+                    let storage: &'static [(U256, U256)] =
+                        if *name == "SafeL2" { SAFE_L2_THRESHOLD_STORAGE } else { &[] };
+                    GovernanceSafeForkInstall {
+                        name,
+                        address: *address,
+                        bytecode,
+                        code_hash,
+                        pre_fork_code_hash,
+                        storage,
+                    }
+                })
+                .collect()
+        });
+
+        &SUITE
+    }
+
+    /// Apply the in-protocol governance-Safe fork.
+    ///
+    /// Brings live adiri's Safe stack to parity with mainnet genesis in one deterministic
+    /// commit (see `tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH` for the full runbook):
+    /// - **etch** the eleven canonical v1.4.1 contracts adiri lacks (SafeL2, the fallback handler,
+    ///   the delegatecall libraries, both migration helpers, the singleton factory) — forcing the
+    ///   canonical bytes over whatever the address holds, so the boundary is idempotent over an
+    ///   already-canonical deployment and an unknown occupant is displaced at `warn!` rather than
+    ///   halting the fleet (balance and unseeded storage are preserved; the nonce clamps up to the
+    ///   EIP-161 contract-account value 1, mirroring mainnet genesis);
+    /// - **swap** the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical bytes —
+    ///   code-only, preserving balance, nonce, and all storage, gated fail-closed on the pinned
+    ///   pre-fork hashes (Safe v1.4.1 storage layout is identical between the recompile and the
+    ///   canonical build, so the preserved slots stay valid);
+    /// - **migrate** the governance Safe proxy onto SafeL2: slot 0 (singleton) and the
+    ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's pinned
+    ///   code hash AND on slot 0 still holding the L1 singleton. Owners, threshold, the Safe nonce,
+    ///   and the TEL balance are untouched (preserved by omission — only changed slots enter the
+    ///   bundle). The handler slot itself is written unconditionally — it is a slot the fork
+    ///   defines — and an owner-installed third-party handler is recorded at `warn!` rather than
+    ///   aborting the boundary;
+    /// - **mark** the Safe Singleton Factory's deployer EOA at nonce 1, the one mainnet-genesis
+    ///   leaf adiri would otherwise lack because it never ran the presigned deployment transaction.
+    ///   Nonce-only and monotonic, so it neither disturbs a live account nor rewinds under replay.
+    ///
+    /// Fires exactly once, from the epoch-closing block that concludes
+    /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` (one-shot `==` trigger in `finish`). No system call
+    /// follows it in this block that reads Safe state, so ordering relative to the epoch-close
+    /// sequence is not load-bearing; it runs before the close for symmetry with the registry
+    /// fork.
+    ///
+    /// Determinism: a pure function of committed state plus the embedded vendored bytes —
+    /// every gate reads committed state only, so the whole fleet passes or aborts in lockstep
+    /// and re-derives a byte-identical `state_root`. Nothing is committed until every gate
+    /// holds; fatal on failure, like the registry fork.
+    #[cfg(feature = "adiri")]
+    fn apply_governance_safe_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`/`storage`; imported anonymously to avoid
+        // clashing with the `alloy_evm::Database` already in module scope.
+        use alloy::primitives::address;
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorage, EvmStorageSlot},
+            Database as _,
+        };
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        let suite = Self::governance_safe_fork_suite();
+        let address_of = |name: &str| {
+            suite
+                .iter()
+                .find(|install| install.name == name)
+                .map(|install| install.address)
+                .expect("governance safe fork suite carries every canonical row")
+        };
+        let safe_l1_singleton = address_of("Safe");
+        let safe_l2_singleton = address_of("SafeL2");
+        let fallback_handler = address_of("CompatibilityFallbackHandler");
+
+        // Stage every account before committing anything: each gate is a pure function of
+        // committed state, so every fork-capable node evaluates the full set identically and
+        // fails (or passes) in lockstep, and a failure aborts the block with no partial
+        // migration. Reading via `basic` also loads each account into the `State` cache, which
+        // the commit below requires even for absent accounts.
+        let mut staged: Vec<(Address, Account)> = Vec::with_capacity(suite.len() + 2);
+        for install in suite {
+            let current = self
+                .evm
+                .db_mut()
+                .basic(install.address)
+                .map_err(|e| {
+                    TnRethError::EVMCustom(format!("{}: account read failed: {e}", install.name))
+                })?
+                .unwrap_or_default();
+
+            let account = if let Some(pin) = install.pre_fork_code_hash {
+                // In-place swap of a live recompiled deployment: rewrite only the
+                // account-code leaf (empty storage map + plain `Touched`, same shape as the
+                // registry swap).
+                //
+                // An already-canonical singleton is this fork's own end state, not drift:
+                // accept it and let the restated write drop out of the changeset, so
+                // re-executing the boundary over already-forked state is a no-op rather than a
+                // fleet-wide abort. Any OTHER hash still fails closed — unlike the etch rows
+                // this branch preserves the account's storage, which is only sound over a
+                // layout the pin vouches for.
+                if current.code_hash != pin && current.code_hash != install.code_hash {
+                    error!(
+                        target: "engine",
+                        contract = install.name,
+                        pre_swap_code_hash = %current.code_hash,
+                        expected = %pin,
+                        "governance safe fork failing closed: unexpected pre-fork code",
+                    );
+                    return Err(TnRethError::EVMCustom(format!(
+                        "governance safe fork failing closed: {} code hash {} does not match \
+                         the pinned pre-fork deployment {}",
+                        install.name, current.code_hash, pin,
+                    )));
+                }
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce,
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                }
+            } else {
+                // Etch the canonical bytes. Deliberately NOT fail-closed on an occupied
+                // address, for the same reason as the fallback-handler slot below: the
+                // boundary exists to put the canonical suite at the canonical addresses, and
+                // halting the whole fleet on the epoch-closing block would sacrifice the
+                // migration over an address the fork itself defines. Three pre-states reach
+                // here and all three land on the canonical end state:
+                // - **no code** — the live chain's state, and what the etch is written for;
+                // - **already the canonical bytes** — a legitimate deployment through the Safe
+                //   singleton factory, which the vendored-bytecode README markets as the supported
+                //   way to add canonical Safe contracts. The write restates what is already there:
+                //   the code leaf is unchanged and each seeded slot is read through below, so an
+                //   already-seeded value drops out of the changeset via the `is_changed` filter and
+                //   `state_root` is unaffected. That is also what makes the whole boundary
+                //   idempotent under re-execution;
+                // - **an unknown occupant** — displaced, loudly. Only the seeded slots are written,
+                //   so the occupant's other storage survives untouched and its code hash stays
+                //   recoverable from the node record.
+                if !current.is_empty_code_hash() && current.code_hash != install.code_hash {
+                    tracing::warn!(
+                        target: "engine",
+                        contract = install.name,
+                        address = %install.address,
+                        displaced_code_hash = %current.code_hash,
+                        canonical_code_hash = %install.code_hash,
+                        "governance safe fork displacing an unexpected deployment at a \
+                         canonical Safe address: the displaced code hash is recorded here and \
+                         the account's storage is left in place",
+                    );
+                }
+                // read each seeded slot through rather than assuming an empty account: a
+                // canonical deployment already ran the constructor this seeding replicates
+                // (SafeL2 inherits `Safe`'s `threshold = 1`), so the honest original value
+                // keeps the revert accurate and lets the no-op drop out of the changeset
+                let mut storage = EvmStorage::default();
+                for (slot, value) in install.storage {
+                    let live = self.evm.db_mut().storage(install.address, *slot).map_err(|e| {
+                        TnRethError::EVMCustom(format!(
+                            "{}: storage slot {slot} read failed: {e}",
+                            install.name,
+                        ))
+                    })?;
+                    storage.insert(*slot, EvmStorageSlot::new_changed(live, *value, 0));
+                }
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce.max(1),
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    storage,
+                    // plain `Touched`, never `Created`: over an occupied address `Created`
+                    // routes `apply_account_state` onto `newly_created`, which swaps the cache
+                    // account's storage map out wholesale and marks the bundle entry
+                    // `InMemoryChange` — in-block reads of any unseeded slot would then answer
+                    // zero while the state trie, which wipes only on `was_destroyed`, still
+                    // carries the committed value. `Touched` reaches that same
+                    // `InMemoryChange` for an address that never existed, so the empty path is
+                    // bit-for-bit unchanged.
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                }
+            };
+            staged.push((install.address, account));
+        }
+
+        // governance Safe proxy: two storage writes behind two gates, everything else untouched
+        let governance = self
+            .evm
+            .db_mut()
+            .basic(GOVERNANCE_SAFE_ADDRESS)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe account read failed: {e}"))
+            })?
+            .unwrap_or_default();
+        if governance.code_hash != tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_fork_code_hash = %governance.code_hash,
+                expected = %tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+                "governance safe fork failing closed: unexpected governance proxy code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy code hash {} does not \
+                 match the pinned pre-fork deployment {}",
+                governance.code_hash,
+                tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+            )));
+        }
+        let singleton_slot =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, U256::ZERO).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe slot 0 read failed: {e}"))
+            })?;
+        let expected_singleton = U256::from_be_bytes(safe_l1_singleton.into_word().0);
+        let migrated_singleton = U256::from_be_bytes(safe_l2_singleton.into_word().0);
+        // slot 0 already on SafeL2 is this fork's own end state, not drift: accept it so a
+        // re-execution over already-forked state is a no-op. Any other singleton means the
+        // proxy was repointed at an unknown implementation and the migration's assumptions
+        // about its layout no longer hold, so that still fails closed.
+        if singleton_slot != expected_singleton && singleton_slot != migrated_singleton {
+            error!(
+                target: "engine",
+                slot0 = %singleton_slot,
+                expected = %expected_singleton,
+                "governance safe fork failing closed: governance proxy slot 0 is not the L1 \
+                 Safe singleton",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy slot 0 holds {} instead \
+                 of the pre-fork L1 Safe singleton {}",
+                singleton_slot, expected_singleton,
+            )));
+        }
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, derived exactly as the Safe source
+        // does. Unlike the two gates above, this slot is deliberately NOT fail-closed: the
+        // migration is entitled to own it, so all three reachable pre-states are written
+        // through rather than aborting the block.
+        // - **unset** (`U256::ZERO`) — the live chain's state, and the reason the write exists at
+        //   all: SafeL2 routes unknown selectors through the handler, so the proxy needs the
+        //   canonical one before it runs on the L2 singleton.
+        // - **already canonical** — the write is a no-op and drops straight out of the changeset
+        //   via the `is_changed` filter, so the `state_root` is unaffected.
+        // - **a third-party handler** — reachable at any time: `setFallbackHandler` is `authorized`
+        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot between the
+        //   arming PR and the boundary. The fork overwrites it anyway. Aborting would stall the
+        //   entire fleet on the epoch-closing block over a slot the migration defines, and the
+        //   canonical handler is the value the post-fork SafeL2 stack expects; getting the intended
+        //   storage and bytecode in place is what the boundary is for. The overwrite is loud rather
+        //   than silent — the `warn!` below records the displaced address alongside its
+        //   replacement, so the prior value stays recoverable from the node record and the owners
+        //   can re-install it afterwards with an ordinary `execTransaction`.
+        let handler_slot = U256::from_be_bytes(
+            alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
+        );
+        let current_handler =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, handler_slot).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe handler slot read failed: {e}"))
+            })?;
+        let canonical_handler = U256::from_be_bytes(fallback_handler.into_word().0);
+        if current_handler != U256::ZERO && current_handler != canonical_handler {
+            tracing::warn!(
+                target: "engine",
+                displaced_handler = %current_handler,
+                canonical_handler = %canonical_handler,
+                "governance safe fork overwriting a non-canonical fallback handler: the \
+                 displaced value is recorded here and can be re-installed by owner action",
+            );
+        }
+        let governance_storage: EvmStorage = [
+            (U256::ZERO, EvmStorageSlot::new_changed(singleton_slot, migrated_singleton, 0)),
+            (handler_slot, EvmStorageSlot::new_changed(current_handler, canonical_handler, 0)),
+        ]
+        .into_iter()
+        .collect();
+        staged.push((
+            GOVERNANCE_SAFE_ADDRESS,
+            Account {
+                // account info passes through unchanged: balance, nonce, and code stay exactly
+                // as committed — the migration is the two storage slots above
+                info: governance,
+                storage: governance_storage,
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
+        /// Safe Singleton Factory deployer EOA.
+        ///
+        /// Mainnet genesis allocates this account `nonce: 0x1, balance: 0x0` with no code, to
+        /// mark its nonce-0 presigned deployment transaction as spent — the same treatment
+        /// every other deployer EOA in that alloc receives (see
+        /// `tn-contracts/deployments/genesis/canonical-bytecode/README.md`, "Nonces are set as
+        /// if the deployments happened"). Note this one is not a Nick's-method keyless address:
+        /// Safe holds the key and signs one deployment transaction per chain, which is why the
+        /// marker has to be written rather than earned by replaying a public transaction.
+        const SAFE_SINGLETON_FACTORY_DEPLOYER: Address =
+            address!("0xE1CB04A0fA36DdD16a06ea828007E35e1a3cBC37");
+
+        // Adiri never ran that presigned transaction, so the etch above installs the factory
+        // without its deployer marker and post-fork adiri would differ from mainnet genesis by
+        // exactly this one state-trie leaf. Touch the nonce here to close the gap. Nonce-only:
+        // balance, code, and any storage pass through untouched (empty storage map + plain
+        // `Touched`, the same shape as the code-only swaps above).
+        //
+        // Deliberately not fail-closed, for the same reason as the handler slot: an unexpected
+        // occupant is worth a record, not a fleet-wide halt on the epoch-closing block. Raising
+        // the nonce of an account that somehow carries code is harmless — it neither disturbs
+        // that code nor its storage — whereas aborting would sacrifice the whole migration over
+        // a leaf with no bearing on the Safe stack's behavior.
+        //
+        // `.max(1)` rather than `= 1` so the write is monotonic. A nonce is only ever raised by
+        // execution, so clamping up preserves determinism under replay: a node re-executing
+        // this block over state where the account has already moved past 1 (a live transaction,
+        // or a re-run against already-forked state) lands on the same value every other node
+        // does, instead of rewinding the leaf and deriving a different `state_root`.
+        let deployer = self
+            .evm
+            .db_mut()
+            .basic(SAFE_SINGLETON_FACTORY_DEPLOYER)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!(
+                    "safe singleton factory deployer account read failed: {e}"
+                ))
+            })?
+            .unwrap_or_default();
+        if !deployer.is_empty_code_hash() {
+            tracing::warn!(
+                target: "engine",
+                address = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+                found_code_hash = %deployer.code_hash,
+                "governance safe fork marking the singleton-factory deployer nonce over an \
+                 account that unexpectedly carries code: code and storage are left untouched",
+            );
+        }
+        staged.push((
+            SAFE_SINGLETON_FACTORY_DEPLOYER,
+            Account {
+                info: AccountInfo { nonce: deployer.nonce.max(1), ..deployer },
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
+        self.evm.db_mut().commit(EvmState::from_iter(staged));
+
+        tracing::info!(
+            target: "engine",
+            installed = suite.len(),
+            singleton = %safe_l2_singleton,
+            handler = %fallback_handler,
+            factory_deployer = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+            "governance safe fork applied: canonical Safe v1.4.1 suite installed, singleton \
+             factory deployer nonce marked, governance proxy migrated to SafeL2",
+        );
+        Ok(())
+    }
+
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
     ///
     /// The seeded shuffle decides committee membership; the shuffled addresses are then sorted
@@ -1423,6 +1886,24 @@ where
                 // no migrate-style call — see `apply_worker_configs_fork` for the storage
                 // preservation and `maxStrategy` runbook notes.
                 self.apply_worker_configs_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
+
+            // In-protocol governance-Safe fork boundary: same one-shot trigger shape as the
+            // registry fork above, keyed on its own (independently armed) epoch constant —
+            // `governance_safe_fork_epoch()` is the compile-time
+            // `GOVERNANCE_SAFE_FORK_EPOCH` unless a test-utils build overrides it via
+            // `TN_GOVERNANCE_SAFE_FORK_EPOCH`. Nothing in this block's close reads Safe
+            // state, so the position (after the registry pair, before the close) mirrors the
+            // fork-leads convention rather than a data dependency. Both the production and
+            // replay paths reach this with an identical `ctx`, so the resulting `state_root`
+            // is byte-identical across the fleet.
+            #[cfg(feature = "adiri")]
+            if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
+                == Some(tn_types::forks::governance_safe_fork_epoch())
+            {
+                self.apply_governance_safe_fork().map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
                 })?;
             }
@@ -1932,6 +2413,252 @@ mod tests {
         assert!(
             format!("{err:#}").contains("worker configs fork failing closed"),
             "abort must come from the WorkerConfigs fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must fail closed over an unexpected pre-fork swap target.
+    ///
+    /// The `Safe` singleton account is overwritten with the post-fork registry artifact bytes
+    /// (any hash other than `SAFE_SINGLETON_PRE_FORK_CODE_HASH` or the canonical post-fork
+    /// hash — a stand-in for "adiri's Safe state moved since the pins were taken"), and the
+    /// boundary must abort rather than swap over an unknown storage layout. The pin is what
+    /// makes this gate meaningful: unlike the etch rows, the swap branch preserves the
+    /// account's existing storage, which is only sound over a layout the pin vouches for.
+    ///
+    /// (Without the gate this block would execute — the swap is storage-compatible with the
+    /// stand-in code — making this test the discriminating check.)
+    ///
+    /// The etch rows deliberately carry no such gate, because they overwrite storage rather
+    /// than inherit it; see
+    /// `test_governance_safe_fork_forces_canonical_code_over_an_occupied_etch_target` below.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // an arbitrary wrong code blob: the post-fork registry artifact (hash matches no pin)
+        let stand_in_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let stand_in_code: Bytes = alloy::hex::decode(
+            stand_in_value.as_str().expect("deployedBytecode.object is a string"),
+        )?
+        .into();
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+
+        // by name, not by index: the table's row order is coupled to the vendored bytecode
+        // list above, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+
+        // swap target (the recompiled Safe singleton) off its pre-fork pin
+        let mut genesis = tn_types::test_genesis();
+        let safe_singleton = suite_address("Safe");
+        genesis
+            .alloc
+            .get_mut(&safe_singleton)
+            .expect("testnet genesis must allocate the recompiled Safe singleton")
+            .code = Some(stand_in_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork fail closed swap");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected Safe singleton deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("governance safe fork failing closed"),
+            "abort must come from the governance fail-closed gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The etch branch must force the canonical end state over every pre-state, not just an
+    /// empty address.
+    ///
+    /// Both cases used to abort the boundary and both must now succeed:
+    /// 1. an **unknown occupant** at the canonical `SafeL2` address — the canonical bytes replace
+    ///    its code, the seeded threshold lands, and its unrelated storage survives;
+    /// 2. the **already-canonical** bytes, the shape a legitimate deployment through the Safe
+    ///    singleton factory leaves behind — the boundary restates them and commits the same state,
+    ///    which is what makes re-executing the fork idempotent.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_forces_canonical_code_over_an_occupied_etch_target(
+    ) -> eyre::Result<()> {
+        use reth_provider::StateProvider as _;
+
+        /// The canonical SafeL2 runtime bytes, from the same vendored file
+        /// `governance_safe_fork_suite` embeds.
+        const SAFE_L2_HEX: &str = include_str!(
+            "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex"
+        );
+
+        // an arbitrary wrong code blob: the post-fork registry artifact (hash matches no row)
+        let stand_in_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let stand_in_code: Bytes = alloy::hex::decode(
+            stand_in_value.as_str().expect("deployedBytecode.object is a string"),
+        )?
+        .into();
+        let canonical_code: Bytes = alloy::hex::decode(SAFE_L2_HEX.trim())?.into();
+
+        // by name, not by index: the table's row order is coupled to the vendored bytecode list
+        let (safe_l2, canonical_hash) = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+            .iter()
+            .find_map(|(name, address, hash)| (*name == "SafeL2").then_some((*address, *hash)))
+            .expect("SafeL2 must be a canonical Safe suite row");
+
+        // a slot the occupant owns, proving the displacement leaves unseeded storage alone
+        let bystander_slot = B256::with_last_byte(9);
+        let threshold_slot = B256::with_last_byte(4);
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+
+        for (label, planted, planted_nonce) in
+            [("unknown occupant", stand_in_code, 3u64), ("already canonical", canonical_code, 1)]
+        {
+            let mut genesis = tn_types::test_genesis();
+            genesis.alloc.insert(
+                safe_l2,
+                GenesisAccount::default()
+                    .with_code(Some(planted))
+                    .with_nonce(Some(planted_nonce))
+                    .with_storage(Some([(bystander_slot, B256::with_last_byte(42))].into())),
+            );
+
+            let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+            let genesis_header = chain.sealed_genesis_header();
+            let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+            let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+            let tmp = TempDir::new().unwrap();
+            let tm = TaskManager::new("governance fork occupied etch target");
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+            if let Err(e) = execute_payload_and_update_canonical_chain(&env, payload, vec![]) {
+                panic!("{label}: the boundary must force the canonical end state, got: {e:#}");
+            }
+
+            let post = env.latest()?;
+            assert_eq!(
+                post.account_code(&safe_l2)?.expect("SafeL2 has code post-fork").0.hash_slow(),
+                canonical_hash,
+                "{label}: SafeL2 must end the boundary on its canonical code hash"
+            );
+            assert_eq!(
+                post.storage(safe_l2, threshold_slot)?,
+                Some(U256::ONE),
+                "{label}: the fork must seed threshold = 1 over an occupied target"
+            );
+            assert_eq!(
+                post.storage(safe_l2, bystander_slot)?,
+                Some(U256::from(42)),
+                "{label}: unseeded storage of the displaced account must survive untouched"
+            );
+            assert_eq!(
+                post.basic_account(&safe_l2)?.expect("SafeL2 account exists").nonce,
+                planted_nonce,
+                "{label}: an occupied target keeps its own nonce, clamped up to EIP-161's 1"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must OVERWRITE a third-party fallback handler, not abort.
+    ///
+    /// This is the deliberate asymmetry with the two gates exercised above, and it lives
+    /// beside them so the contrast is readable in one place: the proxy's code hash and slot 0
+    /// fail closed, while the fallback-handler slot is one the migration defines and therefore
+    /// writes through every reachable pre-state.
+    ///
+    /// The slot is genuinely owner-mutable between the arming PR and the boundary —
+    /// `FallbackManager.setFallbackHandler` is `authorized` (`msg.sender == address(this)`),
+    /// so a quorum of the live 3-of-7 Safe can point it anywhere, including at an address with
+    /// no code. `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
+    /// unset -> canonical transition that the committed genesis fixture exhibits; nothing else
+    /// in the tree seeds a non-zero pre-state, so without this test the overwrite branch is
+    /// unexercised.
+    ///
+    /// Asserts: with a third-party handler pre-seeded in the governance proxy's handler slot,
+    /// the fork boundary block still executes, the handler slot lands on the canonical
+    /// `CompatibilityFallbackHandler`, and the rest of the migration (slot 0 -> SafeL2) is
+    /// unaffected. The displaced value is surfaced at `warn!` by `apply_governance_safe_fork`
+    /// so it stays recoverable from the node record.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_overwrites_third_party_fallback_handler() -> eyre::Result<()>
+    {
+        use reth_provider::StateProvider as _;
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        // by name, not by index: the suite's row order is coupled to the vendored bytecode
+        // list, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+        let canonical_handler = suite_address("CompatibilityFallbackHandler");
+        let safe_l2 = suite_address("SafeL2");
+
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`
+        let handler_slot: B256 = alloy::primitives::keccak256(b"fallback_manager.handler.address");
+        // an owner-installed handler that is neither unset nor canonical. Code-free on purpose:
+        // `setFallbackHandler` requires no code at the target, so this is a state the live Safe
+        // can actually reach
+        let third_party = Address::with_last_byte(0xbe);
+
+        let mut genesis = tn_types::test_genesis();
+        let proxy = genesis
+            .alloc
+            .get_mut(&GOVERNANCE_SAFE_ADDRESS)
+            .expect("testnet genesis must allocate the governance proxy");
+        let mut storage = proxy.storage.clone().unwrap_or_default();
+        // fixture guard: the committed genesis leaves the slot unset, so the seed below is the
+        // only thing separating this case from the happy path
+        assert!(
+            storage.insert(handler_slot, third_party.into_word()).is_none(),
+            "committed genesis must leave the governance proxy's handler slot unset"
+        );
+        proxy.storage = Some(storage);
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork third-party handler");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect("a third-party fallback handler must not abort the fork boundary");
+
+        // read back through a fresh `StateProvider` over the canonicalized chain
+        let post = env.latest()?;
+        let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, handler_slot)?,
+            Some(as_slot_value(canonical_handler)),
+            "the fork must displace a third-party handler with the canonical one"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+            Some(as_slot_value(safe_l2)),
+            "the rest of the migration must complete: slot 0 still flips to SafeL2"
         );
 
         Ok(())

@@ -318,6 +318,111 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
     Ok(())
 }
 
+/// Independent workers keep separate RPC listeners and fees across epoch rollover and regrowth.
+#[tokio::test]
+async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    use tn_node::engine::{ExecutionNode, TnBuilder};
+    use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
+
+    tn_reth::init_reth_defaults();
+    let temp_dir = TempDir::with_prefix("test_multi_worker_components")?;
+    let task_manager = TaskManager::default();
+    let accumulator = GasAccumulator::new(2);
+    let config = tn_config::Config::default_for_test();
+    let node_config = RethConfig::new(
+        RethCommand {
+            rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+            txpool: Default::default(),
+            db: Default::default(),
+        },
+        None,
+        temp_dir.path(),
+        true,
+        Arc::new(config.chain_spec()),
+    );
+    let reth_db = RethEnv::new_database(&node_config, temp_dir.path().join("reth"))?;
+    let reth_env =
+        RethEnv::new(&node_config, &task_manager, reth_db.clone(), None, accumulator.clone())?;
+    let builder = TnBuilder::new(node_config, config, reth_db);
+    let engine = ExecutionNode::new(&builder, reth_env)?;
+    futures::stream::iter(0..2)
+        .then(|worker_id| {
+            let engine = &engine;
+            let task_manager = &task_manager;
+            let accumulator = &accumulator;
+            async move {
+                let fee = MIN_PROTOCOL_BASE_FEE + 1000 * (u64::from(worker_id) + 1);
+                accumulator.base_fee(worker_id).set_base_fee(fee);
+                assert!(!engine.is_worker_initialized(worker_id).await);
+                engine
+                    .initialize_worker_components(
+                        worker_id,
+                        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+                        NoopEngineToPrimary,
+                        accumulator.base_fee(worker_id),
+                        accumulator.worker_base_fee(worker_id),
+                    )
+                    .await?;
+                assert!(engine.is_worker_initialized(worker_id).await);
+                assert_eq!(
+                    engine
+                        .get_worker_transaction_pool(&worker_id)
+                        .await?
+                        .block_info()
+                        .pending_basefee,
+                    fee,
+                );
+                eyre::Ok(())
+            }
+        })
+        .try_collect::<()>()
+        .await?;
+
+    let pool_zero = engine.get_worker_transaction_pool(&0).await?;
+    let pool_one = engine.get_worker_transaction_pool(&1).await?;
+    let rpc_zero = engine
+        .worker_http_local_address(&0)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker zero RPC listener missing"))?;
+    let rpc_one = engine
+        .worker_http_local_address(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker one RPC listener missing"))?;
+    assert_ne!(rpc_zero, rpc_one, "workers must not share an RPC listener");
+    let zero_fee = pool_zero.block_info().pending_basefee;
+    let retained_fee = accumulator.base_fee(1);
+    accumulator.set_num_workers(1);
+    accumulator.set_num_workers(2);
+    let next_fee = MIN_PROTOCOL_BASE_FEE + 9000;
+    accumulator.base_fee(1).set_base_fee(next_fee);
+    engine.set_worker_base_fee(1, next_fee).await?;
+
+    // Canonical maintenance retains the pool's original fee handle across worker-count changes.
+    assert_eq!(retained_fee.base_fee(), next_fee);
+    let genesis = engine.get_reth_env().await.chainspec().sealed_genesis_block();
+    pool_one.update_canonical_state(&genesis, Some(u128::MAX), vec![], vec![]).await?;
+    assert_eq!(pool_one.block_info().pending_basefee, next_fee);
+    assert_eq!(pool_zero.block_info().pending_basefee, zero_fee);
+    assert_eq!(engine.worker_http_local_address(&0).await?, Some(rpc_zero));
+    assert_eq!(engine.worker_http_local_address(&1).await?, Some(rpc_one));
+
+    engine
+        .respawn_worker_network_tasks(
+            1,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        )
+        .await?;
+    assert!(engine
+        .respawn_worker_network_tasks(
+            2,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        )
+        .await
+        .is_err());
+    Ok(())
+}
+
 /// Test that rewards tracking handles a mix of empty and non-empty consensus outputs.
 ///
 /// With skip-empty-execution, rounds with no batches and no epoch close skip EVM execution.

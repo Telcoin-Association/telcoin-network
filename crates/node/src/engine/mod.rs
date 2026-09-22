@@ -254,12 +254,16 @@ impl ExecutionNode {
         guard.set_worker_base_fee(worker_id, base_fee)
     }
 
-    /// Respawn any tasks on the worker network when we get a new epoch task manager.
+    /// Respawn one worker's network tasks with its own handle for the new epoch.
     ///
     /// This method should be called on epoch rollover.
-    pub async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
-        let guard = self.internal.write().await;
-        guard.respawn_worker_network_tasks(network_handle).await
+    pub async fn respawn_worker_network_tasks(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+    ) -> eyre::Result<()> {
+        let guard = self.internal.read().await;
+        guard.respawn_worker_network_tasks(worker_id, network_handle)
     }
 
     /// Push the node's consensus catch-up state into every worker's RPC network shim.
