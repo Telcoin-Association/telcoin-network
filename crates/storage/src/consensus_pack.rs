@@ -898,6 +898,42 @@ pub const CONSENSUS_DIGEST_NAME: &str = Inner::CONSENSUS_HASH_NAME;
 /// Sidecar directory name of the batch digest index (the `bhash` hdx/odx).
 pub const BATCH_DIGEST_NAME: &str = Inner::BATCH_HASH_NAME;
 
+/// Whether any position-index-attested output starts after byte offset `from` and still decodes
+/// from its recorded boundary.
+///
+/// The data-log walk in [`crate::pack_validate`] (and recovery's [`Inner::output_after_tear`])
+/// advances by each record's claimed 4-byte size prefix, so a corrupted size prefix desyncs it and
+/// it can miss a later intact output. The position index recorded that output's exact start, so
+/// `fetch` frames it from a known-good offset a corrupted prefix cannot desync (the damaged
+/// record's own `fetch` simply fails, so it is never miscounted as a survivor). A
+/// missing/unreadable data pack or position index returns `false`, leaving the caller's walk-based
+/// probe as the fallback. Read-only; opens its own handles.
+pub(crate) fn attested_output_survives_past(data_path: &Path, epoch: Epoch, from: u64) -> bool {
+    let Ok(mut data) = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    ) else {
+        return false;
+    };
+    let Some(epoch_dir) = data_path.parent() else {
+        return false;
+    };
+    let offsets: Vec<u64> =
+        match Inner::open_pdx_file::<_, IndexPositions>(epoch_dir, data.header(), true) {
+            Ok(mut idx) => (0..idx.len() as u64)
+                .filter_map(|i| idx.load(i).ok().map(|p| p.consensus_header))
+                .collect(),
+            Err(_) => return false,
+        };
+    offsets
+        .iter()
+        .filter(|&&pos| pos > from)
+        .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
+}
+
 #[derive(Debug)]
 struct Inner {
     data: Pack<PackRecord>,
@@ -1032,6 +1068,16 @@ impl Inner {
             dir = %base_dir.display(),
             "pack opened unclean or inconsistent; replaying data-file WAL to recover"
         );
+        // Capture the position index's attested output-start offsets before any reset below (pass 1
+        // reads no index, so they are still intact). The WAL walk in
+        // `replay_wal`/`output_after_tear` advances by each record's claimed size, so a
+        // corrupted size prefix desyncs it and it can stop early, missing a later intact
+        // output; these recorded boundaries let the post-replay check re-frame such an
+        // output from a known-good offset (see `attested_record_survives`). Empty when the
+        // index was itself discarded (`reset_all_indexes`) -> falls back to the walk.
+        let attested_headers: Vec<u64> = (0..consensus_pos_idx.len() as u64)
+            .filter_map(|i| consensus_pos_idx.load(i).ok().map(|p| p.consensus_header))
+            .collect();
         // Pass 1 -- validate the data-log WAL ALONE (no index is read or written). A detected
         // corruption returns `CorruptPack` without mutating on-disk state, so a retry re-derives
         // the same verdict from the unchanged log. `replay_wal` returns the end of the last
@@ -1051,6 +1097,17 @@ impl Inner {
             if consistent_end < committed_end {
                 return Err(Self::corrupt_pack(base_dir));
             }
+        }
+
+        // A position-index-attested output surviving past the replay's stopping point means
+        // committed data below the acked frontier was damaged -- e.g. a corrupted 4-byte
+        // size prefix desynced the WAL walk so `replay_wal` stopped early and
+        // `output_after_tear` could not re-sync to the later output. Re-framing from the
+        // recorded boundary is immune to that desync, closing the size-prefix gap the walk
+        // cannot (INV1/INV4: a hard `CorruptPack` below acked data, never a
+        // silent truncate). No-op when the index was discarded (empty `attested_headers`).
+        if Self::attested_record_survives(data, &attested_headers, consistent_end) {
+            return Err(Self::corrupt_pack(base_dir));
         }
 
         // Validation passed: the data log is authoritative, so discard the (stale/damaged) indexes
@@ -1264,6 +1321,20 @@ impl Inner {
             base_dir.display(),
             base_dir.display(),
         ))
+    }
+
+    /// Does any position-index-attested output start after byte offset `from` and still decode as a
+    /// `Consensus` record? [`Self::output_after_tear`] walks by each record's claimed 4-byte size
+    /// prefix, so a corrupted prefix desyncs it and it can miss a later intact output; the position
+    /// index recorded that output's exact start, so `fetch` frames it from a known-good boundary (a
+    /// corrupted prefix just makes that `fetch` fail, so it is never miscounted). Empty `headers`
+    /// (the index was itself discarded and is being rebuilt) makes this a no-op, leaving
+    /// `output_after_tear` as the fallback.
+    fn attested_record_survives(data: &mut Pack<PackRecord>, headers: &[u64], from: u64) -> bool {
+        headers
+            .iter()
+            .filter(|&&pos| pos > from)
+            .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
     }
 
     /// After recovery hits a torn/incomplete output, decide whether the rest of the log is a clean
@@ -5703,6 +5774,105 @@ pub(crate) mod test {
         assert!(
             matches!(res, Err(PackError::CorruptPack(_))),
             "mid-log corruption must error, got {res:?}"
+        );
+    }
+
+    /// Finding #19: a corrupted mid-log record *size prefix* (not payload) desyncs the size-walking
+    /// probe, so `output_after_tear` cannot reach the intact outputs after the damage. On an
+    /// unclean pack with no commit marker the position index is the only desync-immune witness
+    /// — a still-attested output past the replay's stopping point makes recovery reject with
+    /// `CorruptPack` rather than silently truncating committed outputs. (Contrast
+    /// `test_recover_mid_log_corruption_errors`, which corrupts the payload with framing intact and
+    /// is caught by the walk itself.)
+    #[tokio::test]
+    async fn test_recover_size_prefix_corruption_errors_via_index() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_size_prefix").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Output 2 begins where output 1 ends; overwrite its 4-byte record size prefix (not the
+        // payload) with a small bogus size so the size-walking probe jumps to a misaligned offset
+        // and cannot re-sync to output 3.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to size prefix");
+            f.write_all(&7u32.to_le_bytes()).expect("corrupt size prefix");
+        }
+        // Strip the clean-close sentinel so the pack opens unclean (forcing recovery) with NO
+        // commit marker — a sealed pack's tail holds none — leaving the (intact) position
+        // index as the only witness. Keep the digest indexes so recovery receives an intact
+        // position index.
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data to unseal");
+            let len = f.metadata().expect("metadata").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(PackError::CorruptPack(_))),
+            "size-prefix corruption with a surviving attested output must error, got {res:?}"
+        );
+    }
+
+    /// Finding #19 (read-only path): the classifier must not misread size-prefix corruption as a
+    /// truncatable tail. With a surviving attested output past the damage,
+    /// `classify_physical_corruption` reports `MidLogCorruption` (DATA LOSS / re-sync), not
+    /// `TornTrailingTail` ("SAFE") — via the position index, immune to the size-walk desync.
+    #[tokio::test]
+    async fn test_classify_size_prefix_corruption_is_mid_log() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let temp_dir = TempDir::with_prefix("test_classify_size_prefix").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to size prefix");
+            f.write_all(&7u32.to_le_bytes()).expect("corrupt size prefix");
+        }
+        // Unclean (stripped sentinel) so the pre-fix walk would call a torn tail "SAFE"; the
+        // position index (kept intact) attests output 3 survives past the damage.
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data to unseal");
+            let len = f.metadata().expect("metadata").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+
+        let corruption = crate::pack_validate::classify_physical_corruption(&data_path, 0)
+            .expect("classify")
+            .expect("corruption detected");
+        assert_eq!(
+            corruption.kind,
+            crate::pack_validate::CorruptionKind::MidLogCorruption,
+            "size-prefix corruption with a surviving attested output must classify as mid-log, got \
+             {:?}",
+            corruption.kind
         );
     }
 

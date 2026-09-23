@@ -47,8 +47,8 @@ use crate::{
         pack_iter::PackIter,
     },
     consensus_pack::{
-        verify_epoch_meta, PackError, PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME,
-        PACK_VERSION,
+        attested_output_survives_past, verify_epoch_meta, PackError, PackRecord, BATCH_DIGEST_NAME,
+        CONSENSUS_DIGEST_NAME, PACK_VERSION,
     },
 };
 
@@ -503,16 +503,23 @@ pub fn classify_physical_corruption(
                 // ambiguity tracked as the deferred size-prefix-checksum item; classification is
                 // best-effort for that case.
                 if offset < data_end {
-                    let kind = match (records_ok_before == 0, sealed) {
-                        (true, _) => CorruptionKind::TornMetaEmpty,
-                        (false, true) => CorruptionKind::CorruptSealedRecord,
-                        (false, false) => CorruptionKind::TornTrailingTail,
+                    // A size prefix corrupted to read as EOF (or to claim past EOF) lands here; the
+                    // walk cannot see past it. The position index attests each output's exact
+                    // start, so re-frame from there (desync-immune) to tell a
+                    // torn tail from mid-log corruption with survivors.
+                    let decodable_after = attested_output_survives_past(path, epoch, offset);
+                    let kind = match (records_ok_before == 0, decodable_after, sealed) {
+                        (true, false, _) => CorruptionKind::TornMetaEmpty,
+                        (true, true, _) => CorruptionKind::CorruptMetaWithData,
+                        (false, true, _) => CorruptionKind::MidLogCorruption,
+                        (false, false, true) => CorruptionKind::CorruptSealedRecord,
+                        (false, false, false) => CorruptionKind::TornTrailingTail,
                     };
                     return Ok(Some(PhysicalCorruption {
                         kind,
                         offset,
                         records_ok_before,
-                        decodable_after: false,
+                        decodable_after,
                         detail: format!(
                             "record truncated within its size prefix ({} trailing byte(s))",
                             data_end - offset
@@ -524,7 +531,12 @@ pub fn classify_physical_corruption(
             }
             Some(Ok(_)) => records_ok_before += 1,
             Some(Err(e)) => {
-                let decodable_after = probe_decodable_after(&mut iter);
+                // A corrupted 4-byte size prefix desyncs `probe_decodable_after`'s walk, hiding a
+                // later intact output and misreading data-losing corruption as a truncatable tail.
+                // The position index frames the later output from its recorded (desync-immune)
+                // boundary; fall back to the walk only when the index is absent/unreadable.
+                let decodable_after = attested_output_survives_past(path, epoch, offset)
+                    || probe_decodable_after(&mut iter);
                 let kind = match (records_ok_before == 0, decodable_after) {
                     // record 0 is the epoch meta
                     (true, false) => CorruptionKind::TornMetaEmpty,
