@@ -684,7 +684,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
 
         let Some(buffer) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) else {
-            return Err(AppendError::ReadOnly);
+            // The save path only runs on a writable index, so `None` means the bucket lies past the
+            // mapped end -- a truncated/corrupt hdx, not a read-only handle (#36).
+            return Err(AppendError::CorruptIndex(
+                "hdx bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         };
         let mut pos = 8; // Skip over overflow_pos.
         let elements = read_u32(buffer, &mut pos);
@@ -780,10 +785,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // reads `bucket_pos(split_bucket)` + the odx chain — neither depends on the bucket
         // count / modulus — so it is safe here.
         let elements = self.collect_bucket_elements(split_bucket)?;
-        let original = match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
-            Some(buf) => buf.to_vec(),
-            None => return Err(AppendError::ReadOnly),
-        };
+        let original =
+            match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
+                Some(buf) => buf.to_vec(),
+                None => return Err(AppendError::CorruptIndex(
+                    "hdx split bucket is past the mapped end -- the index is truncated or corrupt"
+                        .to_string(),
+                )),
+            };
 
         if let Err(e) = self.redistribute_split(split_bucket, split_pos, elements) {
             // Restore the pre-split state: the bucket/modulus counters revert, and rewriting the
@@ -834,14 +843,20 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             // Note this will zero the CRC as well (we want that- marks it "dirty").
             buffer.fill(0);
         } else {
-            return Err(AppendError::ReadOnly);
+            return Err(AppendError::CorruptIndex(
+                "hdx split bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         }
         self.hdx_file.ensure_len(new_pos + Self::BUCKET_SIZE as u64)?;
         if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
             // Note this will zero the CRC as well (we want that- marks it "dirty").
             buffer.fill(0);
         } else {
-            return Err(AppendError::ReadOnly);
+            return Err(AppendError::CorruptIndex(
+                "hdx new bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         }
 
         // Test-only: simulate a mid-split failure with both buckets already zeroed (the worst case

@@ -135,6 +135,14 @@ pub enum PackIssue {
         /// Consensus number of the offending header.
         number: u64,
     },
+    /// A sidecar digest index (`hash`/`bhash`) could not be opened for the bucket-CRC scan
+    /// (unreadable, wrong geometry, or a version/uid mismatch). The data log is validated
+    /// separately; this only reports that the derived index is unreadable and must be rebuilt — it
+    /// is not an epoch-meta problem.
+    IndexUnreadable {
+        /// Which index and the underlying open error.
+        detail: String,
+    },
 }
 
 /// Overall verdict for a pack file.
@@ -448,7 +456,7 @@ fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackVa
         ) {
             Ok(idx) => Some(idx.bucket_crc_scan()),
             Err(e) => {
-                report.issues.push(PackIssue::EpochMetaMismatch {
+                report.issues.push(PackIssue::IndexUnreadable {
                     detail: format!("{which} digest index is unreadable: {e}"),
                 });
                 None
@@ -926,6 +934,7 @@ impl Display for PackValidationReport {
         let mut non_sequential = 0usize;
         let mut meta = 0usize;
         let mut empty_subdag = 0usize;
+        let mut index_unreadable = 0usize;
         for issue in &self.issues {
             match issue {
                 PackIssue::ChainBreak { .. } => chain_breaks += 1,
@@ -938,6 +947,7 @@ impl Display for PackValidationReport {
                 PackIssue::NonSequentialConsensusNumber { .. } => non_sequential += 1,
                 PackIssue::EpochMetaMismatch { .. } => meta += 1,
                 PackIssue::EmptySubDag { .. } => empty_subdag += 1,
+                PackIssue::IndexUnreadable { .. } => index_unreadable += 1,
             }
         }
 
@@ -997,6 +1007,7 @@ impl Display for PackValidationReport {
         writeln!(f, "  non-sequential numbers: {non_sequential}")?;
         writeln!(f, "  epoch meta mismatches:  {meta}")?;
         writeln!(f, "  empty sub-dags:         {empty_subdag}")?;
+        writeln!(f, "  unreadable indexes:     {index_unreadable}")?;
 
         if self.issues.is_empty() {
             return Ok(());
@@ -1026,6 +1037,9 @@ impl Display for PackValidationReport {
                 PackIssue::EpochMetaMismatch { detail } => writeln!(f, "  EPOCH META     {detail}")?,
                 PackIssue::EmptySubDag { number } => {
                     writeln!(f, "  consensus {number}  EMPTY SUB-DAG")?
+                }
+                PackIssue::IndexUnreadable { detail } => {
+                    writeln!(f, "  INDEX UNREADABLE  {detail}")?
                 }
             }
         }
