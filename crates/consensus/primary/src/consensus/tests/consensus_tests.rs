@@ -1055,8 +1055,7 @@ async fn spawn_and_collect(
     let fixture_config =
         fixture.authorities().next().expect("fixture has authorities").consensus_config();
     // rebuilt through the constructor epoch startup uses: the fixture's test constructors carry no
-    // prior epoch close, and `set_prior_epoch_close_for_test` needs `tn-config/test-utils`, which
-    // this crate's tests do not enable
+    // prior epoch close
     let config = ConsensusConfig::new_for_epoch(
         fixture_config.config().clone(),
         fixture_config.node_storage().clone(),
