@@ -886,16 +886,25 @@ where
         // NOTE: this blocks until batches become available
         self.state_sync.sync_header_batches(&header, false, 0).await?;
 
+        /// Round `d` up to whole seconds for comparison with second-granularity header timestamps.
+        ///
+        /// Keeps the voter's whole-second drift check intact (the 250 ms default admits a header
+        /// up to 1 s ahead) until the voter compares timestamps in milliseconds.
+        fn ceil_secs(d: Duration) -> u64 {
+            d.as_secs().saturating_add(u64::from(d.subsec_nanos() != 0))
+        }
+
         // verify header was created in the past
         let now = now();
         if &now < header.created_at() {
             // wait if the difference is small enough
             if *header.created_at() - now
-                <= self
-                    .consensus_config
-                    .network_config()
-                    .sync_config()
-                    .max_header_time_drift_tolerance
+                <= ceil_secs(
+                    self.consensus_config
+                        .network_config()
+                        .sync_config()
+                        .max_header_time_drift_tolerance,
+                )
             {
                 tokio::time::sleep(Duration::from_secs(*header.created_at() - now)).await;
             } else {
