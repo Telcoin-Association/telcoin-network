@@ -22,7 +22,7 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
+    error::HeaderError, now, now_ms, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
     ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager, TnReceiver, B256,
 };
 use tokio::time::timeout;
@@ -869,8 +869,8 @@ async fn test_request_vote_created_at_in_future() {
         }
     }
 
-    // Set the creation time to be a bit in the future (1s)
-    let created_at = now() + 1;
+    // Set the creation time to be a bit in the future, inside the 250 ms drift tolerance
+    let created_at = now_ms().saturating_add_millis(200);
 
     let test_header = author
         .header_builder(&fixture.committee())
@@ -880,8 +880,10 @@ async fn test_request_vote_created_at_in_future() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
-        .created_at(created_at)
+        .created_at_ms(created_at)
         .build();
+    // builds without sub-second timestamps drop the millis, so compare against the header's own
+    let created_at = test_header.created_at_ms();
 
     cb.app().committed_round_updates().send_replace(1);
     let _vote = if let PrimaryResponse::Vote(vote) =
@@ -891,7 +893,7 @@ async fn test_request_vote_created_at_in_future() {
     } else {
         panic!("not a vote!");
     };
-    assert!(created_at <= now());
+    assert!(created_at <= now_ms());
 }
 
 /// The primary's worker-to-primary handler is bound to one worker id per local network

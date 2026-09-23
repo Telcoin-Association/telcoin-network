@@ -262,13 +262,20 @@ pub struct Parameters {
     /// even if batches have not reached `header_num_of_batches_threshold`.
     #[serde(with = "humantime_serde", default = "Parameters::default_min_header_delay")]
     pub min_header_delay: Duration,
-    /// How long the proposer waits for each peer's vote on its header before giving up on that
-    /// request.
+    /// How long a voter may spend evaluating one vote request, and how far past the drift
+    /// tolerance a future-dated header can be and still get a retryable answer.
+    ///
+    /// Both uses are on the voter side. Each vote request is evaluated under this time limit; a
+    /// request that runs out of time gets a retryable response instead of a vote. A header ahead
+    /// of the voter's clock by more than `max_header_time_drift_tolerance` but by no more than
+    /// that tolerance plus this timeout also gets a retryable response rather than a rejection.
+    /// The requesting proposer retries on either response, so a slow voter or a small clock skew
+    /// delays that vote rather than ending the request.
     ///
     /// Kept separate from `max_header_delay` because a voter may hold its vote while it waits out
     /// a future-dated header's lead, up to `max_header_time_drift_tolerance`, before it answers.
-    /// A timeout tied to the header cadence can expire while an honest peer is still waiting to
-    /// vote, and the shorter the cadence the more often that happens.
+    /// A limit tied to the header cadence can expire while an honest voter is still waiting, and
+    /// the shorter the cadence the more often that happens.
     ///
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`). The production `ConsensusConfig` constructors

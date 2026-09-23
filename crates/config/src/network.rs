@@ -335,16 +335,26 @@ pub struct SyncConfig {
     pub max_consenus_round_timeout: Duration,
     /// The maximum number of rounds that a proposed header can be behind the node's local round.
     pub max_proposed_header_age_limit: Round,
-    /// How far a header's `created_at` may run ahead of this node's clock before the header is
-    /// rejected.
+    /// How far a header's creation time may run ahead of this node's clock before the voter
+    /// stops waiting it out.
     ///
-    /// This absorbs small clock drift between validators. When a header's timestamp is ahead of
-    /// local time by no more than this tolerance, the primary waits out the difference before
-    /// deciding whether to vote; a header further ahead is rejected. Defaults to 250 ms, and
-    /// [`NetworkConfig::read_config`] logs a warning for values above one second.
+    /// This absorbs small clock drift between validators. The voter measures how far the header
+    /// is ahead of local time and responds in one of three ways:
     ///
-    /// Header timestamps are whole seconds, so until the voter compares them in milliseconds it
-    /// rounds this tolerance up to the next whole second: the 250 ms default behaves as 1 s.
+    /// - Within this tolerance, it waits out the lead in milliseconds, then decides whether to
+    ///   vote.
+    /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
+    ///   it answers with a retryable response and charges no penalty. The proposer retries the
+    ///   request, and by then the lead may be back within tolerance.
+    /// - Further ahead, it rejects the header and penalizes the proposer.
+    ///
+    /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
+    /// second.
+    ///
+    /// The within-tolerance check compares milliseconds when
+    /// [`tn_types::forks::subsecond_timestamp_active`] holds for the header's epoch. Earlier
+    /// epochs carry whole-second header timestamps, so there the check rounds this tolerance up
+    /// to the next whole second: the 250 ms default behaves as 1 s.
     ///
     /// The config file accepts either a bare integer, read as whole seconds (the format older
     /// config files use), or a humantime string such as `"250ms"` or `"1s"`. The value is always

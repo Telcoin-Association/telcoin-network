@@ -778,7 +778,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong == wrong_time);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong.as_millis() == wrong_time * 1000);
     Ok(())
 }
 
