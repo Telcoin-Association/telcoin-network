@@ -31,7 +31,7 @@ use tn_storage::{
     consensus_pack::{ConsensusPack, EpochRepair, DATA_NAME},
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
-    pack_validate::{classify_physical_corruption, validate_pack_file},
+    pack_validate::{classify_physical_corruption, validate_pack_file, validate_pack_file_bounded},
 };
 use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -138,6 +138,20 @@ impl DbValidateArgs {
             .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
         {
             print!("{corruption}");
+            // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
+            // committed prefix before it must still be logically checked — otherwise `db validate`
+            // reports nothing useful for the normal shape of any crashed current epoch. Walk the
+            // prefix bounded to the corruption offset and print that report too.
+            if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
+                eprintln!(
+                    "\nValidating the intact prefix before the tear (up to byte {})...",
+                    corruption.offset
+                );
+                match validate_pack_file_bounded(&data_file, epoch, None, Some(corruption.offset)) {
+                    Ok(report) => print!("{report}"),
+                    Err(e) => eprintln!("bounded validation of the intact prefix failed: {e}"),
+                }
+            }
             return Ok(());
         }
 

@@ -591,7 +591,6 @@ impl ConsensusChain {
         .await;
         match res_pack {
             Ok(pack) => {
-                let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
                 // Validate the imported pack; on ANY failure async-close it (the only handle)
                 // instead of leaving it to the blocking `Drop` join on this tokio
@@ -630,20 +629,18 @@ impl ConsensusChain {
                 // released), same as the old blocking `Drop::join`, but without
                 // stalling a tokio worker.
                 pack.close().await;
-                // Make sure we don't have any cruft in the final dir.
-                if std::fs::exists(&base_dir).unwrap_or_default() {
-                    // If this exists it is incomplete (see check at start of function).
-                    // This remove will leave a tiny window before the rename where it is
-                    // not available.  This may produce errors that should be handled correctly if
-                    // so.
-                    let _ = std::fs::remove_dir_all(&base_dir);
-                }
-                let rename_err = std::fs::rename(&path_base_dir, &base_dir);
-                // Invalidate the cache AFTER the rename so a concurrent get_static that
-                // missed the cache and opened FDs on the old (now-unlinked) inode cannot
-                // leave a stale entry behind for other callers — any entry cached during
-                // the race is purged here. Readers after this point fall through and
-                // see the new on-disk pack.
+                // Atomically install the imported dir (rename-aside): the live epoch-{N} dir is
+                // moved aside and only removed after the new one is renamed in and
+                // the parent is fsync'd, so a rename failure never leaves
+                // `current_pack` writing to an unlinked inode (on failure
+                // the old dir is restored and the error propagates).
+                Self::install_imported_epoch_dir(&self.base_path, epoch, &path_base_dir)?;
+                // Invalidate the cache now the new dir is durably in place: a concurrent get_static
+                // that missed the cache and opened FDs on the old (now-unlinked) inode must not
+                // leave a stale entry behind. Only a SUCCESSFUL install unlinks the
+                // old inode, so this runs only on success — a failed-and-restored
+                // install keeps the same inode, so cached handles stay valid.
+                // Readers after this point fall through and see the new on-disk pack.
                 let evicted: Vec<ConsensusPack> = {
                     let mut recents = self.recent_packs.lock();
                     let mut kept = VecDeque::with_capacity(recents.len());
@@ -661,12 +658,6 @@ impl ConsensusChain {
                 for p in evicted {
                     p.close().await;
                 }
-                rename_err?;
-                // Make the epoch-{N} directory entry durable in base_path: this commits both
-                // the remove of any stale dir and the renamed-in import before we treat the
-                // import as complete. A failed fsync here means the import is not durable, so
-                // return the error and let it be retried by re-streaming.
-                fsync_directory(&self.base_path)?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
                     // Swap the old pack out under the lock, then async-close it after the guard
@@ -747,20 +738,59 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*` or `import-*` directories under `base_path` (stale from a
-    /// prior run).
+    /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.replaced` directories under
+    /// `base_path` (stale from a prior run — the last is a rename-aside backup left by a crash
+    /// during [`Self::install_imported_epoch_dir`]).
     fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("staging-") || n.starts_with("import-"))
-                {
+                if entry.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("staging-")
+                        || n.starts_with("import-")
+                        || n.ends_with(".replaced")
+                }) {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
+    }
+
+    /// Atomically install a freshly-imported `epoch-{epoch}` directory at `base_path`, replacing
+    /// any existing one, via rename-aside: the live dir is moved to `epoch-{epoch}.replaced`
+    /// and only removed after the import is renamed into place and the parent directory is
+    /// fsync'd. If the install rename fails, the old dir is restored (same inode) so a live
+    /// `current_pack` is never left writing to an unlinked inode. A crash mid-swap leaves a
+    /// `*.replaced` dir that [`Self::remove_all_staging_and_import_dirs`] sweeps on the next
+    /// start.
+    fn install_imported_epoch_dir(
+        base_path: &Path,
+        epoch: Epoch,
+        import_dir: &Path,
+    ) -> Result<(), ConsensusChainError> {
+        let base_dir = base_path.join(format!("epoch-{epoch}"));
+        let aside = base_path.join(format!("epoch-{epoch}.replaced"));
+        // Clear any stale aside from a previously interrupted install.
+        let _ = std::fs::remove_dir_all(&aside);
+        let had_old = std::fs::exists(&base_dir).unwrap_or_default();
+        if had_old {
+            // Move the live dir aside rather than unlinking it, so it is recoverable if the install
+            // rename below fails.
+            std::fs::rename(&base_dir, &aside)?;
+        }
+        let installed = std::fs::rename(import_dir, &base_dir);
+        if installed.is_err() && had_old {
+            // Restore the old dir (same inode) so current_pack / open_append_exists keep a valid
+            // path.
+            let _ = std::fs::rename(&aside, &base_dir);
+        }
+        installed?;
+        // Durably commit the new dir entry before the import is treated as complete.
+        fsync_directory(base_path)?;
+        if had_old {
+            // Best-effort: a crash before this leaves the aside for startup cleanup to remove.
+            let _ = std::fs::remove_dir_all(&aside);
+        }
+        Ok(())
     }
 
     /// Import a verified PARTIAL pack (a prefix of an in-progress epoch streamed from a peer) into
@@ -2444,6 +2474,49 @@ mod test {
             result.is_err(),
             "genuine at-rest corruption must surface through get_static's retry: {result:?}"
         );
+    }
+
+    /// `install_imported_epoch_dir` must never unlink the live epoch dir before the
+    /// new one is safely in place. On success the import replaces it and the rename-aside
+    /// backup is cleaned; on a failed install rename the old dir is restored (same inode), so a
+    /// live writer is never left on an unlinked/absent path.
+    #[test]
+    fn test_install_imported_epoch_dir_atomic_swap() {
+        let tmp = TempDir::with_prefix("test_install_epoch").expect("temp dir");
+        let base = tmp.path();
+        let make_dir = |p: &std::path::Path, marker: &str| {
+            std::fs::create_dir_all(p).expect("mkdir");
+            std::fs::write(p.join("data"), marker).expect("write marker");
+        };
+        let base_dir = base.join("epoch-0");
+        let aside = base.join("epoch-0.replaced");
+
+        // Success: an existing epoch-0 is replaced by the import; the aside is cleaned.
+        make_dir(&base_dir, "OLD");
+        let import = base.join("import-0");
+        make_dir(&import, "NEW");
+        ConsensusChain::install_imported_epoch_dir(base, 0, &import).expect("install succeeds");
+        assert_eq!(
+            std::fs::read_to_string(base_dir.join("data")).unwrap(),
+            "NEW",
+            "new content installed"
+        );
+        assert!(!import.exists(), "import dir consumed by the rename");
+        assert!(!aside.exists(), "rename-aside backup cleaned on success");
+
+        // Failure-restore: a missing import makes the install rename fail (ENOENT); the old dir
+        // must be restored with its original content and no aside left behind.
+        make_dir(&base_dir, "KEEP");
+        let missing = base.join("import-does-not-exist");
+        let err = ConsensusChain::install_imported_epoch_dir(base, 0, &missing);
+        assert!(err.is_err(), "install must fail when the import dir is absent: {err:?}");
+        assert!(base_dir.exists(), "old epoch-0 must still exist after a failed install");
+        assert_eq!(
+            std::fs::read_to_string(base_dir.join("data")).unwrap(),
+            "KEEP",
+            "old content restored (the live dir was never unlinked)"
+        );
+        assert!(!aside.exists(), "aside restored back into place, not left behind");
     }
 
     /// A partial stream of the in-progress (incomplete) current epoch must deliver a verifiable

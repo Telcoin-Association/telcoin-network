@@ -371,11 +371,41 @@ pub fn validate_pack_file(
     epoch: Epoch,
     previous: Option<&EpochRecord>,
 ) -> Result<PackValidationReport, PackError> {
+    validate_pack_file_bounded(path, epoch, previous, None)
+}
+
+/// Like [`validate_pack_file`], but clamps the logical read to `read_bound` bytes when it is
+/// `Some`.
+///
+/// `db validate` uses this to logically walk the intact committed PREFIX of a pack whose tail is a
+/// truncatable (torn, unacked) tear: `set_read_bound` clamps the read-only handle's `end` (honoured
+/// by `raw_iter`/`PackIter`), so the walk stops exactly at the corruption offset instead of
+/// skipping every logical check. `read_bound == None` validates the whole file (what
+/// [`validate_pack_file`] passes).
+pub fn validate_pack_file_bounded(
+    path: &Path,
+    epoch: Epoch,
+    previous: Option<&EpochRecord>,
+    read_bound: Option<u64>,
+) -> Result<PackValidationReport, PackError> {
     // Read-only open of just the data file — `Pack::open` loads/cross-checks the header (the wrong
     // epoch fails here with an open error) and needs no sidecar index files.
-    let pack =
+    let mut pack =
         Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
+    // Clamp BEFORE `raw_iter()` (which captures `end` via `try_clone`) so the walk honours the
+    // bound.
+    if let Some(bound) = read_bound {
+        pack.set_read_bound(bound);
+    }
+    validate_pack_file_impl(path, pack, epoch, previous)
+}
 
+fn validate_pack_file_impl(
+    path: &Path,
+    pack: Pack<PackRecord>,
+    epoch: Epoch,
+    previous: Option<&EpochRecord>,
+) -> Result<PackValidationReport, PackError> {
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = BoundedIssues::default();
 
@@ -1059,7 +1089,10 @@ mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{test_genesis, BlockHash, Committee, ConsensusHeader, ConsensusOutput, Hash};
 
-    use super::{validate_pack_file, BatchClass, PackIssue, Verdict};
+    use super::{
+        classify_physical_corruption, validate_pack_file, validate_pack_file_bounded, BatchClass,
+        PackIssue, Verdict,
+    };
     use crate::{
         archive::pack::{Pack, PackCompression},
         consensus_pack::{test::make_test_output, EpochMeta, PackRecord},
@@ -1182,6 +1215,98 @@ mod test {
             assert_eq!(report.first_consensus_number, Some(1), "v{version}");
             assert_eq!(report.last_consensus_number, Some(5), "v{version}");
         }
+    }
+
+    /// Append a torn size-prefix after a clean pack so it reopens unclean with a truncatable torn
+    /// tail (mirrors the consensus-pack `test_recover_torn_next_header` shape).
+    fn append_torn_tail(path: &Path) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).expect("open append");
+        f.write_all(&4096u32.to_le_bytes()).expect("write torn size prefix");
+    }
+
+    /// A crashed current epoch (torn trailing tail) must not skip the logical checks —
+    /// the intact committed prefix still validates through `validate_pack_file_bounded`.
+    #[test]
+    fn test_validate_bounded_walks_intact_prefix_of_torn_tail() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 3);
+        let (records, _) = build_records(epoch0_meta(&committee), &outputs, 1);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, 1);
+        append_torn_tail(&path);
+
+        // The tail classifies as a truncatable torn tail with intact records before it.
+        let corruption = classify_physical_corruption(&path, 0)
+            .expect("classify ok")
+            .expect("a torn tail must be detected");
+        assert!(
+            corruption.kind.is_truncatable(),
+            "a crashed-current-epoch tail must be truncatable: {:?}",
+            corruption.kind
+        );
+        assert!(corruption.records_ok_before > 0, "intact records precede the tear");
+
+        // Walking the intact prefix up to the tear validates clean (all 3 committed outputs).
+        let report = validate_pack_file_bounded(&path, 0, None, Some(corruption.offset))
+            .expect("bounded validate");
+        assert_eq!(
+            report.verdict,
+            Verdict::Valid,
+            "intact prefix must validate clean: {:?}",
+            report.issues
+        );
+        assert_eq!(report.consensus_count, 3, "all committed outputs are logically checked");
+    }
+
+    /// The read bound must not MASK a real logical error in the intact prefix — a
+    /// missing batch before the tear is still surfaced by the bounded walk.
+    #[test]
+    fn test_validate_bounded_surfaces_logical_error_in_prefix() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 5);
+        let (mut records, group_batches) = build_records(epoch0_meta(&committee), &outputs, 1);
+        // Drop the first batch of group index 2 (consensus header number 3) — an Absent logical
+        // error well inside the committed prefix.
+        let target = group_batches[2][0];
+        let pos = find_batch(&records, target);
+        records.remove(pos);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, 1);
+        append_torn_tail(&path);
+
+        let corruption = classify_physical_corruption(&path, 0)
+            .expect("classify ok")
+            .expect("a torn tail must be detected");
+        assert!(corruption.kind.is_truncatable(), "{:?}", corruption.kind);
+
+        let report = validate_pack_file_bounded(&path, 0, None, Some(corruption.offset))
+            .expect("bounded validate");
+        assert_eq!(report.verdict, Verdict::Invalid, "the prefix's missing batch must surface");
+        assert!(
+            report.issues.iter().any(|i| matches!(i,
+                PackIssue::MissingBatch { digest, class: BatchClass::Absent, number }
+                if *digest == target && *number == 3)),
+            "expected an Absent MissingBatch at consensus 3; issues: {:?}",
+            report.issues
+        );
+    }
+
+    /// `validate_pack_file_bounded(.., None)` is exactly `validate_pack_file` on a clean pack.
+    #[test]
+    fn test_validate_bounded_none_matches_unbounded() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 4);
+        let (records, _) = build_records(epoch0_meta(&committee), &outputs, 1);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, 1);
+
+        let unbounded = validate_pack_file(&path, 0, None).expect("validate");
+        let bounded = validate_pack_file_bounded(&path, 0, None, None).expect("bounded validate");
+        assert_eq!(bounded.verdict, unbounded.verdict);
+        assert_eq!(bounded.verdict, Verdict::Valid);
+        assert_eq!(bounded.consensus_count, unbounded.consensus_count);
+        assert_eq!(bounded.consensus_count, 4);
     }
 
     /// Dropping a batch record that no other group carries → reported Absent for the exact digest,
