@@ -177,14 +177,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
             leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
+            subsecond_timestamp_fork_epoch = tn_types::forks::SUBSECOND_TIMESTAMP_FORK_EPOCH,
             governance_safe_fork_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
         info!(
             target: "cli",
-            "fork schedule: seed_signature, multi_workers, prevrandao, and \
-             leader_seeded_ordering active from genesis"
+            "fork schedule: seed_signature, multi_workers, prevrandao, \
+             leader_seeded_ordering, and subsecond_timestamp active from genesis"
         );
 
         // Both lines above report compiled fork points, which a `test-utils` binary does not have
