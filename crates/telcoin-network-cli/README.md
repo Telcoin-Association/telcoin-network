@@ -489,7 +489,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
-| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; must be at least `max_header_delay` + `max_header_time_drift_tolerance` |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + `max_header_time_drift_tolerance` (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |

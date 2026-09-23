@@ -1,4 +1,5 @@
 use crate::{
+    codec::next_seq_field,
     crypto, encode,
     error::{HeaderError, HeaderResult},
     forks::{seed_signature_active, subsecond_timestamp_active},
@@ -354,16 +355,6 @@ impl<'de> Deserialize<'de> for PayloadOwned {
     }
 }
 
-/// Extracts the next element of the header field sequence, converting an early end of input
-/// into a field-labeled error (bcs would otherwise surface only a distal `Eof`).
-fn next_header_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
-where
-    A: serde::de::SeqAccess<'de>,
-    T: Deserialize<'de>,
-{
-    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
-}
-
 impl Serialize for Header {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -398,22 +389,22 @@ impl<'de> Deserialize<'de> for Header {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let author = next_header_field(&mut seq, "author")?;
-                let round = next_header_field(&mut seq, "round")?;
-                let epoch: Epoch = next_header_field(&mut seq, "epoch")?;
-                let created_at = next_header_field(&mut seq, "created_at")?;
-                let PayloadOwned(payload) = next_header_field(&mut seq, "payload")?;
-                let parents = next_header_field(&mut seq, "parents")?;
-                let latest_execution_block = next_header_field(&mut seq, "latest_execution_block")?;
+                let author = next_seq_field(&mut seq, "author")?;
+                let round = next_seq_field(&mut seq, "round")?;
+                let epoch: Epoch = next_seq_field(&mut seq, "epoch")?;
+                let created_at = next_seq_field(&mut seq, "created_at")?;
+                let PayloadOwned(payload) = next_seq_field(&mut seq, "payload")?;
+                let parents = next_seq_field(&mut seq, "parents")?;
+                let latest_execution_block = next_seq_field(&mut seq, "latest_execution_block")?;
                 let seed_signature = if seed_signature_active(epoch) {
-                    next_header_field(&mut seq, "seed_signature")?
+                    next_seq_field(&mut seq, "seed_signature")?
                 } else {
                     BlsSignature::default()
                 };
                 // not read at all when inactive, so an extra trailing field on an earlier
                 // epoch's header stays unconsumed and fails decode exactly as before the fork
                 let created_at_millis = if subsecond_timestamp_active(epoch) {
-                    let millis: u16 = next_header_field(&mut seq, "created_at_millis")?;
+                    let millis: u16 = next_seq_field(&mut seq, "created_at_millis")?;
                     if millis >= 1000 {
                         return Err(serde::de::Error::invalid_value(
                             serde::de::Unexpected::Unsigned(u64::from(millis)),

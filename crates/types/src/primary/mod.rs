@@ -164,6 +164,16 @@ impl Timestamp for TimestampMs {
     }
 }
 
+/// Round `d` up to whole seconds.
+///
+/// Used wherever a sub-second duration is compared against second-granularity timestamps
+/// (the voter's drift check for epochs without sub-second timestamps and the config check that
+/// budgets it): a whole-second timestamp cannot express a sub-second lead, so the 250 ms default
+/// tolerance admits a header up to 1 s ahead there.
+pub fn ceil_secs(d: Duration) -> u64 {
+    d.as_secs().saturating_add(u64::from(d.subsec_nanos() != 0))
+}
+
 /// Returns the current time expressed as UNIX
 /// timestamp in seconds.
 ///

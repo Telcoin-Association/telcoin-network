@@ -3,9 +3,10 @@
 
 use super::ConsensusHeader;
 use crate::{
-    crypto, encode, forks::subsecond_timestamp_active, Address, Batch, BlockHash, BlsSignature,
-    Certificate, ConsensusHeaderDigest, ConsensusNumHash, Digest, Epoch, EpochSeedChainValue, Hash,
-    Header, ReputationScores, Round, SealedHeader, TimestampMs, TimestampSec, B256,
+    codec::next_seq_field, crypto, encode, forks::subsecond_timestamp_active, Address, Batch,
+    BlockHash, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusNumHash, Digest, Epoch,
+    EpochSeedChainValue, Hash, Header, ReputationScores, Round, SealedHeader, TimestampMs,
+    TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
@@ -471,16 +472,6 @@ impl Serialize for CommittedSubDagRef<'_> {
     }
 }
 
-/// Extracts the next element of the sub-dag field sequence, converting an early end of input
-/// into a field-labeled error where the deserializer reports one.
-fn next_sub_dag_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
-where
-    A: serde::de::SeqAccess<'de>,
-    T: Deserialize<'de>,
-{
-    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
-}
-
 impl Serialize for CommittedSubDag {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -514,14 +505,14 @@ impl<'de> Deserialize<'de> for CommittedSubDag {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let headers: Vec<Header> = next_sub_dag_field(&mut seq, "headers")?;
-                let reputation_scores = next_sub_dag_field(&mut seq, "reputation_scores")?;
-                let commit_timestamp = next_sub_dag_field(&mut seq, "commit_timestamp")?;
-                let randomness = next_sub_dag_field(&mut seq, "randomness")?;
+                let headers: Vec<Header> = next_seq_field(&mut seq, "headers")?;
+                let reputation_scores = next_seq_field(&mut seq, "reputation_scores")?;
+                let commit_timestamp = next_seq_field(&mut seq, "commit_timestamp")?;
+                let randomness = next_seq_field(&mut seq, "randomness")?;
                 // not read at all when inactive, so an extra trailing field on an earlier
                 // epoch's sub-dag stays unconsumed and fails decode exactly as before the fork
                 let commit_timestamp_millis = if leader_subsecond_active(&headers) {
-                    let millis: u16 = next_sub_dag_field(&mut seq, "commit_timestamp_millis")?;
+                    let millis: u16 = next_seq_field(&mut seq, "commit_timestamp_millis")?;
                     if millis >= 1000 {
                         return Err(serde::de::Error::invalid_value(
                             serde::de::Unexpected::Unsigned(u64::from(millis)),

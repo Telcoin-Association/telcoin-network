@@ -10,9 +10,9 @@ use std::{
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    forks::subsecond_timestamp_active, Authority, AuthorityIdentifier, BlsPublicKey, Certificate,
-    Committee, Database, Epoch, EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey,
-    ShutdownNotifier, TimestampSec, WorkerId,
+    ceil_secs, forks::subsecond_timestamp_active, Authority, AuthorityIdentifier, BlsPublicKey,
+    Certificate, Committee, Database, Epoch, EpochDigest, Hash as _, HeaderDigest, Multiaddr,
+    NetworkPublicKey, ShutdownNotifier, TimestampSec, WorkerId,
 };
 use tracing::{info, warn};
 
@@ -162,7 +162,8 @@ where
     ///
     /// Fails when the parameters violate their operational floors, or when `vote_timeout` is
     /// shorter than `max_header_delay` plus the network config's
-    /// `max_header_time_drift_tolerance`.
+    /// `max_header_time_drift_tolerance` (rounded up to whole seconds while the sub-second gate
+    /// is dormant for the epoch), or not below the libp2p request timeout.
     #[allow(clippy::too_many_arguments)]
     pub fn new_for_epoch(
         config: Config,
@@ -468,13 +469,8 @@ fn validate_vote_timeout(
     subsecond_active: bool,
 ) -> eyre::Result<()> {
     let tolerance = sync_config.max_header_time_drift_tolerance;
-    let drift_wait = if subsecond_active {
-        tolerance
-    } else {
-        Duration::from_secs(
-            tolerance.as_secs().saturating_add(u64::from(tolerance.subsec_nanos() != 0)),
-        )
-    };
+    let drift_wait =
+        if subsecond_active { tolerance } else { Duration::from_secs(ceil_secs(tolerance)) };
     // saturating: both terms come from operator config files, so an overflowing sum must not
     // panic node startup
     let vote_window = parameters.max_header_delay.saturating_add(drift_wait);
@@ -774,7 +770,8 @@ mod tests {
         assert_eq!(config_for_epoch(1, Some(close)).prior_epoch_close(), Some(close));
     }
 
-    /// Test-facing constructors never seed a floor; tests opt in through the test setter.
+    /// Test-facing constructors never seed a floor; tests that need one build the config through
+    /// `new_for_epoch`, the path epoch startup uses.
     #[test]
     fn test_constructors_carry_no_prior_close() {
         let (committee, key_config) = committee_and_keys(1);
