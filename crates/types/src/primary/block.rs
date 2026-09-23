@@ -28,12 +28,15 @@ use serde::{Deserialize, Serialize};
 /// constant and is never derived from node-local epoch state, for the same reason.
 ///
 /// NOTE: the resulting digest is build-dependent and is frozen per build flavor by the
-/// `test_consensus_header_default_digest_pinned` pin: the embedded [`Header`](crate::Header)
-/// default (epoch 0) carries `seed_signature` on the wire only where the seed-signature fork
-/// ([`seed_signature_active`](crate::forks::seed_signature_active)) is active for epoch 0
-/// (always on non-adiri builds, never on adiri builds), so the two flavors anchor different
-/// digests. Both flavors also differ from the pre-#1032 anchor, which built this sub-dag
-/// through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
+/// `test_consensus_header_default_digest_pinned` pin. The embedded [`Header`](crate::Header)
+/// default is at epoch 0, and three fields reach the wire, and so the digest, only where their
+/// fork is active for epoch 0: the header's `seed_signature`
+/// ([`seed_signature_active`](crate::forks::seed_signature_active)), and the header's
+/// `created_at_millis` and the sub-dag's `commit_timestamp_millis`
+/// ([`subsecond_timestamp_active`](crate::forks::subsecond_timestamp_active)). Non-adiri builds
+/// activate both forks from genesis and adiri builds neither at epoch 0, so the two flavors
+/// anchor different digests. Both flavors also differ from the pre-#1032 anchor, which built this
+/// sub-dag through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
 /// default certificate's aggregate signature, where this derived default anchors the pinned
 /// placeholder itself (not a fold over it).
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
