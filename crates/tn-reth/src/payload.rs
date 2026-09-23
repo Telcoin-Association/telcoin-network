@@ -4,7 +4,8 @@ use crate::RethEnv;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    Address, ConsensusOutput, ExecHeader, SealedHeader, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    forks::subsecond_timestamp_active, Address, ConsensusOutput, ExecHeader, SealedHeader,
+    TimestampSec, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 
 /// The type for building blocks that extend the canonical tip.
@@ -44,7 +45,22 @@ pub struct TNPayload {
     ///
     /// Used as executed block header's `difficulty`.
     pub batch_index: usize,
-    /// Value for the `timestamp` field of the new payload
+    /// Value for the `timestamp` field of the new payload, in whole seconds.
+    ///
+    /// Consensus times commits in milliseconds from the sub-second timestamp fork on, but the EVM
+    /// `timestamp` stays in seconds: it is [`ConsensusOutput::committed_at`], the floor of the
+    /// commit time, because contracts and Ethereum tooling read `block.timestamp` as Unix
+    /// seconds. Under sub-second commit cadence several consecutive blocks therefore share one
+    /// `timestamp`.
+    ///
+    /// For leaders of epochs where [`subsecond_timestamp_active`] holds, the value is raised to
+    /// at least the parent block's `timestamp`, so EVM time never runs backwards even if
+    /// consensus hands execution a regressed commit time. The clamp is gated on the leader's
+    /// epoch carried in the output, never on a node-local epoch, so every node executing the
+    /// same output computes the same value and replaying pre-fork history reproduces the
+    /// original timestamps. Consensus already keeps commit times non-decreasing from the fork
+    /// on, so a clamp that raises the value signals a consensus bug; the engine counts those
+    /// blocks in `evm_timestamp_clamped_total`.
     pub timestamp: u64,
     /// This is used as the ommers hash.
     /// The default is `B256::ZERO` (no batches to execute).
@@ -113,13 +129,14 @@ impl TNPayload {
             .close_epoch_for_last_batch(batch_index)
             .is_some_and(|last_batch| last_batch)
             .then(|| output.committee_shuffle_seed());
+        let timestamp = evm_block_timestamp(output, &parent_header);
 
         Self {
             parent_header,
             beneficiary,
             nonce: output.nonce(),
             batch_index,
-            timestamp: output.committed_at(),
+            timestamp,
             batch_digest,
             consensus_header_digest,
             base_fee_per_gas,
@@ -201,6 +218,13 @@ impl TNPayload {
 /// parent's, which goes stale across an epoch boundary (TN fees are epoch-flat). TN
 /// therefore defaults `--rpc.pending-block` to `none`, so this env is only simulated
 /// for an operator who opts in with `--rpc.pending-block full`.
+///
+/// The parent + 1 `timestamp` can overstate the real next block's. The EVM `timestamp` keeps
+/// whole seconds, so under sub-second commit cadence several consecutive blocks share one
+/// `timestamp` and the next block often lands in the parent's second. From the sub-second
+/// timestamp fork on, execution never lets a block's `timestamp` fall below its parent's, so
+/// the overstatement is at most 1 s. That is acceptable for gas estimation and `eth_call`
+/// against `pending`, which only need a plausible next-block env.
 impl BuildPendingEnv<ExecHeader> for TNPayload {
     fn build_pending_env(parent: &SealedHeader<ExecHeader>) -> Self {
         Self {
@@ -219,5 +243,101 @@ impl BuildPendingEnv<ExecHeader> for TNPayload {
             #[cfg(test)]
             epoch_boundary_slashes: Vec::new(),
         }
+    }
+}
+
+/// The EVM block `timestamp` for a payload that executes `output` on top of `parent`.
+///
+/// Exactly [`ConsensusOutput::committed_at`] for leaders of epochs before the sub-second
+/// timestamp fork; from the fork on, raised to at least `parent.timestamp`. See
+/// [`TNPayload::timestamp`] for why the clamp exists and why it is gated on the leader's epoch.
+fn evm_block_timestamp(output: &ConsensusOutput, parent: &SealedHeader) -> TimestampSec {
+    let committed_at = output.committed_at();
+    if subsecond_timestamp_active(output.leader().epoch()) {
+        committed_at.max(parent.timestamp)
+    } else {
+        committed_at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::consensus_output_for_tests;
+    use tn_types::{
+        forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
+        Epoch,
+    };
+
+    /// Leader epoch of every output built here; any epoch below `Epoch::MAX` works.
+    const LEADER_EPOCH: Epoch = 3;
+
+    /// Pins this test process's sub-second timestamp fork active (or dormant) from genesis, with
+    /// the seed-signature fork it requires active from genesis.
+    ///
+    /// The gates read their `test-utils` environment overrides once per process, so this must run
+    /// before anything consults a gate, including building the consensus output. nextest runs each
+    /// test in its own process, which keeps one test's pin from reaching another; a single-process
+    /// `cargo test` run shares one latch across the whole test binary instead. Reading the
+    /// overrides back turns a value that latched before the pin into a named failure.
+    fn pin_subsecond_fork(active: bool) {
+        let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+        std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+        std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(0),
+            "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+        );
+        assert_eq!(
+            subsecond_timestamp_fork_epoch_override(),
+            Some(subsecond_fork),
+            "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+        );
+    }
+
+    /// The `timestamp` of a payload that executes `output` on a parent block stamped
+    /// `parent_timestamp`.
+    fn payload_timestamp(output: &ConsensusOutput, parent_timestamp: TimestampSec) -> TimestampSec {
+        let parent = SealedHeader::seal_slow(ExecHeader {
+            timestamp: parent_timestamp,
+            ..Default::default()
+        });
+        TNPayload::new_for_test(parent, output).timestamp
+    }
+
+    #[test]
+    fn post_fork_payload_timestamp_never_precedes_parent() {
+        pin_subsecond_fork(true);
+        let output = consensus_output_for_tests(1, LEADER_EPOCH, 1, false);
+        assert!(
+            subsecond_timestamp_active(output.leader().epoch()),
+            "the pinned fork must be active for the leader's epoch"
+        );
+        let committed_at = output.committed_at();
+
+        // a commit 3 s behind its parent is raised to the parent's timestamp
+        let parent_timestamp = committed_at + 3;
+        assert_eq!(payload_timestamp(&output, parent_timestamp), parent_timestamp);
+
+        // a commit at or ahead of its parent passes through unchanged
+        assert_eq!(payload_timestamp(&output, committed_at), committed_at);
+        assert_eq!(payload_timestamp(&output, committed_at - 2), committed_at);
+    }
+
+    #[test]
+    fn pre_fork_payload_timestamp_is_the_commit_time() {
+        pin_subsecond_fork(false);
+        let output = consensus_output_for_tests(1, LEADER_EPOCH, 1, false);
+        assert!(
+            !subsecond_timestamp_active(output.leader().epoch()),
+            "the pinned fork must be dormant for the leader's epoch"
+        );
+        let committed_at = output.committed_at();
+
+        // pre-fork blocks keep the raw commit time even when it precedes the parent's, so
+        // replaying pre-fork history reproduces the original timestamps
+        assert_eq!(payload_timestamp(&output, committed_at + 3), committed_at);
+        assert_eq!(payload_timestamp(&output, committed_at - 2), committed_at);
     }
 }
