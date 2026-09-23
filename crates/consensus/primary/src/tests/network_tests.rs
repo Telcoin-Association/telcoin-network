@@ -3,11 +3,11 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{PrimaryGossip, PrimaryResponse},
+        message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
         try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
-        PrimaryNetworkHandle, RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
-        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
-        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -20,29 +20,39 @@ use std::{
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, KeyConfig, Parameters};
 use tn_network_libp2p::{
-    types::{GossipPayload, NetworkEvent},
-    GossipMessage, TopicHash,
+    error::NetworkError,
+    types::{
+        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
+        NetworkResult,
+    },
+    GossipMessage, Penalty, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
     consensus_pack::PackError,
     mem_db::MemDatabase,
     tables::Votes,
-    CertificateStore,
+    CertificateStore, VoteDigestStore as _,
 };
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
+    encode,
+    error::HeaderError,
+    forks::{
+        seed_signature_fork_epoch_override, subsecond_timestamp_active,
+        subsecond_timestamp_fork_epoch_override,
+    },
+    now, now_ms, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockHeader,
+    BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
     EpochCertificate, EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _,
-    HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _,
-    TnSender as _, VoteDigest, VoteInfo, B256,
+    Header, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager, TimestampMs,
+    TnReceiver as _, TnSender as _, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -1793,10 +1803,10 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
 // ============================================================================
 // These tests cover the per-authority locking and timeout behavior added to vote().
 
-/// Helper: same as `create_test_types` but overrides `max_header_delay`.
-async fn create_test_types_with_delay(path: &Path, max_header_delay: Duration) -> TestTypes {
-    let mut params = Parameters::default();
-    params.max_header_delay = max_header_delay;
+/// Helper: same as `create_test_types` but overrides [`Parameters::vote_timeout`], the voter-side
+/// bound on evaluating one vote request.
+async fn create_test_types_with_vote_timeout(path: &Path, vote_timeout: Duration) -> TestTypes {
+    let params = Parameters { vote_timeout, ..Default::default() };
     create_test_types_with_params(path, Some(params)).await
 }
 
@@ -1839,21 +1849,24 @@ async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<(
     Ok(())
 }
 
-/// When `vote_inner` blocks longer than `max_header_delay`, `vote()` must return
-/// `PrimaryNetworkError::Timeout`.
+/// When `vote_inner` blocks longer than [`Parameters::vote_timeout`], `vote()` must return
+/// `PrimaryNetworkError::Timeout` once that timeout elapses.
 ///
-/// To force a reliable block we request a header whose `latest_execution_block` is at
-/// block number 1, while the test environment only has block 0.  This causes
-/// `wait_for_execution` to suspend on the watch channel.  We use
-/// `tokio::time::pause/advance` so the test completes instantly without real sleeping.
-#[tokio::test]
+/// `vote_timeout` is the voter-side limit on evaluating one vote request, including every wait for
+/// execution, parents, batches, or a future-dated header's lead. To force a reliable block the
+/// header's `latest_execution_block` is at block number 1 while the test environment only has
+/// block 0, so `wait_for_execution` suspends on the watch channel. The paused clock jumps from
+/// timer to timer, so the virtual time the call takes pins the configured timeout rather than the
+/// 5 s default or any other header-cadence setting.
+///
+/// The timeout is recoverable: it carries no penalty and answers the requester with a
+/// `RecoverableError`, so the proposer asks again instead of giving up on this voter.
+#[tokio::test(start_paused = true)]
 async fn test_vote_inner_timeout() -> eyre::Result<()> {
-    tokio::time::pause();
-
+    let vote_timeout = Duration::from_millis(10);
     let temp_dir = TempDir::new().unwrap();
-    // Use a 50 ms timeout — short enough to be clearly exceeded after a 100 ms advance.
     let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_with_delay(temp_dir.path(), Duration::from_millis(50)).await;
+        create_test_types_with_vote_timeout(temp_dir.path(), vote_timeout).await;
 
     // Block number 1 will never be executed in this test; vote_inner blocks in
     // wait_for_execution until the outer timeout fires.
@@ -1865,14 +1878,25 @@ async fn test_vote_inner_timeout() -> eyre::Result<()> {
         .build();
     let peer = *committee.last_authority().authority().protocol_key();
 
-    // Spawn on a separate task so we can advance the mock clock while it is suspended.
-    let vote_task = tokio::spawn(async move { handler.vote(peer, header, vec![]).await });
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header, vec![])
+        .await
+        .expect_err("a vote request that never finishes evaluating must time out");
+    let waited = start.elapsed();
 
-    // Advance mock clock past the 50 ms deadline.
-    tokio::time::advance(Duration::from_millis(100)).await;
-
-    let res = vote_task.await.expect("vote task panicked");
-    assert_matches!(res, Err(PrimaryNetworkError::Timeout(_)), "expected Timeout error");
+    assert_matches!(err, PrimaryNetworkError::Timeout(_), "expected Timeout error");
+    assert!(
+        waited >= vote_timeout && waited < vote_timeout * 2,
+        "the vote must time out after the configured vote_timeout {vote_timeout:?}, waited \
+         {waited:?}"
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "a vote timeout must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "a vote timeout must answer the requester with a retryable response"
+    );
 
     Ok(())
 }
@@ -1919,6 +1943,620 @@ async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
             Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. }))
         ),
         "Vote from different authority should not trigger equivocation check"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Timestamp Tests
+// ============================================================================
+// These tests pin the voter's timestamp rules: the parent rule on each side of the sub-second
+// timestamp fork, the millisecond range, and the three tiers for a header created ahead of the
+// local clock.
+
+/// Pins this test process's sub-second timestamp fork to active (or dormant) from genesis, with
+/// the seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building the committee fixture. nextest runs each
+/// test in its own process, which is what keeps one test's pin from reaching another; a
+/// single-process `cargo test` run shares one latch across the whole test binary instead. Reading
+/// the overrides back turns a value that latched before the pin into a named failure.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    // anti-vacuity: the fixture committees these tests build sit at epoch 0
+    assert_eq!(subsecond_timestamp_active(0), active, "epoch 0 must sit in the pinned regime");
+}
+
+/// Seed `store` with one round-1 certificate per authority, in fixture order, each created at the
+/// matching entry of `created_at`, and return their digests: the parent set of a round-2 header.
+///
+/// The certificates carry no batches, so a round-2 header built on them reaches a vote decision
+/// with nothing to sync from a worker.
+fn seed_round_one_parents_at<DB: Database + CertificateStore>(
+    committee: &CommitteeFixture<DB>,
+    store: &DB,
+    created_at: &[TimestampMs],
+) -> eyre::Result<BTreeSet<HeaderDigest>> {
+    assert_eq!(committee.authorities().count(), created_at.len(), "one timestamp per authority");
+    let committee_obj = committee.committee();
+    let certs: Vec<_> = committee
+        .authorities()
+        .zip(created_at)
+        .map(|(a, created_at)| {
+            committee.certificate(
+                &a.header_builder_at_round(&committee_obj, 1).created_at_ms(*created_at).build(),
+            )
+        })
+        .collect();
+    store.write_all(certs.iter())?;
+    Ok(certs.iter().map(|c| c.digest()).collect())
+}
+
+/// The voter's drift tolerance and vote timeout, read from the configuration its handler uses.
+fn drift_limits(committee: &CommitteeFixture<MemDatabase>) -> (Duration, Duration) {
+    let config = committee.first_authority().consensus_config();
+    (
+        config.network_config().sync_config().max_header_time_drift_tolerance,
+        config.parameters().vote_timeout,
+    )
+}
+
+/// `d` in whole milliseconds, for offsetting a [`TimestampMs`].
+fn whole_millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).expect("test durations fit in u64 milliseconds")
+}
+
+/// Drive [`PrimaryNetworkHandle::request_vote`] for `header` against `handler`, in process.
+///
+/// The test handle's command channel stands in for the swarm: every vote request the requester
+/// sends to `voter` is answered by `handler.vote` with `author` as the requesting peer, converted
+/// into a response the way `PrimaryNetwork::process_vote_request` converts it. Returns the
+/// requester's result and every response the voter sent, in order.
+async fn request_vote_in_process(
+    handler: &RequestHandler<MemDatabase>,
+    voter: BlsPublicKey,
+    author: BlsPublicKey,
+    header: Header,
+) -> (NetworkResult<RequestVoteResult>, Vec<PrimaryResponse>) {
+    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(10);
+    let requester = PrimaryNetworkHandle::new_for_test(commands_tx);
+    let mut responses = Vec::new();
+    let result = tokio::select! {
+        result = requester.request_vote(voter, header, Vec::new()) => result,
+        () = async {
+            while let Some(command) = commands_rx.recv().await {
+                let NetworkCommand::SendRequest {
+                    peer,
+                    request: PrimaryRequest::Vote { header, parents },
+                    reply,
+                } = command
+                else {
+                    panic!("the requester sent something other than a vote request");
+                };
+                assert_eq!(peer, voter, "the vote request must go to the voter");
+                let response =
+                    handler.vote(author, Arc::unwrap_or_clone(header), parents).await.into_response();
+                responses.push(response.clone());
+                // the requester awaits this reply, so the send cannot fail
+                let _ = reply.send(Ok(NetworkResponseMessage { peer, result: response }));
+            }
+        } => unreachable!("the requester holds the command channel open"),
+    };
+    (result, responses)
+}
+
+/// Once sub-second timestamps are active for a header's epoch, the header must be strictly newer
+/// than every parent on the combined millisecond timestamp.
+///
+/// The round-1 parents are created 1 ms apart within one second, so the boundary sits on the
+/// newest one: a round-2 header created in the same millisecond as it is refused with
+/// `InvalidParentTimestamp`, and one created 1 ms later earns a vote. Relaxing the voter's strict
+/// `>` to `>=` votes for the tied header and fails this test, and so does comparing whole seconds.
+#[tokio::test]
+async fn test_vote_fails_invalid_parent_timestamp() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // the voter is the fixture's first authority, so its store is the one the vote path reads.
+    // the parents sit a minute in the past so the drift check plays no part
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let oldest = TimestampMs::from_parts(now() - 60, 500);
+    let created_at: Vec<_> =
+        committee.authorities().zip(0..).map(|(_, i)| oldest.saturating_add_millis(i)).collect();
+    let newest = *created_at.last().expect("4 authorities in fixture");
+    let parents = seed_round_one_parents_at(&committee, &store, &created_at)?;
+    let round_two = |author: &AuthorityFixture<MemDatabase>, created_at: TimestampMs| {
+        author
+            .header_builder_at_round(&committee_obj, 2)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+
+    let tied_author = committee.last_authority();
+    let tied = round_two(tied_author, newest);
+    assert_eq!(tied.created_at_ms(), newest, "a fork-active header must keep its millisecond part");
+    assert_matches!(
+        handler.vote(*tied_author.authority().protocol_key(), tied, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidParentTimestamp {
+            header: header_ms,
+            parent: parent_ms,
+        })) if header_ms == newest && parent_ms == newest,
+        "a header created in the same millisecond as a parent must be refused"
+    );
+
+    // a different author, so the per-authority equivocation guard plays no part in the outcome
+    let newer_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let newer = round_two(newer_author, newest.saturating_add_millis(1));
+    assert_matches!(
+        handler.vote(*newer_author.authority().protocol_key(), newer, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a header 1 ms newer than its newest parent must earn a vote"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork, timestamps are whole seconds and several rounds can share
+/// one second, so a header only has to be no older than each parent: a round-2 header created in
+/// the same second as its parents earns a vote, and one created a second earlier is refused with
+/// `InvalidParentTimestamp`.
+///
+/// Tightening the pre-fork comparison to a strict `>` refuses the same-second header and fails
+/// this test.
+#[tokio::test]
+async fn test_vote_pre_fork_parent_timestamp_allows_equal_seconds() -> eyre::Result<()> {
+    pin_subsecond_fork(false);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // pre-fork headers drop their millisecond parts, so every parent lands on `second`
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let second = now() - 60;
+    let created_at: Vec<_> = committee
+        .authorities()
+        .zip(0..)
+        .map(|(_, i)| TimestampMs::from_parts(second, 500).saturating_add_millis(i))
+        .collect();
+    let parents = seed_round_one_parents_at(&committee, &store, &created_at)?;
+    let round_two = |author: &AuthorityFixture<MemDatabase>, created_at: TimestampMs| {
+        author
+            .header_builder_at_round(&committee_obj, 2)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+
+    let same_second_author = committee.last_authority();
+    let same_second = round_two(same_second_author, TimestampMs::from_parts(second, 999));
+    assert_eq!(
+        same_second.created_at_ms(),
+        TimestampMs::from_parts(second, 0),
+        "a pre-fork header must drop its millisecond part"
+    );
+    assert_matches!(
+        handler.vote(*same_second_author.authority().protocol_key(), same_second, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a pre-fork header created in the same second as its parents must earn a vote"
+    );
+
+    // a different author, so the per-authority equivocation guard plays no part in the outcome
+    let older_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let older = round_two(older_author, TimestampMs::from_parts(second - 1, 0));
+    assert_matches!(
+        handler.vote(*older_author.authority().protocol_key(), older, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidParentTimestamp {
+            header: header_ms,
+            parent: parent_ms,
+        })) if header_ms == TimestampMs::from_parts(second - 1, 0)
+            && parent_ms == TimestampMs::from_parts(second, 0),
+        "a pre-fork header created a second before its parents must be refused"
+    );
+
+    Ok(())
+}
+
+/// A header whose `created_at_millis` is 1000 or more never reaches the vote path.
+///
+/// Every `Header` constructor keeps the millisecond part below 1000, so the only way to present
+/// such a header is crafted wire bytes, and decoding refuses them: a fork-active vote request
+/// whose header claims 1000 ms fails to decode with an error naming the field. `Header::validate`
+/// repeats the range check on the vote path as `HeaderError::InvalidTimestampMillis`, which no
+/// header built outside `tn-types` can reach, so this test pins what that error costs the author
+/// instead: a fatal penalty and a permanent, non-retryable answer.
+#[tokio::test]
+async fn test_vote_request_with_out_of_range_millis_is_rejected() {
+    pin_subsecond_fork(true);
+    let committee = CommitteeFixture::builder(MemDatabase::default).build();
+    let header = committee
+        .header_builder_last_authority()
+        .created_at_ms(TimestampMs::from_parts(now(), 999))
+        .build();
+    assert_eq!(
+        header.created_at_millis(),
+        999,
+        "a fork-active header must keep its millisecond part"
+    );
+    let request = PrimaryRequest::Vote { header: Arc::new(header), parents: Vec::new() };
+    let mut bytes = encode(&request);
+    assert_eq!(
+        try_decode::<PrimaryRequest>(&bytes).expect("an in-range vote request must decode"),
+        request
+    );
+
+    // bcs writes the header's fields in declaration order with `created_at_millis`, a little-endian
+    // u16, last; only the empty parent list follows it, as a single zero length byte
+    let millis_at = bytes.len() - 3;
+    assert_eq!(bytes[bytes.len() - 1], 0, "the empty parent list must end the request");
+    assert_eq!(
+        bytes[millis_at..millis_at + 2],
+        999u16.to_le_bytes(),
+        "patch the millisecond field"
+    );
+    bytes[millis_at..millis_at + 2].copy_from_slice(&1000u16.to_le_bytes());
+
+    let err = try_decode::<PrimaryRequest>(&bytes)
+        .expect_err("a vote request whose header claims 1000 ms must not decode");
+    assert!(
+        err.to_string().contains("created_at_millis below 1000"),
+        "decode must fail on the millisecond range: {err}"
+    );
+
+    let err: PrimaryNetworkError = HeaderError::InvalidTimestampMillis(1000).into();
+    assert_matches!(
+        Option::<Penalty>::from(&err),
+        Some(Penalty::Fatal),
+        "an out-of-range millisecond part must cost the author a fatal penalty"
+    );
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "an out-of-range millisecond part must be answered as a permanent rejection"
+    );
+}
+
+/// A header created up to the drift tolerance ahead of the local clock earns a vote once the voter
+/// has waited out its exact lead in milliseconds.
+///
+/// The header leads the local clock by 50 ms, inside the drift tolerance. The call must take at
+/// least the lead, since the voter never votes while the header is still in the future, and well
+/// under a second, since it sleeps the lead itself rather than a whole second.
+#[tokio::test]
+async fn test_vote_waits_out_millisecond_lead() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let lead = Duration::from_millis(50);
+    assert!(lead < tolerance, "the lead must fall inside the drift tolerance");
+    let builder = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()));
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let start = Instant::now();
+    let created_at = now_ms().saturating_add_millis(whole_millis(lead));
+    let header = builder.created_at_ms(created_at).build();
+    assert_eq!(
+        header.created_at_ms(),
+        created_at,
+        "a fork-active header must keep its millisecond part"
+    );
+    let res = handler.vote(peer, header, vec![]).await?;
+    let waited = start.elapsed();
+
+    assert_matches!(
+        res,
+        PrimaryResponse::Vote(_),
+        "a header inside the drift tolerance must earn a vote"
+    );
+    assert!(
+        now_ms() >= created_at,
+        "the voter must not vote while the header is still in the future"
+    );
+    // `now_ms` truncates to the millisecond, so the lead measured from `start` can fall short of
+    // `lead` by under 1 ms
+    assert!(
+        waited + Duration::from_millis(1) >= lead,
+        "the voter must wait out the {lead:?} lead, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(500),
+        "the voter must sleep the lead, not a whole second: waited {waited:?}"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork the voter also waits out a future-dated header's lead in
+/// milliseconds.
+///
+/// A whole-second header can only lead the local clock by the gap to its second, so the test
+/// first moves into the 700..=900 ms part of a second and then presents a header created at the
+/// next second: a lead of roughly 100 to 300 ms, which the rounded-up whole-second tolerance
+/// admits. Sleeping the lead takes well under half a second; sleeping a whole second would not.
+#[tokio::test]
+async fn test_vote_pre_fork_waits_out_millisecond_lead() -> eyre::Result<()> {
+    pin_subsecond_fork(false);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let builder = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()));
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let subsec = u64::from(now_ms().subsec_millis());
+    if subsec < 700 {
+        tokio::time::sleep(Duration::from_millis(700 - subsec)).await;
+    } else if subsec > 900 {
+        tokio::time::sleep(Duration::from_millis(1_700 - subsec)).await;
+    }
+
+    let start = Instant::now();
+    let now = now_ms();
+    let header = builder.created_at(now.secs() + 1).build();
+    let created_at = header.created_at_ms();
+    let lead = Duration::from_millis(created_at.as_millis().saturating_sub(now.as_millis()));
+    // anti-vacuity: a real sub-second lead, which a whole-second sleep would overshoot
+    assert!(
+        lead > Duration::ZERO && lead < Duration::from_millis(500),
+        "the header must lead the local clock by under half a second, leads by {lead:?}"
+    );
+    let res = handler.vote(peer, header, vec![]).await?;
+    let waited = start.elapsed();
+
+    assert_matches!(
+        res,
+        PrimaryResponse::Vote(_),
+        "a header inside the drift tolerance must earn a vote"
+    );
+    assert!(
+        now_ms() >= created_at,
+        "the voter must not vote while the header is still in the future"
+    );
+    // `now_ms` truncates to the millisecond, so `lead` can exceed the time since `start` by under
+    // 1 ms
+    assert!(
+        waited + Duration::from_millis(1) >= lead,
+        "the voter must wait out the {lead:?} lead, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(500),
+        "the voter must sleep the lead, not a whole second: waited {waited:?}"
+    );
+
+    Ok(())
+}
+
+/// A header further ahead of the local clock than the drift tolerance, but by no more than the
+/// tolerance plus the vote timeout, gets a recoverable answer that decides nothing about it.
+///
+/// The answer is `Ok`, and `PrimaryNetwork::process_vote_request` penalizes only an error, so the
+/// author pays nothing. Nothing is recorded either: no durable vote record, and the author's
+/// in-memory vote-cache entry is left as it was, so a different header from the same author for
+/// the same round is judged on its own merits and earns a vote. Recording the recoverable outcome
+/// would refuse that header as `AlreadyVotedForLaterRound` although this node never voted in the
+/// round.
+#[tokio::test]
+async fn test_vote_tier_two_lead_is_recoverable_and_uncached() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+    };
+
+    let ahead = builder()
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(tolerance) + 100))
+        .build();
+    assert_matches!(
+        handler.vote(peer, ahead, vec![]).await,
+        Ok(PrimaryResponse::RecoverableError(_)),
+        "a header beyond the drift tolerance but within the vote window must get a recoverable \
+         answer, not an error"
+    );
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a recoverable answer must not record a vote");
+
+    let legit = builder().created_at(1).build();
+    assert_matches!(
+        handler.vote(peer, legit, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the recoverable answer must leave the author free to earn a vote in the same round"
+    );
+
+    Ok(())
+}
+
+/// The requester retries a tier-two answer, and once the header's lead has shrunk inside the
+/// drift tolerance the retry earns the vote.
+///
+/// The header leads the voter's clock by the tolerance plus 100 ms, so the first request gets a
+/// recoverable answer. [`PrimaryNetworkHandle::request_vote`] sleeps before each retry, which
+/// brings the lead inside the tolerance, where the voter waits out the rest and votes.
+#[tokio::test]
+async fn test_request_vote_retries_tier_two_lead_until_vote() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(tolerance) + 100))
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(result, Ok(RequestVoteResult::Vote(_)), "a retry must earn the vote");
+    let (last, retried) = responses.split_last().expect("the voter answered");
+    assert_matches!(last, PrimaryResponse::Vote(_));
+    assert!(
+        !retried.is_empty()
+            && retried.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the first answer must be recoverable, as must every answer before the vote: {responses:?}"
+    );
+
+    Ok(())
+}
+
+/// A tier-two answer that outlasts every retry reaches the certifier as
+/// `NetworkError::RPCRetryable`, so it backs off and asks again rather than treating the voter's
+/// answer as a permanent rejection.
+///
+/// The paused clock skips the requester's retry delays, so the header's wall-clock lead stays in
+/// tier two for every attempt.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_persistent_tier_two_lead_is_retryable() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let lead = tolerance + vote_timeout / 2;
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(
+        result,
+        Err(NetworkError::RPCRetryable(_)),
+        "a recoverable answer that outlasts the retries must stay retryable"
+    );
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(
+                r,
+                PrimaryResponse::RecoverableError(PrimaryRPCError(msg))
+                    if msg.contains("ahead of the local clock")
+            )),
+        "the requester must retry, and every answer must be the tier-two answer: {responses:?}"
+    );
+
+    Ok(())
+}
+
+/// A header further ahead of the local clock than the drift tolerance plus the vote timeout is
+/// rejected for good: `InvalidTimestamp`, a severe penalty, and a verdict cached for its digest.
+///
+/// The repeat request is answered from the cache with the already-converted response; a fresh
+/// evaluation would return the error itself instead.
+#[tokio::test]
+async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let lead = tolerance + vote_timeout + Duration::from_secs(1);
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let created_at = header.created_at_ms();
+
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("a header beyond the vote window must be rejected");
+    assert_matches!(
+        &err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
+            if *created == created_at
+    );
+    assert_matches!(
+        Option::<Penalty>::from(&err),
+        Some(Penalty::Severe),
+        "a header beyond the vote window must cost the author a severe penalty"
+    );
+
+    let repeat = handler.vote(peer, header, vec![]).await?;
+    assert_eq!(
+        repeat,
+        PrimaryResponse::into_error_ref(&err),
+        "the repeat request must be answered from the cached verdict"
+    );
+    assert_matches!(repeat, PrimaryResponse::Error(_), "the cached verdict must be permanent");
+
+    Ok(())
+}
+
+/// A voter that cannot finish evaluating a vote request within its `vote_timeout` answers with a
+/// recoverable response on every attempt, which reaches the certifier as
+/// `NetworkError::RPCRetryable` rather than a permanent `RPCError`.
+///
+/// The header's execution block never arrives, so every evaluation stalls in `wait_for_execution`
+/// until the voter's 10 ms `vote_timeout` fires. The paused clock skips both those timeouts and
+/// the requester's retry delays.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_voter_timeout_is_retryable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_with_vote_timeout(temp_dir.path(), Duration::from_millis(10)).await;
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at(1)
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(
+        result,
+        Err(NetworkError::RPCRetryable(_)),
+        "a voter that times out must leave the request retryable"
+    );
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the requester must retry, and every timed-out answer must be recoverable: {responses:?}"
     );
 
     Ok(())

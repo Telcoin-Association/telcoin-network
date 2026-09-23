@@ -845,8 +845,16 @@ async fn test_request_vote_created_at_in_future() {
         .created_at(created_at)
         .build();
 
-    // For such a future header we get back an error
-    assert!(handler.vote(author_peer, test_header, Vec::new()).await.is_err());
+    // an hour ahead is beyond the drift tolerance plus the vote timeout, so the header is
+    // rejected for good rather than answered as retryable
+    let result = handler.vote(author_peer, test_header, Vec::new()).await;
+    assert!(
+        matches!(
+            result,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { .. }))
+        ),
+        "{result:?}"
+    );
 
     // Verify Handler generates a Vote.
 
