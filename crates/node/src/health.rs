@@ -16,7 +16,7 @@ use std::{future::Future, net::SocketAddr, time::Duration};
 
 use futures::{Stream, StreamExt};
 use serde::Serialize;
-use tn_types::{TaskSpawner, WorkerId, DEFAULT_WORKER_ID};
+use tn_types::{TaskSpawner, WorkerId};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -43,7 +43,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on the readiness probe so a contended engine lock (e.g. held by
 /// a writer during an epoch transition) cannot stall the accept loop. On
-/// timeout the worker is reported not-ready (fail-closed).
+/// timeout an empty worker list is reported (fail-closed).
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Fixed liveness response: the process is up. Returned for every path other
@@ -55,26 +55,30 @@ const LIVENESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nO
 const READINESS_FALLBACK: &str = r#"{"version":1,"workers":[]}"#;
 
 /// Readiness of a single worker, as reported by `GET /health/workers`.
-#[derive(Debug, Serialize)]
-struct WorkerReadiness {
-    /// The worker's id (its index in the node's worker set; v1 is always `0`).
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkerReadiness {
+    /// The worker's id, independent of its position in the response array.
     worker_id: WorkerId,
     /// Whether the worker is up and accepting transactions.
     ///
-    /// True once the worker's RPC server + transaction pool are initialized.
-    /// These are created on the node's first epoch and are not torn down across
-    /// epoch transitions, so this stays true for the life of the process once
-    /// the node has started. A node that is down answers no request at all,
-    /// which the polling gateway treats as not-ready (fail-closed).
+    /// True only when the worker's RPC server and pool are initialized, its id is
+    /// in the current committee's worker range, and that epoch has not shut down.
+    /// Persistent components alone do not imply current readiness.
     accepting_transactions: bool,
+}
+
+impl WorkerReadiness {
+    /// Construct one worker's readiness entry without exposing mutable fields.
+    pub(crate) fn new(worker_id: WorkerId, accepting_transactions: bool) -> Self {
+        Self { worker_id, accepting_transactions }
+    }
 }
 
 /// Versioned envelope served at `GET /health/workers`.
 ///
-/// The `workers` array maps onto the node's worker set (indexed by worker id)
-/// and ships with exactly one entry (worker `0`) today; the method-aware
-/// routing follow-up can extend the per-worker fields without breaking the
-/// envelope shape.
+/// The `workers` array reports every initialized worker by id. Workers outside
+/// the active epoch remain in the list with a false accepting flag. An empty
+/// array indicates that no workers are initialized or the probe timed out.
 #[derive(Debug, Serialize)]
 struct NodeReadiness {
     /// Envelope version; see [`READINESS_VERSION`].
@@ -84,19 +88,24 @@ struct NodeReadiness {
 }
 
 impl NodeReadiness {
-    /// Build the v1 single-worker envelope.
-    fn single_worker(worker_id: WorkerId, accepting_transactions: bool) -> Self {
-        Self {
-            version: READINESS_VERSION,
-            workers: vec![WorkerReadiness { worker_id, accepting_transactions }],
-        }
+    /// Build the v1 envelope for a snapshot of all initialized workers.
+    fn new(workers: Vec<WorkerReadiness>) -> Self {
+        Self { version: READINESS_VERSION, workers }
     }
 }
 
-/// Serialize the v1 readiness body for worker `0` given its accepting state.
-fn readiness_json(accepting_transactions: bool) -> String {
-    let readiness = NodeReadiness::single_worker(DEFAULT_WORKER_ID, accepting_transactions);
+/// Serialize the v1 readiness body for all workers in the probe snapshot.
+fn readiness_json(workers: Vec<WorkerReadiness>) -> String {
+    let readiness = NodeReadiness::new(workers);
     serde_json::to_string(&readiness).unwrap_or_else(|_| READINESS_FALLBACK.to_string())
+}
+
+/// Bound readiness probing and fail closed if the snapshot cannot be acquired in time.
+async fn probe_readiness<Fut>(probe: Fut) -> Vec<WorkerReadiness>
+where
+    Fut: Future<Output = Vec<WorkerReadiness>>,
+{
+    timeout(READINESS_PROBE_TIMEOUT, probe).await.unwrap_or_default()
 }
 
 /// Minimal HTTP health/readiness responder for service monitoring.
@@ -126,8 +135,8 @@ impl HealthcheckServer {
     ///
     /// Binds to the given `port` (or lets the OS assign one if `0`).
     ///
-    /// `worker_ready` is polled per readiness request to learn whether worker
-    /// `0` is accepting transactions. It is a closure (rather than a concrete
+    /// `worker_ready` is polled per readiness request for all initialized workers'
+    /// current accepting states. It is a closure (rather than a concrete
     /// node handle) so the server stays decoupled from the engine and unit
     /// testable; the production call site captures the [`ExecutionNode`] handle.
     ///
@@ -151,7 +160,7 @@ impl HealthcheckServer {
     ) -> eyre::Result<SocketAddr>
     where
         F: Fn() -> Fut + Send + 'static,
-        Fut: Future<Output = bool> + Send,
+        Fut: Future<Output = Vec<WorkerReadiness>> + Send,
     {
         // IMPORTANT: use firewall to protect this endpoint
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -186,7 +195,7 @@ async fn serve<S, F, Fut>(mut incoming: S, worker_ready: F)
 where
     S: Stream<Item = std::io::Result<TcpStream>> + Unpin,
     F: Fn() -> Fut,
-    Fut: Future<Output = bool>,
+    Fut: Future<Output = Vec<WorkerReadiness>>,
 {
     // the loop survives a transient accept error because the `Some(Err(..))`
     // arm below logs and skips instead of breaking. `worker_ready` is called
@@ -212,9 +221,7 @@ where
                     // bound the readiness probe too: if it cannot resolve
                     // quickly (e.g. the engine lock is held during an epoch
                     // transition) report not-ready rather than stalling the loop
-                    let accepting =
-                        timeout(READINESS_PROBE_TIMEOUT, worker_ready()).await.unwrap_or(false);
-                    let body = readiness_json(accepting);
+                    let body = readiness_json(probe_readiness(worker_ready()).await);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
@@ -254,22 +261,22 @@ mod tests {
         net::TcpStream,
     };
 
-    use super::{readiness_json, request_path, serve, HealthcheckServer};
+    use super::{
+        probe_readiness, readiness_json, request_path, serve, HealthcheckServer, WorkerReadiness,
+    };
     use futures::StreamExt;
-    use tn_types::{get_available_tcp_port, TaskManager};
+    use tn_types::TaskManager;
 
     /// Send `request` to the spawned server at `addr` and return the response.
     async fn roundtrip(addr: std::net::SocketAddr, request: &[u8]) -> eyre::Result<String> {
         tokio::time::timeout(Duration::from_millis(500), async move {
             let mut stream = TcpStream::connect(addr).await?;
             stream.write_all(request).await?;
-            let mut response = vec![0u8; 1024];
-            let n = stream.read(&mut response).await?;
-            response.truncate(n);
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
             Ok::<String, eyre::Error>(String::from_utf8_lossy(&response).into_owned())
         })
-        .await
-        .expect("response received")
+        .await?
     }
 
     #[tokio::test]
@@ -277,9 +284,9 @@ mod tests {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
-        let port = get_available_tcp_port("127.0.0.1").expect("tcp port assigned by host");
         // liveness path never polls the readiness probe
-        let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { false }).await?;
+        let addr =
+            HealthcheckServer::spawn(task_spawner.clone(), 0, futures::future::pending).await?;
 
         let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
 
@@ -301,8 +308,10 @@ mod tests {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
-        let port = get_available_tcp_port("127.0.0.1").expect("tcp port assigned by host");
-        let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { false }).await?;
+        let addr = HealthcheckServer::spawn(task_spawner.clone(), 0, || async {
+            vec![WorkerReadiness::new(0, false)]
+        })
+        .await?;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
 
@@ -312,7 +321,8 @@ mod tests {
             "Expected json content type, got: {}",
             response
         );
-        let body = response.split("\r\n\r\n").nth(1).expect("response has a body");
+        let body =
+            response.split_once("\r\n\r\n").ok_or_else(|| eyre::eyre!("response has no body"))?.1;
         assert_eq!(
             body,
             r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":false}]}"#
@@ -326,15 +336,18 @@ mod tests {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
-        let port = get_available_tcp_port("127.0.0.1").expect("tcp port assigned by host");
-        let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { true }).await?;
+        let addr = HealthcheckServer::spawn(task_spawner.clone(), 0, || async {
+            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
+        })
+        .await?;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
 
-        let body = response.split("\r\n\r\n").nth(1).expect("response has a body");
+        let body =
+            response.split_once("\r\n\r\n").ok_or_else(|| eyre::eyre!("response has no body"))?.1;
         assert_eq!(
             body,
-            r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
+            r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true},{"worker_id":1,"accepting_transactions":false}]}"#
         );
 
         Ok(())
@@ -359,7 +372,7 @@ mod tests {
             })
             .chain(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        let handle = tokio::spawn(async move { serve(incoming, || async { false }).await });
+        let handle = tokio::spawn(async move { serve(incoming, || async { Vec::new() }).await });
 
         // the loop logged+skipped the injected error and kept serving
         let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
@@ -378,15 +391,27 @@ mod tests {
 
     #[test]
     fn test_readiness_payload_contract() {
-        // lock the exact wire contract: snake_case keys, version 1, one worker
+        // Lock the exact wire contract: snake_case keys, version 1, per-worker entries.
         assert_eq!(
-            readiness_json(true),
+            readiness_json(vec![WorkerReadiness::new(0, true)]),
             r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#,
         );
         assert_eq!(
-            readiness_json(false),
+            readiness_json(vec![WorkerReadiness::new(0, false)]),
             r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":false}]}"#,
         );
+        assert_eq!(
+            readiness_json(vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]),
+            r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true},{"worker_id":1,"accepting_transactions":true}]}"#,
+        );
+        assert_eq!(readiness_json(Vec::new()), r#"{"version":1,"workers":[]}"#);
+    }
+
+    /// A stalled snapshot must not advertise any worker as accepting transactions.
+    #[tokio::test(start_paused = true)]
+    async fn test_readiness_probe_timeout_fails_closed() {
+        let workers = probe_readiness(futures::future::pending()).await;
+        assert!(workers.is_empty());
     }
 
     #[test]

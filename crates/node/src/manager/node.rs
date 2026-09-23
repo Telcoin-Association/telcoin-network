@@ -875,7 +875,7 @@ where
             let engine = engine.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
-                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
+                async move { engine.worker_readiness().await }
             };
             let _ =
                 HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;

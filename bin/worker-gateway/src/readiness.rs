@@ -234,6 +234,19 @@ mod tests {
         assert_eq!(parse_ready(body, 0), Some(true));
     }
 
+    /// Multi-worker responses select the requested id, including an inactive nonzero worker.
+    #[test]
+    fn parses_nonzero_worker_readiness() {
+        let body = br#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":false},{"worker_id":1,"accepting_transactions":true}]}"#;
+        assert_eq!(parse_ready(body, 0), Some(false));
+        assert_eq!(parse_ready(body, 1), Some(true));
+        assert_eq!(parse_ready(body, 2), Some(false));
+
+        let body = br#"{"version":1,"workers":[{"worker_id":1,"accepting_transactions":false},{"worker_id":0,"accepting_transactions":true}]}"#;
+        assert_eq!(parse_ready(body, 1), Some(false));
+        assert_eq!(parse_ready(body, 0), Some(true));
+    }
+
     #[test]
     fn parses_not_accepting_worker() {
         let body = br#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":false}]}"#;

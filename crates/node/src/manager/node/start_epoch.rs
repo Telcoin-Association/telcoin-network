@@ -445,6 +445,12 @@ where
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<Vec<WorkerNode<DB>>> {
+        engine
+            .start_worker_readiness_epoch(
+                consensus_config.committee().number_of_workers(),
+                consensus_config.shutdown().subscribe(),
+            )
+            .await;
         self.worker_network_handles
             .iter_mut()
             .take(consensus_config.committee().number_of_workers())
@@ -1255,6 +1261,13 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, true),
+            ]
+        );
         let rpc_one = engine.worker_http_local_address(&1).await?;
         assert!(rpc_one.is_some());
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
@@ -1295,6 +1308,15 @@ mod tests {
             engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
             100_000_003
         );
+        consensus_config.shutdown().notify();
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, false),
+                crate::health::WorkerReadiness::new(1, false),
+            ]
+        );
+        assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         Ok(())
     }
 

@@ -11,7 +11,9 @@
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
 use self::inner::ExecutionNodeInner;
+use crate::health::WorkerReadiness;
 use builder::ExecutionNodeBuilder;
+use readiness::WorkerReadinessState;
 use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
 use tn_config::Config;
 use tn_exex::ExExInstallFn;
@@ -31,6 +33,7 @@ use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
 mod builder;
 mod inner;
+mod readiness;
 pub use tn_reth::worker::*;
 
 /// The struct used to build the execution nodes.
@@ -183,7 +186,10 @@ impl std::fmt::Debug for TnBuilder {
 /// Wrapper for the inner execution node components.
 #[derive(Clone, Debug)]
 pub struct ExecutionNode {
+    /// Process-lifetime execution components, including initialized worker RPC servers.
     internal: Arc<RwLock<ExecutionNodeInner>>,
+    /// Current epoch membership and shutdown state for worker readiness probes.
+    worker_readiness: Arc<RwLock<WorkerReadinessState>>,
 }
 
 impl ExecutionNode {
@@ -191,7 +197,10 @@ impl ExecutionNode {
     pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> eyre::Result<Self> {
         let inner = ExecutionNodeBuilder::new(tn_builder, reth_env).build()?;
 
-        Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
+        Ok(ExecutionNode {
+            internal: Arc::new(RwLock::new(inner)),
+            worker_readiness: Arc::new(RwLock::new(WorkerReadinessState::default())),
+        })
     }
 
     /// Execution engine to produce blocks after consensus.
@@ -282,12 +291,24 @@ impl ExecutionNode {
 
     /// Returns true if the worker identified by `worker_id` has been initialized.
     ///
-    /// A worker's components (RPC server + transaction pool) are created once on
-    /// the node's first epoch and are not torn down across epoch transitions, so
-    /// this reflects "this worker is up and accepting transactions" rather than
-    /// any per-epoch state. Backs the `/health/workers` readiness endpoint.
+    /// A worker's components (RPC server + transaction pool) persist across epochs.
+    /// This only reports initialization; [`Self::worker_readiness`] also checks epoch membership.
     pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
-        self.internal.read().await.workers.get(worker_id as usize).is_some()
+        self.internal.read().await.workers.get(usize::from(worker_id)).is_some()
+    }
+
+    /// Set the current committee's worker range and shutdown signal before worker startup.
+    pub(crate) async fn start_worker_readiness_epoch(&self, workers: usize, shutdown: Noticer) {
+        self.worker_readiness.write().await.start_epoch(workers, shutdown);
+    }
+
+    /// Snapshot initialized workers and their current epoch's accepting state.
+    ///
+    /// RPC binding completes before a worker enters the initialized collection. Removed workers
+    /// remain visible with a false accepting flag, as do all workers after consensus shutdown.
+    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+        let engine = self.internal.read().await;
+        self.worker_readiness.read().await.snapshot(engine.workers.len())
     }
 
     /// Batch maker
