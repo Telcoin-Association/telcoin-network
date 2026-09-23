@@ -1432,6 +1432,32 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack);
         }
+        // Purge any cached pack whose background actor thread has died (panic): it would otherwise
+        // be served from the cache and silently answer every lookup as not-found. Only rebuild
+        // the deque when a dead entry is actually present, and drop the
+        // dead packs OUTSIDE the lock — a last-handle `Drop` must not run under the cache
+        // lock (same rule as the eviction below; mirrors the pop-front-into-kept pattern in
+        // `save`). A dead pack's actor has already exited, so its `Drop` detaches
+        // immediately without a blocking join.
+        let dead = {
+            let mut recents = self.recent_packs.lock();
+            if recents.iter().all(|p| p.is_alive()) {
+                Vec::new()
+            } else {
+                let mut kept = VecDeque::with_capacity(recents.len());
+                let mut dead = Vec::new();
+                while let Some(p) = recents.pop_front() {
+                    if p.is_alive() {
+                        kept.push_back(p);
+                    } else {
+                        dead.push(p);
+                    }
+                }
+                *recents = kept;
+                dead
+            }
+        };
+        drop(dead);
         // Evict the oldest entry OUT of the lock scope: a `parking_lot` guard cannot be held across
         // the `.await` below, and if the evicted pack is the last handle its `close()` must not run
         // a blocking `Drop::join` on a tokio worker (let alone while holding the cache

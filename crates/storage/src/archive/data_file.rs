@@ -532,11 +532,13 @@ impl MmapDataFile {
     }
 
     /// Next capacity that holds `needed` bytes: double until a step would exceed `max_map_size`,
-    /// then advance in `max_map_size` increments. Floors the first allocation at `initial_size`.
+    /// then advance in `max_map_size` increments. Every allocation is floored at `initial_size`, so
+    /// a small reopened file (its capacity is the reopened physical size, e.g. a 36-byte
+    /// header-only pack) jumps straight to `initial_size` instead of paying an
+    /// ftruncate+mmap+fsync per doubling back up from that tiny capacity.
     fn next_capacity(&self, needed: u64) -> u64 {
         let max_step = self.opts.max_map_size.max(1);
-        let mut cap =
-            if self.capacity == 0 { self.opts.initial_size.max(1) } else { self.capacity };
+        let mut cap = self.capacity.max(self.opts.initial_size).max(1);
         while cap < needed {
             // Grow by min(cap, max_step): geometric early, linear once a step hits the cap.
             cap = cap.saturating_mul(2).min(cap.saturating_add(max_step));

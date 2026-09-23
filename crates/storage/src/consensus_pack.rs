@@ -641,6 +641,14 @@ impl ConsensusPack {
         self.epoch
     }
 
+    /// True while the background actor thread is still serving requests. A `false` means the actor
+    /// exited (it only dies via a panic — there is no `panic = "abort"`), after which every lookup
+    /// wrapper collapses to `false`/`None`; the static-pack cache uses this to evict a dead handle
+    /// so the next access re-opens the epoch fresh.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
     /// Return the committee persisted in this pack's [`EpochMeta`] — the epoch-START
     /// snapshot this epoch's consensus output is decoded and verified against.
     ///
@@ -746,10 +754,14 @@ impl ConsensusPack {
     pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(false)
-        } else {
-            false
+            if let Ok(found) = rx.await {
+                return found;
+            }
         }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
+        // `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_consensus_header: pack actor unavailable (channel closed); reporting not-found");
+        false
     }
 
     /// Retrieve a consensus header by digest.
@@ -759,10 +771,13 @@ impl ConsensusPack {
     ) -> Option<ConsensusHeader> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
+            if let Ok(header) = rx.await {
+                return header;
+            }
         }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "consensus_header_by_digest: pack actor unavailable (channel closed); reporting not-found");
+        None
     }
 
     /// Retrieve a consensus header by number.
@@ -863,15 +878,28 @@ impl ConsensusPack {
     /// True if the pack contains the batch for digest.
     pub async fn contains_batch(&self, digest: BlockHash) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::ContainsBatch(digest, tx)).await;
-        rx.await.unwrap_or_default()
+        if self.tx.send(PackMessage::ContainsBatch(digest, tx)).await.is_ok() {
+            if let Ok(found) = rx.await {
+                return found;
+            }
+        }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
+        // `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_batch: pack actor unavailable (channel closed); reporting not-found");
+        false
     }
 
     /// Return the Batch for digest if found.
     pub async fn batch(&self, digest: BlockHash) -> Option<Batch> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::Batch(digest, tx)).await;
-        rx.await.unwrap_or_default()
+        if self.tx.send(PackMessage::Batch(digest, tx)).await.is_ok() {
+            if let Ok(batch) = rx.await {
+                return batch;
+            }
+        }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "batch: pack actor unavailable (channel closed); reporting not-found");
+        None
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.

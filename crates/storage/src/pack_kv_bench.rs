@@ -26,8 +26,9 @@
 //! - `read_rand` — `N_READ` random point-gets over the bulk-loaded keys.
 //!
 //! ## Fairness caveats (printed with the results)
-//! - A pack durable barrier fsyncs/msyncs **3 files** (data + `index.hdx` + `index.odx`) vs MDBX's
-//!   single-env commit — an architectural cost of the separate hash index.
+//! - A pack durable barrier msyncs **one file** (the data log); the hash digest index is
+//!   WAL-derived and is not synced per barrier, exactly like `ConsensusPack::persist`. MDBX does a
+//!   single-env commit.
 //! - Pack gives O(1) point KV but **no ordered range scan / cursor** and no cross-key atomic
 //!   transaction — features MDBX has that a replacement would need to add. This bench measures only
 //!   the point-KV subset. Values use `PackCompression::None`.
@@ -182,11 +183,13 @@ struct MdbxKv {
 #[cfg(feature = "reth-libmdbx")]
 impl MdbxKv {
     fn open(dir: &Path, durable: bool) -> Self {
-        // Select the env sync mode (test builds default to SafeNoSync). Read by
-        // `MdbxDatabase::open`. Safe here: the bench runs single-threaded (`--test-threads
-        // 1`).
+        // Select the env sync mode (test builds default to SafeNoSync), read by
+        // `MdbxDatabase::open`. Set it only around the open and clear it immediately after
+        // (the value is consumed at open time), so the override never leaks into the rest
+        // of the process rather than relying on `--test-threads 1` for isolation.
         std::env::set_var("TN_TEST_MDBX_SYNC", if durable { "durable" } else { "safe-no-sync" });
         let db = MdbxDatabase::open(dir, 4, 512 * MEGABYTE, 8 * MEGABYTE).expect("open mdbx");
+        std::env::remove_var("TN_TEST_MDBX_SYNC");
         db.open_table::<KvTable>().expect("open table");
         Self { db }
     }
@@ -288,7 +291,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let cell_w = 13usize;
 
     println!("\n=== pack-file KV vs MDBX (ms; lower is better) ===");
-    println!("legend: pack = memory-mapped append-log + hash digest index (msync barrier); mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync (no fsync). write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier syncs 3 files (data+hdx+odx) vs MDBX's one env commit; pack has no ordered scan / cross-key txn.");
+    println!("legend: pack = memory-mapped append-log + hash digest index (msync barrier); mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync (no fsync). write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier msyncs ONE file (the data log; the hash index is WAL-derived, not synced per barrier) vs MDBX's one env commit; pack has no ordered scan / cross-key txn.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
