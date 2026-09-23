@@ -150,7 +150,7 @@ epoch-close system calls. Both inputs are chain-consistent, so honest nodes agre
 **reproducibility** guarantee, not an authentication one. It is load-bearing in both directions —
 one of those system calls records every worker's next-epoch base fee, and the following epoch's
 entry read consumes exactly that write and halts the node when it is unreadable
-(`read_base_fees_for_entered_epoch`, `run_epoch.rs:213`). A wrong `close_epoch` does not
+(`read_base_fees_for_entered_epoch`, defined in `node.rs:593`, called from `run_epoch.rs:206`). A wrong `close_epoch` does not
 produce a bad block; it strands the next epoch.
 
 Determinism rules for block production live in `crates/tn-reth/README.md` ("Determinism rules"). The
