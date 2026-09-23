@@ -317,6 +317,7 @@ impl<DB: Database> Proposer<DB> {
             parents.iter().map(|x| x.header().digest()).collect(),
             consensus_bus.app().latest_execution_block_num_hash(),
             seed_signature,
+            tn_types::now_ms(),
         );
 
         // Metric: header_proposed - tracks header proposals
