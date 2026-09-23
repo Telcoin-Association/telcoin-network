@@ -1261,6 +1261,122 @@ impl Inner {
         Ok(())
     }
 
+    /// Open the position + digest indexes for append (writable). Mirrors the three index opens in
+    /// [`Self::open_append`]; factored out so [`Self::reset_indexes`] can reopen fresh copies after
+    /// wiping the sidecar directories.
+    fn try_open_indexes(
+        base_dir: &Path,
+        records: &Pack<EpochRecord>,
+        certs: &Pack<EpochCertificate>,
+    ) -> Result<(PositionIndex<u64>, HdxIndex, HdxIndex), OpenError> {
+        let epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
+            base_dir.join(Self::EPOCH_POS_NAME),
+            records.header(),
+            "index.pdx",
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let record_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::RECORD_HASH_NAME),
+            records.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let cert_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::CERT_HASH_NAME),
+            certs.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        Ok((epoch_idx, record_digests, cert_digests))
+    }
+
+    /// Discard the position + digest index sidecar directories and reopen fresh (empty) copies.
+    /// Used when an index fails to open or was left inconsistent by an unclean shutdown; the
+    /// caller then rebuilds them from the data logs (see [`Self::rebuild_indexes`]). A missing
+    /// directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    fn reset_indexes(
+        base_dir: &Path,
+        records: &Pack<EpochRecord>,
+        certs: &Pack<EpochCertificate>,
+    ) -> Result<(PositionIndex<u64>, HdxIndex, HdxIndex), EpochDbError> {
+        for name in [Self::EPOCH_POS_NAME, Self::RECORD_HASH_NAME, Self::CERT_HASH_NAME] {
+            match std::fs::remove_dir_all(base_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Self::try_open_indexes(base_dir, records, certs).map_err(Into::into)
+    }
+
+    /// Rebuild the position + digest indexes by replaying the data logs, the authoritative source
+    /// (mirrors `ConsensusPack::recover_pack`/`replay_wal`). For each log: capture
+    /// `logical_position()` before each `next()` as the record's stored offset, advance the
+    /// consistent end only past a fully-decoded record, and stop at the first torn/short record so
+    /// an incomplete tail is dropped; then roll the log back to that end and reconcile the
+    /// digest marker. The records log keys the position index by insertion order and the
+    /// record-digest index by [`EpochRecord::digest`]; the certs log keys the cert-digest index
+    /// by `EpochCertificate::epoch_hash` (the digest of the record it certifies).
+    fn rebuild_indexes(
+        records: &mut Pack<EpochRecord>,
+        certs: &mut Pack<EpochCertificate>,
+        epoch_idx: &mut PositionIndex<u64>,
+        record_digests: &mut HdxIndex,
+        cert_digests: &mut HdxIndex,
+    ) -> Result<(), EpochDbError> {
+        let mut iter = records.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+        let mut idx = 0u64;
+        let mut consistent_end = iter.logical_position();
+        loop {
+            let pos = iter.logical_position();
+            match iter.next() {
+                None => break,
+                Some(Ok(record)) => {
+                    epoch_idx
+                        .save(idx, pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("epoch position: {e}")))?;
+                    record_digests
+                        .save(record.digest().into(), pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
+                    idx += 1;
+                    consistent_end = iter.logical_position();
+                }
+                Some(Err(_)) => break,
+            }
+        }
+        // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
+        drop(iter);
+        if consistent_end < records.file_len() {
+            records.rewind_to(consistent_end);
+        }
+        record_digests.set_data_file_length(records.file_len());
+
+        let mut iter = certs.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+        let mut consistent_end = iter.logical_position();
+        loop {
+            let pos = iter.logical_position();
+            match iter.next() {
+                None => break,
+                Some(Ok(cert)) => {
+                    cert_digests
+                        .save(cert.epoch_hash.into(), pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
+                    consistent_end = iter.logical_position();
+                }
+                Some(Err(_)) => break,
+            }
+        }
+        drop(iter);
+        if consistent_end < certs.file_len() {
+            certs.rewind_to(consistent_end);
+        }
+        cert_digests.set_data_file_length(certs.file_len());
+        Ok(())
+    }
+
     fn open_append<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
         let base_dir = path.as_ref();
         let _ = create_dir_synced(base_dir);
@@ -1281,29 +1397,25 @@ impl Inner {
             EPOCH_PACK_VERSION,
         )?;
 
-        let mut epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
-            base_dir.join(Self::EPOCH_POS_NAME),
-            records.header(),
-            "index.pdx",
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut record_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::RECORD_HASH_NAME),
-            records.header(),
-            builder,
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut cert_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::CERT_HASH_NAME),
-            certs.header(),
-            builder,
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
+        // Open the position + digest indexes; if any is unreadable, fall back to a fresh set and
+        // force a rebuild from the data logs below rather than failing the open. A corrupt sidecar
+        // index must not brick the node -- the data logs are authoritative.
+        let (mut epoch_idx, mut record_digests, mut cert_digests, index_open_failed) =
+            match Self::try_open_indexes(base_dir, &records, &certs) {
+                Ok((epoch_idx, record_digests, cert_digests)) => {
+                    (epoch_idx, record_digests, cert_digests, false)
+                }
+                Err(e) => {
+                    warn!(
+                        target: "epoch-db",
+                        "epoch-records index failed to open ({e}); discarding and rebuilding all \
+                         indexes from the data logs"
+                    );
+                    let (epoch_idx, record_digests, cert_digests) =
+                        Self::reset_indexes(base_dir, &records, &certs)?;
+                    (epoch_idx, record_digests, cert_digests, true)
+                }
+            };
 
         if !have_records {
             // Freshly created: initialise the stored data lengths in all indexes.
@@ -1311,8 +1423,37 @@ impl Inner {
             cert_digests.set_data_file_length(certs.file_len());
         }
 
-        Self::heal_records(&mut records, &mut epoch_idx, &record_digests)?;
-        Self::heal_certs(&mut certs, &cert_digests)?;
+        // Rebuild the indexes from the authoritative data logs when they were unreadable (above),
+        // were not cleanly sealed, or their tracked data length disagrees with the log -- e.g. an
+        // hdx split whose new buckets reached disk but whose header/`data_file_length` did not,
+        // silently dropping the moved keys (see `ConsensusPack::recover_pack`). Do NOT run the
+        // index-trusting `heal_*` first: a stale position index could mis-bound the log and
+        // permanently drop durable records. On a clean open the indexes are trusted and only the
+        // cheap `heal_*` validation runs.
+        let must_rebuild = index_open_failed
+            || records.opened_unclean()
+            || certs.opened_unclean()
+            || epoch_idx.opened_unclean()
+            || record_digests.opened_unclean()
+            || cert_digests.opened_unclean()
+            || record_digests.data_file_length() != records.file_len()
+            || cert_digests.data_file_length() != certs.file_len();
+        if must_rebuild {
+            let (idx, rdig, cdig) = Self::reset_indexes(base_dir, &records, &certs)?;
+            epoch_idx = idx;
+            record_digests = rdig;
+            cert_digests = cdig;
+            Self::rebuild_indexes(
+                &mut records,
+                &mut certs,
+                &mut epoch_idx,
+                &mut record_digests,
+                &mut cert_digests,
+            )?;
+        } else {
+            Self::heal_records(&mut records, &mut epoch_idx, &record_digests)?;
+            Self::heal_certs(&mut certs, &cert_digests)?;
+        }
 
         // Derive start_epoch from the first stored record if present.
         let start_epoch = if !epoch_idx.is_empty() {
@@ -2322,6 +2463,111 @@ mod test {
 
         // Idempotent: a second reopen still succeeds.
         EpochRecordDb::open(dir.path()).expect("second reopen");
+    }
+
+    #[tokio::test]
+    async fn test_epoch_index_open_failure_rebuilds() {
+        // Regression for finding #8(b): an unreadable sidecar index must not brick
+        // `EpochRecordDb::open`. The data logs are authoritative, so a corrupt position/digest
+        // index is discarded and rebuilt from them instead of failing the open (was:
+        // `OpenError::IndexFileOpen` -> node cannot start).
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // One case per index file; each is destructive so needs its own fresh DB.
+        for (dir_name, file_name) in [
+            (Inner::EPOCH_POS_NAME, "index.pdx"),
+            (Inner::RECORD_HASH_NAME, "index.hdx"),
+            (Inner::CERT_HASH_NAME, "index.hdx"),
+        ] {
+            let temp_dir = TempDir::with_prefix("epoch_index_open_failure").expect("temp dir");
+
+            // Populate and cleanly close so the sidecar indexes exist on disk.
+            let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+            let mut pairs = Vec::new();
+            let mut parent = EpochDigest::default();
+            for epoch in 0..12u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                db.save(record.clone(), cert.clone()).await.expect("save");
+                pairs.push((record, cert));
+            }
+            db.close().await;
+
+            // Corrupt the index header so it fails to open (mirrors `break_index_file`).
+            let index_path = temp_dir.path().join(dir_name).join(file_name);
+            let f =
+                OpenOptions::new().write(true).open(&index_path).expect("open index to corrupt");
+            f.set_len(4).expect("truncate index header");
+            drop(f);
+
+            // Reopen: the unreadable index is discarded and rebuilt from the data logs, so the open
+            // succeeds and every record + cert is still reachable.
+            let db = EpochRecordDb::open(temp_dir.path())
+                .unwrap_or_else(|e| panic!("reopen must rebuild {dir_name}/{file_name}: {e}"));
+            for (record, cert) in &pairs {
+                let by_epoch = db.record_by_epoch(record.epoch).await.expect("record by epoch");
+                assert_eq!(by_epoch.digest(), record.digest());
+                let by_digest =
+                    db.record_by_digest(record.digest()).await.expect("record by digest");
+                assert_eq!(by_digest.digest(), record.digest());
+                let cert_back = db.cert_by_digest(record.digest()).await.expect("cert by digest");
+                assert_eq!(cert_back.epoch_hash, cert.epoch_hash);
+            }
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epoch_unclean_reopen_rebuilds_indexes() {
+        // Regression for finding #8(a): after an unclean shutdown a digest index can be stale (an
+        // hdx split whose new buckets reached disk but whose header did not), silently losing keys.
+        // The reopen must detect the unclean state and rebuild every index from the authoritative
+        // data logs, so all persisted records/certs stay reachable and a re-save is idempotent (no
+        // duplicate cert appended -- the #8 duplicate-append symptom).
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("epoch_unclean_rebuild").expect("temp dir");
+
+        // Populate + persist (durable data logs + synced markers) via the sync `Inner`, then
+        // `mem::forget` to skip the clean close: models a crash -- durable logs, no sentinel.
+        let mut pairs = Vec::new();
+        {
+            let mut inner = Inner::open_append(temp_dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..16u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save(record.clone(), cert.clone()).expect("save");
+                pairs.push((record, cert));
+            }
+            inner.persist().expect("persist");
+            std::mem::forget(inner);
+        }
+
+        // Reopen: unclean (no sentinel) -> indexes rebuilt from the logs; everything reachable.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after unclean exit");
+        for (record, cert) in &pairs {
+            let by_epoch = db.record_by_epoch(record.epoch).await.expect("record by epoch");
+            assert_eq!(by_epoch.digest(), record.digest());
+            let cert_back = db.cert_by_digest(record.digest()).await.expect("cert by digest");
+            assert_eq!(cert_back.epoch_hash, cert.epoch_hash);
+        }
+
+        // Re-saving an already-stored pair must be idempotent: the rebuilt cert-digest index still
+        // resolves the key, so no duplicate cert is appended.
+        let (record, cert) = pairs[0].clone();
+        db.save(record, cert).await.expect("idempotent re-save");
+        db.persist().await.expect("persist");
+        db.close().await;
+        let certs = EpochRecordDb::read_certs_from_pack(temp_dir.path().join(CERTS_NAME))
+            .expect("read certs");
+        assert_eq!(
+            certs.len(),
+            pairs.len(),
+            "re-save must not append a duplicate cert (got {} certs)",
+            certs.len()
+        );
     }
 
     /// Generate a deterministic test BLS public key from a seed.

@@ -324,7 +324,9 @@ impl DbRepairArgs {
                             .map_err(|e| eyre!("failed to persist epoch-records DB: {e}"))?;
                         db.close().await;
                         println!(
-                            "epoch-records DB: healed (torn tails truncated, indexes rebuilt)"
+                            "epoch-records DB: opened and healed (torn tails truncated; \
+                             digest/position indexes rebuilt from the data logs if a prior crash \
+                             left them inconsistent)"
                         );
                     }
                     Err(e) => println!(
