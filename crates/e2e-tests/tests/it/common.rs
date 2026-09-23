@@ -1460,3 +1460,187 @@ pub(crate) fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
         Err(err) => Err(Report::msg(err.to_string())),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Commit-time, metrics and consensus-chain readers
+// ---------------------------------------------------------------------------------------------
+
+/// One `tn_getBlockTimestampMillis` response, parsed out of its hex-encoded JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockCommitTime {
+    /// The execution block's number.
+    pub(crate) block_number: u64,
+    /// The execution block's hash.
+    pub(crate) block_hash: tn_types::B256,
+    /// The execution block's whole-second EVM `timestamp`.
+    pub(crate) timestamp: u64,
+    /// The commit time of the block's consensus header, in milliseconds since the Unix epoch.
+    pub(crate) timestamp_millis: u64,
+    /// Whether the consensus header's leader epoch commits with millisecond resolution.
+    pub(crate) sub_second: bool,
+    /// The number of the consensus header the block was executed from; `None` for genesis.
+    pub(crate) consensus_number: Option<u64>,
+    /// The digest of that consensus header, which is the block's `parentBeaconBlockRoot`; `None`
+    /// for genesis.
+    pub(crate) consensus_digest: Option<tn_types::B256>,
+}
+
+/// Fetch and parse `tn_getBlockTimestampMillis` for execution block `block_number`.
+///
+/// The node answers `null` for a block it does not know, so callers should only ask for heights
+/// at or below the node's head. A `null` answer, a missing required field, or a malformed one is an
+/// error naming the field. The two consensus fields are optional in the response (genesis has
+/// neither), so only a present-but-malformed value fails for them.
+pub(crate) async fn get_block_commit_time<P: Provider>(
+    provider: &P,
+    block_number: u64,
+) -> eyre::Result<BlockCommitTime> {
+    let response: Option<Value> = provider
+        .raw_request("tn_getBlockTimestampMillis".into(), (format!("0x{block_number:x}"),))
+        .await?;
+    let response = response.ok_or_else(|| {
+        eyre::eyre!("tn_getBlockTimestampMillis returned null for block {block_number}")
+    })?;
+    let malformed = |field: &str| {
+        eyre::eyre!("block {block_number}: `{field}` missing or malformed: {response}")
+    };
+    let quantity = |field: &str| response.get(field).and_then(parse_hex_u64);
+    let hash = |field: &str| {
+        response
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<tn_types::B256>().ok())
+    };
+    // genesis omits both consensus fields, so only a present-but-unparseable one fails
+    let optional = |field: &str, parsed: bool| -> eyre::Result<()> {
+        if response.get(field).is_some() && !parsed {
+            return Err(malformed(field));
+        }
+        Ok(())
+    };
+
+    let consensus_number = quantity("consensusNumber");
+    optional("consensusNumber", consensus_number.is_some())?;
+    let consensus_digest = hash("consensusDigest");
+    optional("consensusDigest", consensus_digest.is_some())?;
+    Ok(BlockCommitTime {
+        block_number: quantity("blockNumber").ok_or_else(|| malformed("blockNumber"))?,
+        block_hash: hash("blockHash").ok_or_else(|| malformed("blockHash"))?,
+        timestamp: quantity("timestamp").ok_or_else(|| malformed("timestamp"))?,
+        timestamp_millis: quantity("timestampMillis")
+            .ok_or_else(|| malformed("timestampMillis"))?,
+        sub_second: response
+            .get("subSecond")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| malformed("subSecond"))?,
+        consensus_number,
+        consensus_digest,
+    })
+}
+
+/// Read the value of the prometheus series `name` from the metrics endpoint at `addr` (the
+/// address a node was started with `--metrics` on), summed over every label set.
+///
+/// A series that is absent from the scrape is an error, not zero: counters are the usual subject
+/// of a "this never happened" assertion, and reading an unregistered or renamed series as zero
+/// would pass that assertion without measuring anything. Retries for up to 30s, so a transient
+/// scrape failure or a series that registers on first use late in startup does not fail the read.
+pub(crate) fn scrape_metric_value(addr: &str, name: &str) -> eyre::Result<f64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let last = match scrape_metrics(addr) {
+            Ok(body) => match sum_metric_samples(&body, name)? {
+                Some(value) => return Ok(value),
+                None => body,
+            },
+            Err(e) => format!("scrape failed: {e}"),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "metrics endpoint {addr} never served series `{name}`; last response:\n{}",
+                &last[..last.len().min(2000)]
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Sum every sample of the prometheus series `name` in a text-format scrape `body`, or `None`
+/// when the body holds no sample of it.
+///
+/// A sample line is `name value` or `name{labels} value`; comment lines and every other series
+/// (including ones `name` is a prefix of) are skipped. A sample whose value does not parse is an
+/// error rather than a skipped line, so a format change cannot hide the series.
+fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
+    let mut total = None;
+    for line in body.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        // the label set can hold spaces inside quoted values, so step past its closing brace
+        // before taking the value token
+        let after_labels = match rest.strip_prefix('{') {
+            Some(labels) => match labels.rfind('}') {
+                Some(end) => &labels[end + 1..],
+                None => continue,
+            },
+            None if rest.starts_with(char::is_whitespace) => rest,
+            // a longer series name that merely starts with `name`
+            None => continue,
+        };
+        let raw = after_labels.split_whitespace().next().unwrap_or_default();
+        let value: f64 =
+            raw.parse().map_err(|e| eyre::eyre!("sample of `{name}` has value {raw:?}: {e}"))?;
+        total = Some(total.unwrap_or(0.0) + value);
+    }
+    Ok(total)
+}
+
+/// Read every consensus header a stopped node committed, in consensus-number order.
+///
+/// Opens the node's consensus chain under `datadir` directly, so the node must not be running
+/// and must not be restarted on this datadir afterwards without care: opening heals the open
+/// epoch's pack in place and clears leftover staging directories, which would race a live node.
+/// The walk ends at the last header the open epoch's pack holds (read from the pack itself rather
+/// than the "latest" slot hint, which can run one ahead of a pack cut short by a hard kill) and
+/// starts at number 1, since the genesis header (number 0) is never stored. Any number in between
+/// that the chain cannot serve is an error, so a gap fails the read instead of shortening the
+/// walk.
+pub(crate) async fn read_consensus_headers(
+    datadir: &Path,
+) -> eyre::Result<Vec<tn_types::ConsensusHeader>> {
+    // the node's `TelcoinDirs::epochs_db_path`
+    let base = datadir.join("consensus-db").join("epochs");
+    // opening a missing directory would quietly start a brand-new, empty chain there
+    eyre::ensure!(base.is_dir(), "no consensus chain at {}", base.display());
+    // the committee only seeds a chain that has never committed anything; an existing chain
+    // reads every epoch's committee from its own packs
+    let chain =
+        tn_storage::consensus::ConsensusChain::new(base.clone(), tn_types::Committee::default())
+            .map_err(|e| eyre::eyre!("opening consensus chain at {}: {e}", base.display()))?;
+    let last = chain
+        .consensus_header_latest()
+        .await
+        .map_err(|e| eyre::eyre!("reading latest consensus header at {}: {e}", base.display()))?
+        .ok_or_else(|| eyre::eyre!("consensus chain at {} holds no headers", base.display()))?
+        .number;
+
+    let mut headers = Vec::new();
+    for number in 1..=last {
+        let header = chain
+            .consensus_header_by_number(number)
+            .await
+            .map_err(|e| {
+                eyre::eyre!("reading consensus header {number} at {}: {e}", base.display())
+            })?
+            .ok_or_else(|| {
+                eyre::eyre!("consensus header {number} of 1..={last} missing at {}", base.display())
+            })?;
+        eyre::ensure!(
+            header.number == number,
+            "consensus header lookup for {number} at {} returned header {}",
+            base.display(),
+            header.number
+        );
+        headers.push(header);
+    }
+    Ok(headers)
+}
