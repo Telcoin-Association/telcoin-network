@@ -249,17 +249,29 @@ impl Drop for ConsensusPack {
             // close().await already took the handle, so the block below is skipped. Drop is the
             // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
-                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(), performing sync Drop now...");
-                if self.tx.try_send(PackMessage::Shutdown).is_ok() {
+                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(); sealing as a fallback");
+                if self.tx.try_send(PackMessage::Shutdown).is_err() {
+                    // Full bounded channel — detach. The actor clean-closes when the last Sender
+                    // drops; only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
+                    return;
+                }
+                let join = move || {
                     if let Err(e) = handle.join() {
                         error!(target: "consensus_pack", ?e, "Failed to join consensus pack thread");
                     }
-                } else {
-                    // Full bounded channel — skip the join / detach. Durability
-                    // still holds: the detached thread clean-closes when the last Sender drops;
-                    // only the synchronous "sealed on return" wait is lost, and only on this
-                    // misuse path.
-                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
+                };
+                // Never block a multi-threaded runtime worker on the ~60-75ms clean-close fsyncs:
+                // offload the join to the blocking pool. On a current-thread runtime (nothing else
+                // to starve) or no runtime, a synchronous join keeps "sealed on
+                // return" for callers/tests that drop then immediately reopen.
+                // `close().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
                 }
             }
         }

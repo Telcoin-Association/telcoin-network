@@ -73,16 +73,29 @@ impl Drop for LatestConsensus {
             // close().await already took the handle, so the block below is skipped. Drop is the
             // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
-                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(), performing sync Drop now...");
-                if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
-                    let _ = handle.join();
-                } else {
-                    // Full bounded channel — skip the join / detach. The detached thread exits when
-                    // the last Sender drops, but (unlike the pack actors) its channel-closed exit
-                    // does NOT fsync the slot files, so a power loss right after this misuse path
-                    // can leave a stale hint. Tolerable: the slots are only a hint, reconciled
-                    // against the pack on open (`clamp_latest_to_pack`).
+                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(); sealing as a fallback");
+                if self.tx.try_send(LatestConsensusCommand::Shutdown).is_err() {
+                    // Full bounded channel — detach. The detached thread exits when the last Sender
+                    // drops, but (unlike the pack actors) its channel-closed exit does NOT fsync
+                    // the slot files, so a power loss right after this misuse
+                    // path can leave a stale hint. Tolerable: the slots are
+                    // only a hint, reconciled against the pack on open
+                    // (`clamp_latest_to_pack`).
                     error!(target: "consensus_chain", "Failed to send shutdown message to LatestConsensus (should be using close())");
+                    return;
+                }
+                let join = move || {
+                    let _ = handle.join();
+                };
+                // Never block a multi-threaded runtime worker on the slot fsyncs: offload the join
+                // to the blocking pool. On a current-thread runtime (nothing else
+                // to starve) or no runtime, a synchronous join keeps "sealed on
+                // return". `close().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
                 }
             }
         }
@@ -1243,14 +1256,30 @@ impl ConsensusChain {
         Ok(())
     }
 
+    /// Poll (up to `timeout`) until this is the sole owner of the shared pack state — i.e. no other
+    /// `ConsensusChain` clone remains (notably the worker RPC server's `EngineToPrimaryRpc`, which
+    /// reth's stop-less `RpcServerHandle` releases only as the jsonrpsee task winds down) — so a
+    /// following [`Self::close`] actually runs instead of no-opping through `Arc::try_unwrap`.
+    /// `current_pack`'s strong count is the proxy: every chain clone bumps it, so `== 1` means
+    /// sole. Returns whether sole ownership was reached within `timeout`.
+    pub async fn wait_until_sole_owner(&self, timeout: Duration) -> bool {
+        let poll = async {
+            while Arc::strong_count(&self.current_pack) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(timeout, poll).await.is_ok()
+    }
+
     /// Async-close every background thread this chain owns — the current epoch pack, the cached
     /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
-    /// instead of letting each object's `Drop` run a blocking thread `join()` on the caller's
-    /// thread (which would stall the async runtime).
+    /// instead of letting each object's `Drop` run a blocking thread `join()`.
     ///
-    /// Reliable only when this is the LAST `ConsensusChain` reference: each `Arc::try_unwrap`
-    /// succeeds only then, so any object still shared by another clone is left for its own `Drop`
-    /// to close. Intended for graceful shutdown, after all task-held clones have been dropped.
+    /// Each inner close runs only when this holds the LAST `ConsensusChain` reference (per-field
+    /// `Arc::try_unwrap`); an object still shared by another clone is left for its own (now
+    /// runtime-safe) `Drop`. Callers should first drop/await out every other clone — see
+    /// [`Self::wait_until_sole_owner`], which bounds the wait for the RPC clone. Intended for
+    /// graceful shutdown.
     pub async fn close(self) {
         let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
         if let Ok(pack) = Arc::try_unwrap(current_pack) {
@@ -3112,6 +3141,44 @@ mod test {
             pack.committee().bls_keys().contains(&dropped),
             "the burned member stays in the pack's snapshot for decoding this epoch"
         );
+    }
+
+    /// #23: `wait_until_sole_owner` bounds the wait for another `ConsensusChain` clone (in production
+    /// the worker RPC server's `EngineToPrimaryRpc`) to drop, so `close()` runs instead of
+    /// no-opping through `Arc::try_unwrap`. It reports false while a clone lives and true once
+    /// this is sole.
+    #[tokio::test]
+    async fn test_wait_until_sole_owner_bounds_the_clone_wait() {
+        let temp_dir = TempDir::with_prefix("test_sole_owner").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        // A second clone (models the RPC server's `EngineToPrimaryRpc` clone) keeps it non-sole, so
+        // the bounded wait times out and reports false.
+        let clone = consensus_chain.clone();
+        assert!(
+            !consensus_chain.wait_until_sole_owner(std::time::Duration::from_millis(100)).await,
+            "must not report sole ownership while another clone lives"
+        );
+
+        // Once the only other clone drops, the wait resolves to sole ownership promptly.
+        drop(clone);
+        assert!(
+            consensus_chain.wait_until_sole_owner(std::time::Duration::from_secs(2)).await,
+            "must report sole ownership after the only other clone drops"
+        );
+
+        // Sole owner now, so close() actually runs (does not no-op).
+        consensus_chain.close().await;
     }
 
     #[tokio::test]

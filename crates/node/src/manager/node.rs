@@ -1262,11 +1262,12 @@ where
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
         // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error —
-        // `wait_for_task_shutdown()` drops the task-held `consensus_chain` clones, which is what
-        // lets `shutdown()`'s `close().await` hold the last reference and run off-worker.
-        // Surfacing the persist error before draining (a bare `?`) would leave a straggler
-        // clone whose blocking `Drop` then stalls a tokio worker. Persist error still takes
-        // precedence over `result`.
+        // `wait_for_task_shutdown()` drops the task-held `consensus_chain` clones. (The worker RPC
+        // servers hold one more clone that is NOT a `node_task_manager` task; it is released as the
+        // jsonrpsee task winds down after `engine` drops, which `shutdown()` waits out via
+        // `wait_until_sole_owner` before `close()`.) Surfacing the persist error before draining (a
+        // bare `?`) would skip that drain; the `Drop` fallback is now runtime-safe regardless.
+        // Persist error still takes precedence over `result`.
         let persist_result = self.consensus_chain.persist_current().await;
         node_task_manager.wait_for_task_shutdown().await;
         persist_result?;
@@ -1277,13 +1278,22 @@ where
     /// Gracefully close storage handles that would otherwise block a tokio worker on `Drop`.
     ///
     /// `ConsensusChain::close().await` shuts the pack/epoch/latest background threads down via the
-    /// async path (oneshot) instead of the blocking `handle.join()` in their `Drop` impls. Call
-    /// this after [`Self::run`] returns — by then `wait_for_task_shutdown()` has dropped the
-    /// task-held clones, so this holds the last reference and the close actually runs (see
-    /// `Arc::try_unwrap` in `ConsensusChain::close`). If a straggler clone outlives this,
-    /// `close()` is a harmless no-op and that clone's own `Drop` performs the join — no worse
-    /// than not calling this.
+    /// async path (oneshot) instead of a blocking `handle.join()`. Call this after [`Self::run`]
+    /// returns: `run` has dropped the engine (and thus the worker RPC servers), but reth's
+    /// stop-less `RpcServerHandle` releases the servers' `EngineToPrimaryRpc` →
+    /// `ConsensusChain` clone only as the jsonrpsee task winds down. So first wait (bounded)
+    /// for that clone to drop; then `close()` holds the last reference and seals off-worker. If
+    /// it does not release in time, `close()` is a no-op and the now runtime-safe `Drop`
+    /// fallback seals it (an unclean pack is recovered on next open) — so this never stalls a
+    /// worker regardless.
     pub(crate) async fn shutdown(self) {
+        if !self.consensus_chain.wait_until_sole_owner(std::time::Duration::from_secs(2)).await {
+            warn!(
+                target: "tn::node",
+                "consensus chain still shared at shutdown (a clone outlived run()); close() will \
+                 fall back to the runtime-safe Drop"
+            );
+        }
         self.consensus_chain.close().await;
         // Remaining fields (consensus_db, reth_db, network handles, …) drop here; none use the
         // thread-backed-pack blocking-join pattern, so their `Drop` does not stall the worker.
