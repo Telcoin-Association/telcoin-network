@@ -4248,6 +4248,7 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
 /// record by the primary BLS key, and there is no point caching ourselves as a known peer.
 #[tokio::test]
 async fn test_restore_skips_own_record() -> eyre::Result<()> {
+    use crate::kad::node_record_key;
     use libp2p::kad;
 
     let all_nodes = CommitteeFixture::builder(MemDatabase::default)
@@ -4283,7 +4284,7 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
             |data| key_config.request_signature_direct(data),
         );
         kad_store.put(kad::Record {
-            key: kad::RecordKey::new(&own_bls),
+            key: node_record_key(&own_bls),
             value: encode(&own_record),
             publisher: None,
             expires: None,

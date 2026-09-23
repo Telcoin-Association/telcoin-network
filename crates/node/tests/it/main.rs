@@ -400,7 +400,7 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
 
     // Canonical maintenance retains the pool's original fee handle across worker-count changes.
     assert_eq!(retained_fee.base_fee(), next_fee);
-    let genesis = engine.get_reth_env().await.chainspec().sealed_genesis_block();
+    let genesis = engine.get_reth_env().await.chainspec().sealed_genesis_header();
     pool_one.update_canonical_state(&genesis, Some(u128::MAX), vec![], vec![]).await?;
     assert_eq!(pool_one.block_info().pending_basefee, next_fee);
     assert_eq!(pool_zero.block_info().pending_basefee, zero_fee);
