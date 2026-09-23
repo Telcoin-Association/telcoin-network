@@ -300,7 +300,13 @@ where
             };
 
         let consensus_config = self
-            .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
+            .configure_consensus(
+                network_config,
+                committee,
+                next_committee_keys,
+                prior_epoch_record,
+                epoch_start,
+            )
             .await?;
 
         // Epoch-entry agreement check (issue #556): the committee's worker count sizes the
