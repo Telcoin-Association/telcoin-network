@@ -216,12 +216,13 @@ mod test {
 
     /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] without
     /// `adiri`: every epoch is fork-active, so the embedded [`crate::Header::default`]
-    /// carries `seed_signature` on the wire and the anchor deliberately differs from the
-    /// adiri build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as
-    /// the adiri pin.
+    /// carries `seed_signature` and `created_at_millis` on the wire, the sub-dag digest
+    /// covers `commit_timestamp_millis`, and the anchor deliberately differs from the adiri
+    /// build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as the adiri
+    /// pin.
     #[cfg(not(feature = "adiri"))]
     const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
-        "bcc5222c2dfb715151c596051f5421efa5bf6387d4e9700e91a70f9f51d21e50";
+        "f9a4365f984c09d97b9d17ba33bf9bf362dd6e13147d1cc8906934b4931a060f";
 
     /// PIN: the pre-genesis anchor digest [`crate::ConsensusHeader::default`], per build
     /// flavor (the wire layout of the embedded default header is build-dependent).
