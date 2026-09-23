@@ -709,11 +709,13 @@ impl MmapDataFile {
         if !self.read_only && self.end > 0 {
             if let Backing::Rw(map) = &self.backing {
                 // msync `[0, end)` back to the file: a durability barrier, and the coherence
-                // guarantee for the clone's plain `read()`/copy syscalls.
+                // guarantee for the clone's plain `read()`/copy syscalls. Advance the watermark
+                // only when the msync actually ran -- if a prior `remap` failed and
+                // left no live mapping, the tail is NOT durable and the watermark
+                // must not claim otherwise.
                 map.flush_range(0, self.end as usize)?;
+                self.flushed_end.store(self.end, Ordering::Relaxed);
             }
-            // The whole `[0, end)` region was just flushed durably.
-            self.flushed_end.store(self.end, Ordering::Relaxed);
         }
         Ok((self.file.try_clone()?, self.end))
     }
@@ -728,6 +730,15 @@ impl MmapDataFile {
             return Ok(());
         }
         let Backing::Rw(map) = &self.backing else {
+            // No live mapping -- a prior `remap` failed and released it. Any tail dirtied through
+            // the released mmap still sits in the page cache; only an fsync can push it
+            // out now, and only a durable flush may advance the append watermark. A
+            // silent `Ok(())` here would let the clean-close sentinel be stamped over a
+            // possibly-non-durable tail.
+            if sync && self.flushed_end.load(Ordering::Relaxed) < self.end {
+                self.file.sync_all()?;
+                self.flushed_end.store(self.end, Ordering::Relaxed);
+            }
             return Ok(());
         };
         let start = match self.opts.write_mode {
@@ -1461,6 +1472,53 @@ mod tests {
         let mut rest = Vec::new();
         clone.read_to_end(&mut rest).expect("read padding");
         assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
+    }
+
+    /// After a failed `remap` releases the mapping (`Backing::Empty`) with `end > 0`,
+    /// `try_clone`/`flush_dirty` must not lie about durability. `try_clone` must not advance the
+    /// flush watermark (nothing was msync'd), an async `flush_dirty(false)` stays a no-op, and
+    /// a durable `flush_dirty(true)` must fall back to a real `fsync` before advancing the
+    /// watermark (so a later clean-close sentinel is truthful).
+    #[test]
+    fn failed_remap_flush_and_clone_do_not_lie_about_durability() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = TempDir::with_prefix("mmap_df_remap_fail").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(40); // < initial_size (64): a single mapping, no grow
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        let end = data.len() as u64;
+        assert_eq!(df.end, end);
+
+        // Simulate a `remap` that failed and released the mapping, leaving `end > 0` unmapped.
+        df.backing = Backing::Empty;
+
+        // try_clone with no live mapping must NOT advance the watermark (nothing was flushed).
+        df.flushed_end.store(0, Ordering::Relaxed);
+        let (_clone, cloned_end) = df.try_clone().expect("clone succeeds");
+        assert_eq!(cloned_end, end, "clone still reports the logical end");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            0,
+            "try_clone must not advance the watermark when there is no mapping to msync"
+        );
+
+        // An async flush is a no-op on a lost mapping: no false durability, no watermark advance.
+        df.flush_dirty(false).expect("async flush ok");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            0,
+            "async flush must not advance the watermark with no mapping"
+        );
+
+        // A durable flush must fall back to a real fsync and only then advance the watermark.
+        df.flush_dirty(true).expect("sync flush ok");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            end,
+            "flush_dirty(true) must fsync the page-cache tail and advance the watermark"
+        );
     }
 
     #[test]

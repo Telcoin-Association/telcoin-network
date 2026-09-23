@@ -596,6 +596,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 if let Some(pos) = Self::scan_bucket(buf, key)? {
                     return Ok(Some(pos));
                 }
+                // A miss is the one outcome at-rest damage to this bucket could silently fabricate
+                // (a flipped slot no longer matches `key`). Only bucket 0 is CRC-checked at open
+                // and reads are otherwise CRC-free, so verify the bucket CRC before
+                // trusting the miss. `Dirty` (zero CRC) is a live unsynced write
+                // and is fine -- only `Corrupt` errors.
+                if crc_state(buf) == CrcState::Corrupt {
+                    return Err(FetchError::CorruptIndex(format!(
+                        "bucket {bucket} failed its CRC"
+                    )));
+                }
                 Self::read_overflow_pos(buf)
             }
             // A bucket `< buckets()` is always mapped in a sound index; a short hdx (e.g. an
@@ -628,6 +638,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             };
             if let Some(pos) = Self::scan_bucket(buf, key)? {
                 return Ok(Some(pos));
+            }
+            // As with the main bucket, a miss here could be fabricated by at-rest damage. Overflow
+            // records are always CRC'd at write time, so any CRC failure is genuine corruption.
+            if !check_crc(buf) {
+                return Err(FetchError::CorruptIndex(format!(
+                    "odx record at {overflow_pos} failed its CRC"
+                )));
             }
             upper_bound = overflow_pos;
             overflow_pos = Self::read_overflow_pos(buf);
@@ -1142,6 +1159,42 @@ mod tests {
         assert!(
             matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
             "a corrupt element count must error, not panic"
+        );
+    }
+
+    /// At-rest damage to a NON-first bucket must surface as `CorruptIndex` on a lookup
+    /// that misses in it, not a silent `NotFound`/`None`. Only bucket 0 is CRC-checked at open and
+    /// reads are otherwise CRC-free, so a corrupt non-first bucket previously served a false
+    /// negative. The CRC-on-miss guard in `find_in_bucket` catches it. (The overflow-hop guard
+    /// shares the pattern via `check_crc`.)
+    #[test]
+    fn test_corrupt_non_first_bucket_errors_on_miss() {
+        let tmp = TempDir::with_prefix("test_hdx_corrupt_nonfirst").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        // Enough keys to expand well past the single initial bucket.
+        for i in 0..256u64 {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync"); // stamp real (non-zero) bucket CRCs so a later mismatch is Corrupt
+
+        // Pick an inserted key that maps to a NON-first bucket (the open-time guard covers only 0).
+        let (stored_pos, k, bucket) = (0..256u64)
+            .map(|i| (i, key(i)))
+            .map(|(i, k)| (i, k, idx.hash_to_bucket(k.as_slice())))
+            .find(|(_, _, b)| *b >= 1)
+            .expect("some key must land in a non-first bucket");
+        assert_eq!(idx.load(k).expect("healthy load before corruption"), stored_pos);
+
+        // Corrupt the bucket: zero its element count so every lookup misses, which also invalidates
+        // the now-stale CRC trailer -> `CrcState::Corrupt`.
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("bucket slice");
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+
+        // The lookup now misses in a Corrupt bucket -> must error, not fold into NotFound.
+        assert!(
+            matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
+            "a miss in a corrupt non-first bucket must surface as CorruptIndex, not a silent miss"
         );
     }
 

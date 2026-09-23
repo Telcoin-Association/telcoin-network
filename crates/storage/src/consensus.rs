@@ -1477,7 +1477,24 @@ impl ConsensusChain {
         if let Some(old) = evicted {
             old.close().await;
         }
-        let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
+        // `new_epoch` swaps `current_pack` and only THEN seals the previous writer
+        // (`old_pack.close().await` stamps the clean-close sentinels and truncates the mmap
+        // padding, under `pack_install`); `stream_import`'s replace-current renames under
+        // the same lock. A reader that maps the epoch in that window sees a padded,
+        // unsentineled pack and would reject a healthy epoch as `CorruptPack`. On any
+        // non-"missing files" error, wait out the in-flight handoff/import by taking
+        // `pack_install`, then retry once; a still-`CorruptPack` result is genuine at-rest
+        // corruption and surfaces. Safe from re-entrancy: no `get_static` caller holds
+        // `pack_install` (new_epoch/replace_current use `open_static` directly), and the guard is
+        // scoped to this match arm so it is not held across the cache-dedup `.await`s below.
+        let pack = match ConsensusPack::open_static(&self.base_path, epoch) {
+            Ok(pack) => pack,
+            Err(e) if e.is_missing_static_files() => return Err(e),
+            Err(_) => {
+                let _install = self.pack_install.lock().await;
+                ConsensusPack::open_static(&self.base_path, epoch)?
+            }
+        };
         // Final check after grabbing the lock again that another task did not also create the pack.
         // Decide under the brief lock, then release it BEFORE any `.await` — a `parking_lot` guard
         // must not be held across `close()` (same rule as the eviction block above), and the
@@ -2390,6 +2407,42 @@ mod test {
         assert!(
             unreadable.is_err(),
             "a present-but-unreadable static pack must surface as Err: {unreadable:?}"
+        );
+    }
+
+    /// `get_static` retries `open_static` once under `pack_install` so a healthy epoch
+    /// mapped mid-handoff (padded, not-yet-sentineled) is not misreported as corrupt. The retry
+    /// must still surface GENUINE at-rest corruption rather than mask it, and must terminate
+    /// without deadlocking on the lock. (The transient-handoff benefit itself — a racing writer
+    /// sealing the epoch during the retry — is exercised by
+    /// `test_new_epoch_stream_import_race`.)
+    #[tokio::test]
+    async fn test_get_static_retry_still_surfaces_corruption() {
+        use crate::consensus_pack::DATA_NAME;
+
+        let temp_dir = TempDir::with_prefix("test_get_static_retry").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee).await.unwrap();
+
+        // A present-but-unreadable static pack for a non-current epoch: `get_static` must return
+        // `Err` after its single retry — the retry re-opens under `pack_install` (no
+        // deadlock, no infinite loop) and does not mask genuine corruption as a miss.
+        let epoch_dir = temp_dir.path().join("epoch-1");
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        std::fs::write(epoch_dir.join(DATA_NAME), [0xAB; 64]).expect("write garbage data file");
+        let result = consensus_chain.get_static(1).await;
+        assert!(
+            result.is_err(),
+            "genuine at-rest corruption must surface through get_static's retry: {result:?}"
         );
     }
 
