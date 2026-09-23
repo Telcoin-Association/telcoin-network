@@ -4,7 +4,7 @@ use crate::common::get_block;
 
 use super::common::{
     create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
-    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR,
+    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR, NODE_PASSWORD,
 };
 use alloy::{
     primitives::Bytes,
@@ -20,7 +20,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::WORKER_CONFIGS_ADDRESS;
+use tn_config::{
+    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, NodeInfo, WORKER_CONFIGS_ADDRESS,
+};
 use tn_reth::{
     system_calls::{ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
@@ -33,7 +35,8 @@ use tn_types::{
         leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
         seed_signature_active,
     },
-    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256, U256,
+    get_available_udp_port, keccak256, Address, BootstrapServer, Epoch, EpochCertificate,
+    EpochRecord, Genesis, P2pNode, B256, U256,
 };
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -805,11 +808,43 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
     Ok(())
 }
 
+/// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
+///
+/// Keytool currently generates only worker 0. Derive the second identity from the same keys
+/// the node loads at startup, and share both workers' addresses before starting any processes.
+fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> eyre::Result<()> {
+    let bootstrap_peers = committee
+        .iter()
+        .map(|(name, _)| {
+            let dir = temp_path.join(name);
+            let path = dir.join("node-info.yaml");
+            let keys = KeyConfig::read_config(&dir, Some(NODE_PASSWORD.to_string()))?;
+            let mut info: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+            eyre::ensure!(info.p2p_info.num_workers() == 1, "fixture must start with one worker");
+            let port = get_available_udp_port("127.0.0.1")
+                .ok_or_else(|| eyre::eyre!("no UDP port available for worker 1"))?;
+            info.p2p_info.workers.push(P2pNode {
+                network_key: keys.worker_network_public_key(1),
+                network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse()?,
+                rpc: None,
+            });
+            Config::write_to_path(path, &info, ConfigFmt::YAML)?;
+            Ok((
+                info.bls_public_key,
+                BootstrapServer::new(info.p2p_info.primary, info.p2p_info.workers),
+            ))
+        })
+        .collect::<eyre::Result<BTreeMap<_, _>>>()?;
+    let network: NetworkConfig =
+        serde_json::from_value(serde_json::json!({ "bootstrap_peers": bootstrap_peers }))?;
+    committee.iter().try_for_each(|(name, _)| network.write_config(&temp_path.join(name)))
+}
+
 /// Governance can grow and shrink the protocol worker count while validators keep running.
 ///
-/// Every node starts with one configured worker. Growing to two therefore exercises the live
-/// epoch-entry shortfall after startup; no second worker key or swarm appears. The original
-/// processes must still close epochs and accept the subsequent decrease back to one worker.
+/// Every node provisions two workers while genesis activates only one. The original processes
+/// must start worker 1 at epoch entry, close epochs with both workers, and accept a decrease
+/// back to one worker without restarting. A local capacity shortfall is covered by node tests.
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()> {
@@ -834,6 +869,7 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         EPOCH_DURATION,
     )?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    provision_second_workers(temp_dir.path(), &committee)?;
     let (children, endpoints) = start_nodes(temp_dir.path(), &committee, "worker_count", 1)?;
     let mut guard = ProcessGuard::new(children);
     // A quorum can commit governance before the final validator has opened its RPC listener.

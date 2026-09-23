@@ -28,8 +28,8 @@
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
 
-use alloy::primitives::map::AddressSet;
-use futures::{stream, Stream, StreamExt as _};
+use alloy::primitives::{keccak256, map::AddressSet, B256};
+use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
     TransactionValidationTaskExecutor,
@@ -40,7 +40,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
     CanonStateSubscriptions as _, Chain, ChangedAccount, StateProviderBox,
-    StateProviderFactory as _,
+    StateProviderFactory as _, TransactionsProvider as _,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -55,20 +55,27 @@ use reth_transaction_pool::{
 use std::{
     collections::HashMap,
     pin::pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError,
-    TaskSpawner, TransactionSigned, TxHash, U256,
+    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
+    EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner,
+    TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    error::TnRethResult, evm::TnEvmConfig, metrics::RETH_METRICS, peer_batch::PeerBatchTxs,
-    traits::TelcoinNode, PoolTxn, PoolTxnId,
+    error::TnRethResult,
+    evm::TnEvmConfig,
+    forward::{FORWARD_BATCH_BUDGET, FORWARD_PENDING_LIFETIME, REQUEUE_GRACE},
+    forward_pending::{PendingForwards, RetentionLimits, SubmissionHead},
+    metrics::{ForwarderMetrics, RETH_METRICS},
+    peer_batch::PeerBatchTxs,
+    traits::TelcoinNode,
+    PoolTxn, PoolTxnId,
 };
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
@@ -81,6 +88,37 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 /// reload event, which is the next notification or the [`RELOAD_RETRY_INTERVAL`] tick,
 /// whichever comes first.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// A transaction-pool setting incompatible with TN's batch or fee policy.
+#[derive(Debug, PartialEq, Eq)]
+enum TxPoolConfigError {
+    /// A transaction admitted at this byte limit could never fit in a batch.
+    InputLimitExceedsBatch {
+        /// The operator's per-transaction byte limit.
+        configured: usize,
+        /// The batch protocol's byte limit.
+        maximum: usize,
+    },
+    /// TN has no priority fee market and does not support a pool priority fee floor.
+    MinimumPriorityFee,
+}
+
+impl std::fmt::Display for TxPoolConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLimitExceedsBatch { configured, maximum } => write!(
+                f,
+                "--txpool.max-tx-input-bytes {configured} exceeds TN's batch byte limit {maximum}"
+            ),
+            Self::MinimumPriorityFee => write!(
+                f,
+                "--txpool.minimum-priority-fee is unsupported on TN: omit this flag to accept zero-tip transactions"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TxPoolConfigError {}
 
 /// Interval at which the maintenance loop re-arms the residual dirty-sender reload between
 /// canonical-state notifications.
@@ -184,6 +222,8 @@ pub struct WorkerTxPool(
     /// The transactions this node has seen inside a validated peer batch, deferred by the
     /// builder while that peer batch is in flight (issue #1329).
     PeerBatchTxs,
+    /// Observer transactions awaiting canonical inclusion, shared across epoch forwarders.
+    Arc<Mutex<PendingForwards<TxHash, BlsPublicKey, B256>>>,
 );
 
 impl From<WorkerTxPool>
@@ -195,7 +235,19 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
-    /// Create a new instance of `Self` and spawn its canonical-state maintenance task.
+    /// Set this epoch's fee in both the pool and its canonical-update fee handle.
+    ///
+    /// A worker that is removed and later reactivated gets a new accumulator slot. Its
+    /// persistent pool still holds the old container, so update that container too before
+    /// canonical maintenance can overwrite the pool's pending fee with a stale value.
+    pub fn set_epoch_base_fee(&self, base_fee: u64) {
+        self.2.set_base_fee(base_fee);
+        let mut block_info = self.block_info();
+        block_info.pending_basefee = base_fee;
+        self.set_block_info(block_info);
+    }
+
+    /// Create a pool and spawn canonical-state maintenance and queued-transaction expiry.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -206,6 +258,7 @@ impl WorkerTxPool {
         let this =
             Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
+        this.spawn_expiry_task(task_spawner);
         Ok(this)
     }
 
@@ -221,8 +274,29 @@ impl WorkerTxPool {
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
+        // The pool and validator survive epoch changes, so admission must fit the smallest
+        // batch limit across all supported epochs. Non-blob reth validation measures the full
+        // EIP-2718 encoding, just like the batch protocol.
+        let maximum = min_batch_size();
+        (node_config.txpool.max_tx_input_bytes <= maximum).then_some(()).ok_or(
+            TxPoolConfigError::InputLimitExceedsBatch {
+                configured: node_config.txpool.max_tx_input_bytes,
+                maximum,
+            },
+        )?;
+        // A configured floor would conflict with TN's zero-tip fee policy (#1340).
+        node_config
+            .txpool
+            .minimum_priority_fee
+            .is_none()
+            .then_some(())
+            .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
+        let forward_limits = RetentionLimits::new(
+            pool_config.pending_limit.max_txs,
+            pool_config.pending_limit.max_size,
+        );
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
         let validator = TransactionValidationTaskExecutor::eth_builder(
             blockchain_provider.clone(),
@@ -248,6 +322,9 @@ impl WorkerTxPool {
         // RPC boundary (issue #1160).
         .set_tx_fee_cap(node_config.rpc.rpc_tx_fee_cap)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
+        // These limits live on reth's validator, so Pool::eth_pool cannot apply them.
+        .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
+        .with_max_tx_gas_limit(node_config.txpool.max_tx_gas_limit)
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
         .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
@@ -278,7 +355,59 @@ impl WorkerTxPool {
         );
         */
 
-        Ok(Self(transaction_pool, blockchain_provider.clone(), base_fee, PeerBatchTxs::default()))
+        Ok(Self(
+            transaction_pool,
+            blockchain_provider.clone(),
+            base_fee,
+            PeerBatchTxs::default(),
+            Arc::new(Mutex::new(PendingForwards::new(forward_limits))),
+        ))
+    }
+
+    /// Spawn the critical task that expires parked transactions even when the chain is idle.
+    ///
+    /// Match reth's queued-lifetime sweep and local-origin exemptions. A zero lifetime
+    /// means expire on the next sweep; clamp only the timer period to avoid a zero-period
+    /// panic or a busy loop. Pending transactions never expire through this task.
+    /// A panic or unexpected exit must shut down the node, like canonical-state maintenance,
+    /// rather than silently leave the pool running without its configured age limit.
+    fn spawn_expiry_task(&self, task_spawner: &TaskSpawner) {
+        let pool = self.clone();
+        let period = self.0.config().max_queued_lifetime.max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        task_spawner.spawn_critical_task("queued txn pool expiry", async move {
+            IntervalStream::new(interval)
+                .for_each(move |_| {
+                    pool.evict_stale_transactions(Instant::now());
+                    futures::future::ready(())
+                })
+                .await;
+            Err(TaskError::from_message(
+                "queued txn pool expiry task ended: interval stream closed",
+            ))
+        });
+    }
+
+    /// Remove expired queued and basefee transactions using the pool's configured lifetime.
+    ///
+    /// Reth timestamps admission with `std::time::Instant`; accepting `now` explicitly
+    /// keeps boundary tests deterministic. Local and private origins retain reth's
+    /// exemption unless `--txpool.nolocals` is set. Blob transactions cannot enter this pool.
+    fn evict_stale_transactions(&self, now: Instant) {
+        let config = self.0.config();
+        let stale = self
+            .0
+            .queued_transactions()
+            .into_iter()
+            .filter(|tx| {
+                (tx.origin.is_external() || config.local_transactions_config.no_exemptions)
+                    && now.saturating_duration_since(tx.timestamp) >= config.max_queued_lifetime
+            })
+            .map(|tx| *tx.hash())
+            .collect();
+        let removed = self.0.remove_transactions(stale);
+        RETH_METRICS.record_txpool_expired_transactions(removed.len());
     }
 
     /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
@@ -318,7 +447,9 @@ impl WorkerTxPool {
     /// `Lagged`, and reloads dirty senders in chunks of `max_reload`. A `retry_interval`
     /// tick re-arms the reload between notifications, so a residual dirty set drains at
     /// the retry cadence even when notification traffic goes quiet after the volume spike that
-    /// built it (issue #1304). A tick with no dirty senders is a no-op.
+    /// built it (issue #1304). Each event also expires retained forwards and requeues eligible
+    /// ones; acknowledged transactions require canonical output progress before becoming
+    /// eligible.
     ///
     /// Canonical pool updates finish before the next maintenance event is processed.
     /// The chunk reload is awaited inline, so a tick can never start a second reload while
@@ -385,8 +516,72 @@ impl WorkerTxPool {
                     retained
                 })
             };
+            self.retry_forwarded(Instant::now(), max_reload).await;
         }
         Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
+    }
+
+    /// Access the pool-owned forwarding state without holding the lock across provider I/O.
+    pub(crate) fn pending_forwards(
+        &self,
+    ) -> MutexGuard<'_, PendingForwards<TxHash, BlsPublicKey, B256>> {
+        self.4.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reserve retained bytes before a successful forwarding admission lets the builder prune them.
+    /// Reading the actual canonical head keeps queued historical notifications out of the window.
+    pub(crate) fn admit_forwards(&self, transactions: Vec<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+        let head = self.1.canonical_in_memory_state().get_canonical_head();
+        self.pending_forwards().admit(
+            transactions.into_iter().map(|tx| (keccak256(&tx), tx)).collect(),
+            SubmissionHead::new(head.number, head.parent_beacon_block_root),
+            Instant::now(),
+            FORWARD_BATCH_BUDGET,
+            FORWARD_PENDING_LIFETIME,
+            REQUEUE_GRACE,
+        )
+    }
+
+    /// Return eligible forwards to the ordinary pool after checking canonical inclusion locally.
+    /// The existing maintenance batch limit also bounds provider reads and validations per event.
+    async fn retry_forwarded(&self, now: Instant, limit: usize) {
+        let (ready, expired) = self.pending_forwards().ready(now, limit);
+        if expired > 0 {
+            ::metrics::counter!("tn_reth.forwarded_txns_expired_total")
+                .increment(u64::try_from(expired).unwrap_or(u64::MAX));
+            warn!(target: "worker::forward", expired, "forward inclusion tracking expired");
+        }
+        stream::iter(ready)
+            .for_each(|(hash, bytes)| async move {
+                let provider = self.1.clone();
+                let included = tokio::task::spawn_blocking(move || provider.transaction_by_hash(hash))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| {
+                        result.map(|transaction| transaction.is_some()).map_err(|error| error.to_string())
+                    });
+                if included.as_ref().is_ok_and(|included| *included) {
+                    self.pending_forwards().remove(&hash);
+                } else if included.is_err() {
+                    self.pending_forwards().retry_later(&hash);
+                    warn!(target: "worker::forward", ?included, "cannot check forwarded transaction inclusion");
+                } else {
+                    let added = OptionFuture::from(
+                        recover_raw_transaction(&bytes)
+                            .ok()
+                            .map(|transaction| self.add_recovered_transaction_external(transaction)),
+                    )
+                    .await
+                    .is_some_and(|result| result.is_ok());
+                    if added {
+                        ForwarderMetrics::record_txns_requeued(1);
+                    }
+                    // A new batch may already own the inserted transaction by this point.
+                    let present = added || self.0.get(&hash).is_some();
+                    self.pending_forwards().reinserted(&hash, present);
+                }
+            })
+            .await;
     }
 
     /// Apply one canonical-state notification, awaiting pool maintenance before the next one.
@@ -544,9 +739,11 @@ impl WorkerTxPool {
     /// Pool maintenance runs on the blocking executor because it can hold pool locks and
     /// process many transactions. Awaiting it preserves the caller's update ordering and
     /// reports a blocking-task failure instead of continuing with an incomplete pool update.
+    /// Only the tip header is needed; retaining it avoids copying a block's transactions on
+    /// the calling async thread.
     pub async fn update_canonical_state(
         &self,
-        new_tip: &SealedBlock,
+        new_tip: &SealedHeader,
         pending_block_blob_fee: Option<u128>,
         mined_transactions: Vec<TxHash>,
         changed_accounts: Vec<ChangedAccount>,
@@ -554,17 +751,38 @@ impl WorkerTxPool {
         let pool = self.clone();
         let new_tip = new_tip.clone();
         tokio::task::spawn_blocking(move || {
-            let update = CanonicalStateUpdate {
-                new_tip: &new_tip,
-                pending_block_base_fee: pool.2.base_fee(),
+            // Reth's pool and validator only read header fields from the tip. This synthetic
+            // block satisfies that API without copying a body and stays inside this closure.
+            let new_tip = SealedBlock::from_sealed_parts(new_tip, BlockBody::default());
+            pool.apply_canonical_update(
+                &new_tip,
                 pending_block_blob_fee,
-                changed_accounts,
                 mined_transactions,
-                update_kind: PoolUpdateKind::Commit,
-            };
-            pool.0.on_canonical_state_change(update);
+                changed_accounts,
+            );
         })
         .await
+    }
+
+    /// Apply a canonical update synchronously on the blocking executor.
+    ///
+    /// Both maintenance paths read the current epoch's base fee here, when the update is applied.
+    fn apply_canonical_update(
+        &self,
+        new_tip: &SealedBlock,
+        pending_block_blob_fee: Option<u128>,
+        mined_transactions: Vec<TxHash>,
+        changed_accounts: Vec<ChangedAccount>,
+    ) {
+        let update = CanonicalStateUpdate {
+            new_tip,
+            pending_block_base_fee: self.2.base_fee(),
+            pending_block_blob_fee,
+            changed_accounts,
+            mined_transactions,
+            update_kind: PoolUpdateKind::Commit,
+        };
+        self.0.on_canonical_state_change(update);
     }
 
     /// Return pending transactions.
@@ -579,38 +797,49 @@ impl WorkerTxPool {
 
     /// This method is called when a canonical state update is received.
     ///
-    /// Await the pool update before the maintenance task receives another notification.
+    /// Collect account changes and mined hashes on the blocking executor, borrowing the tip
+    /// from the shared chain. Await completion before receiving another notification.
     async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
-        trace!(target: "worker::block-builder", ?update, "canon state update from engine");
+        let pool = self.clone();
+        tokio::task::spawn_blocking(move || {
+            trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
-        // update pool based with canonical tip update
-        let (blocks, state) = update.inner();
-        let tip = blocks.tip();
+            let (blocks, state) = update.inner();
+            let tip = blocks.tip();
 
-        // collect all accounts that changed in last round of consensus
-        let changed_accounts: Vec<ChangedAccount> = state
-            .accounts_iter()
-            .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
-            .map(|(address, acc)| ChangedAccount {
-                address,
-                nonce: acc.nonce,
-                balance: acc.balance,
-            })
-            .collect();
+            // Collect all accounts that changed in the last round of consensus.
+            let changed_accounts: Vec<ChangedAccount> = state
+                .accounts_iter()
+                .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
+                .map(|(address, acc)| ChangedAccount {
+                    address,
+                    nonce: acc.nonce,
+                    balance: acc.balance,
+                })
+                .collect();
 
-        debug!(target: "block-builder", ?changed_accounts);
+            debug!(target: "block-builder", ?changed_accounts);
 
-        // collect tx hashes to remove any transactions from this pool that were mined
-        let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+            // Collect hashes to remove transactions mined in this canonical update.
+            let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
 
-        debug!(target: "block-builder", ?mined_transactions);
+            tip.parent_beacon_block_root.into_iter().for_each(|output| {
+                pool.pending_forwards().committed(
+                    tip.number,
+                    output,
+                    mined_transactions.iter().copied(),
+                );
+            });
 
-        self.update_canonical_state(
-            tip.sealed_block(),
-            Some(u128::MAX), // set max fee for blobs
-            mined_transactions,
-            changed_accounts,
-        )
+            debug!(target: "block-builder", ?mined_transactions);
+
+            pool.apply_canonical_update(
+                tip.sealed_block(),
+                Some(u128::MAX), // set max fee for blobs
+                mined_transactions,
+                changed_accounts,
+            );
+        })
         .await
     }
 
@@ -877,6 +1106,12 @@ pub fn recover_pooled_transaction(
 }
 
 #[cfg(test)]
+mod config_tests;
+
+#[cfg(test)]
+mod canonical_update_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -912,6 +1147,77 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
+    }
+
+    /// A real canonical notification retires retained forwarding state independently of pool
+    /// pruning.
+    #[tokio::test]
+    async fn forwarded_inclusion_retires_retained_state() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, reth_env, _background_pool) =
+            funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        let mut notifications = pool.1.subscribe_to_canonical_state();
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded])?;
+        assert!(
+            pool.1.transaction_by_hash(hash)?.is_some(),
+            "the transaction must really be included"
+        );
+        let notification =
+            tokio::time::timeout(Duration::from_secs(5), notifications.recv()).await??;
+        pool.apply_canon_notification(notification).await?;
+        assert_eq!(
+            pool.pending_forwards().ready(Instant::now() + FORWARD_PENDING_LIFETIME, 1),
+            (vec![], 0),
+            "canonical inclusion must remove the retained record before expiry",
+        );
+        Ok(())
+    }
+
+    /// An eligible retained payload returns to the real pool and can be admitted for its next send.
+    #[tokio::test]
+    async fn missing_inclusion_requeues_the_retained_payload() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, reth_env, _background_pool) =
+            funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        pool.pending_forwards().defer(&hash);
+        (1_u8..=3).for_each(|output| {
+            pool.pending_forwards().committed(u64::from(output), B256::repeat_byte(output), []);
+        });
+        assert!(pool.get(&hash).is_none());
+        pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
+        assert!(pool.get(&hash).is_some(), "the original signed payload must return to the pool");
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded]));
+        Ok(())
     }
 
     #[test]
@@ -1358,10 +1664,10 @@ mod tests {
 
         // The genesis header carries the chain's default fee. It must differ from EPOCH_FEE,
         // or the assertion below could not distinguish the container from the tip header.
-        let genesis_block = reth_env.chainspec().sealed_genesis_block();
-        assert_ne!(genesis_block.base_fee_per_gas, Some(EPOCH_FEE));
+        let genesis_header = reth_env.chainspec().sealed_genesis_header();
+        assert_ne!(genesis_header.base_fee_per_gas, Some(EPOCH_FEE));
 
-        pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]).await?;
+        pool.update_canonical_state(&genesis_header, Some(u128::MAX), vec![], vec![]).await?;
 
         assert_eq!(
             pool.block_info().pending_basefee,
@@ -1381,7 +1687,7 @@ mod tests {
         let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
         let pool = reth_env
             .init_txn_pool_without_maintenance(BaseFeeContainer::new(MIN_PROTOCOL_BASE_FEE))?;
-        let genesis_block = reth_env.chainspec().sealed_genesis_block();
+        let genesis_header = reth_env.chainspec().sealed_genesis_header();
         pool.set_block_info(RethBlockInfo { pending_basefee: 0, ..pool.block_info() });
 
         // Keep validator tasks on the outer runtime so they cannot occupy the sole blocking
@@ -1401,7 +1707,7 @@ mod tests {
                 ready.await?;
 
                 let update =
-                    pool.update_canonical_state(&genesis_block, Some(u128::MAX), vec![], vec![]);
+                    pool.update_canonical_state(&genesis_header, Some(u128::MAX), vec![], vec![]);
                 tokio::pin!(update);
                 let first_poll = futures::poll!(&mut update);
                 let fee_before_release = pool.block_info().pending_basefee;

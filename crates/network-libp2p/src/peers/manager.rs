@@ -161,7 +161,7 @@ pub(crate) struct PeerManager {
     /// design, because a committee member must stay resolvable for its whole committee window —
     /// an expiry-driven resolution failure would be a consensus liveness bug.
     ///
-    /// Values are post-validation — BLS signature verified and publisher-checked
+    /// Kad-sourced values are BLS signature verified and publisher-checked
     /// (`peer_record_valid` in consensus.rs), committee-gated per issue #827, malformed
     /// advertised RPC info stripped in [`Self::cache_known_peer`] — while the store holds raw
     /// signed record bytes.
@@ -1207,9 +1207,9 @@ impl PeerManager {
     ///
     /// Stub entries (`stub_records`) are exempt from the comparison in the other direction too:
     /// a stub's timestamp is a local provisioning stamp, not a peer-signed record timestamp, and
-    /// node records are signed once at peer startup — so an operator stub stamped after the peer
-    /// started would otherwise block the peer's real record (fresh multiaddrs, advertised rpc)
-    /// forever. A signed record may therefore always replace a stub, which is the upgrade flow
+    /// a signed record may predate local provisioning. Comparing these timestamps could delay
+    /// learning the peer's current multiaddrs and advertised RPC until a later publication.
+    /// A signed record may therefore always replace a stub, which is the upgrade flow
     /// for trusted/bootstrap/explicit peers. The exemption ends with the stub: once a learned
     /// record is cached under a pinned key its timestamp IS peer-signed, and monotonicity applies
     /// so a relayed or replayed older record cannot regress it. Keying the exemption on
@@ -1257,17 +1257,10 @@ impl PeerManager {
         self.apply_unban_actions(unban_actions);
     }
 
-    /// Find authorities for the epoch manager.
+    /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
     pub(crate) fn find_authorities(&mut self, authorities: Vec<BlsPublicKey>) {
-        let mut missing = Vec::new();
-
-        // check all peers for authority and track missing
-        for bls_key in authorities {
-            // identify authorities without a network-learned record
-            if self.record_unlearned(&bls_key) {
-                missing.push(bls_key);
-            }
-        }
+        let missing: Vec<_> =
+            authorities.into_iter().filter(|key| self.record_unlearned(key)).collect();
 
         // emit event for kad to try to discover
         trace!(target: "peer-manager", ?missing, "requesting kad records");
