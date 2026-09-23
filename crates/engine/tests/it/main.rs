@@ -5,6 +5,7 @@
 #![allow(unused_crate_dependencies)]
 
 use assert_matches::assert_matches;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
@@ -32,11 +33,16 @@ use tn_reth::{
 };
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    gas_accumulator::GasAccumulator, keccak256, max_batch_gas, now, test_chain_spec_arc,
-    test_genesis, Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch,
-    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount,
-    Notifier, ReputationScores, SealedBlock, SealedHeader, TaskManager, TransactionTrait as _,
-    B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
+    forks::{
+        seed_signature_fork_epoch_override, subsecond_timestamp_active,
+        subsecond_timestamp_fork_epoch_override,
+    },
+    gas_accumulator::GasAccumulator,
+    keccak256, max_batch_gas, now, test_chain_spec_arc, test_genesis, Address, Batch, BlockHash,
+    Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest,
+    ConsensusOutput, Encodable2718, Epoch, GenesisAccount, Notifier, ReputationScores, SealedBlock,
+    SealedHeader, TaskManager, TimestampMs, TimestampSec, TransactionTrait as _, B256,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -58,6 +64,16 @@ const TOTAL_GAS_PER_TX: u64 = 21_000;
 const MAX_PRIORITY_FEE_PER_GAS: u64 = 100;
 /// Arbitrary value used for priority fee calcs in tests.
 const MAX_FEE_PER_GAS: u64 = 100;
+/// Engine counter of blocks whose EVM `timestamp` was raised above the output's `committed_at`.
+const EVM_TIMESTAMP_CLAMPED_TOTAL: &str = "tn_engine.evm_timestamp_clamped_total";
+/// Engine counter of executed blocks. Clamp tests read it as a positive control: a non-zero count
+/// proves the test's recorder captured the engine's metrics, so a zero clamp count is a
+/// measurement rather than a recorder that saw nothing.
+const BLOCKS_EXECUTED_TOTAL: &str = "tn_engine.blocks_executed_total";
+/// The epoch the cross-epoch clamp tests close.
+const CLOSING_EPOCH: Epoch = 0;
+/// The epoch whose first output the cross-epoch clamp tests execute with a regressed commit time.
+const OPENING_EPOCH: Epoch = CLOSING_EPOCH + 1;
 
 /// Helper function to calculate expected priority fees for batch producer.
 fn calc_priority_fees(basefee: u64) -> u64 {
@@ -4132,6 +4148,457 @@ async fn test_engine_repack_monitor_flags_cross_producer_repack_through_engine()
         repack_monitor.total_repacked(),
         1,
         "the poached transaction must be flagged once by the engine's monitor"
+    );
+
+    Ok(())
+}
+
+/// Pins this test process's sub-second timestamp fork active (or dormant) from genesis, with the
+/// seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building a consensus output. nextest runs each test
+/// in its own process, which keeps one test's pin from reaching another; a single-process `cargo
+/// test` run shares one latch across the whole test binary instead. Reading the overrides back
+/// turns a value that latched before the pin into a named failure. Because both forks are pinned,
+/// a test that calls this behaves the same in the default and `adiri` builds.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+}
+
+/// Installs a [`DebuggingRecorder`] as this process's global metrics recorder and returns the
+/// handle that reads what it captures.
+///
+/// Call this at the start of a test, before anything touches the engine's metrics. The engine
+/// records through a process-wide `LazyLock` static whose handles bind to whichever recorder is
+/// global when the static first initializes, and it executes outputs on a blocking thread, so a
+/// thread-local recorder (`metrics::with_local_recorder`) never sees them. A process keeps one
+/// global recorder for its whole life. Each test gets its own only because nextest runs every
+/// test in a separate process; under a single-process `cargo test` run the second install fails
+/// here rather than letting a test read another test's counts.
+fn install_metrics_recorder() -> Snapshotter {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    recorder.install().expect("no global metrics recorder is installed before this test");
+    snapshotter
+}
+
+/// Every counter `snapshotter` has captured, keyed by metric name.
+///
+/// Taking a snapshot resets the counters it reads, so take it once, after the scenario has run.
+/// A counter the process never registered is absent, which reads the same as 0.
+fn snapshot_counters(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count) => Some((key.key().name().to_string(), count)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `first` and then `second` through an [`ExecutorEngine`] built on `parent`.
+///
+/// `first` is already queued and `second` arrives over the consensus channel, which then closes,
+/// so the engine executes both back to back and stops on the closed stream.
+async fn execute_outputs_back_to_back(
+    reth_env: RethEnv,
+    parent: SealedHeader,
+    gas_accumulator: GasAccumulator,
+    first: ConsensusOutput,
+    second: ConsensusOutput,
+) -> eyre::Result<()> {
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let mut engine = ExecutorEngine::new(
+        reth_env,
+        None,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    engine.push_back_queued_for_test(first);
+    assert!(to_engine.send(second).await.is_ok(), "the engine holds the consensus receiver");
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+    Ok(())
+}
+
+/// Commit and block timestamps observed by [`execute_cross_epoch_commit_regression`].
+struct CrossEpochRegression {
+    /// The `timestamp` of the block that closes [`CLOSING_EPOCH`] (`T`).
+    closing_timestamp: TimestampSec,
+    /// The `committed_at` of the first output of [`OPENING_EPOCH`] (`T - 3`).
+    regressed_committed_at: TimestampSec,
+    /// The `timestamp` of the block built from that output.
+    opening_timestamp: TimestampSec,
+}
+
+/// Closes [`CLOSING_EPOCH`] at EVM timestamp `T`, then executes the first output of
+/// [`OPENING_EPOCH`] with a commit time of `T - 3`.
+///
+/// The regression is the consensus bug the EVM clamp guards against: from the sub-second fork on,
+/// the epoch commit floor keeps an epoch's first commit after the previous epoch's closing block,
+/// and this output is built without it. Each output carries one batch, so each builds exactly one
+/// block and a clamp is counted at most once.
+async fn execute_cross_epoch_commit_regression() -> eyre::Result<CrossEpochRegression> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain, 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let closing_author = committee.authorities().first().expect("first authority").id();
+    let opening_author = committee.authorities().last().expect("last authority").id();
+    let batch_producer =
+        committee.authority(&closing_author).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    let mut batches = batches.into_iter();
+    let closing_batch = batches.next().expect("two batches");
+    let opening_batch = batches.next().expect("two batches");
+
+    // both commit times sit after genesis, so only the regression itself can trigger a clamp
+    let genesis_header = chain.sealed_genesis_header();
+    let closing_timestamp = genesis_header.timestamp + 10;
+    let regressed_committed_at = closing_timestamp - 3;
+
+    //=== Consensus: the output that closes the epoch at `T`
+    let mut closing_leader = Certificate::default();
+    closing_leader.update_header_epoch_for_test(CLOSING_EPOCH);
+    closing_leader.update_header_author_for_test(closing_author);
+    closing_leader.update_header_round_for_test(1);
+    closing_leader.update_header_created_at_for_test(closing_timestamp);
+    let closing_subdag = CommittedSubDag::new(
+        vec![closing_leader.clone()],
+        closing_leader,
+        1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let closing_output = ConsensusOutput::new(
+        closing_subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::from([closing_batch.digest()]),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![closing_batch] }],
+    );
+    assert_eq!(closing_output.committed_at(), closing_timestamp);
+
+    //=== Consensus: the next epoch's first output, committed at `T - 3`
+    //
+    // with neither a previous sub-dag nor an epoch commit floor, the commit time is the leader's
+    let mut opening_leader = Certificate::default();
+    opening_leader.update_header_epoch_for_test(OPENING_EPOCH);
+    opening_leader.update_header_author_for_test(opening_author);
+    opening_leader.update_header_round_for_test(2);
+    opening_leader.update_header_created_at_for_test(regressed_committed_at);
+    let opening_subdag = CommittedSubDag::new(
+        vec![opening_leader.clone()],
+        opening_leader,
+        2,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let opening_output = ConsensusOutput::new(
+        opening_subdag,
+        closing_output.consensus_header_hash(),
+        1,
+        false,
+        VecDeque::from([opening_batch.digest()]),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![opening_batch] }],
+    );
+    assert_eq!(opening_output.leader().epoch(), OPENING_EPOCH);
+    assert_eq!(
+        opening_output.committed_at(),
+        regressed_committed_at,
+        "the regressed commit time must reach execution unchanged"
+    );
+
+    //=== Execution
+    let reth_env = execution_node.get_reth_env().await;
+    execute_outputs_back_to_back(
+        reth_env.clone(),
+        genesis_header,
+        gas_accumulator,
+        closing_output,
+        opening_output,
+    )
+    .await?;
+
+    assert_eq!(reth_env.last_block_number()?, 2, "each output must build exactly one block");
+    let blocks = reth_env.block_with_senders_range(1..=2)?;
+    let [closing_block, opening_block] = blocks.as_slice() else {
+        panic!("expected two executed blocks, got {}", blocks.len());
+    };
+    assert_eq!(closing_block.timestamp, closing_timestamp, "the epoch must close at `T`");
+
+    Ok(CrossEpochRegression {
+        closing_timestamp,
+        regressed_committed_at,
+        opening_timestamp: opening_block.timestamp,
+    })
+}
+
+/// From the sub-second timestamp fork on, an epoch's first block never precedes the previous
+/// epoch's closing block, even when consensus hands execution an earlier commit time, and the
+/// engine counts the clamp.
+///
+/// The closing block is at `T` and the next epoch's first output commits at `T - 3` (see
+/// [`execute_cross_epoch_commit_regression`]). The block built from it is raised to `T` and
+/// `tn_engine.evm_timestamp_clamped_total` reads 1.
+#[tokio::test]
+async fn test_cross_epoch_commit_regression_clamped_to_parent_post_fork() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(true);
+    let snapshotter = install_metrics_recorder();
+    assert!(
+        subsecond_timestamp_active(OPENING_EPOCH),
+        "the pinned fork must be active for the opening leader's epoch"
+    );
+
+    let regression = execute_cross_epoch_commit_regression().await?;
+    assert_eq!(
+        regression.opening_timestamp, regression.closing_timestamp,
+        "a post-fork block must be raised to its parent's timestamp, not take the regressed \
+         commit time {}",
+        regression.regressed_committed_at
+    );
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(2),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        1,
+        "exactly the one clamped block must be counted"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork, a block keeps its output's commit time even when that
+/// precedes the parent block's, so replaying pre-fork history reproduces the original timestamps.
+///
+/// Same scenario as [`test_cross_epoch_commit_regression_clamped_to_parent_post_fork`] with the
+/// fork dormant: the block built from the output committed at `T - 3` keeps `T - 3`, and
+/// `tn_engine.evm_timestamp_clamped_total` stays at 0.
+#[tokio::test]
+async fn test_cross_epoch_commit_regression_unclamped_pre_fork() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(false);
+    let snapshotter = install_metrics_recorder();
+    assert!(
+        !subsecond_timestamp_active(OPENING_EPOCH),
+        "the pinned fork must be dormant for the opening leader's epoch"
+    );
+
+    let regression = execute_cross_epoch_commit_regression().await?;
+    assert_eq!(
+        regression.opening_timestamp, regression.regressed_committed_at,
+        "a pre-fork block must keep its commit time even when it precedes the parent's {}",
+        regression.closing_timestamp
+    );
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(2),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        0,
+        "a pre-fork block is never clamped"
+    );
+
+    Ok(())
+}
+
+/// Consecutive outputs committed within one second share that second as their EVM `timestamp`,
+/// so their EIP-4788 writes land in the same ring-buffer entry and the latest output's
+/// `ConsensusHeader` root wins.
+///
+/// Two outputs commit 500 ms apart inside one second, each with two batches. Every block of both
+/// outputs carries that second. The entry holds the first output's root through the first
+/// output's blocks and the second output's root from the second output's first block on, so at
+/// the tip it holds the latest root. The first root stays reachable because the second output's
+/// `ConsensusHeader` names it as its parent. Blocks that only repeat their parent's timestamp are
+/// not clamps, so the clamp counter stays at 0.
+#[tokio::test]
+async fn test_same_second_outputs_eip4788_latest_root_wins() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(true);
+    let snapshotter = install_metrics_recorder();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // two batches per output
+    let chain = test_chain_spec_arc();
+    let batches_1 = tn_reth::test_utils::batches(chain.clone(), 2);
+    let batches_2 = tn_reth::test_utils::batches(chain, 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let all_batches = [batches_1.clone(), batches_2.clone()].concat();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first authority").id();
+    let authority_2 = committee.authorities().last().expect("last authority").id();
+    let batch_producer =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: two outputs committed 500 ms apart within `second`
+    let genesis_header = chain.sealed_genesis_header();
+    let second = genesis_header.timestamp + 1;
+    let mut leader_1 = Certificate::default();
+    leader_1.update_header_author_for_test(authority_1);
+    leader_1.update_header_round_for_test(1);
+    leader_1.update_header_created_at_ms_for_test(TimestampMs::from_parts(second, 200));
+    let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
+        leader_1,
+        1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests_1,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+    );
+
+    let mut leader_2 = Certificate::default();
+    leader_2.update_header_author_for_test(authority_2);
+    leader_2.update_header_round_for_test(2);
+    leader_2.update_header_created_at_ms_for_test(TimestampMs::from_parts(second, 700));
+    let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
+    let subdag_2 = CommittedSubDag::new(
+        vec![leader_2.clone()],
+        leader_2,
+        2,
+        ReputationScores::default(),
+        Some(subdag_1),
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        false,
+        batch_digests_2,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+    );
+
+    // both commits fall inside `second`, the later one strictly after the earlier
+    assert_eq!(consensus_output_1.committed_at(), second);
+    assert_eq!(consensus_output_2.committed_at(), second);
+    assert_eq!(consensus_output_1.committed_at_ms(), TimestampMs::from_parts(second, 200));
+    assert_eq!(consensus_output_2.committed_at_ms(), TimestampMs::from_parts(second, 700));
+
+    let root_1 = consensus_output_1.consensus_header_hash();
+    let root_2 = consensus_output_2.consensus_header_hash();
+    assert_ne!(root_1, root_2, "each output must write its own root");
+    // the overwritten root stays reachable by walking the consensus chain back from the survivor
+    assert_eq!(consensus_output_2.parent_hash(), root_1);
+
+    //=== Execution
+    let reth_env = execution_node.get_reth_env().await;
+    execute_outputs_back_to_back(
+        reth_env.clone(),
+        genesis_header,
+        gas_accumulator,
+        consensus_output_1,
+        consensus_output_2,
+    )
+    .await?;
+
+    let expected_block_height = 4;
+    assert_eq!(reth_env.last_block_number()?, expected_block_height);
+    let executed_blocks = reth_env.block_with_senders_range(1..=expected_block_height)?;
+    assert_eq!(executed_blocks.len() as u64, expected_block_height);
+    for (idx, block) in executed_blocks.iter().enumerate() {
+        assert_eq!(block.timestamp, second, "block {} must carry the shared second", block.number);
+
+        // the entry holds the first output's root through that output's two blocks; the second
+        // output's first block overwrites it, so from there on, tip included, the latest root wins
+        let expected_root = if idx < 2 { root_1 } else { root_2 };
+        assert_eip4788(&reth_env, block.sealed_block(), expected_root)?;
+    }
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(expected_block_height),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        0,
+        "a block that repeats its parent's timestamp is not a clamp"
     );
 
     Ok(())
