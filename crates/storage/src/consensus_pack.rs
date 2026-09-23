@@ -136,6 +136,7 @@ enum PackMessage {
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
+    LatestConsensusNumber(oneshot::Sender<u64>),
     Shutdown,
     AsyncShutdown(oneshot::Sender<()>),
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
@@ -209,6 +210,9 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
             }
             PackMessage::LatestConsensusHeader(tx) => {
                 let _ = tx.send(inner.latest_consensus_header());
+            }
+            PackMessage::LatestConsensusNumber(tx) => {
+                let _ = tx.send(inner.latest_consensus_number());
             }
             PackMessage::Shutdown => break,
             PackMessage::AsyncShutdown(tx) => {
@@ -819,6 +823,20 @@ impl ConsensusPack {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
             rx.await.unwrap_or(Err(PackError::SendFailed))
+        } else {
+            Err(PackError::SendFailed)
+        }
+    }
+
+    /// The latest stored consensus number, defined for ANY pack with a valid meta: `start + N - 1`
+    /// for N outputs, or `start - 1` (the previous epoch's final consensus number) for a meta-only
+    /// pack. Used at startup to clamp a `LatestConsensus` hint a power loss left ahead of the
+    /// recovered pack (a meta-only pack is the deterministic epoch-boundary case, where
+    /// [`Self::latest_consensus_header`] returns `None`).
+    pub async fn latest_consensus_number(&self) -> Result<u64, PackError> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::LatestConsensusNumber(tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::SendFailed)
         } else {
             Err(PackError::SendFailed)
         }
@@ -2129,6 +2147,14 @@ impl Inner {
         let latest_number =
             self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1;
         self.consensus_header_by_number(latest_number).map(Some)
+    }
+
+    /// The latest stored consensus number. Unlike [`Self::latest_consensus_header`], this is
+    /// defined even for a meta-only pack (no outputs): `start + len - 1` is `start - 1` there —
+    /// the previous epoch's final consensus number. `start_consensus_number >= 1` (epoch 0
+    /// starts at 1), so this never underflows.
+    fn latest_consensus_number(&self) -> u64 {
+        self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {

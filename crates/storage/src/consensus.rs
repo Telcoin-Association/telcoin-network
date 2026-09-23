@@ -302,6 +302,14 @@ impl LatestConsensus {
         self.state.lock().number
     }
 
+    /// Reconcile the hint's number DOWN to `number` (the recovered pack's latest). In-memory only:
+    /// the pack is ground truth, the node re-persists the slots as it saves outputs, and a crash
+    /// before that just re-clamps idempotently at the next open. Keeps the epoch (which
+    /// [`ConsensusChain::new`] uses to open the current pack).
+    fn clamp_to(&self, number: u64) {
+        self.state.lock().number = number;
+    }
+
     /// Take ownership and close async so we Drop does not get a chance to block any threads.
     /// Note, will only close if this is the last reference to this object.
     /// Essentially this an async drop.
@@ -1172,6 +1180,30 @@ impl ConsensusChain {
         self.latest_consensus.number()
     }
 
+    /// Reconcile the `LatestConsensus` hint down to the recovered current pack at startup.
+    ///
+    /// The hint (a durable, fsync'd slot) can end up AHEAD of the pack after a power loss: the slot
+    /// is written before `persist_current` msyncs the pack, so a crash can leave `(epoch, k)`
+    /// durable while output k is not — including deterministically at every epoch boundary,
+    /// where the pack then recovers meta-only. On restart the executor re-derives its parent
+    /// from the pack (`k-1`) and re-saves output k, which the ahead hint refuses
+    /// (`NonMonotonicConsensusNumber`) → a crash-loop. The pack is ground truth, so clamp the
+    /// hint to the pack's actual latest number. Call once, right after opening the chain for
+    /// writing.
+    pub async fn clamp_latest_to_pack(&self) -> Result<(), ConsensusChainError> {
+        let pack_latest = self.current_pack().latest_consensus_number().await?;
+        let hint = self.latest_consensus.number();
+        if hint > pack_latest {
+            warn!(
+                target: "consensus_chain",
+                hint, pack = pack_latest,
+                "LatestConsensus hint is ahead of the recovered pack; clamping to the pack tip"
+            );
+            self.latest_consensus.clamp_to(pack_latest);
+        }
+        Ok(())
+    }
+
     /// Return the last consensus epoch that was processed.
     pub fn latest_consensus_epoch(&self) -> Epoch {
         self.latest_consensus.epoch()
@@ -1973,6 +2005,96 @@ mod test {
             consensus_chain.latest_consensus.number(),
             2,
             "latest_consensus must not change on a rejected output"
+        );
+    }
+
+    /// Item #13: after a power loss the durable `LatestConsensus` hint can be AHEAD of the
+    /// recovered pack, so the executor's re-derived output is refused
+    /// (`NonMonotonicConsensusNumber`) and the node crash-loops. `clamp_latest_to_pack`
+    /// reconciles the hint to the pack tip so it resumes.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_reconciles_ahead_slot() {
+        let temp_dir = TempDir::with_prefix("test_clamp_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        // Save outputs 1 and 2: pack tip = 2, hint = 2.
+        let parent = ConsensusHeader::default().digest();
+        let output1 = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest());
+        let output3 = make_test_output(&committee, 2, chain.clone(), 3, output2.digest());
+        consensus_chain.save_consensus_output(output1).await.unwrap();
+        consensus_chain.save_consensus_output(output2).await.unwrap();
+        assert_eq!(consensus_chain.latest_consensus.number(), 2);
+
+        // Simulate the power loss: the slot was fsync'd to 3 while output 3 never reached the pack.
+        consensus_chain.latest_consensus.update(0, 3).await;
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+
+        // Reproduce the crash-loop: the re-derived output 3 is refused by the ahead hint.
+        let err = consensus_chain
+            .save_consensus_output(output3.clone())
+            .await
+            .expect_err("an ahead hint must refuse the re-derived output");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::NonMonotonicConsensusNumber { latest: 3, number: 3 }
+            ),
+            "expected NonMonotonicConsensusNumber {{ latest: 3, number: 3 }}, got {err:?}"
+        );
+
+        // The clamp reconciles the hint to the pack tip (2).
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp");
+        assert_eq!(consensus_chain.latest_consensus.number(), 2, "hint clamped to the pack tip");
+
+        // Now the re-derived output 3 is accepted and the node makes progress.
+        consensus_chain.save_consensus_output(output3).await.expect("output 3 saved after clamp");
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+    }
+
+    /// Item #13, the deterministic epoch-boundary case: the current pack recovered meta-only (no
+    /// outputs) while the hint says a number was saved. `latest_consensus_header` returns `None`
+    /// there, so the clamp must use `latest_consensus_number` (= `start_consensus_number - 1`).
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_meta_only_pack() {
+        let temp_dir = TempDir::with_prefix("test_clamp_meta_only").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee).await.unwrap();
+        // Meta-only epoch-0 pack: start_consensus_number == 1, no outputs -> latest number 0.
+        assert_eq!(consensus_chain.latest_consensus.number(), 0);
+
+        // A not-ahead hint is a no-op.
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp no-op");
+        assert_eq!(consensus_chain.latest_consensus.number(), 0);
+
+        // Power loss left the hint ahead (an output was fsync'd to the slot but not the pack).
+        consensus_chain.latest_consensus.update(0, 5).await;
+        assert_eq!(consensus_chain.latest_consensus.number(), 5);
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp");
+        assert_eq!(
+            consensus_chain.latest_consensus.number(),
+            0,
+            "meta-only pack: hint clamped to start_consensus_number - 1"
         );
     }
 

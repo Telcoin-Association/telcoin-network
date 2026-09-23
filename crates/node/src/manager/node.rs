@@ -718,6 +718,10 @@ where
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
+        // A power loss can leave the durable `LatestConsensus` hint ahead of the recovered pack
+        // (e.g. meta-only at an epoch boundary); reconcile it to the pack tip so the executor's
+        // re-derived output is not refused as non-monotonic on restart.
+        consensus_chain.clamp_latest_to_pack().await?;
         // shutdown long-running node components
         let node_shutdown = ShutdownNotifier::new();
 
