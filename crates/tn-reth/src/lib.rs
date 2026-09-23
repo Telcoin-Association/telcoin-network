@@ -128,6 +128,7 @@ mod env;
 pub mod error;
 mod evm;
 pub mod forward;
+mod forward_pending;
 mod metrics;
 mod rpc_fee_cap;
 mod rpc_fee_history;

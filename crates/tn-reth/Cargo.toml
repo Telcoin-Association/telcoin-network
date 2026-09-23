@@ -106,12 +106,19 @@ tokio = { workspace = true, features = [
 default = []
 faucet = []
 test-utils = ["dep:secp256k1"]
+# Expose the production sorted-run accumulator to the allocation benchmark.
+bench-internals = []
 adiri = ["faucet", "tn-types/adiri"]
 # Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
 # Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
 # zero-size stub and the 332-translation-unit native compile is skipped entirely.
 # Required before any storage-v2 / `StorageSettings` experimentation.
 rocksdb = ["reth/rocksdb"]
+
+[[bench]]
+name = "output_overlay"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
