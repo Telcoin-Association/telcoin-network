@@ -430,8 +430,12 @@ impl PrimaryNetworkHandle {
         }
         match res {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s))
-            | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            // still recoverable after the retries above: report it as retryable so the caller
+            // backs off and asks again rather than giving up on this peer for the header
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                Err(NetworkError::RPCRetryable(s))
+            }
+            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
