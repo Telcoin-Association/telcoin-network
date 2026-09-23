@@ -818,8 +818,8 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
 
 /// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
 ///
-/// Keytool currently generates only worker 0. Derive the second identity from the same keys
-/// the node loads at startup, and share both workers' addresses before starting any processes.
+/// Preserve the identities in the one-worker genesis while adding local capacity for worker 1.
+/// Share both workers' addresses before starting any processes.
 fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> eyre::Result<()> {
     let bootstrap_peers = committee
         .iter()
@@ -846,6 +846,141 @@ fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> 
     let network: NetworkConfig =
         serde_json::from_value(serde_json::json!({ "bootstrap_peers": bootstrap_peers }))?;
     committee.iter().try_for_each(|(name, _)| network.write_config(&temp_path.join(name)))
+}
+
+/// Reserve worker 0's HTTP port and worker 1's derived port (200 lower) together.
+fn reserve_two_worker_http_ports() -> eyre::Result<(std::net::TcpListener, std::net::TcpListener)> {
+    (0..32)
+        .find_map(|_| {
+            let first = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let second_port = first.local_addr().ok()?.port().checked_sub(200)?;
+            std::net::TcpListener::bind(("127.0.0.1", second_port))
+                .ok()
+                .map(|second| (first, second))
+        })
+        .ok_or_else(|| eyre::eyre!("could not reserve both workers' HTTP ports"))
+}
+
+/// An observer's worker-1 pool forwards through the worker-1 endpoints supplied by keytool.
+/// Worker 0 advertises no endpoint, so selecting the wrong record cannot make this test pass.
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
+    use clap::Parser as _;
+    use telcoin_network_cli::keytool::KeyArgs;
+    use tn_types::test_utils::CommandParser;
+
+    let _permit = super::common::acquire_test_permit();
+    pin_fork_epochs(Some(0), None, None);
+    let temp_dir = tempfile::TempDir::with_prefix("worker_rpc")?;
+    e2e_tests::config_local_testnet_with_worker_fee_configs(
+        temp_dir.path(),
+        Some("restart_test".to_string()),
+        None,
+        None,
+        &["0:1:7", "1:1:7"],
+    )?;
+    let nodes = (0..5)
+        .map(|index| {
+            let name =
+                if index < 4 { format!("validator-{}", index + 1) } else { "observer".to_string() };
+            reserve_two_worker_http_ports().map(|(first, second)| (name, first, second))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    nodes.iter().filter(|(name, _, _)| name != "observer").try_for_each(
+        |(name, _, second)| -> eyre::Result<()> {
+            let url = format!("http://127.0.0.1:{}", second.local_addr()?.port());
+            let command = CommandParser::<KeyArgs>::try_parse_from([
+                "tn",
+                "set-rpc",
+                "--worker-id",
+                "1",
+                "--http",
+                &url,
+            ])?;
+            command.args.execute(temp_dir.path().join(name), None)
+        },
+    )?;
+
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut guard = ProcessGuard::empty();
+    let endpoints = nodes
+        .into_iter()
+        .map(|(name, first, second)| -> eyre::Result<_> {
+            let base_port = first.local_addr()?.port();
+            let url = format!("http://127.0.0.1:{}", second.local_addr()?.port());
+            drop((first, second));
+            let mut command = bin.command();
+            command
+                .env("TN_BLS_PASSPHRASE", "restart_test")
+                .arg("node")
+                .arg("--datadir")
+                .arg(temp_dir.path().join(&name))
+                .arg("--http")
+                .arg("--http.port")
+                .arg(base_port.to_string())
+                .arg("--ipcpath")
+                .arg(temp_dir.path().join(format!("{name}.ipc")))
+                .arg("--node-name")
+                .arg(format!("worker-rpc-{name}"));
+            if name == "observer" {
+                command.arg("--observer");
+            }
+            guard.push(command.spawn()?);
+            Ok((name, url))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    // Empty non-epoch-closing outputs skip execution, so the height stays at genesis until the
+    // forwarded transaction lands. Wait only for each worker-1 RPC server to answer.
+    futures::future::try_join_all(endpoints.iter().map(|(_, url)| async move {
+        let provider = ProviderBuilder::new().connect_http(url.parse()?);
+        wait_until(std::time::Duration::from_secs(60), "worker 1 RPC to answer", || async {
+            Ok(provider.get_block_number().await.is_ok())
+        })
+        .await
+    }))
+    .await?;
+
+    let observer_url = endpoints
+        .iter()
+        .find(|(name, _)| name == "observer")
+        .map(|(_, url)| url)
+        .ok_or_else(|| eyre::eyre!("missing observer endpoint"))?;
+    let validator_url = endpoints
+        .iter()
+        .find(|(name, _)| name == "validator-1")
+        .map(|(_, url)| url)
+        .ok_or_else(|| eyre::eyre!("missing validator endpoint"))?;
+    let hash = super::common::send_tel(
+        observer_url,
+        &super::common::get_key("test-source"),
+        Address::from_slice(&[0x77; 20]),
+        1_000_000_000_000_000,
+        250,
+        21_000,
+        0,
+    )?
+    .parse()?;
+    let validator = ProviderBuilder::new().connect_http(validator_url.parse()?);
+    wait_until(
+        std::time::Duration::from_secs(60),
+        "worker 1 observer transaction to be included",
+        || async {
+            validator
+                .get_transaction_receipt(hash)
+                .await
+                .map(|receipt| receipt.is_some())
+                .map_err(Into::into)
+        },
+    )
+    .await?;
+    let receipt = validator
+        .get_transaction_receipt(hash)
+        .await?
+        .ok_or_else(|| eyre::eyre!("forwarded transaction receipt disappeared"))?;
+    eyre::ensure!(receipt.status(), "forwarded transaction reverted");
+    guard.kill_all();
+    Ok(())
 }
 
 /// Governance can grow and shrink the protocol worker count while validators keep running.
