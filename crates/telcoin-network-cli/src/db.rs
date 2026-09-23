@@ -217,6 +217,15 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
 /// optional `--epoch`. In all-mode (`requested == None`) the current/latest epoch — the one a
 /// running node holds open for append — is skipped and returned as the second element; `--epoch N`
 /// targets exactly N (no skip). The caller validates that a requested epoch exists.
+///
+/// "Current" here is a best-effort heuristic: the highest-numbered `epoch-{N}` directory. That is
+/// the live epoch except in the brief window during an epoch transition when the next epoch's
+/// directory already exists on disk before the node has switched to it — the `LatestConsensus`
+/// slot, not the directory listing, is the authoritative current epoch. This skip is only a
+/// convenience guard against fat-fingering a repair of the live pack; the real safety requirement
+/// is that the node is stopped (a running node holds its pack mmap'd for append regardless of which
+/// epoch is "current"). Pass `--epoch N` to target an exact epoch when the heuristic would pick
+/// wrong.
 fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Option<Epoch>) {
     let current = all.last().copied();
     match requested {

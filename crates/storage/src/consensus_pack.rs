@@ -1210,15 +1210,27 @@ impl Inner {
         // output). Anything after it is an incomplete/torn tail and is truncated away by the
         // caller.
         let mut consistent_end = iter.logical_position();
+        // Only the very first record may be an EpochMeta; a second one mid-log is
+        // append-order-impossible (see the EpochMeta arm below).
+        let mut first_record = true;
 
         loop {
             let header_pos = iter.logical_position();
+            let is_first = first_record;
+            first_record = false;
             match iter.next() {
                 // Clean EOF on an output boundary: every complete output has been replayed.
                 None => break,
                 // The leading EpochMeta carries no index data (epoch_meta is already loaded and the
-                // pos index is 0-based); skip it, but keep it in the consistent prefix.
+                // pos index is 0-based); skip it, but keep it in the consistent prefix. A
+                // *non-leading* EpochMeta is structurally impossible in append order (each pack is
+                // written with exactly one, first) -- treat it as corruption, matching
+                // `validate_pack_file`, rather than silently folding it into the consistent prefix
+                // (which would leave the on-disk log validating as damaged after any repair).
                 Some(Ok(PackRecord::EpochMeta(_))) => {
+                    if !is_first {
+                        return Err(Self::corrupt_pack(base_dir));
+                    }
                     consistent_end = iter.logical_position();
                     continue;
                 }
@@ -1283,8 +1295,9 @@ impl Inner {
                     }
                     break;
                 }
-                // v1 is header-first, so a decodable batch (or a stray second epoch meta) where a
-                // header is expected is append-order-impossible -- genuine corruption, not a tail.
+                // v1 is header-first, so a decodable batch where a header is expected is
+                // append-order-impossible -- genuine corruption, not a tail. (A stray second
+                // EpochMeta is rejected above in the EpochMeta arm.)
                 Some(Ok(_)) => return Err(Self::corrupt_pack(base_dir)),
             }
         }
@@ -5806,6 +5819,79 @@ pub(crate) mod test {
         assert!(
             matches!(res, Err(PackError::CorruptPack(_))),
             "mid-log corruption must error, got {res:?}"
+        );
+    }
+
+    /// Finding #37: a second, non-leading `EpochMeta` in the data log is append-order-impossible
+    /// (each pack is written with exactly one meta, first). `replay_wal` must reject it as
+    /// `CorruptPack` rather than silently folding it into the consistent prefix — which would leave
+    /// the on-disk log validating as damaged after any repair (validate flags the stray meta, so
+    /// `repair_epoch` would rebuild and then return `Unrepairable`). Mirrors
+    /// `test_recover_mid_log_corruption_errors`.
+    #[tokio::test]
+    async fn test_recover_rejects_stray_mid_log_epoch_meta() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+        let temp_dir = TempDir::with_prefix("test_recover_stray_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Frame a stray EpochMeta record exactly as the writer would (a hand-rolled size prefix
+        // would desync the reader): write one into a scratch pack, then lift its bytes past
+        // the data-file header. Read after the pack drops so the file is truncated to
+        // `[header][record][sentinel]`; the trailing clean-close sentinel is harmless —
+        // replay rejects the stray meta well before it reaches the tail.
+        let scratch = temp_dir.path().join("scratch_meta");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&scratch, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open scratch");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append stray meta");
+            pack.commit().expect("commit scratch");
+        }
+        let stray_meta_bytes =
+            std::fs::read(&scratch).expect("read scratch")[DATA_HEADER_BYTES..].to_vec();
+
+        // Overwrite from the end of the last output (output 3) with the framed stray meta,
+        // clobbering the clean-close sentinel that sits there. Appending past the sentinel
+        // instead would leave its 8 bytes between output 3 and the stray meta, and replay
+        // would stop at them as a torn tail before ever reaching the meta.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to output 3 end");
+            f.write_all(&stray_meta_bytes).expect("write stray meta bytes");
+        }
+        // Force recovery (replay_wal) to run by dropping the digest indexes.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
+        }
+
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(PackError::CorruptPack(_))),
+            "a stray mid-log EpochMeta must error, got {res:?}"
         );
     }
 

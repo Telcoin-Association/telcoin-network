@@ -114,12 +114,37 @@ fn run_pack_loop(
 impl Drop for CertificatePack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            if let Some(_handle) = self.handle.lock().take() {
-                error!(target: "certificate_pack", "DID NOT CALL SHUTDOWN on certificate pack for epoch {}", self.epoch);
-                // Make an effort to shutdown anyway but this may not have time to run.
-                // Ideally would wait on the handle to join but don't block the Drop or mess around
-                // with an async runtime- not calling shutdown is the root problem.
-                let _ = self.tx.try_send(PackMessage::Shutdown);
+            // Reaching this with a live handle means shutdown() was NOT used: a correct
+            // shutdown().await already took the handle, so the block below is skipped. Drop is the
+            // safety net; the proper async path is shutdown().await. Mirrors ConsensusPack /
+            // EpochRecordDb / LatestConsensus so all four actors seal consistently on a dropped
+            // last reference.
+            if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "certificate_pack", "CertificatePack for epoch {} dropped without calling shutdown(); persisting as a fallback", self.epoch);
+                if self.tx.try_send(PackMessage::Shutdown).is_err() {
+                    // Full bounded channel -- detach. The actor still persists when the last Sender
+                    // drops (Inner's Drop clean-closes); only the synchronous "persisted on return"
+                    // wait is lost, and only on this misuse path.
+                    error!(target: "certificate_pack", "Failed to send shutdown message to CertificatePack (should be using shutdown())");
+                    return;
+                }
+                let epoch = self.epoch;
+                let join = move || {
+                    if let Err(e) = handle.join() {
+                        error!(target: "certificate_pack", ?e, epoch, "Failed to join certificate pack thread");
+                    }
+                };
+                // Never block a multi-threaded runtime worker on the persist/fsync: offload the
+                // join to the blocking pool. On a current-thread runtime (nothing
+                // else to starve) or no runtime, a synchronous join keeps
+                // "persisted on return" for callers/tests that drop
+                // then immediately reopen. `shutdown().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
+                }
             }
         }
     }

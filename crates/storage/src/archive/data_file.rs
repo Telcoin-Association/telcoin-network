@@ -688,9 +688,12 @@ impl MmapDataFile {
         }
     }
 
-    /// Clone the underlying file handle, flushing `[0, end)` first so the cloned handle's read
-    /// syscalls observe the current mmap writes. Returns the clone together with the logical `end`
-    /// at the moment of the call.
+    /// Clone the underlying file handle, `msync`ing `[0, end)` first. That `flush_range` is a
+    /// durability barrier (`MS_SYNC`), not merely a visibility hint: it writes the mapped region
+    /// back to the file so the cloned fd reads committed bytes even on platforms where mmap
+    /// stores and plain `read()` are not guaranteed coherent, and so a consumer copying through
+    /// the clone gets durable data; it also advances `flushed_end`. Returns the clone together
+    /// with the logical `end` at the moment of the call.
     ///
     /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
     /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
@@ -703,7 +706,8 @@ impl MmapDataFile {
     pub fn try_clone(&self) -> io::Result<(File, u64)> {
         if !self.read_only && self.end > 0 {
             if let Backing::Rw(map) = &self.backing {
-                // Flush dirty pages so the cloned handle observes current data.
+                // msync `[0, end)` back to the file: a durability barrier, and the coherence
+                // guarantee for the clone's plain `read()`/copy syscalls.
                 map.flush_range(0, self.end as usize)?;
             }
             // The whole `[0, end)` region was just flushed durably.
@@ -984,6 +988,16 @@ impl Drop for MmapDataFile {
         // vouch for the durability of the `[flushed_end, end)` tail, so leave the file unsentineled
         // and let the next open take the recovery/heal path rather than trust a possibly-short
         // tail.
+        //
+        // Crash-window note: if the process dies after the `set_len(self.end)` above but before
+        // this sentinel is durable, the file is left at exactly `end` data bytes. A later
+        // open then tests the last 8 DATA bytes as a candidate sentinel and could read the
+        // file as cleanly sealed at `end - 8` — but only if those 8 bytes happen to equal
+        // `clean_close_sentinel(end - 8)`, a ~2^-64 coincidence (and not forgeable: the
+        // writer is trusted, the sentinel is not a security boundary). This residual window
+        // is accepted rather than fixed: a magic prefix would only shrink it while forcing
+        // an on-disk format/version break, and a missed seal merely costs a recovery pass
+        // on the next open.
         if flushed && self.end > 0 {
             let sentinel = clean_close_sentinel(self.end);
             if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
