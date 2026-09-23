@@ -20,7 +20,7 @@ use tn_network_libp2p::{
 };
 use tn_storage::{consensus::ConsensusChain, tables::Votes, CertificateStore, VoteDigestStore};
 use tn_types::{
-    ensure,
+    ceil_secs, ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     forks::subsecond_timestamp_active,
     now_ms, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
@@ -927,15 +927,6 @@ where
             stake >= threshold,
             CertManagerError::from(CertificateError::Inquorate { stake, threshold }).into()
         );
-
-        /// Round `d` up to whole seconds for comparison with second-granularity header timestamps.
-        ///
-        /// Only the drift check for epochs without sub-second timestamps uses this: a whole-second
-        /// timestamp cannot express a sub-second lead, so the 250 ms default admits a header up to
-        /// 1 s ahead there.
-        fn ceil_secs(d: Duration) -> u64 {
-            d.as_secs().saturating_add(u64::from(d.subsec_nanos() != 0))
-        }
 
         // verify the header was not created in the future. this runs before the batch sync so a
         // rejection costs no batch fetches. there is only an upper bound (see the parent rule

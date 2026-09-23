@@ -426,7 +426,7 @@ impl PrimaryNetworkHandle {
         let mut res = res.await??.result;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            warn!(
+            debug!(
                 target: "primary::network",
                 %peer,
                 error = %clip_peer_error(s),
