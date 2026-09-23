@@ -357,8 +357,8 @@ pub struct SyncConfig {
     /// to the next whole second: the 250 ms default behaves as 1 s.
     ///
     /// The config file accepts either a bare integer, read as whole seconds (the format older
-    /// config files use), or a humantime string such as `"250ms"` or `"1s"`. The value is always
-    /// written back as a humantime string.
+    /// config files use, and logged as a warning when read), or a humantime string such as
+    /// `"250ms"` or `"1s"`. The value is always written back as a humantime string.
     #[serde(deserialize_with = "secs_or_humantime", serialize_with = "humantime_serde::serialize")]
     pub max_header_time_drift_tolerance: Duration,
     /// The maximum number of missing certificates a CVV peer can request within GC window.
@@ -675,6 +675,10 @@ impl ScoreConfig {
 /// The integer form keeps older config files loading: nodes persisted
 /// `max_header_time_drift_tolerance: 1` when that field was a whole number of seconds, and a
 /// plain humantime deserializer rejects the bare integer.
+///
+/// Reading the integer form logs a warning each time it is parsed. Older binaries persisted
+/// their whole-second default, so an upgraded node keeps that value, rather than the sub-second
+/// default, until an operator rewrites it.
 fn secs_or_humantime<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
@@ -691,7 +695,16 @@ where
         }
 
         fn visit_u64<E: de::Error>(self, secs: u64) -> Result<Duration, E> {
-            Ok(Duration::from_secs(secs))
+            let drift_tolerance = Duration::from_secs(secs);
+            warn!(
+                target: "tn::config",
+                ?drift_tolerance,
+                default = ?SyncConfig::default().max_header_time_drift_tolerance,
+                "max_header_time_drift_tolerance is a bare integer of seconds, the format older \
+                 binaries wrote, so this node runs with that tolerance instead of the default; set \
+                 a humantime value such as \"250ms\" in the network config to change it"
+            );
+            Ok(drift_tolerance)
         }
 
         fn visit_str<E: de::Error>(self, value: &str) -> Result<Duration, E> {

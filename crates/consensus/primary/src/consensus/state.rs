@@ -380,6 +380,12 @@ pub(crate) fn resolve_seed_chain_anchor(
 ///   without a close yields `None` and logs a warning; the node's epoch startup supplies one for
 ///   every epoch after 0, and only test configs omit it.
 ///
+/// Commit milliseconds therefore strictly increase within an epoch but not across the seam. The
+/// closing EVM block keeps only whole seconds, so this floor drops the sub-second part of the
+/// previous epoch's last commit: the epoch's first commit lands after the closing second but can
+/// sit up to 998 ms below that last commit. The whole seconds, and so the EVM timestamp, never
+/// decrease.
+///
 /// `gate_active` is [`subsecond_timestamp_active`] for `epoch`. The caller evaluates it so every
 /// branch stays testable under any build's fork schedule.
 fn resolve_epoch_commit_floor(

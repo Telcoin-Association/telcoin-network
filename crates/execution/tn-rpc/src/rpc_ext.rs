@@ -64,6 +64,11 @@ pub struct BlockTimestampMillis {
     /// Read from the consensus header's committed sub-dag, not computed from `timestamp`. The one
     /// exception is a block without a consensus header (genesis), which reports
     /// `timestamp * 1000`.
+    ///
+    /// Non-decreasing within an epoch; blocks executed from one consensus output share a value.
+    /// Across an epoch boundary only `timestamp` is guaranteed not to decrease: the blocks of an
+    /// epoch's first commit can report up to 998 ms less than the previous epoch's last block,
+    /// within the same whole second.
     pub timestamp_millis: U64,
     /// Whether the consensus header's leader epoch commits with millisecond resolution.
     ///
@@ -141,6 +146,13 @@ pub trait TelcoinNetworkRpcExtApi {
     /// the first block is finalized, and heights below a snapshot-restored node's restored header
     /// window. A known block whose consensus header is missing from local storage (for example,
     /// its epoch's consensus pack is absent) is a "Not Found." error rather than `null`.
+    ///
+    /// Validators should not expose the `tn` namespace publicly. A request for a block from a
+    /// sealed epoch can open that epoch's consensus pack, and the storage layer opens packs
+    /// synchronously into a small cache it shares with state sync and peer epoch serving. The
+    /// lookup runs off the async runtime and under a tight concurrency bound, but public callers
+    /// can still churn that cache until storage opens and evicts packs without blocking; serve the
+    /// namespace from non-validating nodes instead.
     #[method(name = "getBlockTimestampMillis")]
     async fn get_block_timestamp_millis(
         &self,
@@ -256,12 +268,13 @@ pub trait TelcoinNetworkRpcExtApi {
 
 /// Maximum number of concurrent blocking tasks the `tn` namespace may have in flight.
 ///
-/// Covers every kind of synchronous work this namespace dispatches off the async runtime:
+/// Covers the synchronous work this namespace dispatches off the async runtime:
 /// [`ConsensusRegistry`] reads, which build a fresh EVM and state snapshot at the canonical tip
 /// (database plus CPU), the execution header read behind `getBlockTimestampMillis` (database),
 /// and the BLS12-381 G2 decompress behind `proofOfPossessionMessage` (pure CPU, tens of
 /// microseconds per call). A semaphore permit is held for the full lifetime of the blocking work,
-/// so this bounds true blocking-pool occupancy, not just in-flight requests.
+/// so this bounds true blocking-pool occupancy, not just in-flight requests. Consensus-pack
+/// lookups also run on the blocking pool but under their own [`MAX_CONCURRENT_PACK_READS`] bound.
 ///
 /// One bound covers them all deliberately. The budget below is a share of a pool the whole process
 /// contends for, so splitting it into a guard per endpoint would let their worst cases add up and
@@ -276,12 +289,22 @@ const MAX_CONCURRENT_BLOCKING_RPC_WORK: usize = 64;
 
 /// Maximum number of consensus-pack lookups `getBlockTimestampMillis` may have in flight.
 ///
-/// Each epoch's consensus pack is served by a single thread, and the current epoch's thread also
-/// persists consensus output. Every lookup that misses the commit-time cache queues on one of
-/// these threads, so the bound is small to keep RPC load from delaying consensus writes. It is
-/// separate from [`MAX_CONCURRENT_BLOCKING_RPC_WORK`] because it guards a different resource: the
-/// pack threads, not the blocking pool.
-const MAX_CONCURRENT_PACK_READS: usize = 8;
+/// A lookup that misses the commit-time cache reaches consensus storage, whose resources it shares
+/// with consensus and state sync rather than owning any of them:
+///
+/// - Each epoch's consensus pack is served by a single thread, and the current epoch's thread also
+///   persists consensus output, so every lookup queues behind consensus writes or delays them.
+/// - Sealed packs are opened into a ten-entry cache that state sync and peer epoch serving read
+///   through as well. A lookup for an uncached sealed epoch opens its pack and evicts the oldest
+///   entry, and an eviction that drops the last handle to a pack joins that pack's thread while
+///   holding the cache lock every other sealed-pack reader takes.
+///
+/// The bound is therefore kept at two, which caps how fast public callers can churn that cache
+/// and how long they can hold its lock. It is separate from [`MAX_CONCURRENT_BLOCKING_RPC_WORK`]
+/// because it guards those storage resources, not the blocking pool: each lookup does occupy a
+/// blocking-pool thread (see [`TelcoinNetworkRpcExt::consensus_header_from_pack`]), and this bound
+/// adds at most two threads to that budget.
+const MAX_CONCURRENT_PACK_READS: usize = 2;
 
 /// Number of consensus headers whose commit time `getBlockTimestampMillis` keeps cached.
 ///
@@ -390,7 +413,8 @@ pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
     /// The inner-node network.
     ///
     /// The interface that handles primary <-> engine network communication. Shared so a
-    /// consensus-pack lookup can run as its own task (see [`Self::consensus_header_from_pack`]).
+    /// consensus-pack lookup can run on the blocking pool (see
+    /// [`Self::consensus_header_from_pack`]).
     inner_node_network: Arc<N>,
     /// Bounds the blocking work this namespace dispatches (see
     /// [`MAX_CONCURRENT_BLOCKING_RPC_WORK`]). Acquired before spawning the blocking task and held
@@ -800,44 +824,49 @@ where
         Ok(commit)
     }
 
-    /// Look up consensus header `digest` in `epoch`'s consensus pack under a
+    /// Look up consensus header `digest` in `epoch`'s consensus pack on the blocking pool, under a
     /// [`MAX_CONCURRENT_PACK_READS`] permit.
     ///
-    /// The lookup runs as its own task that owns the permit, for the same reason
-    /// [`spawn_bounded_blocking`] moves its permit into the blocking task: once a request reaches
-    /// the pack thread it is served whether or not the caller is still waiting. Returning the
-    /// permit when a disconnecting caller stops waiting, rather than when the pack answers, would
-    /// let abandoned lookups pile up on the pack thread past the bound.
+    /// The storage call is async but does blocking work before it first yields. Reading a sealed
+    /// epoch whose pack is not cached opens the pack synchronously (several file opens, about
+    /// 4 MiB of bloom-filter reads and a thread spawn), and the cache eviction that makes room for
+    /// it can join the evicted pack's thread. Awaited in an async task, all of that would run on
+    /// one of the shared runtime's workers, where consensus tasks are scheduled. The lookup
+    /// therefore runs on a blocking-pool thread, which drives the storage future to completion
+    /// with [`tokio::runtime::Handle::block_on`].
+    ///
+    /// This is the one place the namespace blocks a thread on a future. `block_on` must never run
+    /// on a runtime worker, but a blocking-pool thread is not one: it exists to be blocked, and its
+    /// occupancy is bounded by the permit.
+    ///
+    /// The permit moves into the blocking task, as [`spawn_bounded_blocking`] does for every
+    /// endpoint: once a request reaches the pack it is served whether or not the caller is still
+    /// waiting. Returning the permit when a disconnecting caller stops waiting, rather than when
+    /// the pack answers, would let abandoned lookups pile up past the bound.
+    ///
+    /// Moving the lookup off the workers does not isolate it from the storage layer's shared pack
+    /// cache: a lookup still opens and caches packs that state sync and peer epoch serving also
+    /// read through, and an eviction still holds the cache lock while it joins a pack thread.
+    /// [`MAX_CONCURRENT_PACK_READS`] limits that interference; removing it needs the storage-side
+    /// open and eviction to stop blocking.
     async fn consensus_header_from_pack(
         &self,
         epoch: Epoch,
         digest: B256,
     ) -> TelcoinNetworkRpcResult<Option<ConsensusHeader>> {
-        // acquire only fails if the semaphore is closed, which never happens because it lives as
-        // long as the RPC server
-        let permit = self.pack_read_guard.clone().acquire_owned().await.map_err(|e| {
-            tracing::warn!(target: "tn::rpc", error = %e, "rpc consensus pack semaphore closed");
-            TNRpcError::Internal
-        })?;
         let primary = Arc::clone(&self.inner_node_network);
-        let (tx, rx) = oneshot::channel();
-        self.evm_state.get_task_spawner().spawn_task("tn-rpc-consensus-header", async move {
-            let header = {
-                let _permit = permit;
-                primary.consensus_header_by_digest(epoch, digest.into()).await
-            };
-            if tx.send(header).is_err() {
-                tracing::debug!(
-                    target: "tn::rpc",
-                    "consensus header receiver dropped before result"
-                );
-            }
-            Ok(())
-        });
-        rx.await.map_err(|e| {
-            tracing::warn!(target: "tn::rpc", error = %e, "consensus header result channel closed");
-            TNRpcError::Internal
-        })
+        spawn_bounded_blocking(
+            &self.pack_read_guard,
+            self.evm_state.get_task_spawner(),
+            "tn-rpc-consensus-header",
+            move || {
+                // blocking-pool threads carry the runtime's handle but are not workers, so
+                // block_on is allowed here and keeps the synchronous pack open off the workers
+                tokio::runtime::Handle::current()
+                    .block_on(primary.consensus_header_by_digest(epoch, digest.into()))
+            },
+        )
+        .await
     }
 }
 
@@ -1175,6 +1204,54 @@ mod tests {
         }
     }
 
+    /// A gate a pack lookup parks on synchronously, without yielding, the way a sealed pack's
+    /// synchronous open holds whatever thread polls it.
+    #[derive(Debug, Default)]
+    struct ThreadGate {
+        /// `(entered, released)`: whether a lookup has parked, and whether it may continue.
+        state: std::sync::Mutex<(bool, bool)>,
+        /// Signalled on every state change.
+        changed: std::sync::Condvar,
+    }
+
+    impl ThreadGate {
+        /// Block the calling thread until the gate is released.
+        fn park(&self) {
+            let mut state = self.state.lock().expect("gate lock is never poisoned");
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).expect("gate lock is never poisoned");
+            }
+        }
+
+        /// Whether a lookup parked on the gate within `timeout`.
+        fn wait_entered(&self, timeout: Duration) -> bool {
+            let state = self.state.lock().expect("gate lock is never poisoned");
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |(entered, _)| !*entered)
+                .expect("gate lock is never poisoned");
+            state.0
+        }
+
+        /// Let every parked lookup continue.
+        fn release(&self) {
+            self.state.lock().expect("gate lock is never poisoned").1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Releases a [`ThreadGate`] when dropped, so a failed assertion never leaves a thread parked
+    /// and the runtime unable to shut down.
+    struct ReleaseOnDrop(Arc<ThreadGate>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     /// In-memory [`EngineToPrimary`]: a fixed latest consensus header, plus consensus packs held
     /// as a map from `(epoch, digest)` to header, counting every read.
     #[derive(Debug)]
@@ -1186,6 +1263,9 @@ mod tests {
         /// When set, every pack lookup waits for a permit from this gate before it answers, so a
         /// test controls when the pack responds.
         pack_gate: Option<Arc<Semaphore>>,
+        /// When set, every pack lookup blocks its thread on this gate before it answers, as a
+        /// synchronous pack open does.
+        thread_gate: Option<Arc<ThreadGate>>,
         /// Read counters, shared with the test.
         reads: Arc<Reads>,
     }
@@ -1198,7 +1278,7 @@ mod tests {
                 .into_iter()
                 .map(|header| ((header.sub_dag.leader_epoch(), header.digest().into()), header))
                 .collect();
-            Self { latest, packs, pack_gate: None, reads: Arc::default() }
+            Self { latest, packs, pack_gate: None, thread_gate: None, reads: Arc::default() }
         }
     }
 
@@ -1222,6 +1302,9 @@ mod tests {
             digest: ConsensusHeaderDigest,
         ) -> Option<ConsensusHeader> {
             self.reads.pack.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.thread_gate {
+                gate.park();
+            }
             if let Some(gate) = &self.pack_gate {
                 gate.acquire().await.expect("the pack gate is never closed").forget();
             }
@@ -1447,6 +1530,51 @@ mod tests {
                 .expect("the permit returns once the pack answers")
                 .expect("the guard is never closed");
         drop(returned);
+        assert_eq!(rpc.reads.pack(), 1);
+    }
+
+    /// A pack lookup never occupies a runtime worker: while one blocks its thread the way a
+    /// sealed pack's synchronous open does, the runtime's only worker still runs other tasks, and
+    /// the lookup answers once its thread is released.
+    ///
+    /// Awaiting the lookup in an async task instead parks that worker, so the probe task never
+    /// runs and the probe assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn pack_lookup_runs_off_the_runtime_workers() {
+        pin_forks();
+        let stored = consensus_header(8, SUBSECOND_FORK_EPOCH);
+        let gate = Arc::new(ThreadGate::default());
+        let mut primary = FakePrimary::new(ConsensusHeader::default(), [stored.clone()]);
+        primary.thread_gate = Some(Arc::clone(&gate));
+        let rpc = TestRpc::new("pack-off-worker", primary);
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
+
+        let mut call = Box::pin(
+            rpc.ext.consensus_header_from_pack(SUBSECOND_FORK_EPOCH, stored.digest().into()),
+        );
+        assert!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "the pack has not answered yet"
+        );
+        // the probe must be queued only once the lookup holds its thread, or it could run first
+        // on the worker and pass however the lookup was scheduled
+        assert!(gate.wait_entered(Duration::from_secs(10)), "the lookup reached the pack");
+
+        // std channel: the test body runs outside the runtime's workers and may block on it
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        rpc.ext.evm_state.get_task_spawner().spawn_task("tn-rpc-test-probe", async move {
+            // a send error only means the receiver timed out and the test already failed
+            let _ = probe_tx.send(());
+            Ok(())
+        });
+        assert!(
+            probe_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the runtime worker stayed free while the pack lookup blocked its thread"
+        );
+
+        gate.release();
+        let header = call.await.expect("the lookup completes once released");
+        assert_eq!(header, Some(stored));
         assert_eq!(rpc.reads.pack(), 1);
     }
 

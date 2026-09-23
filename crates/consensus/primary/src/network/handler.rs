@@ -110,6 +110,13 @@ pub(crate) struct RequestHandler<DB> {
     /// lands on a different key and cannot evict/pre-empt the real vote's slot. See the
     /// `PrimaryGossip::EpochVote` handler and issue #898.
     epoch_votes_seen: Arc<Mutex<HashMap<EpochVoteKey, u64>>>,
+    /// The latest `(epoch, round)` each author was warned about for a vote deferred because its
+    /// header was created too far ahead of the local clock.
+    ///
+    /// The proposer retries a deferred request until the lead has passed, and every retry lands
+    /// in the same branch, so this keeps the warning to once per author per round. Only headers
+    /// whose author passed committee validation get that far, so every key is a committee member.
+    deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -139,6 +146,7 @@ where
             auth_last_vote: Arc::new(auth_last_vote),
             consensus_certs: Default::default(),
             epoch_votes_seen: Default::default(),
+            deferred_vote_warned: Default::default(),
             consensus_chain,
         }
     }
@@ -727,6 +735,21 @@ where
         }
     }
 
+    /// Whether a deferred vote request for `header` is its author's first at the header's
+    /// `(epoch, round)`, recording that round if so.
+    ///
+    /// Retries of a round already recorded, and stale requests for an earlier round, return
+    /// `false`.
+    fn first_deferral_this_round(&self, header: &Header) -> bool {
+        let round = (header.epoch(), header.round());
+        let mut warned = self.deferred_vote_warned.lock();
+        let first = warned.get(header.author()).is_none_or(|last| *last < round);
+        if first {
+            warned.insert(header.author().clone(), round);
+        }
+        first
+    }
+
     /// Evaluate request to possibly issue a vote in support of peer's header.
     async fn vote_inner(
         &self,
@@ -942,12 +965,23 @@ where
             // vote request stays open, so the lead may be honest skew a retry can outlast.
             // answer with a recoverable response: it carries no penalty, `Self::vote` keeps the
             // author's previous vote-cache entry, and the proposer retries the same request
+            self.consensus_bus.metrics().votes_deferred_future_header_total.increment(1);
             debug!(
                 target: "primary",
                 ?header,
                 ahead_ms,
                 "header created ahead of the local clock beyond the drift tolerance; not voting yet"
             );
+            if self.first_deferral_this_round(&header) {
+                warn!(
+                    target: "primary",
+                    author = %header.author(),
+                    epoch = header.epoch(),
+                    round = header.round(),
+                    ahead_ms,
+                    "deferring vote: header created ahead of the local clock beyond the drift tolerance"
+                );
+            }
             return Ok(PrimaryResponse::RecoverableError(PrimaryRPCError(format!(
                 "header {} created {ahead_ms} ms ahead of the local clock, beyond the drift \
                  tolerance of {tolerance:?}",

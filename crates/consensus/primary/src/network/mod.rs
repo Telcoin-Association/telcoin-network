@@ -112,6 +112,14 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
 pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
+/// Longest peer-supplied error text, in characters, that a vote request keeps.
+///
+/// A voter chooses the text of its error responses, bounded only by the RPC message size, and
+/// the requester logs it and hands it to the certifier, which retries until the proposal is
+/// superseded. Clipping keeps a Byzantine voter from turning each response into a megabyte-long
+/// log line.
+const MAX_PEER_ERROR_LEN: usize = 256;
+
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
@@ -418,7 +426,12 @@ impl PrimaryNetworkHandle {
         let mut res = res.await??.result;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            warn!(target: "primary::network", "Got recoverable error {s}, retrying");
+            warn!(
+                target: "primary::network",
+                %peer,
+                error = %clip_peer_error(s),
+                "recoverable vote error, retrying"
+            );
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
             let res_raw = self.handle.send_request(request, peer).await?;
@@ -433,9 +446,11 @@ impl PrimaryNetworkHandle {
             // still recoverable after the retries above: report it as retryable so the caller
             // backs off and asks again rather than giving up on this peer for the header
             PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(s))
+                Err(NetworkError::RPCRetryable(clip_peer_error(s)))
             }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                Err(NetworkError::RPCError(clip_peer_error(s)))
+            }
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
@@ -1701,4 +1716,36 @@ pub enum RequestVoteResult {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<HeaderDigest>),
+}
+
+/// Clip peer-supplied error text to its first [`MAX_PEER_ERROR_LEN`] characters.
+///
+/// Cuts on a character boundary, so multi-byte text never splits mid-character.
+fn clip_peer_error(mut error: String) -> String {
+    if let Some((end, _)) = error.char_indices().nth(MAX_PEER_ERROR_LEN) {
+        error.truncate(end);
+    }
+    error
+}
+
+#[cfg(test)]
+mod clip_peer_error_tests {
+    use super::{clip_peer_error, MAX_PEER_ERROR_LEN};
+
+    /// Text at or under the limit is kept whole; longer text keeps exactly the first
+    /// [`MAX_PEER_ERROR_LEN`] characters, cut on a character boundary when they are multi-byte.
+    #[test]
+    fn clips_to_the_limit_on_a_char_boundary() {
+        let short = "x".repeat(MAX_PEER_ERROR_LEN);
+        assert_eq!(clip_peer_error(short.clone()), short);
+
+        let long = "x".repeat(1 << 20);
+        assert_eq!(clip_peer_error(long), "x".repeat(MAX_PEER_ERROR_LEN));
+
+        // three bytes per char, so a byte-count cut would land mid-character
+        let wide = "€".repeat(MAX_PEER_ERROR_LEN + 1);
+        let clipped = clip_peer_error(wide);
+        assert_eq!(clipped.chars().count(), MAX_PEER_ERROR_LEN);
+        assert_eq!(clipped, "€".repeat(MAX_PEER_ERROR_LEN));
+    }
 }

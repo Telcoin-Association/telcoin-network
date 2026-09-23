@@ -419,12 +419,20 @@ where
     }
 }
 
+/// The libp2p request-response timeout every vote request runs under.
+///
+/// `ConsensusNetwork` builds its request-response behaviours from
+/// `request_response::Config::default()` (`crates/network-libp2p/src/consensus.rs`), whose request
+/// timeout is ten seconds in libp2p-request-response 0.30; no config knob reaches it. The timeout
+/// covers the whole inbound exchange, from reading the request to sending the response, so a
+/// voter still evaluating a header when it fires has its vote cancelled. Keep this in step with
+/// that call site if it ever sets its own timeout.
+const LIBP2P_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Validate the consensus timing knobs that span [`Parameters`] and [`SyncConfig`] for the epoch
 /// about to run.
 ///
-/// Rejects a `vote_timeout` below `max_header_delay + max_header_time_drift_tolerance`, so a vote
-/// request stays open for a full header cadence plus the longest an honest voter may hold its
-/// vote while it waits out a future-dated header's lead.
+/// Rejects a `vote_timeout` outside the window [`validate_vote_timeout`] describes.
 ///
 /// Warns, without failing, when `max_header_delay` is below one second while sub-second
 /// timestamps are inactive for `epoch`: header timestamps and the voter's drift wait stay whole
@@ -434,21 +442,10 @@ fn validate_epoch_timing(
     sync_config: &SyncConfig,
     epoch: Epoch,
 ) -> eyre::Result<()> {
-    // saturating: both terms come from operator config files, so an overflowing sum must not
-    // panic node startup
-    let vote_window =
-        parameters.max_header_delay.saturating_add(sync_config.max_header_time_drift_tolerance);
-    eyre::ensure!(
-        parameters.vote_timeout >= vote_window,
-        "vote_timeout {:?} is shorter than max_header_delay {:?} + max_header_time_drift_tolerance \
-         {:?}; raise vote_timeout to at least {:?}",
-        parameters.vote_timeout,
-        parameters.max_header_delay,
-        sync_config.max_header_time_drift_tolerance,
-        vote_window,
-    );
+    let subsecond_active = subsecond_timestamp_active(epoch);
+    validate_vote_timeout(parameters, sync_config, subsecond_active)?;
 
-    if parameters.max_header_delay < Duration::from_secs(1) && !subsecond_timestamp_active(epoch) {
+    if parameters.max_header_delay < Duration::from_secs(1) && !subsecond_active {
         warn!(
             target: "tn::config",
             epoch,
@@ -461,9 +458,65 @@ fn validate_epoch_timing(
     Ok(())
 }
 
+/// Check `vote_timeout` against the longest an honest vote evaluation can take and the transport
+/// timeout it runs under.
+///
+/// The lower bound is `max_header_delay` plus the longest the voter may hold its vote while it
+/// waits out a future-dated header's lead, so a vote request stays open for a full header cadence
+/// plus that wait. With sub-second timestamps active (`subsecond_active`) the wait is at most
+/// `max_header_time_drift_tolerance`. Without them the voter compares whole seconds against the
+/// tolerance rounded up to whole seconds, so it can admit, and then wait out, a lead of that
+/// rounded-up length: 1 s at the 250 ms default.
+///
+/// The upper bound is [`LIBP2P_REQUEST_TIMEOUT`], exclusive: at or above it the transport cancels
+/// a slow vote before `vote_timeout` can fire. The transport also counts the time to read and
+/// dispatch the request, so a value just below the bound leaves little margin.
+fn validate_vote_timeout(
+    parameters: &Parameters,
+    sync_config: &SyncConfig,
+    subsecond_active: bool,
+) -> eyre::Result<()> {
+    let tolerance = sync_config.max_header_time_drift_tolerance;
+    let drift_wait = if subsecond_active {
+        tolerance
+    } else {
+        Duration::from_secs(
+            tolerance.as_secs().saturating_add(u64::from(tolerance.subsec_nanos() != 0)),
+        )
+    };
+    // saturating: both terms come from operator config files, so an overflowing sum must not
+    // panic node startup
+    let vote_window = parameters.max_header_delay.saturating_add(drift_wait);
+    eyre::ensure!(
+        parameters.vote_timeout >= vote_window,
+        "vote_timeout {:?} is shorter than max_header_delay {:?} + the voter's longest drift wait \
+         {:?} (max_header_time_drift_tolerance {:?}{}); raise vote_timeout to at least {:?}",
+        parameters.vote_timeout,
+        parameters.max_header_delay,
+        drift_wait,
+        tolerance,
+        if subsecond_active {
+            ""
+        } else {
+            ", rounded up to whole seconds while sub-second timestamps are inactive"
+        },
+        vote_window,
+    );
+    eyre::ensure!(
+        parameters.vote_timeout < LIBP2P_REQUEST_TIMEOUT,
+        "vote_timeout {:?} must stay below the libp2p request timeout {:?}, which otherwise \
+         cancels a slow vote before vote_timeout fires; lower vote_timeout",
+        parameters.vote_timeout,
+        LIBP2P_REQUEST_TIMEOUT,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{validate_epoch_timing, ConsensusConfig};
+    use super::{
+        validate_epoch_timing, validate_vote_timeout, ConsensusConfig, LIBP2P_REQUEST_TIMEOUT,
+    };
     use crate::{Config, KeyConfig, NetworkConfig, Parameters, SyncConfig};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::time::Duration;
@@ -603,18 +656,23 @@ mod tests {
             .expect("default parameters and sync config must pass the vote_timeout check");
     }
 
+    /// A sync config whose drift tolerance is `millis`.
+    fn tolerance_ms(millis: u64) -> SyncConfig {
+        SyncConfig {
+            max_header_time_drift_tolerance: Duration::from_millis(millis),
+            ..Default::default()
+        }
+    }
+
+    /// Parameters with a 2 s `max_header_delay` and the given `vote_timeout`.
+    fn two_second_rounds(vote_timeout: Duration) -> Parameters {
+        Parameters { max_header_delay: Duration::from_secs(2), vote_timeout, ..Default::default() }
+    }
+
     #[test]
     fn vote_timeout_below_header_window_is_rejected() {
-        let sync_config = SyncConfig {
-            max_header_time_drift_tolerance: Duration::from_millis(250),
-            ..Default::default()
-        };
-        let params = Parameters {
-            max_header_delay: Duration::from_secs(2),
-            vote_timeout: Duration::from_millis(2_249),
-            ..Default::default()
-        };
-        let err = validate_epoch_timing(&params, &sync_config, 0)
+        let params = two_second_rounds(Duration::from_millis(2_249));
+        let err = validate_vote_timeout(&params, &tolerance_ms(250), true)
             .expect_err("vote_timeout below max_header_delay + tolerance must be rejected");
         assert!(
             err.to_string().contains("vote_timeout"),
@@ -624,26 +682,82 @@ mod tests {
 
     #[test]
     fn vote_timeout_equal_to_header_window_is_accepted() {
-        let sync_config = SyncConfig {
-            max_header_time_drift_tolerance: Duration::from_millis(250),
-            ..Default::default()
-        };
-        let params = Parameters {
-            max_header_delay: Duration::from_secs(2),
-            vote_timeout: Duration::from_millis(2_250),
-            ..Default::default()
-        };
-        validate_epoch_timing(&params, &sync_config, 0)
+        let params = two_second_rounds(Duration::from_millis(2_250));
+        validate_vote_timeout(&params, &tolerance_ms(250), true)
             .expect("vote_timeout exactly max_header_delay + tolerance must be accepted");
     }
 
-    /// An overflowing `max_header_delay + tolerance` must reject rather than panic.
+    /// Without sub-second timestamps the voter admits a lead of the tolerance rounded up to whole
+    /// seconds and waits all of it out, so the window budgets 1 s for the 250 ms default: the
+    /// `vote_timeout` that suffices with sub-second timestamps is rejected, and the bound sits at
+    /// exactly `max_header_delay + 1 s`. A whole-second tolerance is budgeted as is.
+    #[test]
+    fn inactive_subsecond_budgets_the_tolerance_rounded_up_to_whole_seconds() {
+        let sub_second_window = two_second_rounds(Duration::from_millis(2_250));
+        let err = validate_vote_timeout(&sub_second_window, &tolerance_ms(250), false)
+            .expect_err("a 250 ms budget undercounts the whole-second drift wait");
+        assert!(err.to_string().contains("rounded up to whole seconds"), "{err}");
+
+        let err = validate_vote_timeout(
+            &two_second_rounds(Duration::from_millis(2_999)),
+            &tolerance_ms(250),
+            false,
+        )
+        .expect_err("one millisecond short of max_header_delay + 1 s must be rejected");
+        assert!(err.to_string().contains("at least 3s"), "{err}");
+        validate_vote_timeout(
+            &two_second_rounds(Duration::from_secs(3)),
+            &tolerance_ms(250),
+            false,
+        )
+        .expect("max_header_delay + 1 s must be accepted");
+        validate_vote_timeout(
+            &two_second_rounds(Duration::from_secs(3)),
+            &tolerance_ms(1_000),
+            false,
+        )
+        .expect("a whole-second tolerance is not rounded further");
+    }
+
+    /// A `vote_timeout` at or above the libp2p request timeout is rejected whether or not
+    /// sub-second timestamps are active, and anything below it that covers the header window is
+    /// accepted.
+    #[test]
+    fn vote_timeout_must_stay_below_the_libp2p_request_timeout() {
+        for subsecond_active in [true, false] {
+            for vote_timeout in [LIBP2P_REQUEST_TIMEOUT, LIBP2P_REQUEST_TIMEOUT * 2] {
+                let err = validate_vote_timeout(
+                    &two_second_rounds(vote_timeout),
+                    &tolerance_ms(250),
+                    subsecond_active,
+                )
+                .expect_err("the transport would cancel the vote first");
+                assert!(
+                    err.to_string().contains("libp2p request timeout"),
+                    "subsecond_active {subsecond_active}, {vote_timeout:?}: {err}"
+                );
+            }
+            let just_below = LIBP2P_REQUEST_TIMEOUT - Duration::from_millis(1);
+            validate_vote_timeout(
+                &two_second_rounds(just_below),
+                &tolerance_ms(250),
+                subsecond_active,
+            )
+            .expect("just below the transport timeout must be accepted");
+        }
+    }
+
+    /// An overflowing `max_header_delay + tolerance` must reject rather than panic, including
+    /// when the tolerance is first rounded up to whole seconds.
     #[test]
     fn overflowing_header_window_is_rejected_without_panic() {
         let sync_config =
             SyncConfig { max_header_time_drift_tolerance: Duration::MAX, ..Default::default() };
         let params = Parameters { max_header_delay: Duration::from_secs(1), ..Default::default() };
         assert!(validate_epoch_timing(&params, &sync_config, 0).is_err());
+        for subsecond_active in [true, false] {
+            assert!(validate_vote_timeout(&params, &sync_config, subsecond_active).is_err());
+        }
     }
 
     /// Both shipped `parameters.yaml` presets, loaded through the node's deserializer, must pass

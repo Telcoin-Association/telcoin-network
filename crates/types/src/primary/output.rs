@@ -613,16 +613,21 @@ impl CommittedSubDag {
     /// - Inactive: whole seconds only, `max(previous commit_timestamp, leader created_at)`, with
     ///   the previous sub-dag's raw stored seconds (0 when absent) and a sub-second part of 0.
     ///   `epoch_commit_floor` is ignored, so pre-fork commits replay byte-identically.
-    /// - Active: milliseconds, strictly increasing. The floor is the previous sub-dag's
-    ///   [`Self::commit_timestamp_ms`] when there is one (a pre-fork previous sub-dag resolves to
-    ///   whole seconds times 1000), else `epoch_commit_floor`. The commit timestamp is the leader's
-    ///   [`Header::created_at_ms`] raised to at least 1 ms after the floor; without any floor it is
-    ///   the leader's timestamp.
+    /// - Active: milliseconds, strictly increasing within an epoch. The floor is the previous
+    ///   sub-dag's [`Self::commit_timestamp_ms`] when there is one (a pre-fork previous sub-dag
+    ///   resolves to whole seconds times 1000), else `epoch_commit_floor`. The commit timestamp is
+    ///   the leader's [`Header::created_at_ms`] raised to at least 1 ms after the floor; without
+    ///   any floor it is the leader's timestamp.
     ///
-    /// `epoch_commit_floor` is the lower bound for the first commit of an epoch, the previous
-    /// epoch's closing EVM block timestamp in milliseconds (`None` for epoch 0). Every node must
-    /// pass the same value for the same commit, so it has to come from committed history, never
-    /// from local clocks or node progress.
+    /// `epoch_commit_floor` is the lower bound for the first commit of an epoch: the previous
+    /// epoch's closing EVM block timestamp, whole seconds times 1000 (`None` for epoch 0). Every
+    /// node must pass the same value for the same commit, so it has to come from committed
+    /// history, never from local clocks or node progress.
+    ///
+    /// That floor drops the sub-second part of the previous epoch's last commit, so the first
+    /// commit of an epoch lands after the closing second but can sit up to 998 ms below the
+    /// previous epoch's last [`Self::commit_timestamp_ms`]. Across an epoch seam only the whole
+    /// seconds, and with them the EVM `timestamp`, are guaranteed not to decrease.
     pub fn new_with_commit_floor(
         certificates: Vec<Certificate>,
         leader: Certificate,

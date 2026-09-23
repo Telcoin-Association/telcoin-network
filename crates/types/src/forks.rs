@@ -271,9 +271,13 @@ const fn build_fork_active(epoch: Epoch) -> bool {
 /// would silently reach only the in-process tests, and the multi-node tests that actually
 /// exercise epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`. A node-scoped build (`cargo build -p
+/// telcoin-network`, as release builds are made) leaves that feature off, so its binary keeps the
+/// compile-time constant whatever its environment holds. A workspace-root build without `-p`
+/// does not: `e2e-tests` enables `tn-types/test-utils`, feature unification carries it into the
+/// node binary, and that binary honours this variable. The e2e binary relies on this. An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -400,10 +404,10 @@ const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
 /// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
 /// with the harness, so a process-global setter would silently reach only in-process tests.
-/// Compiled out entirely without `test-utils`, so a production binary keeps the
-/// compile-time constant and cannot be repointed at runtime by its environment. An
-/// unparseable value is ignored rather than defaulted, leaving the build's own fork point
-/// in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -537,9 +541,10 @@ const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
 /// silently reach only the in-process tests, and the multi-node tests that actually exercise
 /// epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -697,9 +702,10 @@ const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
 /// node processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static
 /// would silently reach only the in-process tests.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -861,10 +867,10 @@ const fn subsecond_timestamp_build_fork_active(epoch: Epoch) -> bool {
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
 /// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
 /// with the harness, so a process-global setter would silently reach only in-process tests.
-/// Compiled out entirely without `test-utils`, so a production binary keeps the
-/// compile-time constant and cannot be repointed at runtime by its environment. An
-/// unparseable value is ignored rather than defaulted, leaving the build's own fork point
-/// in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn subsecond_timestamp_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -880,8 +886,9 @@ pub fn subsecond_timestamp_fork_epoch_override() -> Option<Epoch> {
 ///
 /// Callable from any build so the CLI logs the effective schedule without having to know whether
 /// `tn-types`' `test-utils` was unified into the binary it is compiled into. Always empty in a
-/// production binary, where the overrides are compiled out and no environment variable can
-/// repoint a fork; empty in a `test-utils` build too when nothing is exported. Without this the
+/// binary built without that feature (a node-scoped release build), where the overrides are
+/// compiled out and no environment variable can repoint a fork; empty in a `test-utils` build too
+/// when nothing is exported. Without this the
 /// startup line reports the compiled constants only, and a `test-utils` binary whose forks its
 /// harness pinned elsewhere (the e2e harness holds all but the leader-seeded fork dormant) logs
 /// "active from genesis" while executing the legacy derivations — the shape of a `mix_hash`
@@ -1166,10 +1173,11 @@ pub fn governance_safe_fork_epoch() -> Epoch {
 ///
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]: e2e
 /// tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory with the
-/// harness, so a process-global setter would silently reach only in-process tests. Compiled
-/// out entirely without `test-utils`, so a production binary keeps the compile-time constant
-/// and cannot be repointed at runtime by its environment. An unparseable value is ignored
-/// rather than defaulted, leaving the build's own fork point in force.
+/// harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn governance_safe_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
