@@ -5,7 +5,7 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
-    kad::KadStore,
+    kad::{node_record_key, KadStore},
     metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     send_or_log_error,
@@ -656,7 +656,7 @@ where
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
-        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        let key = node_record_key(&self.key_config.primary_public_key());
         // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
         // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
         // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
@@ -1140,7 +1140,7 @@ where
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
-                let record_key = kad::RecordKey::new(&key);
+                let record_key = node_record_key(&key);
                 let record = self
                     .swarm
                     .behaviour_mut()
@@ -1820,7 +1820,7 @@ where
                 // non-committee re-arms the key.
                 for bls_key in missing {
                     if self.kad_record_queries.values().all(|q| q.request != bls_key) {
-                        let key = kad::RecordKey::new(&bls_key);
+                        let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
                     } else {
