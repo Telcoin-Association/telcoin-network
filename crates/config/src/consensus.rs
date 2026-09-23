@@ -1,17 +1,20 @@
 //! Configuration for consensus network (primary and worker).
 use crate::{
-    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
+    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, SyncConfig,
+    TelcoinDirs,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    Authority, AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch,
-    EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, ShutdownNotifier, WorkerId,
+    forks::subsecond_timestamp_active, Authority, AuthorityIdentifier, BlsPublicKey, Certificate,
+    Committee, Database, Epoch, EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey,
+    ShutdownNotifier, WorkerId,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 struct ConsensusConfigInner<DB> {
@@ -78,6 +81,7 @@ where
         let committee: Committee =
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         info!(target: "telcoin", "committee loaded");
+        validate_epoch_timing(&config.parameters, network_config.sync_config(), committee.epoch())?;
         Self::new_with_committee(
             config,
             node_storage,
@@ -142,6 +146,10 @@ where
     ///
     /// This constructor is used during epoch transitions to initialize configuration
     /// with updated committee membership and worker topology for the new epoch.
+    ///
+    /// Fails when the parameters violate their operational floors, or when `vote_timeout` is
+    /// shorter than `max_header_delay` plus the network config's
+    /// `max_header_time_drift_tolerance`.
     pub fn new_for_epoch(
         config: Config,
         node_storage: DB,
@@ -155,6 +163,7 @@ where
         // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
         // them so DAG fixtures may use small `gc_depth` values.
         config.parameters.validate_operational_floors()?;
+        validate_epoch_timing(&config.parameters, network_config.sync_config(), committee.epoch())?;
 
         Self::new_with_committee(
             config,
@@ -370,5 +379,116 @@ where
     /// Retrieve the network address of worker `worker_id`, if this node runs that worker.
     pub fn worker_address(&self, worker_id: WorkerId) -> Option<Multiaddr> {
         self.inner.config.node_info.worker_network_address(worker_id).cloned()
+    }
+}
+
+/// Validate the consensus timing knobs that span [`Parameters`] and [`SyncConfig`] for the epoch
+/// about to run.
+///
+/// Rejects a `vote_timeout` below `max_header_delay + max_header_time_drift_tolerance`, so a vote
+/// request stays open for a full header cadence plus the longest an honest voter may hold its
+/// vote while it waits out a future-dated header's lead.
+///
+/// Warns, without failing, when `max_header_delay` is below one second while sub-second
+/// timestamps are inactive for `epoch`: header timestamps and the voter's drift wait stay whole
+/// seconds for that epoch, so a sub-second cadence can stall at second boundaries.
+fn validate_epoch_timing(
+    parameters: &Parameters,
+    sync_config: &SyncConfig,
+    epoch: Epoch,
+) -> eyre::Result<()> {
+    // saturating: both terms come from operator config files, so an overflowing sum must not
+    // panic node startup
+    let vote_window =
+        parameters.max_header_delay.saturating_add(sync_config.max_header_time_drift_tolerance);
+    eyre::ensure!(
+        parameters.vote_timeout >= vote_window,
+        "vote_timeout {:?} is shorter than max_header_delay {:?} + max_header_time_drift_tolerance \
+         {:?}; raise vote_timeout to at least {:?}",
+        parameters.vote_timeout,
+        parameters.max_header_delay,
+        sync_config.max_header_time_drift_tolerance,
+        vote_window,
+    );
+
+    if parameters.max_header_delay < Duration::from_secs(1) && !subsecond_timestamp_active(epoch) {
+        warn!(
+            target: "tn::config",
+            epoch,
+            max_header_delay = ?parameters.max_header_delay,
+            "max_header_delay is below 1s but sub-second timestamps are inactive for this epoch; \
+             header timestamps stay whole seconds, so rounds can stall at second boundaries"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_epoch_timing;
+    use crate::{Parameters, SyncConfig};
+    use std::time::Duration;
+    use tn_types::{MAINNET_PARAMETERS, TESTNET_PARAMETERS};
+
+    #[test]
+    fn default_timing_passes() {
+        validate_epoch_timing(&Parameters::default(), &SyncConfig::default(), 0)
+            .expect("default parameters and sync config must pass the vote_timeout check");
+    }
+
+    #[test]
+    fn vote_timeout_below_header_window_is_rejected() {
+        let sync_config = SyncConfig {
+            max_header_time_drift_tolerance: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let params = Parameters {
+            max_header_delay: Duration::from_secs(2),
+            vote_timeout: Duration::from_millis(2_249),
+            ..Default::default()
+        };
+        let err = validate_epoch_timing(&params, &sync_config, 0)
+            .expect_err("vote_timeout below max_header_delay + tolerance must be rejected");
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "the error must name vote_timeout as the knob to raise: {err}"
+        );
+    }
+
+    #[test]
+    fn vote_timeout_equal_to_header_window_is_accepted() {
+        let sync_config = SyncConfig {
+            max_header_time_drift_tolerance: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let params = Parameters {
+            max_header_delay: Duration::from_secs(2),
+            vote_timeout: Duration::from_millis(2_250),
+            ..Default::default()
+        };
+        validate_epoch_timing(&params, &sync_config, 0)
+            .expect("vote_timeout exactly max_header_delay + tolerance must be accepted");
+    }
+
+    /// An overflowing `max_header_delay + tolerance` must reject rather than panic.
+    #[test]
+    fn overflowing_header_window_is_rejected_without_panic() {
+        let sync_config =
+            SyncConfig { max_header_time_drift_tolerance: Duration::MAX, ..Default::default() };
+        let params = Parameters { max_header_delay: Duration::from_secs(1), ..Default::default() };
+        assert!(validate_epoch_timing(&params, &sync_config, 0).is_err());
+    }
+
+    /// Both shipped `parameters.yaml` presets, loaded through the node's deserializer, must pass
+    /// with the default network sync config.
+    #[test]
+    fn shipped_chain_presets_pass_the_vote_timeout_check() {
+        for (name, yaml) in [("mainnet", MAINNET_PARAMETERS), ("adiri", TESTNET_PARAMETERS)] {
+            let params: Parameters = serde_yaml::from_str(yaml)
+                .unwrap_or_else(|e| panic!("{name} parameters.yaml must parse: {e}"));
+            validate_epoch_timing(&params, &SyncConfig::default(), 0)
+                .unwrap_or_else(|e| panic!("{name} preset must pass the vote_timeout check: {e}"));
+        }
     }
 }
