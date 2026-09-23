@@ -262,6 +262,19 @@ pub struct Parameters {
     /// even if batches have not reached `header_num_of_batches_threshold`.
     #[serde(with = "humantime_serde", default = "Parameters::default_min_header_delay")]
     pub min_header_delay: Duration,
+    /// How long the proposer waits for each peer's vote on its header before giving up on that
+    /// request.
+    ///
+    /// Kept separate from `max_header_delay` because a voter may hold its vote while it waits out
+    /// a future-dated header's lead, up to `max_header_time_drift_tolerance`, before it answers.
+    /// A timeout tied to the header cadence can expire while an honest peer is still waiting to
+    /// vote, and the shorter the cadence the more often that happens.
+    ///
+    /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
+    /// in the network config's `sync_config`). The production `ConsensusConfig` constructors
+    /// reject a smaller value, so a node refuses to start an epoch with one. Defaults to 5 s.
+    #[serde(with = "humantime_serde", default = "Parameters::default_vote_timeout")]
+    pub vote_timeout: Duration,
 
     /// The depth of the garbage collection (Denominated in number of rounds).
     #[serde(default = "Parameters::default_gc_depth")]
@@ -341,6 +354,10 @@ impl Parameters {
         Duration::from_millis(1000)
     }
 
+    fn default_vote_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
     /// The default gc depth for consensus.
     pub fn default_gc_depth() -> u32 {
         tn_types::MAX_GC_DEPTH
@@ -404,6 +421,7 @@ impl Default for Parameters {
             max_header_num_of_batches: Parameters::default_max_header_num_of_batches(),
             max_header_delay: Parameters::default_max_header_delay(),
             min_header_delay: Parameters::default_min_header_delay(),
+            vote_timeout: Parameters::default_vote_timeout(),
             gc_depth: Parameters::default_gc_depth(),
             sync_retry_delay: Parameters::default_sync_retry_delay(),
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
@@ -474,6 +492,9 @@ impl Parameters {
     ///   but includes at most `max_header_num_of_batches` of them, so a zero threshold seals empty
     ///   headers on the fast path and a threshold above the max makes the two conditions mutually
     ///   inconsistent.
+    /// - `min_header_delay` must not exceed `max_header_delay`. The proposer treats the minimum as
+    ///   an early-proposal point inside the maximum's window; with the two inverted the maximum
+    ///   expires first and the configured minimum never takes effect.
     ///
     /// `basefee_address` needs no floor here: the field is a required key with no serde default,
     /// so a `parameters.yaml` that omits it already fails to deserialize, before any constructor
@@ -501,6 +522,12 @@ impl Parameters {
             self.header_num_of_batches_threshold,
             self.max_header_num_of_batches,
         );
+        eyre::ensure!(
+            self.min_header_delay <= self.max_header_delay,
+            "min_header_delay {:?} must not exceed max_header_delay {:?}",
+            self.min_header_delay,
+            self.max_header_delay,
+        );
         Ok(())
     }
 
@@ -510,6 +537,7 @@ impl Parameters {
         info!("Header max number of batches set to {}", self.max_header_num_of_batches);
         info!("Max header delay set to {} ms", self.max_header_delay.as_millis());
         info!("Min header delay set to {} ms", self.min_header_delay.as_millis());
+        info!("Vote timeout set to {} ms", self.vote_timeout.as_millis());
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay.as_millis());
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
@@ -531,6 +559,7 @@ mod test {
     use crate::{
         Config, ConfigFmt, ConfigTrait as _, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
     };
+    use std::time::Duration;
     use tn_types::{
         address, Address, Bytes, Committee, Genesis, MAINNET_COMMITTEE, MAINNET_GENESIS,
         MAINNET_PARAMETERS, TESTNET_PARAMETERS,
@@ -774,6 +803,58 @@ mod test {
             params.validate_operational_floors().is_ok(),
             "threshold == max == 1 is the minimal consistent batch configuration and must be accepted"
         );
+    }
+
+    #[test]
+    fn parameters_reject_min_header_delay_above_max_header_delay() {
+        let params = Parameters {
+            min_header_delay: Duration::from_millis(1_001),
+            max_header_delay: Duration::from_millis(1_000),
+            ..Default::default()
+        };
+        let err = params
+            .validate_operational_floors()
+            .expect_err("a min_header_delay above max_header_delay must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("min_header_delay") && msg.contains("max_header_delay"),
+            "the error must name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn parameters_accept_min_header_delay_equal_to_max_header_delay() {
+        let params = Parameters {
+            min_header_delay: Duration::from_secs(1),
+            max_header_delay: Duration::from_secs(1),
+            ..Default::default()
+        };
+        assert!(
+            params.validate_operational_floors().is_ok(),
+            "min_header_delay == max_header_delay (the mainnet preset) must be accepted"
+        );
+    }
+
+    #[test]
+    fn default_vote_timeout_is_five_seconds() {
+        assert_eq!(Parameters::default().vote_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn vote_timeout_parses_from_humantime_yaml() {
+        let yaml = format!("basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"\nvote_timeout: \"7s\"");
+        let params: Parameters =
+            serde_yaml::from_str(&yaml).expect("a humantime vote_timeout must parse");
+        assert_eq!(params.vote_timeout, Duration::from_secs(7));
+    }
+
+    /// Parameters files written before `vote_timeout` existed omit the key and must still load.
+    #[test]
+    fn absent_vote_timeout_key_defaults_to_five_seconds() {
+        let yaml = format!("basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"");
+        let params: Parameters =
+            serde_yaml::from_str(&yaml).expect("a parameters file without vote_timeout must parse");
+        assert_eq!(params.vote_timeout, Duration::from_secs(5));
     }
 
     /// A parameters file that omits `basefee_address` must fail to deserialize.
