@@ -100,7 +100,7 @@ If `/proc/pressure` is missing, the running kernel lacks it or has it disabled.
 
 The batch cache is an MDBX file that never shrinks.
 Batches are removed at each epoch close, but the file keeps its size, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
-In the 2026-09 benchmark the file reached its 1 GiB maximum on every validator while each 20-minute epoch carried only about 0.5 GB of batch data, and no node logged a cache insert failure.
+In the 2026-09 benchmark the file reached its 1 GiB maximum on every c3 validator and on four of ten e2 validators (the rest stopped at 960 MiB) while each 20-minute epoch carried only about 0.5 GB of batch data, and no node logged a cache insert failure.
 Mainnet and testnet use 6-hour epochs, so the ceiling there is about 260 TPS of the benchmark mix (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
 Read live occupancy from MDBX instead.
 The release exports no metric for it.

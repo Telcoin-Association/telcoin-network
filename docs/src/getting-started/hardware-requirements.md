@@ -269,7 +269,7 @@ The recommended and headroom tiers use it.
 
 At 20-minute epochs the ceiling is in the thousands of TPS, so a benchmark with short epochs measures hardware limits, not this ceiling.
 The benchmark stayed below its own 20-minute ceiling: its epochs carried about 0.52 to 0.55 GB of batch data on average, and no node logged a batch-cache insert failure.
-The cache file still reached its 1 GiB maximum on every validator, because MDBX never shrinks the file.
+The cache file still reached its 1 GiB maximum on every c3 validator and on four of the ten e2 validators (the other six stopped at 960 MiB), because MDBX never shrinks the file.
 File size is a high-water mark, not live occupancy (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
 
 ### Networking
