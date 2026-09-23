@@ -930,10 +930,12 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
             Ok((name, url))
         })
         .collect::<eyre::Result<Vec<_>>>()?;
+    // Empty non-epoch-closing outputs skip execution, so the height stays at genesis until the
+    // forwarded transaction lands. Wait only for each worker-1 RPC server to answer.
     futures::future::try_join_all(endpoints.iter().map(|(_, url)| async move {
         let provider = ProviderBuilder::new().connect_http(url.parse()?);
-        wait_until(std::time::Duration::from_secs(60), "worker 1 to serve blocks", || async {
-            Ok(provider.get_block_number().await.is_ok_and(|height| height > 0))
+        wait_until(std::time::Duration::from_secs(60), "worker 1 RPC to answer", || async {
+            Ok(provider.get_block_number().await.is_ok())
         })
         .await
     }))
