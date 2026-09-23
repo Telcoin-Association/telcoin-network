@@ -52,6 +52,14 @@ impl TestBinary {
     /// can still override a pin with its own later `env()` call. Only binaries built with
     /// `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see `make build-e2e-bin`)
     /// consult these variables; production binaries ignore them.
+    ///
+    /// The governance-Safe pin is the odd one out: its whole mechanism is `adiri`-gated, so a
+    /// default e2e binary neither honors the forwarded value nor reports it (its
+    /// `fork_epoch_overrides` row is carried under the same cfg as its consumer). It is forwarded
+    /// all the same, with the same dormant `u32::MAX` default, so that the one lane running an
+    /// `adiri` binary (`make test-e2e-governance-safe`, see `tests/it/governance_safe_fork.rs`)
+    /// pins the fork rather than inheriting the compiled-in constant, and so no other test on
+    /// that binary can pick the fork up by accident.
     pub fn command(&self) -> std::process::Command {
         let mut command = match self {
             TestBinary::Prebuilt(path) => std::process::Command::new(path),
@@ -69,6 +77,7 @@ impl TestBinary {
             ("TN_MULTI_WORKERS_FORK_EPOCH", u32::MAX),
             ("TN_PREVRANDAO_FORK_EPOCH", u32::MAX),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", 0),
+            ("TN_GOVERNANCE_SAFE_FORK_EPOCH", u32::MAX),
         ]
         .into_iter()
         .for_each(|(var, default)| {

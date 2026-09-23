@@ -76,6 +76,8 @@ The `--bls-passphrase-source` global flag controls how the BLS private key is en
 
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
 
+The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
+
 ### Generated files
 
 After running `keytool generate`, the data directory contains:
@@ -276,9 +278,13 @@ Generate a config and keys for your observer node:
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
 Start your observer node:
-`target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
+
+Node role is derived from committee membership: a key outside the current committee runs as an
+observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
+chain.
 
 
 ### Using local config
@@ -298,7 +304,7 @@ telcoin-network node \
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
 | `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
 | `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
-| `--observer`          | `false`        | Run as an observer (no consensus participation)                                                |
+| `--observer`          | `false`        | Deprecated, hidden no-op. Node role follows committee membership.                              |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
@@ -470,6 +476,8 @@ Inbound (must be open):
 | 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
 
 Outbound: Unrestricted UDP for QUIC connections to peers.
+
+These are application port requirements, not a complete production perimeter. The node does not configure host firewall rules. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#firewall-configuration) for the recommended validator, sentry, observer, and management separation. Never create firewall rules from DHT or peer exchange data.
 
 ## Consensus parameters
 
@@ -711,12 +719,12 @@ The compressed BLS public key is 96 bytes and the proof-of-possession signature 
 
 ## Observer mode
 
-Run a node that follows consensus and executes blocks without participating in voting or block production:
+With a key outside the current committee, a node follows consensus and executes blocks without
+participating in voting or block production. Role is derived from committee membership:
 
 ```bash
 telcoin-network node \
     --datadir /var/lib/telcoin \
-    --observer \
     --http
 ```
 
@@ -734,7 +742,11 @@ telcoin-network node \
 
 Observers still require key generation (`keytool generate observer`) and the genesis files. They need the same genesis config and parameters as validators.
 
-An observer generates its own network identity keys for P2P connectivity but never participates in the consensus committee, regardless of whether it is registered on-chain.
+An observer generates its own network identity keys for P2P connectivity. If its key joins the
+committee, the node takes the validator role and participates once caught up. `--observer` remains
+accepted for compatibility, but is hidden from CLI help and only logs a deprecation warning
+([#1355](https://github.com/Telcoin-Association/telcoin-network/issues/1355)). It cannot keep a seated
+validator out of consensus; exit the validator on chain to do that.
 
 ## Security considerations
 

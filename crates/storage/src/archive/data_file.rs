@@ -20,10 +20,10 @@
 //!
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
 //! while actively appending (`end` is the logical data length). The physical file is reconciled to
-//! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
-//! `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close) truncates
-//! to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are bounded by
-//! `end` and never see the padding.
+//! **exactly `end`** at every point an external consumer can observe it — `MmapDataFile::try_clone`
+//! (for `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close)
+//! truncates to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are
+//! bounded by `end` and never see the padding.
 //!
 //! ## Clean-close sentinel
 //!
@@ -31,18 +31,19 @@
 //! `crc32` of those four bytes; see `clean_close_sentinel`). A reopen validates it against the
 //! physical size, and on a match strips it back to `end` and knows the file was sealed. A missing
 //! or invalid sentinel means the file was **not** closed cleanly (most likely still padded after a
-//! crash); [`Self::opened_unclean`] surfaces that, the logical end is left at physical EOF, and the
-//! pack's CRC + `recover_pack` path truncates it back to the last good record. The self-referential
-//! second CRC is what stops trailing zero padding from masquerading as a clean close
-//! (`crc32(0x00000000) != 0`).
+//! crash); `MmapDataFile::opened_unclean` surfaces that, the logical end is left at physical EOF,
+//! and the pack's CRC + `recover_pack` path truncates it back to the last good record. The
+//! self-referential second CRC is what stops trailing zero padding from masquerading as a clean
+//! close (`crc32(0x00000000) != 0`).
 //!
 //! ## Durability
 //!
-//! The default barrier [`Self::sync_all`] is `msync` (flush dirty pages to the backing store) —
-//! this is sufficient for data written within an already-fsync'd file size, and each size extension
-//! is fsync'd when it happens (in the grow path). [`Self::sync_disk`] is the full, slower `msync` +
-//! `fsync`, which additionally persists the file's size/metadata. (On macOS `fsync` is not a full
-//! power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync default is on Linux.)
+//! The default barrier `MmapDataFile::sync_all` is `msync` (flush dirty pages to the backing store)
+//! — this is sufficient for data written within an already-fsync'd file size, and each size
+//! extension is fsync'd when it happens (in the grow path). `MmapDataFile::sync_disk` is the full,
+//! slower `msync` + `fsync`, which additionally persists the file's size/metadata. (On macOS
+//! `fsync` is not a full power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync
+//! default is on Linux.)
 //!
 //! This module also holds the shared directory-durability helpers (`fsync_directory`,
 //! `create_dir_synced`) used across the pack file types.
@@ -172,6 +173,47 @@ enum Backing {
 /// Width of the clean-close sentinel appended at physical EOF by [`MmapDataFile`]'s `Drop`.
 pub(crate) const SENTINEL_LEN: u64 = 8;
 
+/// Size of the optional commit marker written to the tail of the mmap capacity (see
+/// [`MmapDataFile::stamp_commit_marker`]): `[committed_end u64][crc32 u32][crc32(crc32) u32]`.
+pub(crate) const COMMIT_MARKER_LEN: u64 = 16;
+
+/// Build the 16-byte commit marker for a durable data end of `committed_end`.
+///
+/// Unlike the clean-close sentinel (which encodes only CRCs and derives the length from the file
+/// size), this carries the raw `committed_end` because the marker sits in the capacity padding, not
+/// at a length-defining EOF. The trailing CRC-of-CRC is the same self-referential guard the
+/// clean-close sentinel uses: it stops zero padding from validating, and — because it ties the
+/// bytes to `committed_end` rather than to the file size — a marker can never be mistaken for a
+/// clean-close sentinel (which encodes `crc32(disk_len - 8)`).
+fn commit_marker(committed_end: u64) -> [u8; 16] {
+    let mut marker = [0_u8; 16];
+    marker[0..8].copy_from_slice(&committed_end.to_le_bytes());
+    let pos_crc = crc32fast::hash(&marker[0..8]);
+    marker[8..12].copy_from_slice(&pos_crc.to_le_bytes());
+    let crc_of_crc = crc32fast::hash(&marker[8..12]);
+    marker[12..16].copy_from_slice(&crc_of_crc.to_le_bytes());
+    marker
+}
+
+/// Parse and validate the 16-byte commit marker at the tail of a `disk_len`-byte file. Returns the
+/// stored `committed_end` only when both CRCs check out and the position lies within the file
+/// (`<= disk_len - COMMIT_MARKER_LEN`). Absent/torn/zeroed markers return `None` so recovery falls
+/// back to the WAL probe. This is fail-safe: the double CRC rejects zero padding and garbage, and
+/// even an (astronomically unlikely) CRC-valid but too-small `committed_end` is harmless — recovery
+/// only errors when the WAL stops *below* the marker, so a low/stale marker never fabricates a
+/// watermark ahead of the durable data.
+fn parse_commit_marker(bytes: &[u8; 16], disk_len: u64) -> Option<u64> {
+    let committed_end = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    if crc32fast::hash(&bytes[0..8]) != u32::from_le_bytes(bytes[8..12].try_into().ok()?) {
+        return None;
+    }
+    if crc32fast::hash(&bytes[8..12]) != u32::from_le_bytes(bytes[12..16].try_into().ok()?) {
+        return None;
+    }
+    let max_pos = disk_len.checked_sub(COMMIT_MARKER_LEN)?;
+    (committed_end <= max_pos).then_some(committed_end)
+}
+
 /// Build the 8-byte clean-close sentinel for a file whose logical data length is `end`.
 ///
 /// Layout (little-endian): bytes `[0..4]` are `crc32(end)`, bytes `[4..8]` are the `crc32` of those
@@ -241,6 +283,12 @@ pub struct MmapDataFile {
     /// was not sealed by a clean `Drop` and is most likely still padded, so the pack's heal path
     /// should run. Set once at open; a fresh (0-length) file is not considered unclean.
     opened_unclean: bool,
+    /// Durable `committed_end` recovered from the tail commit marker of an unclean file, if a
+    /// valid one is present (see [`Self::stamp_commit_marker`] / [`Self::committed_end`]).
+    /// `None` on clean or fresh opens, or when no valid marker was written/flushed
+    /// (best-effort). Recovery uses it as an index-free acked-data watermark to catch at-rest
+    /// corruption of the last committed record.
+    committed_marker: Option<u64>,
     opts: MmapFileOptions,
 }
 
@@ -275,6 +323,18 @@ impl MmapDataFile {
         // cleanly (most likely still padded), which `opened_unclean` surfaces so the pack's heal
         // path runs — the logical end is left at physical EOF for that scan.
         let (logical_end, opened_unclean) = detect_sentinel(&file, orig_len)?;
+
+        // On an unclean file, recover a durable commit marker from the tail of the mmap capacity if
+        // one is present (best-effort — see `stamp_commit_marker`). A clean/fresh file has none (a
+        // clean close truncates the padding, and its own trailing bytes are the 8-byte clean-close
+        // sentinel, not this 16-byte marker). Absent/torn/stale → `None` → the WAL probe decides.
+        let committed_marker = if opened_unclean && orig_len >= COMMIT_MARKER_LEN {
+            let mut tail = [0_u8; COMMIT_MARKER_LEN as usize];
+            file.read_exact_at(&mut tail, orig_len - COMMIT_MARKER_LEN)?;
+            parse_commit_marker(&tail, orig_len)
+        } else {
+            None
+        };
 
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
         // until the first write, so a crash before any data keeps it 0-length (and it reopens as
@@ -316,6 +376,7 @@ impl MmapDataFile {
             // Existing content is already durable on disk, so the sync fast path starts here.
             flushed_end: AtomicU64::new(logical_end),
             opened_unclean,
+            committed_marker,
             opts,
         };
         df.advise_backing();
@@ -343,6 +404,64 @@ impl MmapDataFile {
     /// (0-length) file.
     pub fn opened_unclean(&self) -> bool {
         self.opened_unclean
+    }
+
+    /// True iff the file has a physical size but every logical byte is zero — the signature of a
+    /// first write whose `grow_to` ftruncate+fsync sized the file (to `DEFAULT_INITIAL_SIZE`) but
+    /// whose header never reached disk before a crash. Such a file is semantically *unwritten*
+    /// (the same "all-zero == unwritten" rule the pack applies to records), not corrupt. Only
+    /// meaningful on an [`Self::opened_unclean`] file: a clean close always leaves a non-zero
+    /// trailing sentinel, so a sealed file is never all-zero.
+    ///
+    /// The scan is bounded to `opts.initial_size` — a never-written file is exactly that first-grow
+    /// size, and growing past it requires writing (a non-zero header first), so a larger all-zero
+    /// file is not a first-write artifact ("something else is wrong"). Bounding here both excludes
+    /// that case and keeps a pathological large all-zero file from bogging down the open.
+    pub fn is_unwritten(&self) -> bool {
+        self.end != 0
+            && self.end <= self.opts.initial_size
+            && self.slice(0, self.end as usize).is_some_and(|b| b.iter().all(|&x| x == 0))
+    }
+
+    /// The durable acked-data watermark recovered from the tail commit marker of an unclean file,
+    /// if a valid one was found at open. `None` on clean/fresh opens or when no valid marker
+    /// survived (best-effort). Recovery uses it as an index-free way to detect at-rest
+    /// corruption of the last committed record: if a WAL replay stops *below* this offset,
+    /// durable data was damaged.
+    pub fn committed_end(&self) -> Option<u64> {
+        self.committed_marker
+    }
+
+    /// Write the commit marker (`committed_end == end`) into the last `COMMIT_MARKER_LEN` bytes
+    /// of the mmap capacity. Best-effort: it dirties one padding page but adds NO sync — the
+    /// durability barrier stays the caller's `sync_all` (`msync` of `[flushed_end, end)`),
+    /// which does not cover this page, so the marker reaches disk via OS writeback or the next
+    /// grow/clean-close fsync. That is enough for its purpose (at-rest rot is detected long
+    /// after the persist).
+    ///
+    /// Fail-safe by construction: callers stamp *after* the data `msync`, so the marker can never
+    /// be ahead of durable data — a crash leaves it behind or absent, never fabricating a
+    /// watermark past real data. A no-op on a read-only handle, an empty file, or when the
+    /// capacity padding cannot hold the marker without overlapping `[0, end)` (in which case it
+    /// is simply skipped this time — the next stamp, after the next append grows capacity,
+    /// records it).
+    pub fn stamp_commit_marker(&mut self) {
+        if self.read_only || self.end == 0 {
+            return;
+        }
+        // Need `end + COMMIT_MARKER_LEN <= capacity` so the marker sits in the padding past the
+        // data.
+        let Some(marker_pos) = self.capacity.checked_sub(COMMIT_MARKER_LEN) else {
+            return;
+        };
+        if marker_pos < self.end {
+            return; // no headroom this persist; skip (fail-safe — falls back to the WAL probe)
+        }
+        if let Backing::Rw(map) = &mut self.backing {
+            let marker = commit_marker(self.end);
+            let pos = marker_pos as usize;
+            map[pos..pos + COMMIT_MARKER_LEN as usize].copy_from_slice(&marker);
+        }
     }
 
     /// Clamp a read-only handle's read bound down to `logical_end` (the caller's index-attested
@@ -413,11 +532,13 @@ impl MmapDataFile {
     }
 
     /// Next capacity that holds `needed` bytes: double until a step would exceed `max_map_size`,
-    /// then advance in `max_map_size` increments. Floors the first allocation at `initial_size`.
+    /// then advance in `max_map_size` increments. Every allocation is floored at `initial_size`, so
+    /// a small reopened file (its capacity is the reopened physical size, e.g. a 36-byte
+    /// header-only pack) jumps straight to `initial_size` instead of paying an
+    /// ftruncate+mmap+fsync per doubling back up from that tiny capacity.
     fn next_capacity(&self, needed: u64) -> u64 {
         let max_step = self.opts.max_map_size.max(1);
-        let mut cap =
-            if self.capacity == 0 { self.opts.initial_size.max(1) } else { self.capacity };
+        let mut cap = self.capacity.max(self.opts.initial_size).max(1);
         while cap < needed {
             // Grow by min(cap, max_step): geometric early, linear once a step hits the cap.
             cap = cap.saturating_mul(2).min(cap.saturating_add(max_step));
@@ -496,8 +617,10 @@ impl MmapDataFile {
 
     /// Ensure the logical length is at least `new_len`, extending the mapping (growing capacity
     /// geometrically if needed) so `[end, new_len)` becomes addressable for `slice`/`slice_mut`.
-    /// The extended region reads as zeros — fresh file growth is zero-filled and the capacity
-    /// padding past `end` is never written — so callers can treat it as freshly-zeroed space. Never
+    /// A FRESH grow is zero-filled, but the extended region is NOT guaranteed zero: after a
+    /// clean-close reopen the first `SENTINEL_LEN` bytes past `end` hold the previous clean-close
+    /// sentinel (the map spans `[0, disk_len)` with `end = disk_len - SENTINEL_LEN`), so a caller
+    /// growing into that gap must zero what it reads (e.g. `HdxIndex::redistribute_split`). Never
     /// shrinks. Unlike [`Self::set_len`], growth is geometric (a remap only when a step crosses the
     /// current capacity), so repeated one-record extensions (e.g. the digest index adding a bucket
     /// per split) do not remap every call.
@@ -567,9 +690,12 @@ impl MmapDataFile {
         }
     }
 
-    /// Clone the underlying file handle, flushing `[0, end)` first so the cloned handle's read
-    /// syscalls observe the current mmap writes. Returns the clone together with the logical `end`
-    /// at the moment of the call.
+    /// Clone the underlying file handle, `msync`ing `[0, end)` first. That `flush_range` is a
+    /// durability barrier (`MS_SYNC`), not merely a visibility hint: it writes the mapped region
+    /// back to the file so the cloned fd reads committed bytes even on platforms where mmap
+    /// stores and plain `read()` are not guaranteed coherent, and so a consumer copying through
+    /// the clone gets durable data; it also advances `flushed_end`. Returns the clone together
+    /// with the logical `end` at the moment of the call.
     ///
     /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
     /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
@@ -582,11 +708,14 @@ impl MmapDataFile {
     pub fn try_clone(&self) -> io::Result<(File, u64)> {
         if !self.read_only && self.end > 0 {
             if let Backing::Rw(map) = &self.backing {
-                // Flush dirty pages so the cloned handle observes current data.
+                // msync `[0, end)` back to the file: a durability barrier, and the coherence
+                // guarantee for the clone's plain `read()`/copy syscalls. Advance the watermark
+                // only when the msync actually ran -- if a prior `remap` failed and
+                // left no live mapping, the tail is NOT durable and the watermark
+                // must not claim otherwise.
                 map.flush_range(0, self.end as usize)?;
+                self.flushed_end.store(self.end, Ordering::Relaxed);
             }
-            // The whole `[0, end)` region was just flushed durably.
-            self.flushed_end.store(self.end, Ordering::Relaxed);
         }
         Ok((self.file.try_clone()?, self.end))
     }
@@ -601,6 +730,15 @@ impl MmapDataFile {
             return Ok(());
         }
         let Backing::Rw(map) = &self.backing else {
+            // No live mapping -- a prior `remap` failed and released it. Any tail dirtied through
+            // the released mmap still sits in the page cache; only an fsync can push it
+            // out now, and only a durable flush may advance the append watermark. A
+            // silent `Ok(())` here would let the clean-close sentinel be stamped over a
+            // possibly-non-durable tail.
+            if sync && self.flushed_end.load(Ordering::Relaxed) < self.end {
+                self.file.sync_all()?;
+                self.flushed_end.store(self.end, Ordering::Relaxed);
+            }
             return Ok(());
         };
         let start = match self.opts.write_mode {
@@ -863,6 +1001,16 @@ impl Drop for MmapDataFile {
         // vouch for the durability of the `[flushed_end, end)` tail, so leave the file unsentineled
         // and let the next open take the recovery/heal path rather than trust a possibly-short
         // tail.
+        //
+        // Crash-window note: if the process dies after the `set_len(self.end)` above but before
+        // this sentinel is durable, the file is left at exactly `end` data bytes. A later
+        // open then tests the last 8 DATA bytes as a candidate sentinel and could read the
+        // file as cleanly sealed at `end - 8` — but only if those 8 bytes happen to equal
+        // `clean_close_sentinel(end - 8)`, a ~2^-64 coincidence (and not forgeable: the
+        // writer is trusted, the sentinel is not a security boundary). This residual window
+        // is accepted rather than fixed: a magic prefix would only shrink it while forcing
+        // an on-disk format/version break, and a missed seal merely costs a recovery pass
+        // on the next open.
         if flushed && self.end > 0 {
             let sentinel = clean_close_sentinel(self.end);
             if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
@@ -946,6 +1094,68 @@ mod tests {
         let mut all = vec![0u8; 350];
         df.read_exact(&mut all).expect("read all after reopen");
         assert_eq!(all, expected);
+    }
+
+    /// `commit_marker`/`parse_commit_marker` round-trip; garbage and out-of-file positions are
+    /// rejected by the double CRC; a marker never reads as a clean-close sentinel.
+    #[test]
+    fn commit_marker_encode_validate() {
+        assert_eq!(parse_commit_marker(&[0u8; 16], 1024), None, "zero tail is not a marker");
+        let m = commit_marker(466);
+        assert_eq!(parse_commit_marker(&m, 1024), Some(466));
+        for i in 0..16 {
+            let mut bad = m;
+            bad[i] ^= 1;
+            assert_eq!(parse_commit_marker(&bad, 1024), None, "bit flip at {i} must invalidate");
+        }
+        assert_eq!(parse_commit_marker(&commit_marker(2000), 1024), None, "pos past EOF rejected");
+        // The marker's trailing 8 bytes must not satisfy the clean-close check for the file size.
+        let last8: [u8; 8] = m[8..16].try_into().unwrap();
+        assert!(
+            !sentinel_matches(&last8, 1024 - SENTINEL_LEN),
+            "a commit marker must not read as a clean-close sentinel"
+        );
+    }
+
+    /// After an unclean exit (no clean-close sentinel), a valid tail commit marker exposes the
+    /// durable committed end for recovery. Data is msync'd before the marker is stamped (the
+    /// `persist()` ordering that makes the marker fail-safe).
+    #[test]
+    fn commit_marker_recovered_on_unclean_reopen() {
+        let tmp = TempDir::with_prefix("mmap_df_marker_unclean").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(200);
+        {
+            let mut df = MmapDataFile::open(&path, false).expect("open");
+            df.write_all(&data).expect("write");
+            df.sync_all().expect("msync data");
+            df.stamp_commit_marker();
+            std::mem::forget(df); // skip Drop → unclean, padded, marker intact
+        }
+        let df = MmapDataFile::open(&path, false).expect("reopen");
+        assert!(df.opened_unclean(), "no clean-close sentinel → unclean");
+        assert_eq!(df.committed_end(), Some(data.len() as u64));
+        std::mem::forget(df); // no heal path in this unit test; don't seal the padding on drop
+    }
+
+    /// A clean close truncates the marker away (it lives in the padding), so the reopen is clean
+    /// and exposes no committed_end.
+    #[test]
+    fn commit_marker_removed_by_clean_close() {
+        let tmp = TempDir::with_prefix("mmap_df_marker_clean").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(200);
+        {
+            let mut df = MmapDataFile::open(&path, false).expect("open");
+            df.write_all(&data).expect("write");
+            df.sync_all().expect("msync");
+            df.stamp_commit_marker();
+            // Drops here: clean close truncates to `end` (+ sentinel), removing the marker.
+        }
+        let df = MmapDataFile::open(&path, false).expect("reopen");
+        assert!(!df.opened_unclean(), "clean close sealed the file");
+        assert_eq!(df.committed_end(), None, "no marker on a clean file");
+        assert_eq!(df.len(), data.len() as u64);
     }
 
     /// The zero-copy slice accessor: borrowed windows equal the written bytes; out-of-bounds or
@@ -1262,6 +1472,53 @@ mod tests {
         let mut rest = Vec::new();
         clone.read_to_end(&mut rest).expect("read padding");
         assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
+    }
+
+    /// After a failed `remap` releases the mapping (`Backing::Empty`) with `end > 0`,
+    /// `try_clone`/`flush_dirty` must not lie about durability. `try_clone` must not advance the
+    /// flush watermark (nothing was msync'd), an async `flush_dirty(false)` stays a no-op, and
+    /// a durable `flush_dirty(true)` must fall back to a real `fsync` before advancing the
+    /// watermark (so a later clean-close sentinel is truthful).
+    #[test]
+    fn failed_remap_flush_and_clone_do_not_lie_about_durability() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = TempDir::with_prefix("mmap_df_remap_fail").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(40); // < initial_size (64): a single mapping, no grow
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        let end = data.len() as u64;
+        assert_eq!(df.end, end);
+
+        // Simulate a `remap` that failed and released the mapping, leaving `end > 0` unmapped.
+        df.backing = Backing::Empty;
+
+        // try_clone with no live mapping must NOT advance the watermark (nothing was flushed).
+        df.flushed_end.store(0, Ordering::Relaxed);
+        let (_clone, cloned_end) = df.try_clone().expect("clone succeeds");
+        assert_eq!(cloned_end, end, "clone still reports the logical end");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            0,
+            "try_clone must not advance the watermark when there is no mapping to msync"
+        );
+
+        // An async flush is a no-op on a lost mapping: no false durability, no watermark advance.
+        df.flush_dirty(false).expect("async flush ok");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            0,
+            "async flush must not advance the watermark with no mapping"
+        );
+
+        // A durable flush must fall back to a real fsync and only then advance the watermark.
+        df.flush_dirty(true).expect("sync flush ok");
+        assert_eq!(
+            df.flushed_end.load(Ordering::Relaxed),
+            end,
+            "flush_dirty(true) must fsync the page-cache tail and advance the watermark"
+        );
     }
 
     #[test]

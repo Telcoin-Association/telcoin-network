@@ -73,15 +73,29 @@ impl Drop for LatestConsensus {
             // close().await already took the handle, so the block below is skipped. Drop is the
             // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
-                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(), performing sync Drop now...");
-                if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
-                    let _ = handle.join();
-                } else {
-                    // Full bounded channel — skip the join / detach. Durability
-                    // still holds: the detached thread clean-closes when the last Sender drops;
-                    // only the synchronous "sealed on return" wait is lost, and only on this
-                    // misuse path.
+                warn!(target: "consensus_chain", "LatestConsensus dropped without calling close(); sealing as a fallback");
+                if self.tx.try_send(LatestConsensusCommand::Shutdown).is_err() {
+                    // Full bounded channel — detach. The detached thread exits when the last Sender
+                    // drops, but (unlike the pack actors) its channel-closed exit does NOT fsync
+                    // the slot files, so a power loss right after this misuse
+                    // path can leave a stale hint. Tolerable: the slots are
+                    // only a hint, reconciled against the pack on open
+                    // (`clamp_latest_to_pack`).
                     error!(target: "consensus_chain", "Failed to send shutdown message to LatestConsensus (should be using close())");
+                    return;
+                }
+                let join = move || {
+                    let _ = handle.join();
+                };
+                // Never block a multi-threaded runtime worker on the slot fsyncs: offload the join
+                // to the blocking pool. On a current-thread runtime (nothing else
+                // to starve) or no runtime, a synchronous join keeps "sealed on
+                // return". `close().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
                 }
             }
         }
@@ -300,6 +314,14 @@ impl LatestConsensus {
     /// Return the current number.
     fn number(&self) -> u64 {
         self.state.lock().number
+    }
+
+    /// Reconcile the hint's number DOWN to `number` (the recovered pack's latest). In-memory only:
+    /// the pack is ground truth, the node re-persists the slots as it saves outputs, and a crash
+    /// before that just re-clamps idempotently at the next open. Keeps the epoch (which
+    /// [`ConsensusChain::new`] uses to open the current pack).
+    fn clamp_to(&self, number: u64) {
+        self.state.lock().number = number;
     }
 
     /// Take ownership and close async so we Drop does not get a chance to block any threads.
@@ -569,7 +591,6 @@ impl ConsensusChain {
         .await;
         match res_pack {
             Ok(pack) => {
-                let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
                 // Validate the imported pack; on ANY failure async-close it (the only handle)
                 // instead of leaving it to the blocking `Drop` join on this tokio
@@ -608,20 +629,18 @@ impl ConsensusChain {
                 // released), same as the old blocking `Drop::join`, but without
                 // stalling a tokio worker.
                 pack.close().await;
-                // Make sure we don't have any cruft in the final dir.
-                if std::fs::exists(&base_dir).unwrap_or_default() {
-                    // If this exists it is incomplete (see check at start of function).
-                    // This remove will leave a tiny window before the rename where it is
-                    // not available.  This may produce errors that should be handled correctly if
-                    // so.
-                    let _ = std::fs::remove_dir_all(&base_dir);
-                }
-                let rename_err = std::fs::rename(&path_base_dir, &base_dir);
-                // Invalidate the cache AFTER the rename so a concurrent get_static that
-                // missed the cache and opened FDs on the old (now-unlinked) inode cannot
-                // leave a stale entry behind for other callers — any entry cached during
-                // the race is purged here. Readers after this point fall through and
-                // see the new on-disk pack.
+                // Atomically install the imported dir (rename-aside): the live epoch-{N} dir is
+                // moved aside and only removed after the new one is renamed in and
+                // the parent is fsync'd, so a rename failure never leaves
+                // `current_pack` writing to an unlinked inode (on failure
+                // the old dir is restored and the error propagates).
+                Self::install_imported_epoch_dir(&self.base_path, epoch, &path_base_dir)?;
+                // Invalidate the cache now the new dir is durably in place: a concurrent get_static
+                // that missed the cache and opened FDs on the old (now-unlinked) inode must not
+                // leave a stale entry behind. Only a SUCCESSFUL install unlinks the
+                // old inode, so this runs only on success — a failed-and-restored
+                // install keeps the same inode, so cached handles stay valid.
+                // Readers after this point fall through and see the new on-disk pack.
                 let evicted: Vec<ConsensusPack> = {
                     let mut recents = self.recent_packs.lock();
                     let mut kept = VecDeque::with_capacity(recents.len());
@@ -639,12 +658,6 @@ impl ConsensusChain {
                 for p in evicted {
                     p.close().await;
                 }
-                rename_err?;
-                // Make the epoch-{N} directory entry durable in base_path: this commits both
-                // the remove of any stale dir and the renamed-in import before we treat the
-                // import as complete. A failed fsync here means the import is not durable, so
-                // return the error and let it be retried by re-streaming.
-                fsync_directory(&self.base_path)?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
                     // Swap the old pack out under the lock, then async-close it after the guard
@@ -725,20 +738,59 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*` or `import-*` directories under `base_path` (stale from a
-    /// prior run).
+    /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.replaced` directories under
+    /// `base_path` (stale from a prior run — the last is a rename-aside backup left by a crash
+    /// during [`Self::install_imported_epoch_dir`]).
     fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("staging-") || n.starts_with("import-"))
-                {
+                if entry.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("staging-")
+                        || n.starts_with("import-")
+                        || n.ends_with(".replaced")
+                }) {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
+    }
+
+    /// Atomically install a freshly-imported `epoch-{epoch}` directory at `base_path`, replacing
+    /// any existing one, via rename-aside: the live dir is moved to `epoch-{epoch}.replaced`
+    /// and only removed after the import is renamed into place and the parent directory is
+    /// fsync'd. If the install rename fails, the old dir is restored (same inode) so a live
+    /// `current_pack` is never left writing to an unlinked inode. A crash mid-swap leaves a
+    /// `*.replaced` dir that [`Self::remove_all_staging_and_import_dirs`] sweeps on the next
+    /// start.
+    fn install_imported_epoch_dir(
+        base_path: &Path,
+        epoch: Epoch,
+        import_dir: &Path,
+    ) -> Result<(), ConsensusChainError> {
+        let base_dir = base_path.join(format!("epoch-{epoch}"));
+        let aside = base_path.join(format!("epoch-{epoch}.replaced"));
+        // Clear any stale aside from a previously interrupted install.
+        let _ = std::fs::remove_dir_all(&aside);
+        let had_old = std::fs::exists(&base_dir).unwrap_or_default();
+        if had_old {
+            // Move the live dir aside rather than unlinking it, so it is recoverable if the install
+            // rename below fails.
+            std::fs::rename(&base_dir, &aside)?;
+        }
+        let installed = std::fs::rename(import_dir, &base_dir);
+        if installed.is_err() && had_old {
+            // Restore the old dir (same inode) so current_pack / open_append_exists keep a valid
+            // path.
+            let _ = std::fs::rename(&aside, &base_dir);
+        }
+        installed?;
+        // Durably commit the new dir entry before the import is treated as complete.
+        fsync_directory(base_path)?;
+        if had_old {
+            // Best-effort: a crash before this leaves the aside for startup cleanup to remove.
+            let _ = std::fs::remove_dir_all(&aside);
+        }
+        Ok(())
     }
 
     /// Import a verified PARTIAL pack (a prefix of an in-progress epoch streamed from a peer) into
@@ -1172,6 +1224,30 @@ impl ConsensusChain {
         self.latest_consensus.number()
     }
 
+    /// Reconcile the `LatestConsensus` hint down to the recovered current pack at startup.
+    ///
+    /// The hint (a durable, fsync'd slot) can end up AHEAD of the pack after a power loss: the slot
+    /// is written before `persist_current` msyncs the pack, so a crash can leave `(epoch, k)`
+    /// durable while output k is not — including deterministically at every epoch boundary,
+    /// where the pack then recovers meta-only. On restart the executor re-derives its parent
+    /// from the pack (`k-1`) and re-saves output k, which the ahead hint refuses
+    /// (`NonMonotonicConsensusNumber`) → a crash-loop. The pack is ground truth, so clamp the
+    /// hint to the pack's actual latest number. Call once, right after opening the chain for
+    /// writing.
+    pub async fn clamp_latest_to_pack(&self) -> Result<(), ConsensusChainError> {
+        let pack_latest = self.current_pack().latest_consensus_number().await?;
+        let hint = self.latest_consensus.number();
+        if hint > pack_latest {
+            warn!(
+                target: "consensus_chain",
+                hint, pack = pack_latest,
+                "LatestConsensus hint is ahead of the recovered pack; clamping to the pack tip"
+            );
+            self.latest_consensus.clamp_to(pack_latest);
+        }
+        Ok(())
+    }
+
     /// Return the last consensus epoch that was processed.
     pub fn latest_consensus_epoch(&self) -> Epoch {
         self.latest_consensus.epoch()
@@ -1179,7 +1255,7 @@ impl ConsensusChain {
 
     /// Write the "latest consensus" slot hint under `base_path` to `(epoch, number)` so a node
     /// opened there resumes from that consensus output instead of genesis. Writes one slot
-    /// (`consensus_slot1`); the other stays `(0, 0)` and loses the [`LatestConsensus::new`]
+    /// (`consensus_slot1`); the other stays `(0, 0)` and loses the `LatestConsensus::new`
     /// reconciliation. Used by `db load-state` after rebuilding an imported epoch's packs.
     pub fn write_latest_consensus_hint(
         base_path: &Path,
@@ -1210,14 +1286,30 @@ impl ConsensusChain {
         Ok(())
     }
 
+    /// Poll (up to `timeout`) until this is the sole owner of the shared pack state — i.e. no other
+    /// `ConsensusChain` clone remains (notably the worker RPC server's `EngineToPrimaryRpc`, which
+    /// reth's stop-less `RpcServerHandle` releases only as the jsonrpsee task winds down) — so a
+    /// following [`Self::close`] actually runs instead of no-opping through `Arc::try_unwrap`.
+    /// `current_pack`'s strong count is the proxy: every chain clone bumps it, so `== 1` means
+    /// sole. Returns whether sole ownership was reached within `timeout`.
+    pub async fn wait_until_sole_owner(&self, timeout: Duration) -> bool {
+        let poll = async {
+            while Arc::strong_count(&self.current_pack) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(timeout, poll).await.is_ok()
+    }
+
     /// Async-close every background thread this chain owns — the current epoch pack, the cached
     /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
-    /// instead of letting each object's `Drop` run a blocking thread `join()` on the caller's
-    /// thread (which would stall the async runtime).
+    /// instead of letting each object's `Drop` run a blocking thread `join()`.
     ///
-    /// Reliable only when this is the LAST `ConsensusChain` reference: each `Arc::try_unwrap`
-    /// succeeds only then, so any object still shared by another clone is left for its own `Drop`
-    /// to close. Intended for graceful shutdown, after all task-held clones have been dropped.
+    /// Each inner close runs only when this holds the LAST `ConsensusChain` reference (per-field
+    /// `Arc::try_unwrap`); an object still shared by another clone is left for its own (now
+    /// runtime-safe) `Drop`. Callers should first drop/await out every other clone — see
+    /// [`Self::wait_until_sole_owner`], which bounds the wait for the RPC clone. Intended for
+    /// graceful shutdown.
     pub async fn close(self) {
         let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
         if let Ok(pack) = Arc::try_unwrap(current_pack) {
@@ -1370,6 +1462,32 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack);
         }
+        // Purge any cached pack whose background actor thread has died (panic): it would otherwise
+        // be served from the cache and silently answer every lookup as not-found. Only rebuild
+        // the deque when a dead entry is actually present, and drop the
+        // dead packs OUTSIDE the lock — a last-handle `Drop` must not run under the cache
+        // lock (same rule as the eviction below; mirrors the pop-front-into-kept pattern in
+        // `save`). A dead pack's actor has already exited, so its `Drop` detaches
+        // immediately without a blocking join.
+        let dead = {
+            let mut recents = self.recent_packs.lock();
+            if recents.iter().all(|p| p.is_alive()) {
+                Vec::new()
+            } else {
+                let mut kept = VecDeque::with_capacity(recents.len());
+                let mut dead = Vec::new();
+                while let Some(p) = recents.pop_front() {
+                    if p.is_alive() {
+                        kept.push_back(p);
+                    } else {
+                        dead.push(p);
+                    }
+                }
+                *recents = kept;
+                dead
+            }
+        };
+        drop(dead);
         // Evict the oldest entry OUT of the lock scope: a `parking_lot` guard cannot be held across
         // the `.await` below, and if the evicted pack is the last handle its `close()` must not run
         // a blocking `Drop::join` on a tokio worker (let alone while holding the cache
@@ -1389,7 +1507,24 @@ impl ConsensusChain {
         if let Some(old) = evicted {
             old.close().await;
         }
-        let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
+        // `new_epoch` swaps `current_pack` and only THEN seals the previous writer
+        // (`old_pack.close().await` stamps the clean-close sentinels and truncates the mmap
+        // padding, under `pack_install`); `stream_import`'s replace-current renames under
+        // the same lock. A reader that maps the epoch in that window sees a padded,
+        // unsentineled pack and would reject a healthy epoch as `CorruptPack`. On any
+        // non-"missing files" error, wait out the in-flight handoff/import by taking
+        // `pack_install`, then retry once; a still-`CorruptPack` result is genuine at-rest
+        // corruption and surfaces. Safe from re-entrancy: no `get_static` caller holds
+        // `pack_install` (new_epoch/replace_current use `open_static` directly), and the guard is
+        // scoped to this match arm so it is not held across the cache-dedup `.await`s below.
+        let pack = match ConsensusPack::open_static(&self.base_path, epoch) {
+            Ok(pack) => pack,
+            Err(e) if e.is_missing_static_files() => return Err(e),
+            Err(_) => {
+                let _install = self.pack_install.lock().await;
+                ConsensusPack::open_static(&self.base_path, epoch)?
+            }
+        };
         // Final check after grabbing the lock again that another task did not also create the pack.
         // Decide under the brief lock, then release it BEFORE any `.await` — a `parking_lot` guard
         // must not be held across `close()` (same rule as the eviction block above), and the
@@ -1976,6 +2111,96 @@ mod test {
         );
     }
 
+    /// Item #13: after a power loss the durable `LatestConsensus` hint can be AHEAD of the
+    /// recovered pack, so the executor's re-derived output is refused
+    /// (`NonMonotonicConsensusNumber`) and the node crash-loops. `clamp_latest_to_pack`
+    /// reconciles the hint to the pack tip so it resumes.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_reconciles_ahead_slot() {
+        let temp_dir = TempDir::with_prefix("test_clamp_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        // Save outputs 1 and 2: pack tip = 2, hint = 2.
+        let parent = ConsensusHeader::default().digest();
+        let output1 = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest());
+        let output3 = make_test_output(&committee, 2, chain.clone(), 3, output2.digest());
+        consensus_chain.save_consensus_output(output1).await.unwrap();
+        consensus_chain.save_consensus_output(output2).await.unwrap();
+        assert_eq!(consensus_chain.latest_consensus.number(), 2);
+
+        // Simulate the power loss: the slot was fsync'd to 3 while output 3 never reached the pack.
+        consensus_chain.latest_consensus.update(0, 3).await;
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+
+        // Reproduce the crash-loop: the re-derived output 3 is refused by the ahead hint.
+        let err = consensus_chain
+            .save_consensus_output(output3.clone())
+            .await
+            .expect_err("an ahead hint must refuse the re-derived output");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::NonMonotonicConsensusNumber { latest: 3, number: 3 }
+            ),
+            "expected NonMonotonicConsensusNumber {{ latest: 3, number: 3 }}, got {err:?}"
+        );
+
+        // The clamp reconciles the hint to the pack tip (2).
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp");
+        assert_eq!(consensus_chain.latest_consensus.number(), 2, "hint clamped to the pack tip");
+
+        // Now the re-derived output 3 is accepted and the node makes progress.
+        consensus_chain.save_consensus_output(output3).await.expect("output 3 saved after clamp");
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+    }
+
+    /// Item #13, the deterministic epoch-boundary case: the current pack recovered meta-only (no
+    /// outputs) while the hint says a number was saved. `latest_consensus_header` returns `None`
+    /// there, so the clamp must use `latest_consensus_number` (= `start_consensus_number - 1`).
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_meta_only_pack() {
+        let temp_dir = TempDir::with_prefix("test_clamp_meta_only").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee).await.unwrap();
+        // Meta-only epoch-0 pack: start_consensus_number == 1, no outputs -> latest number 0.
+        assert_eq!(consensus_chain.latest_consensus.number(), 0);
+
+        // A not-ahead hint is a no-op.
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp no-op");
+        assert_eq!(consensus_chain.latest_consensus.number(), 0);
+
+        // Power loss left the hint ahead (an output was fsync'd to the slot but not the pack).
+        consensus_chain.latest_consensus.update(0, 5).await;
+        assert_eq!(consensus_chain.latest_consensus.number(), 5);
+        consensus_chain.clamp_latest_to_pack().await.expect("clamp");
+        assert_eq!(
+            consensus_chain.latest_consensus.number(),
+            0,
+            "meta-only pack: hint clamped to start_consensus_number - 1"
+        );
+    }
+
     #[tokio::test]
     async fn test_consensus_store_db_stream() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
@@ -2213,6 +2438,85 @@ mod test {
             unreadable.is_err(),
             "a present-but-unreadable static pack must surface as Err: {unreadable:?}"
         );
+    }
+
+    /// `get_static` retries `open_static` once under `pack_install` so a healthy epoch
+    /// mapped mid-handoff (padded, not-yet-sentineled) is not misreported as corrupt. The retry
+    /// must still surface GENUINE at-rest corruption rather than mask it, and must terminate
+    /// without deadlocking on the lock. (The transient-handoff benefit itself — a racing writer
+    /// sealing the epoch during the retry — is exercised by
+    /// `test_new_epoch_stream_import_race`.)
+    #[tokio::test]
+    async fn test_get_static_retry_still_surfaces_corruption() {
+        use crate::consensus_pack::DATA_NAME;
+
+        let temp_dir = TempDir::with_prefix("test_get_static_retry").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee).await.unwrap();
+
+        // A present-but-unreadable static pack for a non-current epoch: `get_static` must return
+        // `Err` after its single retry — the retry re-opens under `pack_install` (no
+        // deadlock, no infinite loop) and does not mask genuine corruption as a miss.
+        let epoch_dir = temp_dir.path().join("epoch-1");
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        std::fs::write(epoch_dir.join(DATA_NAME), [0xAB; 64]).expect("write garbage data file");
+        let result = consensus_chain.get_static(1).await;
+        assert!(
+            result.is_err(),
+            "genuine at-rest corruption must surface through get_static's retry: {result:?}"
+        );
+    }
+
+    /// `install_imported_epoch_dir` must never unlink the live epoch dir before the
+    /// new one is safely in place. On success the import replaces it and the rename-aside
+    /// backup is cleaned; on a failed install rename the old dir is restored (same inode), so a
+    /// live writer is never left on an unlinked/absent path.
+    #[test]
+    fn test_install_imported_epoch_dir_atomic_swap() {
+        let tmp = TempDir::with_prefix("test_install_epoch").expect("temp dir");
+        let base = tmp.path();
+        let make_dir = |p: &std::path::Path, marker: &str| {
+            std::fs::create_dir_all(p).expect("mkdir");
+            std::fs::write(p.join("data"), marker).expect("write marker");
+        };
+        let base_dir = base.join("epoch-0");
+        let aside = base.join("epoch-0.replaced");
+
+        // Success: an existing epoch-0 is replaced by the import; the aside is cleaned.
+        make_dir(&base_dir, "OLD");
+        let import = base.join("import-0");
+        make_dir(&import, "NEW");
+        ConsensusChain::install_imported_epoch_dir(base, 0, &import).expect("install succeeds");
+        assert_eq!(
+            std::fs::read_to_string(base_dir.join("data")).unwrap(),
+            "NEW",
+            "new content installed"
+        );
+        assert!(!import.exists(), "import dir consumed by the rename");
+        assert!(!aside.exists(), "rename-aside backup cleaned on success");
+
+        // Failure-restore: a missing import makes the install rename fail (ENOENT); the old dir
+        // must be restored with its original content and no aside left behind.
+        make_dir(&base_dir, "KEEP");
+        let missing = base.join("import-does-not-exist");
+        let err = ConsensusChain::install_imported_epoch_dir(base, 0, &missing);
+        assert!(err.is_err(), "install must fail when the import dir is absent: {err:?}");
+        assert!(base_dir.exists(), "old epoch-0 must still exist after a failed install");
+        assert_eq!(
+            std::fs::read_to_string(base_dir.join("data")).unwrap(),
+            "KEEP",
+            "old content restored (the live dir was never unlinked)"
+        );
+        assert!(!aside.exists(), "aside restored back into place, not left behind");
     }
 
     /// A partial stream of the in-progress (incomplete) current epoch must deliver a verifiable
@@ -2989,6 +3293,44 @@ mod test {
             pack.committee().bls_keys().contains(&dropped),
             "the burned member stays in the pack's snapshot for decoding this epoch"
         );
+    }
+
+    /// #23: `wait_until_sole_owner` bounds the wait for another `ConsensusChain` clone (in production
+    /// the worker RPC server's `EngineToPrimaryRpc`) to drop, so `close()` runs instead of
+    /// no-opping through `Arc::try_unwrap`. It reports false while a clone lives and true once
+    /// this is sole.
+    #[tokio::test]
+    async fn test_wait_until_sole_owner_bounds_the_clone_wait() {
+        let temp_dir = TempDir::with_prefix("test_sole_owner").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        // A second clone (models the RPC server's `EngineToPrimaryRpc` clone) keeps it non-sole, so
+        // the bounded wait times out and reports false.
+        let clone = consensus_chain.clone();
+        assert!(
+            !consensus_chain.wait_until_sole_owner(std::time::Duration::from_millis(100)).await,
+            "must not report sole ownership while another clone lives"
+        );
+
+        // Once the only other clone drops, the wait resolves to sole ownership promptly.
+        drop(clone);
+        assert!(
+            consensus_chain.wait_until_sole_owner(std::time::Duration::from_secs(2)).await,
+            "must report sole ownership after the only other clone drops"
+        );
+
+        // Sole owner now, so close() actually runs (does not no-op).
+        consensus_chain.close().await;
     }
 
     #[tokio::test]

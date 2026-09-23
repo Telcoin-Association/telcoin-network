@@ -19,7 +19,7 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{encode, try_decode, BlockHash, Database, DefaultHashFunction};
+use tn_types::{encode, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
 use tracing::{error, warn};
 
 /// A record stored in the DHT.
@@ -217,6 +217,20 @@ impl KadProviderRow {
 /// interval bounds that cost without losing any eviction a 48h TTL could yield.
 const PROVIDER_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The DHT key under which a node's [`NodeRecord`](crate::types::NodeRecord) lives: the
+/// raw bytes of its primary BLS public key.
+///
+/// This is deliberately *not* the BCS encoding of the key, which would prepend a ULEB128
+/// length prefix and land on a different row. Every production producer and consumer of a
+/// node's record key goes through this function so they cannot drift apart:
+/// `ConsensusNetwork::get_peer_record` publishes under it, the `MissingAuthorities`
+/// handler in `ConsensusNetwork` queries it, and [`KadStore`] uses it as `node_key` so
+/// [`RecordStore::provided`] enumerates the row `start_providing` actually wrote (issue
+/// #1331).
+pub(crate) fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
+    RecordKey::new(primary_public_key)
+}
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
@@ -262,7 +276,7 @@ impl<DB: Database> KadStore<DB> {
         key_config: &KeyConfig,
         kad_type: NetworkType,
     ) -> Self {
-        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let node_key = node_record_key(&key_config.primary_public_key());
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
         let mut store = Self {
@@ -1086,10 +1100,10 @@ mod test {
         test_rec(&rec2, &kad_store);
         test_rec(&rec3, &kad_store);
 
-        let key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let key = node_record_key(&key_config.primary_public_key());
         let provider = PeerId::random();
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
-        // Make manually to use our node key as key.
+        // Built by hand so the key is this store's `node_key` (the slot `provided()` reads).
         let provider_rec1 = ProviderRecord { key, provider, expires, addresses: vec![] };
         let provider = PeerId::random();
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
@@ -1220,8 +1234,11 @@ mod test {
         let local_peer_id = PeerId::random();
         let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
 
-        // Both records key on `node_key`, the slot `provided()` reads.
-        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        // Both records key on the node's published record key, which must be the slot
+        // `provided()` reads (issue #1331): derive it the way the publish path does, not
+        // from the store's private field, so a divergence fails this test.
+        let node_key = node_record_key(&key_config.primary_public_key());
+        assert_eq!(kad_store.node_key, node_key, "store node_key matches the published key");
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
         let ours = ProviderRecord {
             key: node_key.clone(),
@@ -1248,6 +1265,51 @@ mod test {
             kad_store.provided().map(|record| record.into_owned()).collect();
         assert_eq!(provided.len(), 1, "provided() enumerates only self-authored records");
         assert_eq!(provided[0].provider, local_peer_id, "the enumerated record is ours");
+    }
+
+    /// The store's `node_key` is the raw primary BLS public key, byte for byte the key
+    /// `ConsensusNetwork::get_peer_record` publishes under, and not its BCS encoding.
+    ///
+    /// Before issue #1331 the store BCS-encoded the key (one ULEB128 length byte ahead of
+    /// the raw bytes) while the publish path used the raw bytes, so `provided()` scanned a
+    /// row production never wrote and the node never republished its own provider record.
+    #[test]
+    fn test_node_key_is_raw_primary_key_bytes() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let local_peer_id = PeerId::random();
+        let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
+
+        let primary_key = key_config.primary_public_key();
+        // The exact expression the publish path uses.
+        let published_key = RecordKey::new(&primary_key);
+        assert_eq!(kad_store.node_key, published_key, "node_key is the published record key");
+        assert_eq!(kad_store.node_key.as_ref(), primary_key.as_ref(), "raw key bytes");
+        assert_ne!(
+            kad_store.node_key.as_ref(),
+            encode(&primary_key).as_slice(),
+            "node_key must not be the BCS encoding of the key"
+        );
+
+        // A self-provide under the published key is what the republish job enumerates.
+        // Production `start_providing` stores it with `expires: None` (libp2p
+        // `ProviderRecord::new`), so model that row exactly: `None` must survive the
+        // `KadProviderRow` round trip and pass the expiry filters.
+        let ours = ProviderRecord {
+            key: published_key,
+            provider: local_peer_id,
+            expires: None,
+            addresses: vec![],
+        };
+        kad_store.add_provider(ours).expect("add our provider record");
+        kad_store.db.sync_persist();
+        let provided: Vec<ProviderRecord> =
+            kad_store.provided().map(|record| record.into_owned()).collect();
+        assert_eq!(provided.len(), 1, "provided() enumerates the self-provide");
+        assert_eq!(provided[0].provider, local_peer_id);
+        assert!(provided[0].expires.is_none(), "expires: None survives the round trip");
     }
 
     /// Expired records must be filtered from `get()` and `records()` even though
@@ -1291,6 +1353,41 @@ mod test {
         kad_store.put(fresh.clone()).expect("eviction must make room");
         assert_eq!(kad_store.num_records, 1, "only the fresh row should remain");
         assert!(kad_store.get(&fresh.key).is_some(), "fresh record retained");
+    }
+
+    /// Replacing a record refreshes expiry without consuming another slot, even at capacity.
+    #[test]
+    fn test_kad_put_refreshes_expiry_at_capacity() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
+            .into_iter()
+            .try_for_each(|network_type| -> eyre::Result<()> {
+                let mut store =
+                    KadStore::new(db.clone(), PeerId::random(), &key_config, network_type);
+                store.config.max_records = 1;
+                let instant = Instant::now();
+                let mut record = test_record(false);
+                record.expires = Some(instant + Duration::from_secs(60));
+                store.put(record.clone())?;
+                let first_expiry = store
+                    .get(&record.key)
+                    .and_then(|stored| stored.expires)
+                    .ok_or_else(|| eyre::eyre!("initial expiry"))?;
+                record.expires = Some(instant + Duration::from_secs(120));
+                store.put(record.clone())?;
+                let stored =
+                    store.get(&record.key).ok_or_else(|| eyre::eyre!("refreshed record"))?;
+                assert_eq!(stored.value, record.value);
+                assert_eq!(stored.publisher, record.publisher);
+                assert!(stored
+                    .expires
+                    .is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+                assert_eq!(store.num_records, 1);
+                assert_eq!(store.records().count(), 1);
+                Ok(())
+            })
     }
 
     /// Test that we do not count duplicate puts against our max records.

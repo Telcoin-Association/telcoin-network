@@ -10,6 +10,7 @@ mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;
 mod genesis_tests;
+mod governance_safe_fork;
 mod metrics;
 mod restarts;
 mod staking;

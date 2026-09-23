@@ -506,9 +506,9 @@ impl Report {
     }
 
     fn print(&self) {
-        // Columns are pushed 2 per width block (buf, mmap); a vertical rail after every block and a
-        // rule between row groups make a single row easy to follow across all columns.
-        const GROUP: usize = 2;
+        // One column per width now (the buf/mmap A-B comparison was removed); a vertical rail
+        // between width columns and a rule between row groups keep a single row easy to follow.
+        const GROUP: usize = 1;
         let label_w =
             self.order.iter().map(|s| s.len()).max().unwrap_or(0).max("bytes/output".len());
         let cell_w = 14usize;

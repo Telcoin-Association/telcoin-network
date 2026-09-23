@@ -1,7 +1,7 @@
 //! Code to support various chain forks.
 
 use crate::Epoch;
-use alloy::primitives::{b256, B256};
+use alloy::primitives::{address, b256, Address, B256};
 
 /// Keccak-256 hash of the pre-fork `ConsensusRegistry` runtime bytecode deployed on the live
 /// adiri testnet (the registry account's `code` in the committed
@@ -297,14 +297,30 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// always has; it does not make `PREVRANDAO` unbiasable. See
 /// [`EpochSeedChainValue`](crate::EpochSeedChainValue) on accepted last-actor bias.
 ///
-/// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
-/// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
-/// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting
-/// PR fleet-wide before the fork epoch begins. The rollout PR MUST set a value at or above
-/// the live adiri epoch plus deployment margin, and at or above
-/// [`SEED_SIGNATURE_FORK_EPOCH`]: [`prevrandao_seed_active`] additionally requires
-/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork
-/// fires instead of hashing the forkable legacy leader-aggregate seed (#1032).
+/// Armed for adiri (chain 2017) at epoch 574: every block executed for a commit whose leader
+/// carries epoch 574 or later derives `PREVRANDAO` from the seed chain. Measured boundary: Wed
+/// 2026-09-30 08:33 UTC (03:33 CDT). Derived by binary-searching first-block timestamps over
+/// epochs 536→544 on the live chain (mean epoch length 21,602 s, σ 58 s, so about 6.001 h per
+/// epoch), snapshotted at epoch 544 / block 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 574 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so blocks the fleet already executed with the XOR derivation at or past the
+/// constant would replay with a different `mix_hash` on this build and diverge from canonical
+/// history.
+///
+/// Arming constraint (compile-time asserted below): the epoch must be at or above
+/// [`SEED_SIGNATURE_FORK_EPOCH`]. [`prevrandao_seed_active`] additionally requires
+/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork fires
+/// instead of hashing the forkable legacy leader-aggregate seed (#1032).
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary keeps the XOR derivation, computes a different `mix_hash` for
+/// every block from the fork epoch on, and forks away from the upgraded fleet at its first
+/// post-fork block.
 ///
 /// Pre-fork epochs keep the XOR derivation byte-identical so replaying already-executed
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
@@ -320,19 +336,12 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// commit. This fork promotes that bias into an opcode contracts can read; contracts that
 /// need unbiasable randomness must not use `PREVRANDAO` alone.
 #[cfg(feature = "adiri")]
-pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
+pub const PREVRANDAO_FORK_EPOCH: Epoch = 574;
 
-/// Compile-time enforcement of the rollout-order contract documented on
-/// [`PREVRANDAO_FORK_EPOCH`]: a rollout PR that sets the PREVRANDAO fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires.
+/// Compile-time enforcement of the arming constraint documented on [`PREVRANDAO_FORK_EPOCH`]:
+/// a retarget that sets the PREVRANDAO fork below the seed fork fails to compile instead of
+/// shipping a gate that silently stays dormant until the seed fork fires.
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while PREVRANDAO_FORK_EPOCH is the `Epoch::MAX` placeholder; \
-              once the rollout PR lowers the constant the comparison becomes live and this \
-              expectation flags itself for removal"
-)]
 const _: () = assert!(PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Whether executed blocks of `epoch` derive `PREVRANDAO` from the epoch seed chain (#1247).
@@ -374,12 +383,6 @@ fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
 #[inline]
 const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "PREVRANDAO_FORK_EPOCH is an `Epoch::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= PREVRANDAO_FORK_EPOCH
     }
@@ -411,7 +414,7 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 
 #[cfg(feature = "adiri")]
 /// First epoch whose [`Committee`](crate::Committee) is bcs-encoded in the multi-worker layout
-/// (#554).
+/// (issue #554).
 ///
 /// Two fields move at this boundary, both inside the `Committee` value itself:
 /// - each `BootstrapServer` writes `workers`, a length-prefixed sequence of `P2pNode`, where the
@@ -423,38 +426,58 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 /// worker's first byte as a sequence length. `Committee` is embedded in `EpochMeta`, the first
 /// record of every consensus pack, so an un-gated layout change bricks decode of every pack
 /// already on disk: an adiri node restarting on the new build cannot read its own history. Below
-/// this epoch the encoder writes the legacy single-worker shape byte-identically to the pre-#554
-/// binary, so packs stay readable in both directions across a mixed fleet.
+/// this epoch the encoder writes the legacy single-worker shape byte-identically to the
+/// pre-multi-worker (#554) binary, so packs stay readable in both directions across a mixed fleet.
 ///
 /// The gate ([`multi_workers_fork_active`]) always reads the epoch carried inside the value being
 /// encoded or decoded — never node-local committee state — so mixed-epoch containers (pack
 /// records, epoch records, state-sync payloads) decode correctly at any nesting depth and
 /// historical digests are preserved end to end.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 570: every committee of epoch 570 or later is encoded in
+/// the multi-worker layout. Measured boundary: Tue 2026-09-29 08:32 UTC (03:32 CDT). Derived by
+/// binary-searching first-block timestamps over epochs 536→544 on the live chain (mean epoch
+/// length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block 408941
+/// on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup so
+/// operators can diff it across the fleet; a compile-time constant that differs between binaries
+/// has no other in-protocol detection.
 ///
-/// Arming constraint: the concrete epoch must be at least [`CONSENSUS_REGISTRY_FORK_EPOCH`]
-/// (407). Committees below 407 are structurally single-worker — the deployed pre-fork registry
-/// exposes no governance path that raises the worker count — so the legacy layout is lossless
-/// for every epoch this gate leaves dormant. From 407 onward that guarantee becomes operational
-/// rather than structural: the worker count must stay at one until this fork epoch has begun, or
-/// a multi-worker committee gets written in a layout that cannot represent it.
+/// Re-verify at merge and at tag time. If epoch 570 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so committees at or past the constant that the fleet already wrote in the
+/// legacy layout would not decode under this build.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since it writes and reads the legacy layout for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch begins. A
-/// straggler still on an old build past the boundary fails to decode post-fork committees loudly
-/// and drops out rather than silently diverging.
+/// Arming constraint (compile-time asserted below): the epoch must be at least
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] (407). Committees below 407 are structurally single-worker —
+/// the deployed pre-fork registry exposes no governance path that raises the worker count — so the
+/// legacy layout is lossless for every epoch this gate leaves dormant. From 407 onward that
+/// guarantee becomes operational rather than structural: the on-chain worker count must stay at
+/// one until epoch 570 begins, or a multi-worker committee gets written in a layout that cannot
+/// represent it.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build is not cut off at this boundary: with a single worker it keeps running past it on
+/// its own legacy-layout packs and never decodes a peer's committee. It fails only when it must
+/// fetch an epoch pack for an epoch at or past the constant from an upgraded peer, or serve one
+/// to it, because the post-fork `EpochMeta` record does not decode on the old binary and the
+/// legacy record does not decode on the new one.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the multi-worker layout is active from
 /// genesis and this constant does not exist there.
-pub const MULTI_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
+pub const MULTI_WORKERS_FORK_EPOCH: Epoch = 570;
+
+/// Compile-time enforcement of the arming constraint documented on
+/// [`MULTI_WORKERS_FORK_EPOCH`]: a retarget that sets this fork below
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] fails to compile instead of leaving the ordering to a
+/// reader's arithmetic.
+#[cfg(feature = "adiri")]
+const _: () = assert!(MULTI_WORKERS_FORK_EPOCH >= CONSENSUS_REGISTRY_FORK_EPOCH);
 
 /// Whether the [`Committee`](crate::Committee) of `epoch` is bcs-encoded in the multi-worker
-/// layout (#554).
+/// layout (issue #554).
 ///
 /// Gates both directions of serialization. Callers MUST pass the epoch carried inside the value
 /// being encoded or decoded (the committee's own epoch, the epoch of the pack record being read),
@@ -486,20 +509,15 @@ pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
 /// because the two forks arm independently and must never be tied to one constant.
 ///
 /// Unchanged from [`MULTI_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
-/// carries pre-#554 packs on disk) stays dormant until the constant is lowered, and every other
-/// build is active from genesis. The genesis default rests on an assumption worth stating: no
-/// non-adiri network holds packs written by a pre-#554 binary, so no such build ever has to read
-/// the legacy single-worker layout. A non-adiri deployment that predates #554 would need its own
-/// dormant period here instead.
+/// carries pre-multi-worker (#554) packs on disk) stays dormant before
+/// [`MULTI_WORKERS_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other build is
+/// active from genesis. The genesis default rests on an assumption worth stating: no non-adiri
+/// network holds packs written by a pre-multi-worker (#554) binary, so no such build ever has to
+/// read the legacy single-worker layout. A non-adiri deployment that predates the multi-worker
+/// layout (#554) would need its own dormant period here instead.
 #[inline]
 const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "MULTI_WORKERS_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= MULTI_WORKERS_FORK_EPOCH
     }
@@ -564,38 +582,41 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 ///   two headers is credited to whichever header comes first in sequence and dropped from the
 ///   second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork permutes exactly that
 ///   sequence, so arming it at or below the cutoff would change replayed attribution on adiri, a
-///   resync divergence rather than just a reordering. The epoch-setting PR is the place this bites,
-///   and that PR will not be looking at the dup-batch interaction; the assert makes it look.
+///   resync divergence rather than just a reordering. A retarget of the constant is the place this
+///   bites, and a retarget will not be looking at the dup-batch interaction; the assert makes it
+///   look.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 567: every commit whose leader carries epoch 567 or later
+/// takes the seeded intra-round order. Measured boundary: Mon 2026-09-28 14:32 UTC (09:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup
+/// so operators can diff it across the fleet; a compile-time constant that differs between
+/// binaries has no other in-protocol detection.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since the legacy order stays in force for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
-/// begins. A straggler still on an old build past the boundary orders the same certificates
-/// differently, executes them in a different sequence, and forks away from the upgraded fleet
-/// at its next commit. That divergence is loud (its executed state stops matching the fleet's)
-/// but it is a fork, not a decode error, so the fleet must be fully upgraded before the epoch
-/// is armed.
+/// Re-verify at merge and at tag time. If epoch 567 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so commits the fleet already executed in the legacy order at or past the
+/// constant would replay in the seeded order on this build and diverge from canonical history.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary orders the same certificates differently, executes them in a
+/// different sequence, and forks away from the upgraded fleet at its next commit. That divergence
+/// is loud (its executed state stops matching the fleet's) but it is a fork, not a decode error,
+/// so the fleet must be fully upgraded before the fork epoch begins.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the seeded order is active from genesis
 /// and this constant does not exist there.
-pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
+pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = 567;
 
 /// Compile-time enforcement of the first arming constraint documented on
-/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a rollout PR that sets this fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires (the [`leader_seeded_ordering_active`] conjunct).
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a retarget that sets this fork below the seed fork
+/// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
+/// fires (the [`leader_seeded_ordering_active`] conjunct).
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while LEADER_SEEDED_ORDERING_FORK_EPOCH is the `u32::MAX` \
-              placeholder; once the rollout PR lowers the constant the comparison becomes \
-              live and this expectation flags itself for removal"
-)]
 const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Compile-time enforcement of the second arming constraint documented on
@@ -652,17 +673,12 @@ fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
 /// independently and must never be tied to one constant.
 ///
 /// Unchanged from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]'s documented contract: adiri (testnet,
-/// which carries legacy-ordered commits in its history) stays dormant until the constant is
-/// lowered, and every other build is active from genesis.
+/// which carries legacy-ordered commits in its history) stays dormant before
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other
+/// build is active from genesis.
 #[inline]
 const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "LEADER_SEEDED_ORDERING_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not \
-                  `==`) is the gate the future epoch-setting PR relies on, and this expectation \
-                  flags itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= LEADER_SEEDED_ORDERING_FORK_EPOCH
     }
@@ -707,10 +723,24 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
 /// mismatch that is otherwise invisible in the logs.
 ///
 /// Only variables that parsed are listed, so an entry means "pinned here", absence means "using
-/// this build's own fork point". Values latch on first read like the individual overrides do.
+/// this build's own fork point". A row is carried here under the same cfg as the gate that
+/// consumes it, so absence also covers a fork this build cannot honor at all: reporting one would
+/// name a pin nothing reads. [`governance_safe_fork_epoch`] is `adiri`-only, so its row is too,
+/// and a non-adiri `test-utils` binary inheriting `TN_GOVERNANCE_SAFE_FORK_EPOCH` from a Makefile
+/// lane stays silent about it rather than warn-logging a schedule change that never happens. Every
+/// entry is therefore genuinely in force on the build that printed it. Values latch on first read
+/// like the individual overrides do.
 pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
     #[cfg(feature = "test-utils")]
     {
+        // Carried under its consumer's cfg per the paragraph above. An attribute cannot sit on an
+        // array element, so the row joins the unconditional ones as a chained `Option`.
+        #[cfg(feature = "adiri")]
+        let governance_safe =
+            Some(("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()));
+        #[cfg(not(feature = "adiri"))]
+        let governance_safe: Option<(&'static str, Option<Epoch>)> = None;
+
         [
             ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
@@ -718,11 +748,268 @@ pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
         ]
         .into_iter()
+        .chain(governance_safe)
         .filter_map(|(var, fork_epoch)| fork_epoch.map(|fork_epoch| (var, fork_epoch)))
         .collect()
     }
     #[cfg(not(feature = "test-utils"))]
     Vec::new()
+}
+
+/// Keccak-256 hash of the governance Safe proxy runtime bytecode deployed on the live adiri
+/// testnet (the `0x…07a0` account's `code` in the committed `chain-configs/testnet/genesis.yaml`
+/// — an 81-byte solc-0.8.26 recompile of `SafeProxy`, not the canonical 171-byte build).
+///
+/// Pins the code the [`GOVERNANCE_SAFE_FORK_EPOCH`] migration expects to find at the governance
+/// address. The fork rewrites the proxy's singleton slot (slot 0) and fallback-handler slot in
+/// place; doing that over any other deployment risks corrupting an unknown layout, so the
+/// migration fails closed unless the on-chain code hashes to this value AND slot 0 still holds
+/// the pre-fork L1 `Safe` singleton.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH: B256 =
+    b256!("0xfe74fcea823036dfc874205a4198185eedae92b256d956cbf805c6c0dc2fd184");
+
+/// Keccak-256 hash of the pre-fork `Safe` singleton runtime bytecode deployed on the live adiri
+/// testnet at the canonical `0x41675C09…` address (a 12,180-byte solc-0.8.26 recompile; the
+/// canonical v1.4.1 build is 8,640 bytes of solc-0.7.6 output).
+///
+/// Pins the code the [`GOVERNANCE_SAFE_FORK_EPOCH`] swap expects to find before replacing it
+/// with the canonical bytes: the code-only swap preserves the account's storage (`threshold = 1`
+/// from the recompiled constructor), which is only sound over the pinned layout — Safe v1.4.1
+/// storage is identical between the recompile and the canonical build, but an unknown deployment
+/// gets no such guarantee, so the swap fails closed on any other hash.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const SAFE_SINGLETON_PRE_FORK_CODE_HASH: B256 =
+    b256!("0xcebd258f55cc264ff411b2797a0a1609764f47076a34cef429264a3e2ea96b77");
+
+/// Keccak-256 hash of the pre-fork `SafeProxyFactory` runtime bytecode deployed on the live
+/// adiri testnet at the canonical `0x4e1DCf7A…` address (a solc-0.8.26 recompile).
+///
+/// The recompiled factory is the reason counterfactual Safe creations land at non-canonical
+/// addresses on adiri: `createProxyWithNonce` derives the proxy address via CREATE2 over the
+/// factory's **embedded proxy creation code**, and the recompile embeds different bytes than
+/// every other chain's canonical deployment. The [`GOVERNANCE_SAFE_FORK_EPOCH`] swap replaces it
+/// with the canonical bytes, restoring cross-chain address parity for every Safe created after
+/// the boundary; proxies the recompiled factory already created (their addresses and code) are
+/// untouched. Fails closed on any other hash.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH: B256 =
+    b256!("0x7c62c68777c4f5d3a736cabf479a12f2fc043ef7016fad20da5a9bb0c68433fc");
+
+/// The canonical Safe v1.4.1 suite the [`GOVERNANCE_SAFE_FORK_EPOCH`] boundary installs:
+/// `(vendored-file stem, canonical cross-chain address, keccak-256 of the runtime bytecode)`.
+///
+/// One row per contract in mainnet genesis' Safe suite — the full 12-contract
+/// safe-deployments v1.4.1 registry plus the Safe Singleton Factory — sourced from
+/// `tn-contracts/deployments/genesis/canonical-bytecode/` (provenance and per-file hashes in
+/// its README; the file stem names the vendored `<stem>.hex`). `tn-reth`'s fork machinery
+/// embeds those files and refuses to etch any byte string that does not hash to its row here,
+/// and after the fork has run live these values carry the replay constraint documented on
+/// [`CONSENSUS_REGISTRY_POST_FORK_CODE_HASH`]: re-executing the boundary must install these
+/// exact bytes, so a tn-contracts bump that changes a vendored file is caught by the pin test
+/// instead of breaking historical state roots.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const GOVERNANCE_SAFE_FORK_CANONICAL_SUITE: [(&str, Address, B256); 13] = [
+    (
+        "Safe",
+        address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
+        b256!("0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4"),
+    ),
+    (
+        "SafeL2",
+        address!("0x29fcB43b46531BcA003ddC8FCB67FFE91900C762"),
+        b256!("0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff"),
+    ),
+    (
+        "SafeProxyFactory",
+        address!("0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"),
+        b256!("0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317"),
+    ),
+    (
+        "CompatibilityFallbackHandler",
+        address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99"),
+        b256!("0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9"),
+    ),
+    (
+        "SafeToL2Setup",
+        address!("0xBD89A1CE4DDe368FFAB0eC35506eEcE0b1fFdc54"),
+        b256!("0x2f25df28caf984366ee584e13241707e85dcd5a6ea0c14267928dafc1fd6274b"),
+    ),
+    (
+        "MultiSend",
+        address!("0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526"),
+        b256!("0x0e4f7fc66550a322d1e7688e181b75e217e662a4f3f4d6a29b22bc61217c4b77"),
+    ),
+    (
+        "MultiSendCallOnly",
+        address!("0x9641d764fc13c8B624c04430C7356C1C7C8102e2"),
+        b256!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939"),
+    ),
+    (
+        "SignMessageLib",
+        address!("0xd53cd0aB83D845Ac265BE939c57F53AD838012c9"),
+        b256!("0x525c754a46b79e05543a59bb61e8de3c9eee0d955a59352409cbe67ea1077528"),
+    ),
+    (
+        "CreateCall",
+        address!("0x9b35Af71d77eaf8d7e40252370304687390A1A52"),
+        b256!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889"),
+    ),
+    (
+        "SimulateTxAccessor",
+        address!("0x3d4BA2E0884aa488718476ca2FB8Efc291A46199"),
+        b256!("0x91f82615581fc73b190b83d72e883608b25e392f72322035df1b13d51766cf8d"),
+    ),
+    (
+        "SafeSingletonFactory",
+        address!("0x914d7Fec6aaC8cd542e72Bca78B30650d45643d7"),
+        b256!("0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989"),
+    ),
+    (
+        "SafeMigration",
+        address!("0x526643F69b81B008F46d95CD5ced5eC0edFFDaC6"),
+        b256!("0xc00d7921460cd5a05393e7772e634bd7d212f356356aa3a77f0120a9b8e25e99"),
+    ),
+    (
+        "SafeToL2Migration",
+        address!("0xfF83F6335d8930cBad1c0D439A841f01888D9f69"),
+        b256!("0xa83e7be2fa20c96dc9575e3937239d552f3831ea437d7c96397eec8736f0cba0"),
+    ),
+];
+
+/// The canonical address of the named [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] row, or `None`
+/// when the suite carries no such contract.
+///
+/// Row order in the table is load-bearing — `tn-reth` zips it against the vendored bytecode
+/// list, so the two must stay positionally aligned — which makes an index the wrong handle for
+/// callers that mean one *specific* contract. They resolve it by name here, the same way the
+/// fork's installer keys its per-contract special cases (pre-fork pins, the SafeL2 threshold
+/// seed) off the row name.
+pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
+    GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+        .iter()
+        .find_map(|(row, address, _)| (row == &name).then_some(*address))
+}
+
+#[cfg(feature = "adiri")]
+/// First epoch that begins with the canonical Safe v1.4.1 suite installed and the governance
+/// Safe migrated onto `SafeL2`.
+///
+/// The epoch-closing block that concludes `GOVERNANCE_SAFE_FORK_EPOCH - 1` fires
+/// `tn-reth::evm::block::apply_governance_safe_fork` exactly once (one-shot `==` trigger, the
+/// same shape as [`CONSENSUS_REGISTRY_FORK_EPOCH`]), bringing live adiri's Safe stack to parity
+/// with mainnet genesis:
+/// - **etch** the eleven [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] contracts adiri lacks (SafeL2 +
+///   fallback handler + libraries + both migration helpers + the singleton factory), forcing the
+///   canonical bytes over whatever the address holds — empty on the live chain, already canonical
+///   if someone deployed the suite through the singleton factory, and an unknown occupant only at
+///   `warn!` rather than a fleet-wide abort;
+/// - **swap** the two recompiled deployments — the `Safe` singleton and the `SafeProxyFactory` — to
+///   the canonical bytes, each gated fail-closed on its pre-fork pin
+///   ([`SAFE_SINGLETON_PRE_FORK_CODE_HASH`], [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]), preserving
+///   balance, nonce, and all storage;
+/// - **migrate** the governance Safe proxy: slot 0 (singleton) from the L1 `Safe` to `SafeL2` and
+///   the fallback-handler slot from unset to the canonical `CompatibilityFallbackHandler`, gated
+///   fail-closed on [`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`] and on slot 0 still holding the L1
+///   singleton. Owners, threshold, the Safe nonce, and the TEL balance are untouched.
+///
+/// Why a protocol fork instead of a governance transaction: the sanctioned in-Safe path,
+/// `SafeToL2Migration.migrateToL2`, requires the Safe's storage nonce to be exactly 1 (its
+/// `onlyNonceZero` guard runs after `execTransaction` increments), i.e. it must be the Safe's
+/// first transaction ever. Adiri governance sits at nonce 2, so no transaction it can ever sign
+/// performs the migration; `SafeMigration.migrateL2Singleton` has no nonce guard but leaves the
+/// missing suite and the recompiled factory in place. The fork does the whole job atomically
+/// behind the gates above — fail-closed wherever a pin vouches for a storage layout the write
+/// preserves (every gate is a pure function of committed state, so the fleet passes or aborts in
+/// lockstep).
+///
+/// Scope: adiri-only, like every constant in this family — mainnet genesis already carries the
+/// full canonical suite with governance on SafeL2, so non-adiri builds exclude the mechanism
+/// entirely.
+///
+/// Armed for adiri (chain 2017) at epoch 554, so the migration executes one boundary earlier, in
+/// the epoch-closing block of 553. Measured boundary: Fri 2026-09-25 08:32 UTC (03:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 554 has begun, raise the constant in the same PR:
+/// the trigger (`concluding_epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH`) cannot fire retroactively,
+/// so the live fleet would skip the migration for good while a node replaying that boundary on
+/// this build applies it and diverges from canonical history. The const assert below rejects only
+/// a value at or below [`CONSENSUS_REGISTRY_FORK_EPOCH`]; a stale epoch above that floor still
+/// compiles, so this re-verification is the guard.
+///
+/// Live pre-fork state, re-read on 2026-09-22 (first sampled 2026-08-28): the three pre-fork pins
+/// ([`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`], [`SAFE_SINGLETON_PRE_FORK_CODE_HASH`],
+/// [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]) match the live deployments; the governance proxy's
+/// slot 0 holds the L1 `Safe` singleton and its fallback-handler slot is unset; the Safe nonce
+/// is 2; the Safe Singleton Factory deployer's nonce is 0; all eleven etch targets are empty;
+/// and the registry carries the post-fork code (the epoch-407 fork ran). A mismatch at
+/// re-verification means adiri's Safe state moved: reassess before tagging, and do not update
+/// pins to make gates pass.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553 executes; a
+/// node still on 5f1c0b49 closes that epoch without the migration and diverges from the canonical
+/// chain.
+///
+/// Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
+/// [`governance_safe_fork_epoch_override`]). Honoring it also takes `adiri`: every piece of this
+/// fork is behind that feature and `make build-e2e-bin` omits it, so the variable is inert on the
+/// default e2e lanes. `make test-e2e-governance-safe` is the one invocation that arms it on
+/// spawned nodes — it builds the `adiri` e2e binary and runs
+/// `crates/e2e-tests/tests/it/governance_safe_fork.rs`, which rewrites its genesis into the live
+/// adiri pre-fork Safe state and asserts the transition over RPC. Arming the variable on any other
+/// lane is a named test failure there rather than a silent no-op.
+pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = 554;
+
+/// Compile-time floor for [`GOVERNANCE_SAFE_FORK_EPOCH`]: adiri has already crossed
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`], so a value at or below it would be a retroactive
+/// arming, and a one-shot `==` trigger can never fire for a boundary that has already closed.
+/// Only this floor is machine-checked; whether the armed epoch is still in the future is the
+/// manual re-verification documented on the constant.
+#[cfg(feature = "adiri")]
+const _: () = assert!(GOVERNANCE_SAFE_FORK_EPOCH > CONSENSUS_REGISTRY_FORK_EPOCH);
+
+/// This build's effective governance-Safe fork epoch: the `TN_GOVERNANCE_SAFE_FORK_EPOCH`
+/// override when compiled with `test-utils` and set, otherwise
+/// [`GOVERNANCE_SAFE_FORK_EPOCH`].
+///
+/// The boundary trigger in `tn-reth::evm::block` compares the concluding epoch + 1 against
+/// this value (one-shot `==`), so tests arm the fork by environment variable without touching
+/// the production constant.
+#[cfg(feature = "adiri")]
+pub fn governance_safe_fork_epoch() -> Epoch {
+    #[cfg(feature = "test-utils")]
+    if let Some(fork) = governance_safe_fork_epoch_override() {
+        return fork;
+    }
+    GOVERNANCE_SAFE_FORK_EPOCH
+}
+
+/// Test-only override of the effective governance-Safe fork epoch, read once from
+/// `TN_GOVERNANCE_SAFE_FORK_EPOCH` (`4294967295` for "never fires"; a small value plus a
+/// consensus output concluding `value - 1` drives the boundary in-process).
+///
+/// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]: e2e
+/// tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory with the
+/// harness, so a process-global setter would silently reach only in-process tests. Compiled
+/// out entirely without `test-utils`, so a production binary keeps the compile-time constant
+/// and cannot be repointed at runtime by its environment. An unparseable value is ignored
+/// rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn governance_safe_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_GOVERNANCE_SAFE_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
+    })
 }
 
 #[cfg(test)]
@@ -768,6 +1055,194 @@ mod tests {
             "CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH mirrors the LIVE adiri deployment — do not \
              blindly update this constant to make the test pass; if genesis.yaml was regenerated, \
              reassess the fork plan and `CONSENSUS_REGISTRY_FORK_EPOCH` first",
+        );
+    }
+
+    /// Pin every [`GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`] hash to the vendored canonical
+    /// bytecode file it names.
+    ///
+    /// The files are the byte-exact Ethereum-mainnet-captured Safe v1.4.1 runtime bytes that
+    /// mainnet genesis etches and the [`GOVERNANCE_SAFE_FORK_EPOCH`] boundary installs on
+    /// adiri. Once the fork has run live, re-executing the boundary must install these exact
+    /// bytes, so a tn-contracts submodule bump that changes a vendored file must fail here
+    /// rather than silently changing historical state roots.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the table is `adiri`-only.
+    #[test]
+    fn test_governance_safe_fork_canonical_suite_pinned() {
+        // embedded on the same terms as CONSENSUS_REGISTRY_ARTIFACT_JSON above: tn-types cannot
+        // read these through tn-config without a circular edge, and the include is the identical
+        // file tn-reth's fork machinery embeds
+        const VENDORED: [(&str, &str); 13] = [
+            ("Safe", include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/Safe.hex")),
+            ("SafeL2", include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex")),
+            (
+                "SafeProxyFactory",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeProxyFactory.hex"),
+            ),
+            (
+                "CompatibilityFallbackHandler",
+                include_str!(
+                    "../../../tn-contracts/deployments/genesis/canonical-bytecode/CompatibilityFallbackHandler.hex"
+                ),
+            ),
+            (
+                "SafeToL2Setup",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Setup.hex"),
+            ),
+            (
+                "MultiSend",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSend.hex"),
+            ),
+            (
+                "MultiSendCallOnly",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSendCallOnly.hex"),
+            ),
+            (
+                "SignMessageLib",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SignMessageLib.hex"),
+            ),
+            (
+                "CreateCall",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/CreateCall.hex"),
+            ),
+            (
+                "SimulateTxAccessor",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SimulateTxAccessor.hex"),
+            ),
+            (
+                "SafeSingletonFactory",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeSingletonFactory.hex"),
+            ),
+            (
+                "SafeMigration",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeMigration.hex"),
+            ),
+            (
+                "SafeToL2Migration",
+                include_str!("../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Migration.hex"),
+            ),
+        ];
+
+        for ((table_name, _, expected), (file_name, hex)) in
+            GOVERNANCE_SAFE_FORK_CANONICAL_SUITE.iter().zip(VENDORED)
+        {
+            assert_eq!(
+                *table_name, file_name,
+                "the vendored-file list must stay in table order so every row is checked",
+            );
+            let bytes = alloy::hex::decode(hex.trim())
+                .unwrap_or_else(|e| panic!("vendored {file_name}.hex must be valid hex: {e}"));
+            assert_eq!(
+                keccak256(&bytes),
+                *expected,
+                "{file_name}: GOVERNANCE_SAFE_FORK_CANONICAL_SUITE pins the vendored canonical \
+                 bytecode — a tn-contracts bump changed the file; after the fork runs live these \
+                 bytes are locked by replay, so reassess the fork plan rather than re-pinning",
+            );
+        }
+    }
+
+    /// Pin the three governance-Safe-fork pre-fork hashes to the LIVE adiri deployments (the
+    /// committed `chain-configs/testnet/genesis.yaml`), and the governance proxy's singleton
+    /// slot to the L1 `Safe` — the exact state the fork's fail-closed gates expect.
+    ///
+    /// Mirrors [`test_pre_fork_consensus_registry_code_hash_pinned`], and unconditional for the
+    /// same reason. Do not blindly update these constants to make the test pass: if
+    /// genesis.yaml was regenerated, the fixture no longer mirrors the live chain the fork
+    /// targets — reassess the fork plan first.
+    #[test]
+    fn test_governance_safe_fork_pre_fork_pins_match_adiri_genesis() {
+        let genesis = crate::adiri_genesis();
+        // `tn-config::GOVERNANCE_SAFE_ADDRESS` and the canonical Safe addresses, hardcoded
+        // because tn-types cannot depend on tn-config/tn-reth
+        let cases = [
+            (
+                "governance SafeProxy",
+                address!("0x00000000000000000000000000000000000007a0"),
+                GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+            ),
+            (
+                "Safe singleton (recompile)",
+                address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
+                SAFE_SINGLETON_PRE_FORK_CODE_HASH,
+            ),
+            (
+                "SafeProxyFactory (recompile)",
+                address!("0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"),
+                SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH,
+            ),
+        ];
+        for (name, addr, expected) in cases {
+            let code = genesis
+                .alloc
+                .get(&addr)
+                .and_then(|account| account.code.as_ref())
+                .unwrap_or_else(|| panic!("testnet genesis must allocate {name} runtime code"));
+            assert_eq!(
+                keccak256(code),
+                expected,
+                "{name}: pre-fork pin mirrors the LIVE adiri deployment",
+            );
+        }
+
+        // second half of the governance gate: slot 0 must still hold the L1 Safe singleton
+        let slot0 = genesis
+            .alloc
+            .get(&address!("0x00000000000000000000000000000000000007a0"))
+            .and_then(|account| account.storage.as_ref())
+            .and_then(|storage| storage.get(&B256::ZERO))
+            .expect("adiri governance proxy must carry singleton storage at slot 0");
+        assert_eq!(
+            Address::from_word(*slot0),
+            address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
+            "adiri governance proxy slot 0 must hold the pre-fork L1 Safe singleton",
+        );
+    }
+
+    /// The governance-Safe fork trigger is one-shot: with the concluding epoch `e`, the
+    /// boundary fires iff `e + 1 == GOVERNANCE_SAFE_FORK_EPOCH` — exactly once, never
+    /// retroactively, and (unlike the `>=` layout gates) never for any later epoch. On adiri the
+    /// fork fires only in the epoch-closing block that concludes epoch 553, the boundary that opens
+    /// [`GOVERNANCE_SAFE_FORK_EPOCH`]; the boundary before it, the one after it, and every later
+    /// one stay silent. The closure mirrors the trigger in `tn-reth::evm::block`, `checked_add`
+    /// included: a concluding epoch of `u32::MAX` has no successor, so it neither fires nor
+    /// overflows.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn governance_safe_fork_boundary_is_one_shot() {
+        let fires =
+            |concluding: Epoch| concluding.checked_add(1) == Some(GOVERNANCE_SAFE_FORK_EPOCH);
+
+        for concluding in
+            [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH, u32::MAX]
+        {
+            assert!(!fires(concluding), "concluding epoch {concluding} must not fire the fork");
+        }
+        assert!(
+            fires(GOVERNANCE_SAFE_FORK_EPOCH - 1),
+            "the boundary concluding GOVERNANCE_SAFE_FORK_EPOCH - 1 is the single firing point",
+        );
+    }
+
+    /// With no `TN_GOVERNANCE_SAFE_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the effective fork epoch is exactly the compile-time constant.
+    #[cfg(all(feature = "adiri", feature = "test-utils"))]
+    #[test]
+    fn governance_safe_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            governance_safe_fork_epoch_override().is_none(),
+            "this test requires a process without TN_GOVERNANCE_SAFE_FORK_EPOCH set; the \
+             override is OnceLock-latched, so run the unset case in its own process",
+        );
+        assert_eq!(
+            governance_safe_fork_epoch(),
+            GOVERNANCE_SAFE_FORK_EPOCH,
+            "an unset override must not shift the effective fork epoch",
         );
     }
 
@@ -985,9 +1460,11 @@ mod tests {
     /// `*_override_is_inert_when_unset` test needs a variable-free process, and the same loud
     /// failure if one latched first.
     ///
-    /// The `pinned` list below must name every fork that has a `test-utils` override; a fork added
-    /// to [`fork_epoch_overrides`] but not here fails the length assert only in a process that
-    /// exports it.
+    /// The `pinned` list below must name every fork that has a `test-utils` override, each under
+    /// the same cfg [`fork_epoch_overrides`] carries it: a fork whose gate is `adiri`-only is
+    /// listed only under `adiri`, because only an `adiri` build reports it. A fork added to
+    /// [`fork_epoch_overrides`] but not here — or carrying a cfg there that is not mirrored here —
+    /// fails the length assert only in a process that exports it.
     #[test]
     fn fork_epoch_overrides_lists_only_the_pins_in_force() {
         #[cfg(not(feature = "test-utils"))]
@@ -998,7 +1475,15 @@ mod tests {
         #[cfg(feature = "test-utils")]
         {
             let reported = fork_epoch_overrides();
-            let pinned = [
+            // Mirrors the cfg on the governance-Safe row in `fork_epoch_overrides`, restated
+            // rather than shared so this stays an independent statement of what it reports.
+            #[cfg(feature = "adiri")]
+            let governance_safe =
+                Some(("TN_GOVERNANCE_SAFE_FORK_EPOCH", governance_safe_fork_epoch_override()));
+            #[cfg(not(feature = "adiri"))]
+            let governance_safe: Option<(&'static str, Option<Epoch>)> = None;
+
+            let pinned: Vec<_> = [
                 ("TN_SEED_SIGNATURE_FORK_EPOCH", seed_signature_fork_epoch_override()),
                 ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
                 ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
@@ -1006,11 +1491,14 @@ mod tests {
                     "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
                     leader_seeded_ordering_fork_epoch_override(),
                 ),
-            ];
-            pinned.into_iter().for_each(|(var, fork_epoch)| {
+            ]
+            .into_iter()
+            .chain(governance_safe)
+            .collect();
+            pinned.iter().for_each(|(var, fork_epoch)| {
                 assert_eq!(
-                    reported.iter().find(|(name, _)| *name == var).map(|(_, epoch)| *epoch),
-                    fork_epoch,
+                    reported.iter().find(|(name, _)| name == var).map(|(_, epoch)| *epoch),
+                    *fork_epoch,
                     "{var} must be reported exactly when it is pinned, at the pinned value",
                 );
             });
@@ -1063,14 +1551,14 @@ mod tests {
     /// Pin the multi-workers gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
-    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// for the seed-signature gate: "dormant before `MULTI_WORKERS_FORK_EPOCH`" holds only under
     /// `adiri`. Every other build — including the default one that produces both the shipped node
     /// binary and the e2e binary — is active from genesis, so epoch 1 already uses the
     /// multi-worker layout there.
     ///
     /// Asserts against [`multi_workers_build_fork_active`], the override-free decision, so the
     /// result does not depend on whether `test-utils` was unified into this build. The grid is
-    /// derived from the constant, so arming the fork does not require editing this test.
+    /// derived from the constant, so retargeting the fork does not require editing this test.
     #[test]
     fn multi_workers_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
@@ -1126,14 +1614,14 @@ mod tests {
     /// implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`]
-    /// states for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds
-    /// only under `adiri`. Every other build, including the default one that produces both the
-    /// shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
+    /// states for the seed-signature gate: "dormant before `LEADER_SEEDED_ORDERING_FORK_EPOCH`"
+    /// holds only under `adiri`. Every other build, including the default one that produces both
+    /// the shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
     /// orders sub-DAGs with the leader-seeded tie-break there.
     ///
     /// Asserts against [`leader_seeded_ordering_build_fork_active`], the override-free
     /// decision, so the result does not depend on whether `test-utils` was unified into this
-    /// build. The grid is derived from the constant, so arming the fork does not require
+    /// build. The grid is derived from the constant, so retargeting the fork does not require
     /// editing this test.
     #[test]
     fn leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract() {

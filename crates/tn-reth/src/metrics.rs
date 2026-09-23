@@ -21,11 +21,12 @@
 //! rather than a loss: it counts validator verdicts that contradicted each other on one
 //! forwarded transaction (issue #1167). See [`ForwarderMetrics`] for per-series semantics.
 //!
-//! Worker pool canonical-state subscription health. `tn_reth.canon_state_lagged_total`
+//! Worker pool maintenance. `tn_reth.canon_state_lagged_total`
 //! (alertable) counts broadcast lag events observed by the pool maintenance task;
 //! `tn_reth.canon_state_notifications_missed_total` carries the magnitude behind each event;
 //! and `tn_reth.canon_state_resync_read_failures_total` counts canonical account reads the
 //! post-lag resync absorbed and retried. See [`RethEnvMetrics`] for per-series semantics.
+//! `tn_reth.txpool_expired_txs_total` counts parked transactions removed by the age sweep.
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
@@ -71,7 +72,7 @@ use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 /// A `LazyLock` static is justified here for the same reason as the engine's
 /// `ENGINE_METRICS`: there is exactly one execution environment per process, and threading a
 /// handle through `RethEnvInner` would touch every construction site and caller signature for
-/// two counters.
+/// these counters.
 ///
 /// First use must happen after the global recorder is installed. `tn_metrics::install_recorder`
 /// runs before `RethEnv::new_database` (that ordering is a documented invariant of the
@@ -82,11 +83,9 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 /// Register every [`RethEnvMetrics`] counter and every labeled skip series with the global
 /// recorder without recording an event.
 ///
-/// For the derive-based counters, registration happens when the `LazyLock` is first forced,
-/// and the sites that force it are drop paths a healthy node never takes plus the pool
-/// maintenance task's lag recovery (`mark_drifted` in `txn_pool.rs`), which a healthy node
-/// also never reaches. Without this call the series would simply not exist in a scrape until
-/// the first drop, which breaks the counters in the two ways that matter: an absent series is
+/// For the derive-based counters, registration happens when the `LazyLock` is first forced.
+/// Register before the expiry task or any drop or lag-recovery path first uses the counters.
+/// Otherwise a scrape before that first use would have no series: an absent series is
 /// indistinguishable from a broken exporter or a mistyped metric name, so the "alert on any
 /// nonzero value" rule can never be verified in its negative case; and `rate()` over a series
 /// whose very first sample is already nonzero renders no step, so a one-shot drop burst on an
@@ -104,7 +103,7 @@ pub(crate) fn init() {
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
-/// the worker pool's canonical-state subscription health.
+/// the worker pool's canonical-state subscription health and parked-transaction expiry.
 ///
 /// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
 /// cover transactions that `build_block_from_batch_payload` silently declines to include in
@@ -115,6 +114,14 @@ pub(crate) fn init() {
 #[derive(Metrics)]
 #[metrics(scope = "tn_reth")]
 pub(crate) struct RethEnvMetrics {
+    /// Parked (queued/basefee) transactions removed by the age-based expiry sweep.
+    ///
+    /// Counts actual removals, not stale candidates: canonical maintenance may remove a
+    /// transaction between the scan and removal. Reth's removed-transactions counter does
+    /// not include this path. A flat value alone does not imply a stalled sweep, since an
+    /// empty pool, unexpired transactions, or exempt local origins also cause no removals.
+    txpool_expired_txs_total: Counter,
+
     /// Transactions dropped while building a block because their signer could not be recovered.
     ///
     /// Alert on any nonzero value. A certified sub-DAG is fixed and identical on every honest
@@ -152,6 +159,13 @@ pub(crate) struct RethEnvMetrics {
     /// does not fall back to zero means the resync is stuck retrying the same senders and
     /// the pool's view of them stays stale.
     pub(crate) canon_state_resync_read_failures_total: Counter,
+}
+
+impl RethEnvMetrics {
+    /// Record the number of parked transactions actually removed by an expiry sweep.
+    pub(crate) fn record_txpool_expired_transactions(&self, removed: usize) {
+        self.txpool_expired_txs_total.increment(u64::try_from(removed).unwrap_or(u64::MAX));
+    }
 }
 
 /// Counter name for transactions skipped while building a block because the EVM rejected them
@@ -653,6 +667,7 @@ mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
 
+    /// Block-building and expiry counters record their own events independently.
     #[test]
     fn test_metrics_register_and_update() {
         let recorder = DebuggingRecorder::new();
@@ -662,18 +677,22 @@ mod tests {
             // construct directly (not via the static) so handles bind to the local recorder
             let metrics = RethEnvMetrics::new_with_labels(Vec::<metrics::Label>::new());
             metrics.unrecoverable_txs_dropped_total.increment(2);
+            metrics.record_txpool_expired_transactions(3);
+            metrics.record_txpool_expired_transactions(0);
+            metrics.record_txpool_expired_transactions(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
-        let find = |name: &str| {
-            snapshot
-                .iter()
-                .find(|(key, ..)| key.key().name() == name)
-                .unwrap_or_else(|| panic!("metric {name} not registered"))
-        };
+        let find = |name: &str| snapshot.iter().find(|(key, ..)| key.key().name() == name);
 
-        let (_, _, _, value) = find("tn_reth.unrecoverable_txs_dropped_total");
-        assert!(matches!(value, DebugValue::Counter(2)));
+        assert!(matches!(
+            find("tn_reth.unrecoverable_txs_dropped_total"),
+            Some((_, _, _, DebugValue::Counter(2)))
+        ));
+        assert!(matches!(
+            find("tn_reth.txpool_expired_txs_total"),
+            Some((_, _, _, DebugValue::Counter(4)))
+        ));
     }
 
     /// Construction alone must register every derive-based series at zero, with no event
@@ -696,21 +715,17 @@ mod tests {
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
-        let find = |name: &str| {
-            snapshot
-                .iter()
-                .find(|(key, ..)| key.key().name() == name)
-                .unwrap_or_else(|| panic!("metric {name} not registered without an event"))
-        };
+        let find = |name: &str| snapshot.iter().find(|(key, ..)| key.key().name() == name);
 
-        let (_, _, _, value) = find("tn_reth.unrecoverable_txs_dropped_total");
-        assert!(matches!(value, DebugValue::Counter(0)));
-        let (_, _, _, value) = find("tn_reth.canon_state_lagged_total");
-        assert!(matches!(value, DebugValue::Counter(0)));
-        let (_, _, _, value) = find("tn_reth.canon_state_notifications_missed_total");
-        assert!(matches!(value, DebugValue::Counter(0)));
-        let (_, _, _, value) = find("tn_reth.canon_state_resync_read_failures_total");
-        assert!(matches!(value, DebugValue::Counter(0)));
+        [
+            "tn_reth.unrecoverable_txs_dropped_total",
+            "tn_reth.canon_state_lagged_total",
+            "tn_reth.canon_state_notifications_missed_total",
+            "tn_reth.canon_state_resync_read_failures_total",
+            "tn_reth.txpool_expired_txs_total",
+        ]
+        .into_iter()
+        .for_each(|name| assert!(matches!(find(name), Some((_, _, _, DebugValue::Counter(0))))));
     }
 
     /// [`ForwarderMetrics::init`] must register every forwarder series at zero, and each record

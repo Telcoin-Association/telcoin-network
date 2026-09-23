@@ -7,7 +7,7 @@
 //! be pure overhead.
 //!
 //! ## Reads (zero-copy)
-//! [`HdxIndex::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and — on
+//! `HdxIndex::find_in_bucket` borrows the target bucket from the hdx mapping, scans it, and — on
 //! a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
 //! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
 //! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
@@ -317,7 +317,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         read_only: bool,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
-        let dir_created = fs::create_dir(dir).is_ok();
+        // A read-only open must not create the sidecar directory (a documented "writes nothing"
+        // door). An absent dir still fails `NotFound` in `open_with` below, so
+        // `is_missing_static_files` is unchanged.
+        let dir_created = !read_only && fs::create_dir(dir).is_ok();
         if dir_created {
             // The index directory is brand new; fsync the parent so the entry survives a crash.
             if let Some(parent) = dir.parent() {
@@ -382,6 +385,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.bucket_size() != Self::BUCKET_SIZE as u16
                 || header.bucket_elements() != Self::BUCKET_ELEMENTS as u16
             {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
+            // The file must physically hold every bucket the header claims. A truncated-but-sealed
+            // hdx (writer bug or a re-stamped sentinel) would otherwise read its missing buckets as
+            // absent -- `bucket_crc_scan` skips them and lookups miss -- while validation reports
+            // it clean. Reject it so a writable open rebuilds from the WAL (INV3) and a
+            // read-only open surfaces `corrupt_static_index`.
+            let needed = (HEADER_SIZE + BLOOM_SIZE_BYTES) as u64
+                + header.buckets as u64 * Self::BUCKET_SIZE as u64;
+            if file_end < needed {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
             // Check the salt/pepper to confirm the same (stable) hasher is in use.
@@ -583,6 +596,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 if let Some(pos) = Self::scan_bucket(buf, key)? {
                     return Ok(Some(pos));
                 }
+                // A miss is the one outcome at-rest damage to this bucket could silently fabricate
+                // (a flipped slot no longer matches `key`). Only bucket 0 is CRC-checked at open
+                // and reads are otherwise CRC-free, so verify the bucket CRC before
+                // trusting the miss. `Dirty` (zero CRC) is a live unsynced write
+                // and is fine -- only `Corrupt` errors.
+                if crc_state(buf) == CrcState::Corrupt {
+                    return Err(FetchError::CorruptIndex(format!(
+                        "bucket {bucket} failed its CRC"
+                    )));
+                }
                 Self::read_overflow_pos(buf)
             }
             // A bucket `< buckets()` is always mapped in a sound index; a short hdx (e.g. an
@@ -615,6 +638,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             };
             if let Some(pos) = Self::scan_bucket(buf, key)? {
                 return Ok(Some(pos));
+            }
+            // As with the main bucket, a miss here could be fabricated by at-rest damage. Overflow
+            // records are always CRC'd at write time, so any CRC failure is genuine corruption.
+            if !check_crc(buf) {
+                return Err(FetchError::CorruptIndex(format!(
+                    "odx record at {overflow_pos} failed its CRC"
+                )));
             }
             upper_bound = overflow_pos;
             overflow_pos = Self::read_overflow_pos(buf);
@@ -684,7 +714,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
 
         let Some(buffer) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) else {
-            return Err(AppendError::ReadOnly);
+            // The save path only runs on a writable index, so `None` means the bucket lies past the
+            // mapped end -- a truncated/corrupt hdx, not a read-only handle (#36).
+            return Err(AppendError::CorruptIndex(
+                "hdx bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         };
         let mut pos = 8; // Skip over overflow_pos.
         let elements = read_u32(buffer, &mut pos);
@@ -780,10 +815,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // reads `bucket_pos(split_bucket)` + the odx chain — neither depends on the bucket
         // count / modulus — so it is safe here.
         let elements = self.collect_bucket_elements(split_bucket)?;
-        let original = match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
-            Some(buf) => buf.to_vec(),
-            None => return Err(AppendError::ReadOnly),
-        };
+        let original =
+            match self.hdx_file.slice(split_pos, Self::BUCKET_SIZE) {
+                Some(buf) => buf.to_vec(),
+                None => return Err(AppendError::CorruptIndex(
+                    "hdx split bucket is past the mapped end -- the index is truncated or corrupt"
+                        .to_string(),
+                )),
+            };
 
         if let Err(e) = self.redistribute_split(split_bucket, split_pos, elements) {
             // Restore the pre-split state: the bucket/modulus counters revert, and rewriting the
@@ -826,20 +865,28 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Clear both buckets before redistributing. The split bucket is already within the logical
         // end, so zero it in place. The new bucket lies at/after the current end (buckets are
         // contiguous), so first extend the mapping to make room for it: `ensure_len` grows
-        // geometrically and zero-extends, so `slice_mut(new_pos, ..)` is then in-bounds and the
-        // fresh region is already an empty bucket (the fill below is a cheap defensive memset).
+        // geometrically so `slice_mut(new_pos, ..)` is then in-bounds. `ensure_len` zero-fills a
+        // FRESH grow, but on a clean-close reopen the first bytes past `end` hold the previous
+        // sentinel, so the `fill(0)` below is load-bearing (not merely defensive): it is what makes
+        // the new bucket start empty after a reopen.
         if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
             // Note this will zero the CRC as well (we want that- marks it "dirty").
             buffer.fill(0);
         } else {
-            return Err(AppendError::ReadOnly);
+            return Err(AppendError::CorruptIndex(
+                "hdx split bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         }
         self.hdx_file.ensure_len(new_pos + Self::BUCKET_SIZE as u64)?;
         if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
             // Note this will zero the CRC as well (we want that- marks it "dirty").
             buffer.fill(0);
         } else {
-            return Err(AppendError::ReadOnly);
+            return Err(AppendError::CorruptIndex(
+                "hdx new bucket is past the mapped end -- the index is truncated or corrupt"
+                    .to_string(),
+            ));
         }
 
         // Test-only: simulate a mid-split failure with both buckets already zeroed (the worst case
@@ -973,12 +1020,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     pub fn bucket_crc_scan(&self) -> BucketCrcReport {
         let mut report = BucketCrcReport::default();
         for bucket in 0..self.buckets() as u64 {
-            if let Some(buffer) = self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
-                match crc_state(buffer) {
+            match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
+                Some(buffer) => match crc_state(buffer) {
                     CrcState::Valid => {}
                     CrcState::Dirty => report.dirty += 1,
                     CrcState::Corrupt => report.corrupt += 1,
-                }
+                },
+                // A bucket past the mapped end means the hdx is truncated (short file); count it as
+                // corrupt so a short-but-sealed index is not reported clean.
+                None => report.corrupt += 1,
             }
         }
         report
@@ -1035,7 +1085,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
     }
 
     /// Flush and sync all the index data to disk. The `data_file_length` commit marker is written
-    /// last (see [`Self::ordered_sync`]) so `files_consistent` never trusts a torn index.
+    /// last (see `Self::ordered_sync`) so `files_consistent` never trusts a torn index.
     fn sync(&mut self) -> Result<(), CommitError> {
         if self.read_only {
             Err(CommitError::ReadOnly)
@@ -1109,6 +1159,42 @@ mod tests {
         assert!(
             matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
             "a corrupt element count must error, not panic"
+        );
+    }
+
+    /// At-rest damage to a NON-first bucket must surface as `CorruptIndex` on a lookup
+    /// that misses in it, not a silent `NotFound`/`None`. Only bucket 0 is CRC-checked at open and
+    /// reads are otherwise CRC-free, so a corrupt non-first bucket previously served a false
+    /// negative. The CRC-on-miss guard in `find_in_bucket` catches it. (The overflow-hop guard
+    /// shares the pattern via `check_crc`.)
+    #[test]
+    fn test_corrupt_non_first_bucket_errors_on_miss() {
+        let tmp = TempDir::with_prefix("test_hdx_corrupt_nonfirst").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        // Enough keys to expand well past the single initial bucket.
+        for i in 0..256u64 {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync"); // stamp real (non-zero) bucket CRCs so a later mismatch is Corrupt
+
+        // Pick an inserted key that maps to a NON-first bucket (the open-time guard covers only 0).
+        let (stored_pos, k, bucket) = (0..256u64)
+            .map(|i| (i, key(i)))
+            .map(|(i, k)| (i, k, idx.hash_to_bucket(k.as_slice())))
+            .find(|(_, _, b)| *b >= 1)
+            .expect("some key must land in a non-first bucket");
+        assert_eq!(idx.load(k).expect("healthy load before corruption"), stored_pos);
+
+        // Corrupt the bucket: zero its element count so every lookup misses, which also invalidates
+        // the now-stale CRC trailer -> `CrcState::Corrupt`.
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("bucket slice");
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+
+        // The lookup now misses in a Corrupt bucket -> must error, not fold into NotFound.
+        assert!(
+            matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
+            "a miss in a corrupt non-first bucket must surface as CorruptIndex, not a silent miss"
         );
     }
 
@@ -1346,6 +1432,40 @@ mod tests {
         assert!(
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
+        );
+    }
+
+    /// A truncated-but-otherwise-valid hdx (fewer bucket bytes than the header's bucket count
+    /// claims) must be rejected on open rather than read its missing buckets as absent.
+    #[test]
+    fn test_archive_hdx_index_short_file_rejected() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_short").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        {
+            let builder = BuildHasherDefault::<FxHasher>::default();
+            let mut idx: HdxIndex =
+                HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
+                    .expect("hdx file");
+            idx.save(key(0), 1).expect("add to index");
+            idx.sync().expect("sync");
+        }
+        // Truncate to just past the 68-byte header: the header still loads, but the file no longer
+        // holds the buckets it claims. `open_hdx_file` stores the mapping at `<dir>/index.hdx`, so
+        // the dir here is `tmp/index.hdx` and the actual file is `tmp/index.hdx/index.hdx`.
+        let dir = tmp_path.join("index.hdx");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("index.hdx"))
+            .expect("open hdx file")
+            .set_len(200)
+            .expect("truncate hdx short");
+
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let res: Result<HdxIndex, _> = HdxIndex::open_hdx_file(&dir, &data_header, builder, true);
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
+            "a short hdx must be rejected as InvalidIndexGeometry, got {res:?}"
         );
     }
 

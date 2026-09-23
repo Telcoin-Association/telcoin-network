@@ -69,7 +69,7 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
 A typed append-only record log over an `MmapDataFile`. Each record on disk is
 `u32 size ‖ payload ‖ u32 crc32`; payloads are the encoded `V` (via `tn-types`) and optionally `zstd`-compressed
 (`MAX_RECORD_SIZE` caps both the framed size and the decompressed size — a decompression-bomb guard).
-A 28-byte `DataHeader` (`DATA_HEADER_BYTES`, CRC + type + uid + version + appnum) leads every file and
+A 28-byte `DataHeader` (`DATA_HEADER_BYTES`: type, version, uid, appnum, compression, CRC32) leads every file and
 is validated on open. `raw_iter` walks the log using **only** the data file (no indexes), bounded to
 the clone-time logical `end` — this is the authoritative replay source for index rebuilds.
 
@@ -88,7 +88,8 @@ Both index types are **fully reconstructable from the data file** and are never 
 ### 4. `consensus_pack` — `ConsensusPack` (one epoch of consensus output)
 
 An epoch's pack directory `epoch-{N}/` contains `data` (the WAL), `idx/` (position index),
-`hash/` + `bhash/` (consensus-header and batch digest indexes). Records are a leading
+`hash/` + `bhash/` (consensus-header and batch digest indexes), plus the per-epoch certificate pack
+(`cert_data` + `cert_hash/`, a `CertificatePack`). Records are a leading
 `EpochMeta` (committee, epoch-start linkage) followed by, per output, a `Consensus` header and its
 `Batch` records. A background thread (`run_pack_loop`) serializes writes behind a channel; the public
 type is `Send + Sync + Clone`.
@@ -105,10 +106,14 @@ type is `Send + Sync + Clone`.
 
 The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_validate`) uphold:
 
-- **INV1 — recover from truncation.** A torn/partial trailing record or trailing padding is truncated
-  back to the last complete output; the node continues. `recover_pack` replays the WAL, tracks
-  `consistent_end`, and truncates the tail; `attested_end` + `tail_is_torn` distinguish an *unacked*
-  torn tail (safe to drop) from a tear *below* durably-acked data (real corruption ⇒ error).
+- **INV1 — recover from truncation, error on corruption.** In an *unclean* (crash-interrupted) log a
+  torn/partial trailing record or trailing padding is truncated back to the last complete output and
+  the node continues; in a *cleanly-sealed* log the clean-close sentinel proves the log is complete,
+  so **any** CRC failure is at-rest corruption and a hard `CorruptPack`. `recover_pack` replays the
+  WAL index-free, tracks `consistent_end`, and decides truncate-vs-error from the data alone: a torn
+  tail is truncatable unless a later complete *output* decodes past it (`output_after_tear`) —
+  committed data, so it errors — and a best-effort commit marker (written by `persist()` to the mmap
+  capacity tail) catches at-rest corruption of the last committed output.
 - **INV2 — headers & meta are clean-or-error.** The `DataHeader` and the leading `EpochMeta` are
   expected present and correct; a corrupt/torn one is an **error** surfaced to the operator, **never
   repaired**. The meta is fsync'd the instant it is written, so a torn meta is not a normal state.
@@ -120,7 +125,8 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   bounded to the logical length.
 
 `pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail` /
-`TornMetaEmpty` (truncatable) or `CorruptMetaWithData` / `MidLogCorruption` (data loss ⇒ re-sync).
+`TornMetaEmpty` (truncatable) or `CorruptMetaWithData` / `MidLogCorruption` / `CorruptSealedRecord`
+(data loss ⇒ re-sync).
 
 ### 6. `consensus.rs` — `ConsensusChain` (full consensus store)
 
@@ -158,6 +164,8 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
         idx/index_pos.pdx      position index (derived)
         hash/{index.hdx,.odx}  consensus-header digest index (derived)
         bhash/{index.hdx,.odx} batch digest index (derived)
+        cert_data              per-epoch certificate pack (CertificatePack)  ── + clean-close sentinel
+        cert_hash/{index.hdx,.odx} certificate digest index (derived)
       epochs.pack / epoch_certs.pack + sidecars   the EpochRecordDb chain
       consensus_slot{1,2}      latest-consensus hint (double-buffered)
       staging-{N}/             transient state-sync import target

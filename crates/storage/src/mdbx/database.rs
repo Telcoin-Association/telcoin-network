@@ -157,7 +157,7 @@ fn resolve_sync_mode(raw: Option<std::ffi::OsString>) -> eyre::Result<reth_libmd
 
 impl MdbxDatabase {
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
-    /// Check [`init_db`].
+    /// Check `init_db`.
     pub fn open<P: AsRef<Path>>(
         path: P,
         max_tables: usize,

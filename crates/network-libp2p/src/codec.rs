@@ -1,13 +1,13 @@
 //! Codec for encoding/decoding consensus network messages.
 
 use crate::PeerExchangeMap;
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response::Codec, StreamProtocol};
 use serde::{de::DeserializeOwned, Serialize};
 use snap::read::FrameDecoder;
 use std::{
     fmt,
+    future::Future,
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
@@ -218,7 +218,6 @@ impl<Req, Res> TNCodec<Req, Res> {
     }
 }
 
-#[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where
     Req: TNMessage,
@@ -228,11 +227,11 @@ where
     type Request = Req;
     type Response = Res;
 
-    async fn read_request<T>(
+    fn read_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
-    ) -> std::io::Result<Self::Request>
+    ) -> impl Future<Output = std::io::Result<Self::Request>> + Send
     where
         T: AsyncRead + Unpin + Send,
     {
@@ -242,7 +241,6 @@ where
             &mut self.compressed_buffer,
             self.max_chunk_size,
         )
-        .await
     }
 
     async fn read_response<T>(

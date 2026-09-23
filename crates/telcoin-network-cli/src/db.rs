@@ -31,7 +31,7 @@ use tn_storage::{
     consensus_pack::{ConsensusPack, EpochRepair, DATA_NAME},
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
-    pack_validate::{classify_physical_corruption, validate_pack_file},
+    pack_validate::{classify_physical_corruption, validate_pack_file, validate_pack_file_bounded},
 };
 use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -138,6 +138,20 @@ impl DbValidateArgs {
             .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
         {
             print!("{corruption}");
+            // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
+            // committed prefix before it must still be logically checked — otherwise `db validate`
+            // reports nothing useful for the normal shape of any crashed current epoch. Walk the
+            // prefix bounded to the corruption offset and print that report too.
+            if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
+                eprintln!(
+                    "\nValidating the intact prefix before the tear (up to byte {})...",
+                    corruption.offset
+                );
+                match validate_pack_file_bounded(&data_file, epoch, None, Some(corruption.offset)) {
+                    Ok(report) => print!("{report}"),
+                    Err(e) => eprintln!("bounded validation of the intact prefix failed: {e}"),
+                }
+            }
             return Ok(());
         }
 
@@ -217,6 +231,15 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
 /// optional `--epoch`. In all-mode (`requested == None`) the current/latest epoch — the one a
 /// running node holds open for append — is skipped and returned as the second element; `--epoch N`
 /// targets exactly N (no skip). The caller validates that a requested epoch exists.
+///
+/// "Current" here is a best-effort heuristic: the highest-numbered `epoch-{N}` directory. That is
+/// the live epoch except in the brief window during an epoch transition when the next epoch's
+/// directory already exists on disk before the node has switched to it — the `LatestConsensus`
+/// slot, not the directory listing, is the authoritative current epoch. This skip is only a
+/// convenience guard against fat-fingering a repair of the live pack; the real safety requirement
+/// is that the node is stopped (a running node holds its pack mmap'd for append regardless of which
+/// epoch is "current"). Pass `--epoch N` to target an exact epoch when the heuristic would pick
+/// wrong.
 fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Option<Epoch>) {
     let current = all.last().copied();
     match requested {
@@ -324,7 +347,9 @@ impl DbRepairArgs {
                             .map_err(|e| eyre!("failed to persist epoch-records DB: {e}"))?;
                         db.close().await;
                         println!(
-                            "epoch-records DB: healed (torn tails truncated, indexes rebuilt)"
+                            "epoch-records DB: opened and healed (torn tails truncated; \
+                             digest/position indexes rebuilt from the data logs if a prior crash \
+                             left them inconsistent)"
                         );
                     }
                     Err(e) => println!(

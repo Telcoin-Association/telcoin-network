@@ -515,7 +515,7 @@ pub(crate) fn spawn_epoch_vote_collector(
 /// nothing; its round only listens for votes and then tries the peer fetch.
 ///
 /// Epoch 0 is re-armed like any other epoch. The uncertifiable epoch-0 dummy record is not
-/// observable here: `run_epochs` seeds it in-memory AFTER this hook runs and
+/// observable here: `run` seeds it in-memory AFTER this hook and before the startup sync gate, and
 /// `save_dummy_epoch0` never persists it, so a stored epoch-0 record at startup is a genuine
 /// closed-epoch-0 record.
 ///

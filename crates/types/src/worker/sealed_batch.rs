@@ -198,10 +198,36 @@ pub fn max_batch_gas(_epoch: Epoch) -> u64 {
     30_000_000
 }
 
-/// Max batch size in effect at a timestamp.  Measured in bytes.
-/// Currently allways 1,000,000 but can change in the future at a fork.
+/// Max batch size in effect at an epoch, measured in bytes.
+/// Currently always 1,000,000 but can change in the future at a fork.
+///
+/// Fork changes that lower this limit must also lower [`min_batch_size`] and extend
+/// `min_batch_size_bounds_every_epoch` with the fork boundary and its adjacent epochs.
+/// The transaction pool checks its admission byte limit against that floor only once
+/// at node startup: the pool and its validator persist across epoch changes.
 pub fn max_batch_size(_epoch: Epoch) -> usize {
     1_000_000
+}
+
+/// Smallest batch byte limit across every epoch this build can serve.
+///
+/// Used by startup guards whose consumers cannot update their limits at epoch boundaries.
+/// Keep this floor in sync with every fork that lowers [`max_batch_size`].
+pub fn min_batch_size() -> usize {
+    max_batch_size(0)
+}
+
+/// Startup admission must fit every supported batch-size schedule segment.
+#[cfg(test)]
+#[test]
+fn min_batch_size_bounds_every_epoch() {
+    // Add each batch-size fork boundary and its adjacent epochs when the schedule changes.
+    [0, 1, Epoch::MAX].into_iter().for_each(|epoch| {
+        assert!(
+            min_batch_size() <= max_batch_size(epoch),
+            "batch byte floor exceeds epoch {epoch}"
+        );
+    });
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)

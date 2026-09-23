@@ -17,8 +17,8 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    gas_accumulator::RewardsCounter, max_batch_size, AuthorityIdentifier, Batch, BlockHash,
+    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
     B256, MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
@@ -50,7 +50,23 @@ use crate::{
 };
 
 /// Current version for new pack files.
-pub const PACK_VERSION: u16 = 1;
+///
+/// v2 is byte-identical to v1 on disk (header-first record layout); the sole difference is that a
+/// v2 file carries the 8-byte clean-close sentinel the data-file layer appends on a clean shutdown,
+/// whereas v0 and v1 predate the sentinel and never have one. Writing new packs as v2 is what lets
+/// a missing sentinel be read as a genuine "not cleanly closed" signal: a pre-sentinel pack (v0/v1)
+/// is recognized by its version and trusted via the length / WAL cross-checks instead (see
+/// `SENTINEL_MIN_VERSION` and `Inner::files_consistent`).
+pub const PACK_VERSION: u16 = 2;
+
+/// First pack version whose files carry the clean-close sentinel.
+///
+/// A file whose on-disk version is below this predates the sentinel (the buffered backend never
+/// wrote one), so the *absence* of a sentinel is normal and must not be read as an unclean
+/// shutdown; such packs are validated by the cross-file length checks and, on the writable door, by
+/// WAL replay — exactly how pre-mmap `main` treated them. Kept distinct from [`PACK_VERSION`] so a
+/// later version bump cannot silently drop the sentinel gate for v2.
+const SENTINEL_MIN_VERSION: u16 = 2;
 
 /// Metadata for an Epoch.  Should always be the first record in a consensus pack.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
@@ -120,6 +136,7 @@ enum PackMessage {
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
+    LatestConsensusNumber(oneshot::Sender<u64>),
     Shutdown,
     AsyncShutdown(oneshot::Sender<()>),
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
@@ -147,8 +164,11 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
     // When this returns None then the channel is consumed and closed, so exit the thread.
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
-    // Note, that code called in this thread should NEVER panic since that will orphan the pack
-    // file. This is acceptable since panic should never occur in properly written Inner code.
+    // Note: code in this thread should NEVER panic. Unwinding drops `Inner`, whose `Drop` still
+    // runs the clean-close (msync + truncate-to-`end` + sentinel), so a mid-save panic SEALS the
+    // pack as "clean" rather than orphaning it — only the length cross-checks in `files_consistent`
+    // then catch the incomplete write. Acceptable only because panics should never occur in correct
+    // Inner code.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
@@ -194,6 +214,9 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
             PackMessage::LatestConsensusHeader(tx) => {
                 let _ = tx.send(inner.latest_consensus_header());
             }
+            PackMessage::LatestConsensusNumber(tx) => {
+                let _ = tx.send(inner.latest_consensus_number());
+            }
             PackMessage::Shutdown => break,
             PackMessage::AsyncShutdown(tx) => {
                 // Confirm AFTER the clean-close below (not here) so `close().await` returns only
@@ -226,17 +249,29 @@ impl Drop for ConsensusPack {
             // close().await already took the handle, so the block below is skipped. Drop is the
             // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
-                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(), performing sync Drop now...");
-                if self.tx.try_send(PackMessage::Shutdown).is_ok() {
+                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(); sealing as a fallback");
+                if self.tx.try_send(PackMessage::Shutdown).is_err() {
+                    // Full bounded channel — detach. The actor clean-closes when the last Sender
+                    // drops; only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
+                    return;
+                }
+                let join = move || {
                     if let Err(e) = handle.join() {
                         error!(target: "consensus_pack", ?e, "Failed to join consensus pack thread");
                     }
-                } else {
-                    // Full bounded channel — skip the join / detach. Durability
-                    // still holds: the detached thread clean-closes when the last Sender drops;
-                    // only the synchronous "sealed on return" wait is lost, and only on this
-                    // misuse path.
-                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
+                };
+                // Never block a multi-threaded runtime worker on the ~60-75ms clean-close fsyncs:
+                // offload the join to the blocking pool. On a current-thread runtime (nothing else
+                // to starve) or no runtime, a synchronous join keeps "sealed on
+                // return" for callers/tests that drop then immediately reopen.
+                // `close().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
                 }
             }
         }
@@ -362,7 +397,10 @@ impl ConsensusPack {
         let mut epochs = Vec::new();
         for entry in std::fs::read_dir(epochs_dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            // `path().is_dir()` follows symlinks, so a symlinked `epoch-N/` is enumerated (the node
+            // opens epochs by path and follows them); the destructive prune paths deliberately keep
+            // the non-following `file_type()` check instead.
+            if !entry.path().is_dir() {
                 continue;
             }
             if let Some(n) = entry
@@ -397,7 +435,8 @@ impl ConsensusPack {
         epoch: Epoch,
         apply: bool,
     ) -> Result<EpochRepair, PackError> {
-        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+        let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        let data_file = epoch_dir.join(Inner::DATA_NAME);
         // Healthy requires BOTH a clean read-only open AND full validation. `open_static` proves
         // the seal, cross-file lengths, final position entry, and the FIRST digest-index
         // bucket's CRC — but it does NOT scan the other buckets or the data stream, so on
@@ -408,6 +447,16 @@ impl ConsensusPack {
             Ok(pack) => {
                 pack.close().await;
                 true
+            }
+            // An all-zero `data` file (a first write that sized the file but crashed before the
+            // header was durable) is unwritten, not repairable: there is nothing to rebuild.
+            // Report it with an actionable message rather than letting the classifier surface a
+            // bare open error.
+            Err(e) if e.is_unwritten_data_file() => {
+                return Ok(EpochRepair::Unrepairable(format!(
+                    "epoch {epoch}: the data file is all zeros (an interrupted first write); \
+                     remove `epoch-{epoch}/` -- it is recreated on the next epoch transition."
+                )));
             }
             Err(_) => false,
         };
@@ -452,8 +501,42 @@ impl ConsensusPack {
                         c.offset
                     )));
                 }
+                CorruptionKind::CorruptSealedRecord => {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: a committed record failed its CRC in a cleanly-sealed pack \
+                         at offset {}; the clean-close sentinel proves the log was complete, so this \
+                         is at-rest corruption (bit rot), not a truncatable tail. Re-sync the epoch \
+                         from peers.",
+                        c.offset
+                    )));
+                }
             },
         };
+
+        // Prove the data-log WAL replays BEFORE wiping any index -- the same validate-before-mutate
+        // discipline `recover_pack` uses (pass 1). Only needed when `open_static` opened clean:
+        // then `recover_pack`'s `files_consistent` early-return would skip its own
+        // validation, so the wipe below is repair_epoch's own and must be proven here too.
+        // A structurally unrebuildable log (a v0 batches-first pack, or a v1/v2
+        // malformation the physical classifier misses) is reported `Unrepairable` with
+        // nothing changed -- so the pack still opens read-only afterwards -- and the dry
+        // run reports the same verdict the apply would. `replay_wal(.., None)` reads only
+        // the data log via `raw_iter`, never the (possibly corrupt) index.
+        if opens_clean {
+            let data = Pack::<PackRecord>::open(
+                &data_file,
+                epoch as u64,
+                true,
+                PackCompression::ZStd,
+                PACK_VERSION,
+            )?;
+            if let Err(e) = Inner::replay_wal(&data, &epoch_dir, None) {
+                return Ok(EpochRepair::Unrepairable(format!(
+                    "epoch {epoch}: the data log cannot be replayed to rebuild its indexes ({e}); \
+                     nothing was changed. Re-sync the epoch from peers."
+                )));
+            }
+        }
 
         if !apply {
             return Ok(EpochRepair::WouldRepair(plan));
@@ -461,14 +544,13 @@ impl ConsensusPack {
 
         // Force a rebuild when `open_static` opened clean: a length-consistent corrupt digest
         // bucket passes `files_consistent`, so the append open's `recover_pack` would
-        // early-return and leave it untouched. Remove the derived digest indexes so the
-        // open must rebuild them from the data-log WAL. The position index is kept so
-        // `recover_pack`'s `attested_end` (the torn-tail safety watermark) stays correct.
-        // After the `!apply` return above, so a dry run writes nothing. Every other
-        // repairable case has `open_static` already failing, so `recover_pack` runs on its
+        // early-return and leave it untouched. Remove the derived digest indexes so the open must
+        // rebuild them from the data-log WAL (`recover_pack` then wipes and rebuilds every index
+        // anyway). The WAL was proven replayable above, so this wipe is always followed by a
+        // successful rebuild. After the `!apply` return above, so a dry run writes nothing. Every
+        // other repairable case has `open_static` already failing, so `recover_pack` runs on its
         // own and the indexes are left in place.
         if opens_clean {
-            let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
             for name in [Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME] {
                 match std::fs::remove_dir_all(epoch_dir.join(name)) {
                     Ok(()) => {}
@@ -557,6 +639,14 @@ impl ConsensusPack {
     /// Return the epoch for this pack file.
     pub fn epoch(&self) -> Epoch {
         self.epoch
+    }
+
+    /// True while the background actor thread is still serving requests. A `false` means the actor
+    /// exited (it only dies via a panic — there is no `panic = "abort"`), after which every lookup
+    /// wrapper collapses to `false`/`None`; the static-pack cache uses this to evict a dead handle
+    /// so the next access re-opens the epoch fresh.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
     }
 
     /// Return the committee persisted in this pack's [`EpochMeta`] — the epoch-START
@@ -664,10 +754,14 @@ impl ConsensusPack {
     pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(false)
-        } else {
-            false
+            if let Ok(found) = rx.await {
+                return found;
+            }
         }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
+        // `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_consensus_header: pack actor unavailable (channel closed); reporting not-found");
+        false
     }
 
     /// Retrieve a consensus header by digest.
@@ -677,10 +771,13 @@ impl ConsensusPack {
     ) -> Option<ConsensusHeader> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
+            if let Ok(header) = rx.await {
+                return header;
+            }
         }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "consensus_header_by_digest: pack actor unavailable (channel closed); reporting not-found");
+        None
     }
 
     /// Retrieve a consensus header by number.
@@ -764,18 +861,45 @@ impl ConsensusPack {
         }
     }
 
+    /// The latest stored consensus number, defined for ANY pack with a valid meta: `start + N - 1`
+    /// for N outputs, or `start - 1` (the previous epoch's final consensus number) for a meta-only
+    /// pack. Used at startup to clamp a `LatestConsensus` hint a power loss left ahead of the
+    /// recovered pack (a meta-only pack is the deterministic epoch-boundary case, where
+    /// [`Self::latest_consensus_header`] returns `None`).
+    pub async fn latest_consensus_number(&self) -> Result<u64, PackError> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::LatestConsensusNumber(tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::SendFailed)
+        } else {
+            Err(PackError::SendFailed)
+        }
+    }
+
     /// True if the pack contains the batch for digest.
     pub async fn contains_batch(&self, digest: BlockHash) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::ContainsBatch(digest, tx)).await;
-        rx.await.unwrap_or_default()
+        if self.tx.send(PackMessage::ContainsBatch(digest, tx)).await.is_ok() {
+            if let Ok(found) = rx.await {
+                return found;
+            }
+        }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
+        // `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_batch: pack actor unavailable (channel closed); reporting not-found");
+        false
     }
 
     /// Return the Batch for digest if found.
     pub async fn batch(&self, digest: BlockHash) -> Option<Batch> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::Batch(digest, tx)).await;
-        rx.await.unwrap_or_default()
+        if self.tx.send(PackMessage::Batch(digest, tx)).await.is_ok() {
+            if let Ok(batch) = rx.await {
+                return batch;
+            }
+        }
+        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "batch: pack actor unavailable (channel closed); reporting not-found");
+        None
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -820,6 +944,42 @@ pub const CONSENSUS_DIGEST_NAME: &str = Inner::CONSENSUS_HASH_NAME;
 /// Sidecar directory name of the batch digest index (the `bhash` hdx/odx).
 pub const BATCH_DIGEST_NAME: &str = Inner::BATCH_HASH_NAME;
 
+/// Whether any position-index-attested output starts after byte offset `from` and still decodes
+/// from its recorded boundary.
+///
+/// The data-log walk in [`crate::pack_validate`] (and recovery's [`Inner::output_after_tear`])
+/// advances by each record's claimed 4-byte size prefix, so a corrupted size prefix desyncs it and
+/// it can miss a later intact output. The position index recorded that output's exact start, so
+/// `fetch` frames it from a known-good offset a corrupted prefix cannot desync (the damaged
+/// record's own `fetch` simply fails, so it is never miscounted as a survivor). A
+/// missing/unreadable data pack or position index returns `false`, leaving the caller's walk-based
+/// probe as the fallback. Read-only; opens its own handles.
+pub(crate) fn attested_output_survives_past(data_path: &Path, epoch: Epoch, from: u64) -> bool {
+    let Ok(mut data) = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    ) else {
+        return false;
+    };
+    let Some(epoch_dir) = data_path.parent() else {
+        return false;
+    };
+    let offsets: Vec<u64> =
+        match Inner::open_pdx_file::<_, IndexPositions>(epoch_dir, data.header(), true) {
+            Ok(mut idx) => (0..idx.len() as u64)
+                .filter_map(|i| idx.load(i).ok().map(|p| p.consensus_header))
+                .collect(),
+            Err(_) => return false,
+        };
+    offsets
+        .iter()
+        .filter(|&&pos| pos > from)
+        .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
+}
+
 #[derive(Debug)]
 struct Inner {
     data: Pack<PackRecord>,
@@ -853,6 +1013,15 @@ impl Inner {
     /// cases the length checks alone miss — e.g. a crash that left a file exactly at capacity,
     /// where physical == logical == the index markers yet the tail record may be torn.
     ///
+    /// The sentinel is a v2-format feature. Pre-sentinel packs (v0/v1, below
+    /// [`SENTINEL_MIN_VERSION`]) never carried one — the buffered backend wrote physical == logical
+    /// with no trailing sentinel — so for them a missing sentinel is expected and must not force
+    /// recovery. The gate below is therefore applied only to v2+ files; a legacy pack falls through
+    /// to the length cross-checks alone, which is exactly the length-only test pre-mmap `main`
+    /// used, so an existing datadir opens as it did before the sentinel existed. Real damage in
+    /// a legacy pack still trips the length checks here (and, on the writable door, WAL
+    /// replay).
+    ///
     /// The length comparisons below remain as a secondary cross-file integrity check: even a sealed
     /// pack is only consistent if the data length agrees with what both digest indexes and the
     /// position index attest.
@@ -862,11 +1031,14 @@ impl Inner {
         consensus_digests: &HdxIndex,
         batch_digests: &HdxIndex,
     ) -> bool {
-        // Primary gate: any file that was not cleanly sealed forces recovery.
-        if data.opened_unclean()
-            || consensus_pos_idx.opened_unclean()
-            || consensus_digests.opened_unclean()
-            || batch_digests.opened_unclean()
+        // Primary gate: any *sentinel-era* (v2+) file that was not cleanly sealed forces recovery.
+        // Pre-sentinel packs (v0/v1) never wrote a sentinel, so a missing one is not an unclean
+        // signal for them — they rely on the length cross-checks below instead.
+        if data.version() >= SENTINEL_MIN_VERSION
+            && (data.opened_unclean()
+                || consensus_pos_idx.opened_unclean()
+                || consensus_digests.opened_unclean()
+                || batch_digests.opened_unclean())
         {
             return false;
         }
@@ -900,9 +1072,11 @@ impl Inner {
     /// (incomplete) output. Damage anywhere but the final record cannot be a clean tail and is
     /// reported as [`PackError::CorruptPack`].
     ///
-    /// v1 (header-first) format only: `open_static` rejects an inconsistent read-only pack rather
-    /// than healing, so recovery only runs on the writable append opens, which are always current
-    /// format.
+    /// Header-first (v1/v2) format only. `open_static` rejects an inconsistent read-only pack
+    /// rather than healing, so recovery only runs on the writable append opens. Those may open
+    /// a legacy v1 pack (the in-flight epoch at upgrade) as well as current v2 packs; both
+    /// replay identically. An inconsistent v0 (batches-first) pack cannot be replayed and is
+    /// rejected up front with a re-sync message — see the guard below.
     fn recover_pack<P: AsRef<Path>>(
         data: &mut Pack<PackRecord>,
         base_dir: P,
@@ -915,6 +1089,22 @@ impl Inner {
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
         let base_dir = base_dir.as_ref();
+        // `replay_wal` below understands only the v1/v2 header-first layout. A *consistent* v0 pack
+        // never reaches here — the length cross-checks in `files_consistent` pass for it without a
+        // sentinel — so the only way to arrive holding a v0 pack is an inconsistent one: a v0 log
+        // the mmap backend appended to and then crashed, leaving padding or a torn tail. Replaying
+        // its batches-first records as v1 would misread them as mid-log corruption, so surface an
+        // honest error instead. Unreachable in practice: the current (appendable) epoch after an
+        // upgrade is v1, and every v0 pack on disk is a sealed static epoch opened read-only via
+        // `open_static` (which never calls this).
+        if data.version() == 0 {
+            return Err(PackError::CorruptPack(format!(
+                "epoch pack {} is a pre-mmap v0 (batches-first) log left inconsistent after an \
+                 unclean shutdown; it cannot be rebuilt by replay and must be re-synced from peers. \
+                 Do NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+                base_dir.display(),
+            )));
+        }
         // Recovery replays the whole data-file WAL, so it can take time proportional to pack size.
         // Log the start (and the completion below) so a slow recovery is observable rather than a
         // silent stall at startup.
@@ -924,41 +1114,51 @@ impl Inner {
             dir = %base_dir.display(),
             "pack opened unclean or inconsistent; replaying data-file WAL to recover"
         );
-        // Highest record end either index attests as durably indexed: the digest index's
-        // `data_file_length` (the commit marker written last on an index sync) and the position
-        // index's last `output_end`. Indexes sync on a clean close, not on every `persist()`, so
-        // the data WAL can legitimately run *past* this with unacked appends -- a torn record out
-        // there is the normal mmap out-of-order-writeback tail, safe to drop even if later records
-        // still decode. But a tear that leaves the recovered prefix ending *below* an attested
-        // record end means an acked record was lost -- real corruption. Capture both before the
-        // indexes are reset just below. (A fresh/rebuilt index reports `DATA_HEADER_BYTES`, so the
-        // guard degrades to "trust the WAL, truncate at the first tear".)
-        let attested_end = {
-            let digest_end = consensus_digests.data_file_length();
-            let pos_end = if consensus_pos_idx.is_empty() {
-                DATA_HEADER_BYTES as u64
-            } else {
-                consensus_pos_idx
-                    .load(consensus_pos_idx.len() as u64 - 1)
-                    .map(|p| p.output_end)
-                    .unwrap_or(DATA_HEADER_BYTES as u64)
-            };
-            digest_end.max(pos_end)
-        };
-        // Validate before mutating. The mid-log-corruption guard (in `replay_wal`) is gated on
-        // `attested_end`, which is derived from the very indexes this function is about to discard.
-        // So a recovery that detects corruption must NOT have touched those indexes yet: otherwise
-        // the failed attempt persists a *reduced* watermark — a position index truncated to the
-        // pre-corruption prefix plus a fresh digest index whose `data_file_length` was never
-        // re-stamped — and a retry (a plain node restart, or `db repair`) recomputes a lower
-        // `attested_end`, skips the guard, and silently truncates the committed records the guard
-        // exists to protect. Pass 1 replays the log read-only (no index is touched); only once it
-        // proves the log is clean up to a truncatable tail do we discard and rebuild in pass 2.
-        Self::replay_wal(data, base_dir, attested_end, None)?;
+        // Capture the position index's attested output-start offsets before any reset below (pass 1
+        // reads no index, so they are still intact). The WAL walk in
+        // `replay_wal`/`output_after_tear` advances by each record's claimed size, so a
+        // corrupted size prefix desyncs it and it can stop early, missing a later intact
+        // output; these recorded boundaries let the post-replay check re-frame such an
+        // output from a known-good offset (see `attested_record_survives`). Empty when the
+        // index was itself discarded (`reset_all_indexes`) -> falls back to the walk.
+        let attested_headers: Vec<u64> = (0..consensus_pos_idx.len() as u64)
+            .filter_map(|i| consensus_pos_idx.load(i).ok().map(|p| p.consensus_header))
+            .collect();
+        // Pass 1 -- validate the data-log WAL ALONE (no index is read or written). A detected
+        // corruption returns `CorruptPack` without mutating on-disk state, so a retry re-derives
+        // the same verdict from the unchanged log. `replay_wal` returns the end of the last
+        // complete output and rejects a tear that has a later *complete output* after it:
+        // an output written past the tear can only exist if the earlier one was durably
+        // committed first, so the damage is corruption, not the single unacked in-flight
+        // tail. (Production persists after every output, so at most one output is ever
+        // unacked at the physical tail -- see `persist`.)
+        let consistent_end = Self::replay_wal(data, base_dir, None)?;
+
+        // Close the one gap the probe cannot see from structure alone: at-rest corruption of the
+        // LAST committed output with nothing decodable after it. `persist()` writes a best-effort
+        // tail commit marker recording the durable acked end, index-free; because it is stamped
+        // AFTER the data msync it can never sit ahead of durable data, so a replay that stops below
+        // it means acked data was damaged. A missing/stale marker just falls back to the probe.
+        if let Some(committed_end) = data.committed_end() {
+            if consistent_end < committed_end {
+                return Err(Self::corrupt_pack(base_dir));
+            }
+        }
+
+        // A position-index-attested output surviving past the replay's stopping point means
+        // committed data below the acked frontier was damaged -- e.g. a corrupted 4-byte
+        // size prefix desynced the WAL walk so `replay_wal` stopped early and
+        // `output_after_tear` could not re-sync to the later output. Re-framing from the
+        // recorded boundary is immune to that desync, closing the size-prefix gap the walk
+        // cannot (INV1/INV4: a hard `CorruptPack` below acked data, never a
+        // silent truncate). No-op when the index was discarded (empty `attested_headers`).
+        if Self::attested_record_survives(data, &attested_headers, consistent_end) {
+            return Err(Self::corrupt_pack(base_dir));
+        }
 
         // Validation passed: the data log is authoritative, so discard the (stale/damaged) indexes
-        // and start fresh. The digest indexes are directories (index.hdx + index.odx), so remove
-        // the whole directory.
+        // and rebuild. The digest indexes are directories (index.hdx + index.odx), so remove the
+        // whole directory.
         consensus_pos_idx.truncate_all()?;
         drop(consensus_digests);
         drop(batch_digests);
@@ -967,19 +1167,19 @@ impl Inner {
         let (mut consensus_digests, mut batch_digests) =
             Self::open_digest_indexes(base_dir, data.header(), false)?;
 
-        // Pass 2: replay again, this time writing every recovered position/digest into the fresh
-        // indexes. Validation already ruled out mid-log corruption, so this returns the
-        // authoritative consistent end that the rebuilt indexes reflect.
+        // Pass 2: replay again, writing every recovered position/digest into the fresh indexes.
+        // The data log is unchanged between passes, so this returns the same `consistent_end`.
         let consistent_end = Self::replay_wal(
             data,
             base_dir,
-            attested_end,
             Some((&mut consensus_pos_idx, &mut consensus_digests, &mut batch_digests)),
         )?;
 
         // Drop any incomplete/torn tail so the log ends exactly at the last complete output.
+        // `rewind_to` (not `truncate`) keeps the mmap capacity and opens no read-only-mmap SIGBUS
+        // window -- the same primitive `rollback_output` uses to undo a partial append below.
         if consistent_end < data.file_len() {
-            data.truncate(consistent_end)?;
+            data.rewind_to(consistent_end);
         }
         // Reconcile the digest indexes' tracked data length with the (possibly truncated) log so
         // `files_consistent` holds on the next open even if no save follows this recovery.
@@ -998,40 +1198,67 @@ impl Inner {
     }
 
     /// Replay the data-log WAL once, returning the byte offset just past the last complete output
-    /// (`consistent_end`) and applying the mid-log-corruption guard against `attested_end`.
+    /// (`consistent_end`) and rejecting mid-log corruption from the data alone (no index is read).
+    ///
+    /// A torn/incomplete output ends the consistent prefix. It is truncatable UNLESS a later,
+    /// well-formed OUTPUT (`output_after_tear`) decodes past the tear: production persists after
+    /// every output, so at most one output is ever unacked at the tail, and a *complete* output
+    /// past the tear can only exist if the earlier one was durably committed first -- so its
+    /// damage is at-rest corruption of committed data ([`PackError::CorruptPack`]), not the
+    /// single unacked in-flight tail. (At-rest corruption of the last output with nothing after
+    /// it is covered by the commit marker in [`Self::recover_pack`].)
+    ///
+    /// A *cleanly-sealed* log (`!opened_unclean()`) is complete by construction — the clean-close
+    /// sentinel is written only after the tail is msync'd and truncated to `end` — so it can hold
+    /// no torn tail: ANY tear during replay is at-rest corruption and a hard `CorruptPack`.
     ///
     /// When `sink` is `None` the log is only *validated* — no index is touched — so a detected
-    /// corruption returns [`PackError::CorruptPack`] without mutating any on-disk state. That is
-    /// what lets [`Self::recover_pack`] validate before it discards the indexes: the durable
-    /// watermark `attested_end` is derived from cannot regress across a failed recovery, so a retry
-    /// (a node restart or `db repair`) re-detects the same corruption instead of silently
-    /// truncating the committed records past it. When `sink` is `Some`, each recovered output's
-    /// header/batch digests and position are written into the provided indexes (the rebuild pass).
+    /// corruption returns without mutating any on-disk state and a retry re-derives the same
+    /// verdict from the unchanged log. When `sink` is `Some`, each recovered output's
+    /// header/batch digests and position are written into the provided indexes (the rebuild
+    /// pass).
     ///
     /// Uses `logical_position` (advanced only by whole record frames), never the physical
     /// `position`, so the returned offset can never land mid-record even after a torn read.
     fn replay_wal(
         data: &Pack<PackRecord>,
         base_dir: &Path,
-        attested_end: u64,
         mut sink: Option<(&mut PositionIndex<IndexPositions>, &mut HdxIndex, &mut HdxIndex)>,
     ) -> Result<u64, PackError> {
         let mut iter = data.raw_iter().map_err(DataFileOpen)?;
+        // A cleanly-sealed log (clean-close sentinel present) is complete by construction — the
+        // seal is written only after the tail is msync'd and truncated to `end`. So it can
+        // hold no torn tail: ANY replay tear is at-rest corruption (bit rot), a hard
+        // `CorruptPack`. Only an *unclean* (crash-interrupted) log can have a truncatable
+        // tail, decided below.
+        let sealed = !data.opened_unclean();
         // 0-based local index of the output within this pack (mirrors `save_consensus_output`).
         let mut idx: u64 = 0;
         // Byte offset just past the last fully-recovered record (the EpochMeta or a complete
         // output). Anything after it is an incomplete/torn tail and is truncated away by the
         // caller.
         let mut consistent_end = iter.logical_position();
+        // Only the very first record may be an EpochMeta; a second one mid-log is
+        // append-order-impossible (see the EpochMeta arm below).
+        let mut first_record = true;
 
         loop {
             let header_pos = iter.logical_position();
+            let is_first = first_record;
+            first_record = false;
             match iter.next() {
                 // Clean EOF on an output boundary: every complete output has been replayed.
                 None => break,
                 // The leading EpochMeta carries no index data (epoch_meta is already loaded and the
-                // pos index is 0-based); skip it, but keep it in the consistent prefix.
+                // pos index is 0-based); skip it, but keep it in the consistent prefix. A
+                // *non-leading* EpochMeta is structurally impossible in append order (each pack is
+                // written with exactly one, first) -- treat it as corruption, matching
+                // `validate_pack_file`, rather than silently folding it into the consistent prefix
+                // (which would leave the on-disk log validating as damaged after any repair).
                 Some(Ok(PackRecord::EpochMeta(_))) => {
+                    if !is_first {
+                        return Err(Self::corrupt_pack(base_dir));
+                    }
                     consistent_end = iter.logical_position();
                     continue;
                 }
@@ -1066,11 +1293,12 @@ impl Inner {
                         }
                     }
                     if torn {
-                        // Incomplete output ends the consistent prefix. Dropping it is safe unless
-                        // the tear sits within acked data *and* readable records survive past it
-                        // (mid-log corruption, not the final record). Past the attested watermark
-                        // it is an unacked out-of-order-writeback tail, so skip the scan entirely.
-                        if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                        // Incomplete output ends the consistent prefix. In a sealed log any tear is
+                        // corruption. In an unclean log, dropping it is safe unless a later
+                        // well-formed OUTPUT decodes past the tear -- that output was written after
+                        // this one was durably committed, so the damage is corruption of committed
+                        // data, not the single unacked in-flight tail.
+                        if sealed || Self::output_after_tear(&mut iter) {
                             return Err(Self::corrupt_pack(base_dir));
                         }
                         break; // consistent_end still marks the end of the last complete output
@@ -1085,18 +1313,19 @@ impl Inner {
                     consistent_end = output_end;
                 }
                 // A torn record where the next output's header would start. The last complete
-                // output is already finalized; this ends the consistent prefix. It is only fatal
-                // when the tear sits within acked data *and* readable records survive past it
-                // (mid-log corruption); past the attested watermark it is an unacked tail, safe to
-                // drop.
+                // output is already finalized; this ends the consistent prefix. In a sealed log any
+                // tear is corruption. In an unclean log it is fatal only when a later well-formed
+                // OUTPUT still decodes past the tear (corruption of committed data); otherwise it
+                // is the unacked in-flight tail, safe to drop.
                 Some(Err(_)) => {
-                    if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                    if sealed || Self::output_after_tear(&mut iter) {
                         return Err(Self::corrupt_pack(base_dir));
                     }
                     break;
                 }
-                // v1 is header-first, so a decodable batch (or a stray second epoch meta) where a
-                // header is expected is append-order-impossible -- genuine corruption, not a tail.
+                // v1 is header-first, so a decodable batch where a header is expected is
+                // append-order-impossible -- genuine corruption, not a tail. (A stray second
+                // EpochMeta is rejected above in the EpochMeta arm.)
                 Some(Ok(_)) => return Err(Self::corrupt_pack(base_dir)),
             }
         }
@@ -1153,21 +1382,50 @@ impl Inner {
         ))
     }
 
-    /// After recovery hits a damaged record *within acked data*, decide whether the rest of the log
-    /// is a clean torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn
-    /// tail yields only unreadable garbage until EOF; if any later record still decodes then valid
-    /// data survived past the damage, so the damaged record was not the final one. Only consulted
-    /// when the tear is at/below the attested watermark -- past it, an unacked
-    /// out-of-order-writeback tail is expected to hold decodable records and is truncated
-    /// without this scan.
-    fn tail_is_torn(
+    /// Does any position-index-attested output start after byte offset `from` and still decode as a
+    /// `Consensus` record? [`Self::output_after_tear`] walks by each record's claimed 4-byte size
+    /// prefix, so a corrupted prefix desyncs it and it can miss a later intact output; the position
+    /// index recorded that output's exact start, so `fetch` frames it from a known-good boundary (a
+    /// corrupted prefix just makes that `fetch` fail, so it is never miscounted). Empty `headers`
+    /// (the index was itself discarded and is being rebuilt) makes this a no-op, leaving
+    /// `output_after_tear` as the fallback.
+    fn attested_record_survives(data: &mut Pack<PackRecord>, headers: &[u64], from: u64) -> bool {
+        headers
+            .iter()
+            .filter(|&&pos| pos > from)
+            .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
+    }
+
+    /// After recovery hits a torn/incomplete output, decide whether the rest of the log is a clean
+    /// unacked tail (safe to truncate) or corruption of committed data (an error). Because
+    /// production persists after every output, at most one output is ever unacked at the tail,
+    /// so its leftovers are only its own `Batch` records — never a new `Consensus` header. A
+    /// decodable `Consensus` header past the tear therefore means a *later output* was written,
+    /// which can only have happened after the earlier one was durably committed: the earlier
+    /// damage is corruption.
+    ///
+    /// Returns `true` (corruption) iff a later output header decodes before EOF; stray batches, a
+    /// stray meta, and CRC-failed frames are skipped. The `position` no-forward-progress guard
+    /// (mirrors `pack_validate::probe_decodable_after`) stops a size-prefix-past-EOF from spinning.
+    fn output_after_tear(
         iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
     ) -> bool {
+        let mut last_pos = iter.position().unwrap_or(u64::MAX);
         loop {
             match iter.next() {
-                None => return true,
-                Some(Ok(_)) => return false,
-                Some(Err(_)) => continue,
+                None => return false,
+                // A later output began → an output was written past the tear → corruption.
+                Some(Ok(PackRecord::Consensus(_))) => return true,
+                // A stray batch/meta of the torn in-flight output: not a new output; keep scanning.
+                Some(Ok(_)) => last_pos = iter.position().unwrap_or(u64::MAX),
+                Some(Err(_)) => {
+                    let pos = iter.position().unwrap_or(u64::MAX);
+                    if pos <= last_pos {
+                        return false; // no forward progress (extent past EOF): nothing readable
+                                      // after
+                    }
+                    last_pos = pos;
+                }
             }
         }
     }
@@ -1400,7 +1658,7 @@ impl Inner {
             // always has a durable meta, which is what lets the torn-meta path above
             // fail instead of repair.
             if pack_len > DATA_HEADER_BYTES as u64 {
-                data.truncate(DATA_HEADER_BYTES as u64)?;
+                data.rewind_to(DATA_HEADER_BYTES as u64);
             }
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
@@ -1604,12 +1862,23 @@ impl Inner {
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
+        // Materialize the imported epoch in the SOURCE stream's format, not the local current
+        // format. The bytes written must stay byte-identical to what the peer sent so a peer still
+        // on a pre-sentinel build can read this epoch back verbatim when we later serve it (the
+        // golden-legacy byte-identity tests pin exactly this). A brand-new local epoch created via
+        // `open_append` is stamped the current `PACK_VERSION`; a replicated epoch keeps its origin
+        // version. Reject a source newer than this build understands rather than mis-parsing it
+        // with current-format logic.
+        let import_version = stream_iter.version();
+        if import_version > PACK_VERSION {
+            return Err(PackError::InvalidVersion(PACK_VERSION, import_version));
+        }
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
             false,
             PackCompression::ZStd,
-            PACK_VERSION,
+            import_version,
         )?;
         let epoch_meta = if let Some(meta) = next_output_record(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
@@ -1682,6 +1951,17 @@ impl Inner {
                     consensus_number,
                     final_consensus_number,
                 ));
+            }
+            // A streamed import builds a fresh pack strictly in order: the next output MUST be
+            // exactly the next consensus number. A repeat or gap is peer misbehavior --
+            // not the idempotent local replay `save_consensus_output` tolerates (`idx <
+            // len` there) -- so reject it here. Otherwise a non-advancing parent-linked
+            // chain is accepted-and-ignored forever and pins the import (see finding
+            // #10); `InvalidConsensusNumber` charges the peer a Severe penalty.
+            let expected =
+                pack.epoch_meta.start_consensus_number + pack.consensus_pos_idx.len() as u64;
+            if consensus_number != expected {
+                return Err(PackError::InvalidConsensusNumber(expected, consensus_number));
             }
             parent_digest_expectation = HeaderExpectation::Parent(output.digest());
             pack.save_consensus_output(&output)?;
@@ -1826,9 +2106,8 @@ impl Inner {
         self.data.rewind_to(data_start);
         self.consensus_pos_idx.rewind_to_len(pos_idx_start);
         // 0 can never equal the real data length (always >= DATA_HEADER_BYTES), so
-        // `files_consistent` always triggers the WAL rebuild; it also leaves
-        // `recover_pack`'s attested_end = max(0, pos_end) = pos_end (the true watermark),
-        // so recovery validation stays correct.
+        // `files_consistent` always fails and the next open runs `recover_pack`, which rebuilds
+        // every index from the (rewound) data-log WAL.
         const FORCE_INDEX_REBUILD: u64 = 0;
         self.consensus_digests.set_data_file_length(FORCE_INDEX_REBUILD);
         self.batch_digests.set_data_file_length(FORCE_INDEX_REBUILD);
@@ -1924,6 +2203,13 @@ impl Inner {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             // Note, we don't sync indexes.  The data file acts as a WAL we can use to clean up and
             // rebuild if we crash and it causes corruption.
+            //
+            // Stamp the commit marker AFTER the data msync so it can never point past durable data
+            // (fail-safe). It is a plain 16-byte mmap write in the capacity padding with NO extra
+            // sync — best-effort, flushed by OS writeback / the next grow — so it adds nothing to
+            // the persist hot path. `recover_pack` uses it to catch at-rest corruption
+            // of the last committed output that the structural WAL probe cannot see.
+            self.data.stamp_commit_marker();
         }
         Ok(())
     }
@@ -1991,6 +2277,14 @@ impl Inner {
         let latest_number =
             self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1;
         self.consensus_header_by_number(latest_number).map(Some)
+    }
+
+    /// The latest stored consensus number. Unlike [`Self::latest_consensus_header`], this is
+    /// defined even for a meta-only pack (no outputs): `start + len - 1` is `start - 1` there —
+    /// the previous epoch's final consensus number. `start_consensus_number >= 1` (epoch 0
+    /// starts at 1), so this never underflows.
+    fn latest_consensus_number(&self) -> u64 {
+        self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
@@ -2254,6 +2548,15 @@ fn check_header_expectation(
     header: &ConsensusHeader,
     expectation: HeaderExpectation,
 ) -> Result<(), PackError> {
+    // A sub-dag names its leader as its last header; an empty one has no leader, so every
+    // `leader()`-derived accessor (`leader_epoch`, `nonce`, `commit_timestamp`, `Display`, ...)
+    // would panic. A committed output always names a leader, so reject a peer-supplied empty
+    // sub-dag here -- the single decode chokepoint both `iter_to_output` and
+    // `iter_to_output_legacy` pass through before any leader access -- rather than let it reach
+    // `save_consensus_output` and panic the critical import task.
+    if header.sub_dag.is_empty() {
+        return Err(PackError::EmptySubDag);
+    }
     match expectation {
         HeaderExpectation::None => Ok(()),
         HeaderExpectation::Digest(expected) => {
@@ -2281,7 +2584,9 @@ pub(crate) async fn decode_output_bytes(
     let reader = BufReader::new(cursor);
     match version {
         0 => bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee).await,
-        1 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
+        // v2 shares v1's header-first on-disk layout (it differs only in the data-file sentinel),
+        // so both decode identically here.
+        1 | 2 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
         _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
@@ -2329,7 +2634,8 @@ pub(crate) async fn serve_output_bytes(
             }
             Ok(bytes)
         }
-        1 => Ok(bytes),
+        // v2 is header-first like v1, so the raw bytes are already in serve format.
+        1 | 2 => Ok(bytes),
         _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
@@ -2475,6 +2781,17 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                         digest
                     )));
                 }
+                // Bound per-output buffering by the same measure the batch validator enforces at
+                // production/gossip (`validate_batch_size_bytes`): the raw transaction-byte sum
+                // against the epoch's `max_batch_size`. A record may be up to MAX_RECORD_SIZE
+                // (16 MiB), but a legitimate batch is far smaller, so without this an attacker's
+                // oversized batches inflate `available_batches` ~16x (finding #10 OOM). Rejecting
+                // before the insert keeps only batches within the limit buffered.
+                let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
+                let max = max_batch_size(committee.epoch());
+                if batch_bytes > max {
+                    return Err(PackError::BatchTooLarge { size: batch_bytes, max });
+                }
                 referenced_batches.insert(digest);
                 available_batches.insert(digest, batch);
                 digest_count += 1;
@@ -2576,6 +2893,15 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 batch_records += 1;
                 if batch_records > max_batches {
                     return Err(PackError::TooManyBatches(max_batches));
+                }
+                // Same per-batch byte cap as the v1 path (`iter_to_output`): reject a batch whose
+                // transaction bytes exceed the epoch's `max_batch_size` before buffering it, so an
+                // oversized-batch flood cannot inflate `available_batches` toward OOM (finding
+                // #10).
+                let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
+                let max = max_batch_size(committee.epoch());
+                if batch_bytes > max {
+                    return Err(PackError::BatchTooLarge { size: batch_bytes, max });
                 }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
@@ -2831,11 +3157,25 @@ pub enum PackError {
         /// The digest that was actually received in the stream.
         got: ConsensusHeaderDigest,
     },
+    /// A decoded consensus header carried a sub-dag with no headers, and therefore no leader.
+    /// Every `leader()`-derived accessor panics on such a value, so it is rejected at decode
+    /// time; a legitimately committed output always names its leader as its last header.
+    EmptySubDag,
+    /// A `Batch` record in an import stream carried more transaction bytes than the epoch's
+    /// `max_batch_size`. Legitimate batches are capped at production/gossip by the batch
+    /// validator, so this is peer misbehavior; rejecting it bounds per-output buffering to a
+    /// legitimate size.
+    BatchTooLarge {
+        /// The offending batch's transaction-byte total.
+        size: usize,
+        /// The per-epoch limit (`max_batch_size`) it exceeded.
+        max: usize,
+    },
 }
 
 impl PackError {
     /// True when a static-pack open failed because the epoch's files are absent on disk: the
-    /// data-file or an index-file open bottomed out in io `NotFound`. [`Inner::open_static`]
+    /// data-file or an index-file open bottomed out in io `NotFound`. `Inner::open_static`
     /// opens the data file before anything else, so a missing `epoch-{N}` directory (or a
     /// never-created epoch) always surfaces as the data file's `NotFound`; an index file can
     /// bottom out there on its own while the data file still opens, because `stream_import`
@@ -2855,6 +3195,22 @@ impl PackError {
                     OpenError::DataFileOpen(LoadHeaderError::IO(io_error))
                     | OpenError::IndexFileOpen(LoadHeaderError::IO(io_error))
                         if io_error.kind() == io::ErrorKind::NotFound
+                )
+        )
+    }
+
+    /// True iff this is the "unwritten data file" open error: the `data` file has a physical size
+    /// but is all zeros — a first write that sized the file (ftruncate + fsync) but crashed before
+    /// the header was durable. There is nothing to rebuild; `repair_epoch` maps this to an
+    /// actionable `Unrepairable`, and read-only doors surface it so the operator can remove the
+    /// pack directory (a writable open reinitializes it in place).
+    pub fn is_unwritten_data_file(&self) -> bool {
+        matches!(
+            self,
+            PackError::Open(open_error)
+                if matches!(
+                    open_error.as_ref(),
+                    OpenError::DataFileOpen(LoadHeaderError::Unwritten)
                 )
         )
     }
@@ -2909,6 +3265,12 @@ impl Display for PackError {
             }
             PackError::UnexpectedConsensusDigest { expected, got } => {
                 write!(f, "Consensus header digest mismatch: expected {expected}, got {got}")
+            }
+            PackError::EmptySubDag => {
+                write!(f, "consensus header carries an empty sub-dag (no leader)")
+            }
+            PackError::BatchTooLarge { size, max } => {
+                write!(f, "batch of {size} transaction bytes exceeds the {max}-byte limit")
             }
         }
     }
@@ -3678,6 +4040,134 @@ pub(crate) mod test {
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
     }
 
+    /// Finding #10 (OOM): the batch buffer in `iter_to_output` is bounded only by count, not bytes,
+    /// so a `Batch` whose transaction bytes exceed `max_batch_size(epoch)` must be rejected — the
+    /// same limit the batch validator enforces at production/gossip — rather than buffered at up to
+    /// `MAX_RECORD_SIZE` (16 MiB) each. Without the cap this decodes `Ok`; with it,
+    /// `BatchTooLarge`.
+    #[tokio::test]
+    async fn test_iter_to_output_rejects_oversized_batch() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_oversized_batch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // One batch whose single transaction is one byte over the epoch's limit; well under the
+        // 16 MiB record cap, so it decodes and reaches the byte check rather than being rejected as
+        // an oversized record.
+        let oversized = Batch::new_for_test(
+            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
+            ExecHeader::default(),
+            0,
+            committee.epoch(),
+        );
+
+        // A leader header that references exactly that batch (so the output declares one batch and
+        // the decoder reaches the buffering loop).
+        let authority = committee.authorities();
+        let authority = authority.first().expect("committee has authorities");
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority.id());
+        leader.update_header_for_test(
+            HeaderBuilder::from_header(leader.header())
+                .with_payload_batch(&oversized, 0_u16)
+                .build(),
+        );
+        leader.update_header_epoch_for_test(committee.epoch());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let header = ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag,
+            number: 1,
+            extra: Default::default(),
+        };
+
+        // v1 stream: header first, then the oversized batch record.
+        let path = temp_dir.path().join("oversized");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            pack.append(&PackRecord::Batch(oversized)).expect("append oversized batch");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::BatchTooLarge { .. })),
+            "an oversized batch must be rejected as BatchTooLarge, got {res:?}"
+        );
+    }
+
+    /// Finding #10 (OOM), v0 path: `iter_to_output_legacy` buffers batches (which in v0 arrive
+    /// before the header) with the same count-only bound, so the per-batch byte cap applies here
+    /// too — and fires as the oversized batch is read, before any consensus header.
+    #[tokio::test]
+    async fn test_iter_to_output_legacy_rejects_oversized_batch() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output_legacy, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_oversized_batch_v0").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // One batch one byte over the epoch's limit.
+        let oversized = Batch::new_for_test(
+            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
+            ExecHeader::default(),
+            0,
+            committee.epoch(),
+        );
+
+        // v0 is batches-first, so a single batch record is enough to reach the byte check.
+        let path = temp_dir.path().join("oversized_v0");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Batch(oversized)).expect("append oversized batch");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output_legacy(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::BatchTooLarge { .. })),
+            "an oversized v0 batch must be rejected as BatchTooLarge, got {res:?}"
+        );
+    }
+
     /// A `ConsensusOutput` that references more than the old fixed 1000-batch cap but stays within
     /// the committee-derived bound must round-trip through the pack: it is executed live on
     /// every node, so it must always be reconstructable.  Regression test for the writer/reader
@@ -4210,9 +4700,27 @@ pub(crate) mod test {
         previous_epoch: &EpochRecord,
         n: u64,
     ) {
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open pack");
+        build_test_pack_version(temp_dir, committee, chain, previous_epoch, n, PACK_VERSION).await;
+    }
+
+    /// Build `n` sequential outputs into a fresh pack stamped with an explicit data-file `version`
+    /// and persist the data log. v0/v1 exercise the pre-sentinel legacy formats a pre-mmap build
+    /// wrote; the current `PACK_VERSION` (v2) is the sentinel-era format.
+    async fn build_test_pack_version(
+        temp_dir: &TempDir,
+        committee: &Committee,
+        chain: &Arc<RethChainSpec>,
+        previous_epoch: &EpochRecord,
+        n: u64,
+        version: u16,
+    ) {
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch.clone(),
+            committee.clone(),
+            version,
+        )
+        .expect("open pack");
         let mut parent = ConsensusHeader::default().digest();
         for i in 0..n {
             let output =
@@ -4223,10 +4731,11 @@ pub(crate) mod test {
         pack.persist().await.expect("persist");
     }
 
-    /// The clean-close sentinel is the *definitive* consistency gate: a pack whose lengths all
-    /// still agree (physical == logical == index markers) but which lost its data-file sentinel
-    /// is treated as inconsistent. `open_static` refuses it (CorruptPack); `open_append_exists`
-    /// recovers it.
+    /// For a current-version (v2) pack the clean-close sentinel is the *definitive* consistency
+    /// gate: a pack whose lengths all still agree (physical == logical == index markers) but which
+    /// lost its data-file sentinel is treated as inconsistent. `open_static` refuses it
+    /// (CorruptPack); `open_append_exists` recovers it. (A pre-sentinel v0/v1 pack has no sentinel
+    /// to lose — see `test_open_static_accepts_sentinelless_legacy_pack`.)
     #[tokio::test]
     async fn test_missing_sentinel_forces_recovery_even_when_lengths_agree() {
         let temp_dir = TempDir::with_prefix("test_missing_sentinel").expect("temp dir");
@@ -4260,6 +4769,108 @@ pub(crate) mod test {
                 pack.get_consensus_output(i).await.is_ok(),
                 "output {i} must read back after recovery"
             );
+        }
+    }
+
+    /// Migration (finding #3): a pack written before the clean-close sentinel existed (v0/v1) has
+    /// no sentinel on disk, so the pre-sentinel version must be recognized and the missing
+    /// sentinel treated as normal rather than as an unclean shutdown. `open_static` — the
+    /// read-only door that serves sealed epochs to syncing peers and backs restart-time state
+    /// restore — must open such a pack instead of returning `CorruptPack`, and must not rewrite
+    /// the file. The cross-file length checks still carry the integrity guarantee (exactly the
+    /// length-only test pre-mmap `main` used).
+    #[tokio::test]
+    async fn test_open_static_accepts_sentinelless_legacy_pack() {
+        for version in [0_u16, 1] {
+            let temp_dir = TempDir::with_prefix("test_legacy_static").expect("temp dir");
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let committee = fixture.committee();
+            let previous_epoch = test_previous_epoch(&committee);
+            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
+                .await;
+
+            // Synthesize the pre-PR on-disk shape: strip the 8-byte clean-close sentinel the
+            // current build appends on close, leaving a bare v{0,1} data file just as
+            // the buffered backend wrote it (physical == logical, no sentinel).
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            let len_before = {
+                let f = OpenOptions::new().write(true).open(&data_path).expect("open data");
+                let len = f.metadata().expect("meta").len();
+                let stripped = len - crate::archive::data_file::SENTINEL_LEN;
+                f.set_len(stripped).expect("strip sentinel");
+                stripped
+            };
+
+            // The read-only door must accept it. Before the version gate this returned CorruptPack
+            // for every pre-upgrade epoch, halting peer sync and restart-time state restore.
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).unwrap_or_else(|e| {
+                panic!("open_static must accept a sentinel-less v{version} pack, got {e:?}")
+            });
+            for i in 1..=3 {
+                assert!(
+                    pack.get_consensus_output(i).await.is_ok(),
+                    "v{version} output {i} must read back through the read-only door"
+                );
+            }
+
+            // A read-only open must not have re-sealed or otherwise rewritten the data file.
+            let len_after = std::fs::metadata(&data_path).expect("meta").len();
+            assert_eq!(len_after, len_before, "open_static must not mutate a v{version} pack");
+        }
+    }
+
+    /// New packs are written at the current `PACK_VERSION`, the sentinel-era format: a freshly
+    /// built, cleanly-closed pack reports a version at or above [`SENTINEL_MIN_VERSION`] and opens
+    /// through the read-only door — which for a sentinel-era pack only succeeds when the
+    /// clean-close sentinel is present, so this also proves the pack was sealed.
+    #[tokio::test]
+    async fn test_fresh_pack_is_sentinel_version_and_sealed() {
+        let temp_dir = TempDir::with_prefix("test_fresh_sentinel").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("a cleanly-closed current-version pack opens read-only");
+        assert_eq!(pack.version, PACK_VERSION, "a fresh pack must be written at PACK_VERSION");
+        assert!(
+            pack.version >= super::SENTINEL_MIN_VERSION,
+            "PACK_VERSION must be a sentinel-era version so new packs get crash detection"
+        );
+    }
+
+    /// The v0 (batches-first) legacy format cannot be rebuilt by the header-first WAL replay, so an
+    /// *inconsistent* v0 pack opened for append is rejected with an honest re-sync message rather
+    /// than mis-replayed as v1 corruption. (A *consistent* v0 pack opens fine — it never reaches
+    /// replay; see `test_open_static_accepts_sentinelless_legacy_pack`.)
+    #[tokio::test]
+    async fn test_recover_rejects_inconsistent_v0_pack() {
+        let temp_dir = TempDir::with_prefix("test_v0_recover").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
+
+        // Force inconsistency the writable door cannot short-circuit past: drop the sidecar indexes
+        // so `files_consistent` fails and `recover_pack` is entered. For v1/v2 that replays the
+        // WAL; for v0 the guard must fire first.
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        for name in ["idx", "hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
+        }
+
+        match ConsensusPack::open_append_exists(temp_dir.path(), 0) {
+            Err(super::PackError::CorruptPack(msg)) => assert!(
+                msg.contains("v0"),
+                "an inconsistent v0 pack must be rejected with the honest v0 re-sync message, got: {msg}"
+            ),
+            other => panic!(
+                "open_append_exists on an inconsistent v0 pack must return CorruptPack, got {other:?}"
+            ),
         }
     }
 
@@ -4774,6 +5385,178 @@ pub(crate) mod test {
         assert_pack_reads_back(&temp_dir, 3).await;
     }
 
+    /// Finding #4: `repair_epoch` must PROVE the data-log WAL replays before wiping the digest
+    /// indexes. A pack that opens read-only clean but whose log cannot be rebuilt — here a sealed
+    /// v0 (batches-first) pack, which the header-first `replay_wal` cannot replay — must be
+    /// reported `Unrepairable` with nothing changed, so it still opens afterwards. Without the
+    /// guard the wipe happens first and `open_static` then fails on every later open. The dry
+    /// run must predict the same verdict as the apply.
+    #[tokio::test]
+    async fn test_repair_epoch_unrebuildable_preserves_indexes() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        const HDX_BUCKET: usize = 16 + (32 + 8) * 32;
+
+        let temp_dir = TempDir::with_prefix("test_repair_unrebuildable").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // A sealed v0 pack opens read-only clean post-migration, but its batches-first log cannot
+        // be replayed by the header-first `replay_wal`.
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
+
+        // Corrupt a non-first bucket so `open_static` (first-bucket-only) still succeeds but full
+        // validation fails, driving repair_epoch into the opens-clean-but-invalid branch.
+        {
+            let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
+            let n = bytes.len();
+            bytes[n - HDX_BUCKET + 12] ^= 0xFF;
+            std::fs::write(&hdx_path, &bytes).expect("write hdx");
+        }
+
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
+            "the corrupt non-first bucket must still pass the read-only open (the bug setup)"
+        );
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Invalid,
+            "the full validator must flag the corrupt bucket"
+        );
+
+        // Dry run must predict the apply verdict: Unrepairable, not WouldRepair.
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
+            .await
+            .expect("dry run must not err");
+        assert!(
+            matches!(dry, EpochRepair::Unrepairable(_)),
+            "an unreplayable v0 pack must be Unrepairable on a dry run, got {dry:?}"
+        );
+
+        // Apply must also report Unrepairable AND must not have wiped the indexes.
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("apply must not err");
+        assert!(
+            matches!(applied, EpochRepair::Unrepairable(_)),
+            "an unreplayable v0 pack must be Unrepairable on apply, got {applied:?}"
+        );
+        assert!(
+            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
+            "repair must not have wiped the indexes: open_static must still succeed after an \
+             Unrepairable apply"
+        );
+    }
+
+    /// Finding #7: a fresh pack whose first write sized the `data` file to 1 MiB of zeros but
+    /// crashed before the header was durable is *unwritten*, not corrupt. A writable `open_append`
+    /// must reinitialize it in place (so the node stops crash-looping at `new_epoch`) rather than
+    /// failing with a bare CRC error.
+    #[tokio::test]
+    async fn test_open_append_reinitializes_unwritten_file() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_append").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Simulate the crash: an epoch dir with a 1 MiB all-zero `data` file.
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("write zeros");
+
+        // Writable open reinitializes the unwritten file and behaves like a fresh pack.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open_append must reinitialize an all-zero data file");
+        let output =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        pack.save_consensus_output(output).await.expect("save output");
+        pack.persist().await.expect("persist");
+        pack.close().await;
+
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after reinit");
+        assert!(pack.get_consensus_output(1).await.is_ok(), "output must read back after reinit");
+    }
+
+    /// Finding #7: a read-only door cannot reinitialize, so it must surface the all-zero file as a
+    /// classifiable, actionable error rather than a bare "invalid crc32 checksum".
+    #[tokio::test]
+    async fn test_open_static_rejects_unwritten_file() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_static").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("write zeros");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("read-only open of an all-zero file must fail");
+        assert!(err.is_unwritten_data_file(), "must be classified as unwritten, got {err:?}");
+        assert!(
+            err.to_string().contains("all zeros"),
+            "the error must be actionable (mention 'all zeros'), got: {err}"
+        );
+    }
+
+    /// Finding #7 (refinement): only a file up to the first-grow size (`initial_size` = 1 MiB) is
+    /// treated as unwritten. A larger all-zero file is not a first-write artifact (growing past the
+    /// first allocation requires writing a non-zero header first), so it must NOT be classified as
+    /// unwritten — it falls through to the normal corrupt-header path, and the zero-scan never runs
+    /// over it.
+    #[tokio::test]
+    async fn test_oversized_zero_file_is_not_unwritten() {
+        let temp_dir = TempDir::with_prefix("test_oversized_zero").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        // One byte past the 1 MiB first-grow size.
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; (1 << 20) + 1])
+            .expect("write zeros");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("read-only open of an oversized all-zero file must fail");
+        assert!(
+            !err.is_unwritten_data_file(),
+            "a file larger than the first grow must NOT be classified as unwritten, got {err:?}"
+        );
+    }
+
+    /// Finding #7: `db repair` on an all-zero file reports `Unrepairable` (there is nothing to
+    /// rebuild) with an actionable message, and does NOT mutate the file (no sealing the zeros into
+    /// an 8-byte sentinel, which would erase the forensic signal).
+    #[tokio::test]
+    async fn test_repair_epoch_unwritten_is_unrepairable() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_repair").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        std::fs::write(&data_path, vec![0_u8; 1 << 20]).expect("write zeros");
+
+        for apply in [false, true] {
+            let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect("repair must not err");
+            match res {
+                EpochRepair::Unrepairable(msg) => assert!(
+                    msg.contains("all zeros"),
+                    "an unwritten file must be Unrepairable with an actionable message, got: {msg}"
+                ),
+                other => {
+                    panic!("an unwritten file must be Unrepairable (apply={apply}), got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("stat").len(),
+            1 << 20,
+            "repair must not mutate the unwritten data file"
+        );
+    }
+
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
     /// last complete output by `repair_epoch`.
     #[tokio::test]
@@ -4961,7 +5744,21 @@ pub(crate) mod test {
         }
         std::fs::create_dir_all(temp_dir.path().join("staging-3")).expect("mkdir"); // ignored
         std::fs::write(temp_dir.path().join("epoch-99"), b"a file, not a dir").expect("write"); // ignored
+
+        // A symlinked `epoch-N/` must be enumerated (the node opens epochs by path and follows
+        // symlinks); `path().is_dir()` follows the link where `file_type().is_dir()` did not.
+        #[cfg(unix)]
+        {
+            let target = temp_dir.path().join("real-epoch-5");
+            std::fs::create_dir_all(&target).expect("mkdir target");
+            std::os::unix::fs::symlink(&target, temp_dir.path().join("epoch-5"))
+                .expect("symlink epoch-5");
+        }
+
         let epochs = ConsensusPack::epoch_dirs(temp_dir.path()).expect("list epochs");
+        #[cfg(unix)]
+        assert_eq!(epochs, vec![0, 1, 2, 5, 10]);
+        #[cfg(not(unix))]
         assert_eq!(epochs, vec![0, 1, 2, 10]);
     }
 
@@ -5053,14 +5850,185 @@ pub(crate) mod test {
         );
     }
 
-    /// R1 regression: a *failed* recovery must not corrupt the state a *retry* depends on. The
-    /// first open correctly rejects mid-log corruption (the position index attests outputs 2/3
-    /// as committed while output 2 is torn). Before the fix, that first attempt truncated the
-    /// position index to output 1 and recreated a fresh, low-watermark digest index *before*
-    /// the guard fired; a second open (a plain node restart, or `db repair`) then recomputed a
-    /// lower `attested_end`, skipped the guard, and silently truncated the committed outputs 2
-    /// and 3 while returning `Ok`. Both attempts must reject, and the data bytes must survive
-    /// untouched.
+    /// Finding #37: a second, non-leading `EpochMeta` in the data log is append-order-impossible
+    /// (each pack is written with exactly one meta, first). `replay_wal` must reject it as
+    /// `CorruptPack` rather than silently folding it into the consistent prefix — which would leave
+    /// the on-disk log validating as damaged after any repair (validate flags the stray meta, so
+    /// `repair_epoch` would rebuild and then return `Unrepairable`). Mirrors
+    /// `test_recover_mid_log_corruption_errors`.
+    #[tokio::test]
+    async fn test_recover_rejects_stray_mid_log_epoch_meta() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+        let temp_dir = TempDir::with_prefix("test_recover_stray_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Frame a stray EpochMeta record exactly as the writer would (a hand-rolled size prefix
+        // would desync the reader): write one into a scratch pack, then lift its bytes past
+        // the data-file header. Read after the pack drops so the file is truncated to
+        // `[header][record][sentinel]`; the trailing clean-close sentinel is harmless —
+        // replay rejects the stray meta well before it reaches the tail.
+        let scratch = temp_dir.path().join("scratch_meta");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&scratch, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open scratch");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append stray meta");
+            pack.commit().expect("commit scratch");
+        }
+        let stray_meta_bytes =
+            std::fs::read(&scratch).expect("read scratch")[DATA_HEADER_BYTES..].to_vec();
+
+        // Overwrite from the end of the last output (output 3) with the framed stray meta,
+        // clobbering the clean-close sentinel that sits there. Appending past the sentinel
+        // instead would leave its 8 bytes between output 3 and the stray meta, and replay
+        // would stop at them as a torn tail before ever reaching the meta.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to output 3 end");
+            f.write_all(&stray_meta_bytes).expect("write stray meta bytes");
+        }
+        // Force recovery (replay_wal) to run by dropping the digest indexes.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
+        }
+
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(PackError::CorruptPack(_))),
+            "a stray mid-log EpochMeta must error, got {res:?}"
+        );
+    }
+
+    /// Finding #19: a corrupted mid-log record *size prefix* (not payload) desyncs the size-walking
+    /// probe, so `output_after_tear` cannot reach the intact outputs after the damage. On an
+    /// unclean pack with no commit marker the position index is the only desync-immune witness
+    /// — a still-attested output past the replay's stopping point makes recovery reject with
+    /// `CorruptPack` rather than silently truncating committed outputs. (Contrast
+    /// `test_recover_mid_log_corruption_errors`, which corrupts the payload with framing intact and
+    /// is caught by the walk itself.)
+    #[tokio::test]
+    async fn test_recover_size_prefix_corruption_errors_via_index() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_size_prefix").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Output 2 begins where output 1 ends; overwrite its 4-byte record size prefix (not the
+        // payload) with a small bogus size so the size-walking probe jumps to a misaligned offset
+        // and cannot re-sync to output 3.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to size prefix");
+            f.write_all(&7u32.to_le_bytes()).expect("corrupt size prefix");
+        }
+        // Strip the clean-close sentinel so the pack opens unclean (forcing recovery) with NO
+        // commit marker — a sealed pack's tail holds none — leaving the (intact) position
+        // index as the only witness. Keep the digest indexes so recovery receives an intact
+        // position index.
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data to unseal");
+            let len = f.metadata().expect("metadata").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(PackError::CorruptPack(_))),
+            "size-prefix corruption with a surviving attested output must error, got {res:?}"
+        );
+    }
+
+    /// Finding #19 (read-only path): the classifier must not misread size-prefix corruption as a
+    /// truncatable tail. With a surviving attested output past the damage,
+    /// `classify_physical_corruption` reports `MidLogCorruption` (DATA LOSS / re-sync), not
+    /// `TornTrailingTail` ("SAFE") — via the position index, immune to the size-walk desync.
+    #[tokio::test]
+    async fn test_classify_size_prefix_corruption_is_mid_log() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let temp_dir = TempDir::with_prefix("test_classify_size_prefix").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to size prefix");
+            f.write_all(&7u32.to_le_bytes()).expect("corrupt size prefix");
+        }
+        // Unclean (stripped sentinel) so the pre-fix walk would call a torn tail "SAFE"; the
+        // position index (kept intact) attests output 3 survives past the damage.
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data to unseal");
+            let len = f.metadata().expect("metadata").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+
+        let corruption = crate::pack_validate::classify_physical_corruption(&data_path, 0)
+            .expect("classify")
+            .expect("corruption detected");
+        assert_eq!(
+            corruption.kind,
+            crate::pack_validate::CorruptionKind::MidLogCorruption,
+            "size-prefix corruption with a surviving attested output must classify as mid-log, got \
+             {:?}",
+            corruption.kind
+        );
+    }
+
+    /// R1 regression: a *failed* recovery must be idempotent and non-destructive. Recovery
+    /// validates the data-log WAL (index-free) BEFORE it touches any index or truncates the
+    /// log, so a detected corruption returns without mutating on-disk state and a retry (a
+    /// plain node restart, or `db repair`) re-derives the SAME reject from the unchanged log.
+    /// Here output 2 is torn with output 3 decodable after it (corruption of committed data);
+    /// both attempts must reject with `CorruptPack`, and the data bytes must survive untouched
+    /// across both.
     #[tokio::test]
     async fn test_failed_recovery_preserves_data_on_retry() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -5096,8 +6064,9 @@ pub(crate) mod test {
             f.seek(SeekFrom::Start(boundary + 20)).expect("seek back");
             f.write_all(&byte).expect("write");
         }
-        // Force recovery by dropping the digest indexes; the position index remains and attests
-        // outputs 2/3, so the tear is (correctly) mid-log corruption, not an unacked tail.
+        // Force recovery by dropping the digest indexes (so `files_consistent` fails). Detection is
+        // index-free: output 3 decoding past the torn output 2 is corruption regardless of what any
+        // index says.
         for name in ["hash", "bhash"] {
             std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
         }
@@ -5131,26 +6100,27 @@ pub(crate) mod test {
         );
     }
 
-    /// The mmap backend ends `persist()` at an `msync` only, and the kernel may write dirty pages
-    /// back out of order, so a power loss can leave `[k good][k+1 torn][k+2 good]` in the region
-    /// past the last index sync -- an unacked tail, not committed data. Recovery must truncate it
-    /// and let the node start, not reject the pack because a record still decodes after the tear.
-    /// (Before the fix, `tail_is_torn` saw the decodable `k+2` and returned `CorruptPack`, bricking
-    /// startup on the normal mmap power-loss shape.) The mid-log-corruption test above is the
-    /// mirror image: it keeps the position index, which attests outputs 2/3 as committed, so the
-    /// same byte-level damage is (correctly) fatal there.
+    /// Index-free corruption detection (the #5 regression). `persist()` acks the DATA (msync)
+    /// without syncing indexes, so after a crash the indexes are stale; the old
+    /// `attested_end`-from-indexes watermark then collapsed and *silently truncated* committed
+    /// outputs. Here output 2 is damaged at rest but output 3 — a complete LATER output — still
+    /// decodes past the tear. With EVERY index deleted (the post-crash state and proof no index is
+    /// consulted), `output_after_tear` sees output 3's header: an output written past the tear
+    /// implies output 2 was durably committed first, so this is corruption of committed data and
+    /// recovery must reject it, not drop outputs 2-3.
     #[tokio::test]
-    async fn test_recover_truncates_unacked_torn_tail_with_later_good_record() {
+    async fn test_recover_corruption_before_a_later_output_is_index_free() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-        let temp_dir = TempDir::with_prefix("test_recover_unacked_tail").expect("temp dir");
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_index_free_corrupt").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
         build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
 
-        // End of output 1 is the last consistent point once output 2 is torn.
+        // End of output 1 is where a naive replay stops once output 2 is torn.
         let output1_end = {
             let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
             pack.consensus_output_end(1).await.expect("output 1 end")
@@ -5161,7 +6131,7 @@ pub(crate) mod test {
         assert!(full_len > output1_end, "outputs 2 and 3 must extend past output 1");
 
         // Corrupt a byte inside output 2's header payload (past the 4-byte size prefix, so the
-        // framing stays intact and output 3 still decodes AFTER the damage).
+        // framing stays intact and output 3 — a complete later output — still decodes AFTER it).
         {
             let mut f =
                 OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
@@ -5172,44 +6142,120 @@ pub(crate) mod test {
             f.seek(SeekFrom::Start(output1_end + 20)).expect("seek back");
             f.write_all(&byte).expect("write");
         }
-        // Reset every index so recovery runs with no attested watermark past output 1 -- the
-        // on-disk state a real crash leaves, since indexes sync on a clean close, not on
-        // `persist()`. With nothing attesting outputs 2/3, the torn region is an unacked tail.
+        // Delete EVERY index (the post-crash state, and proof the detection needs no index at all).
         for name in ["hash", "bhash", "idx"] {
             std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
         }
 
-        // Recovery must accept the pack (truncate the torn tail) rather than brick startup.
+        // A later complete output decodes past the tear → committed data was damaged → reject.
+        let result =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "corruption before a later committed output must be rejected, got {result:?}"
+        );
+        // A rejected recovery mutates nothing, so the data log is untouched.
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            full_len,
+            "a rejected recovery must not truncate the data log"
+        );
+    }
+
+    /// Build `n` outputs and `persist()` (which stamps the tail commit marker) via the `Inner`,
+    /// then leak it so no clean close runs — an unclean data file with the marker intact on
+    /// disk. Returns the end offset of output `n-1` (the last complete boundary once output
+    /// `n`'s header is torn).
+    fn build_unclean_pack_with_marker(
+        temp_dir: &TempDir,
+        committee: &Committee,
+        chain: &Arc<RethChainSpec>,
+        previous_epoch: &EpochRecord,
+        n: u64,
+    ) -> u64 {
+        let mut inner =
+            Inner::open_append(temp_dir.path(), previous_epoch, committee.clone(), PACK_VERSION)
+                .expect("open_append inner");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..n {
+            let output =
+                make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            inner.save_consensus_output(&output).expect("save output");
+        }
+        inner.persist().expect("persist stamps the marker");
+        let prev_end = inner.output_end_for_consensus(n - 1).expect("boundary");
+        std::mem::forget(inner); // unclean exit: skip the clean close so the marker survives
+        prev_end
+    }
+
+    /// Flip one byte at `pos` in the file at `path` (corruption at rest).
+    fn corrupt_byte_at(path: &std::path::Path, pos: u64) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut f = OpenOptions::new().read(true).write(true).open(path).expect("open data");
+        f.seek(SeekFrom::Start(pos)).expect("seek");
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).expect("read");
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(pos)).expect("seek back");
+        f.write_all(&byte).expect("write");
+    }
+
+    /// The tail commit marker closes the residual the structural probe cannot see: at-rest
+    /// corruption of the LAST committed output with nothing decodable after it. The marker records
+    /// the durable acked end, so a WAL replay that stops below it means committed data was damaged.
+    #[tokio::test]
+    async fn test_recover_last_output_corruption_caught_by_commit_marker() {
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_marker_last_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Unclean pack; the marker records committed_end == output 3's end.
+        let output2_end =
+            build_unclean_pack_with_marker(&temp_dir, &committee, &chain, &previous_epoch, 3);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Corrupt output 3's header (past its 4-byte size prefix): replay stops at output 2 and no
+        // complete output decodes after, so only the marker can flag it.
+        corrupt_byte_at(&data_path, output2_end + 20);
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee);
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "the commit marker must catch at-rest corruption of the last output, got {result:?}"
+        );
+    }
+
+    /// Fail-safe degrade: with the marker cleared (a power loss that lost the best-effort write),
+    /// the same last-output corruption is indistinguishable from an unacked torn tail, so
+    /// recovery truncates it rather than raising a false error (the pre-marker / probe-only
+    /// behavior).
+    #[tokio::test]
+    async fn test_recover_last_output_corruption_without_marker_truncates() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let temp_dir = TempDir::with_prefix("test_marker_last_nomark").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let output2_end =
+            build_unclean_pack_with_marker(&temp_dir, &committee, &chain, &previous_epoch, 3);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        corrupt_byte_at(&data_path, output2_end + 20);
+        // Clear the marker (zero the last 16 bytes of the padded, unclean file).
         {
-            let pack = ConsensusPack::open_append(
-                temp_dir.path(),
-                previous_epoch.clone(),
-                committee.clone(),
-            )
-            .expect("unacked torn tail must recover, not brick startup");
-            pack.persist().await.expect("persist after recovery");
+            let mut f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open");
+            f.seek(SeekFrom::End(-16)).expect("seek end");
+            f.write_all(&[0u8; 16]).expect("clear marker");
         }
 
-        // The log is truncated back to the end of output 1; outputs 2 and 3 are dropped.
-        // Recovery truncates the logical data to output 1's end; the clean close then re-appends
-        // the 8-byte sentinel, so the physical file is `output1_end + SENTINEL_LEN`.
-        let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
-        assert_eq!(
-            recovered_len,
-            output1_end + crate::archive::data_file::SENTINEL_LEN,
-            "recovery must truncate the torn tail back to the last complete output before the tear"
-        );
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
-            .expect("recovered pack must open read-only and pass files_consistent");
-        assert_eq!(
-            pack.get_consensus_output(1).await.expect("output 1 survives").number(),
-            1,
-            "the last complete output before the tear must read back"
-        );
-        assert!(
-            pack.get_consensus_output(2).await.is_err(),
-            "the torn output 2 (and everything after) must be gone"
-        );
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee)
+            .expect("without the marker, recovery truncates the torn last output");
+        assert!(pack.get_consensus_output(2).await.is_ok(), "output 2 survives");
+        assert!(pack.get_consensus_output(3).await.is_err(), "torn output 3 truncated");
     }
 
     /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with
@@ -5368,6 +6414,97 @@ pub(crate) mod test {
         assert_eq!(c.kind, CorruptionKind::CorruptMetaWithData);
         assert!(!c.kind.is_truncatable(), "corrupt meta with data behind it is not truncatable");
         assert!(c.decodable_after);
+    }
+
+    /// A CRC failure in the FINAL record of a cleanly-SEALED pack is at-rest corruption (bit rot),
+    /// not a truncatable tail — the clean-close sentinel proves the log was complete. `db validate`
+    /// must classify it `CorruptSealedRecord` (data loss), NOT `TornTrailingTail` ("SAFE").
+    #[tokio::test]
+    async fn test_classify_physical_corruption_corrupt_sealed_record() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Flip a payload byte of the LAST record (past its size prefix, before its CRC): the record
+        // framing and the clean-close sentinel stay intact, so the pack is still SEALED and nothing
+        // decodes after the damage.
+        corrupt_byte_at(&data_path, output3_end - 8);
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::CorruptSealedRecord);
+        assert!(!c.kind.is_truncatable(), "a corrupt record in a sealed pack is not truncatable");
+        assert!(!c.decodable_after, "nothing decodes after the last record");
+    }
+
+    /// `db repair --force` (and its dry run) must NOT truncate a sealed pack's bit-rotted committed
+    /// output — it reports `Unrepairable` and leaves the data untouched.
+    #[tokio::test]
+    async fn test_repair_epoch_sealed_corrupt_record_is_unrepairable() {
+        let temp_dir = TempDir::with_prefix("test_repair_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+        corrupt_byte_at(&data_path, output3_end - 8);
+
+        for apply in [false, true] {
+            let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect("repair must not err");
+            assert!(
+                matches!(outcome, EpochRepair::Unrepairable(_)),
+                "sealed bit-rot must be Unrepairable (apply={apply}), got {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::metadata(&data_path).expect("metadata").len(),
+                full_len,
+                "an unrepairable pack must not be truncated (apply={apply})"
+            );
+        }
+    }
+
+    /// The recovery authority itself refuses a sealed pack's corrupt record (guard, not just the
+    /// CLI messaging): with the digest indexes deleted `files_consistent` fails and
+    /// `recover_pack` replays the WAL, where the sealed-log guard errors instead of truncating.
+    #[tokio::test]
+    async fn test_recover_pack_refuses_sealed_corrupt_record() {
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_sealed_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output3_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(3).await.expect("output 3 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        corrupt_byte_at(&data_path, output3_end - 8);
+        // Delete the digest indexes so `files_consistent` fails and `recover_pack` replays the WAL.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
+        }
+        let result = ConsensusPack::open_append_exists(temp_dir.path(), 0);
+        assert!(
+            matches!(result, Err(PackError::CorruptPack(_))),
+            "recover_pack must refuse a sealed pack's corrupt record, got {result:?}"
+        );
     }
 
     /// A pack whose first record is torn (a crash mid meta append left only part of the size
@@ -5607,7 +6744,7 @@ pub(crate) mod test {
             pack.persist().await.expect("persist");
         }
 
-        // Reconstruct the exact on-disk state a crash-before-meta leaves: the 32-byte header
+        // Reconstruct the exact on-disk state a crash-before-meta leaves: the 28-byte header
         // followed by zero padding (the grown mmap capacity), with no clean-close sentinel and no
         // meta record. Keeping only the header discards the meta the seed pack wrote.
         let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
@@ -5971,6 +7108,65 @@ pub(crate) mod test {
         assert_eq!(output.number(), 1, "static read must return the recovered output");
     }
 
+    /// The header-only recovery must also handle a *padded* header-only file: a crash right after
+    /// pack creation can leave the data file grown to its mmap capacity (zero-padded past the
+    /// 28-byte header) with no clean-close sentinel -- unlike the exactly-header-sized file the
+    /// sibling test uses. `open_append` must roll the logical end back to the header (via
+    /// `rewind_to`) and append the meta, rather than mistake the padding for a torn record. This is
+    /// the only test that reaches the `pack_len > DATA_HEADER_BYTES` trim in the header-only
+    /// branch.
+    #[tokio::test]
+    async fn test_open_append_recovers_padded_header_only_file() {
+        let temp_dir = TempDir::with_prefix("test_cp_padded_header_only").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Write the data header, then LEAK the pack (skip the clean-close Drop) so the file keeps
+        // its mmap capacity padding and gets no sentinel -- the on-disk shape of a crash between
+        // the header write and the first (meta) append.
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&base_dir).expect("create epoch dir");
+        let data_path = base_dir.join(Inner::DATA_NAME);
+        {
+            let mut raw: Pack<PackRecord> =
+                Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("raw pack");
+            raw.commit().expect("commit header");
+            std::mem::forget(raw); // no clean close: no truncate, no sentinel
+        }
+        let padded_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            padded_len > DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN,
+            "setup must leave a padded, unsentineled header-only file (got {padded_len} bytes)"
+        );
+
+        // open_append must reach the header-only branch, roll the padding back, and append the
+        // meta.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("padded header-only file must recover");
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist");
+        }
+
+        // Reopen read-only: the meta + output are durable and consistent.
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after recovery");
+        assert_eq!(
+            pack.get_consensus_output(1).await.expect("recovered output").number(),
+            1,
+            "static read must return the recovered output",
+        );
+    }
+
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
     /// (governance `burn` / slash-to-zero) produces. The committee check is set-based
     /// (`BTreeSet`), so the stored order of `next_committee` must not matter — only shrinking
@@ -6181,6 +7377,183 @@ pub(crate) mod test {
         );
     }
 
+    /// Finding #6: a decoded consensus header whose sub-dag has no headers (hence no leader) must
+    /// be rejected at the decode chokepoint, not turned into an output that panics the moment
+    /// any `leader()`-derived accessor is touched. `bytes_to_output` is the per-output decode
+    /// path used to serve/receive a single output (`request_consensus_output`). Without the
+    /// guard this returns `Ok` with a leaderless output that later panics; with it the decode
+    /// fails cleanly.
+    #[tokio::test]
+    async fn test_bytes_to_output_rejects_empty_subdag() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_empty_subdag").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // A well-framed header carrying an empty sub-dag: decodable, but leaderless.
+        let header = ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![]),
+            number: 1,
+            extra: Default::default(),
+        };
+        assert!(header.sub_dag.is_empty(), "the crafted sub-dag must be empty");
+
+        let path = temp_dir.path().join("empty_subdag");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            pack.commit().expect("commit");
+        }
+        // bytes_to_output uses open_partial (no header) so feed the records past the data header.
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::EmptySubDag)),
+            "an empty sub-dag must be rejected as EmptySubDag, got {res:?}"
+        );
+    }
+
+    /// Finding #6: the same empty sub-dag arriving over an epoch-sync stream must not panic the
+    /// (critical) import task. `stream_import` decodes each output through the same chokepoint, so
+    /// a hostile empty sub-dag is rejected with `EmptySubDag` before `save_consensus_output`
+    /// calls `leader_epoch()`. The output's parent link is the expected genesis parent, so
+    /// without the guard the import reaches `leader_epoch()` and this test panics instead of
+    /// erroring.
+    #[tokio::test]
+    async fn test_stream_import_rejects_empty_subdag() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_import_empty_subdag").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append meta");
+            pack.append(&PackRecord::Consensus(Box::new(ConsensusHeader {
+                parent_hash: previous_epoch.final_consensus.hash,
+                sub_dag: CommittedSubDag::new_with_headers_for_test(vec![]),
+                number: 1,
+                extra: Default::default(),
+            })))
+            .expect("append empty-sub-dag output");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_import_empty_subdag_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an empty sub-dag must be rejected, not imported");
+        assert!(matches!(err, PackError::EmptySubDag), "got {err:?}");
+    }
+
+    /// Finding #10: a streamed import builds a fresh pack strictly in order, so a header whose
+    /// number does not advance must be rejected — not accepted-and-ignored. Here two outputs
+    /// share number 1 with a valid parent link, so only the number is wrong. Without the
+    /// advancement check the second is a silent no-op (`save_consensus_output`'s idempotent
+    /// `idx < len` path) and an endless such chain pins the import forever; with it, the second
+    /// output is `InvalidConsensusNumber` (a Severe peer penalty), so this returns `Err`
+    /// instead of `Ok`.
+    #[tokio::test]
+    async fn test_stream_import_rejects_non_advancing_number() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_non_advancing").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Two batch-less outputs (a leader header, no payload) that both claim number 1. The
+        // second's parent link is the first's digest, so the parent-chain check passes and
+        // ONLY the number is wrong.
+        let leader_header = Certificate::default().header().clone();
+        let header1 = ConsensusHeader {
+            parent_hash: previous_epoch.final_consensus.hash,
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![leader_header.clone()]),
+            number: 1,
+            extra: Default::default(),
+        };
+        let header2 = ConsensusHeader {
+            parent_hash: header1.digest(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(vec![leader_header]),
+            number: 1,
+            extra: Default::default(),
+        };
+
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.clone(),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append meta");
+            pack.append(&PackRecord::Consensus(Box::new(header1))).expect("append output 1");
+            pack.append(&PackRecord::Consensus(Box::new(header2))).expect("append repeat output");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_non_advancing_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a non-advancing consensus number must be rejected, not accepted-and-ignored");
+        assert!(matches!(err, PackError::InvalidConsensusNumber(2, 1)), "got {err:?}");
+    }
+
     /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
     /// from a seeded rng and BLS signing is deterministic, so the fixture bytes are stable
     /// across runs.
@@ -6284,17 +7657,17 @@ pub(crate) mod test {
     /// Epoch of the frozen pre-fork pack: 406.
     ///
     /// One epoch below `CONSENSUS_REGISTRY_FORK_EPOCH` (407), the documented arming floor of the
-    /// multi-workers fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
+    /// multi-workers fork (issue #554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
     /// pins — so the frozen committee vector there and the frozen pack file here describe one wire
     /// moment from opposite ends of the stack.
     ///
-    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
-    /// 407: the gate is `>=`, so 407 would become post-fork and the anti-vacuity assert in
-    /// `test_golden_legacy_pack_regenerates` would fail. 406 is structurally pre-fork under every
-    /// legal arming, so the embedded [`Committee`] encodes in the legacy single-worker layout
-    /// whichever epoch the arming PR picks. It is still at or above `SEED_SIGNATURE_FORK_EPOCH`
-    /// (383), so the nested headers carry `seed_signature`: exactly the shape of an epoch pack
-    /// sitting on an adiri node's disk today.
+    /// One below the floor rather than the floor itself, because the floor is itself a legal fork
+    /// epoch: the gate is `>=`, so a fork epoch of 407 would make 407 post-fork and fail the
+    /// anti-vacuity assert in `test_golden_legacy_pack_regenerates`. The adiri fork epoch is 570
+    /// (floored at 407), so epoch 406 here is pre-fork, and it stays pre-fork under any fork epoch
+    /// the floor allows: the embedded [`Committee`] encodes in the legacy single-worker layout. It
+    /// is still at or above `SEED_SIGNATURE_FORK_EPOCH` (383), so the nested headers carry
+    /// `seed_signature`: exactly the shape of an epoch pack sitting on an adiri node's disk today.
     const LEGACY_PACK_EPOCH: Epoch = 406;
 
     /// Final consensus number of the epoch before [`LEGACY_PACK_EPOCH`].
@@ -6537,19 +7910,23 @@ pub(crate) mod test {
         outputs
     }
 
-    /// Write the fixture pack through the normal write path (`open_append` +
-    /// `save_consensus_output`) into `dir` and return the resulting `data` file bytes.
+    /// Write the fixture pack through the normal write path (`save_consensus_output`) into `dir`,
+    /// pinned to the pre-fork data-file version, and return the resulting `data` file bytes.
     ///
     /// On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated encoder emits the legacy committee
     /// layout, which `tn_types`' differentials prove is byte-identical to the pre-#554 derive. A
     /// pack this writes at that epoch therefore IS a pre-fork pack, byte for byte — which is what
-    /// makes freezing its output a fixture of history rather than of this build.
+    /// makes freezing its output a fixture of history rather than of this build. The version is
+    /// pinned to v1 explicitly: `open_append` now stamps the current `PACK_VERSION` (v2, which adds
+    /// the clean-close sentinel) into fresh files, so regenerating through the version-pinning door
+    /// keeps the fixture a faithful pre-sentinel artifact.
     #[cfg(feature = "adiri")]
     async fn write_legacy_pack(dir: &std::path::Path) -> Vec<u8> {
         let committee = legacy_pack_committee();
         let previous_epoch = legacy_pack_previous_epoch(&committee);
-        let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
-            .expect("open fixture pack for append");
+        let pack =
+            ConsensusPack::open_append_version(dir, previous_epoch.clone(), committee.clone(), 1)
+                .expect("open fixture pack for append");
         for output in legacy_pack_outputs(&committee, &previous_epoch) {
             pack.save_consensus_output(output).await.expect("save fixture output");
         }
@@ -6662,8 +8039,9 @@ pub(crate) mod test {
     /// meant to hold still.
     ///
     /// Also the anti-vacuity check for the whole group: it asserts the two gates that decide the
-    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or the fork
-    /// being armed) fails here with a diagnosis instead of downstream as an unexplained byte diff.
+    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or a fork epoch
+    /// moved below its 407 floor) fails here with a diagnosis instead of downstream as an
+    /// unexplained byte diff.
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_golden_legacy_pack_regenerates() {
@@ -6672,8 +8050,8 @@ pub(crate) mod test {
         assert!(
             !forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
             "epoch {LEGACY_PACK_EPOCH} must be PRE-fork for the frozen pack to be a legacy-layout \
-             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
-             armed?"
+             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork epoch \
+             been moved below its 407 floor?"
         );
         assert!(
             forks::seed_signature_active(LEGACY_PACK_EPOCH),
@@ -6725,7 +8103,10 @@ pub(crate) mod test {
         {
             let pack = ConsensusPack::open_append_exists(bare.path(), LEGACY_PACK_EPOCH)
                 .expect("warm restart against a bare frozen pre-fork data file");
-            assert_eq!(pack.version, PACK_VERSION, "frozen pack version moved");
+            // The frozen fixture is a v1 (pre-sentinel) pack and must stay one. `PACK_VERSION` has
+            // since advanced to v2 for newly written packs, so pin the literal pre-fork version
+            // here rather than comparing against the moving current version.
+            assert_eq!(pack.version, 1, "frozen pack version moved");
             assert!(!pack.is_static(), "a warm-restart handle is writable");
             assert_legacy_pack_committee(&pack);
             pack.persist().await.expect("persist");

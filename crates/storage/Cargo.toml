@@ -29,7 +29,7 @@ serde = { workspace = true }
 # round-trip alloy's serde types (skip_serializing_if / quantity attributes).
 alloy-rlp = { workspace = true }
 zstd = "0.13.3"
-# mmap-backed data file backend (see archive/data_file_mmap.rs).
+# mmap-backed data file backend (see archive/data_file.rs).
 memmap2 = { workspace = true }
 
 # redb backend

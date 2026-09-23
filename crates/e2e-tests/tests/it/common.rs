@@ -26,6 +26,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fmt::Debug,
+    io::{Read, Write},
+    net::TcpStream,
     ops::RangeInclusive,
     path::Path,
     process::{Child, ExitStatus},
@@ -567,12 +569,21 @@ pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> 
 
 /// Retrieve a node's current consensus participation mode ([`NodeMode`]) over RPC.
 ///
-/// Reads the live mode (via `tn_nodeMode`), so repeated calls can observe transient modes such as
-/// [`NodeMode::CvvInactive`] while a restarted node catches up. A node whose RPC is not yet up
-/// (e.g. mid-restart) surfaces as an `Err` here rather than panicking; `call_rpc`'s own retries
-/// absorb brief unavailability.
+/// Reads the live mode via `tn_nodeMode`. A node whose RPC is not yet up returns an error
+/// immediately, leaving retry timing to the caller's bounded wait. A current-mode query cannot
+/// establish whether a transient mode occurred between calls.
 pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
-    call_rpc(node, "tn_nodeMode", rpc_params![], 10, "tn_nodeMode")
+    call_rpc(node, "tn_nodeMode", rpc_params![], 0, "tn_nodeMode")
+}
+
+/// Scrape the metrics endpoint with a raw HTTP GET (no client dependencies).
+pub(crate) fn scrape_metrics(addr: &str) -> eyre::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 /// Query a node's highest consensus chain block height.
@@ -786,6 +797,7 @@ pub(crate) fn create_genesis_for_test(
         accounts,
         committee,
         epoch_duration,
+        None,
     )?;
 
     // copy genesis for the extra validator
@@ -809,6 +821,12 @@ pub(crate) fn create_genesis_for_test(
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
+///
+/// `chain_id` overrides the genesis ceremony's default chain id (`911329`). Only the
+/// governance-Safe fork lane needs it: an `adiri` binary refuses to boot any chain whose id is
+/// not `2017` (`telcoin-network-cli::node`), and the default binary refuses one whose id IS
+/// `2017`, so the two e2e binaries need different ids and neither can be left implicit on the
+/// adiri lane. Pass `None` everywhere else to keep the ceremony default.
 pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
@@ -817,6 +835,7 @@ pub(crate) fn config_committee(
     accounts: Vec<(Address, GenesisAccount)>,
     validators: &Vec<(&str, Address)>,
     epoch_duration: u64,
+    chain_id: Option<u64>,
 ) -> eyre::Result<Genesis> {
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
@@ -838,29 +857,34 @@ pub(crate) fn config_committee(
     info!(target: "epoch-test", "creating committee!");
 
     // create committee from shared genesis dir
-    let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
-        "tn",
-        "--basefee-address",
-        "0x9999999999999999999999999999999999999999",
-        "--consensus-registry-owner",
-        &consensus_registry_owner.to_string(),
-        "--initial-stake-per-validator",
-        INITIAL_STAKE_AMOUNT,
-        "--min-withdraw-amount",
-        min_withdrawal,
-        "--epoch-block-rewards",
-        epoch_rewards,
-        "--epoch-duration-in-secs",
-        &epoch_duration.to_string(),
-        "--dev-funded-account",
-        "test-source",
-        "--max-header-delay-ms",
-        "500",
-        "--min-header-delay-ms",
-        "250",
-        "--max-batch-delay-ms",
-        "250",
-    ]);
+    let mut genesis_args: Vec<String> = vec![
+        "tn".into(),
+        "--basefee-address".into(),
+        "0x9999999999999999999999999999999999999999".into(),
+        "--consensus-registry-owner".into(),
+        consensus_registry_owner.to_string(),
+        "--initial-stake-per-validator".into(),
+        INITIAL_STAKE_AMOUNT.into(),
+        "--min-withdraw-amount".into(),
+        min_withdrawal.into(),
+        "--epoch-block-rewards".into(),
+        epoch_rewards.into(),
+        "--epoch-duration-in-secs".into(),
+        epoch_duration.to_string(),
+        "--dev-funded-account".into(),
+        "test-source".into(),
+        "--max-header-delay-ms".into(),
+        "500".into(),
+        "--min-header-delay-ms".into(),
+        "250".into(),
+        "--max-batch-delay-ms".into(),
+        "250".into(),
+    ];
+    if let Some(chain_id) = chain_id {
+        genesis_args.push("--chain-id".into());
+        genesis_args.push(chain_id.to_string());
+    }
+    let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
 
     // update genesis with funded accounts

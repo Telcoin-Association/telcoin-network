@@ -34,16 +34,13 @@
 //!   visiting values in key order.
 //!
 //! ## Fairness caveats (printed with the results)
-//! - A pack barrier msyncs only the data log — the index is rebuildable from it, so it is not
-//!   synced on the barrier — vs MDBX's single-env commit.
-//! - The digest pack gives O(1) point KV but **no ordered scan**; the btree pack adds ordered scan
-//!   (the sorted table) at some point-lookup cost. Neither pack has cross-key atomic transactions —
-//!   a feature MDBX has that a replacement would need to add. Values use `PackCompression::None`.
-//! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; the packs use `msync`.
-//! - Unlike the raw `pack-*` columns (which msync only the WAL, rebuilding the index on recovery),
-//!   `tndb` is a full typed `Database`: its `commit` durably syncs **both** the value log and the
-//!   B+tree index, and its values carry an extra `encode` (bcs) layer — so `tndb` measures the
-//!   higher-level store, not just the raw pack.
+//! - A pack durable barrier msyncs **one file** (the data log); the hash digest index is
+//!   WAL-derived and is not synced per barrier, exactly like `ConsensusPack::persist`. MDBX does a
+//!   single-env commit.
+//! - Pack gives O(1) point KV but **no ordered range scan / cursor** and no cross-key atomic
+//!   transaction — features MDBX has that a replacement would need to add. This bench measures only
+//!   the point-KV subset. Values use `PackCompression::None`.
+//! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; `pack` uses `msync`.
 
 use std::{
     hash::BuildHasherDefault,
@@ -398,11 +395,13 @@ struct MdbxKv {
 #[cfg(feature = "reth-libmdbx")]
 impl MdbxKv {
     fn open(dir: &Path, durable: bool) -> Self {
-        // Select the env sync mode (test builds default to SafeNoSync). Read by
-        // `MdbxDatabase::open`. Safe here: the bench runs single-threaded (`--test-threads
-        // 1`).
+        // Select the env sync mode (test builds default to SafeNoSync), read by
+        // `MdbxDatabase::open`. Set it only around the open and clear it immediately after
+        // (the value is consumed at open time), so the override never leaks into the rest
+        // of the process rather than relying on `--test-threads 1` for isolation.
         std::env::set_var("TN_TEST_MDBX_SYNC", if durable { "durable" } else { "safe-no-sync" });
         let db = MdbxDatabase::open(dir, 4, 512 * MEGABYTE, 8 * MEGABYTE).expect("open mdbx");
+        std::env::remove_var("TN_TEST_MDBX_SYNC");
         db.open_table::<KvTable>().expect("open table");
         Self { db }
     }
