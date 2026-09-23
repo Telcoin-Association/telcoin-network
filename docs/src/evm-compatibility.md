@@ -120,17 +120,17 @@ TN repurposes several Ethereum block header fields to carry consensus-layer meta
 | -------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
 | `nonce`                    | PoW mining nonce             | Epoch and consensus round, packed as `(epoch << 32) \| round`                              |
 | `difficulty`               | Network difficulty           | Worker ID and batch index, packed as `(batch_index << 16) \| worker_id`                    |
-| `mix_hash`                 | PoW mix digest               | Fork-gated (see [Deriving the `mix_hash` field](#deriving-the-mix_hash-field)): before the PREVRANDAO fork epoch, consensus output digest XOR'd with batch digest (just the output digest if no batches); from it, `keccak256("TN_PREVRANDAO_V1" \|\| epoch seed chain value as of this commit \|\| consensus block number \|\| batch index)`, the latter two little-endian `u64` |
+| `mix_hash`                 | PoW mix digest               | Fork-gated (see [Deriving the `mix_hash` field](#deriving-the-mix_hash-field)): on adiri before epoch 574, consensus output digest XOR'd with batch digest (just the output digest if no batches); from adiri epoch 574, and on mainnet from genesis, `keccak256("TN_PREVRANDAO_V1" \|\| epoch seed chain value as of this commit \|\| consensus block number \|\| batch index)`, the latter two little-endian `u64` |
 | `ommers_hash`              | Uncle block hash             | Digest of the consensus `Batch` executed to produce this block. `B256::ZERO` if no batches |
 | `parent_beacon_block_root` | Beacon chain parent root     | Digest of the `ConsensusHeader` that committed the transactions                            |
 | `extra_data`               | Arbitrary miner data         | Committee-shuffle seed (the epoch seed chain value as of the closing commit) at epoch boundaries, empty bytes otherwise |
 | `base_fee_per_gas`         | Adjusts per block (EIP-1559) | Fixed for the entire epoch, adjusts at epoch boundaries. See [basefees](basefees.md)       |
 | `withdrawals`              | Beacon chain withdrawals     | Validator reward records at epoch boundaries, empty otherwise                              |
 
-The `mix_hash` derivation changed at a hard fork. Blocks from epochs before the PREVRANDAO fork epoch use
-the legacy `output_digest ^ batch_digest` form; blocks from that epoch onward use the seed-chain
-derivation. Indexers that reproduce `mix_hash` from consensus data must branch on the block's epoch (the
-upper 32 bits of `nonce`).
+The `mix_hash` derivation changed at the PREVRANDAO fork: adiri epoch 574, mainnet from genesis.
+On adiri, blocks from epochs before 574 use the legacy `output_digest ^ batch_digest` form, and blocks from epoch 574 onward use the seed-chain derivation.
+Mainnet builds use the seed-chain derivation at every epoch.
+Indexers that reproduce adiri `mix_hash` values from consensus data must branch on the block's epoch (the upper 32 bits of `nonce`).
 
 The seed chain value in that hash is the block's own commit-level value, and the chain advances at every
 commit. It matches the `extra_data` of the epoch's closing block only for that closing block itself; mid-epoch
@@ -176,26 +176,24 @@ nonce = (epoch << 32) | round
 
 #### Deriving the `mix_hash` Field
 
-`mix_hash` (exposed to contracts as `PREVRANDAO`, EIP-4399) is fork-gated on the epoch of
-the committing leader, which is recoverable from the upper 32 bits of the block's `nonce`:
+`mix_hash` (exposed to contracts as `PREVRANDAO`, EIP-4399) is fork-gated on the epoch of the committing leader, which is recoverable from the upper 32 bits of the block's `nonce`.
+The PREVRANDAO fork is adiri epoch 574 (`PREVRANDAO_FORK_EPOCH` in `tn-types` `forks.rs`, compiled only into adiri builds); mainnet builds use the post-fork derivation from genesis.
 
-* **Before the PREVRANDAO fork epoch** (`PREVRANDAO_FORK_EPOCH` in `tn-types` `forks.rs`):
-  the consensus output digest XOR'd with the batch digest; just the output digest when the
-  output carried no batches (the epoch-closing block).
-* **From the fork epoch on**:
+* **Before the fork** (adiri epochs below 574):
+  the consensus output digest XOR'd with the batch digest; just the output digest when the output carried no batches (the epoch-closing block).
+  Both inputs are on the block header, so this equals `parent_beacon_block_root ^ ommers_hash`.
+* **From the fork on** (adiri epoch 574 onward, every mainnet epoch):
 
   ```
   mix_hash = keccak256("TN_PREVRANDAO_V1" || seed || consensus_block_number || batch_index)
   ```
 
   where `seed` is the 32-byte epoch seed chain value as of the committing consensus output.
-  The chain folds one seed signature per commit, so the value advances every commit; the
-  closing commit's value is the one published as `extra_data` on the epoch's closing block.
-  The two integers are little-endian u64s. The fork activates only once the seed-signature
-  fork is also active (the gate is a fail-closed conjunction of the two).
+  The chain folds one seed signature per commit, so the value advances every commit; the closing commit's value is the one published as `extra_data` on the epoch's closing block.
+  The two integers are little-endian u64s.
+  The gate also requires the seed-signature fork (adiri epoch 383), so it never hashes the legacy leader-aggregate seed that pre-383 epochs carry; on adiri that fork is already active by epoch 574.
 
-Indexers reproducing `mix_hash` from consensus data must branch on the block's epoch, not
-on node version or wall-clock time.
+On adiri, indexers reproducing `mix_hash` from consensus data must branch on the block's epoch, not on node version or wall-clock time.
 
 Note on bias: the seeded derivation removes payload grinding (every input is pinned by the
 committed order, so the leader cannot generate candidate values by re-cutting its

@@ -461,8 +461,8 @@ mod tests {
     /// is rejected while generating genesis instead of panicking the first time epoch 0's
     /// `EpochMeta` is encoded. A single worker still validates.
     ///
-    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
-    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// Adiri arms the fork at epoch 570, and its arming constraint floors it at 407, so epoch 0 is
+    /// pre-fork in this lane however the schedule moves.
     /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]

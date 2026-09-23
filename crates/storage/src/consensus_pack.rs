@@ -7657,17 +7657,17 @@ pub(crate) mod test {
     /// Epoch of the frozen pre-fork pack: 406.
     ///
     /// One epoch below `CONSENSUS_REGISTRY_FORK_EPOCH` (407), the documented arming floor of the
-    /// multi-workers fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
+    /// multi-workers fork (issue #554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
     /// pins — so the frozen committee vector there and the frozen pack file here describe one wire
     /// moment from opposite ends of the stack.
     ///
-    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
-    /// 407: the gate is `>=`, so 407 would become post-fork and the anti-vacuity assert in
-    /// `test_golden_legacy_pack_regenerates` would fail. 406 is structurally pre-fork under every
-    /// legal arming, so the embedded [`Committee`] encodes in the legacy single-worker layout
-    /// whichever epoch the arming PR picks. It is still at or above `SEED_SIGNATURE_FORK_EPOCH`
-    /// (383), so the nested headers carry `seed_signature`: exactly the shape of an epoch pack
-    /// sitting on an adiri node's disk today.
+    /// One below the floor rather than the floor itself, because the floor is itself a legal fork
+    /// epoch: the gate is `>=`, so a fork epoch of 407 would make 407 post-fork and fail the
+    /// anti-vacuity assert in `test_golden_legacy_pack_regenerates`. The adiri fork epoch is 570
+    /// (floored at 407), so epoch 406 here is pre-fork, and it stays pre-fork under any fork epoch
+    /// the floor allows: the embedded [`Committee`] encodes in the legacy single-worker layout. It
+    /// is still at or above `SEED_SIGNATURE_FORK_EPOCH` (383), so the nested headers carry
+    /// `seed_signature`: exactly the shape of an epoch pack sitting on an adiri node's disk today.
     const LEGACY_PACK_EPOCH: Epoch = 406;
 
     /// Final consensus number of the epoch before [`LEGACY_PACK_EPOCH`].
@@ -8039,8 +8039,9 @@ pub(crate) mod test {
     /// meant to hold still.
     ///
     /// Also the anti-vacuity check for the whole group: it asserts the two gates that decide the
-    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or the fork
-    /// being armed) fails here with a diagnosis instead of downstream as an unexplained byte diff.
+    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or a fork epoch
+    /// moved below its 407 floor) fails here with a diagnosis instead of downstream as an
+    /// unexplained byte diff.
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_golden_legacy_pack_regenerates() {
@@ -8049,8 +8050,8 @@ pub(crate) mod test {
         assert!(
             !forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
             "epoch {LEGACY_PACK_EPOCH} must be PRE-fork for the frozen pack to be a legacy-layout \
-             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
-             armed?"
+             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork epoch \
+             been moved below its 407 floor?"
         );
         assert!(
             forks::seed_signature_active(LEGACY_PACK_EPOCH),
