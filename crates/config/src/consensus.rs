@@ -16,7 +16,7 @@ use tn_types::{
 };
 use tracing::{info, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
@@ -307,15 +307,6 @@ where
     /// value so EVM time does not run backwards across the epoch seam.
     pub fn prior_epoch_close(&self) -> Option<TimestampSec> {
         self.inner.prior_epoch_close
-    }
-
-    /// Overrides [`Self::prior_epoch_close`] on this handle. Test-only.
-    ///
-    /// When other handles share this config, the shared state is copied first, so handles cloned
-    /// before the call keep their current value.
-    #[cfg(feature = "test-utils")]
-    pub fn set_prior_epoch_close_for_test(&mut self, close: Option<TimestampSec>) {
-        Arc::make_mut(&mut self.inner).prior_epoch_close = close;
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -806,23 +797,6 @@ mod tests {
             EpochDigest::default(),
         )
         .expect("test config");
-        assert_eq!(config.prior_epoch_close(), None);
-    }
-
-    /// The setter overrides the value on its own handle only: a clone taken before the call keeps
-    /// the value it was built with.
-    #[cfg(feature = "test-utils")]
-    #[test]
-    fn set_prior_epoch_close_for_test_round_trips() {
-        let close: TimestampSec = 1_700_000_000;
-        let mut config = config_for_epoch(1, None);
-        let earlier = config.clone();
-
-        config.set_prior_epoch_close_for_test(Some(close));
-        assert_eq!(config.prior_epoch_close(), Some(close));
-        assert_eq!(earlier.prior_epoch_close(), None);
-
-        config.set_prior_epoch_close_for_test(None);
         assert_eq!(config.prior_epoch_close(), None);
     }
 }
