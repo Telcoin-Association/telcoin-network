@@ -1609,10 +1609,8 @@ async fn test_vote_seed_signature_uses_configured_prior_epoch_record() -> eyre::
     let store = committee.first_authority().consensus_config().node_storage().clone();
     let parents = seed_round_two_quorum(&committee, &store)?;
     let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
-        a.header_builder(&committee.committee())
-            .round(3)
+        a.header_builder_at_round(&committee.committee(), 3)
             .parents(parents.clone())
-            .created_at(2)
             .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
             .seed_signature(seed_signature)
             .build()
@@ -1650,26 +1648,18 @@ async fn test_vote_seed_signature_uses_configured_prior_epoch_record() -> eyre::
 /// Seed `store` with a full round-2 certificate quorum for `committee` and return the parent
 /// digest set a round-3 header must reference.
 ///
-/// The round-2 headers carry no batches and a fixed `created_at`, so a round-3 header built on
-/// them reaches a real vote decision with nothing to sync from a worker and no wall-clock
-/// dependence.
+/// The round-2 headers carry no batches and are built with
+/// [`AuthorityFixture::header_builder_at_round`], so a round-3 header built the same way is
+/// strictly newer than every parent and reaches a real vote decision with nothing to sync from a
+/// worker and no wall-clock dependence.
 fn seed_round_two_quorum<DB: Database + CertificateStore>(
     committee: &CommitteeFixture<DB>,
     store: &DB,
 ) -> eyre::Result<BTreeSet<HeaderDigest>> {
     let committee_obj = committee.committee();
-    let epoch = committee_obj.epoch();
     let certs: Vec<_> = committee
         .authorities()
-        .map(|a| {
-            let header = a
-                .header_builder(&committee_obj)
-                .round(2)
-                .created_at(1)
-                .seed_signature(a.seed_signature(epoch, 2))
-                .build();
-            committee.certificate(&header)
-        })
+        .map(|a| committee.certificate(&a.header_builder_at_round(&committee_obj, 2).build()))
         .collect();
     store.write_all(certs.iter())?;
     Ok(certs.iter().map(|c| c.digest()).collect())
@@ -1697,10 +1687,8 @@ async fn test_vote_rejects_seed_signature_for_wrong_round() -> eyre::Result<()> 
     let parents = seed_round_two_quorum(&committee, &store)?;
 
     let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
-        a.header_builder(&committee_obj)
-            .round(3)
+        a.header_builder_at_round(&committee_obj, 3)
             .parents(parents.clone())
-            .created_at(2)
             .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
             .seed_signature(seed_signature)
             .build()
