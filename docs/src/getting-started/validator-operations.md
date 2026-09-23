@@ -91,6 +91,7 @@ The alert levels are starting points; tune them after a week of baseline data.
 | IO pressure | `/proc/pressure/io`, `full avg60` | Above 10 | Execution is waiting on disk | Move to faster storage or raise the volume's provisioned IOPS, then check for throttling. |
 | Disk throttling | The provider's volume metrics (GCP reports throttled read and write operations and bytes per disk); `iostat -x` queue size and await | Any sustained throttling | The volume has reached its provisioned IOPS or throughput | Raise the volume limits or move to local NVMe. |
 | Batch cache occupancy | Live data in `<datadir>/consensus-db/cache` from an MDBX statistic, for example `mdbx_stat -ef` from the libmdbx tools (pages used minus free pages, times the page size), against the 1 GiB maximum. Not the file size (see below) | 768 MiB of live data | The committee's batch volume in an epoch is approaching the per-epoch ceiling | Tell the Telcoin Association network team. Hardware does not raise this limit. |
+| Batch cache full | Node log: an error from target `layered_db_runner` that starts `DB Insert` or `DB TXN Insert` and names a cache table, for example `DB Insert node_batches_cache` or `DB Insert our_node_batches_cache` followed by the MDBX error | Any occurrence | The per-epoch cache reached its 1 GiB maximum. The node keeps running but holds each new batch in memory until the epoch closes, so resident memory climbs | Alert. Expect resident memory to grow until the epoch boundary, and tell the Telcoin Association network team. No metric reports this state. |
 | Engine backlog | `tn_engine_queued_outputs`, 0 to 8 | 4 or more for 5 minutes | Execution is falling behind consensus | At 8 the engine queue is full and outputs back up into the 64-slot channel in front of it. Check CPU and IO pressure and `tn_engine_execution_duration_seconds`. |
 | Resident memory | `reth_process_resident_memory_bytes` | Above 70% of RAM | Queued outputs, RPC caches or the transaction pool are growing | Compare with the engine backlog and the RPC request rate. A climb right after a restart is replay and should fall once the node catches up. |
 
@@ -99,10 +100,11 @@ If `/proc/pressure` is missing, the running kernel lacks it or has it disabled.
 
 The batch cache is an MDBX file that never shrinks.
 Batches are removed at each epoch close, but the file keeps its size, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
-In the 2026-09 benchmark the file reached its 1 GiB maximum on every validator while each 20-minute epoch carried only about 0.5 GB of batch data, and no node failed.
+In the 2026-09 benchmark the file reached its 1 GiB maximum on every validator while each 20-minute epoch carried only about 0.5 GB of batch data, and no node logged a cache insert failure.
+Mainnet and testnet use 6-hour epochs, so the ceiling there is about 260 TPS of the benchmark mix (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
 Read live occupancy from MDBX instead.
 The release exports no metric for it.
-The committee's batch output since the epoch started, summed over all validators from `tn_worker_batch_size_bytes`, gives a rough upper estimate, because that histogram also counts failed seal attempts.
+The committee's batch output since the epoch started, summed over all validators from `tn_worker_batch_size_bytes`, gives a rough upper estimate, because that histogram records each batch when it reaches quorum, so it also counts batches that were never reported or committed.
 
 Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
 Alert on how fast it climbs during load and after restarts, not only on the level.
