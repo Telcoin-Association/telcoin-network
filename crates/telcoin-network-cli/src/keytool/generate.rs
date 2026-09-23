@@ -83,7 +83,7 @@ pub enum NodeType {
 #[derive(Debug, Clone, Args)]
 pub struct KeygenArgs {
     /// Number of workers to provision, with consecutive IDs starting at 0.
-    #[arg(long, value_name = "COUNT", global = true, default_value_t = 1, value_parser = value_parser!(u32).range(1..=u64::from(WorkerId::MAX) + 1))]
+    #[arg(long, value_name = "COUNT", global = true, default_value_t = 1, value_parser = value_parser!(u32).range(1..=i64::from(WorkerId::MAX) + 1))]
     pub workers: u32,
 
     /// Overwrite existing keys, if present.
