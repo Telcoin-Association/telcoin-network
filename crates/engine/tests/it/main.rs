@@ -1072,11 +1072,16 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update cert
     leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
+    leader_1.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
@@ -1104,6 +1109,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
@@ -1583,8 +1589,13 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
+    leader_1.update_header_created_at_for_test(timestamp);
     leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1: u64 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
@@ -1614,6 +1625,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update timestamp
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
@@ -1968,8 +1980,13 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
+    leader_1.update_header_created_at_for_test(timestamp);
     let sub_dag_index_1 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
@@ -1996,6 +2013,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // create second output
     let mut leader_2 = Certificate::default();
     // update timestamp
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
@@ -2209,6 +2227,8 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
@@ -2564,6 +2584,8 @@ async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::R
     leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
     let subdag = CommittedSubDag::new(
@@ -2759,6 +2781,8 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
@@ -2942,6 +2966,8 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3062,6 +3088,8 @@ async fn test_persist_output_failure_rolls_back_in_memory_state() -> eyre::Resul
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3200,6 +3228,8 @@ async fn test_late_persist_failure_rolls_back_in_memory_state() -> eyre::Result<
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3337,6 +3367,8 @@ async fn test_repeat_persist_after_static_file_progress_is_terminal() -> eyre::R
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3468,6 +3500,8 @@ async fn test_persist_provider_fault_retry_recovers() -> eyre::Result<()> {
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3586,6 +3620,8 @@ async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()>
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
@@ -3711,6 +3747,8 @@ async fn execute_uneven_output(
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
@@ -3864,6 +3902,8 @@ async fn test_cross_producer_repack_flagged_during_execution() -> eyre::Result<(
     leader.update_header_author_for_test(leader_id);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(1);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
     let mut batches_iter = batches.into_iter();
     let victim_batch = batches_iter.next().expect("two batches");
@@ -3978,9 +4018,13 @@ async fn test_engine_repack_monitor_flags_cross_producer_repack_through_engine()
     gas_accumulator.rewards_counter().set_committee(committee);
 
     //=== Consensus: two outputs, the second producer re-packs the first producer's transaction
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     leader_1.update_header_author_for_test(authority_1);
     leader_1.update_header_round_for_test(1);
+    leader_1.update_header_created_at_for_test(timestamp);
     let sub_dag_index_1: u64 = 1;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let subdag_1 = CommittedSubDag::new(
@@ -4004,6 +4048,7 @@ async fn test_engine_repack_monitor_flags_cross_producer_repack_through_engine()
     let mut leader_2 = Certificate::default();
     leader_2.update_header_author_for_test(authority_2);
     leader_2.update_header_round_for_test(2);
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     let sub_dag_index_2: u64 = 2;
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2 = CommittedSubDag::new(
