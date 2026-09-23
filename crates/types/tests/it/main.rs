@@ -10,5 +10,6 @@ mod header_timestamp_props;
 mod nesting_tests;
 mod randomness_tests;
 mod serde_tests;
+mod subdag_timestamp_props;
 
 fn main() {}
