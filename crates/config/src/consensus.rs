@@ -12,11 +12,11 @@ use tn_network_types::local::LocalNetwork;
 use tn_types::{
     forks::subsecond_timestamp_active, Authority, AuthorityIdentifier, BlsPublicKey, Certificate,
     Committee, Database, Epoch, EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey,
-    ShutdownNotifier, WorkerId,
+    ShutdownNotifier, TimestampSec, WorkerId,
 };
 use tracing::{info, warn};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
@@ -38,6 +38,10 @@ struct ConsensusConfigInner<DB> {
     /// Single source of truth for the canonical epoch-close seed message: proposers sign it and
     /// voters verify header seed signatures against it, so both sides must read the same value.
     prior_epoch_record: EpochDigest,
+    /// Timestamp, in seconds, of the previous epoch's closing EVM block (`None` for epoch 0).
+    ///
+    /// See [`ConsensusConfig::prior_epoch_close`].
+    prior_epoch_close: Option<TimestampSec>,
 }
 
 /// The configuration for consensus.
@@ -62,6 +66,7 @@ where
     ///
     /// This is the primary constructor that loads configuration from the filesystem,
     /// including committee membership and worker topology from YAML files.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<TND: TelcoinDirs + 'static>(
         config: Config,
         tn_datadir: &TND,
@@ -70,6 +75,7 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
         prior_epoch_record: EpochDigest,
+        prior_epoch_close: Option<TimestampSec>,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors that the shared, test-facing
         // `new_with_committee` deliberately skips so DAG test fixtures may use small `gc_depth`
@@ -90,6 +96,7 @@ where
             network_config,
             next_committee_keys,
             prior_epoch_record,
+            prior_epoch_close,
         )
     }
 
@@ -97,7 +104,7 @@ where
     ///
     /// **WARNING: This method is exposed publicly for testing ONLY.**
     /// Production code should use `new()` or `new_for_epoch()` to ensure proper configuration
-    /// loading.
+    /// loading. The config carries no [`Self::prior_epoch_close`].
     pub fn new_with_committee_for_test(
         config: Config,
         node_storage: DB,
@@ -113,6 +120,7 @@ where
             network_config,
             vec![],
             EpochDigest::default(),
+            None,
         )
     }
 
@@ -123,6 +131,7 @@ where
     /// Mirrors [`Self::new_with_committee_for_test`] but seeds a specific `prior_epoch_record`
     /// instead of [`EpochDigest::default`], so tests can exercise the epoch-close seed path with a
     /// non-default cross-epoch anchor (the value a proposer signs and a voter verifies against).
+    /// The config carries no [`Self::prior_epoch_close`].
     pub fn new_with_committee_and_prior_epoch_record_for_test(
         config: Config,
         node_storage: DB,
@@ -139,6 +148,7 @@ where
             network_config,
             vec![],
             prior_epoch_record,
+            None,
         )
     }
 
@@ -147,9 +157,13 @@ where
     /// This constructor is used during epoch transitions to initialize configuration
     /// with updated committee membership and worker topology for the new epoch.
     ///
+    /// `prior_epoch_close` is the timestamp, in seconds, of the previous epoch's closing EVM block,
+    /// or `None` for epoch 0 (see [`Self::prior_epoch_close`]).
+    ///
     /// Fails when the parameters violate their operational floors, or when `vote_timeout` is
     /// shorter than `max_header_delay` plus the network config's
     /// `max_header_time_drift_tolerance`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_epoch(
         config: Config,
         node_storage: DB,
@@ -158,6 +172,7 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
         prior_epoch_record: EpochDigest,
+        prior_epoch_close: Option<TimestampSec>,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors (see
         // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
@@ -173,6 +188,7 @@ where
             network_config,
             next_committee_keys,
             prior_epoch_record,
+            prior_epoch_close,
         )
     }
 
@@ -183,6 +199,7 @@ where
     /// - Resolving authority status within the committee
     /// - Creating genesis certificates
     /// - Initializing shutdown notification system
+    #[allow(clippy::too_many_arguments)]
     fn new_with_committee(
         config: Config,
         node_storage: DB,
@@ -191,6 +208,7 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
         prior_epoch_record: EpochDigest,
+        prior_epoch_close: Option<TimestampSec>,
     ) -> eyre::Result<Self> {
         // Reject a configuration whose consensus parameters exceed the protocol ceilings the
         // consensus-pack reader relies on, so a node can never commit an output it cannot later
@@ -233,6 +251,7 @@ where
                 network_config,
                 genesis,
                 prior_epoch_record,
+                prior_epoch_close,
             }),
             shutdown,
         })
@@ -279,6 +298,24 @@ where
     /// seed signatures against it.
     pub fn prior_epoch_record(&self) -> EpochDigest {
         self.inner.prior_epoch_record
+    }
+
+    /// Returns the timestamp, in seconds, of the previous epoch's closing EVM block.
+    ///
+    /// `None` for epoch 0, which follows genesis rather than a closed epoch. In epochs with
+    /// sub-second timestamps active, consensus floors the epoch's first commit timestamp on this
+    /// value so EVM time does not run backwards across the epoch seam.
+    pub fn prior_epoch_close(&self) -> Option<TimestampSec> {
+        self.inner.prior_epoch_close
+    }
+
+    /// Overrides [`Self::prior_epoch_close`] on this handle. Test-only.
+    ///
+    /// When other handles share this config, the shared state is copied first, so handles cloned
+    /// before the call keep their current value.
+    #[cfg(feature = "test-utils")]
+    pub fn set_prior_epoch_close_for_test(&mut self, close: Option<TimestampSec>) {
+        Arc::make_mut(&mut self.inner).prior_epoch_close = close;
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -426,10 +463,139 @@ fn validate_epoch_timing(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_epoch_timing;
-    use crate::{Parameters, SyncConfig};
+    use super::{validate_epoch_timing, ConsensusConfig};
+    use crate::{Config, KeyConfig, NetworkConfig, Parameters, SyncConfig};
+    use rand::{rngs::StdRng, SeedableRng as _};
     use std::time::Duration;
-    use tn_types::{MAINNET_PARAMETERS, TESTNET_PARAMETERS};
+    use tn_types::{
+        Address, BlsKeypair, Committee, CommitteeBuilder, DBIter, Database, DbTx, DbTxMut, Epoch,
+        EpochDigest, Table, TimestampSec, MAINNET_PARAMETERS, TESTNET_PARAMETERS,
+    };
+
+    /// Storage stand-in: building a [`ConsensusConfig`] only stores the handle, so none of these
+    /// methods is ever reached.
+    #[derive(Clone, Debug)]
+    struct NoStorage;
+
+    /// Transaction stand-in for [`NoStorage`].
+    #[derive(Debug)]
+    struct NoTx;
+
+    impl DbTx for NoTx {
+        fn get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+            unreachable!()
+        }
+    }
+
+    impl DbTxMut for NoTx {
+        fn insert<T: Table>(&mut self, _key: &T::Key, _value: &T::Value) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn remove<T: Table>(&mut self, _key: &T::Key) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn commit(self) -> eyre::Result<()> {
+            unreachable!()
+        }
+    }
+
+    impl Database for NoStorage {
+        type TX<'txn> = NoTx;
+        type TXMut<'txn> = NoTx;
+
+        fn open_table<T: Table>(&self) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
+            unreachable!()
+        }
+
+        fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+            unreachable!()
+        }
+
+        fn contains_key<T: Table>(&self, _key: &T::Key) -> eyre::Result<bool> {
+            unreachable!()
+        }
+
+        fn get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+            unreachable!()
+        }
+
+        fn insert<T: Table>(&self, _key: &T::Key, _value: &T::Value) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn remove<T: Table>(&self, _key: &T::Key) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn clear_table<T: Table>(&self) -> eyre::Result<()> {
+            unreachable!()
+        }
+
+        fn is_empty<T: Table>(&self) -> bool {
+            unreachable!()
+        }
+
+        fn iter<T: Table>(&self) -> DBIter<'_, T> {
+            unreachable!()
+        }
+
+        fn skip_to<T: Table>(&self, _key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+            unreachable!()
+        }
+
+        fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+            unreachable!()
+        }
+
+        fn record_prior_to<T: Table>(&self, _key: &T::Key) -> Option<(T::Key, T::Value)> {
+            unreachable!()
+        }
+
+        fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
+            unreachable!()
+        }
+    }
+
+    /// A two-member committee for `epoch` (the minimum a [`Committee`] accepts) and the key config
+    /// of its first member.
+    fn committee_and_keys(epoch: Epoch) -> (Committee, KeyConfig) {
+        let mut rng = StdRng::from_seed([7; 32]);
+        let own = BlsKeypair::generate(&mut rng);
+        let peer = BlsKeypair::generate(&mut rng);
+        let mut builder = CommitteeBuilder::new(epoch);
+        builder.add_authority(*own.public(), Address::ZERO);
+        builder.add_authority(*peer.public(), Address::ZERO);
+        (builder.build(), KeyConfig::new_with_testing_key(own))
+    }
+
+    /// Builds a config for `epoch` through the production [`ConsensusConfig::new_for_epoch`].
+    fn config_for_epoch(
+        epoch: Epoch,
+        prior_epoch_close: Option<TimestampSec>,
+    ) -> ConsensusConfig<NoStorage> {
+        let (committee, key_config) = committee_and_keys(epoch);
+        ConsensusConfig::new_for_epoch(
+            Config::default_for_test(),
+            NoStorage,
+            key_config,
+            committee,
+            NetworkConfig::default(),
+            vec![],
+            EpochDigest::default(),
+            prior_epoch_close,
+        )
+        .expect("default test config passes new_for_epoch validation")
+    }
 
     #[test]
     fn default_timing_passes() {
@@ -490,5 +656,59 @@ mod tests {
             validate_epoch_timing(&params, &SyncConfig::default(), 0)
                 .unwrap_or_else(|e| panic!("{name} preset must pass the vote_timeout check: {e}"));
         }
+    }
+
+    #[test]
+    fn new_for_epoch_without_prior_close_reports_none() {
+        assert_eq!(config_for_epoch(0, None).prior_epoch_close(), None);
+    }
+
+    #[test]
+    fn new_for_epoch_threads_prior_close() {
+        let close: TimestampSec = 1_700_000_000;
+        assert_eq!(config_for_epoch(1, Some(close)).prior_epoch_close(), Some(close));
+    }
+
+    /// Test-facing constructors never seed a floor; tests opt in through the test setter.
+    #[test]
+    fn test_constructors_carry_no_prior_close() {
+        let (committee, key_config) = committee_and_keys(1);
+        let config = ConsensusConfig::new_with_committee_for_test(
+            Config::default_for_test(),
+            NoStorage,
+            key_config.clone(),
+            committee.clone(),
+            NetworkConfig::default(),
+        )
+        .expect("test config");
+        assert_eq!(config.prior_epoch_close(), None);
+
+        let config = ConsensusConfig::new_with_committee_and_prior_epoch_record_for_test(
+            Config::default_for_test(),
+            NoStorage,
+            key_config,
+            committee,
+            NetworkConfig::default(),
+            EpochDigest::default(),
+        )
+        .expect("test config");
+        assert_eq!(config.prior_epoch_close(), None);
+    }
+
+    /// The setter overrides the value on its own handle only: a clone taken before the call keeps
+    /// the value it was built with.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn set_prior_epoch_close_for_test_round_trips() {
+        let close: TimestampSec = 1_700_000_000;
+        let mut config = config_for_epoch(1, None);
+        let earlier = config.clone();
+
+        config.set_prior_epoch_close_for_test(Some(close));
+        assert_eq!(config.prior_epoch_close(), Some(close));
+        assert_eq!(earlier.prior_epoch_close(), None);
+
+        config.set_prior_epoch_close_for_test(None);
+        assert_eq!(config.prior_epoch_close(), None);
     }
 }

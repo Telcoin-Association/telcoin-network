@@ -123,9 +123,10 @@ where
     /// The single atomic `epoch_state_at_epoch_start` read yields the committee, the `EpochInfo`,
     /// the epoch-start timestamp, and the pin header (the previous epoch's closing block; genesis
     /// for epoch 0), returned together so the caller (`run_epoch`) can compute the epoch boundary,
-    /// batch the neighbor-committee reads at the same pin, and thread the committee into
-    /// [`configure_consensus`] and the pin into [`create_consensus`] for the remaining pinned
-    /// read — all without a second system call. The pin is what makes every
+    /// batch the neighbor-committee reads at the same pin, thread the committee and the
+    /// epoch-start timestamp (the previous epoch's closing timestamp) into
+    /// [`configure_consensus`], and thread the pin into [`create_consensus`] for the remaining
+    /// pinned read — all without a second system call. The pin is what makes every
     /// entry shape — fresh boundary crossing, crash-restart replay, or ModeChange re-entry, before
     /// or after a mid-epoch governance `burn` — derive the IDENTICAL committee; the
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
@@ -313,15 +314,23 @@ where
     /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
     /// chain-derived digest - never a silent default. For seed-signature-active epochs
     /// the EpochRecord is deterministic and can be derived after executing the epoch boundary.
+    ///
+    /// `epoch_start` is the timestamp of the pinned header, the previous epoch's closing block
+    /// (genesis for epoch 0), from the same entry read as `committee`. It becomes the config's
+    /// [`ConsensusConfig::prior_epoch_close`] for every epoch after 0.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
         committee: Committee,
         next_committee_keys: Vec<BlsPublicKey>,
         prior_epoch_record: EpochDigest,
+        epoch_start: tn_types::TimestampSec,
     ) -> eyre::Result<ConsensusConfig<DB>> {
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
+
+        // epoch 0's pin is genesis, not a closed epoch, so there is no seam to floor
+        let prior_epoch_close = (committee.epoch() > 0).then_some(epoch_start);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -332,6 +341,7 @@ where
             network_config.clone(),
             next_committee_keys,
             prior_epoch_record,
+            prior_epoch_close,
         )?;
 
         Ok(consensus_config)
