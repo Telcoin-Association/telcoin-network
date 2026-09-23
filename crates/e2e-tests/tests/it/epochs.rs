@@ -51,8 +51,8 @@ const MIN_EPOCHS_TO_TEST: usize = 6;
 // not shrink with the epoch cadence.
 const EPOCH_DURATION: u64 = 5;
 
-/// Environment variable selecting the multi-workers fork epoch (#554) for this process and
-/// every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
+/// Environment variable selecting the multi-workers fork epoch (issue #554) for this process
+/// and every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
 const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
 
 /// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
@@ -537,9 +537,9 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin every fork epoch this suite depends on, the multi-workers fork (#554), the seed-signature
-/// fork (#1032), and the leader-seeded-ordering fork (#1260), for this process and every node it
-/// spawns.
+/// Pin three fork epochs for this process and every node it spawns: the multi-workers fork
+/// (issue #554), the seed-signature fork (#1032), and the leader-seeded-ordering fork (#1260). The
+/// PREVRANDAO and governance-Safe forks are not pinned here; see below.
 ///
 /// Step 8 decodes sealed pack bytes in the harness, and that reaches the first two gates: the
 /// `EpochMeta`'s [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every
@@ -553,10 +553,18 @@ fn assert_sealed_packs_unchanged(
 /// not consult it; it is pinned here for the children (and against a latched-earlier override),
 /// with the always-armed `0` default `TestBinary::command` forwards for it.
 ///
-/// Every fork is pinned, not just the one a given test is about. Pinning only some leaves the rest
+/// All three are pinned, not just the one a given test is about. Pinning only some leaves the rest
 /// asymmetric whenever the suite runs outside the Makefile wrapper that exports them, and the
 /// symptom is misleading: children write dormant-layout headers, the harness decodes them as
 /// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
+///
+/// The other two forks cannot put the harness and the nodes at odds. PREVRANDAO changes only the
+/// executed block's `mix_hash`, which step 8 never decodes and no test in this file checks, so
+/// children run whatever `TestBinary::command` forwards: the lane's `TN_PREVRANDAO_FORK_EPOCH`,
+/// else the dormant `u32::MAX`. Everything the governance-Safe fork is made of is `adiri`-gated,
+/// so it is compiled out of this harness and of the default e2e node binary; only the
+/// `make test-e2e-governance-safe` lane runs it, and that lane runs `test_governance_safe_fork`
+/// alone.
 ///
 /// Each `force_*` argument states that fork epoch outright, for a test whose claim is about a
 /// specific boundary. `None` inherits whatever the lane exported, defaulting to what
@@ -1060,8 +1068,8 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
-/// Test that an epoch pack archive spanning the multi-workers fork boundary (#554) survives a
-/// restart.
+/// Test that an epoch pack archive spanning the multi-workers fork boundary (issue #554)
+/// survives a restart.
 ///
 /// The same kill/restart scenario as [`test_epoch_sync`], with the fork pinned at
 /// [`CROSS_FORK_EPOCH`] so one datadir holds both committee layouts: epoch 0 written in the legacy
