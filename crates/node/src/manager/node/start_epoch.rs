@@ -97,7 +97,7 @@ where
             }
             let consensus_output =
                 self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
-            let is_epoch_close = consensus_output.committed_at() >= self.epoch_boundary;
+            let is_epoch_close = consensus_output.reaches_epoch_boundary(self.epoch_boundary);
             let output_hash = consensus_output.consensus_header_hash();
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);

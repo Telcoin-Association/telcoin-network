@@ -564,7 +564,7 @@ where
         mut output: ConsensusOutput,
     ) -> eyre::Result<()> {
         let last_forwarded_consensus_number = output.number();
-        if output.committed_at() >= self.epoch_boundary {
+        if output.reaches_epoch_boundary(self.epoch_boundary) {
             // update output so engine closes epoch
             output.set_epoch_close();
         }
@@ -623,7 +623,7 @@ where
                 OutputContinuity::Next => {}
             }
             // observe epoch boundary to initiate epoch transition
-            if output.committed_at() >= self.epoch_boundary {
+            if output.reaches_epoch_boundary(self.epoch_boundary) {
                 info!(
                     target: "epoch-manager",
                     epoch=?output.leader().epoch(),
