@@ -10,14 +10,15 @@ The `telcoin-network` binary has three subcommands:
 
 ## Prerequisites
 
-Hardware (recommended minimums for Adiri testnet):
+Hardware: [Hardware requirements](../../docs/src/getting-started/hardware-requirements.md) has the sizing model, the benchmark results and the observer profiles.
+The validator figures below are the minimum and recommended tiers from that page, set from the 2026-09 benchmark; the page says which figures are measured and which are modelled.
 
-| Resource | Minimum    | Recommended   |
-| -------- | ---------- | ------------- |
-| CPU      | 8 cores    | 16+ cores     |
-| RAM      | 16 GB      | 64 GB        |
-| Disk     | 500 TB TLC NVMe SSD | 1 TB TLC NVMe SSD |
-| Network  | 100 Mbps   | 1 Gbps        |
+| Resource | Minimum | Recommended |
+| -------- | ------- | ----------- |
+| CPU      | 4 physical cores | 4 physical cores, PassMark single-thread 3,500+ |
+| RAM      | 16 GB, no swap | 32 GB, no swap |
+| Disk     | 2 TB TLC NVMe SSD, 10,000+ sustained write IOPS, 300+ MB/s, rated 2+ DWPD | 4 TB TLC NVMe SSD, 20,000+ sustained IOPS, 500+ MB/s, rated 1+ DWPD |
+| Network  | 200 Mbps symmetric | 1 Gbps |
 
 Software:
 

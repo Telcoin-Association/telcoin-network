@@ -77,6 +77,36 @@ Use this rollout order:
 
 For an emergency patch, name an incident owner, a release owner, and an independent verifier. Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signed manifest and digest checks, and record each validator's completion. A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
 
+## Capacity monitoring
+
+Resource use rises with network load, and some limits are fixed in the release.
+Watch these signals on every validator and observer.
+[Hardware requirements](hardware-requirements.md) explains the model behind each one.
+The alert levels are starting points; tune them after a week of baseline data.
+
+| Signal | Where to read it | Starting alert | What a rising trend means | What to do |
+| --- | --- | --- | --- | --- |
+| CPU pressure | `/proc/pressure/cpu`, `some avg60` | Above 20 for 10 minutes | Runnable threads are waiting for a core | Check the engine backlog first. If execution lags, move to a CPU with faster single-thread performance. If RPC load causes it, serve public RPC from an observer instead. |
+| Memory pressure | `/proc/pressure/memory`, `full avg60` | Above 1 | The kernel is reclaiming pages the node needs, so all its threads stall | Add RAM. On RPC nodes, lower `--rpc-cache.max-blocks`. Do not add swap. |
+| IO pressure | `/proc/pressure/io`, `full avg60` | Above 10 | Execution is waiting on disk | Move to faster storage or raise the volume's provisioned IOPS, then check for throttling. |
+| Disk throttling | The provider's volume metrics (GCP reports throttled read and write operations and bytes per disk); `iostat -x` queue size and await | Any sustained throttling | The volume has reached its provisioned IOPS or throughput | Raise the volume limits or move to local NVMe. |
+| Batch cache occupancy | Live data in `<datadir>/consensus-db/cache` from an MDBX statistic, for example `mdbx_stat -ef` from the libmdbx tools (pages used minus free pages, times the page size), against the 1 GiB maximum. Not the file size (see below) | 768 MiB of live data | The committee's batch volume in an epoch is approaching the per-epoch ceiling | Tell the Telcoin Association network team. Hardware does not raise this limit. |
+| Engine backlog | `tn_engine_queued_outputs`, 0 to 8 | 4 or more for 5 minutes | Execution is falling behind consensus | At 8 the engine queue is full and outputs back up into the 64-slot channel in front of it. Check CPU and IO pressure and `tn_engine_execution_duration_seconds`. |
+| Resident memory | `reth_process_resident_memory_bytes` | Above 70% of RAM | Queued outputs, RPC caches or the transaction pool are growing | Compare with the engine backlog and the RPC request rate. A climb right after a restart is replay and should fall once the node catches up. |
+
+Pressure stall information needs a kernel built with PSI support, which mainline Linux added in 4.20.
+If `/proc/pressure` is missing, the running kernel lacks it or has it disabled.
+
+The batch cache is an MDBX file that never shrinks.
+Batches are removed at each epoch close, but the file keeps its size, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
+In the 2026-09 benchmark the file reached its 1 GiB maximum on every validator while each 20-minute epoch carried only about 0.5 GB of batch data, and no node failed.
+Read live occupancy from MDBX instead.
+The release exports no metric for it.
+The committee's batch output since the epoch started, summed over all validators from `tn_worker_batch_size_bytes`, gives a rough upper estimate, because that histogram also counts failed seal attempts.
+
+Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
+Alert on how fast it climbs during load and after restarts, not only on the level.
+
 ## Required evidence before mainnet
 
 - firewall policy tested from allowed and denied source networks;
