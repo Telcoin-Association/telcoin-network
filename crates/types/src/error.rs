@@ -278,6 +278,9 @@ pub enum HeaderError {
     /// The header's timestamp is too far in the future
     #[error("Invalid timestamp. Created at: {created}, received {received})")]
     InvalidTimestamp { created: TimestampSec, received: TimestampSec },
+    /// The header's sub-second creation time is outside `0..=999` milliseconds.
+    #[error("Invalid header created_at_millis {0}: must be below 1000")]
+    InvalidTimestampMillis(u16),
     /// Already voted for this header.
     #[error("Already voted for header {0} at round {1}")]
     AlreadyVoted(HeaderDigest, Round),
