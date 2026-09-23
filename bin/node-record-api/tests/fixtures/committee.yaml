@@ -1,0 +1,26 @@
+# A two-validator committee in the current on-disk shape (`workers:` list), used by the
+# `keys` unit tests. Keys and addresses are copied from `chain-configs/testnet/committee.yaml`.
+---
+authorities:
+  pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj:
+    protocol_key: pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj
+    execution_address: "0x0033a370616805b1fd275b7ffab83fc41d665ccb"
+  rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA:
+    protocol_key: rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA
+    execution_address: "0x89dab9f6fdc569c1bcdbd6493f25b7040b55dc79"
+epoch: 0
+bootstrap_servers:
+  pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj:
+    primary:
+      network_address: /ip4/35.203.41.59/udp/49590/quic-v1/p2p/12D3KooWCnizjv4ctsBTwwYJxZP3duCuoebJfbk1fUQv6Vg1dVUh
+      network_key: 4XTTM47Qeb4XhWEK7ybzj5bGsnVraHKaknpMFPgpg8jHYbGFo
+    workers:
+      - network_address: /ip4/35.203.41.59/udp/49594/quic-v1/p2p/12D3KooWHGdbYerasxspuhZW4KqNMbbpqvLNCG6LGpS5yx6b8x2x
+        network_key: 4XTTM8bKFPoKfVL1UwN1vBMjCWCFVKbKpKUha12qr2Bi86ip4
+  rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA:
+    primary:
+      network_address: /ip4/34.105.191.161/udp/49590/quic-v1/p2p/12D3KooWBRH7XpYhxCPTrw364UnmaSYDR4hCotoTHxTWTjKfrcUm
+      network_key: 4XTTM2jxmNy1nZZX7tbVWBWgbj3Bstjgew7Qh2AsGVxwCpPFs
+    workers:
+      - network_address: /ip4/34.105.191.161/udp/49594/quic-v1/p2p/12D3KooWFf6gRgYGnob7zhSZEnswRAHs4tSuh9UZXc5HzeKNut14
+        network_key: 4XTTM6ynLGq1MQAin2MtyMpmmZkwXYZSMpN5oFpV42svusenA
