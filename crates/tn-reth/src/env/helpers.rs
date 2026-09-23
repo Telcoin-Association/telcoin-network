@@ -72,6 +72,11 @@ pub struct TxFeedEntry {
     /// Hash of the block containing this transaction.
     pub block_hash: B256,
     /// Timestamp of the containing block.
+    ///
+    /// Seconds granularity and not unique: every block of one consensus output carries the same
+    /// timestamp, and blocks of different outputs committed within the same second tie as well.
+    /// Order entries by (`block_number`, `index`), or equivalently by `tx_number`, never by
+    /// timestamp.
     pub timestamp: u64,
     /// Zero-based index of the transaction within its block.
     pub index: u64,
