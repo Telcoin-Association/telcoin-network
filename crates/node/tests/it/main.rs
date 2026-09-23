@@ -3,7 +3,9 @@
 // unused deps lint confusion
 #![allow(unused_crate_dependencies)]
 
+use jsonrpsee::core::server::{Methods, MethodsError};
 use rand::{rngs::StdRng, SeedableRng as _};
+use serde_json::{json, Value as JsonValue};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
@@ -36,22 +38,25 @@ use tn_reth::{
     },
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
 };
-use tn_rpc::{EngineToPrimary, RpcNodeInfo};
+use tn_rpc::{
+    EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
+};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
     adiri_genesis,
+    forks::subsecond_timestamp_active,
     gas_accumulator::{
         compute_next_base_fee_eip1559, next_base_fee_for_config, GasAccumulator, WorkerFeeConfig,
     },
-    Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
-    EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Multiaddr, Notifier,
-    ReputationScores, SealedHeader, SignatureVerificationState, SolCall as _, TaskManager,
-    TnReceiver as _, TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    test_chain_spec_arc, Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate,
+    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochSeedChainValue, ExecHeader,
+    GenesisAccount, Multiaddr, Notifier, ReputationScores, SealedHeader,
+    SignatureVerificationState, SolCall as _, TaskManager, TimestampMs, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::{
@@ -300,23 +305,11 @@ async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()>
         consensus_chain.consensus_header_by_number(number).await?.expect("header was just stored");
     let epoch = stored.sub_dag.leader_epoch();
 
-    let key_config = config.key_config();
-    let key = key_config.primary_public_key();
-    let rpc = EngineToPrimaryRpc::new(
-        consensus_bus.app().clone(),
-        consensus_chain.clone(),
-        RpcNodeInfo {
-            chain_id: config.chain_id(),
-            version: "test",
-            name: "consensus header by digest test".to_owned(),
-            bls_public_key: key,
-            authority_id: key.into(),
-            execution_address: Address::ZERO,
-            primary_network_key: key_config.primary_network_public_key(),
-            worker_network_key: key_config.worker_network_public_key(0),
-            primary_external_address: Multiaddr::empty(),
-            worker_external_address: Multiaddr::empty(),
-        },
+    let rpc = engine_to_primary_rpc(
+        &config,
+        &consensus_bus,
+        &consensus_chain,
+        "consensus header by digest test",
     );
 
     let found = rpc
@@ -334,6 +327,281 @@ async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()>
     assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await.is_none());
 
     Ok(())
+}
+
+/// `tn_getBlockTimestampMillis`, served by the node's own [`EngineToPrimaryRpc`], reports each
+/// execution block's consensus commit time in milliseconds whether the block's consensus header
+/// sits in the sealed (static) pack of a closed epoch or in the current epoch's pack, by block
+/// number and by block hash.
+///
+/// Each execution block references its consensus header through `parent_beacon_block_root` and
+/// names the header's epoch in its nonce (`(epoch << 32) | round`), which routes the pack lookup.
+/// The header the consensus bus publishes as the latest resolves from the bus alone, and a block
+/// whose epoch has no pack on this node is `NotFound`, which clients can tell apart from the
+/// `null` of an unknown block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_block_timestamp_millis_across_static_and_current_packs() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("rpc_block_timestamp_millis")?;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let committee = fixture.committee();
+    let consensus_bus = ConsensusBus::new();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await?;
+    let task_manager = TaskManager::new("rpc block timestamp millis test");
+    let chain = test_chain_spec_arc();
+    let reth_env = RethEnv::new_for_temp_chain(
+        chain.clone(),
+        temp_dir.path().join("reth"),
+        &task_manager,
+        None,
+    )?;
+    let genesis = chain.sealed_genesis_header();
+
+    let static_epoch: Epoch = 0;
+    let current_epoch = static_epoch + 1;
+    let unpacked_epoch = current_epoch + 1;
+
+    // consensus numbers 1-2 fall in the static epoch and 3-4 in the current one; 5 is published
+    // on the bus but held by no pack, and 6 belongs to an epoch this node has no pack for. leaders
+    // are created a few seconds past genesis, each with its own sub-second part
+    let mut parent = ConsensusHeader::default().digest();
+    let mut outputs = Vec::new();
+    for (number, epoch) in [
+        (1, static_epoch),
+        (2, static_epoch),
+        (3, current_epoch),
+        (4, current_epoch),
+        (5, current_epoch),
+        (6, unpacked_epoch),
+    ] {
+        let created_at_ms = (genesis.timestamp + number) * 1000 + number * 111;
+        let output = millis_consensus_output(epoch, number, parent, created_at_ms);
+        parent = output.consensus_header_hash();
+        outputs.push(output);
+    }
+    let (closed, rest) = outputs.split_at(2);
+    let (opened, rest) = rest.split_at(2);
+    let [bus_only, unpacked] = rest else { unreachable!("six outputs") };
+
+    for output in closed {
+        consensus_chain.save_consensus_output(output.clone()).await?;
+    }
+    // opening the next epoch seals the closed epoch's pack, which is then read as a static pack;
+    // the closed epoch's record maps its consensus numbers to that pack
+    let closing = closed.last().expect("the closed epoch has outputs");
+    let closed_record = EpochRecord {
+        epoch: static_epoch,
+        committee: committee.bls_keys().iter().copied().collect(),
+        next_committee: committee.bls_keys().iter().copied().collect(),
+        final_consensus: ConsensusNumHash {
+            number: closing.number(),
+            hash: closing.consensus_header_hash(),
+        },
+        ..Default::default()
+    };
+    consensus_chain
+        .new_epoch(closed_record.clone(), committee.advance_epoch_for_test(current_epoch))
+        .await?;
+    consensus_chain.epochs().save_record(closed_record).await?;
+    for output in opened {
+        consensus_chain.save_consensus_output(output.clone()).await?;
+    }
+    let mut stored = Vec::new();
+    for output in closed.iter().chain(opened) {
+        let header = consensus_chain
+            .consensus_header_by_number(output.number())
+            .await?
+            .expect("saved consensus header reads back");
+        assert_eq!(header.digest(), output.consensus_header_hash());
+        stored.push(header);
+    }
+    for output in [bus_only, unpacked] {
+        let epoch = output.sub_dag().leader_epoch();
+        assert!(
+            consensus_chain
+                .consensus_header_by_digest(epoch, output.consensus_header_hash())
+                .await?
+                .is_none(),
+            "no pack holds consensus output {}",
+            output.number()
+        );
+    }
+
+    // one execution block per consensus output, stamped as the payload builder stamps them
+    let mut blocks = Vec::new();
+    let mut parent_block = genesis;
+    for output in &outputs {
+        let payload = TNPayload::new_for_test(parent_block, output);
+        let executed = execute_payload_and_update_canonical_chain(&reth_env, payload, Vec::new())?;
+        parent_block = executed.recovered_block.clone_sealed_header();
+        assert_eq!(
+            parent_block.parent_beacon_block_root,
+            Some(output.consensus_header_hash().into()),
+            "the block references its consensus header"
+        );
+        assert_eq!(
+            RethEnv::extract_epoch_from_header(&parent_block),
+            output.sub_dag().leader_epoch(),
+            "the block's nonce names its consensus header's epoch"
+        );
+        blocks.push(parent_block.clone());
+    }
+    let [.., bus_only_block, unpacked_block] = blocks.as_slice() else {
+        unreachable!("six blocks")
+    };
+
+    let rpc = engine_to_primary_rpc(
+        &config,
+        &consensus_bus,
+        &consensus_chain,
+        "block timestamp millis test",
+    );
+    // the latest consensus header is the current pack's last, as a validator publishes it once
+    // saved; its block takes the latest-header fast path, which must agree with the pack
+    let latest = stored.last().expect("headers were stored").clone();
+    consensus_bus.app().last_consensus_header().send_replace(Some(latest));
+
+    for by_hash in [false, true] {
+        // a fresh namespace per pass starts with an empty commit-time cache, so both passes
+        // resolve every consensus header rather than replaying the first pass's answers
+        let module = TelcoinNetworkRpcExt::new(reth_env.clone(), rpc.clone()).into_rpc();
+        for (block, header) in blocks.iter().zip(&stored) {
+            let id = if by_hash { json!(block.hash()) } else { json!(block_number_id(block)) };
+            let response = block_timestamp_millis(&module, id).await?;
+            assert_eq!(
+                response,
+                expected_block_timestamp_millis(block, header),
+                "consensus header {} (epoch {}), by hash: {by_hash}",
+                header.number,
+                header.sub_dag.leader_epoch()
+            );
+        }
+    }
+
+    let module = TelcoinNetworkRpcExt::new(reth_env.clone(), rpc.clone()).into_rpc();
+
+    // state sync can publish a header fetched from a peer as the latest while it sits only in
+    // the consensus cache, before a pack holds it. until published no source can answer for its
+    // block; once published the bus alone answers, which shows the lookup consults the latest
+    // header before the packs
+    let bus_only_id = json!(block_number_id(bus_only_block));
+    let unpublished = block_timestamp_millis(&module, bus_only_id.clone()).await;
+    assert!(is_not_found(&unpublished), "no source holds the header yet: {unpublished:?}");
+    let bus_only_header = bus_only.consensus_header();
+    consensus_bus.app().last_consensus_header().send_replace(Some(bus_only_header.clone()));
+    assert_eq!(
+        block_timestamp_millis(&module, bus_only_id).await?,
+        expected_block_timestamp_millis(bus_only_block, &bus_only_header)
+    );
+
+    // the block exists but its consensus header's epoch has no pack here: an error clients can
+    // tell apart from the `null` of an unknown block
+    let result = block_timestamp_millis(&module, json!(block_number_id(unpacked_block))).await;
+    assert!(is_not_found(&result), "a block whose epoch has no local pack: {result:?}");
+
+    Ok(())
+}
+
+/// Consensus output `number` chained to `parent`, whose epoch-`epoch` leader was created at
+/// `created_at_ms`.
+///
+/// Without a previous sub-dag or an epoch commit floor the commit time is the leader's creation
+/// time, which keeps its sub-second part only where the sub-second timestamp fork is active for
+/// `epoch`.
+fn millis_consensus_output(
+    epoch: Epoch,
+    number: u64,
+    parent: ConsensusHeaderDigest,
+    created_at_ms: u64,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    // the epoch goes first: the header builder keeps the sub-second part only for epochs where
+    // the fork is active
+    leader.update_header_epoch_for_test(epoch);
+    leader.update_header_round_for_test(2);
+    leader.update_header_created_at_ms_for_test(TimestampMs::from_millis(created_at_ms));
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+        EpochSeedChainValue::epoch_root(epoch),
+    );
+    ConsensusOutput::new_with_subdag(sub_dag, parent, number)
+}
+
+/// The `tn_getBlockTimestampMillis` response for execution `block`, executed from consensus
+/// `header`: the header's commit time in milliseconds, flagged sub-second when the fork is
+/// active for the header's leader epoch.
+fn expected_block_timestamp_millis(block: &SealedHeader, header: &ConsensusHeader) -> JsonValue {
+    let commit_ms = header.sub_dag.commit_timestamp_ms();
+    let sub_second = subsecond_timestamp_active(header.sub_dag.leader_epoch());
+    // a sub-second part tells the consensus commit time apart from the block's whole-second
+    // timestamp scaled to milliseconds, so the fixture must carry one wherever the fork is active
+    assert_eq!(commit_ms.subsec_millis() != 0, sub_second, "fixture commit time {commit_ms}");
+    json!({
+        "blockNumber": format!("{:#x}", block.number),
+        "blockHash": block.hash(),
+        "timestamp": format!("{:#x}", block.timestamp),
+        "timestampMillis": format!("{:#x}", commit_ms.as_millis()),
+        "subSecond": sub_second,
+        "consensusNumber": format!("{:#x}", header.number),
+        "consensusDigest": B256::from(header.digest()),
+    })
+}
+
+/// Call `tn_getBlockTimestampMillis` for block `id` on the `tn` namespace `methods`.
+async fn block_timestamp_millis(
+    methods: &Methods,
+    id: JsonValue,
+) -> Result<JsonValue, MethodsError> {
+    methods.call("tn_getBlockTimestampMillis", [id]).await
+}
+
+/// `block`'s number as a JSON-RPC block id: a hex quantity.
+fn block_number_id(block: &SealedHeader) -> String {
+    format!("{:#x}", block.number)
+}
+
+/// Whether `result` is the `tn` namespace's not-found error, EIP-1474 "resource not found"
+/// (code -32001).
+fn is_not_found(result: &Result<JsonValue, MethodsError>) -> bool {
+    matches!(result, Err(MethodsError::JsonRpc(error)) if error.code() == -32001)
+}
+
+/// An [`EngineToPrimaryRpc`] over `consensus_chain` and `consensus_bus`, identifying as the
+/// authority `config` belongs to.
+fn engine_to_primary_rpc(
+    config: &ConsensusConfig<MemDatabase>,
+    consensus_bus: &ConsensusBus,
+    consensus_chain: &ConsensusChain,
+    name: &str,
+) -> EngineToPrimaryRpc {
+    let key_config = config.key_config();
+    let key = key_config.primary_public_key();
+    EngineToPrimaryRpc::new(
+        consensus_bus.app().clone(),
+        consensus_chain.clone(),
+        RpcNodeInfo {
+            chain_id: config.chain_id(),
+            version: "test",
+            name: name.to_owned(),
+            bls_public_key: key,
+            authority_id: key.into(),
+            execution_address: Address::ZERO,
+            primary_network_key: key_config.primary_network_public_key(),
+            worker_network_key: key_config.worker_network_public_key(0),
+            primary_external_address: Multiaddr::empty(),
+            worker_external_address: Multiaddr::empty(),
+        },
+    )
 }
 
 /// A worker's transaction pool charges the base fee supplied at epoch setup (the
