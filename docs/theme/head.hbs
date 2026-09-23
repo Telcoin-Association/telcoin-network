@@ -1,0 +1,25 @@
+{{!-- Telcoin Network: site metadata the stock mdBook template leaves out.
+     mdBook 0.5.4 injects this partial into <head> through the stock
+     {{> head}} hook in index.hbs, so it survives theme re-dumps untouched.
+
+     Social scrapers (Slack, X, LinkedIn, Discord, iMessage) ignore relative
+     og:image URLs and mdBook exposes no site origin to templates, so the card
+     image is an absolute URL into the latest build. Every version's pages share
+     that one card. Move the origin here if the docs host ever changes. --}}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ book_title }}">
+<meta property="og:locale" content="en_US">
+<meta property="og:title" content="{{#if title}}{{ title }}{{else}}{{ book_title }}{{/if}}">
+<meta property="og:description" content="{{ description }}">
+<meta property="og:image" content="https://docs.telcoin.network/assets/og-image.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Telcoin Network">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{#if title}}{{ title }}{{else}}{{ book_title }}{{/if}}">
+<meta name="twitter:description" content="{{ description }}">
+<meta name="twitter:image" content="https://docs.telcoin.network/assets/og-image.png">
+<meta name="twitter:image:alt" content="Telcoin Network">
+<link rel="apple-touch-icon" sizes="180x180" href="{{ path_to_root }}assets/apple-touch-icon.png">
+<link rel="manifest" href="{{ path_to_root }}assets/site.webmanifest">
