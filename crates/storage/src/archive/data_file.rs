@@ -20,10 +20,10 @@
 //!
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
 //! while actively appending (`end` is the logical data length). The physical file is reconciled to
-//! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
-//! `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close) truncates
-//! to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are bounded by
-//! `end` and never see the padding.
+//! **exactly `end`** at every point an external consumer can observe it — `MmapDataFile::try_clone`
+//! (for `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close)
+//! truncates to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are
+//! bounded by `end` and never see the padding.
 //!
 //! ## Clean-close sentinel
 //!
@@ -31,18 +31,19 @@
 //! `crc32` of those four bytes; see `clean_close_sentinel`). A reopen validates it against the
 //! physical size, and on a match strips it back to `end` and knows the file was sealed. A missing
 //! or invalid sentinel means the file was **not** closed cleanly (most likely still padded after a
-//! crash); [`Self::opened_unclean`] surfaces that, the logical end is left at physical EOF, and the
-//! pack's CRC + `recover_pack` path truncates it back to the last good record. The self-referential
-//! second CRC is what stops trailing zero padding from masquerading as a clean close
-//! (`crc32(0x00000000) != 0`).
+//! crash); `MmapDataFile::opened_unclean` surfaces that, the logical end is left at physical EOF,
+//! and the pack's CRC + `recover_pack` path truncates it back to the last good record. The
+//! self-referential second CRC is what stops trailing zero padding from masquerading as a clean
+//! close (`crc32(0x00000000) != 0`).
 //!
 //! ## Durability
 //!
-//! The default barrier [`Self::sync_all`] is `msync` (flush dirty pages to the backing store) —
-//! this is sufficient for data written within an already-fsync'd file size, and each size extension
-//! is fsync'd when it happens (in the grow path). [`Self::sync_disk`] is the full, slower `msync` +
-//! `fsync`, which additionally persists the file's size/metadata. (On macOS `fsync` is not a full
-//! power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync default is on Linux.)
+//! The default barrier `MmapDataFile::sync_all` is `msync` (flush dirty pages to the backing store)
+//! — this is sufficient for data written within an already-fsync'd file size, and each size
+//! extension is fsync'd when it happens (in the grow path). `MmapDataFile::sync_disk` is the full,
+//! slower `msync` + `fsync`, which additionally persists the file's size/metadata. (On macOS
+//! `fsync` is not a full power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync
+//! default is on Linux.)
 //!
 //! This module also holds the shared directory-durability helpers (`fsync_directory`,
 //! `create_dir_synced`) used across the pack file types.
@@ -431,7 +432,7 @@ impl MmapDataFile {
         self.committed_marker
     }
 
-    /// Write the commit marker (`committed_end == end`) into the last [`COMMIT_MARKER_LEN`] bytes
+    /// Write the commit marker (`committed_end == end`) into the last `COMMIT_MARKER_LEN` bytes
     /// of the mmap capacity. Best-effort: it dirties one padding page but adds NO sync — the
     /// durability barrier stays the caller's `sync_all` (`msync` of `[flushed_end, end)`),
     /// which does not cover this page, so the marker reaches disk via OS writeback or the next
@@ -614,8 +615,10 @@ impl MmapDataFile {
 
     /// Ensure the logical length is at least `new_len`, extending the mapping (growing capacity
     /// geometrically if needed) so `[end, new_len)` becomes addressable for `slice`/`slice_mut`.
-    /// The extended region reads as zeros — fresh file growth is zero-filled and the capacity
-    /// padding past `end` is never written — so callers can treat it as freshly-zeroed space. Never
+    /// A FRESH grow is zero-filled, but the extended region is NOT guaranteed zero: after a
+    /// clean-close reopen the first `SENTINEL_LEN` bytes past `end` hold the previous clean-close
+    /// sentinel (the map spans `[0, disk_len)` with `end = disk_len - SENTINEL_LEN`), so a caller
+    /// growing into that gap must zero what it reads (e.g. `HdxIndex::redistribute_split`). Never
     /// shrinks. Unlike [`Self::set_len`], growth is geometric (a remap only when a step crosses the
     /// current capacity), so repeated one-record extensions (e.g. the digest index adding a bucket
     /// per split) do not remap every call.

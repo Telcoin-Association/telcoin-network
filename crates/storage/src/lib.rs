@@ -5,14 +5,14 @@ mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
-// Always build redb, we use it as the default for persistant consensus data.
+// `redb` is always built; it backs tests/benches and the `redb` feature. MDBX is the default
+// consensus backend (see Cargo.toml `default = ["reth-libmdbx"]`).
 pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
-// Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
 pub mod certificate_pack;
 /// The `CompositeDatabase` backend that splits the workload into epoch/kad/cache sub-databases.
@@ -38,7 +38,8 @@ mod pack_bench;
 #[cfg(test)]
 mod pack_kv_bench;
 pub mod pack_validate;
-/// The `redb`-backed database implementation (the default persistent consensus store).
+/// The `redb`-backed database implementation (used by tests/benches and the `redb` feature; MDBX
+/// is the default consensus backend).
 pub mod redb;
 
 pub use tn_types::error::StoreError;

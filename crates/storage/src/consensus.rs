@@ -77,10 +77,11 @@ impl Drop for LatestConsensus {
                 if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
                     let _ = handle.join();
                 } else {
-                    // Full bounded channel — skip the join / detach. Durability
-                    // still holds: the detached thread clean-closes when the last Sender drops;
-                    // only the synchronous "sealed on return" wait is lost, and only on this
-                    // misuse path.
+                    // Full bounded channel — skip the join / detach. The detached thread exits when
+                    // the last Sender drops, but (unlike the pack actors) its channel-closed exit
+                    // does NOT fsync the slot files, so a power loss right after this misuse path
+                    // can leave a stale hint. Tolerable: the slots are only a hint, reconciled
+                    // against the pack on open (`clamp_latest_to_pack`).
                     error!(target: "consensus_chain", "Failed to send shutdown message to LatestConsensus (should be using close())");
                 }
             }
@@ -1211,7 +1212,7 @@ impl ConsensusChain {
 
     /// Write the "latest consensus" slot hint under `base_path` to `(epoch, number)` so a node
     /// opened there resumes from that consensus output instead of genesis. Writes one slot
-    /// (`consensus_slot1`); the other stays `(0, 0)` and loses the [`LatestConsensus::new`]
+    /// (`consensus_slot1`); the other stays `(0, 0)` and loses the `LatestConsensus::new`
     /// reconciliation. Used by `db load-state` after rebuilding an imported epoch's packs.
     pub fn write_latest_consensus_hint(
         base_path: &Path,

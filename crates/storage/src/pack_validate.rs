@@ -162,7 +162,9 @@ impl Display for Verdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorruptionKind {
     /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
-    /// no outputs. Truncatable — `open_append` reinitializes the meta on next start.
+    /// no outputs. No committed data is at risk, but both open doors REFUSE a torn meta (they
+    /// cannot read the committee), so it is not auto-healed: remove this `epoch-N` directory to
+    /// rebuild.
     TornMetaEmpty,
     /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
     /// unreachable without the meta. Data loss for this epoch.
@@ -231,8 +233,9 @@ impl Display for PhysicalCorruption {
         match self.kind {
             CorruptionKind::TornMetaEmpty => writeln!(
                 f,
-                "SAFE — the pack holds no outputs; `open_append` reinitializes the meta on next \
-                 start (or remove this `epoch-N` directory to rebuild)."
+                "no committed data at risk, but ACTION NEEDED — both open doors refuse a torn \
+                 epoch-meta, so `open_append` will NOT reinitialize it: remove this `epoch-N` \
+                 directory to rebuild (re-sync the epoch from peers if it is not the current one)."
             ),
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
@@ -292,9 +295,9 @@ pub struct PackValidationReport {
     pub first_consensus_number: Option<u64>,
     /// Consensus number of the last header in the file, if any.
     pub last_consensus_number: Option<u64>,
-    /// Every issue found, in file order (capped at [`MAX_ISSUES`]; see `dropped_issues`).
+    /// Every issue found, in file order (capped at `MAX_ISSUES`; see `dropped_issues`).
     pub issues: Vec<PackIssue>,
-    /// Count of issues found beyond [`MAX_ISSUES`] and therefore not retained in `issues` (a
+    /// Count of issues found beyond `MAX_ISSUES` and therefore not retained in `issues` (a
     /// memory bound for hostile/pathological packs). Zero in the normal case.
     pub dropped_issues: u64,
     /// Bucket-CRC scan of the sidecar digest indexes, if the `hash`/`bhash` dirs were present next
@@ -320,7 +323,7 @@ impl PackValidationReport {
 /// `Invalid` and the summary + first rows suffice to diagnose.
 const MAX_ISSUES: usize = 100_000;
 
-/// A `Vec<PackIssue>` that stops growing at [`MAX_ISSUES`], counting further pushes instead of
+/// A `Vec<PackIssue>` that stops growing at `MAX_ISSUES`, counting further pushes instead of
 /// storing them, so validating a hostile pack cannot exhaust memory on the issue list.
 #[derive(Default)]
 struct BoundedIssues {
@@ -350,7 +353,7 @@ impl BoundedIssues {
 /// `EpochMeta` record.
 ///
 /// When `previous` (the previous epoch's [`EpochRecord`]) is supplied, the full
-/// [`verify_epoch_meta`] linkage checks run and the first header's `parent_hash` is anchored to the
+/// `verify_epoch_meta` linkage checks run and the first header's `parent_hash` is anchored to the
 /// previous epoch's final consensus header. With no previous record those linkage checks and the
 /// first-header parent check are skipped (everything else still runs).
 /// Note the previous link is NOT checked on block 1 (epoch 0- first block after genesis).

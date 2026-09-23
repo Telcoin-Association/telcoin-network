@@ -69,7 +69,7 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
 A typed append-only record log over an `MmapDataFile`. Each record on disk is
 `u32 size ‖ payload ‖ u32 crc32`; payloads are the encoded `V` (via `tn-types`) and optionally `zstd`-compressed
 (`MAX_RECORD_SIZE` caps both the framed size and the decompressed size — a decompression-bomb guard).
-A 28-byte `DataHeader` (`DATA_HEADER_BYTES`, CRC + type + uid + version + appnum) leads every file and
+A 28-byte `DataHeader` (`DATA_HEADER_BYTES`: type, version, uid, appnum, compression, CRC32) leads every file and
 is validated on open. `raw_iter` walks the log using **only** the data file (no indexes), bounded to
 the clone-time logical `end` — this is the authoritative replay source for index rebuilds.
 
@@ -88,7 +88,8 @@ Both index types are **fully reconstructable from the data file** and are never 
 ### 4. `consensus_pack` — `ConsensusPack` (one epoch of consensus output)
 
 An epoch's pack directory `epoch-{N}/` contains `data` (the WAL), `idx/` (position index),
-`hash/` + `bhash/` (consensus-header and batch digest indexes). Records are a leading
+`hash/` + `bhash/` (consensus-header and batch digest indexes), plus the per-epoch certificate pack
+(`cert_data` + `cert_hash/`, a `CertificatePack`). Records are a leading
 `EpochMeta` (committee, epoch-start linkage) followed by, per output, a `Consensus` header and its
 `Batch` records. A background thread (`run_pack_loop`) serializes writes behind a channel; the public
 type is `Send + Sync + Clone`.
@@ -163,6 +164,8 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
         idx/index_pos.pdx      position index (derived)
         hash/{index.hdx,.odx}  consensus-header digest index (derived)
         bhash/{index.hdx,.odx} batch digest index (derived)
+        cert_data              per-epoch certificate pack (CertificatePack)  ── + clean-close sentinel
+        cert_hash/{index.hdx,.odx} certificate digest index (derived)
       epochs.pack / epoch_certs.pack + sidecars   the EpochRecordDb chain
       consensus_slot{1,2}      latest-consensus hint (double-buffered)
       staging-{N}/             transient state-sync import target

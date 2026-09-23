@@ -56,7 +56,7 @@ use crate::{
 /// whereas v0 and v1 predate the sentinel and never have one. Writing new packs as v2 is what lets
 /// a missing sentinel be read as a genuine "not cleanly closed" signal: a pre-sentinel pack (v0/v1)
 /// is recognized by its version and trusted via the length / WAL cross-checks instead (see
-/// [`SENTINEL_MIN_VERSION`] and `Inner::files_consistent`).
+/// `SENTINEL_MIN_VERSION` and `Inner::files_consistent`).
 pub const PACK_VERSION: u16 = 2;
 
 /// First pack version whose files carry the clean-close sentinel.
@@ -164,8 +164,11 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
     // When this returns None then the channel is consumed and closed, so exit the thread.
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
-    // Note, that code called in this thread should NEVER panic since that will orphan the pack
-    // file. This is acceptable since panic should never occur in properly written Inner code.
+    // Note: code in this thread should NEVER panic. Unwinding drops `Inner`, whose `Drop` still
+    // runs the clean-close (msync + truncate-to-`end` + sentinel), so a mid-save panic SEALS the
+    // pack as "clean" rather than orphaning it — only the length cross-checks in `files_consistent`
+    // then catch the incomplete write. Acceptable only because panics should never occur in correct
+    // Inner code.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
@@ -3116,7 +3119,7 @@ pub enum PackError {
 
 impl PackError {
     /// True when a static-pack open failed because the epoch's files are absent on disk: the
-    /// data-file or an index-file open bottomed out in io `NotFound`. [`Inner::open_static`]
+    /// data-file or an index-file open bottomed out in io `NotFound`. `Inner::open_static`
     /// opens the data file before anything else, so a missing `epoch-{N}` directory (or a
     /// never-created epoch) always surfaces as the data file's `NotFound`; an index file can
     /// bottom out there on its own while the data file still opens, because `stream_import`
@@ -6598,7 +6601,7 @@ pub(crate) mod test {
             pack.persist().await.expect("persist");
         }
 
-        // Reconstruct the exact on-disk state a crash-before-meta leaves: the 32-byte header
+        // Reconstruct the exact on-disk state a crash-before-meta leaves: the 28-byte header
         // followed by zero padding (the grown mmap capacity), with no clean-close sentinel and no
         // meta record. Keeping only the header discards the meta the seed pack wrote.
         let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);

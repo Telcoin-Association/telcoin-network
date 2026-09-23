@@ -7,7 +7,7 @@
 //! be pure overhead.
 //!
 //! ## Reads (zero-copy)
-//! [`HdxIndex::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and — on
+//! `HdxIndex::find_in_bucket` borrows the target bucket from the hdx mapping, scans it, and — on
 //! a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
 //! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
 //! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
@@ -826,8 +826,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Clear both buckets before redistributing. The split bucket is already within the logical
         // end, so zero it in place. The new bucket lies at/after the current end (buckets are
         // contiguous), so first extend the mapping to make room for it: `ensure_len` grows
-        // geometrically and zero-extends, so `slice_mut(new_pos, ..)` is then in-bounds and the
-        // fresh region is already an empty bucket (the fill below is a cheap defensive memset).
+        // geometrically so `slice_mut(new_pos, ..)` is then in-bounds. `ensure_len` zero-fills a
+        // FRESH grow, but on a clean-close reopen the first bytes past `end` hold the previous
+        // sentinel, so the `fill(0)` below is load-bearing (not merely defensive): it is what makes
+        // the new bucket start empty after a reopen.
         if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
             // Note this will zero the CRC as well (we want that- marks it "dirty").
             buffer.fill(0);
@@ -1035,7 +1037,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
     }
 
     /// Flush and sync all the index data to disk. The `data_file_length` commit marker is written
-    /// last (see [`Self::ordered_sync`]) so `files_consistent` never trusts a torn index.
+    /// last (see `Self::ordered_sync`) so `files_consistent` never trusts a torn index.
     fn sync(&mut self) -> Result<(), CommitError> {
         if self.read_only {
             Err(CommitError::ReadOnly)

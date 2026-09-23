@@ -98,11 +98,11 @@ enum EpochDbMessage {
 /// Handle to the epoch records database.
 ///
 /// Operations are dispatched to a background thread that owns the file handles.
-/// Errors from background writes are surfaced on the next call via [`get_error`], which clears
+/// Errors from background writes are surfaced on the next call via `get_error`, which clears
 /// the slot as it reads, so exactly one subsequent caller observes a given failure. When more
 /// than one write fails before a read, the slot keeps the first failure (for a poisoned-pack
-/// cascade that is the root cause; every failure is logged either way). Use [`peek_error`] to
-/// check without consuming. [`persist`] is the durability barrier: it reports any earlier
+/// cascade that is the root cause; every failure is logged either way). Use `peek_error` to
+/// check without consuming. `persist` is the durability barrier: it reports any earlier
 /// write failure even if that write was still queued when the flush was requested.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
@@ -374,7 +374,7 @@ pub enum CertifiedRecordError {
     InvalidCertificate(Epoch, EpochDigest),
     /// Resolving the record or its certificate failed at the storage layer for a reason other
     /// than genuine absence (I/O error, CRC mismatch, decode failure, or an unreachable
-    /// database thread — everything [`fetch_error_is_absent`] rejects). The underlying error is
+    /// database thread — everything `fetch_error_is_absent` rejects). The underlying error is
     /// logged at `error!` at the classification site; only the epoch is carried so the enum
     /// stays `Copy`. Never retryable: polling corrupt bytes can only mask the corruption behind
     /// a misleading "missing" timeout.
@@ -654,7 +654,7 @@ impl EpochRecordDb {
     ///
     /// Unlike the raw [`Self::record_by_epoch`] / [`Self::cert_by_digest`] fetches, the reads
     /// here do NOT collapse storage failures into absence: only a genuine miss (per the shared
-    /// absence classification, [`fetch_error_is_absent`]) reports
+    /// absence classification, `fetch_error_is_absent`) reports
     /// [`CertifiedRecordError::MissingRecord`] / [`CertifiedRecordError::MissingCertificate`];
     /// corruption or an unreachable db thread reports the non-retryable
     /// [`CertifiedRecordError::Storage`] so the timeout variant fails loudly at once instead of
@@ -864,7 +864,7 @@ impl EpochRecordDb {
 
     /// Take ownership and clean-close the DB asynchronously, so `Drop` does not block a thread on a
     /// `join()`. Only closes if this is the last reference; awaits confirmation that the background
-    /// thread sealed the packs. Essentially an async drop (mirrors [`ConsensusPack::close`]).
+    /// thread sealed the packs. Essentially an async drop (mirrors `ConsensusPack::close`).
     pub async fn close(self) {
         if Arc::strong_count(&self.handle) == 1 {
             let Some(_handle) = self.handle.lock().take() else {
@@ -881,7 +881,7 @@ impl EpochRecordDb {
 
     /// Retrieve the committee keys for `epoch` if available.
     /// Tries the exact epoch first; falls back to the previous epoch's `next_committee`.
-    /// Returns as a [`BTreeSet`] to enforce a stable order.
+    /// Returns as a `BTreeSet` to enforce a stable order.
     pub async fn get_committee_keys(
         &self,
         epoch: Epoch,
@@ -900,7 +900,7 @@ impl EpochRecordDb {
     /// Retrieve the epoch record and certificate (if available) by epoch number.
     ///
     /// One actor round trip: the record and cert are resolved together on the background thread
-    /// (see [`EpochDbMessage::EpochByNumber`]) rather than as two separate lookups.
+    /// (see `EpochDbMessage::EpochByNumber`) rather than as two separate lookups.
     pub async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
@@ -938,7 +938,7 @@ impl EpochRecordDb {
     /// Retrieve the epoch record and certificate (if available) by record digest.
     ///
     /// One actor round trip: the record and cert are resolved together on the background thread
-    /// (see [`EpochDbMessage::EpochByHash`]) rather than as two separate lookups.
+    /// (see `EpochDbMessage::EpochByHash`) rather than as two separate lookups.
     pub async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
@@ -1091,7 +1091,7 @@ impl EpochRecordDb {
     /// Find the epoch for a consensus header number.
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
-    /// lookup. The vector is guaranteed sorted because [`update_finals`] enforces
+    /// lookup. The vector is guaranteed sorted because `update_finals` enforces
     /// sequential epoch insertion. If `number` is beyond the last stored epoch,
     /// returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
@@ -1146,7 +1146,7 @@ pub const CERTS_NAME: &str = Inner::CERTS_NAME;
 
 /// Lift a raw index/pack read into the non-collapsing shape: `Ok(Some(v))` on success,
 /// `Ok(None)` when the error means the key is genuinely not present (per
-/// [`fetch_error_is_absent`], the single absence classification shared with the consensus
+/// `fetch_error_is_absent`, the single absence classification shared with the consensus
 /// pack), and `Err` for every real storage failure.
 fn absent_to_none<T>(res: Result<T, FetchError>) -> Result<Option<T>, FetchError> {
     res.map(Some).or_else(|e| fetch_error_is_absent(&e).then_some(None).ok_or(e))
@@ -1567,7 +1567,7 @@ impl Inner {
     /// Non-collapsing read of the record for `epoch`.
     ///
     /// `Ok(None)` only on genuine absence — an index or pack lookup failing with an error
-    /// [`fetch_error_is_absent`] accepts. Every other storage failure (I/O, CRC mismatch,
+    /// `fetch_error_is_absent` accepts. Every other storage failure (I/O, CRC mismatch,
     /// decode) surfaces as `Err` so the certified read path can classify it as
     /// [`CertifiedRecordError::Storage`] instead of a retryable "missing".
     fn try_record_by_epoch(&mut self, epoch: Epoch) -> Result<Option<EpochRecord>, FetchError> {
