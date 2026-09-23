@@ -189,8 +189,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         );
 
         // Both lines above report compiled fork points, which a `test-utils` binary does not have
-        // to obey: the e2e harness spawns nodes with all but the leader-seeded fork pinned dormant,
-        // and they log "active from genesis" while executing the legacy derivations. Name the pins
+        // to obey: the e2e harness spawns nodes with all but the leader-seeded and sub-second
+        // forks pinned dormant (the sub-second gate stays dormant anyway while the seed-signature
+        // pin is dormant), and they log "active from genesis" while executing the legacy
+        // derivations. Name the pins
         // that are actually in force so the startup log stays diffable there too. Empty and
         // silent in a production binary, where the overrides are compiled out of `tn-types`
         // entirely.
