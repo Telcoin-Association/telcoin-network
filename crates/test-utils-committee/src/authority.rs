@@ -6,7 +6,8 @@ use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BlsSignature, Certificate,
     Committee, Database, Epoch, EpochDigest, EpochSeedMessage, Genesis, Hash as _, Header,
-    HeaderBuilder, NetworkKeypair, NetworkPublicKey, P2pNode, Round, Vote, DEFAULT_WORKER_ID,
+    HeaderBuilder, NetworkKeypair, NetworkPublicKey, P2pNode, Round, TimestampMs, Vote,
+    DEFAULT_WORKER_ID,
 };
 
 /// Fixture representing an validator node within the network.
@@ -98,6 +99,28 @@ impl<DB: Database> AuthorityFixture<DB> {
             .epoch(committee.epoch())
             .parents(Certificate::genesis(committee).iter().map(|x| x.digest()).collect())
             .seed_signature(self.seed_signature(committee.epoch(), 1))
+    }
+
+    /// Return a [HeaderBuilder] for `round`, created `round` milliseconds after the UNIX epoch.
+    ///
+    /// Otherwise the same as [`Self::header_builder`] (this authority as author, the committee's
+    /// epoch, genesis parents), with the seed signature re-stamped for `round`.
+    ///
+    /// The round doubles as the millisecond clock because the vote path checks a header's
+    /// creation time against each of its parents'. A fixed timestamp would tie a child with its
+    /// parents; with the round as the clock, a header built here at round `r` is strictly newer
+    /// than any header built the same way at a lower round, which satisfies both a
+    /// no-older-than-parents rule and a strictly-newer-than-parents rule. The clock sits far in
+    /// the past, so the vote path's future-drift check never delays or rejects these headers.
+    ///
+    /// Where the sub-second timestamp fork is inactive for the committee's epoch,
+    /// [`HeaderBuilder::build`] drops the sub-second part, so every round below 1000 reads as
+    /// second 0: headers tie but never go backwards.
+    pub fn header_builder_at_round(&self, committee: &Committee, round: Round) -> HeaderBuilder {
+        self.header_builder(committee)
+            .round(round)
+            .seed_signature(self.seed_signature(committee.epoch(), round))
+            .created_at_ms(TimestampMs::from_millis(u64::from(round)))
     }
 
     /// This authority's deterministic BLS signature over the canonical seed message for
