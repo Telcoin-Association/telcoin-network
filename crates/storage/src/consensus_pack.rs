@@ -385,7 +385,10 @@ impl ConsensusPack {
         let mut epochs = Vec::new();
         for entry in std::fs::read_dir(epochs_dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            // `path().is_dir()` follows symlinks, so a symlinked `epoch-N/` is enumerated (the node
+            // opens epochs by path and follows them); the destructive prune paths deliberately keep
+            // the non-following `file_type()` check instead.
+            if !entry.path().is_dir() {
                 continue;
             }
             if let Some(n) = entry
@@ -5688,7 +5691,21 @@ pub(crate) mod test {
         }
         std::fs::create_dir_all(temp_dir.path().join("staging-3")).expect("mkdir"); // ignored
         std::fs::write(temp_dir.path().join("epoch-99"), b"a file, not a dir").expect("write"); // ignored
+
+        // A symlinked `epoch-N/` must be enumerated (the node opens epochs by path and follows
+        // symlinks); `path().is_dir()` follows the link where `file_type().is_dir()` did not.
+        #[cfg(unix)]
+        {
+            let target = temp_dir.path().join("real-epoch-5");
+            std::fs::create_dir_all(&target).expect("mkdir target");
+            std::os::unix::fs::symlink(&target, temp_dir.path().join("epoch-5"))
+                .expect("symlink epoch-5");
+        }
+
         let epochs = ConsensusPack::epoch_dirs(temp_dir.path()).expect("list epochs");
+        #[cfg(unix)]
+        assert_eq!(epochs, vec![0, 1, 2, 5, 10]);
+        #[cfg(not(unix))]
         assert_eq!(epochs, vec![0, 1, 2, 10]);
     }
 

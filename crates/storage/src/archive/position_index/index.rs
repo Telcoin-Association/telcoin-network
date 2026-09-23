@@ -137,7 +137,9 @@ impl<T: PosIndexValue> PositionIndex<T> {
             "PosIndexValue::buffer_len() exceeds VALUE_MAX_BYTES"
         );
         let dir = dir.as_ref();
-        let dir_created = fs::create_dir(dir).is_ok();
+        // A read-only open must not create the sidecar directory (see `HdxIndex::open_hdx_file`);
+        // an absent dir still fails `NotFound` below.
+        let dir_created = !read_only && fs::create_dir(dir).is_ok();
         if dir_created {
             // The index directory is brand new; fsync the parent so the entry survives a crash.
             if let Some(parent) = dir.parent() {
@@ -179,14 +181,18 @@ impl<T: PosIndexValue> PositionIndex<T> {
         let buffer_len = T::buffer_len() as u64;
         let record_bytes = index.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64);
         if !record_bytes.is_multiple_of(buffer_len) {
-            if read_only {
-                // Can't repair a read-only file, and a stride mismatch means this `T` cannot
-                // read it safely; reject rather than return garbage.
+            // A cleanly-sealed file can only be misaligned by a stride (`T`) mismatch, never a torn
+            // tail: clean close truncates to the exact logical end. Only heal an *unclean* file;
+            // otherwise reject rather than truncate bytes of a complete record (a read-only open
+            // cannot repair, and a writable one must not silently drop committed data). This cannot
+            // brick a pack open -- `open_indexes_for_append` discards and rebuilds on any
+            // `LoadHeaderError`.
+            if read_only || !index.pdx_file.opened_unclean() {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Writable: drop a torn trailing partial record so appends stay aligned.  Without
-            // this, the next append (always at the true EOF) would land mid-stride and shift
-            // every subsequent record.
+            // Unclean writable: drop a torn trailing partial record so appends stay aligned.
+            // Without this, the next append (always at the true EOF) would land
+            // mid-stride and shift every subsequent record.
             let aligned = PDX_HEADER_SIZE as u64 + (index.len() as u64 * buffer_len);
             index.pdx_file.set_len(aligned)?;
         }

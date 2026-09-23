@@ -673,7 +673,19 @@ where
                                 use std::io::Read as _;
                                 let mut src = std::fs::File::open(&src_consensus)?;
                                 let mut dst = std::fs::File::create(&copy_dst)?;
-                                std::io::copy(&mut (&mut src).take(data_len), &mut dst)?;
+                                let copied =
+                                    std::io::copy(&mut (&mut src).take(data_len), &mut dst)?;
+                                if copied != data_len {
+                                    // A short copy (source shrank mid-copy) would silently produce a
+                                    // truncated bundle only caught at import; fail here instead.
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        format!(
+                                            "consensus pack copy short: copied {copied} of \
+                                             {data_len} bytes"
+                                        ),
+                                    ));
+                                }
                                 dst.sync_all()?;
                                 Ok(())
                             })

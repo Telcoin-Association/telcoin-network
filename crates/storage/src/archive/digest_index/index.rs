@@ -317,7 +317,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         read_only: bool,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
-        let dir_created = fs::create_dir(dir).is_ok();
+        // A read-only open must not create the sidecar directory (a documented "writes nothing"
+        // door). An absent dir still fails `NotFound` in `open_with` below, so
+        // `is_missing_static_files` is unchanged.
+        let dir_created = !read_only && fs::create_dir(dir).is_ok();
         if dir_created {
             // The index directory is brand new; fsync the parent so the entry survives a crash.
             if let Some(parent) = dir.parent() {
@@ -382,6 +385,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.bucket_size() != Self::BUCKET_SIZE as u16
                 || header.bucket_elements() != Self::BUCKET_ELEMENTS as u16
             {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
+            // The file must physically hold every bucket the header claims. A truncated-but-sealed
+            // hdx (writer bug or a re-stamped sentinel) would otherwise read its missing buckets as
+            // absent -- `bucket_crc_scan` skips them and lookups miss -- while validation reports
+            // it clean. Reject it so a writable open rebuilds from the WAL (INV3) and a
+            // read-only open surfaces `corrupt_static_index`.
+            let needed = (HEADER_SIZE + BLOOM_SIZE_BYTES) as u64
+                + header.buckets as u64 * Self::BUCKET_SIZE as u64;
+            if file_end < needed {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
             // Check the salt/pepper to confirm the same (stable) hasher is in use.
@@ -990,12 +1003,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     pub fn bucket_crc_scan(&self) -> BucketCrcReport {
         let mut report = BucketCrcReport::default();
         for bucket in 0..self.buckets() as u64 {
-            if let Some(buffer) = self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
-                match crc_state(buffer) {
+            match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
+                Some(buffer) => match crc_state(buffer) {
                     CrcState::Valid => {}
                     CrcState::Dirty => report.dirty += 1,
                     CrcState::Corrupt => report.corrupt += 1,
-                }
+                },
+                // A bucket past the mapped end means the hdx is truncated (short file); count it as
+                // corrupt so a short-but-sealed index is not reported clean.
+                None => report.corrupt += 1,
             }
         }
         report
@@ -1363,6 +1379,40 @@ mod tests {
         assert!(
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
+        );
+    }
+
+    /// A truncated-but-otherwise-valid hdx (fewer bucket bytes than the header's bucket count
+    /// claims) must be rejected on open rather than read its missing buckets as absent.
+    #[test]
+    fn test_archive_hdx_index_short_file_rejected() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_short").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        {
+            let builder = BuildHasherDefault::<FxHasher>::default();
+            let mut idx: HdxIndex =
+                HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
+                    .expect("hdx file");
+            idx.save(key(0), 1).expect("add to index");
+            idx.sync().expect("sync");
+        }
+        // Truncate to just past the 68-byte header: the header still loads, but the file no longer
+        // holds the buckets it claims. `open_hdx_file` stores the mapping at `<dir>/index.hdx`, so
+        // the dir here is `tmp/index.hdx` and the actual file is `tmp/index.hdx/index.hdx`.
+        let dir = tmp_path.join("index.hdx");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("index.hdx"))
+            .expect("open hdx file")
+            .set_len(200)
+            .expect("truncate hdx short");
+
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let res: Result<HdxIndex, _> = HdxIndex::open_hdx_file(&dir, &data_header, builder, true);
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
+            "a short hdx must be rejected as InvalidIndexGeometry, got {res:?}"
         );
     }
 
