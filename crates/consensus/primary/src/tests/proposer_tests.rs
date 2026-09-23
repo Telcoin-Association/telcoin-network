@@ -6,8 +6,12 @@ use indexmap::IndexMap;
 use std::collections::BTreeSet;
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{error::HeaderError, now, HeaderBuilder, B256, MAX_HEADER_NUM_OF_BATCHES};
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
+use tn_types::{
+    error::HeaderError,
+    forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
+    now, HeaderBuilder, TimestampMs, B256, MAX_HEADER_NUM_OF_BATCHES,
+};
 
 #[tokio::test]
 async fn test_empty_proposal() {
@@ -350,15 +354,32 @@ async fn test_proposer_recovers_round_from_last_proposed() {
 /// round carries a *different* digest. This is the premise the fail-closed vote guard depends on:
 /// voters holding a durable `Votes` record for round `P` only recast their vote for the identical
 /// digest, and reject anything else with `AlreadyVoted`.
+///
+/// The stored header is from a fork-active epoch and carries a non-zero `created_at_millis`, which
+/// the digest preimage covers as well, so a guard record that lost the millisecond part would
+/// repropose a header those voters reject.
 #[tokio::test]
 async fn test_restart_reproposes_identical_header() {
+    pin_subsecond_fork(true);
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().next().unwrap();
     let config = primary.consensus_config();
 
     // the header this authority proposed before the crash, still in the guard record
-    let proposed = build_header_at(&primary.id(), 7, committee.epoch(), &[B256::random()]);
+    let proposed = HeaderBuilder::from_header(&build_header_at(
+        &primary.id(),
+        7,
+        committee.epoch(),
+        &[B256::random()],
+    ))
+    .created_at_ms(TimestampMs::from_parts(now(), 737))
+    .build();
+    assert_eq!(
+        proposed.created_at_millis(),
+        737,
+        "a fork-active header must keep its millisecond part, or this test proves nothing about it"
+    );
     config.node_storage().write_last_proposed(&proposed).unwrap();
 
     let cb = ConsensusBus::new();
@@ -382,6 +403,192 @@ async fn test_restart_reproposes_identical_header() {
     assert_eq!(header.round(), proposed.round(), "first proposal must land back on round P");
     assert_eq!(header, proposed, "restart must repropose the identical header");
     assert_eq!(header.digest(), proposed.digest(), "the reproposed digest must be unchanged");
+    assert_eq!(
+        header.created_at_ms(),
+        proposed.created_at_ms(),
+        "the reproposed header must keep its millisecond timestamp"
+    );
+}
+
+/// Pins this test process's sub-second timestamp fork to active (or dormant) from genesis, with
+/// the seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building the committee fixture. nextest runs each
+/// test in its own process, which is what keeps one test's pin from reaching another; a
+/// single-process `cargo test` run shares one latch across the whole test binary instead. Reading
+/// the overrides back turns a value that latched before the pin into a named failure.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+}
+
+/// Round-1 parent certificates, one per authority in fixture order, created at the given times.
+///
+/// The proposer takes its parents as already certified and reads only their digests and
+/// timestamps, so these carry no votes and no seed signature. Nothing here signs, which keeps the
+/// gap between choosing the timestamps and proposing far below the leads under test.
+fn parents_created_at(
+    fixture: &CommitteeFixture<MemDatabase>,
+    created_at: &[TimestampMs],
+) -> Vec<Certificate> {
+    let committee = fixture.committee();
+    let genesis: BTreeSet<_> =
+        Certificate::genesis(&committee).iter().map(|c| c.digest()).collect();
+    assert_eq!(fixture.authorities().count(), created_at.len(), "one timestamp per authority");
+    fixture
+        .authorities()
+        .zip(created_at)
+        .map(|(authority, &created_at)| {
+            let header = HeaderBuilder::default()
+                .author(authority.id())
+                .round(1)
+                .epoch(committee.epoch())
+                .parents(genesis.clone())
+                .created_at_ms(created_at)
+                .build();
+            Certificate::new_unsigned_for_test(&committee, header, Vec::new())
+                .expect("unsigned parent certificate")
+        })
+        .collect()
+}
+
+/// Proposes `primary`'s round-2 header over `parents` and returns it with the time the proposal
+/// took on tokio's clock.
+///
+/// Callers pause tokio's clock, which then advances only when the proposer sleeps, so the returned
+/// duration is exactly the proposer's wait, free of scheduling and signing noise. The wall clock
+/// behind `now_ms` keeps running, so the header is still stamped from real time.
+async fn propose_round_two(
+    primary: &AuthorityFixture<MemDatabase>,
+    committee: &Committee,
+    parents: Vec<Certificate>,
+) -> (Header, Duration) {
+    let config = primary.consensus_config();
+    let cb = ConsensusBus::new();
+    // keep the header channel subscribed so `send` is not silently dropped
+    let _rx_headers = cb.subscribe_headers();
+    let identity = HeaderIdentity {
+        round: 2,
+        epoch: committee.epoch(),
+        author: primary.id(),
+        prior_epoch_record: config.prior_epoch_record(),
+        key_config: config.key_config().clone(),
+    };
+
+    let start = tokio::time::Instant::now();
+    let header = Proposer::propose_header(
+        identity,
+        config.node_storage().clone(),
+        &cb,
+        parents,
+        VecDeque::new(),
+    )
+    .await
+    .expect("header proposed");
+    (header, start.elapsed())
+}
+
+/// A parent stamped ahead of this node's clock delays a fork-active proposal by the millisecond
+/// gap, not whole seconds, and the header lands strictly after the latest parent.
+///
+/// Fork-active voters require a header's millisecond timestamp to exceed every parent's, so the
+/// proposer waits for, and clamps to, one millisecond past the latest parent. The latest parent
+/// sits mid-list so reading any parent but the maximum fails the clamp. With tokio's clock paused
+/// the wait costs no real time, so the header is normally stamped while the wall clock still
+/// trails the parent and the clamp decides the timestamp: a wait rounded up to whole seconds fails
+/// the wait bound, and a missing clamp or missing `+ 1` fails the timestamp bound.
+#[tokio::test(start_paused = true)]
+async fn test_proposal_waits_milliseconds_for_future_parents() {
+    pin_subsecond_fork(true);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    assert!(subsecond_timestamp_active(committee.epoch()), "the pin must activate the fork");
+
+    let base = now_ms();
+    let latest_parent = base.saturating_add_millis(30);
+    let parents = parents_created_at(
+        &fixture,
+        &[
+            base.saturating_add_millis(10),
+            latest_parent,
+            base.saturating_add_millis(20),
+            base.saturating_add_millis(5),
+        ],
+    );
+
+    let (header, waited) = propose_round_two(primary, &committee, parents).await;
+
+    let min_created_at = latest_parent.saturating_add_millis(1);
+    assert!(
+        header.created_at_ms() >= min_created_at,
+        "header created at {} must be at least 1ms after the latest parent {latest_parent}",
+        header.created_at_ms(),
+    );
+    // the wait is `min_created_at - now_ms()` measured after `base`; tokio's timer may round the
+    // deadline up to its next millisecond tick
+    let max_wait = Duration::from_millis(min_created_at.as_millis() - base.as_millis() + 1);
+    assert!(
+        waited <= max_wait,
+        "proposer waited {waited:?}, more than the {max_wait:?} gap to the latest parent"
+    );
+    assert!(waited < Duration::from_secs(1), "proposer must not wait whole seconds");
+}
+
+/// Before the sub-second fork the proposer keeps the seconds-only rule (`>=` against the latest
+/// parent's whole second, millisecond part 0) but still waits only the millisecond gap.
+///
+/// Pre-fork parents carry whole seconds, so the latest parent sits on the next second boundary,
+/// less than a second ahead of this node's clock. A seconds-granular sleep waits out a whole
+/// second there and overshoots the gap to that boundary.
+#[tokio::test(start_paused = true)]
+async fn test_pre_fork_proposal_keeps_seconds_rule_with_millisecond_wait() {
+    pin_subsecond_fork(false);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    assert!(!subsecond_timestamp_active(committee.epoch()), "the pin must keep the fork dormant");
+
+    let base = now_ms();
+    let latest_parent = TimestampMs::from_parts(base.secs() + 1, 0);
+    let current_second = TimestampMs::from_parts(base.secs(), 0);
+    let parents = parents_created_at(
+        &fixture,
+        &[current_second, latest_parent, current_second, current_second],
+    );
+    assert!(
+        parents.iter().all(|p| p.header().created_at_millis() == 0),
+        "pre-fork parents must carry whole seconds only"
+    );
+
+    let (header, waited) = propose_round_two(primary, &committee, parents).await;
+
+    assert_eq!(header.created_at_millis(), 0, "a pre-fork header must not carry milliseconds");
+    assert!(
+        *header.created_at() >= latest_parent.secs(),
+        "header second {} must not precede the latest parent's second {}",
+        header.created_at(),
+        latest_parent.secs(),
+    );
+    // the wait is `latest_parent - now_ms()` measured after `base`; tokio's timer may round the
+    // deadline up to its next millisecond tick
+    let max_wait = Duration::from_millis(latest_parent.as_millis() - base.as_millis() + 1);
+    assert!(
+        waited <= max_wait,
+        "proposer waited {waited:?}, more than the {max_wait:?} gap to the next second"
+    );
 }
 
 /// A proposal at a lower round must not erase the guard record for a higher round.
