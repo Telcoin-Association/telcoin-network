@@ -2452,9 +2452,8 @@ mod test {
         let db = EpochRecordDb::open(dir.path()).expect("reopen after unclean fresh exit");
         drop(db); // clean close seals both packs at the header
 
-        // Both packs are back to header + sentinel — no 1 MiB of sealed padding (also covers #22's
-        // never-appended certs case). Mirrors the drop-then-stat assertion in
-        // `test_epoch_record_db`.
+        // Both packs are back to header + sentinel — no 1 MiB of sealed padding.
+        // Mirrors the drop-then-stat assertion in `test_epoch_record_db`.
         let sealed = DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN;
         for name in [RECORDS_NAME, CERTS_NAME] {
             let len = std::fs::metadata(dir.path().join(name)).expect("stat").len();
@@ -2568,6 +2567,57 @@ mod test {
             "re-save must not append a duplicate cert (got {} certs)",
             certs.len()
         );
+    }
+
+    /// After an unclean reopen of a DB that has records but no certs, the header-only
+    /// padded `epoch_certs.pack` must be trimmed so a later cert append does not seal a 1 MiB zero
+    /// gap that breaks every sequential walk (`read_certs_from_pack`, `db load-state` ->
+    /// `CorruptDb`). Subsumed by the #8 unclean-reopen rebuild, which replays the certs log (0
+    /// certs -> trim to the header) instead of the old `heal_certs`; this locks in the specific
+    /// symptom.
+    #[test]
+    fn test_unclean_reopen_records_no_certs_keeps_cert_log_readable() {
+        let dir = TempDir::with_prefix("test_records_no_certs_unclean").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // Save records ONLY (no certs), persist them (durable), then skip the clean close: models a
+        // crash that leaves `epoch_certs.pack` header-only + mmap-padded and unclean.
+        let mut pairs = Vec::new();
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..5u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save_record(record.clone()).expect("save record");
+                pairs.push((record, cert));
+            }
+            inner.persist().expect("persist");
+            std::mem::forget(inner);
+        }
+
+        // Reopen writable: the unclean certs log is rebuilt -> trimmed to the header (no 1 MiB
+        // gap). Append one cert now; it must land right after the header, not after the
+        // padding.
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("reopen after unclean exit");
+            let (record, cert) = pairs[0].clone();
+            inner.save(record, cert).expect("save cert after reopen");
+            inner.persist().expect("persist");
+            // clean close on drop seals the gap-free cert log
+        }
+
+        // The sequential walk the finding broke must succeed and see exactly the one cert.
+        let certs = EpochRecordDb::read_certs_from_pack(dir.path().join(CERTS_NAME))
+            .expect("read_certs_from_pack must not be CorruptDb");
+        assert_eq!(certs.len(), 1, "exactly the one appended cert, no padding gap");
+        assert_eq!(certs[0].epoch_hash, pairs[0].0.digest());
+
+        // Records survived the unclean reopen too.
+        let records = EpochRecordDb::read_records_from_pack(dir.path().join(RECORDS_NAME))
+            .expect("read_records_from_pack");
+        assert_eq!(records.len(), pairs.len());
     }
 
     /// Generate a deterministic test BLS public key from a seed.
