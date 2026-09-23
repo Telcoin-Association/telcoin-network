@@ -17,7 +17,7 @@ use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
-    sync_num_workers_from_chain,
+    sync_num_workers_from_chain, EngineToPrimaryRpc,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -48,7 +48,7 @@ use tn_types::{
     },
     Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
-    EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Notifier,
+    EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Multiaddr, Notifier,
     ReputationScores, SealedHeader, SignatureVerificationState, SolCall as _, TaskManager,
     TnReceiver as _, TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     MIN_PROTOCOL_BASE_FEE, U256,
@@ -254,6 +254,14 @@ impl EngineToPrimary for NoopEngineToPrimary {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
 
+    async fn consensus_header_by_digest(
+        &self,
+        _epoch: Epoch,
+        _digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
     fn node_info(&self) -> &RpcNodeInfo {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
@@ -261,6 +269,71 @@ impl EngineToPrimary for NoopEngineToPrimary {
     fn node_mode(&self) -> tn_types::NodeMode {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
+}
+
+/// `EngineToPrimaryRpc::consensus_header_by_digest` finds a stored header by (epoch, digest) and
+/// answers `None` for a digest the epoch never stored or an epoch whose pack this node lacks.
+#[tokio::test]
+async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("test_consensus_header_by_digest")?;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // store one header in the current epoch's pack
+    let number = consensus_chain.latest_consensus_number() + 1;
+    let leader = Certificate::default();
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    consensus_chain.write_subdag_for_test(number, sub_dag).await;
+    let stored =
+        consensus_chain.consensus_header_by_number(number).await?.expect("header was just stored");
+    let epoch = stored.sub_dag.leader_epoch();
+
+    let key_config = config.key_config();
+    let key = key_config.primary_public_key();
+    let rpc = EngineToPrimaryRpc::new(
+        consensus_bus.app().clone(),
+        consensus_chain.clone(),
+        RpcNodeInfo {
+            chain_id: config.chain_id(),
+            version: "test",
+            name: "consensus header by digest test".to_owned(),
+            bls_public_key: key,
+            authority_id: key.into(),
+            execution_address: Address::ZERO,
+            primary_network_key: key_config.primary_network_public_key(),
+            worker_network_key: key_config.worker_network_public_key(0),
+            primary_external_address: Multiaddr::empty(),
+            worker_external_address: Multiaddr::empty(),
+        },
+    );
+
+    let found = rpc
+        .consensus_header_by_digest(epoch, stored.digest())
+        .await
+        .expect("stored header is found by its epoch and digest");
+    assert_eq!(found.digest(), stored.digest());
+    assert_eq!(found, stored);
+
+    // the digest of the next header, which this chain has not stored
+    let unknown = ConsensusHeader::digest_from_parts(stored.digest(), &stored.sub_dag, number + 1);
+    assert!(rpc.consensus_header_by_digest(epoch, unknown).await.is_none());
+
+    // a known digest routed to an epoch with no pack on disk is a miss, not a panic or a hit
+    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await.is_none());
+
+    Ok(())
 }
 
 /// A worker's transaction pool charges the base fee supplied at epoch setup (the

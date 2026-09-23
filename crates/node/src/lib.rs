@@ -13,7 +13,9 @@ use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
 use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord};
+use tn_types::{
+    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+};
 use tokio::task::JoinHandle;
 
 pub mod engine;
@@ -125,6 +127,28 @@ impl EngineToPrimary for EngineToPrimaryRpc {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await,
             (Some(epoch), _) => self.get_epoch_by_number(epoch).await,
             (None, None) => None,
+        }
+    }
+
+    async fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        match self.consensus_chain.consensus_header_by_digest(epoch, digest).await {
+            Ok(header) => header,
+            Err(e) => {
+                // an unreadable pack is a hard error in storage, but rpc callers only learn
+                // "not found"; the warn keeps the storage failure visible to operators
+                tracing::warn!(
+                    target: "engine",
+                    ?e,
+                    epoch,
+                    ?digest,
+                    "consensus header lookup failed"
+                );
+                None
+            }
         }
     }
 
