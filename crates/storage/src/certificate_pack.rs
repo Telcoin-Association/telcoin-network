@@ -414,6 +414,12 @@ impl Inner {
             if unclean {
                 digest_idx = Self::reset_index(base_dir, &data)?;
                 Self::rebuild_index(&mut data, &mut digest_idx)?;
+                // Recovery made the log + rebuilt index self-consistent; clear their unclean flags
+                // so the clean `Drop` re-seals them and the next open skips this
+                // rebuild (rather than rebuilding on every restart). A durability
+                // failure still blocks the seal.
+                data.mark_consistent();
+                digest_idx.mark_consistent();
             }
         }
         Ok(Self { data, digest_idx })

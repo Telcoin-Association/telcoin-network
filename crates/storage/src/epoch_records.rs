@@ -1462,7 +1462,18 @@ impl Inner {
                 &mut record_digests,
                 &mut cert_digests,
             )?;
+            // Recovery made both logs + rebuilt indexes self-consistent; clear their unclean flags
+            // so the clean `Drop` re-seals them and the next open skips this rebuild (rather than
+            // rebuilding on every restart). A durability failure still independently blocks the
+            // seal.
+            records.mark_consistent();
+            certs.mark_consistent();
+            epoch_idx.mark_consistent();
+            record_digests.mark_consistent();
+            cert_digests.mark_consistent();
         } else {
+            // Clean open: nothing was unclean, so the handles will seal normally; only the cheap
+            // index-lag heal runs.
             Self::heal_records(&mut records, &mut epoch_idx, &record_digests)?;
             Self::heal_certs(&mut certs, &cert_digests)?;
         }

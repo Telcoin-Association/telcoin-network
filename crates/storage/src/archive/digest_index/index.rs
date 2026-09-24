@@ -479,6 +479,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.hdx_file.opened_unclean() || self.odx_file.opened_unclean()
     }
 
+    /// Clear the "opened unclean" flag on BOTH backing files (hdx main buckets + odx overflow)
+    /// after a successful rebuild, so a clean `Drop` re-seals them and the next open skips
+    /// recovery. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.hdx_file.mark_consistent();
+        self.odx_file.mark_consistent();
+    }
+
     /// Set the data_file_length field. This tracks information about another file but does not
     /// affect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {

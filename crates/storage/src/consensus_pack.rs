@@ -1081,11 +1081,20 @@ impl Inner {
         data: &mut Pack<PackRecord>,
         base_dir: P,
         mut consensus_pos_idx: PositionIndex<IndexPositions>,
-        consensus_digests: HdxIndex,
-        batch_digests: HdxIndex,
+        mut consensus_digests: HdxIndex,
+        mut batch_digests: HdxIndex,
     ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
         if Self::files_consistent(data, &mut consensus_pos_idx, &consensus_digests, &batch_digests)
         {
+            // Already consistent: nothing to rebuild. Mark every handle consistent so a clean
+            // `Drop` (re-)seals it. For a v2 pack reaching here all four are already
+            // clean (no-op); for a consistent legacy v1 pack (its length cross-checks
+            // pass without a sentinel) this preserves the previous always-seal-on-close
+            // behaviour.
+            data.mark_consistent();
+            consensus_pos_idx.mark_consistent();
+            consensus_digests.mark_consistent();
+            batch_digests.mark_consistent();
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
         let base_dir = base_dir.as_ref();
@@ -1194,6 +1203,15 @@ impl Inner {
             elapsed_ms = recover_start.elapsed().as_millis() as u64,
             "pack WAL recovery complete"
         );
+        // Recovery rewound the log to its last complete output and rebuilt the indexes from it, so
+        // all four handles are now self-consistent. Clear their unclean flags so the clean `Drop`
+        // re-seals them and the next open skips this replay (rather than rebuilding on every
+        // restart). A `write_failed` durability failure still independently blocks the seal, so
+        // this can never seal a tail that did not reach disk.
+        data.mark_consistent();
+        consensus_pos_idx.mark_consistent();
+        consensus_digests.mark_consistent();
+        batch_digests.mark_consistent();
         Ok((consensus_pos_idx, consensus_digests, batch_digests))
     }
 
@@ -4903,6 +4921,11 @@ pub(crate) mod test {
             pack.persist().await.expect("persist");
         }
 
+        // Perf-regression guard: recovery must `mark_consistent` (and the clean `Drop` re-seal)
+        // every backing file, so the next open finds them consistent instead of rebuilding the
+        // whole WAL on every restart.
+        assert_all_pack_files_sealed(&epoch_dir);
+
         // Consistent again, and every output is reachable by number and by digest.
         let pack =
             ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after rebuild");
@@ -4951,6 +4974,32 @@ pub(crate) mod test {
                     "batch digest for output {i} must be indexed after rebuild"
                 );
             }
+        }
+    }
+
+    /// Perf-regression guard: after a recover + clean-drop cycle, every backing file (the data
+    /// log and all index files) must carry a valid clean-close sentinel — `opened_unclean()` is
+    /// false. If recovery did not `mark_consistent` (and thus re-seal) a rebuilt file, that file
+    /// would reopen unclean and force a full WAL rebuild on EVERY restart. Each file is read with a
+    /// read-only `MmapDataFile` (whose `Drop` never seals), so the check itself never mutates
+    /// state.
+    fn assert_all_pack_files_sealed(epoch_dir: &std::path::Path) {
+        use crate::archive::data_file::MmapDataFile;
+        let files = [
+            epoch_dir.join(Inner::DATA_NAME),
+            epoch_dir.join(Inner::CONSENSUS_POS_NAME).join("index_pos.pdx"),
+            epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx"),
+            epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.odx"),
+            epoch_dir.join(Inner::BATCH_HASH_NAME).join("index.hdx"),
+            epoch_dir.join(Inner::BATCH_HASH_NAME).join("index.odx"),
+        ];
+        for f in files {
+            let df = MmapDataFile::open(&f, true).expect("open backing file read-only");
+            assert!(
+                !df.opened_unclean(),
+                "backing file must be sealed after recovery (else it rebuilds every restart): {}",
+                f.display(),
+            );
         }
     }
 

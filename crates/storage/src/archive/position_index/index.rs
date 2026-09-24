@@ -217,6 +217,13 @@ impl<T: PosIndexValue> PositionIndex<T> {
         self.pdx_file.opened_unclean()
     }
 
+    /// Clear the backing pdx file's "opened unclean" flag after a successful rebuild, so a clean
+    /// `Drop` re-seals it and the next open skips recovery. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.pdx_file.mark_consistent();
+    }
+
     /// Return an iterator over file positions with up to len items.
     pub fn iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };

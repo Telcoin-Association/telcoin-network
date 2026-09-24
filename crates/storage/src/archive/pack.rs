@@ -62,6 +62,15 @@ where
         self.inner.opened_unclean()
     }
 
+    /// Clear the backing data file's "opened unclean" flag after a successful recovery/heal, so a
+    /// clean `Drop` re-seals the pack (and a reopen reports it clean) instead of replaying the WAL
+    /// on every restart. Callers invoke this once recovery has made the log + its derived
+    /// indexes self-consistent. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.inner.mark_consistent();
+    }
+
     /// Clamp a read-only pack's read bound down to `logical_end` (the index-attested record end),
     /// so reads never touch bytes above the committed data even if the underlying file were
     /// physically padded. Defense-in-depth against the read-only-mmap SIGBUS window; no-op on a
@@ -304,6 +313,12 @@ where
     /// sealed).
     fn opened_unclean(&self) -> bool {
         self.data_file.opened_unclean()
+    }
+
+    /// Clear the backing data file's "opened unclean" flag (see
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent)).
+    fn mark_consistent(&mut self) {
+        self.data_file.mark_consistent();
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.

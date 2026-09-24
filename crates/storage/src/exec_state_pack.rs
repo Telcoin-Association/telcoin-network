@@ -386,6 +386,12 @@ impl ExecStatePackWriter {
     pub fn finish(mut self) -> Result<ExecStateStats, ExecStatePackError> {
         Self::append(&mut self.data, &ExecStateRecord::End(self.stats))?;
         self.data.commit().map_err(|e| ExecStatePackError::Persist(e.to_string()))?;
+        // The write-once export is complete and committed; mark it consistent so the clean `Drop`
+        // seals it even if this pack had been reopened over an interrupted prior attempt (a fresh
+        // export is already clean, so this is a no-op then). A failed commit returns early above,
+        // and a `write_failed` poison would still block the seal, so a torn export is never
+        // sealed.
+        self.data.mark_consistent();
         Ok(self.stats)
     }
 
