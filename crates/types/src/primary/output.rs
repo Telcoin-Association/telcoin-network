@@ -661,8 +661,9 @@ mod tests {
     /// the seed conjunct alone, so deleting the PREVRANDAO fork point from
     /// `prevrandao_seed_active` would leave the keeper green. Pin the strict inequality here
     /// rather than tightening `forks`, which states a rollout contract (`>=`) that is correct on
-    /// its own terms; an arming PR that lands on equality fails to compile its tests and has to
-    /// retarget the keeper deliberately.
+    /// its own terms. The adiri schedule clears it (seed fork 383, PREVRANDAO fork 574, so the
+    /// `pre_fork` probe at 573 is seed-active); a retarget that lands on equality fails to
+    /// compile its tests and has to rework the keeper deliberately.
     #[cfg(feature = "adiri")]
     const _: () = assert!(
         crate::forks::PREVRANDAO_FORK_EPOCH > crate::forks::SEED_SIGNATURE_FORK_EPOCH,
@@ -769,15 +770,19 @@ mod tests {
         }
     }
 
-    /// THE boundary keeper for #1247: the arm switch must happen AT `PREVRANDAO_FORK_EPOCH`.
-    /// Both epochs derive from the constant, so an arming PR retargets this with no edit here.
+    /// THE boundary keeper for #1247: the arm switch must happen AT `PREVRANDAO_FORK_EPOCH`
+    /// (574 on adiri, so epoch 573 replays the legacy XOR and 574 takes the seeded derivation).
+    /// Both epochs derive from the constant, so moving the fork epoch retargets this with no
+    /// edit here.
     #[cfg(feature = "adiri")]
     #[test]
     fn prev_randao_switches_arms_at_the_prevrandao_fork_epoch() {
         let post_fork = crate::forks::PREVRANDAO_FORK_EPOCH;
         let pre_fork = post_fork - 1;
-        // anti-vacuity tripwire, mirroring `committee_sweep_tests.rs`: an ambient override or an
-        // armed fork would make both sides land on the same arm and pass for the wrong reason
+        // anti-vacuity tripwire, mirroring `committee_sweep_tests.rs`: the probes are 573 (legacy)
+        // and 574 (seeded), and an ambient override (`TN_PREVRANDAO_FORK_EPOCH`, or a
+        // `TN_SEED_SIGNATURE_FORK_EPOCH` above 574) would put both on the same arm and let the
+        // test pass for the wrong reason
         assert!(
             !crate::forks::prevrandao_seed_active(pre_fork),
             "epoch {pre_fork} must be pre-fork for this keeper to mean anything; is \

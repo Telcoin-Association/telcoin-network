@@ -1390,8 +1390,8 @@ mod tests {
     /// Pre-fork the legacy committee layout cannot carry a worker count, so entry halts rather than
     /// deferring the failure to the first pack write.
     ///
-    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
-    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// The adiri fork epoch is 570 (floored at 407), so epoch 0 is pre-fork in this lane even if
+    /// the constant is retargeted.
     /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
