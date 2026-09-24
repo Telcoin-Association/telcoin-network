@@ -48,7 +48,7 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
 |---|---|
 | `nonce` | `((epoch as u64) << 32) \| round` of the leader certificate (`tn-types` `primary/header.rs`; decoded by `deconstruct_nonce`). Epoch = high 32 bits, round = low 32 bits. |
 | `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` (canonical in `tn-types` `gas_accumulator.rs`, re-exported from `src/snapshot.rs`) reads the low 16 bits. |
-| `mix_hash` | Computed in `crates/engine/src/payload_builder.rs` via `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs`), fork-gated on `prevrandao_seed_active` for the committing leader's epoch (`PREVRANDAO_FORK_EPOCH` in `tn-types` `forks.rs`, conjoined fail-closed with the seed-signature fork). Before the fork: `output_digest ^ batch_digest` when the output has batches, plain `output_digest` otherwise. From the fork epoch: `keccak256("TN_PREVRANDAO_V1" \|\| epoch seed chain value as of this commit \|\| consensus block number \|\| batch index)` (integers little-endian u64); the seed chain value advances every commit (one folded deterministic seed signature per commit), and the epoch's closing block publishes the closing commit's value as `extra_data`, a checkpoint that reproduces only that final commit's blocks. Exposed as `prevrandao` (EIP-4399). Post-fork the value cannot be ground by re-cutting the payload, but the committing leader computes every value before broadcasting and keeps one propose-or-withhold choice per commit . . . not unbiasable randomness on its own. |
+| `mix_hash` | Computed in `crates/engine/src/payload_builder.rs` via `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs`), fork-gated on `prevrandao_seed_active` for the committing leader's epoch (`PREVRANDAO_FORK_EPOCH` in `tn-types` `forks.rs`, armed at adiri epoch 574 and conjoined fail-closed with the seed-signature fork; non-adiri builds are post-fork from genesis). Before the fork: `output_digest ^ batch_digest` when the output has batches, plain `output_digest` otherwise. From the fork epoch: `keccak256("TN_PREVRANDAO_V1" \|\| epoch seed chain value as of this commit \|\| consensus block number \|\| batch index)` (integers little-endian u64); the seed chain value advances every commit (one folded deterministic seed signature per commit), and the epoch's closing block publishes the closing commit's value as `extra_data`, a checkpoint that reproduces only that final commit's blocks. Exposed as `prevrandao` (EIP-4399). Post-fork the value cannot be ground by re-cutting the payload, but the committing leader computes every value before broadcasting and keeps one propose-or-withhold choice per commit . . . not unbiasable randomness on its own. |
 | `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte epoch-close randomness, which is epoch-gated on `seed_signature_active` (legacy keccak256 of the leader certificate's aggregate BLS signature before the fork epoch, epoch seed chain value as of the closing commit from the fork epoch on). The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
 | `parent_beacon_block_root` | Digest of the `ConsensusHeader` that committed the executed transactions. Written to the EIP-4788 beacon-roots contract once per consensus output (only on the first batch, `apply_pre_execution_changes` in `src/evm/block.rs`). |
 | `ommers_hash` | Digest of the executed `Batch`; `B256::ZERO` when the output carried no batches. |
@@ -76,9 +76,12 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
   (`crates/batch-builder/src/batch.rs`) marks blob transactions invalid via
   `BestTxns::ignore_eip4844` and purges them and their descendants with
   `WorkerTxPool::remove_eip4844_txs` (which also deletes sidecars from the blob store).
-- The in-protocol `ConsensusRegistry` upgrade is gated by `CONSENSUS_REGISTRY_FORK_EPOCH`
-  (`tn-types` `forks.rs`, currently armed at adiri epoch 407) and compiled only under the
-  `adiri` feature. See "ConsensusRegistry fork gate" below.
+- The in-protocol `ConsensusRegistry` upgrade is gated by `CONSENSUS_REGISTRY_FORK_EPOCH` (`tn-types` `forks.rs`, armed at adiri epoch 407) and compiled only under the `adiri` feature.
+  See "ConsensusRegistry fork gate" below.
+- The governance-Safe fork is gated by `GOVERNANCE_SAFE_FORK_EPOCH` (`tn-types` `forks.rs`, armed at adiri epoch 554, so it fires in the closing block of epoch 553) and is also compiled only under the `adiri` feature.
+  It installs the canonical Safe v1.4.1 suite and moves adiri's governance Safe proxy onto `SafeL2` (`apply_governance_safe_fork` in `src/evm/block.rs`); mainnet genesis already carries that end state, so non-adiri builds have no counterpart.
+  It fails closed: if the deployed `Safe` singleton, `SafeProxyFactory` or governance proxy code does not match its pinned `*_PRE_FORK_CODE_HASH`, or the proxy's slot 0 no longer holds the L1 `Safe` singleton, the closing block aborts on every node alike.
+  See step 2 of "Epoch close" below.
 
 ## Epoch close
 
@@ -95,7 +98,17 @@ failure**:
    post-fork sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
    `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
    block.
-2. The four boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
+2. *(adiri builds only)* If `concluding_epoch + 1 == governance_safe_fork_epoch()`, apply the governance-Safe fork (`apply_governance_safe_fork`).
+   `governance_safe_fork_epoch()` returns `GOVERNANCE_SAFE_FORK_EPOCH` (armed at 554) unless a `test-utils` build overrides it through `TN_GOVERNANCE_SAFE_FORK_EPOCH`.
+   The trigger is a one-shot `==` on its own constant, independent of step 1, so it fires exactly once, in the closing block of epoch 553.
+   The fork etches the eleven canonical Safe v1.4.1 contracts adiri lacks, swaps the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical bytes, rewrites the governance proxy's singleton slot (slot 0) to `SafeL2` and its fallback-handler slot to the canonical `CompatibilityFallbackHandler`, and raises the Safe Singleton Factory deployer's nonce to 1 if it is lower.
+   Each swap fails closed unless the deployed code hash matches its pin (`SAFE_SINGLETON_PRE_FORK_CODE_HASH`, `SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`), and the proxy migration fails closed unless the proxy code matches `GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH` and slot 0 holds the L1 `Safe` singleton.
+   State already at the fork's end (canonical singleton or factory bytes, slot 0 on `SafeL2`) also passes these gates, so re-executing the boundary over forked state is a no-op.
+   The etches and the fallback-handler write are deliberately not fail-closed: an unexpected occupant is displaced and logged at `warn!` rather than halting the fleet.
+   Every gate is checked against committed state before a single commit, so a failed gate aborts the block with no partial migration.
+   The fork is a direct state edit, not a system call, so it spends no system-call gas and adds no `call` series to the `tn_reth_epoch_close_*` gauges.
+   Nothing later in the close reads Safe state; the step sits after the registry pair and before the system calls to keep the forks-lead convention, not because of a data dependency.
+3. The four boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
    order that is itself a consensus-safety obligation: `applyIncentives(RewardInfo[])` first
    (the reward infos carry each validator's consensus-leader count, weighted on pre-slash
    collateral), then `applySlashes(Slash[])` (the slashes carrier — the protocol passes an
@@ -408,7 +421,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/env/rpc.rs` | Assembles and starts reth's RPC server over the worker pool + `WorkerNetwork`; no engine namespace. |
 | `src/error.rs` | `TnRethError` and the state-read error taxonomy. |
 | `src/evm/mod.rs` | `TNEvm` wrapper over revm; `transact_system_call` (100M gas, fee-exempt, nonce-check disabled); pre-genesis create. |
-| `src/evm/block.rs` | `TNBlockExecutor` (pre-block system contracts, epoch-close sequence, registry fork) and `TNBlockAssembler` (header assembly); committee assembly. |
+| `src/evm/block.rs` | `TNBlockExecutor` (pre-block system contracts, epoch-close sequence, registry and governance-Safe forks) and `TNBlockAssembler` (header assembly); committee assembly. |
 | `src/evm/config.rs` | `TnEvmConfig`: EVM env derivation, difficulty packing, `extra_data` decode for replay. |
 | `src/evm/context.rs` | revm context type aliases and builder traits. |
 | `src/evm/factory.rs` | `TNEvmFactory` / `TNBlockExecutorFactory`; installs TEL + BLS precompiles on every EVM instance. |
@@ -435,6 +448,6 @@ From `crates/tn-reth/Cargo.toml`:
 | Feature | Effect |
 |---|---|
 | `faucet` | Instant role-gated TEL mint replacing the timelocked mint. **Never on mainnet.** |
-| `adiri` | Adiri-testnet build: enables the registry fork machinery and **implies `faucet`**. |
+| `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
 | `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). |

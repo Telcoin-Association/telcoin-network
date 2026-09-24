@@ -1,4 +1,4 @@
-//! Deterministic parameter sweep over the epoch-gated `Committee` wire layout (#554).
+//! Deterministic parameter sweep over the epoch-gated `Committee` wire layout (issue #554).
 //!
 //! Every combination of (epoch, authority count, bootstrap-server count, workers per server)
 //! below is checked against a byte-length oracle and a byte-exact re-encode. The grid is
@@ -14,8 +14,8 @@
 //! the encoder unconditionally wrote (or unconditionally stripped) the multi-worker fields.
 //!
 //! The epoch axis brackets the fork boundary and is derived from
-//! [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`] itself, so arming the fork retargets this
-//! sweep with no edit here. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately never set: the
+//! [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`] itself, so moving the fork epoch retargets
+//! this sweep with no edit here. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately never set: the
 //! sweep asserts what this build's lane actually does, and an override would only prove that
 //! the override works.
 //!
@@ -80,7 +80,7 @@ struct LegacyCommitteeMirror {
     bootstrap_servers: BTreeMap<BlsPublicKey, LegacyBootstrapMirror>,
 }
 
-/// The adiri grid derives three of its four epochs from the fork constant, so arming the fork
+/// The adiri grid derives two of its four epochs from the fork constant, so moving the fork epoch
 /// retargets the sweep without an edit here. That only stays meaningful while at least one epoch
 /// below the constant exists: a fork epoch of zero would make every epoch post-fork and silently
 /// drop both the legacy arm and every fail-closed point from this lane. Subtracting one from the
@@ -92,10 +92,7 @@ const _: () = assert!(tn_types::forks::MULTI_WORKERS_FORK_EPOCH != 0);
 /// Epochs swept under `adiri`: the legacy floor, both sides of the fork boundary (the last
 /// pre-fork epoch and the first gate-open one), and the top of the epoch range.
 ///
-/// The constant is a dormant `u32::MAX` placeholder today, which collapses the last two entries
-/// onto one another — [`sweep_epochs`] dedupes rather than this list hardcoding today's shape.
-/// `u32::MAX` is itself gate-open even while the fork is dormant, since the gate is `>=`, so this
-/// lane covers both arms before and after arming.
+/// With the fork epoch at 570 these are 0, 569, 570 and `Epoch::MAX`, two on each side of the gate.
 #[cfg(feature = "adiri")]
 const SWEEP_EPOCHS: [Epoch; 4] = [
     0,
@@ -129,9 +126,9 @@ const WORKER_SEED_TAG: u8 = 0xE0;
 
 /// The distinct epochs of [`SWEEP_EPOCHS`].
 ///
-/// Deduped rather than listed: while the adiri fork epoch is the `u32::MAX` placeholder, two of
-/// its four entries are the same epoch, and lowering the constant separates them again with no
-/// edit here.
+/// Deduped rather than listed: the armed adiri fork epoch keeps all four entries distinct, but a
+/// fork epoch of 1 or `Epoch::MAX` makes two of them the same epoch, and the set sweeps that epoch
+/// once with no edit here.
 fn sweep_epochs() -> BTreeSet<Epoch> {
     SWEEP_EPOCHS.into_iter().collect()
 }
@@ -464,7 +461,7 @@ fn test_committee_sweep_grid_brackets_the_fork() {
         BTreeSet::from([false, true]),
         gate_states,
         "the adiri grid must cover both gate states; is TN_MULTI_WORKERS_FORK_EPOCH set in \
-         the environment, or has the fork been armed at epoch 0?"
+         the environment, or is the fork epoch 0?"
     );
 
     #[cfg(not(feature = "adiri"))]
@@ -500,8 +497,8 @@ fn test_committee_layout_parameter_sweep() {
 }
 
 /// Negative keeper (adiri): rewriting the `epoch` field inside an encoded post-fork [`Committee`]
-/// to the dormant side of the fork makes the decoder read everything after it with the legacy field
-/// set, and that decode MUST fail.
+/// to a pre-fork epoch makes the decoder read everything after it with the legacy field set, and
+/// that decode MUST fail.
 ///
 /// The gate reads the epoch carried inside the value, so the layout selector travels with the very
 /// bytes it selects for and one corrupted field can point it at the wrong layout. Succeeding here
@@ -511,14 +508,14 @@ fn test_committee_layout_parameter_sweep() {
 ///
 /// Adiri-only because it needs a legacy arm to mis-select; every other build is gate-open from
 /// genesis, which the sibling below states instead. Both epochs come from
-/// [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`], so arming the fork retargets this keeper with
-/// no edit here.
+/// [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`], so moving the fork epoch retargets this keeper
+/// with no edit here.
 #[cfg(feature = "adiri")]
 #[test]
 fn test_committee_epoch_corruption_fails_loudly() {
     let post_fork = tn_types::forks::MULTI_WORKERS_FORK_EPOCH;
-    // the corruption nearest the boundary: one epoch below the gate, which while the constant is
-    // the `u32::MAX` placeholder is a single byte of the encoded epoch
+    // the corruption nearest the boundary: one epoch below the gate, which at the armed fork epoch
+    // (570 to 569) rewrites a single byte of the encoded epoch
     let pre_fork = post_fork - 1;
     assert!(
         multi_workers_fork_active(post_fork),
@@ -527,9 +524,8 @@ fn test_committee_epoch_corruption_fails_loudly() {
     );
     assert!(
         !multi_workers_fork_active(pre_fork),
-        "epoch {pre_fork} must be dormant for this keeper to mean anything; is \
-         TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
-         epoch 0?"
+        "epoch {pre_fork} must be pre-fork for this keeper to mean anything; is \
+         TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or is the fork epoch 0?"
     );
 
     let point = epoch_poke_point(post_fork);
@@ -565,7 +561,7 @@ fn test_committee_epoch_corruption_fails_loudly() {
 #[cfg(not(feature = "adiri"))]
 #[test]
 fn test_committee_epoch_poke_leaves_the_genesis_active_layout_intact() {
-    // genesis is the poke target because under `adiri` it is the deepest dormant epoch there is,
+    // genesis is the poke target because under `adiri` it is the deepest pre-fork epoch there is,
     // so this states plainly that no epoch selects a different layout here. no constant marks a
     // boundary on this lane, so the source epoch is a literal like the rest of the non-adiri grid.
     let poked_epoch: Epoch = 0;
