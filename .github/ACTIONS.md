@@ -126,7 +126,7 @@ This is documented, not enforced by GitHub: nothing stops a maintainer from queu
 ## Caches
 
 `main` is the only cache writer.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (both clippy passes under the nightly pin) and `test-cache` (the test binaries of both test lanes, default and adiri features, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
@@ -135,7 +135,7 @@ When the entry already matches, the run restores it, rebuilds only the workspace
 Two properties of `Swatinem/rust-cache` shape all of this:
 
 - The key is `<prefix-key>-<shared-key>-<os>-<hash of rustc and every CARGO*/RUST*
-  variable in the environment>-<hash of the lockfiles>`. So the `env:` block and the steps
+  variable in the environment>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`. So the `env:` block and the steps
   before the cache step must be identical in `cache-deps.yaml` and `pr.yaml`; they are,
   and both files say so. The clippy jobs hash seven variables (the six in `env:` plus
   `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
@@ -146,10 +146,9 @@ Two properties of `Swatinem/rust-cache` shape all of this:
   builds (a lane added, a feature set changed) writes nothing until the key changes: bump
   `prefix-key` in both workflows, `cache-deps.yaml` first, then `pr.yaml` once `main` has
   written the new entries. (Or delete the entries under Settings -> Actions -> Caches and
-  re-run the warm.) That is why `pr.yaml` still restores `v0-rust-*` entries while
-  `cache-deps.yaml` already writes `v1-rust-*`: a follow-up flips `pr.yaml` to
-  `prefix-key: v1-rust` once the first warm has landed on `main`, after which the
-  `v0-rust-*` entries can be deleted.
+  re-run the warm.) Both workflows now use `prefix-key: v1-rust`; the old
+  `v0-rust-*` entries can be deleted after the first successful PR and merge-group
+  runs restore `v1-rust-*`.
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
