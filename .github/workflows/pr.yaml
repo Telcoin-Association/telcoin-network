@@ -188,7 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       # Before the cache step: RUST_NIGHTLY is part of the cache key (rust-cache hashes
@@ -200,14 +200,11 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
-      # Restore only; cache-deps.yaml writes the entries on main (see the header). The
-      # `prefix-key` deliberately still defaults to v0-rust: the v1-rust entries cache-deps
-      # now writes do not exist until it has run on main, and a fully cold queue run would
-      # hit the timeout. Flip all three cache steps to `prefix-key: v1-rust` in a follow-up
-      # once it has (see .github/ACTIONS.md, "Caches").
+      # Restore only; cache-deps.yaml writes the v1-rust entries on main.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
+          prefix-key: v1-rust
           shared-key: clippy-cache
           save-if: "false"
 
@@ -228,7 +225,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
@@ -243,6 +240,7 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
+          prefix-key: v1-rust
           shared-key: test-cache
           save-if: "false"
 
@@ -272,7 +270,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
@@ -289,6 +287,7 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
+          prefix-key: v1-rust
           shared-key: test-cache
           save-if: "false"
 

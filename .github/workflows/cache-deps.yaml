@@ -3,18 +3,19 @@
 # main is the only writer. A cache saved by a pull_request run is scoped to that PR's
 # branch and one saved by a merge_group run lands on the queue's throwaway branch, so no
 # other run ever reads either. pr.yaml therefore only restores (`save-if: "false"`), on
-# both events, and reads what this workflow wrote on main. A lane's cold build is paid
-# once here, off the critical path, instead of on every queue entry.
+# both events, and reads what this workflow wrote on main. A lane's cold dependency build
+# is paid once here, off the critical path, instead of on every queue entry.
 #
 # Two jobs, two entries, one per toolchain pr.yaml uses:
 #
 #   clippy-cache  both clippy passes (default and --all-features) under the nightly pin;
 #                 read by pr.yaml's `clippy` job
-#   test-cache    the test binaries of both test lanes (default and adiri features) under
-#                 the stable pin; read by `test` and `adiri-test`
+#   test-cache    dependencies for both test lanes (default and adiri features) under
+#                 the stable pin; read by `test` and `adiri-test`. Workspace test binaries
+#                 are rebuilt per run because rust-cache does not save workspace crates.
 #
 # rust-cache's key is <prefix-key>-<shared-key>-<os>-<hash of the rustc version and every
-# CARGO*/RUST* variable in the environment>-<hash of the lockfiles>. For a restore in
+# CARGO*/RUST* variable in the environment>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>. For a restore in
 # pr.yaml to hit, the env block and every step before the cache step must match this file:
 # the same six variables, plus RUST_NIGHTLY written to GITHUB_ENV before the cache step in
 # the clippy jobs. Keep the two files in lockstep by hand; there is no shared definition
@@ -81,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       # Before the cache step: RUST_NIGHTLY is part of the key.
@@ -110,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
