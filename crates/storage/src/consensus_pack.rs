@@ -2541,6 +2541,30 @@ fn max_batches_per_output(committee: &Committee) -> usize {
     committee.size().saturating_mul(MAX_GC_DEPTH as usize).saturating_mul(MAX_HEADER_NUM_OF_BATCHES)
 }
 
+// Test-only override for `output_buffer_budget` so the per-output decoded-memory bound can be
+// exercised without GB-scale fixtures. Thread-local, so parallel tests don't interfere.
+#[cfg(test)]
+thread_local! {
+    static TEST_OUTPUT_BUFFER_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Aggregate budget on the DECODED footprint (`tx_count * size_of::<Vec<u8>>() + tx_bytes`) of all
+/// batches buffered for a single consensus output. `2x` the honest byte-content ceiling
+/// (`max_batches_per_output * max_batch_size`): an honest output's per-transaction `Vec` overhead
+/// is a small fraction of its bytes (real transactions are >= ~65 bytes), so this never rejects a
+/// legitimate output, while a crafted flood of tiny transactions — each within the per-batch byte
+/// cap but carrying 24 B of `Vec` overhead apiece — is rejected before it can exhaust memory.
+fn output_buffer_budget(committee: &Committee) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.get()) {
+        return limit;
+    }
+    max_batches_per_output(committee)
+        .saturating_mul(max_batch_size(committee.epoch()))
+        .saturating_mul(2)
+}
+
 /// What the caller already knows about the consensus header of the output being decoded, used to
 /// reject a bad or forged header the instant it is read — before any `Batch` record is buffered.
 ///
@@ -2778,6 +2802,15 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     let mut expected_batch_digests = expected_batch_digests.into_iter();
 
     let mut available_batches = HashMap::new();
+    // Aggregate per-output budget on the DECODED footprint of the buffered batches (not just their
+    // transaction bytes): each `Vec<u8>` transaction costs `size_of::<Vec<u8>>()` beyond its data,
+    // so a flood of tiny transactions across the allowed batch fan-out could each pass the
+    // per-batch byte cap yet still exhaust memory. 2x the honest byte-content ceiling — an
+    // honest output's overhead is a small fraction of its bytes (real transactions are >= ~65
+    // bytes) — so this never rejects a legitimate output while bounding the
+    // crafted-tiny-transaction case.
+    let output_buffer_limit = output_buffer_budget(committee);
+    let mut buffered_decoded = 0usize;
     // Load and verify batches.  Batches are matched positionally against `expected_batch_digests`
     // (sorted digest order): producers write them in `BTreeMap`/`BTreeSet` digest order (see
     // `collect_batches` / `save_consensus_batches`), so the stream MUST arrive in that same order.
@@ -2809,6 +2842,20 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                 let max = max_batch_size(committee.epoch());
                 if batch_bytes > max {
                     return Err(PackError::BatchTooLarge { size: batch_bytes, max });
+                }
+                // Charge this batch's decoded footprint against the per-output budget before
+                // buffering.
+                let batch_decoded = batch
+                    .transactions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>())
+                    .saturating_add(batch_bytes);
+                buffered_decoded = buffered_decoded.saturating_add(batch_decoded);
+                if buffered_decoded > output_buffer_limit {
+                    return Err(PackError::OutputTooLarge {
+                        size: buffered_decoded,
+                        max: output_buffer_limit,
+                    });
                 }
                 referenced_batches.insert(digest);
                 available_batches.insert(digest, batch);
@@ -2895,6 +2942,10 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
     let mut referenced_batches = HashSet::new();
     let mut batch_records = 0_usize;
     let max_batches = max_batches_per_output(committee);
+    // Aggregate per-output decoded-memory budget (see `iter_to_output`): bounds a tiny-transaction
+    // flood across the batch fan-out that individually passes the per-batch byte cap.
+    let output_buffer_limit = output_buffer_budget(committee);
+    let mut buffered_decoded = 0usize;
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
@@ -2920,6 +2971,20 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 let max = max_batch_size(committee.epoch());
                 if batch_bytes > max {
                     return Err(PackError::BatchTooLarge { size: batch_bytes, max });
+                }
+                // Charge this batch's decoded footprint against the per-output budget (see
+                // `iter_to_output`) before buffering.
+                let batch_decoded = batch
+                    .transactions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>())
+                    .saturating_add(batch_bytes);
+                buffered_decoded = buffered_decoded.saturating_add(batch_decoded);
+                if buffered_decoded > output_buffer_limit {
+                    return Err(PackError::OutputTooLarge {
+                        size: buffered_decoded,
+                        max: output_buffer_limit,
+                    });
                 }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
@@ -3189,6 +3254,17 @@ pub enum PackError {
         /// The per-epoch limit (`max_batch_size`) it exceeded.
         max: usize,
     },
+    /// The batches buffered for one consensus output exceeded the per-output decoded-memory
+    /// budget. Bounds the DECODED footprint (each `Vec<u8>` transaction costs
+    /// `size_of::<Vec<u8>>()` beyond its bytes), so a flood of tiny transactions across the
+    /// allowed batch fan-out cannot OOM the import even though each individual batch is within
+    /// `max_batch_size`.
+    OutputTooLarge {
+        /// The decoded footprint accumulated so far.
+        size: usize,
+        /// The per-output budget it exceeded.
+        max: usize,
+    },
 }
 
 impl PackError {
@@ -3289,6 +3365,13 @@ impl Display for PackError {
             }
             PackError::BatchTooLarge { size, max } => {
                 write!(f, "batch of {size} transaction bytes exceeds the {max}-byte limit")
+            }
+            PackError::OutputTooLarge { size, max } => {
+                write!(
+                    f,
+                    "buffered batches for one output decode to {size} bytes, exceeds the \
+                     {max}-byte per-output budget"
+                )
             }
         }
     }
@@ -4183,6 +4266,133 @@ pub(crate) mod test {
         assert!(
             matches!(res, Err(PackError::BatchTooLarge { .. })),
             "an oversized v0 batch must be rejected as BatchTooLarge, got {res:?}"
+        );
+    }
+
+    /// A batch carrying a zero-byte (empty) transaction is invalid and must fail the import at
+    /// decode — a peer uses a flood of empty transactions (which compress to almost nothing but
+    /// decode to a huge `Vec<Vec<u8>>`) to exhaust memory. The `Batch` deserializer rejects it, so
+    /// `bytes_to_output` errors instead of buffering it.
+    #[tokio::test]
+    async fn test_iter_to_output_rejects_empty_transaction() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_empty_tx").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // One batch whose single transaction is zero bytes.
+        let bad = Batch::new_for_test(vec![vec![]], ExecHeader::default(), 0, committee.epoch());
+        let authority = committee.authorities();
+        let authority = authority.first().expect("committee has authorities");
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority.id());
+        leader.update_header_for_test(
+            HeaderBuilder::from_header(leader.header()).with_payload_batch(&bad, 0_u16).build(),
+        );
+        leader.update_header_epoch_for_test(committee.epoch());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let header = ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag,
+            number: 1,
+            extra: Default::default(),
+        };
+
+        let path = temp_dir.path().join("empty_tx");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            // Encoding does not validate, so the malicious batch is written; decode must reject it.
+            pack.append(&PackRecord::Batch(bad)).expect("append empty-tx batch");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a batch with a zero-byte transaction must be rejected on import, got {res:?}"
+        );
+    }
+
+    /// Even with empty transactions rejected and each batch within the per-batch byte cap, a
+    /// flood of tiny (1-byte) transactions across the batch fan-out would still exhaust memory via
+    /// the 24-byte `Vec<u8>` overhead per transaction. The aggregate per-output decoded-memory
+    /// budget rejects it. Uses a test-only small budget so the bound is exercised without
+    /// GB-scale fixtures.
+    #[tokio::test]
+    async fn test_iter_to_output_legacy_rejects_output_over_budget() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output_legacy, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_output_budget_v0").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Shrink the per-output budget so three small batches trip it (real budget is GB-scale).
+        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(Some(3 * 1024 * 1024)));
+
+        // Each batch: 50k single-byte transactions — non-empty (decodes fine) and only 50 KB of
+        // transaction bytes (within the per-batch cap), but ~1.19 MB of DECODED footprint (24 B of
+        // `Vec` overhead per tx). Three exceed the 3 MiB budget.
+        let tiny_batch = || {
+            Batch::new_for_test(
+                vec![vec![1_u8]; 50_000],
+                ExecHeader::default(),
+                0,
+                committee.epoch(),
+            )
+        };
+        let path = temp_dir.path().join("budget_v0");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            for _ in 0..3 {
+                pack.append(&PackRecord::Batch(tiny_batch())).expect("append batch");
+            }
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output_legacy(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        // Reset before asserting so a failure doesn't leak the override into other tests on this
+        // thread.
+        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(None));
+        assert!(
+            matches!(res, Err(PackError::OutputTooLarge { .. })),
+            "a tiny-transaction batch fan-out must be rejected as OutputTooLarge, got {res:?}"
         );
     }
 

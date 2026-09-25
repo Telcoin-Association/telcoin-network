@@ -7,8 +7,11 @@ use crate::{
     crypto, encode, Address, BlockHash, BlsPublicKey, Epoch, ExecHeader, RpcInfo, TimestampSec,
     MIN_PROTOCOL_BASE_FEE,
 };
-use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::fmt::{self, Debug};
 use thiserror::Error;
 
 use super::WorkerId;
@@ -62,6 +65,13 @@ impl SealedBatch {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Batch {
     /// The collection of transactions in this batch as bytes.
+    ///
+    /// Decoded through [`deserialize_transactions`], which rejects a zero-byte (empty) transaction
+    /// and bounds the transaction count at [`MAX_TXS_PER_BATCH`] before allocating — an untrusted
+    /// peer must not be able to make a tiny compressed record decode into a huge `Vec<Vec<u8>>`
+    /// (see the epoch-pack import path). Encoding is unchanged, so the digest/wire format are
+    /// stable.
+    #[serde(deserialize_with = "deserialize_transactions")]
     pub transactions: Vec<Vec<u8>>,
     /// The epoch that this batch belongs to.
     pub epoch: Epoch,
@@ -205,8 +215,73 @@ pub fn max_batch_gas(_epoch: Epoch) -> u64 {
 /// `min_batch_size_bounds_every_epoch` with the fork boundary and its adjacent epochs.
 /// The transaction pool checks its admission byte limit against that floor only once
 /// at node startup: the pool and its validator persist across epoch changes.
-pub fn max_batch_size(_epoch: Epoch) -> usize {
+pub const fn max_batch_size(_epoch: Epoch) -> usize {
     1_000_000
+}
+
+/// Upper bound on the number of transactions a single [`Batch`] may carry, enforced on decode by
+/// [`deserialize_transactions`].
+///
+/// A valid transaction is non-empty (≥ 1 byte) and a batch's transaction bytes never exceed
+/// [`max_batch_size`], so a legitimate batch can never hold more than `max_batch_size`
+/// transactions. Bounding the count on decode stops an untrusted peer from making a small
+/// (compressible) record deserialize into a `Vec<Vec<u8>>` far larger than its byte content — each
+/// entry costs `size_of::<Vec<u8>>()` (24 bytes on 64-bit) beyond its data.
+pub const MAX_TXS_PER_BATCH: usize = max_batch_size(0);
+
+/// Deserialize a batch's transaction list, rejecting inputs an honest producer never creates and an
+/// attacker uses to blow up memory during decode:
+/// - a **zero-byte (empty) transaction** is invalid (a real transaction is a non-empty RLP/EIP-2718
+///   envelope; see the batch validator's `EmptyBatch` and transaction recovery), and
+/// - the transaction count is bounded at [`MAX_TXS_PER_BATCH`], checked against the declared length
+///   **before** allocating so a crafted huge count cannot force a large up-front allocation.
+///
+/// Honest batches decode unchanged; only serialization (unchanged) feeds the digest, so this does
+/// not affect any batch hash.
+fn deserialize_transactions<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TransactionsVisitor;
+
+    impl<'de> Visitor<'de> for TransactionsVisitor {
+        type Value = Vec<Vec<u8>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a sequence of at most {MAX_TXS_PER_BATCH} non-empty transactions")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Reject an absurd declared length before allocating anything for it.
+            if let Some(declared) = seq.size_hint() {
+                if declared > MAX_TXS_PER_BATCH {
+                    return Err(de::Error::custom(format!(
+                        "batch declares {declared} transactions, exceeds MAX_TXS_PER_BATCH \
+                         ({MAX_TXS_PER_BATCH})"
+                    )));
+                }
+            }
+            // Cautious initial capacity: never trust the declared length for the allocation size.
+            let mut txs: Vec<Vec<u8>> = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(tx) = seq.next_element::<Vec<u8>>()? {
+                if tx.is_empty() {
+                    return Err(de::Error::custom("zero-byte transaction is invalid"));
+                }
+                if txs.len() >= MAX_TXS_PER_BATCH {
+                    return Err(de::Error::custom(format!(
+                        "batch exceeds MAX_TXS_PER_BATCH ({MAX_TXS_PER_BATCH}) transactions"
+                    )));
+                }
+                txs.push(tx);
+            }
+            Ok(txs)
+        }
+    }
+
+    deserializer.deserialize_seq(TransactionsVisitor)
 }
 
 /// Smallest batch byte limit across every epoch this build can serve.
@@ -228,6 +303,61 @@ fn min_batch_size_bounds_every_epoch() {
             "batch byte floor exceeds epoch {epoch}"
         );
     });
+}
+
+#[cfg(test)]
+mod transaction_bounds_tests {
+    use super::{max_batch_size, Batch, MAX_TXS_PER_BATCH};
+    use crate::{encode, try_decode, ExecHeader};
+
+    /// The count cap can never reject a legitimate batch: a valid transaction is non-empty (>= 1
+    /// byte) and a batch's transaction bytes are capped at `max_batch_size`, so a valid batch holds
+    /// at most `max_batch_size` transactions.
+    #[test]
+    fn max_txs_per_batch_matches_byte_ceiling() {
+        assert_eq!(MAX_TXS_PER_BATCH, max_batch_size(0));
+    }
+
+    /// A zero-byte (empty) transaction is invalid and must fail to decode (encode does not
+    /// validate, so the malicious payload can still be produced).
+    #[test]
+    fn decode_rejects_zero_byte_transaction() {
+        let batch = Batch::new_for_test(vec![vec![]], ExecHeader::default(), 0, 0);
+        let bytes = encode(&batch);
+        let decoded: bcs::Result<Batch> = try_decode(&bytes);
+        assert!(decoded.is_err(), "a batch with a zero-byte transaction must fail to decode");
+    }
+
+    /// A `Batch` whose `transactions` field declares more than `MAX_TXS_PER_BATCH` entries must be
+    /// rejected before allocating. The bytes are the leading `uleb128(MAX_TXS_PER_BATCH + 1)`
+    /// length prefix of a BCS `Batch` (transactions is the first field); decode fails on that
+    /// field.
+    #[test]
+    fn decode_rejects_absurd_transaction_count() {
+        // MAX_TXS_PER_BATCH == 1_000_000, so declare 1_000_001 == uleb128 [0xC1, 0x84, 0x3D].
+        assert_eq!(
+            MAX_TXS_PER_BATCH, 1_000_000,
+            "update the crafted length prefix if this changes"
+        );
+        let bytes = [0xC1_u8, 0x84, 0x3D];
+        let decoded: bcs::Result<Batch> = try_decode(&bytes);
+        assert!(
+            decoded.is_err(),
+            "a batch declaring > MAX_TXS_PER_BATCH transactions must be rejected"
+        );
+    }
+
+    /// A legitimate batch round-trips unchanged and its digest is stable (the guard is
+    /// decode-only).
+    #[test]
+    fn valid_batch_round_trips_with_stable_digest() {
+        let batch =
+            Batch::new_for_test(vec![vec![1, 2, 3], vec![4, 5]], ExecHeader::default(), 0, 0);
+        let bytes = encode(&batch);
+        let decoded: Batch = try_decode(&bytes).expect("a valid batch decodes");
+        assert_eq!(decoded, batch);
+        assert_eq!(decoded.digest(), batch.digest());
+    }
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
