@@ -16,6 +16,13 @@
 //! are preserved); [`GrowMode::Segment`] is reserved for a future multi-file layout and currently
 //! errors on rollover.
 //!
+//! Each growth step **preallocates** the new range (`fallocate` on Linux, `F_PREALLOCATE` on macOS)
+//! rather than a bare ftruncate, so it reserves real disk blocks up front: a full filesystem then
+//! fails the growing write with an `io::Error` (which the pack turns into a failed state and a
+//! clean shutdown) instead of a SIGBUS on the first `memcpy` store into an unbacked hole page. The
+//! reserved padding is transient — the clean-close `Drop` truncates it back to the logical end — so
+//! the extra real disk (≤ one growth step past the data) is only used while a file is open.
+//!
 //! ## Transient padding, exact on exposure
 //!
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
@@ -51,7 +58,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::FileExt,
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -629,9 +636,87 @@ impl MmapDataFile {
         Ok(())
     }
 
-    /// Grow the file to `new_cap` and fsync the size extension so data later `msync`'d into the
-    /// grown region survives a crash (`msync` alone does not persist size growth).
+    /// Reserve real disk blocks for `[from, to)` and grow the file to `to`, so a later `memcpy`
+    /// store into that range can never SIGBUS on a full filesystem — an out-of-space condition
+    /// surfaces here as an `io::Error` (which the pack turns into a failed state and a clean
+    /// shutdown) instead. A bare `set_len`/ftruncate only moves EOF and leaves the new bytes as
+    /// sparse holes whose first write-fault allocates a block and, when the disk is full,
+    /// delivers `VM_FAULT_SIGBUS` with no Rust error path.
+    ///
+    /// The reserved padding is transient: the clean-close `Drop` truncates back to `end`, so the
+    /// real disk cost (≤ one growth step past the data) is only paid while the file is open.
+    /// Where the platform/filesystem cannot preallocate, it falls back to a plain resize (the
+    /// old sparse behaviour) so the file still functions.
+    #[cfg(target_os = "linux")]
+    fn allocate_range(&self, from: u64, to: u64) -> io::Result<()> {
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return Ok(());
+        }
+        // fallocate(2) mode 0: allocate blocks for [from, from+len) and extend the size to cover
+        // it.
+        let rc = unsafe {
+            libc::fallocate(self.file.as_raw_fd(), 0, from as libc::off_t, len as libc::off_t)
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // Some filesystems (tmpfs, some network/older FS) don't implement fallocate; fall back to a
+        // plain resize (sparse) rather than failing an otherwise-serviceable write.
+        if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) {
+            return self.file.set_len(to);
+        }
+        Err(err) // ENOSPC / EDQUOT / EFBIG / EIO propagate as the write's io::Error
+    }
+
+    #[cfg(target_os = "macos")]
+    fn allocate_range(&self, from: u64, to: u64) -> io::Result<()> {
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return Ok(());
+        }
+        // F_PREALLOCATE reserves blocks from the physical EOF (== `from` while open) but does NOT
+        // change the file size, so a `set_len` still follows to grow the logical size. Try a
+        // contiguous reservation first, then allow a fragmented one.
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATECONTIG,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len as libc::off_t,
+            fst_bytesalloc: 0,
+        };
+        let fd = self.file.as_raw_fd();
+        let mut rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+        if rc == -1 {
+            store.fst_flags = libc::F_ALLOCATEALL;
+            rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+        }
+        if rc == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOTSUP) {
+                return self.file.set_len(to);
+            }
+            return Err(err);
+        }
+        self.file.set_len(to)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn allocate_range(&self, _from: u64, to: u64) -> io::Result<()> {
+        // No portable preallocation on this target; keep the previous (sparse) resize behaviour.
+        self.file.set_len(to)
+    }
+
+    /// Grow the file to `new_cap`, preallocating the new range and fsyncing the size extension so
+    /// data later `msync`'d into the grown region survives a crash (`msync` alone does not
+    /// persist size growth). Preallocation ([`Self::allocate_range`]) reserves real blocks so a
+    /// full disk fails here with an `io::Error` rather than a later SIGBUS on the first store
+    /// into an unbacked page.
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
+        // `capacity` is the current physical size (== physical EOF); reserve the new range from it.
+        let from = self.capacity;
+        self.allocate_range(from, new_cap).inspect_err(|_| self.poison())?;
         self.remap(new_cap)?;
         self.file.sync_all().inspect_err(|_| self.poison())?;
         // The fsync just persisted every dirty page (and the size), so all data `[0, end)` is now
@@ -645,7 +730,11 @@ impl MmapDataFile {
         if needed <= self.capacity {
             return Ok(());
         }
-        let new_cap = self.next_capacity(needed);
+        // Size the regrow from `max(needed, end)`, never `needed` alone: after a failed `remap`
+        // reset `capacity` to 0 while `end` stayed put, a regrow sized from a small
+        // `needed` would `set_len` below `end` and leave `end > map.len()`, so a later
+        // `slice`/`rewind_to` would index the map out of bounds.
+        let new_cap = self.next_capacity(needed.max(self.end));
         if self.opts.grow_mode == GrowMode::Segment && new_cap > self.opts.max_map_size {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1355,6 +1444,33 @@ mod tests {
         let mut mid = vec![0u8; 20];
         df.read_exact(&mut mid).expect("read mid");
         assert_eq!(&mid[..], &data[120..140]);
+    }
+
+    /// A growth step must reserve real disk blocks (fallocate / F_PREALLOCATE), not leave the new
+    /// capacity as a sparse hole — otherwise the first `memcpy` store into that hole SIGBUSes on a
+    /// full disk. A preallocated file reports allocated blocks covering its physical size; a sparse
+    /// file would report far fewer than its (padded) length.
+    #[test]
+    fn grow_preallocates_real_blocks_not_sparse() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::with_prefix("mmap_df_prealloc").expect("temp dir");
+        let path = tmp.path().join("data");
+        // A 1 MiB first-grow is many filesystem blocks, so allocated-vs-sparse is unambiguous.
+        let opts = MmapFileOptions { initial_size: 1 << 20, ..MmapFileOptions::default() };
+        let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+        // A few bytes trigger the first grow_to(initial_size), which preallocates the whole
+        // capacity.
+        df.write_all(&pattern(100)).expect("write");
+        // Inspect BEFORE drop: the clean close would truncate the padding away.
+        let meta = std::fs::metadata(&path).expect("meta");
+        let physical = meta.len();
+        assert!(physical >= (1 << 20), "file grew to at least initial_size, got {physical}");
+        let allocated = meta.blocks() * 512;
+        assert!(
+            allocated >= physical,
+            "growth must preallocate real blocks (allocated {allocated} >= physical {physical}); a \
+             sparse hole would report far fewer"
+        );
     }
 
     #[test]

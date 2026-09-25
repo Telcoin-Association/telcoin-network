@@ -12354,6 +12354,7 @@ dependencies = [
  "crc32fast",
  "dashmap",
  "eyre",
+ "libc",
  "memmap2",
  "ouroboros",
  "page_size",

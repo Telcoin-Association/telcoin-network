@@ -31,6 +31,9 @@ alloy-rlp = { workspace = true }
 zstd = "0.13.3"
 # mmap-backed data file backend (see archive/data_file.rs).
 memmap2 = { workspace = true }
+# Preallocate disk blocks on mmap growth (fallocate / F_PREALLOCATE) so a full disk surfaces as an
+# io::Error instead of a SIGBUS on the next memcpy into an unbacked page (see archive/data_file.rs).
+libc = "0.2"
 
 # redb backend
 redb = { version = "3.1.0", optional = false }
