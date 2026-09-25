@@ -12,6 +12,10 @@ The protocol IDs live in
 and the transport defaults live in
 [`crates/config/src/network.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/config/src/network.rs).
 
+The [early identity refusal decision](early-identity-refusal.md) records why an
+additional TLS admission check is not currently selected and the admission and
+measurement prerequisites for reconsidering it.
+
 ## QUIC only
 
 The swarm is built with a single transport: QUIC v1 over UDP.
