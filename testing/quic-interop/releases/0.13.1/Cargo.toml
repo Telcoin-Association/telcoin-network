@@ -1,0 +1,22 @@
+[package]
+name = "tn-quic-interop"
+version = "0.13.1"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Independent resolution is essential: this must not join the node's workspace.
+[workspace]
+
+[[bin]]
+name = "quic-interop"
+path = "../../src/main.rs"
+
+[dependencies]
+futures = "0.3"
+libp2p = { version = "=0.56.0", default-features = false, features = ["quic", "tokio", "ed25519"] }
+libp2p-quic = { version = "=0.13.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
