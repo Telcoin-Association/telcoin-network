@@ -1,0 +1,23 @@
+[package]
+name = "tn-quic-handshake-profile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Temporary instrumentation must never enter the node's dependency graph.
+[workspace]
+
+[dependencies]
+libp2p-identity = { version = "=0.3.0", features = ["ed25519", "rand"] }
+libp2p-tls = "=0.7.0"
+rustls = { version = "=0.23.37", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"] }
+serde_json = "1"
+# Pin the cryptographic implementation to the node's current lockfile too.
+aws-lc-rs = "=1.16.2"
+aws-lc-sys = "=0.39.1"
+rustls-webpki = "=0.103.10"
+
+[patch.crates-io]
+libp2p-tls = { path = "generated/libp2p-tls" }
