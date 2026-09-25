@@ -245,9 +245,10 @@ pub(crate) struct EpochManager<P, DB> {
     node_shutdown: ShutdownNotifier,
     /// The timestamp to close the current epoch.
     ///
-    /// The manager monitors leader timestamps for the epoch boundary.
-    /// If the timestamp of the leader is >= the epoch_boundary then the
-    /// manager closes the epoch after the engine executes all data.
+    /// The manager monitors commit timestamps for the epoch boundary through
+    /// `ConsensusOutput::reaches_epoch_boundary` (whole seconds; the sub-second
+    /// part of a commit never affects the decision). Once an output reaches the
+    /// boundary the manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.

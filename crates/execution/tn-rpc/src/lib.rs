@@ -7,8 +7,8 @@ mod rpc_ext;
 pub use rpc_ext::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use serde::Serialize;
 use tn_types::{
-    Address, AuthorityIdentifier, BlsPublicKey, ConsensusHeader, Epoch, EpochCertificate,
-    EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey, NodeMode,
+    Address, AuthorityIdentifier, BlsPublicKey, ConsensusHeader, ConsensusHeaderDigest, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey, NodeMode,
 };
 
 /// Contain the node's identifying info to provide over RPC.
@@ -50,6 +50,16 @@ pub trait EngineToPrimary {
         epoch: Option<Epoch>,
         hash: Option<EpochDigest>,
     ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
+    /// Get the consensus header with `digest` from `epoch`'s consensus pack, if found.
+    ///
+    /// Returns `None` when the digest is unknown, the epoch's pack is absent, or storage fails.
+    /// Implementations log storage errors at warn and collapse them to `None` because RPC
+    /// callers must never see storage internals, and the RPC layer treats `None` as "not found".
+    fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> impl std::future::Future<Output = Option<ConsensusHeader>> + Send;
     /// Return the node's static information.
     fn node_info(&self) -> &RpcNodeInfo;
     /// Return the node's current consensus participation mode.

@@ -201,7 +201,7 @@ malformed certificate it did not write.
 
 ### 5.3 `penalty_from_header_error`
 
-Source: `crates/consensus/primary/src/error/network.rs:210-259`.
+Source: `crates/consensus/primary/src/error/network.rs:210-260`.
 
 | `HeaderError` variant              | Severity | Source                                                  |
 | ---------------------------------- | -------- | ------------------------------------------------------- |
@@ -213,26 +213,27 @@ Source: `crates/consensus/primary/src/error/network.rs:210-259`.
 | `InvalidTimestamp { .. }`          | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
 | `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
 | `InvalidSeedSignature`             | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `AlreadyVotedForLaterRound { .. }` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-243` |
-| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:251-257` |
-| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:244-257` |
-| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:244-257` |
-| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:251-257` |
-| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:251-257` |
-| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:251-257` |
-| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:251-257` |
+| `AlreadyVotedForLaterRound { .. }` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `InvalidTimestampMillis(_)`        | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
+| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
+| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
+| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
 
 `InvalidSeedSignature` is `Severe` rather than `Fatal` on purpose.
 The seed message is anchored to the verifier's local `prior_epoch_record`, so a node whose record diverged
@@ -240,6 +241,11 @@ signs an anchor no peer accepts and rejects every honest peer's header.
 `Fatal` would make that ban mutual, total and non-self-healing — neither side could ever repair its record
 from the other once both have banned. `Severe` still suppresses a genuinely bad signer while leaving a
 divergent node a path back. `crates/consensus/primary/src/error/network.rs:220-226`.
+
+`InvalidTimestampMillis(_)` is `Fatal` because no honest node can produce it.
+An honest `created_at_millis` is derived from a millisecond timestamp and is always below 1000,
+and header decode already rejects an out-of-range value before `Header::validate` runs, so the
+validate check only catches a bug in the header type itself. `crates/consensus/primary/src/error/network.rs:231-244`.
 
 ### 5.4 `consensus_chain_error_to_penalty`
 
@@ -284,8 +290,8 @@ These are deliberate tolerances for benign failures. Changing any of these from
 - `PrimaryNetworkError::Storage` / `Timeout` / `ConsensusChainError` / `Internal` — local failures. `crates/consensus/primary/src/error/network.rs:199-202`. `ConsensusChainError` is built at exactly one site, a failed read of this node's own chain while serving a peer (`crates/consensus/primary/src/network/handler.rs:1158`); peer-attributable chain faults are scored separately at the sync call site (`crates/consensus/primary/src/network/mod.rs:748-750`).
 - `CertManagerError::Certificate(CertificateError::TooNew(..))` — request races ahead of local state. `crates/consensus/primary/src/error/network.rs:163-165`.
 - All `CertManagerError` operational variants (pending lookups, GC, oneshot drops, channel closures, internal storage / network errors). `crates/consensus/primary/src/error/network.rs:170-184`.
-- `HeaderError::InvalidEpoch { .. }` — explicitly `None`; epoch boundary mismatch is not penalized. `crates/consensus/primary/src/error/network.rs:251-257`.
-- `HeaderError::PendingCertificateOneshot` / `TNSend` / `ClosedWatchChannel` — local channel/task failures. `crates/consensus/primary/src/error/network.rs:251-257`.
+- `HeaderError::InvalidEpoch { .. }` — explicitly `None`; epoch boundary mismatch is not penalized. `crates/consensus/primary/src/error/network.rs:252-258`.
+- `HeaderError::PendingCertificateOneshot` / `TNSend` / `ClosedWatchChannel` — local channel/task failures. `crates/consensus/primary/src/error/network.rs:252-258`.
 - All `PackError` IO/load/persist/internal variants, plus `InvalidVersion` (pack written by a newer node — version skew, not a fault) and the `ConsensusNumber*` sequencing variants — local or skew failures. `crates/consensus/primary/src/network/mod.rs:1145-1162`.
 - `ConsensusChainError::StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError` / `InvalidPackEpoch` / `CantSaveAndNotAvailable` / `NonMonotonicConsensusNumber` / `IO` — local failures during epoch pack streaming; the arm documents `NonMonotonicConsensusNumber` as local resume state rather than peer misbehavior. `crates/consensus/primary/src/network/mod.rs:1170-1178`.
 - A rejected kad put record from a banned source/publisher with `record.publisher.is_some()` — no extra penalty is stacked on top of the existing ban. `crates/network-libp2p/src/consensus.rs:2028-2034`.

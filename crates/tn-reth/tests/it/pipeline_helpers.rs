@@ -107,6 +107,9 @@ pub(crate) struct PipelineTestEnv {
     pub(crate) canonical_header: SealedHeader,
     /// Monotonically increasing block timestamp.
     pub(crate) block_timestamp: u64,
+    /// Timestamp of the genesis block, the base for fixture timestamps.
+    #[cfg(not(feature = "faucet"))]
+    genesis_timestamp: u64,
     /// Monotonically increasing subdag index for consensus output.
     subdag_index: u64,
     _db_permit: DbPermit,
@@ -225,7 +228,8 @@ impl PipelineTestEnv {
         #[cfg(feature = "faucet")]
         recipient_factory.set_nonce(0);
 
-        let block_timestamp = canonical_header.timestamp + 1;
+        let genesis_timestamp = canonical_header.timestamp;
+        let block_timestamp = genesis_timestamp + 1;
 
         Self {
             reth_env,
@@ -236,12 +240,23 @@ impl PipelineTestEnv {
             recipient_factory,
             canonical_header,
             block_timestamp,
+            #[cfg(not(feature = "faucet"))]
+            genesis_timestamp,
             subdag_index: 1,
             _db_permit: db_permit,
             _tmp_dir: tmp_dir,
             _task_manager: task_manager,
             _runtime: runtime,
         }
+    }
+
+    /// The genesis block's timestamp in seconds.
+    ///
+    /// Fixtures that pick their own block timestamps offset them from this value so every
+    /// block lands after genesis, as it does on a real chain.
+    #[cfg(not(feature = "faucet"))]
+    pub(crate) fn genesis_timestamp(&self) -> u64 {
+        self.genesis_timestamp
     }
 
     /// Execute a block containing the given encoded transactions.
@@ -252,6 +267,10 @@ impl PipelineTestEnv {
     }
 
     /// Execute a block with a specific timestamp (for timelock tests).
+    ///
+    /// `timestamp` is absolute and must not precede the parent's: from the sub-second timestamp
+    /// fork on, execution raises it to the parent's timestamp (`evm_block_timestamp` in
+    /// `crates/tn-reth/src/payload.rs`).
     pub(crate) fn execute_block_at_timestamp(
         &mut self,
         txs: Vec<Vec<u8>>,

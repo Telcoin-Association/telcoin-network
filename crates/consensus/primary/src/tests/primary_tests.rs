@@ -22,7 +22,7 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
+    error::HeaderError, now, now_ms, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
     ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager, TnReceiver, B256,
 };
 use tokio::time::timeout;
@@ -77,9 +77,8 @@ async fn test_request_vote_too_new() {
 
     // Create a test header.
     let test_header = author
-        .header_builder(&fixture.committee())
+        .header_builder_at_round(&fixture.committee(), 100) // Need to be bigger than the gc window
         .author(author_id)
-        .round(100) // Need to be bigger than the gc window
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -222,11 +221,8 @@ async fn test_request_vote_has_missing_execution_block() {
 
     // Create a test header.
     let test_header = author
-        .header_builder(&fixture.committee())
+        .header_builder_at_round(&fixture.committee(), 3)
         .author(author_id)
-        .round(3)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 3))
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -322,11 +318,8 @@ async fn test_request_vote_older_execution_block() {
 
     // Create a test header.
     let test_header = author
-        .header_builder(&fixture.committee())
+        .header_builder_at_round(&fixture.committee(), 3)
         .author(author_id)
-        .round(3)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 3))
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -406,11 +399,8 @@ async fn test_request_vote_has_missing_parents() {
 
     // Create a test header.
     let test_header = author
-        .header_builder(&fixture.committee())
+        .header_builder_at_round(&fixture.committee(), 2)
         .author(author_id)
-        .round(2)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 2))
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -528,11 +518,8 @@ async fn test_request_vote_accept_missing_parents() {
 
     // Create a test header.
     let test_header = author
-        .header_builder(&fixture.committee())
+        .header_builder_at_round(&fixture.committee(), 3)
         .author(author_id)
-        .round(3)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 3))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -627,7 +614,7 @@ async fn test_request_vote_missing_batches() {
     let mut certificates = HashMap::new();
     for primary in fixture.authorities().filter(|a| a.id() != authority_id) {
         let header = primary
-            .header_builder(&fixture.committee())
+            .header_builder_at_round(&fixture.committee(), 1)
             .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
@@ -641,10 +628,7 @@ async fn test_request_vote_missing_batches() {
         }
     }
     let test_header = author
-        .header_builder(&fixture.committee())
-        .round(2)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 2))
+        .header_builder_at_round(&fixture.committee(), 2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -712,7 +696,7 @@ async fn test_request_vote_already_voted() {
     let mut certificates = HashMap::new();
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
-            .header_builder(&fixture.committee())
+            .header_builder_at_round(&fixture.committee(), 1)
             .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
@@ -735,10 +719,7 @@ async fn test_request_vote_already_voted() {
 
     // Verify Handler generates a Vote.
     let test_header = author
-        .header_builder(&fixture.committee())
-        .round(2)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 2))
+        .header_builder_at_round(&fixture.committee(), 2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -770,10 +751,7 @@ async fn test_request_vote_already_voted() {
 
     // Verify a different request for the same round receives an error.
     let test_header = author
-        .header_builder(&fixture.committee())
-        .round(2)
-        // The seed message binds the round, so re-stamp the signature for it.
-        .seed_signature(author.seed_signature(fixture.committee().epoch(), 2))
+        .header_builder_at_round(&fixture.committee(), 2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
@@ -830,7 +808,7 @@ async fn test_request_vote_created_at_in_future() {
     let mut certificates = HashMap::new();
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
-            .header_builder(&fixture.committee())
+            .header_builder_at_round(&fixture.committee(), 1)
             .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
@@ -867,8 +845,16 @@ async fn test_request_vote_created_at_in_future() {
         .created_at(created_at)
         .build();
 
-    // For such a future header we get back an error
-    assert!(handler.vote(author_peer, test_header, Vec::new()).await.is_err());
+    // an hour ahead is beyond the drift tolerance plus the vote timeout, so the header is
+    // rejected for good rather than answered as retryable
+    let result = handler.vote(author_peer, test_header, Vec::new()).await;
+    assert!(
+        matches!(
+            result,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { .. }))
+        ),
+        "{result:?}"
+    );
 
     // Verify Handler generates a Vote.
 
@@ -877,10 +863,7 @@ async fn test_request_vote_created_at_in_future() {
     let mut certificates = HashMap::new();
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
-            .header_builder(&fixture.committee())
-            .round(2)
-            // The seed message binds the round, so re-stamp the signature for it.
-            .seed_signature(primary.seed_signature(fixture.committee().epoch(), 2))
+            .header_builder_at_round(&fixture.committee(), 2)
             .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
@@ -894,8 +877,8 @@ async fn test_request_vote_created_at_in_future() {
         }
     }
 
-    // Set the creation time to be a bit in the future (1s)
-    let created_at = now() + 1;
+    // Set the creation time to be a bit in the future, inside the 250 ms drift tolerance
+    let created_at = now_ms().saturating_add_millis(200);
 
     let test_header = author
         .header_builder(&fixture.committee())
@@ -905,8 +888,10 @@ async fn test_request_vote_created_at_in_future() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(&fixture_batch_with_transactions(10), 0)
-        .created_at(created_at)
+        .created_at_ms(created_at)
         .build();
+    // builds without sub-second timestamps drop the millis, so compare against the header's own
+    let created_at = test_header.created_at_ms();
 
     cb.app().committed_round_updates().send_replace(1);
     let _vote = if let PrimaryResponse::Vote(vote) =
@@ -916,7 +901,7 @@ async fn test_request_vote_created_at_in_future() {
     } else {
         panic!("not a vote!");
     };
-    assert!(created_at <= now());
+    assert!(created_at <= now_ms());
 }
 
 /// The primary's worker-to-primary handler is bound to one worker id per local network

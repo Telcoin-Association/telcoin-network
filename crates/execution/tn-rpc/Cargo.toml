@@ -11,6 +11,7 @@ exclude.workspace = true
 [dependencies]
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
+alloy = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 jsonrpsee-types = { workspace = true }
 async-trait = { workspace = true }
@@ -18,10 +19,13 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
-alloy = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# `test-utils` exposes the fork-epoch overrides the pre-fork timestamp test pins.
+tn-types = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

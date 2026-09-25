@@ -5,17 +5,20 @@ use crate::{
     consensus::{
         Bullshark, Consensus, ConsensusError, ConsensusState, LeaderSchedule, LeaderSwapTable,
     },
-    test_utils::{make_optimal_certificates, mock_certificate},
+    test_utils::{make_optimal_certificates, mock_certificate, mock_certificate_with_epoch},
     ConsensusBus,
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::RangeInclusive, time::Duration};
 use tempfile::TempDir;
+use tn_config::ConsensusConfig;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    keccak256, BlsSignature, Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash,
-    Epoch, EpochSeedChainError, EpochSeedChainValue, ExecHeader, Hash as _, Header, HeaderDigest,
-    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
+    keccak256, AuthorityIdentifier, BlsSignature, Certificate, CommittedSubDag, Committee,
+    ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochSeedChainError, EpochSeedChainValue,
+    ExecHeader, Hash as _, Header, HeaderBuilder, HeaderDigest, ReputationScores, Round,
+    SealedHeader, TaskManager, TimestampMs, TimestampSec, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::fs::create_dir_all;
@@ -816,4 +819,394 @@ async fn test_seed_chain_survives_restart() {
         first_commit.randomness(),
         "the chain must still advance after the restart"
     );
+}
+
+/// Whole seconds of every header's creation time in the epoch commit floor tests (see
+/// [`created_at`]).
+const LEADER_SECS: TimestampSec = 1_700_000_000;
+
+/// The previous epoch's closing EVM block timestamp in the epoch commit floor tests: ten seconds
+/// after every header, so the floor lies in the future relative to each leader.
+const PRIOR_EPOCH_CLOSE: TimestampSec = LEADER_SECS + 10;
+
+/// The epoch the floor tests run in when they need one after genesis, the first epoch that can
+/// take a floor.
+const FLOOR_EPOCH: Epoch = 1;
+
+/// Last round the floor tests build. Rounds 3 and 5 give the leaders of rounds 2 and 4 their
+/// support, so every run commits exactly two sub-dags.
+const FLOOR_LAST_ROUND: Round = 5;
+
+/// Garbage collection depth for the Bullshark-level floor tests, above every round they build.
+const FLOOR_GC_DEPTH: Round = 50;
+
+/// Committed sub-dags per leader schedule in the floor tests, high enough that no schedule change
+/// interrupts the two commits under test.
+const FLOOR_SUB_DAGS_PER_SCHEDULE: u32 = 100;
+
+/// Pins this test process's sub-second timestamp fork to active (or dormant) from genesis, with
+/// the seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building the committee fixture. nextest runs each
+/// test in its own process, which is what keeps one test's pin from reaching another; a
+/// single-process `cargo test` run shares one latch across the whole test binary instead. Reading
+/// the overrides back turns a value that latched before the pin into a named failure.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+}
+
+/// The previous epoch's close as an epoch commit floor: whole seconds, sub-second part 0.
+fn prior_epoch_close_floor() -> TimestampMs {
+    TimestampMs::from_parts(PRIOR_EPOCH_CLOSE, 0)
+}
+
+/// Creation time of every header at `round`: 250 ms into [`LEADER_SECS`] plus 100 ms per round.
+///
+/// Every leader carries a non-zero sub-second part, which headers keep only where the sub-second
+/// fork is active, and every round built here stays inside that one second.
+fn created_at(round: Round) -> TimestampMs {
+    TimestampMs::from_parts(LEADER_SECS, 250).saturating_add_millis(u64::from(round) * 100)
+}
+
+/// Certificates for `rounds` of `epoch` in round order, one per authority in `ids`, each round
+/// referencing every certificate of the round before it (genesis for the first), and every header
+/// created at [`created_at`] for its round.
+///
+/// Built from [`mock_certificate_with_epoch`] and re-stamped with the creation time, which keeps
+/// its per-author seed signature. Digests, and so the next round's parents, are taken after
+/// re-stamping.
+fn certificates_created_at(
+    committee: &Committee,
+    rounds: RangeInclusive<Round>,
+    epoch: Epoch,
+    ids: &[AuthorityIdentifier],
+) -> Vec<Certificate> {
+    let mut parents: BTreeSet<HeaderDigest> =
+        Certificate::genesis(committee).iter().map(|c| c.digest()).collect();
+    let mut certificates = Vec::new();
+    for round in rounds {
+        let round_certificates: Vec<Certificate> = ids
+            .iter()
+            .map(|id| {
+                let (_, mock) = mock_certificate_with_epoch(
+                    committee,
+                    id.clone(),
+                    round,
+                    epoch,
+                    parents.clone(),
+                );
+                let header = HeaderBuilder::from_header(mock.header())
+                    .created_at_ms(created_at(round))
+                    .build();
+                Certificate::new_unsigned_for_test(committee, header, Vec::new())
+                    .expect("unsigned fixture certificate")
+            })
+            .collect();
+        parents = round_certificates.iter().map(|c| c.digest()).collect();
+        certificates.extend(round_certificates);
+    }
+    certificates
+}
+
+/// Feeds `certificates` in order to a fresh Bullshark over `state` and returns every sub-dag it
+/// commits, in commit order.
+fn commit_with_bullshark(
+    committee: &Committee,
+    mut state: ConsensusState,
+    certificates: &[Certificate],
+) -> Vec<CommittedSubDag> {
+    let mut bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    certificates
+        .iter()
+        .flat_map(|certificate| {
+            let (_outcome, committed) = bullshark
+                .process_certificate(&mut state, certificate.clone())
+                .expect("fixture certificates form a valid dag");
+            committed
+        })
+        .collect()
+}
+
+/// A Bullshark run whose `ConsensusState` carries an epoch commit floor, in an epoch with
+/// sub-second timestamps active, raises the epoch's first commit to exactly 1 ms past the floor
+/// when the leader is older than it, and commits strictly later after that. The same certificates
+/// without a floor commit at the leader's own millisecond time.
+///
+/// `ConsensusState`'s floor is private to the state module, so this Bullshark-level test lives
+/// here rather than beside the other Bullshark tests.
+///
+/// Catches: Bullshark handing `new_with_commit_floor` anything other than
+/// `state.epoch_commit_floor()` (the first commit falls back to the leader's time, behind the
+/// previous epoch's close), a clamp that lands other than 1 ms past the floor, and a floor
+/// re-applied to later commits in place of the previous sub-dag (the second commit ties the
+/// first).
+#[test]
+fn bullshark_first_commit_clears_seeded_epoch_commit_floor() {
+    pin_subsecond_fork(true);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(FLOOR_EPOCH).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let certificates = certificates_created_at(&committee, 1..=FLOOR_LAST_ROUND, FLOOR_EPOCH, &ids);
+    let floor = prior_epoch_close_floor();
+
+    let seeded =
+        ConsensusState { epoch_commit_floor: Some(floor), ..ConsensusState::new(FLOOR_GC_DEPTH) };
+    assert_eq!(seeded.epoch_commit_floor(), Some(floor));
+    let floored = commit_with_bullshark(&committee, seeded, &certificates);
+    let unfloored =
+        commit_with_bullshark(&committee, ConsensusState::new(FLOOR_GC_DEPTH), &certificates);
+
+    assert_eq!(floored.len(), 2, "rounds 1..=5 commit the leaders of rounds 2 and 4");
+    let (first, later) = (&floored[0], &floored[1]);
+    assert_eq!(first.leader_round(), 2);
+    assert_eq!(first.leader_epoch(), FLOOR_EPOCH);
+    assert!(
+        first.leader().created_at_ms() < floor,
+        "the first leader must be older than the floor, or the clamp is not exercised"
+    );
+    assert_eq!(
+        first.commit_timestamp_ms(),
+        TimestampMs::from_millis(PRIOR_EPOCH_CLOSE * 1000 + 1),
+        "the epoch's first commit must land exactly 1 ms past the seeded floor"
+    );
+    assert!(
+        later.commit_timestamp_ms() > first.commit_timestamp_ms(),
+        "a later commit must be strictly after the first: {} is not after {}",
+        later.commit_timestamp_ms(),
+        first.commit_timestamp_ms()
+    );
+
+    // without a floor the same dag commits the same leader at its own time
+    assert_eq!(
+        unfloored.iter().map(|s| s.leader().digest()).collect::<Vec<_>>(),
+        floored.iter().map(|s| s.leader().digest()).collect::<Vec<_>>(),
+        "the floor must not change which leaders commit"
+    );
+    let first_unfloored = &unfloored[0];
+    assert_ne!(created_at(2).subsec_millis(), 0, "the leader time must carry a sub-second part");
+    assert_eq!(
+        first_unfloored.commit_timestamp_ms(),
+        created_at(2),
+        "without a floor the epoch's first commit is the leader's millisecond time"
+    );
+    assert_eq!(first_unfloored.commit_timestamp_ms(), first_unfloored.leader().created_at_ms());
+}
+
+/// Before the sub-second fork, a floor carried by `ConsensusState` is ignored: the epoch's first
+/// commit is the leader's whole-second time, even though the previous epoch closed later.
+///
+/// Catches: a floor applied on the pre-fork commit path, which would change the timestamps of
+/// commits that must replay byte-identically.
+#[test]
+fn bullshark_ignores_epoch_commit_floor_before_subsecond_fork() {
+    pin_subsecond_fork(false);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(FLOOR_EPOCH).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let certificates = certificates_created_at(&committee, 1..=FLOOR_LAST_ROUND, FLOOR_EPOCH, &ids);
+
+    let seeded = ConsensusState {
+        epoch_commit_floor: Some(prior_epoch_close_floor()),
+        ..ConsensusState::new(FLOOR_GC_DEPTH)
+    };
+    let committed = commit_with_bullshark(&committee, seeded, &certificates);
+
+    assert_eq!(committed.len(), 2, "rounds 1..=5 commit the leaders of rounds 2 and 4");
+    let first = &committed[0];
+    assert_eq!(first.leader_round(), 2);
+    assert_eq!(
+        first.commit_timestamp_ms(),
+        TimestampMs::from_parts(LEADER_SECS, 0),
+        "the pre-fork first commit is the leader's whole seconds, not floored"
+    );
+    assert!(
+        first.commit_timestamp() < PRIOR_EPOCH_CLOSE,
+        "the pre-fork first commit must ignore the floor"
+    );
+}
+
+/// Spawns consensus for the first authority of `fixture`, with `prior_epoch_close` carried by its
+/// config, feeds it `certificates` in order, and returns the first `count` sub-dags off the
+/// `sequence` channel.
+async fn spawn_and_collect(
+    fixture: &CommitteeFixture<MemDatabase>,
+    prior_epoch_close: Option<TimestampSec>,
+    certificates: Vec<Certificate>,
+    count: usize,
+) -> Vec<CommittedSubDag> {
+    let fixture_config =
+        fixture.authorities().next().expect("fixture has authorities").consensus_config();
+    // rebuilt through the constructor epoch startup uses: the fixture's test constructors carry no
+    // prior epoch close
+    let config = ConsensusConfig::new_for_epoch(
+        fixture_config.config().clone(),
+        fixture_config.node_storage().clone(),
+        fixture_config.key_config().clone(),
+        fixture_config.committee().clone(),
+        fixture_config.network_config().clone(),
+        fixture_config.next_committee_keys().to_vec(),
+        fixture_config.prior_epoch_record(),
+        prior_epoch_close,
+    )
+    .expect("fixture parameters satisfy the epoch constructor");
+    assert_eq!(config.prior_epoch_close(), prior_epoch_close);
+
+    let committee = config.committee().clone();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee, LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    let cb = ConsensusBus::new();
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
+    let mut rx_output = cb.subscribe_sequence();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
+
+    for certificate in certificates {
+        cb.new_certificates().send(certificate).await.unwrap();
+    }
+
+    let mut committed = Vec::with_capacity(count);
+    while committed.len() < count {
+        let sub_dag = tokio::time::timeout(Duration::from_secs(10), rx_output.recv())
+            .await
+            .expect("consensus committed before the timeout")
+            .expect("sequence channel stayed open");
+        committed.push(sub_dag);
+    }
+    committed
+}
+
+/// Consensus spawned at epoch 1 with sub-second timestamps active, and the previous epoch's close
+/// in the future relative to every leader, commits the epoch's first sub-dag exactly 1 ms past the
+/// close, so no commit's seconds fall behind the previous epoch's closing block. The next commit
+/// is strictly later.
+///
+/// Drives the whole seam: the config carries the close, `Consensus::spawn` resolves it into the
+/// `ConsensusState` floor, and the commit loop hands that floor to Bullshark.
+///
+/// Catches: `Consensus::spawn` not threading the configured close into the state (the first
+/// commit falls back to the leader's time, seconds behind the close), and a floor resolved from
+/// anything other than the configured close.
+#[tokio::test]
+async fn spawn_floors_first_commit_on_prior_epoch_close() {
+    pin_subsecond_fork(true);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(FLOOR_EPOCH).build();
+    let committee = fixture.committee();
+    assert_eq!(committee.epoch(), FLOOR_EPOCH);
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let certificates = certificates_created_at(&committee, 1..=FLOOR_LAST_ROUND, FLOOR_EPOCH, &ids);
+
+    let committed = spawn_and_collect(&fixture, Some(PRIOR_EPOCH_CLOSE), certificates, 2).await;
+
+    let (first, later) = (&committed[0], &committed[1]);
+    assert_eq!(first.leader_epoch(), FLOOR_EPOCH);
+    assert_eq!(first.leader_round(), 2);
+    assert!(
+        first.leader().created_at_ms() < prior_epoch_close_floor(),
+        "the first leader must be older than the previous epoch's close, or the floor is not \
+         exercised"
+    );
+    assert_eq!(
+        first.commit_timestamp_ms(),
+        TimestampMs::from_millis(PRIOR_EPOCH_CLOSE * 1000 + 1),
+        "the epoch's first commit must land exactly 1 ms past the previous epoch's close"
+    );
+    for sub_dag in &committed {
+        assert!(
+            sub_dag.commit_timestamp() >= PRIOR_EPOCH_CLOSE,
+            "commit at leader round {} went backwards: {} s is before the previous epoch's close \
+             at {PRIOR_EPOCH_CLOSE} s",
+            sub_dag.leader_round(),
+            sub_dag.commit_timestamp()
+        );
+    }
+    assert!(
+        later.commit_timestamp_ms() > first.commit_timestamp_ms(),
+        "a later commit must be strictly after the first: {} is not after {}",
+        later.commit_timestamp_ms(),
+        first.commit_timestamp_ms()
+    );
+}
+
+/// Consensus spawned at epoch 0 takes no commit floor even when its config carries a prior epoch
+/// close: the first epoch follows genesis, so its first commit is the leader's own millisecond
+/// time.
+///
+/// Catches: `Consensus::spawn` flooring epoch 0 on a configured close.
+#[tokio::test]
+async fn spawn_at_epoch_zero_takes_no_commit_floor() {
+    pin_subsecond_fork(true);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    assert_eq!(committee.epoch(), 0);
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let certificates = certificates_created_at(&committee, 1..=FLOOR_LAST_ROUND, 0, &ids);
+
+    let committed = spawn_and_collect(&fixture, Some(PRIOR_EPOCH_CLOSE), certificates, 1).await;
+
+    let first = &committed[0];
+    assert_eq!(first.leader_round(), 2);
+    assert_eq!(
+        first.commit_timestamp_ms(),
+        created_at(2),
+        "epoch 0's first commit is the leader's millisecond time, never floored"
+    );
+    assert!(first.commit_timestamp() < PRIOR_EPOCH_CLOSE);
+}
+
+/// Before the sub-second fork, consensus spawned at epoch 1 ignores the prior epoch close: the
+/// first commit is the leader's whole-second time, even though that is behind the close.
+///
+/// Catches: `Consensus::spawn` resolving a floor without consulting the sub-second gate for the
+/// epoch it starts, which would move pre-fork commit timestamps that must replay unchanged.
+#[tokio::test]
+async fn spawn_before_subsecond_fork_ignores_prior_epoch_close() {
+    pin_subsecond_fork(false);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(FLOOR_EPOCH).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let certificates = certificates_created_at(&committee, 1..=FLOOR_LAST_ROUND, FLOOR_EPOCH, &ids);
+
+    let committed = spawn_and_collect(&fixture, Some(PRIOR_EPOCH_CLOSE), certificates, 1).await;
+
+    let first = &committed[0];
+    assert_eq!(first.leader_round(), 2);
+    assert_eq!(
+        first.commit_timestamp_ms(),
+        TimestampMs::from_parts(LEADER_SECS, 0),
+        "the pre-fork first commit is the leader's whole seconds, not floored"
+    );
+    assert!(first.commit_timestamp() < PRIOR_EPOCH_CLOSE);
 }

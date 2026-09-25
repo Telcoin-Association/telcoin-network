@@ -254,6 +254,12 @@ impl PrimaryResponse {
                 // This is a common race condition on epoch restart so report as recoverable.
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
             }
+            // a request that ran out of time here (e.g. a vote waiting on execution, parents, or
+            // batches) can succeed when repeated later, so the requester retries instead of
+            // giving up on this node
+            PrimaryNetworkError::Timeout(_) => {
+                Self::RecoverableError(PrimaryRPCError(error.to_string()))
+            }
             PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Decode(_)
             | PrimaryNetworkError::Certificate(_)
@@ -267,7 +273,6 @@ impl PrimaryResponse {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::UnknownConsensusOutput(_)
-            | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::InvalidEpochVote(_, _, _)
             | PrimaryNetworkError::InvalidEpochRequest => {

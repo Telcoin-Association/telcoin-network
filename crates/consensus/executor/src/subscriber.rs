@@ -210,8 +210,11 @@ impl<DB: Database> Subscriber<DB> {
                 // If we seem to be on the same number also make sure this is not a stale record.
                 // If that happens during a catch up it will lead to premature cvv active when not
                 // caught up.
+                // freshness is measured in milliseconds so a sub-second commit time is not rounded
+                // away. a pre-fork commit time is whole seconds, and there this equals comparing
+                // whole seconds against the clock rounded down to the second
                 if consensus_header_number == last_consensus_header.number
-                    && last_consensus_header.sub_dag.commit_timestamp().elapsed()
+                    && last_consensus_header.sub_dag.commit_timestamp_ms().elapsed()
                         < Duration::from_secs(5)
                 {
                     // We are caught up enough so try to jump back into consensus
@@ -367,7 +370,7 @@ impl<DB: Database> Subscriber<DB> {
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
                     // Once we cross epoch boundary then process this last output then we are done.
-                    if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
+                    if sub_dag.reaches_epoch_boundary(self.inner.epoch_boundary) { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more

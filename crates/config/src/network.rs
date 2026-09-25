@@ -2,9 +2,13 @@
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::kad::K_VALUE;
-use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
 use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tracing::warn;
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -117,9 +121,24 @@ impl NetworkConfig {
     }
 
     /// Read a network config file.
+    ///
+    /// Logs a warning when [`SyncConfig::max_header_time_drift_tolerance`] exceeds one second.
     pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
         let path = tn_datadir.network_config_path();
-        Self::load_from_path_or_default(path, ConfigFmt::YAML)
+        let config: Self = Self::load_from_path_or_default(path, ConfigFmt::YAML)?;
+
+        // the voter waits out a future-dated header's lead, up to this tolerance, before deciding
+        // whether to vote, so a large value lets a proposer's clock skew delay that vote as long
+        let drift_tolerance = config.sync_config.max_header_time_drift_tolerance;
+        if drift_tolerance > Duration::from_secs(1) {
+            warn!(
+                target: "tn::config",
+                ?drift_tolerance,
+                "max_header_time_drift_tolerance exceeds 1s; votes on future-dated headers may wait this long"
+            );
+        }
+
+        Ok(config)
     }
 
     /// Write the current network config to file.
@@ -316,11 +335,32 @@ pub struct SyncConfig {
     pub max_consenus_round_timeout: Duration,
     /// The maximum number of rounds that a proposed header can be behind the node's local round.
     pub max_proposed_header_age_limit: Round,
-    /// The tolerable amount of time to wait if a header is proposed before the current time.
+    /// How far a header's creation time may run ahead of this node's clock before the voter
+    /// stops waiting it out.
     ///
-    /// This accounts for small drifts in time keeping between nodes. The timestamp for headers is
-    /// currently measured in secs.
-    pub max_header_time_drift_tolerance: u64,
+    /// This absorbs small clock drift between validators. The voter measures how far the header
+    /// is ahead of local time and responds in one of three ways:
+    ///
+    /// - Within this tolerance, it waits out the lead in milliseconds, then decides whether to
+    ///   vote.
+    /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
+    ///   it answers with a retryable response and charges no penalty. The proposer retries the
+    ///   request, and by then the lead may be back within tolerance.
+    /// - Further ahead, it rejects the header and penalizes the proposer.
+    ///
+    /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
+    /// second.
+    ///
+    /// The within-tolerance check compares milliseconds when
+    /// [`tn_types::forks::subsecond_timestamp_active`] holds for the header's epoch. Earlier
+    /// epochs carry whole-second header timestamps, so there the check rounds this tolerance up
+    /// to the next whole second: the 250 ms default behaves as 1 s.
+    ///
+    /// The config file accepts either a bare integer, read as whole seconds (the format older
+    /// config files use, and logged as a warning when read), or a humantime string such as
+    /// `"250ms"` or `"1s"`. The value is always written back as a humantime string.
+    #[serde(deserialize_with = "secs_or_humantime", serialize_with = "humantime_serde::serialize")]
+    pub max_header_time_drift_tolerance: Duration,
     /// The maximum number of missing certificates a CVV peer can request within GC window.
     ///
     /// NOTE: this DOES NOT affect nodes that are syncing full state.
@@ -357,7 +397,7 @@ impl Default for SyncConfig {
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
             max_consenus_round_timeout: Duration::from_secs(30),
             max_proposed_header_age_limit: 3,
-            max_header_time_drift_tolerance: 1,
+            max_header_time_drift_tolerance: Duration::from_millis(250),
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
@@ -628,6 +668,51 @@ impl ScoreConfig {
         );
         Ok(())
     }
+}
+
+/// Deserialize a [`Duration`] from either a bare integer of seconds or a humantime string.
+///
+/// The integer form keeps older config files loading: nodes persisted
+/// `max_header_time_drift_tolerance: 1` when that field was a whole number of seconds, and a
+/// plain humantime deserializer rejects the bare integer.
+///
+/// Reading the integer form logs a warning each time it is parsed. Older binaries persisted
+/// their whole-second default, so an upgraded node keeps that value, rather than the sub-second
+/// default, until an operator rewrites it.
+fn secs_or_humantime<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// Accepts an unsigned integer as seconds or a string parsed by humantime.
+    struct SecsOrHumantime;
+
+    impl Visitor<'_> for SecsOrHumantime {
+        type Value = Duration;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .write_str("a whole number of seconds or a humantime duration such as \"250ms\"")
+        }
+
+        fn visit_u64<E: de::Error>(self, secs: u64) -> Result<Duration, E> {
+            let drift_tolerance = Duration::from_secs(secs);
+            warn!(
+                target: "tn::config",
+                ?drift_tolerance,
+                default = ?SyncConfig::default().max_header_time_drift_tolerance,
+                "max_header_time_drift_tolerance is a bare integer of seconds, the format older \
+                 binaries wrote, so this node runs with that tolerance instead of the default; set \
+                 a humantime value such as \"250ms\" in the network config to change it"
+            );
+            Ok(drift_tolerance)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Duration, E> {
+            humantime_serde::re::humantime::parse_duration(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(SecsOrHumantime)
 }
 
 #[cfg(test)]
@@ -1053,5 +1138,97 @@ hostname: "my-validator"
         // NaN would fail anyway); pin it explicitly so the ordering of the two checks is safe.
         let config = ScoreConfig { score_halflife: f64::NAN, ..Default::default() };
         assert!(config.validate().is_err(), "a NaN score_halflife must be rejected");
+    }
+
+    #[test]
+    fn header_drift_tolerance_defaults_to_250ms() {
+        assert_eq!(
+            SyncConfig::default().max_header_time_drift_tolerance,
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn header_drift_tolerance_reads_legacy_integer_as_seconds() -> eyre::Result<()> {
+        // the shape persisted in network.yaml while the field was a whole number of seconds
+        let parsed: NetworkConfig =
+            serde_yaml::from_str("sync_config:\n  max_header_time_drift_tolerance: 1\n")?;
+        assert_eq!(parsed.sync_config.max_header_time_drift_tolerance, Duration::from_secs(1));
+
+        let parsed: SyncConfig = serde_yaml::from_str("max_header_time_drift_tolerance: 0")?;
+        assert_eq!(parsed.max_header_time_drift_tolerance, Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn header_drift_tolerance_reads_humantime_strings() -> eyre::Result<()> {
+        for (yaml, expected) in [
+            ("max_header_time_drift_tolerance: \"250ms\"", Duration::from_millis(250)),
+            ("max_header_time_drift_tolerance: 250ms", Duration::from_millis(250)),
+            ("max_header_time_drift_tolerance: \"1s\"", Duration::from_secs(1)),
+            ("max_header_time_drift_tolerance: 1s 500ms", Duration::from_millis(1_500)),
+        ] {
+            let parsed: SyncConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(parsed.max_header_time_drift_tolerance, expected, "{yaml}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn header_drift_tolerance_rejects_malformed_values() {
+        for yaml in [
+            "max_header_time_drift_tolerance: -1",
+            "max_header_time_drift_tolerance: 1.5",
+            "max_header_time_drift_tolerance: soon",
+            "max_header_time_drift_tolerance:\n  secs: 1\n  nanos: 0",
+        ] {
+            assert!(serde_yaml::from_str::<SyncConfig>(yaml).is_err(), "{yaml} must be rejected");
+        }
+    }
+
+    #[test]
+    fn header_drift_tolerance_round_trips_as_humantime() -> eyre::Result<()> {
+        for tolerance in [
+            Duration::ZERO,
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            Duration::from_millis(1_500),
+            Duration::from_nanos(1),
+        ] {
+            let config =
+                SyncConfig { max_header_time_drift_tolerance: tolerance, ..Default::default() };
+            let yaml = serde_yaml::to_string(&config)?;
+
+            // the field is written as a humantime string, not serde's `{ secs, nanos }` map
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+            let written = value
+                .get("max_header_time_drift_tolerance")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("drift tolerance serializes as a string");
+            assert_eq!(
+                written,
+                humantime_serde::re::humantime::format_duration(tolerance).to_string()
+            );
+
+            let parsed: SyncConfig = serde_yaml::from_str(&yaml)?;
+            assert_eq!(parsed.max_header_time_drift_tolerance, tolerance);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sync_config_without_header_drift_tolerance_uses_default() -> eyre::Result<()> {
+        let config = SyncConfig { max_proposed_header_age_limit: 7, ..Default::default() };
+        let mut value = serde_yaml::to_value(&config)?;
+        let mapping = value.as_mapping_mut().expect("sync config serializes to a mapping");
+        assert!(mapping
+            .remove(&serde_yaml::Value::String("max_header_time_drift_tolerance".into()))
+            .is_some());
+
+        let parsed: SyncConfig = serde_yaml::from_value(value)?;
+        assert_eq!(parsed.max_header_time_drift_tolerance, Duration::from_millis(250));
+        // the remaining fields still load from the file rather than from the default
+        assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
+        Ok(())
     }
 }
