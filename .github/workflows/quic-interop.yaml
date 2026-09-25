@@ -32,8 +32,10 @@ jobs:
         release: ["0.13.1", "0.14.0"]
     steps:
       - uses: actions/checkout@v4
-      - name: Install the repository toolchain
-        run: rustup show active-toolchain
+      - name: Install the repository toolchain and Clippy
+        run: |
+          rustup show active-toolchain
+          rustup component add clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: testing/quic-interop/releases/${{ matrix.release }}
