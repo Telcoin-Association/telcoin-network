@@ -1400,6 +1400,25 @@ impl Inner {
         // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
         drop(iter);
         if consistent_end < records.file_len() {
+            if !records.opened_unclean() {
+                // A cleanly-sealed log is complete by construction: a decode failure part-way through
+                // is at-rest corruption, not an unacked torn tail — fail closed instead of silently
+                // dropping acked records (INV4).
+                return Err(EpochDbError::CorruptLog(format!(
+                    "sealed records log stops decoding at offset {consistent_end} of {}; at-rest \
+                     corruption, re-sync required",
+                    records.file_len()
+                )));
+            }
+            // Unclean shutdown: the trailing record was interrupted mid-write (unacked). Drop it
+            // (INV1), but log it so a truncation is never invisible.
+            warn!(
+                target: "epoch-db",
+                log = "records",
+                offset = consistent_end,
+                bytes_dropped = records.file_len() - consistent_end,
+                "truncating torn tail of unclean log"
+            );
             records.rewind_to(consistent_end);
         }
         record_digests.set_data_file_length(records.file_len());
@@ -1421,6 +1440,22 @@ impl Inner {
         }
         drop(iter);
         if consistent_end < certs.file_len() {
+            if !certs.opened_unclean() {
+                // See the records log above: a sealed cert log is complete, so a decode failure is
+                // at-rest corruption, not a torn tail — fail closed rather than silently truncate.
+                return Err(EpochDbError::CorruptLog(format!(
+                    "sealed certs log stops decoding at offset {consistent_end} of {}; at-rest \
+                     corruption, re-sync required",
+                    certs.file_len()
+                )));
+            }
+            warn!(
+                target: "epoch-db",
+                log = "certs",
+                offset = consistent_end,
+                bytes_dropped = certs.file_len() - consistent_end,
+                "truncating torn tail of unclean log"
+            );
             certs.rewind_to(consistent_end);
         }
         cert_digests.set_data_file_length(certs.file_len());
@@ -1853,6 +1888,10 @@ pub enum EpochDbError {
     PersistError(String),
     /// The epoch-records database is corrupt.
     CorruptDb,
+    /// A cleanly-sealed data log stopped decoding partway through a rebuild — at-rest corruption of
+    /// complete (acked) data, which must be surfaced rather than silently truncated (INV4). Carries a
+    /// human-readable location.
+    CorruptLog(String),
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
     /// Failed to join a background thread for the database.
@@ -1883,6 +1922,7 @@ impl Display for EpochDbError {
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             EpochDbError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             EpochDbError::CorruptDb => write!(f, "Epoch records database is corrupt"),
+            EpochDbError::CorruptLog(e) => write!(f, "Sealed data log is corrupt: {e}"),
             EpochDbError::BundleValidation(e) => {
                 write!(f, "Export bundle validation failed: {e}")
             }
@@ -2648,6 +2688,47 @@ mod test {
             }
             db.close().await;
         }
+    }
+
+    /// A cleanly-sealed data log that stops decoding during a rebuild is at-rest corruption of
+    /// complete (acked) data — the rebuild must fail closed (`CorruptLog`) rather than silently
+    /// truncate it (INV4). A sidecar index is broken so `must_rebuild` runs the rebuild over the
+    /// sealed-but-corrupt log.
+    #[tokio::test]
+    async fn rebuild_fails_closed_on_sealed_log_corruption() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("epoch_sealed_corruption").expect("temp dir");
+
+        // Populate and cleanly close so both logs + indexes carry a clean-close sentinel.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        for epoch in 0..3u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record, cert).await.expect("save");
+        }
+        db.close().await;
+
+        // Corrupt a record payload in the SEALED records log. An in-place byte flip keeps the file
+        // length (and the trailing clean-close sentinel) intact, so the log still reopens *sealed* —
+        // the case a rebuild must never silently truncate.
+        let recs_path = temp_dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&recs_path).expect("read records log");
+        bytes[DATA_HEADER_BYTES + 10] ^= 0xFF;
+        std::fs::write(&recs_path, &bytes).expect("write corrupted records log");
+
+        // Break a sidecar index so `must_rebuild` fires and `rebuild_indexes` runs over the sealed log.
+        let hdx = temp_dir.path().join(Inner::RECORD_HASH_NAME).join("index.hdx");
+        let f = OpenOptions::new().write(true).open(&hdx).expect("open index to corrupt");
+        f.set_len(4).expect("truncate index header");
+        drop(f);
+
+        // The rebuild must fail closed, not silently drop the sealed log's acked records.
+        let err = EpochRecordDb::open(temp_dir.path())
+            .err()
+            .expect("open must fail closed on sealed-log corruption");
+        assert!(matches!(err, EpochDbError::CorruptLog(_)), "expected CorruptLog, got {err:?}");
     }
 
     #[tokio::test]
