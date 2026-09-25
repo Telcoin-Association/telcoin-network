@@ -9,6 +9,7 @@
   * [Peer-to-peer Network](architecture/network.md)
 * [P2P Network](network/README.md)
   * [Transport](network/transport.md)
+  * [Handshake-start accounting](network/handshake-starts.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
   * [Peers](network/peers.md)
