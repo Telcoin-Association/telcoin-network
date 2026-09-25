@@ -62,6 +62,13 @@ make pr
 
 At this time, core maintainers are the only ones allowed to run the final check required to merge PRs.
 
+#### Carried transport patches
+
+Changes that carry a patch to the QUIC/TLS transport dependencies must include a
+[maintenance and advisory record](docs/transport-patches/README.md) in the same PR.
+The record identifies the resolved source, owners, update/removal plan, advisory
+coverage and stock-peer compatibility evidence required before the patch ships.
+
 #### Adding tests
 
 PRs must include unit tests for any new feature and bug fixes.
