@@ -19,7 +19,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tn_types::{BlsPublicKey, Epoch, EpochCertificate, EpochDigest, EpochRecord};
+use tn_types::{BlsPublicKey, Epoch, EpochCertificate, EpochDigest, EpochRecord, B256};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
@@ -450,9 +450,20 @@ impl EpochRecordDb {
         let path: PathBuf = path.into();
         let (error, _) = watch::channel(None);
         let inner = Inner::open_append(path, 0)?;
-        let mut final_numbers = Vec::with_capacity(inner.epoch_idx.len());
-        for epoch in inner.records.raw_iter().map_err(|_e| EpochDbError::CorruptDb)? {
-            final_numbers.push(epoch?.final_consensus.number);
+        // Index `final_numbers` by absolute epoch (matching `update_finals`), NOT by
+        // push-per-record: an interrupted-then-retried save can leave a duplicate record in
+        // the log, and a `push` would then shift every later epoch's number and misroute
+        // `number_to_epoch`. Overwriting the epoch's own slot is idempotent under a
+        // duplicate. (Epochs are contiguous from 0 by construction, so there are no gaps to
+        // leave as zero.)
+        let mut final_numbers: Vec<u64> = Vec::with_capacity(inner.epoch_idx.len());
+        for record in inner.records.raw_iter().map_err(|_e| EpochDbError::CorruptDb)? {
+            let record = record?;
+            let epoch = record.epoch as usize;
+            if epoch >= final_numbers.len() {
+                final_numbers.resize(epoch + 1, 0);
+            }
+            final_numbers[epoch] = record.final_consensus.number;
         }
         let tx_error = error.clone();
         let handle = std::thread::spawn(move || run_db_loop(inner, rx, tx_error));
@@ -1187,6 +1198,11 @@ struct Inner {
     /// is certified, so a hole (a cert that arrives late via failed-quorum recovery or
     /// state-sync backfill) parks it until a later scan observes the backfill.
     certified_watermark: Epoch,
+    /// Test-only: when set, the next record index-save fails right after the data append, so tests
+    /// can exercise the atomic rollback (mirrors ConsensusPack's `fail_save_after_append`).
+    /// Consumed once.
+    #[cfg(test)]
+    fail_index_save_after_append: bool,
 }
 
 impl Inner {
@@ -1340,20 +1356,42 @@ impl Inner {
         cert_digests: &mut HdxIndex,
     ) -> Result<(), EpochDbError> {
         let mut iter = records.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
-        let mut idx = 0u64;
+        // Key the position index by the record's OWN epoch (relative to the first record's epoch),
+        // not by a running ordinal: an interrupted-then-retried save can leave a duplicate record
+        // in the log, and an ordinal counter would give it a second slot and shift every
+        // later epoch. `expected_slot` stays a dense sequential append; a duplicate epoch
+        // (slot below it) is skipped first-write-wins, and a gap (slot above it) is
+        // corruption in a contiguous chain and fails closed.
+        let mut expected_slot = 0u64;
+        let mut base_epoch: Option<Epoch> = None;
         let mut consistent_end = iter.logical_position();
         loop {
             let pos = iter.logical_position();
             match iter.next() {
                 None => break,
                 Some(Ok(record)) => {
+                    let base = *base_epoch.get_or_insert(record.epoch);
+                    let slot = (record.epoch as u64)
+                        .checked_sub(base as u64)
+                        .ok_or(EpochDbError::CorruptDb)?; // non-ascending epoch → corrupt
+                    if slot < expected_slot {
+                        // Duplicate of an already-indexed epoch: first-write-wins, skip it. It
+                        // stays as dead bytes in the log but no index
+                        // references it.
+                        consistent_end = iter.logical_position();
+                        continue;
+                    }
+                    if slot > expected_slot {
+                        // A missing epoch in a contiguous chain is corruption; fail closed.
+                        return Err(EpochDbError::CorruptDb);
+                    }
                     epoch_idx
-                        .save(idx, pos)
+                        .save(expected_slot, pos)
                         .map_err(|e| EpochDbError::IndexAppend(format!("epoch position: {e}")))?;
                     record_digests
                         .save(record.digest().into(), pos)
                         .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
-                    idx += 1;
+                    expected_slot += 1;
                     consistent_end = iter.logical_position();
                 }
                 Some(Err(_)) => break,
@@ -1495,6 +1533,8 @@ impl Inner {
             start_epoch,
             dummy_epoch0: None,
             certified_watermark: 0,
+            #[cfg(test)]
+            fail_index_save_after_append: false,
         };
         inner.seed_certified_watermark();
         Ok(inner)
@@ -1514,6 +1554,13 @@ impl Inner {
 
     /// Save an [`EpochRecord`] without a certificate.
     /// Idempotent: returns `Ok(())` if the record is already stored.
+    ///
+    /// **Atomic** (mirrors `ConsensusPack::rollback_output`): the record is appended to the data
+    /// log *before* its indexes are written, so if an index save fails after the append the
+    /// appended bytes would otherwise be left orphaned and a retry would append a duplicate. On
+    /// any error the append + index writes are rolled back, so a retry re-appends cleanly at
+    /// the same offset and, if the process reopens first, the desynced digest marker forces an
+    /// index rebuild from the (rewound) data log.
     fn save_record(&mut self, record: EpochRecord) -> Result<(), EpochDbError> {
         let epoch = record.epoch;
         let idx = epoch.saturating_sub(self.start_epoch) as u64;
@@ -1528,17 +1575,51 @@ impl Inner {
             ));
         }
 
+        let data_start = self.records.file_len();
+        let idx_len = self.epoch_idx.len();
+        if let Err(e) = self.append_and_index_record(&record, idx) {
+            self.rollback_record(data_start, idx_len);
+            return Err(e);
+        }
+        self.record_digests.set_data_file_length(self.records.file_len());
+        Ok(())
+    }
+
+    /// Append the record and write both of its indexes. The caller snapshots the pre-append lengths
+    /// and calls [`Self::rollback_record`] if this returns `Err`, so the save is atomic.
+    fn append_and_index_record(
+        &mut self,
+        record: &EpochRecord,
+        idx: u64,
+    ) -> Result<(), EpochDbError> {
         let record_digest = record.digest();
         let record_pos =
-            self.records.append(&record).map_err(|e| EpochDbError::Append(e.to_string()))?;
+            self.records.append(record).map_err(|e| EpochDbError::Append(e.to_string()))?;
+        // Test-only injection: fail the index save after the append to exercise the rollback.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_index_save_after_append) {
+            return Err(EpochDbError::IndexAppend(
+                "injected post-append index failure".to_string(),
+            ));
+        }
         self.record_digests
             .save(record_digest.into(), record_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
         self.epoch_idx
             .save(idx, record_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("epoch position: {e}")))?;
-        self.record_digests.set_data_file_length(self.records.file_len());
         Ok(())
+    }
+
+    /// Undo a partial [`Self::append_and_index_record`]: roll the data log + position index back to
+    /// their pre-append lengths and invalidate the digest commit marker so the next open rebuilds
+    /// every index from the (now-rewound) data log. `0` can never equal a real data length (it is
+    /// always `>=` the pack header), so `files_consistent` always fails — same discipline as
+    /// `ConsensusPack::rollback_output`.
+    fn rollback_record(&mut self, data_start: u64, idx_len: usize) {
+        self.records.rewind_to(data_start);
+        self.epoch_idx.rewind_to_len(idx_len);
+        self.record_digests.set_data_file_length(0);
     }
 
     /// Save an [`EpochRecord`] paired with its [`EpochCertificate`].
@@ -1547,7 +1628,7 @@ impl Inner {
     fn save(&mut self, record: EpochRecord, cert: EpochCertificate) -> Result<(), EpochDbError> {
         let record_digest = record.digest();
 
-        // Save the record (idempotent).
+        // Save the record (idempotent, atomic).
         self.save_record(record)?;
 
         // Skip if the cert is already stored.
@@ -1555,12 +1636,7 @@ impl Inner {
             return Ok(());
         }
 
-        let cert_pos = self.certs.append(&cert).map_err(|e| EpochDbError::Append(e.to_string()))?;
-        self.cert_digests
-            .save(record_digest.into(), cert_pos)
-            .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
-        self.cert_digests.set_data_file_length(self.certs.file_len());
-        Ok(())
+        self.save_cert_atomic(record_digest.into(), &cert)
     }
 
     /// Save an [`EpochCertificate`] keyed by `digest`. Idempotent.
@@ -1572,10 +1648,26 @@ impl Inner {
         if self.cert_digests.load(digest.into()).is_ok() {
             return Ok(());
         }
-        let cert_pos = self.certs.append(&cert).map_err(|e| EpochDbError::Append(e.to_string()))?;
-        self.cert_digests
-            .save(digest.into(), cert_pos)
-            .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
+        self.save_cert_atomic(digest.into(), &cert)
+    }
+
+    /// Atomically append a certificate and index it by `key` (same rollback discipline as
+    /// [`Self::save_record`]).
+    fn save_cert_atomic(&mut self, key: B256, cert: &EpochCertificate) -> Result<(), EpochDbError> {
+        let data_start = self.certs.file_len();
+        let append_and_index = |this: &mut Self| -> Result<(), EpochDbError> {
+            let cert_pos =
+                this.certs.append(cert).map_err(|e| EpochDbError::Append(e.to_string()))?;
+            this.cert_digests
+                .save(key, cert_pos)
+                .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
+            Ok(())
+        };
+        if let Err(e) = append_and_index(self) {
+            self.certs.rewind_to(data_start);
+            self.cert_digests.set_data_file_length(0);
+            return Err(e);
+        }
         self.cert_digests.set_data_file_length(self.certs.file_len());
         Ok(())
     }
@@ -1600,14 +1692,32 @@ impl Inner {
         if epoch == 0 && self.epoch_idx.is_empty() {
             Ok(self.dummy_epoch0.clone())
         } else {
-            absent_to_none(self.epoch_idx.load((epoch - self.start_epoch) as u64))?
-                .map_or(Ok(None), |pos| absent_to_none(self.records.fetch(pos)))
+            let Some(pos) = absent_to_none(self.epoch_idx.load((epoch - self.start_epoch) as u64))?
+            else {
+                return Ok(None);
+            };
+            let Some(record) = absent_to_none(self.records.fetch(pos))? else {
+                return Ok(None);
+            };
+            // Defense in depth: the position index is keyed by `epoch - start_epoch`. If a
+            // mis-keyed rebuild or a stale slot ever pointed this epoch at another epoch's record,
+            // fail loud instead of returning the wrong epoch's record to the certified read path.
+            if record.epoch != epoch {
+                return Err(FetchError::CorruptIndex(format!(
+                    "epoch index slot for epoch {epoch} resolves to a record for epoch {}",
+                    record.epoch
+                )));
+            }
+            Ok(Some(record))
         }
     }
 
     fn record_by_digest(&mut self, digest: EpochDigest) -> Option<EpochRecord> {
         let pos = self.record_digests.load(digest.into()).ok()?;
-        self.records.fetch(pos).ok()
+        let record = self.records.fetch(pos).ok()?;
+        // The hash index has no per-hit CRC; verify the fetched record actually hashes to the
+        // requested digest so a mis-keyed entry can't return a record for a different digest.
+        (record.digest() == digest).then_some(record)
     }
 
     /// Raw fetch of the certificate stored under `digest`; collapses EVERY storage failure
@@ -2590,6 +2700,112 @@ mod test {
             "re-save must not append a duplicate cert (got {} certs)",
             certs.len()
         );
+    }
+
+    /// An index-save failure after the data append must roll the append back (no orphan), and a
+    /// retry must re-append cleanly at the same offset (no duplicate). Without the rollback the
+    /// state-sync 5 s re-save would append a second copy, corrupting the by-number/by-epoch
+    /// routing.
+    #[test]
+    fn test_save_record_atomic_rollback_and_retry() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_f3_atomic").expect("temp dir");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+
+        // Save epochs 0,1,2 cleanly.
+        let mut parent = EpochDigest::default();
+        for epoch in 0..3u32 {
+            let (record, _cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            inner.save_record(record).expect("save 0..3");
+        }
+        let len_before = inner.records.file_len();
+        assert_eq!(inner.epoch_idx.len(), 3);
+
+        // Arm the injected post-append index failure and attempt epoch 3.
+        let (record3, _c3) = make_test_pair(3, &signers, parent);
+        inner.fail_index_save_after_append = true;
+        let err = inner.save_record(record3.clone()).expect_err("index save must fail");
+        assert!(matches!(err, EpochDbError::IndexAppend(_)), "unexpected error: {err:?}");
+        // Rolled back: no orphan bytes in the log, no phantom position slot.
+        assert_eq!(inner.records.file_len(), len_before, "data log must be rewound (no orphan)");
+        assert_eq!(inner.epoch_idx.len(), 3, "no phantom position slot");
+
+        // Retry (the flag auto-cleared) re-appends at the same offset and succeeds.
+        inner.save_record(record3.clone()).expect("retry save 3");
+        assert_eq!(inner.epoch_idx.len(), 4);
+        assert_eq!(inner.record_by_epoch(3).expect("record 3").digest(), record3.digest());
+        inner.persist().expect("persist");
+        drop(inner); // clean close (seals)
+
+        // Exactly four records — the failed attempt left no orphan and the retry no duplicate.
+        let records = EpochRecordDb::read_records_from_pack(dir.path().join(RECORDS_NAME))
+            .expect("read records");
+        assert_eq!(records.len(), 4, "no orphan/duplicate accumulated in the log");
+        let db = EpochRecordDb::open(dir.path()).expect("reopen");
+        // finals: epoch e -> (e+1)*10 => [10,20,30,40]; number 35 falls in epoch 3.
+        assert_eq!(db.number_to_epoch(35), 3, "by-number routing not shifted");
+    }
+
+    /// A duplicate record left in the log (the pre-fix orphan+duplicate shape) must
+    /// be skipped by an index rebuild keyed on the record's epoch (not a running ordinal), and
+    /// `final_numbers` must be keyed by epoch so `number_to_epoch` is not shifted.
+    #[test]
+    fn test_rebuild_skips_duplicate_record_keeps_numbering() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_f3_rebuild_dup").expect("temp dir");
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            let mut record3 = None;
+            for epoch in 0..4u32 {
+                let (record, _cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save_record(record.clone()).expect("save");
+                if epoch == 3 {
+                    record3 = Some(record);
+                }
+            }
+            // Append a raw DUPLICATE of epoch 3 straight to the log (bypassing the idempotency
+            // guard), modeling the orphan+duplicate a pre-fix failed index save would
+            // have left.
+            inner.records.append(&record3.unwrap()).expect("raw duplicate append");
+            inner.persist().expect("persist");
+            std::mem::forget(inner); // crash: unclean -> reopen rebuilds
+        }
+        let db = EpochRecordDb::open(dir.path()).expect("reopen rebuilds");
+        // The rebuild keyed epoch_idx by epoch (dup skipped) and final_numbers by epoch, so routing
+        // is not shifted (the old ordinal rebuild + push-based final_numbers gave 4 and 5
+        // here).
+        assert_eq!(db.number_to_epoch(35), 3, "numbering not shifted by the duplicate");
+        assert_eq!(db.number_to_epoch(45), 4, "past-end epoch correct");
+    }
+
+    /// If a position-index slot is ever mis-keyed (points at another epoch's record), the
+    /// by-epoch read must fail loud (`CorruptIndex`) instead of returning the wrong epoch's record
+    /// to the certified path.
+    #[test]
+    fn test_try_record_by_epoch_detects_mis_keyed_slot() {
+        use crate::archive::{error::fetch::FetchError, index::Index as _};
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_f3_miskey").expect("temp dir");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        let mut parent = EpochDigest::default();
+        for epoch in 0..3u32 {
+            let (record, _cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            inner.save_record(record).expect("save");
+        }
+        // Point epoch 2's slot at epoch 0's record (rewind the last slot, then re-append it
+        // mis-keyed).
+        let pos_of_0 = inner.epoch_idx.load(0).expect("load slot 0");
+        inner.epoch_idx.rewind_to_len(2);
+        inner.epoch_idx.save(2, pos_of_0).expect("overwrite slot 2");
+        let err = inner.try_record_by_epoch(2).expect_err("mis-keyed slot must error");
+        assert!(matches!(err, FetchError::CorruptIndex(_)), "unexpected error: {err:?}");
     }
 
     /// After an unclean reopen of a DB that has records but no certs, the header-only
