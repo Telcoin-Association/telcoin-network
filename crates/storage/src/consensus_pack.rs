@@ -419,9 +419,13 @@ impl ConsensusPack {
     /// Assess (and, when `apply`, repair) one epoch's consensus pack **at rest**.
     ///
     /// MUST run with the node stopped: with `apply` it opens the pack for append and rewrites it,
-    /// which would corrupt a live node's mapping. A pack [`Self::open_static`] opens cleanly is
-    /// healthy and is left untouched (a read-only open never writes). A pack `open_static` rejects
-    /// is damaged; the data file is classified with
+    /// which would corrupt a live node's mapping. A pack is healthy (and left untouched — a
+    /// read-only open never writes) only when [`Self::open_static`] opens it cleanly AND full
+    /// [`validate_pack_file`](crate::pack_validate::validate_pack_file) passes: `open_static` alone
+    /// only checks the seal, cross-file lengths, the final position entry, and the FIRST
+    /// digest-index bucket's CRC, so full validation (which walks the whole data stream and
+    /// every bucket) is also required to catch a corrupt non-first bucket. A pack `open_static`
+    /// rejects — or that validation flags — is damaged; the data file is classified with
     /// [`classify_physical_corruption`](crate::pack_validate::classify_physical_corruption) to
     /// decide whether a truncate-and-rebuild can recover it — a torn trailing record, or a
     /// physically-sound log whose sidecar indexes are missing/corrupt — or whether the damage
@@ -6361,7 +6365,7 @@ pub(crate) mod test {
 
     /// Index-free corruption detection (the #5 regression). `persist()` acks the DATA (msync)
     /// without syncing indexes, so after a crash the indexes are stale; the old
-    /// `attested_end`-from-indexes watermark then collapsed and *silently truncated* committed
+    /// index-attested-end watermark then collapsed and *silently truncated* committed
     /// outputs. Here output 2 is damaged at rest but output 3 — a complete LATER output — still
     /// decodes past the tear. With EVERY index deleted (the post-crash state and proof no index is
     /// consulted), `output_after_tear` sees output 3's header: an output written past the tear

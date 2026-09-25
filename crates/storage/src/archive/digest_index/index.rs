@@ -307,9 +307,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Open (creating if empty) a memory-mapped HDX index in directory `dir`.
     ///
     /// Note you MUST supply a stable hasher (e.g. fxhasher); the default Rust hasher is not stable
-    /// across instances and would invalidate the index. This is the mmap-only analogue of
-    /// [`HdxIndex::open_hdx_file`](super::index::HdxIndex::open_hdx_file) and always uses the
-    /// memory-mapped file backend.
+    /// across instances and would invalidate the index. The index always uses the memory-mapped
+    /// file backend (the non-mmap backend was removed).
     pub fn open_hdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
@@ -932,8 +931,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     }
 
     /// Read-modify-write body of [`Self::save_to_bucket`]: rewrites the bucket in place through the
-    /// mapping, then zeroes its trailer to mark it dirty for the bulk CRC at `sync()`. On any error
-    /// the on-disk bucket is left untouched.
+    /// mapping, then zeroes its trailer to mark it dirty for the bulk CRC at `sync()`. If the
+    /// in-place rewrite fails the on-disk bucket is left untouched; on the overflow path a failed
+    /// odx `write_all` may leave the bucket trailer already re-CRC'd, which is harmless (the
+    /// CRC still matches the bucket bytes).
     fn save_to_bucket_inner(
         &mut self,
         key: &[u8],
@@ -1180,7 +1181,8 @@ mod tests {
     fn test_corrupt_non_first_bucket_errors_on_miss() {
         let tmp = TempDir::with_prefix("test_hdx_corrupt_nonfirst").expect("temp dir");
         let mut idx = open_index(tmp.path());
-        // Enough keys to expand well past the single initial bucket.
+        // Populate enough keys to exercise bucket reads/misses (INITIAL_BUCKETS is 1000, so 256
+        // keys fill buckets without triggering a split).
         for i in 0..256u64 {
             idx.save(key(i), i).expect("save");
         }

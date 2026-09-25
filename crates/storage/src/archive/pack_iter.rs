@@ -92,10 +92,13 @@ where
         self.reader.stream_position()
     }
 
-    /// Byte offset just past the last complete record read (the header + all whole record frames
-    /// consumed so far). Unlike [`Self::position`] this never lands mid-record — it is only
-    /// advanced by the exact on-disk frame size of each fully-read record — so it is the safe
-    /// boundary to truncate a torn log back to.
+    /// Byte offset just past the last record `next()` returned (the header + all whole record
+    /// frames consumed so far). After a successful `next()` this is a record boundary — the
+    /// safe point to truncate a torn log back to. It is NOT a valid boundary after `next()`
+    /// returns an `Err`: `pos` advances by the frame's claimed length before the CRC/decode is
+    /// checked, so on a decode failure it can sit past an incomplete (or, on a corrupt size
+    /// prefix, out-of-range) frame. Recovery callers capture it *before* each `next()` and
+    /// never read it after an `Err`.
     pub fn logical_position(&self) -> u64 {
         self.pos
     }
@@ -236,9 +239,11 @@ where
     /// are returned in insert order.
     pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
-        // so the (peer-facing) async path rejects future/foreign formats instead of parsing
-        // them with current-format logic.
+        // Reject an unexpected `appnum` so the (peer-facing) async path rejects foreign formats
+        // instead of parsing them with current-format logic. The pack-format VERSION is not checked
+        // here: the sole caller (`ConsensusPack::stream_import`) enforces `version <= PACK_VERSION`
+        // after open. A future caller of `AsyncPackIter::open` must do the same (or take a
+        // max-version parameter).
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }

@@ -20,7 +20,8 @@
 //! typical / wide batches per output). Each column writes [`NUM_OUTPUTS`] chained outputs built
 //! with [`make_wide_test_output`], whose batches are genuinely distinct across outputs (random
 //! transactions). Every one of the pack's files (data + position index + digest index) is
-//! memory-mapped, so the whole pack is `msync`-durable.
+//! memory-mapped; `persist()` msyncs the data log (the WAL, source of truth), while the derived
+//! indexes are written through the pack's background thread and rebuilt from the log on recovery.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:

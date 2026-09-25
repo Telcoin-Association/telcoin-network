@@ -688,11 +688,14 @@ impl ConsensusChain {
                             && epoch_final_hash == last_header.digest()
                         {
                             // Return the logical data length so the caller streams exactly
-                            // `[0, data_len)` and never the mmap capacity padding the physical file
-                            // may carry past `end`. A sealed epoch was clean-closed (physical ==
-                            // logical) and `open_static` already rejects an inconsistent file, so
-                            // this bound is belt-and-suspenders — but it lets the pack own its own
-                            // length instead of a network-triggered truncate of the served file.
+                            // `[0, data_len)`. This bound is LOAD-BEARING, not belt-and-suspenders:
+                            // a sealed pack is physically `end + 8`
+                            // (the clean-close sentinel) and a live
+                            // pack is padded out to mmap capacity, so without it the stream would
+                            // carry the sentinel / padding and the
+                            // importer's `AsyncPackIter` would reject
+                            // the trailing bytes. It also lets the pack own its length instead of a
+                            // network-triggered truncate of the served file.
                             let data_len = pack.data_file_len().await?;
                             drop(pack);
                             let base_dir = self.base_path.join(format!("epoch-{epoch}"));

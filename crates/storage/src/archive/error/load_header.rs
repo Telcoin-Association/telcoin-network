@@ -59,7 +59,7 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidType => write!(f, "invalid type id"),
             Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
-            Self::InvalidVersion => write!(f, "invalid version (should be 0)"),
+            Self::InvalidVersion => write!(f, "unsupported pack file version"),
             Self::InvalidDataUID => write!(f, "invalid data file uid"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
             Self::InvalidIndexVersion => write!(f, "invalid index version"),

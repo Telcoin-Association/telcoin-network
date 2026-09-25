@@ -18,13 +18,12 @@ const MIN_HEADER_SIZE: usize = 28;
 /// time. This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
 pub struct OdxHeader {
-    type_id: [u8; 8], // The characters "telcoinx"
-    version: u16,     // Holds the version number
-    uid: u64,         // Unique ID generated on creation
-    appnum: u32,      // Application defined constant
-    header_size: usize, /* Size of the header (not saved to file, max of bucket_size or
-                       * MIN_HEADER_SIZE). */
-    read_only: bool, // Is this file read only?
+    type_id: [u8; 8],   // The characters "telcoinx"
+    version: u16,       // Holds the version number
+    uid: u64,           // Unique ID generated on creation
+    appnum: u32,        // Application defined constant
+    header_size: usize, // Size of the header (not saved to file); always MIN_HEADER_SIZE (28).
+    read_only: bool,    // Is this file read only?
 }
 
 impl OdxHeader {

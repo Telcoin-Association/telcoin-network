@@ -98,12 +98,14 @@ where
     /// True iff the record-length-prefix region at `pos` has been written — any of the up-to-4
     /// prefix bytes within the logical data `[pos, min(pos + 4, len()))` is non-zero.
     ///
-    /// A real record's length prefix is non-zero, whereas freshly-grown mmap capacity padding reads
-    /// as zeros; a partially-written or torn prefix still has a non-zero leading byte. So this
+    /// A real record's 4-byte length prefix is non-zero, whereas freshly-grown mmap capacity
+    /// padding reads as zeros. This checks every one of the up-to-4 prefix bytes (not just the
+    /// leading one — a valid length that is a multiple of 256 has a zero low byte), so it
     /// distinguishes "a record (even a torn one) was written here" — which a caller must not
-    /// silently overwrite — from unwritten zero padding or an empty tail. Bounded by the logical
-    /// end, so a cleanly-sealed file with nothing at `pos` (`pos >= len()`) returns false, and a
-    /// crash-grown, zero-padded file with no record written past `pos` also returns false.
+    /// silently overwrite — from unwritten zero padding or an empty tail. Bounded by the
+    /// logical end, so a cleanly-sealed file with nothing at `pos` (`pos >= len()`) returns
+    /// false, and a crash-grown, zero-padded file with no record written past `pos` also
+    /// returns false.
     pub(crate) fn record_present_at(&self, pos: u64) -> bool {
         let avail = self.inner.data_file.len().saturating_sub(pos).min(4) as usize;
         avail != 0
@@ -201,11 +203,6 @@ where
     /// Rename the pack file to name.
     pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         self.inner.rename(path)
-    }
-
-    /// Truncate the pack file.  Use this get back to known good state.
-    pub fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
-        self.inner.truncate(new_len)
     }
 
     /// Roll the log's logical end back to `new_len`, zeroing the abandoned region, WITHOUT a
@@ -328,9 +325,9 @@ where
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
     fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
-        // Validate the range against the file length before allocating so a corrupt or
-        // oversized bound (the position index has no per-record CRC) errors instead of
-        // triggering a huge up-front allocation that would only fail at read_exact.
+        // Validate the range against the file length before allocating so a corrupt or oversized
+        // bound (a caller-supplied out-of-range end offset) errors instead of triggering a huge
+        // up-front allocation that would only fail at read_exact.
         if start_pos > end_pos || end_pos > self.data_file.len() {
             return Err(FetchError::IO(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -640,11 +637,6 @@ where
     /// Rename the pack file to name.
     fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         self.data_file.rename(path.as_ref())
-    }
-
-    /// Truncate the pack file.  Use this get back to known good state.
-    fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
-        self.data_file.set_len(new_len)
     }
 
     /// Return an iterator over the key values in insertion order.

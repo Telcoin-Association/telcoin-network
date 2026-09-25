@@ -20,9 +20,10 @@
 //! `sync()` (reads do not verify a per-op CRC). That makes per-op sync (`insert_dur`) cheap, while
 //! a full-build `sync_bulk` (nearly all buckets dirty) is the worst case.
 //!
-//! Caveats: under `#[cfg(test)]` the bloom filter is 64 KB (2 MB in prod), so `load_miss` probes
-//! more buckets than production. `reopen_load` is cold only in-process (the file stays in the OS
-//! page cache). macOS `fsync` is not a full barrier — run on Linux/SSD for the durability rows.
+//! Caveats: this bench runs under `#[cfg(test)]`, which selects the full production 2 MiB bloom
+//! filter (the 64 KB bloom is only for `all(feature = "test-utils", not(test))`), so `load_miss`
+//! probes exactly as production does. `reopen_load` is cold only in-process (the file stays in the
+//! OS page cache). macOS `fsync` is not a full barrier — run on Linux/SSD for the durability rows.
 
 use std::{
     hash::BuildHasherDefault,
@@ -199,7 +200,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let cell_w = 12usize;
 
     println!("\n=== digest index: HdxIndex (ms; lower is better) ===");
-    println!("legend: HdxIndex = cache-free mmap; per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. test-cfg bloom is 64 KB; run on Linux/SSD.");
+    println!("legend: HdxIndex = cache-free mmap; per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. test-cfg bloom is the production 2 MiB; run on Linux/SSD.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {

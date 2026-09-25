@@ -247,6 +247,12 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// Truncate the index to key (inclusive).  `key` must be an existing index; truncating
     /// to a key at or beyond the current length would otherwise *extend* the file with
     /// zero-filled records, so this is a no-op in that case.
+    ///
+    /// Precondition: this physically shrinks the pdx file (`set_len` → ftruncate + remap), so it is
+    /// sound only while no read-only mmap of the same pdx is live — a read-only handle mapped
+    /// before the shrink would SIGBUS on any touch past the new EOF. The pack model upholds
+    /// this: recovery and heal run only on the writable append open, never concurrently with an
+    /// `open_static` read-only map of the same epoch.
     pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
         if key as usize >= self.len() {
             return Ok(());
@@ -256,7 +262,8 @@ impl<T: PosIndexValue> PositionIndex<T> {
         self.pdx_file.set_len(pos)
     }
 
-    /// Truncate the index to just the header.
+    /// Truncate the index to just the header. Same read-only-mmap SIGBUS precondition as
+    /// [`Self::truncate_to_index`] (physical shrink; no live read-only map of this pdx).
     pub fn truncate_all(&mut self) -> Result<(), io::Error> {
         let pos = PDX_HEADER_SIZE as u64;
         self.pdx_file.set_len(pos)

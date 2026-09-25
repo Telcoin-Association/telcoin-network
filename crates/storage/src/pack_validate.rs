@@ -609,7 +609,7 @@ pub fn classify_physical_corruption(
 }
 
 /// After the walk hit an unreadable record, scan the rest of the stream: `true` if any later record
-/// still decodes (so the damage was not the final record). Mirrors the recovery `tail_is_torn`
+/// still decodes (so the damage was not the final record). Mirrors the recovery `output_after_tear`
 /// probe — a CRC-failed frame advances past itself, so decoding continues after it, while a
 /// short/torn record leaves the reader at EOF. Guards against a record whose claimed extent runs
 /// past EOF (the iterator's logical position does not advance on that read): if a repeated error

@@ -124,16 +124,18 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   indexes never override the data file, no durably-acked data is dropped, and reads/serving are
   bounded to the logical length.
 
-`pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail` /
-`TornMetaEmpty` (truncatable) or `CorruptMetaWithData` / `MidLogCorruption` / `CorruptSealedRecord`
-(data loss ⇒ re-sync).
+`pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail`
+(an unacked torn tail — truncated and repaired) or as needing a re-sync: `TornMetaEmpty` (a torn
+epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption`, `CorruptSealedRecord`
+(data loss).
 
 ### 6. `consensus.rs` — `ConsensusChain` (full consensus store)
 
 Ties the epochs together under `<datadir>/consensus-db/epochs/`. It opens the **current** epoch
 writable (`open_append_exists`, which runs recovery on restart), serves **sealed past** epochs
-read-only via `open_static` (behind a small `recent_packs` cache), imports epochs from peers with
-`stream_import` (into a `staging-{N}/` dir, then an install-locked rename), and drives epoch handoff.
+read-only via `open_static` (behind a small `recent_packs` cache), imports a full epoch from peers with
+`stream_import` (into an `import-{N}/` dir, then an install-locked rename to `epoch-{N}/`; a read-only
+partial-prefix pack instead stages under `staging-{N}/` and is never renamed), and drives epoch handoff.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
@@ -155,9 +157,9 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
 
 ```
 <datadir>/
-  db/                          reth execution DB (MDBX) + epoch/kad/cache tables
+  db/                          reth execution DB (MDBX)
   static_files/                reth static file segments
-  consensus-db/
+  consensus-db/                epoch/kad/cache sub-databases (redb or MDBX) + the epochs/ tree below
     epochs/
       epoch-{N}/               one ConsensusPack per epoch
         data                   the record WAL (source of truth)  ── + clean-close sentinel
@@ -168,7 +170,8 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
         cert_hash/{index.hdx,.odx} certificate digest index (derived)
       epochs.pack / epoch_certs.pack + sidecars   the EpochRecordDb chain
       consensus_slot{1,2}      latest-consensus hint (double-buffered)
-      staging-{N}/             transient state-sync import target
+      import-{N}/              full-epoch import target (renamed to epoch-{N}/ on install)
+      staging-{N}/             read-only partial-prefix import pack (never renamed)
     state_exports/             EVM state-export bundles
 ```
 
@@ -202,8 +205,10 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    at the consensus layer (BLS/ECDSA signatures over the payloads). Using CRC32 here is correct and
    intentional; it is not a weak-hash/authentication finding.
 5. **`recover_pack` truncates the "torn tail" / drops trailing records.** Dropping an *unacked*,
-   incompletely-written trailing record is INV1, not data loss. The `attested_end` + `tail_is_torn`
-   guards ensure a tear *below* durably-acked data becomes a hard `CorruptPack` error instead.
+   incompletely-written trailing record is INV1, not data loss. The `output_after_tear` probe (a
+   complete output decoding past the tear), the `committed_end` commit marker, and the
+   `attested_record_survives` position-index check ensure a tear *below* durably-acked data becomes a
+   hard `CorruptPack` error instead.
 6. **A torn/corrupt `EpochMeta` (or `DataHeader`) is a hard error, never repaired (INV2).** Do not
    suggest "reconstructing" or "healing" the meta. It is deliberately refused: the committee (with
    network addresses) cannot be reconstructed from the epoch alone, so recovery is a re-sync, not a

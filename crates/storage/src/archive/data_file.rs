@@ -26,11 +26,11 @@
 //! ## Transient padding, exact on exposure
 //!
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
-//! while actively appending (`end` is the logical data length). The physical file is reconciled to
-//! **exactly `end`** at every point an external consumer can observe it — `MmapDataFile::try_clone`
-//! (for `PackIter`/`raw_iter`, which read to EOF) truncates to `end`, and `Drop` (clean close)
-//! truncates to `end` and then appends an 8-byte *clean-close sentinel* — while our own reads are
-//! bounded by `end` and never see the padding.
+//! while actively appending (`end` is the logical data length). Consumers never see the padding:
+//! `MmapDataFile::try_clone` (for `PackIter`/`raw_iter`) does NOT truncate — it returns the logical
+//! `end` as the boundary the reader must stop at — and only `Drop` (clean close) reconciles the
+//! physical file to **exactly `end`** and then appends an 8-byte *clean-close sentinel*. Our own
+//! reads are bounded by `end` and never see the padding.
 //!
 //! ## Clean-close sentinel
 //!

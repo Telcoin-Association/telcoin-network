@@ -443,8 +443,8 @@ impl Display for CertifiedRecordError {
 impl EpochRecordDb {
     /// Open (or create) the epoch records database at `path` for append.
     ///
-    /// `start_epoch` is used when creating a brand-new database.  When reopening an
-    /// existing database the start epoch is derived from the first stored record.
+    /// This singleton chain always starts at epoch 0. When reopening an existing database the start
+    /// epoch is derived from the first stored record.
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self, EpochDbError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
@@ -1193,10 +1193,11 @@ struct Inner {
     dummy_epoch0: Option<EpochRecord>,
     /// Every epoch in `0..certified_watermark` has both a record and a stored certificate (a
     /// contiguous certified prefix, counted from absolute epoch 0 regardless of `start_epoch`).
-    /// Never persisted: recomputed per process at open, because the heal step can truncate
-    /// trailing records or certs after a crash. Advances only while the epoch at the watermark
-    /// is certified, so a hole (a cert that arrives late via failed-quorum recovery or
-    /// state-sync backfill) parks it until a later scan observes the backfill.
+    /// Never persisted: recomputed per process at open, because the heal step or a full index
+    /// rebuild can truncate trailing records or certs after a crash. Advances only while the
+    /// epoch at the watermark is certified, so a hole (a cert that arrives late via
+    /// failed-quorum recovery or state-sync backfill) parks it until a later scan observes the
+    /// backfill.
     certified_watermark: Epoch,
     /// Test-only: when set, the next record index-save fails right after the data append, so tests
     /// can exercise the atomic rollback (mirrors ConsensusPack's `fail_save_after_append`).
@@ -1401,9 +1402,9 @@ impl Inner {
         drop(iter);
         if consistent_end < records.file_len() {
             if !records.opened_unclean() {
-                // A cleanly-sealed log is complete by construction: a decode failure part-way through
-                // is at-rest corruption, not an unacked torn tail — fail closed instead of silently
-                // dropping acked records (INV4).
+                // A cleanly-sealed log is complete by construction: a decode failure part-way
+                // through is at-rest corruption, not an unacked torn tail — fail
+                // closed instead of silently dropping acked records (INV4).
                 return Err(EpochDbError::CorruptLog(format!(
                     "sealed records log stops decoding at offset {consistent_end} of {}; at-rest \
                      corruption, re-sync required",
@@ -1888,9 +1889,9 @@ pub enum EpochDbError {
     PersistError(String),
     /// The epoch-records database is corrupt.
     CorruptDb,
-    /// A cleanly-sealed data log stopped decoding partway through a rebuild — at-rest corruption of
-    /// complete (acked) data, which must be surfaced rather than silently truncated (INV4). Carries a
-    /// human-readable location.
+    /// A cleanly-sealed data log stopped decoding partway through a rebuild — at-rest corruption
+    /// of complete (acked) data, which must be surfaced rather than silently truncated (INV4).
+    /// Carries a human-readable location.
     CorruptLog(String),
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
@@ -2711,14 +2712,15 @@ mod test {
         db.close().await;
 
         // Corrupt a record payload in the SEALED records log. An in-place byte flip keeps the file
-        // length (and the trailing clean-close sentinel) intact, so the log still reopens *sealed* —
-        // the case a rebuild must never silently truncate.
+        // length (and the trailing clean-close sentinel) intact, so the log still reopens *sealed*
+        // — the case a rebuild must never silently truncate.
         let recs_path = temp_dir.path().join(RECORDS_NAME);
         let mut bytes = std::fs::read(&recs_path).expect("read records log");
         bytes[DATA_HEADER_BYTES + 10] ^= 0xFF;
         std::fs::write(&recs_path, &bytes).expect("write corrupted records log");
 
-        // Break a sidecar index so `must_rebuild` fires and `rebuild_indexes` runs over the sealed log.
+        // Break a sidecar index so `must_rebuild` fires and `rebuild_indexes` runs over the sealed
+        // log.
         let hdx = temp_dir.path().join(Inner::RECORD_HASH_NAME).join("index.hdx");
         let f = OpenOptions::new().write(true).open(&hdx).expect("open index to corrupt");
         f.set_len(4).expect("truncate index header");
