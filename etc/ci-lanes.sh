@@ -92,6 +92,7 @@ lane_clippy() {
 }
 
 lane_test_default() {
+    run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
     run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 

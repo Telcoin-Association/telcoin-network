@@ -11,6 +11,7 @@ use reth_metrics::{
     metrics::{Counter, Gauge},
     Metrics,
 };
+use tn_config::{QuicConfig, SwarmNetworkBudget};
 
 /// Map a [`NetworkType`] to its metric label value.
 pub(crate) fn network_label(network_type: &NetworkType) -> String {
@@ -24,6 +25,16 @@ pub(crate) fn network_label(network_type: &NetworkType) -> String {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct SwarmMetricHandles {
+    /// Current established connections across both directions and all peer classes.
+    established_connections: Gauge,
+    /// Configured established-connection ceiling; zero denotes the legacy unbounded total.
+    established_connection_limit: Gauge,
+    /// Configured incoming bidirectional stream ceiling for each established connection.
+    inbound_streams_per_connection_limit: Gauge,
+    /// Advertised receive-credit ceiling per established connection, not retained bytes or RSS.
+    receive_credit_per_connection_bytes: Gauge,
+    /// Connections rejected by the total or per-peer established-connection limits.
+    connection_limit_rejections_total: Counter,
     /// Gossip messages published by this node.
     gossip_published_total: Counter,
     /// Gossip messages received from peers.
@@ -48,6 +59,33 @@ pub(crate) struct SwarmMetrics {
 }
 
 impl SwarmMetrics {
+    /// Record effective transport ceilings using only the configured network label.
+    pub(crate) fn with_capacity(
+        self,
+        quic: &QuicConfig,
+        budget: Option<SwarmNetworkBudget>,
+    ) -> Self {
+        self.handles
+            .established_connection_limit
+            .set(f64::from(budget.map_or(0, |budget| budget.connections())));
+        self.handles
+            .inbound_streams_per_connection_limit
+            .set(f64::from(quic.max_concurrent_stream_limit));
+        self.handles.receive_credit_per_connection_bytes.set(f64::from(quic.max_connection_data));
+        self.handles.established_connections.set(0.0);
+        self
+    }
+
+    /// Observe established connection occupancy, including multiple connections to one peer.
+    pub(crate) fn set_established_connections(&self, connections: u32) {
+        self.handles.established_connections.set(f64::from(connections));
+    }
+
+    /// Count shedding at the resource limit without peer or address labels.
+    pub(crate) fn record_connection_limit_rejection(&self) {
+        self.handles.connection_limit_rejections_total.increment(1);
+    }
+
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
@@ -223,6 +261,38 @@ impl PeerManagerMetrics {
 mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// Capacity observations have only the configured swarm label and track occupancy and shedding.
+    #[test]
+    fn budget_metrics_record_capacity_occupancy_and_shedding() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Worker(2))
+                .with_capacity(&QuicConfig::default(), None);
+            swarm.set_established_connections(7);
+            swarm.record_connection_limit_rejection();
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge_is = |name, expected| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key.key().labels().count() == 1
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| label.key() == "network" && label.value() == "worker-2")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        assert!(gauge_is("tn_network.established_connections", 7.0));
+        assert!(gauge_is("tn_network.established_connection_limit", 0.0));
+        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 10_000.0));
+        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 104_857_600.0));
+        assert!(snapshot.iter().any(|(key, _, _, value)| key.key().name()
+            == "tn_network.connection_limit_rejections_total"
+            && matches!(value, DebugValue::Counter(1))));
+    }
 
     /// Primary and worker metrics register their expected labels and update every handle.
     #[test]

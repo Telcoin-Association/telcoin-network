@@ -40,7 +40,9 @@ use std::{
     num::NonZeroUsize,
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
+use tn_config::{
+    KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
+};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
     TnSender, WorkerId,
@@ -54,6 +56,10 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/network_budget_tests.rs"]
+mod network_budget_tests;
 
 /// Hard cap on the number of distinct peers retained in
 /// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
@@ -123,17 +129,19 @@ enum RecordFreshness {
 /// of connections instead of an unbounded fan-out.
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
-/// Build the [`connection_limits::Behaviour`] that caps concurrent established connections per peer
-/// at [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`].
+/// Build established-connection limits for this swarm's optional process allocation.
 ///
-/// Only the per-peer bound is set; the other `connection_limits` dimensions (pending / established
-/// totals and per-direction caps) are intentionally left unbounded so this change adds exactly the
-/// missing per-peer ceiling and nothing else. Shared by [`TNBehavior::new`] and its regression test
-/// so both exercise the identical limit.
-fn connection_limits_behaviour() -> connection_limits::Behaviour {
+/// Without an allocation, retain [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]. Both directions and all
+/// peer classes consume the allocation: this behaviour must never install bypass peer IDs.
+fn connection_limits_behaviour(budget: Option<SwarmNetworkBudget>) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER)),
+            .with_max_established_per_peer(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                    budget.connections_per_peer()
+                }),
+            ))
+            .with_max_established(budget.map(|budget| budget.connections())),
     )
 }
 
@@ -159,7 +167,7 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer connection ceiling (issue #1010).
+    /// Per-peer connection ceiling and optional per-swarm process allocation.
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
     /// peer is rejected before it is counted here), and before the remaining behaviors so an
@@ -202,7 +210,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour();
+        let connection_limits = connection_limits_behaviour(None);
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -414,6 +422,8 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -538,6 +548,7 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior.connection_limits = connection_limits_behaviour(budget);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -563,13 +574,12 @@ where
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
+                config.handshake_timeout = quic_config.handshake_timeout;
+                config.max_idle_timeout = quic_config.max_idle_timeout;
+                config.keep_alive_interval = quic_config.keep_alive_interval;
+                config.max_concurrent_stream_limit = quic_config.max_concurrent_stream_limit;
+                config.max_stream_data = quic_config.max_stream_data;
+                config.max_connection_data = quic_config.max_connection_data;
                 config
             })
             .with_behaviour(|_| behavior)
@@ -615,7 +625,7 @@ where
             external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
-            metrics: SwarmMetrics::new_for(&network_type),
+            metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
         })
     }
 
@@ -792,6 +802,9 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_established_connections(
+                self.swarm.network_info().connection_counters().num_established(),
+            );
         }
     }
 
@@ -801,6 +814,13 @@ where
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
+        if matches!(&event,
+            SwarmEvent::IncomingConnectionError { error: libp2p::swarm::ListenError::Denied { cause }, .. }
+            | SwarmEvent::OutgoingConnectionError { error: libp2p::swarm::DialError::Denied { cause }, .. }
+            if cause.downcast_ref::<connection_limits::Exceeded>().is_some()
+        ) {
+            self.metrics.record_connection_limit_rejection();
+        }
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
