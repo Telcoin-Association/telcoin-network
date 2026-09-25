@@ -20,13 +20,14 @@ Each figure on this page comes from a code constant, from the resource model in 
 The benchmark ran on 2026-09-23 on two GCP fleets, and its results are in the [benchmark report](https://claude.ai/artifact/6qpBKmd3eKNaRBuxUtPPCR), also committed as `bench/reports/2026-09-bench-10v.html` in the tn-transaction-generator repository.
 On this page, e2 means the e2-custom-4-8192 fleet (4 vCPU, which is 2 physical cores, and 8 GB; run r20260923-0708) and c3 means the c3-highcpu-8 fleet (8 vCPU, which is 4 physical cores, and 16 GB; run r20260923-0515).
 Each cell below says whether its figure is measured, modelled or provisional, and its note gives the run and the `sizing.json` field or the formula behind it.
+The validator CPU and memory cells also name the measured single-worker figure they double (see [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled)).
 Benchmark sources and code references are listed at the end of the page.
 
 | Role | Tier | CPU (physical cores, PassMark single-thread) | RAM | Storage (capacity, sustained IOPS, MB/s, DWPD) | Network |
 | --- | --- | --- | --- | --- | --- |
-| Validator | Minimum | 4 physical cores (measured) [^b-val-cpu-min] | 16 GB (measured) [^b-val-ram-min] | 2 TB TLC NVMe, 10,000 write IOPS, 300 MB/s, 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
-| Validator | Recommended | 4 physical cores, PassMark 3,500 or higher (cores measured, PassMark modelled) [^b-val-cpu-rec] | 32 GB (measured) [^b-val-ram-rec] | 4 TB TLC NVMe, 20,000 IOPS, 500 MB/s, 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] | 1 Gbps (measured demand, modelled margin) [^b-net] |
-| Validator | Headroom | As recommended (modelled) [^b-head] | 32 GB (modelled) [^b-head] | 12 TB, otherwise as recommended (modelled) [^b-head-disk] | 1 Gbps (modelled) [^b-head] |
+| Validator | Minimum | 8 physical cores (twice the measured 4) [^b-val-cpu-min] [^doubling] | 32 GB ECC (twice the measured 16 GB) [^b-val-ram-min] [^doubling] | 2 TB TLC NVMe, 10,000 write IOPS, 300 MB/s, 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
+| Validator | Recommended | 16 physical cores, PassMark 3,500 or higher (twice the minimum; PassMark modelled) [^b-val-cpu-rec] [^doubling] | 64 GB ECC (twice the minimum) [^b-val-ram-rec] [^doubling] | 4 TB TLC NVMe, 20,000 IOPS, 500 MB/s, 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] | 1 Gbps (measured demand, modelled margin) [^b-net] |
+| Validator | Headroom | As recommended (modelled) [^b-head] | 64 GB ECC (as recommended) [^b-head] [^doubling] | 12 TB, otherwise as recommended (modelled) [^b-head-disk] | 1 Gbps (modelled) [^b-head] |
 | Observer (follower) | Minimum | 2 physical cores (measured) [^b-obs-min] | 8 GB (measured) [^b-obs-min] | As validator minimum (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
 | Observer (follower) | Recommended | 4 physical cores (measured) [^b-obs-rec] | 16 GB (measured) [^b-obs-rec] | As validator recommended (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
 | Observer (follower) | Headroom | 4 physical cores (modelled) [^b-head] | 16 GB (modelled) [^b-head] | 12 TB, as validator headroom (modelled) [^b-head-disk] | 50 Mbps (modelled) [^b-obs-net] |
@@ -42,15 +43,90 @@ The tiers mean:
 - Recommended: enough margin that p95 use of CPU, memory, disk IOPS and bandwidth stays below half of capacity at the benchmark load, plus one year of storage growth at the [per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling) (about 260 TPS with the 6-hour epochs mainnet and testnet use). Storage uses the ceiling because the benchmark's load is far above what the release can sustain with 6-hour epochs.
 - Headroom: sized for the highest sustained load the current release can carry, which is set by the batch-cache ceiling, including restart replay at that load and three years of storage growth. That load is under a thirteenth of what the benchmark ran, so the recommended CPU, memory and network already cover it. Headroom beyond Recommended is about storage growth and RPC caching, not throughput.
 
+Those rules describe the single-worker validators the benchmark ran, and [Single-worker figures from the benchmark](#single-worker-figures-from-the-benchmark) lists what they gave: 4 physical cores and 16 GB minimum, 32 GB recommended.
+The validator CPU and memory tiers above are twice that, a margin for the worker count that governance is expected to raise above one over the next 12 months.
+The minimum tier is twice the measured single-worker minimum, and the recommended tier is twice the minimum.
+Storage and network keep their derived figures, and the observer tiers are not doubled.
+[Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled) says what each worker adds, and [Expected service life](#expected-service-life) says how long each tier lasts.
+
 Neither fleet's 100 GB network-attached volume ran free of IO stalls (see [Storage](#storage)), so every tier's disk figures come from measured demand plus margin, not from a tested volume.
 
-Cloud vCPUs are usually hyperthreads, so 8 vCPUs are 4 physical cores.
+Cloud vCPUs are usually hyperthreads, so 8 vCPUs are 4 physical cores, and the minimum tier's 8 physical cores are a 16-vCPU instance.
 Compare physical cores when reading this table.
+
+### Single-worker figures from the benchmark
+
+The tier rules applied to the benchmark's validators, which ran one worker each, give these figures.
+The summary doubles the CPU and memory and carries storage and network over unchanged.
+
+| Tier | CPU (physical cores) | RAM | In the summary |
+| --- | --- | --- | --- |
+| Minimum | 4 (measured) [^b-val-cpu-min] | 16 GB (measured) [^b-val-ram-min] | 8 cores, 32 GB ECC |
+| Recommended | 4, PassMark 3,500 or higher (cores measured, PassMark modelled) [^b-val-cpu-rec] | 32 GB (measured) [^b-val-ram-rec] | 16 cores, 64 GB ECC |
+| Headroom | As recommended (modelled) [^b-head] | 32 GB (modelled) [^b-head] | As recommended, 64 GB ECC |
+
+### Why validator CPU and memory are doubled
+
+The benchmark ran one worker per validator, the count adiri runs today [^workers-fork].
+The worker count is an on-chain parameter.
+At each epoch entry the node reads `WorkerConfigs` at the previous epoch's closing block and builds the committee with that count [^workers-onchain], and the multi-worker fork lets governance raise it above one [^workers-fork].
+The Telcoin Association expects to raise it over the next 12 months, to as many as four workers per validator.
+The benchmark did not measure a multi-worker node, so the validator CPU and memory tiers carry a margin instead of a measurement: the minimum tier is twice the single-worker minimum, and the recommended tier is twice the minimum [^doubling].
+
+Each worker adds its own copy of these components [^workers-per]:
+
+- A transaction pool with its own maintenance tasks, under the same `--txpool.*` limits as the first, so the pool bound grows by 60 MB per worker [^workers-pool].
+- A batch builder that seals batches from that pool, and a batch validator for the batches other validators send.
+  Batch validation recovers signatures on the process-wide pool of core count minus two threads [^rayon], next to execution's own recovery work.
+- A JSON-RPC server on its own ports [^workers-rpc].
+- A libp2p swarm with its own listen address and UDP port, its own network key and its own batch gossip topic, kept for the life of the process [^workers-swarm].
+  Its quorum waiter sends each batch it seals to the other N − 1 committee members [^qw-fanout], so peer connections grow to about W · (N − 1) for W workers, plus the primary's.
+  Open one worker port per configured worker in the [firewall](validator-operations.md#firewall-configuration).
+
+These do not change with the worker count:
+
+- Execution.
+  One engine executes one consensus output at a time on one blocking thread [^engine-single], and a header carries at most 10 batch digests in total, shared across the node's workers in round-robin order [^header-cap].
+  More workers let a validator seal batches in parallel, and an output can carry more blocks than the benchmark's outputs did, but never more than the header cap allows.
+- The batch cache.
+  There is one cache environment per process, keyed by batch hash with no worker id [^cache-shared], so the [per-epoch ceiling](#per-epoch-batch-cache-ceiling) of about 260 TPS bounds the committee's batch data whatever the worker count.
+- Storage growth and network bandwidth, which follow committed batch bytes and so stay under the same ceiling.
+  Their tier figures are not doubled.
+
+The doubling is a provisioning margin, not a measurement.
+The per-worker terms are small next to a 32 GB host, and the c3 validators carried 5,384 TPS, about twenty times the 6-hour ceiling, at 25% CPU and 52% memory at p95 with one worker, so twice that host covers a second worker with room to spare.
+Buy the recommended tier for a host that will run more than two.
+Four workers need a multi-worker benchmark before this page can size them, and the page will be re-derived from it before the count gets there.
+
+### Expected service life
+
+Storage is the resource that runs out.
+CPU and memory are sized for a load the release cannot reach.
+
+The table gives the time to fill each tier's capacity from the growth formula under [Storage](#storage), with idle growth included: about 8 GB a day at the 6-hour ceiling and 3.2 GB a day at 100 TPS of the benchmark mix.
+β_reth is a lower bound on growth, so these are the longest each capacity can be expected to last.
+
+| Tier | Capacity | At 100 TPS, benchmark mix | At the 6-hour ceiling, about 260 TPS |
+| --- | --- | --- | --- |
+| Minimum | 2 TB | About 1.7 years | About 8 months |
+| Recommended | 4 TB | About 3.4 years | About 16 months |
+| Headroom | 12 TB | About 10 years | About 4 years |
+
+Today's networks add about 0.07 TB a year, so at today's load a drive reaches the end of its rated life before it fills.
+The DWPD ratings in the summary are twice the write rate modelled at the ceiling, so a drive that meets them uses at most half of its rated endurance over its warranty period, usually five years, even at the ceiling.
+
+CPU and memory are not expected to be the limit in any tier.
+The minimum tier is twice a host that carried 5,384 TPS, about twenty times the 6-hour ceiling, with its engine queue at 3 or below and memory pressure at zero.
+Two things could exhaust that margin: more workers than the doubling was sized for, or a release that raises the batch-cache ceiling toward the thousands of TPS the benchmark ran.
+A multi-worker benchmark is due before the worker count reaches four, and a ceiling change ships as a release, so this page will be re-derived before either matters.
+
+For a three-year hardware cycle, the recommended tier holds at loads up to about 100 TPS of the benchmark mix.
+At the ceiling its disk fills in about 16 months, so plan a storage upgrade then or start on the headroom tier.
 
 ### Provisional estimates
 
 These estimates come from the model and from the networks running today.
-They were made before the benchmark ran, and the table above replaces them.
+They were made before the benchmark ran, and the single-worker figures above replace them; the summary then doubles the validator CPU and memory.
 
 | Role | CPU | RAM | Storage | Network |
 | --- | --- | --- | --- | --- |
@@ -59,18 +135,19 @@ They were made before the benchmark ran, and the table above replaces them.
 | Observer, follower | 4 physical cores | 8 to 16 GB | Same as a validator | 50 Mbps |
 | Observer, public RPC | 8 physical cores | 32 GB | Same as a validator | Sized for RPC traffic |
 
-The benchmark moved these provisional figures:
+The benchmark moved these provisional figures, before the multi-worker doubling:
 
 - Recommended validator CPU fell from 8 to 4 physical cores, and its PassMark floor from 4,000 to 3,500.
 - The minimum disk changed from 15,000 sustained IOPS to 10,000 sustained write IOPS plus a 300 MB/s throughput floor, and needs a 2.4 DWPD rating.
 - The recommended disk gained a 20,000 IOPS and 500 MB/s floor, and its endurance rating rose from 1 to 1.2 DWPD.
 - The follower observer minimum fell from 4 to 2 physical cores and settled at 8 GB, with 16 GB recommended.
 
-Validator RAM (16 and 32 GB), storage capacity (2 and 4 TB) and network (200 Mbps and 1 Gbps) held.
+Validator RAM (16 and 32 GB for one worker), storage capacity (2 and 4 TB) and network (200 Mbps and 1 Gbps) held.
 
 Earlier versions of this page asked validators for 16 cores / 32 threads, 128 GB of RAM and 4 to 7.5 TB of NVMe, and observers for 8 cores / 16 threads and 16 to 32 GB.
 Those figures were not derived from measurement.
-Against them, validator RAM moved from 128 GB to 16 GB minimum and 32 GB recommended, CPU from 16 cores to 4 physical cores, and storage from 4 to 7.5 TB to 2 to 4 TB, sized for the batch-cache ceiling of about 260 TPS.
+Against them, validator RAM moved from 128 GB to 32 GB minimum and 64 GB recommended, CPU from 16 cores and 32 threads to 8 physical cores minimum and 16 recommended, and storage from 4 to 7.5 TB to 2 to 4 TB, sized for the batch-cache ceiling of about 260 TPS.
+The benchmark alone would have set 16 and 32 GB and 4 physical cores; the rest is the multi-worker margin.
 
 ## Validator
 
@@ -82,7 +159,7 @@ Block execution is sequential.
 The engine executes one consensus output at a time on a single blocking thread [^engine-single], and transactions inside a block run in order.
 Signature recovery for an output's transactions runs in parallel [^ecrecover] on a thread pool sized to the core count minus two [^rayon], and incoming batches are checked on the same pool [^batch-validator].
 Single-thread speed therefore sets how fast a node executes.
-Extra cores help with signature recovery and with the networking, database and RPC work that runs next to execution.
+Extra cores help with signature recovery and with the networking, database and RPC work that runs next to execution, and once the worker count rises above one, with the batch builder and batch validator that each worker adds (see [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled)).
 
 Execution speed also limits consensus speed:
 
@@ -100,8 +177,8 @@ The c3 validators (4 physical cores) used 13% on average and 25% at p95, their e
 Total CPU percentage understates an execution bottleneck, because one saturated execution thread is only 25% of a 4-vCPU host.
 Watch the engine queue instead (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
 
-Buy single-thread speed first.
-A higher-clocked 8-core part does more for a validator than a 32-core part at a lower clock.
+Buy single-thread speed first, then core count.
+A higher-clocked 16-core part does more for a validator than a 32-core part at a lower clock.
 
 ### Memory
 
@@ -124,7 +201,7 @@ The last three are the range across validators from the on-node sampler (`sample
 No node was OOM-killed.
 On e2 the node filled 7.2 of 8 GB and the kernel was reclaiming pages it needed, so 8 GB fails the minimum rule even though no node ran out.
 On c3 memory pressure stayed at zero.
-Its 52% at p95 is just over the half-capacity line, so the recommended tier is 32 GB.
+Its 52% at p95 is just over the half-capacity line, so the single-worker recommended figure is 32 GB, which the summary doubles to 64 GB.
 Anonymous memory on one c3 validator reached 8.1 GB, more than an 8 GB host holds in total.
 c3 RSS is higher partly because the node maps its databases into memory and those file-backed pages stay resident while RAM is free, and partly because anonymous memory rose with the higher load.
 
@@ -176,7 +253,8 @@ So PC_hot is about 3 GB at the benchmark's chain size, and it grows with state.
 
 Disable swap.
 A swapping validator keeps running but executes slowly, and because votes wait on execution it drags on the committee instead of failing visibly.
-Use ECC memory on bare-metal hosts.
+Use ECC memory.
+Cloud instance hosts generally have it already; on bare metal, specify ECC DIMMs.
 
 ### Storage
 
@@ -538,7 +616,8 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 | Code constants (1 GiB batch cache, 64 + 8 output queue, 10 batches per header, 1 MB batch, 6 h mainnet epoch, 8 h CLI default) | Code | Exact for this release |
 | Batch-cache TPS ceiling | Constants and the measured 190 B per transaction | Modelled from a measured input; MDBX page overhead not included |
 | CPU, RAM, disk and network use at benchmark load | Benchmark, both fleets | Measured |
-| Minimum and recommended CPU and RAM | Benchmark and the tier rules | Measured |
+| Single-worker minimum and recommended CPU and RAM | Benchmark and the tier rules | Measured |
+| Validator CPU and RAM tiers in the summary | Twice the single-worker figures | Modelled margin for the multi-worker rollout, not measured |
 | PassMark floor | Judgement; CPU scores were not recorded | Modelled |
 | Disk and network figures in every tier | Measured demand plus the tier margins | Modelled from measured demand |
 | Replay memory peak | Benchmark, one e2 validator, one restart | Measured, single sample |
@@ -557,14 +636,14 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 ## Sources and code references
 
 Notes whose names start with `b-` cite the benchmark: the run, and the field in that run's `sizing.json` unless another file is named.
-The rest cite code.
+`doubling` states the multi-worker rule, and the rest cite code.
 
-[^b-val-cpu-min]: Measured, r20260923-0708 (e2) and r20260923-0515 (c3). `gcp_by_role.validator.cpu_utilization`: e2 validators ran 44% mean (`mean_avg_nodes`), 55% p95 (`p95_max_node`) and 66% max of 4 vCPU; c3 validators ran 13%, 25% and 36% of 8 vCPU. `prometheus.tn_engine_queued_outputs`: every e2 validator reached 7 or 8 queued outputs, against a limit of 8, while no c3 validator passed 3. `prometheus.tn_batch_builder_pending_pool_transactions`: seven e2 pools peaked at 9,480 to 9,850 transactions, near the default limit of 10,000. The 2-core e2 hosts were execution-bound, so they fail the minimum rule; the 4-core c3 hosts pass it on CPU.
-[^b-val-ram-min]: Measured, r20260923-0708 and r20260923-0515. e2 (8 GB): `gcp_by_role.validator.memory_percent_used.p95_max_node` 81%, `telcoin_rss_bytes.p95_max_node` 7.15 GB, `sampler_by_node.*.psi_mem_some_avg10.run_max` 0.9 to 4%, replay peak 7.0 GB. c3 (16 GB): 52%, 10.8 GB, PSI memory 0. 8 GB left no room for the replay peak, so the minimum is 16 GB.
+[^b-val-cpu-min]: Measured, r20260923-0708 (e2) and r20260923-0515 (c3). `gcp_by_role.validator.cpu_utilization`: e2 validators ran 44% mean (`mean_avg_nodes`), 55% p95 (`p95_max_node`) and 66% max of 4 vCPU; c3 validators ran 13%, 25% and 36% of 8 vCPU. `prometheus.tn_engine_queued_outputs`: every e2 validator reached 7 or 8 queued outputs, against a limit of 8, while no c3 validator passed 3. `prometheus.tn_batch_builder_pending_pool_transactions`: seven e2 pools peaked at 9,480 to 9,850 transactions, near the default limit of 10,000. The 2-core e2 hosts were execution-bound, so they fail the minimum rule; the 4-core c3 hosts pass it on CPU. The single-worker minimum is therefore 4 physical cores, and the summary doubles it to 8.
+[^b-val-ram-min]: Measured, r20260923-0708 and r20260923-0515. e2 (8 GB): `gcp_by_role.validator.memory_percent_used.p95_max_node` 81%, `telcoin_rss_bytes.p95_max_node` 7.15 GB, `sampler_by_node.*.psi_mem_some_avg10.run_max` 0.9 to 4%, replay peak 7.0 GB. c3 (16 GB): 52%, 10.8 GB, PSI memory 0. 8 GB left no room for the replay peak, so the single-worker minimum is 16 GB, and the summary doubles it to 32 GB.
 [^b-val-disk-min]: Modelled from measured demand. The minimum takes twice the e2 p95 write IOPS (5,120, `gcp_by_role.validator.disk_write_ops_per_sec.p95_max_node`) and sets throughput above the c3 plateau of 190 MB/s (`disk_write_bytes_per_sec.p95_max_node`), because both fleets' 100 GB volumes showed IO stalls. 2 TB holds about 8 months of growth at the 6-hour ceiling (about 8 GB a day with idle growth). 2.4 DWPD is twice the modelled 0.4 to 1.2 DWPD at the ceiling (see [Endurance](#endurance-from-the-measured-write-rate)).
 [^b-net]: Measured demand, r20260923-0708 and r20260923-0515, `gcp_by_role.validator.network_sent_bytes_per_sec.p95_max_node` and `network_received_bytes_per_sec.p95_max_node`: out 56 Mbps (e2) and 86 Mbps (c3), in 24 and 21 Mbps. 200 Mbps symmetric clears the measured p95 with room for catch-up. 1 Gbps keeps p95 under a tenth of capacity and leaves room for catch-up and serving epoch packs, which the benchmark did not measure. Egress includes RPC traffic to the load generator.
-[^b-val-cpu-rec]: Cores measured, r20260923-0515: 25% p95 and 36% max of 8 vCPU (`gcp_by_role.validator.cpu_utilization`) on 4 physical cores, under the half-capacity line, with the engine queue at 3 or below. The PassMark figure is modelled: the benchmark did not record CPU models or scores, and 3,500 is a floor chosen for single-thread speed, not a measurement.
-[^b-val-ram-rec]: Measured, r20260923-0515: 16 GB ran at 52% p95 (`gcp_by_role.validator.memory_percent_used.p95_max_node`), just over half of capacity, so the recommended tier doubles it to 32 GB.
+[^b-val-cpu-rec]: Cores measured, r20260923-0515: 25% p95 and 36% max of 8 vCPU (`gcp_by_role.validator.cpu_utilization`) on 4 physical cores, under the half-capacity line, with the engine queue at 3 or below, so the single-worker recommended figure is 4 physical cores; the summary's 16 is twice the doubled minimum. The PassMark figure is modelled: the benchmark did not record CPU models or scores, and 3,500 is a floor chosen for single-thread speed, not a measurement.
+[^b-val-ram-rec]: Measured, r20260923-0515: 16 GB ran at 52% p95 (`gcp_by_role.validator.memory_percent_used.p95_max_node`), just over half of capacity, so the single-worker recommended figure is 32 GB; the summary's 64 GB is twice the doubled minimum.
 [^b-val-disk-rec]: Modelled from measured demand. 20,000 sustained IOPS is above twice the e2 p95 read plus write IOPS (2 × (2,990 + 5,120) = 16,220; `disk_read_ops_per_sec.p95_max_node`, `disk_write_ops_per_sec.p95_max_node`). 500 MB/s is above twice the c3 write plateau (380 MB/s). 4 TB covers one year at the 6-hour ceiling (2.9 TB) with room to spare. 1.2 DWPD is twice the modelled 0.2 to 0.6 DWPD at the ceiling.
 [^b-head]: Modelled. The highest sustained load this release carries is the 6-hour batch-cache ceiling, about 260 TPS, under a thirteenth of the e2 fleet's 3,569 TPS. The recommended CPU, memory and network cover that load, and replay at it holds at most 1 GiB of batch data. Headroom therefore adds storage (and, for public RPC observers, memory), not throughput.
 [^b-head-disk]: Modelled: G_day = 86400 · λ · 345 B + G_idle at the ceiling is about 8 GB a day, 8.8 TB over three years (a lower bound). 12 TB holds that with about a third to spare.
@@ -581,6 +660,7 @@ The rest cite code.
 [^b-txbytes]: Measured from Prometheus over each fleet's mixed window: batch bytes divided by batch transactions (`tn_worker_batch_size_bytes`, `tn_worker_batch_transactions`) is 188 B on c3 (r20260923-0515) and about 190 B on e2 (r20260923-0708), about 340 transactions and 63 to 65 KiB per batch. The e2 figure excludes bench-validator-03's re-sealed batches and is approximated from the histogram means. The superseded e2 run r20260923-0215 measured 192 B.
 [^b-disk]: Measured, `gcp_by_role.validator.disk_*_per_sec.p95_max_node`: e2 2,990 read and 5,120 write IOPS (5,570 max) at 137 MB/s (145 max); c3 5 read and 2,440 write IOPS at 190 MB/s. IO pressure from `sampler_by_node.*.psi_io_some_avg10.run_max`. Volume limits from each run's `limits` section and the report.
 [^b-writes]: Measured, `sampler_by_node.*.growth_mixed.io_write_bytes` over the mixed window, divided by `storage_growth.chain_tx_in_window` and by the data directory's growth, excluding the restarted validator. The process write rate is `storage_growth.telcoin_process_write_bytes_per_sec`: 56 MB/s median on e2 and 163 MB/s on c3. The scaling to 260 TPS is modelled.
+[^doubling]: Modelled margin, not measured. The benchmark ran one worker per validator. The summary's validator minimum is twice the single-worker minimum and its recommended tier is twice that minimum, to cover the worker count governance is expected to raise over the next 12 months (see [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled)). Storage, network and observer figures are not doubled.
 [^engine-single]: `crates/engine/src/lib.rs:66-68` (one pending execution task), `crates/engine/src/lib.rs:159` (execution on a blocking thread).
 [^ecrecover]: `crates/tn-reth/src/env/execution.rs:167-181`.
 [^rayon]: `crates/telcoin-network-cli/src/node.rs:218-226` (global pool size is available cores minus 2, at least 1).
@@ -615,3 +695,11 @@ The rest cite code.
 [^forward]: `crates/consensus/worker/src/worker.rs:310-312`, `crates/consensus/worker/src/worker.rs:254-296`.
 [^observer-gossip]: `crates/consensus/worker/src/network/handler.rs:138-144`.
 [^block-per-batch]: `crates/engine/src/payload_builder.rs:193-195`.
+[^workers-onchain]: `crates/node/src/manager/node.rs:479-500` (`read_num_workers_at_epoch_entry` reads `WorkerConfigs` at the block before the epoch's first block), `crates/tn-reth/src/env/epoch.rs:597-615` (the `getAllWorkerConfigs` system call), `crates/tn-reth/src/system_calls.rs:296-299` (the count is a `uint16`), `crates/types/src/committee.rs:978-979` (`number_of_workers`).
+[^workers-fork]: `crates/types/src/forks.rs:454` (`MULTI_WORKERS_FORK_EPOCH`, an adiri placeholder at the time of writing), `crates/types/src/forks.rs:452-453` (mainnet builds run the multi-worker layout from genesis), `crates/types/src/forks.rs:138` (the live adiri `WorkerConfigs` read `numWorkers() == 1` on 2026-08-18), `crates/node/src/manager/node.rs:111-124` (`check_worker_count_fork` rejects more than one worker before the fork).
+[^workers-per]: `crates/node/src/manager/node/start_epoch.rs:433-437` (one pool, RPC server, validator and network per on-chain worker, in id order), `crates/node/src/engine/inner.rs:155-182` (pool and RPC server), `crates/node/src/engine/inner.rs:248-258` (batch validator), `crates/node/src/manager/node/run_epoch.rs:381-397` (batch builder per worker).
+[^workers-pool]: `crates/tn-reth/src/txn_pool.rs:295` (each pool takes the full `txpool` config); the 20 MB per-subpool defaults are in [^txpool].
+[^workers-rpc]: `crates/tn-reth/src/env/rpc.rs:61` (`WORKER_PORT_STRIDE = 200`), `crates/tn-reth/src/env/rpc.rs:136-143` (worker 0 keeps the configured ports; worker k shifts its HTTP port down by 200·k and its WebSocket port up by 400·k).
+[^workers-swarm]: `crates/node/src/manager/node.rs:163-221` (`prepare_worker_networks` requires a distinct listen address and key per worker), `crates/node/src/manager/node.rs:1345-1380` (one long-running swarm per configured worker), `crates/node/src/manager/node/start_epoch.rs:871-872` (batch topic per worker).
+[^header-cap]: `crates/types/src/primary/header.rs:31` (the payload maps batch digest to worker id), `crates/types/src/primary/header.rs:137-149` (a header with more than `MAX_HEADER_NUM_OF_BATCHES` digests is rejected), `crates/consensus/primary/src/proposer.rs:699-732` (header slots are shared across workers round-robin, up to the cap in total).
+[^cache-shared]: `crates/node/src/manager/node.rs:690-703` (one consensus database per process, shared across epochs), `crates/storage/src/lib.rs:108-114` (cache tables keyed by batch hash only); the maximum size is in [^cache-max].

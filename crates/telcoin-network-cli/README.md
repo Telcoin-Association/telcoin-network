@@ -12,11 +12,12 @@ The `telcoin-network` binary has three subcommands:
 
 Hardware: [Hardware requirements](../../docs/src/getting-started/hardware-requirements.md) has the sizing model, the benchmark results and the observer profiles.
 The validator figures below are the minimum and recommended tiers from that page, set from the 2026-09 benchmark; the page says which figures are measured and which are modelled.
+CPU and memory are twice the measured single-worker figures, a margin for the multi-worker rollout.
 
 | Resource | Minimum | Recommended |
 | -------- | ------- | ----------- |
-| CPU      | 4 physical cores | 4 physical cores, PassMark single-thread 3,500+ |
-| RAM      | 16 GB, no swap | 32 GB, no swap |
+| CPU      | 8 physical cores | 16 physical cores, PassMark single-thread 3,500+ |
+| RAM      | 32 GB ECC, no swap | 64 GB ECC, no swap |
 | Disk     | 2 TB TLC NVMe SSD, 10,000+ sustained write IOPS, 300+ MB/s, rated 2+ DWPD | 4 TB TLC NVMe SSD, 20,000+ sustained IOPS, 500+ MB/s, rated 1+ DWPD |
 | Network  | 200 Mbps symmetric | 1 Gbps |
 
