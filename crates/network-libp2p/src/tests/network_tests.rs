@@ -4544,7 +4544,7 @@ fn connection_limit_caps_established_connections_per_peer() {
     };
 
     // exactly the behaviour installed in production
-    let mut limits = super::connection_limits_behaviour();
+    let mut limits = super::connection_limits_behaviour(None);
     let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
 
     let peer = PeerId::random();
