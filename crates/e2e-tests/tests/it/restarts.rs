@@ -706,6 +706,98 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
+/// A validator starting alone at genesis must serve RPC through startup timeouts and join consensus
+/// when the rest of its committee starts. The name includes `test_epoch` for the Durable MDBX lane.
+#[test]
+#[ignore = "run with make test-epochs"]
+fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let temp = tempfile::TempDir::new()?;
+    let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs/cold_genesis");
+    let peer_readiness_wait = Duration::from_millis(500) * 240;
+    let startup_sync_wait = Duration::from_secs(30);
+    config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let rpc_ports = [
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 0"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 1"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 2"))?,
+        get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no RPC port available for cold-genesis validator 3"))?,
+    ];
+    let client_urls = rpc_ports.map(|port| format!("http://127.0.0.1:{port}"));
+    let [alone_port, ..] = rpc_ports;
+    let [alone_url, peer_url, ..] = &client_urls;
+    let mut guard = ProcessGuard::empty();
+    guard.push(start_validator(0, bin, temp.path(), alone_port, "cold_genesis", 0));
+
+    {
+        let child = RefCell::new(
+            guard.get_mut(0).ok_or_else(|| eyre::eyre!("missing cold-genesis validator"))?,
+        );
+        let check_alive = || {
+            child.try_borrow_mut()?.try_wait()?.map_or(Ok(()), |status| {
+                eyre::bail!("cold-genesis validator exited: {status} ({})", log_dir.display())
+            })
+        };
+        // Startup sync and primary-network readiness run before the worker creates its RPC
+        // server. With no peers, allow both waits to expire plus process-startup headroom.
+        wait_until_blocking(
+            startup_sync_wait + peer_readiness_wait + Duration::from_secs(45),
+            &format!("cold-genesis RPC ready without peers ({})", log_dir.display()),
+            || {
+                check_alive()?;
+                Ok(call_rpc::<String, _, _>(
+                    alone_url,
+                    "eth_blockNumber",
+                    rpc_params![],
+                    0,
+                    "cold-genesis readiness",
+                )
+                .is_ok())
+            },
+        )?;
+
+        // Primary and worker readiness each wait 240 x 500ms. Observe beyond both waits plus the
+        // 30s startup-sync deadline, even if every stage spends its entire allowance without peers.
+        // Start this window after RPC is ready so slow process startup cannot shorten it.
+        let observation = peer_readiness_wait * 2 + startup_sync_wait;
+        let started = Instant::now();
+        wait_until_blocking(
+            observation + Duration::from_secs(30),
+            &format!("cold-genesis RPC stays available without peers ({})", log_dir.display()),
+            || {
+                check_alive()?;
+                call_rpc::<String, _, _>(
+                    alone_url,
+                    "eth_blockNumber",
+                    rpc_params![],
+                    0,
+                    "cold-genesis liveness",
+                )
+                .wrap_err("cold-genesis RPC stopped responding while alone")?;
+                Ok(started.elapsed() >= observation)
+            },
+        )?;
+    }
+
+    rpc_ports.into_iter().enumerate().skip(1).for_each(|(instance, port)| {
+        guard.push(start_validator(instance, bin, temp.path(), port, "cold_genesis", 0));
+    });
+    network_advancing(&client_urls)?;
+    wait_for_node_mode(alone_url, NodeMode::CvvActive)?;
+
+    // Active mode is optimistic. Require a transaction submitted by the original process to be
+    // confirmed by a peer, then applied locally, to prove that consensus actually formed.
+    let key = get_key("test-source");
+    send_and_confirm(alone_url, peer_url, &key, address_from_word("cold-genesis-target"), 0)?;
+    wait_for_block(alone_url, get_block_number(peer_url)?)?;
+    Ok(())
+}
+
 /// Test that an observer started AFTER validators have already produced blocks
 /// can catch up to the current chain height.
 /// This tests the state-sync catch-up path which is critical for observer reliability.

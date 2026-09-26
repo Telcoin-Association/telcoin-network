@@ -1007,13 +1007,15 @@ where
             .unwrap_or(Ok(fallback))
     }
 
-    /// Block until the given [`NetworkHandle`] has at least one established peer available for
+    /// Give the given [`NetworkHandle`] a bounded wait for an established peer available for
     /// requests. Pending dials do not satisfy this readiness check.
     ///
-    /// Polls the peer count every 500ms, logging periodically, and gives up after 240 attempts
-    /// (~2 minutes) with an error rather than letting epoch startup hang forever on a network that
-    /// cannot bootstrap. Generic over the [`TNMessage`] request/response types so it serves both
-    /// the primary and worker networks.
+    /// Polls the peer count every 500ms, logging periodically, and continues startup after 240
+    /// attempts (~2 minutes) even if no peer has connected. A validator can start before the rest
+    /// of its committee: the live swarm keeps accepting connections, and consensus can form
+    /// once peers arrive. A readiness timeout must not terminate the node or its RPC service.
+    /// Generic over the [`TNMessage`] request/response types so it serves both the primary and
+    /// worker networks.
     async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         network_name: &str,
@@ -1023,9 +1025,8 @@ where
         while peers == 0 {
             retries += 1;
             if retries > 240 {
-                return Err(eyre::eyre!(
-                    "{network_name} unable to join, cannot connect to any peers!"
-                ));
+                warn!(target: "epoch-manager", "{network_name} has no connected peers; continuing startup");
+                return Ok(());
             }
             if retries % 10 == 0 {
                 error!(target: "epoch-manager", "failed to join the {network_name}!");
@@ -1328,6 +1329,44 @@ mod tests {
         } else {
             Err(eyre::eyre!("readiness probe must exclude pending dials"))
         }
+    }
+
+    /// A network with no established peers exhausts its readiness wait without failing startup.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_timeout_allows_startup() -> eyre::Result<()> {
+        use super::{EpochManager, NetworkHandle};
+        use futures::{StreamExt as _, TryStreamExt as _};
+        use std::{path::PathBuf, time::Duration};
+        use tn_network_libp2p::{types::NetworkCommand, PeerExchangeMap};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (sender, commands) = tokio::sync::mpsc::channel(2);
+        let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
+        let replies = tokio::spawn(async move {
+            futures::stream::unfold(commands, |mut commands| async move {
+                commands.recv().await.map(|command| (command, commands))
+            })
+            .map(Ok::<_, eyre::Report>)
+            .try_for_each(|command| async move {
+                if let NetworkCommand::EstablishedPeerCount { reply } = command {
+                    reply.send(0).map_err(|count| eyre::eyre!("peer count {count} was dropped"))
+                } else {
+                    Err(eyre::eyre!("readiness probe must exclude pending dials"))
+                }
+            })
+            .await
+        });
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(121),
+            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network"),
+        )
+        .await??;
+        assert_eq!(started.elapsed(), Duration::from_secs(120));
+        drop(handle);
+        replies.await??;
+        Ok(())
     }
 
     /// An active committee validator prefetches batches for the vote path.
