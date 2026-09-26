@@ -130,11 +130,13 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
         rewards_counter: RewardsCounter,
     ) -> impl Future<Output = eyre::Result<()>> + Send;
 
-    /// Open a verified read stream over the data file for `epoch`.
+    /// Open a verified read stream over the data file for `epoch`, together with its logical length
+    /// (the number of bytes the caller should stream: `[0, len)`, excluding any mmap capacity
+    /// padding).
     fn get_epoch_stream(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = eyre::Result<Box<dyn ReadStream>>> + Send;
+    ) -> impl Future<Output = eyre::Result<(Box<dyn ReadStream>, u64)>> + Send;
 
     /// Return true if this process is already streaming `epoch`.
     fn already_streaming_epoch(&self, epoch: Epoch) -> bool;

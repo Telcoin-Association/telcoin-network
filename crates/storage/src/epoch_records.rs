@@ -24,12 +24,12 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::{
         data_file::create_dir_synced,
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -90,16 +90,19 @@ enum EpochDbMessage {
     /// Flush all pending writes to disk.
     Persist(oneshot::Sender<Result<(), EpochDbError>>),
     Shutdown,
+    /// Async shutdown: clean-close the DB, then confirm on the channel (an async drop, so callers
+    /// avoid the blocking thread join in `Drop`).
+    AsyncShutdown(oneshot::Sender<()>),
 }
 
 /// Handle to the epoch records database.
 ///
 /// Operations are dispatched to a background thread that owns the file handles.
-/// Errors from background writes are surfaced on the next call via [`get_error`], which clears
+/// Errors from background writes are surfaced on the next call via `get_error`, which clears
 /// the slot as it reads, so exactly one subsequent caller observes a given failure. When more
 /// than one write fails before a read, the slot keeps the first failure (for a poisoned-pack
-/// cascade that is the root cause; every failure is logged either way). Use [`peek_error`] to
-/// check without consuming. [`persist`] is the durability barrier: it reports any earlier
+/// cascade that is the root cause; every failure is logged either way). Use `peek_error` to
+/// check without consuming. `persist` is the durability barrier: it reports any earlier
 /// write failure even if that write was still queued when the flush was requested.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
@@ -119,6 +122,11 @@ fn run_db_loop(
     mut rx: Receiver<EpochDbMessage>,
     tx_error: watch::Sender<Option<EpochDbError>>,
 ) {
+    // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
+    // below.
+    let mut async_confirm: Option<oneshot::Sender<()>> = None;
+    // Note, that code called in this thread should NEVER panic since that will orphan the db
+    // files. This is acceptable since panic should never occur in properly written Inner code.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             // The four save arms latch first-error-wins: two queued saves can fail with no
@@ -212,20 +220,52 @@ fn run_db_loop(
                 let flushed = inner.persist();
                 let _ = tx.send(pending.map_or(flushed, Err));
             }
-            EpochDbMessage::Shutdown => {
-                let _ = inner.persist();
+            EpochDbMessage::Shutdown => break,
+            EpochDbMessage::AsyncShutdown(tx) => {
+                // Confirm AFTER the clean-close below so `close().await` returns only once the DB
+                // is fully sealed.
+                async_confirm = Some(tx);
                 break;
             }
         }
+    }
+    // Clean-close: dropping `inner` commits/seals the epochs + certs packs. Do it before confirming
+    // an async shutdown; it also runs for the sync `Shutdown` and channel-closed paths (the sync
+    // `Drop`'s `join()` waits on this return).
+    drop(inner);
+    if let Some(tx) = async_confirm {
+        let _ = tx.send(());
     }
 }
 
 impl Drop for EpochRecordDb {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
+            // Reaching this with a live handle means close() was NOT used: a correct close().await
+            // already took the handle, so the block below is skipped. Drop is the safety net; the
+            // proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
-                if self.tx.try_send(EpochDbMessage::Shutdown).is_ok() {
+                warn!(target: "epoch-db", "EpochRecordDb dropped without calling close(); sealing as a fallback");
+                if self.tx.try_send(EpochDbMessage::Shutdown).is_err() {
+                    // Full bounded channel — detach. The actor clean-closes when the last Sender
+                    // drops; only the synchronous "sealed on return" wait is lost, and only on this
+                    // misuse path.
+                    error!(target: "epoch-db", "Failed to send shutdown message to EpochRecordDb (should be using close())");
+                    return;
+                }
+                let join = move || {
                     let _ = handle.join();
+                };
+                // Never block a multi-threaded runtime worker on the clean-close fsyncs: offload
+                // the join to the blocking pool. On a current-thread runtime
+                // (nothing else to starve) or no runtime, a synchronous join keeps
+                // "sealed on return" for callers/tests that drop then immediately
+                // reopen. `close().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
                 }
             }
         }
@@ -247,7 +287,16 @@ pub enum EpochRecordValidation {
     /// The record was checked against the trusted committee but failed one or more of the anchor
     /// checks. The booleans record which checks passed, for diagnostics. `epoch_matches` is false
     /// when the record is for a different epoch than the one that was requested.
-    Invalid { epoch_matches: bool, parents_match: bool, committee_valid: bool, cert_valid: bool },
+    Invalid {
+        /// True if the record is for the epoch that was requested.
+        epoch_matches: bool,
+        /// True if the record's parent hash matches the trusted anchor.
+        parents_match: bool,
+        /// True if the record is anchored to the locally-trusted committee.
+        committee_valid: bool,
+        /// True if the record carries a valid super-quorum certificate from that committee.
+        cert_valid: bool,
+    },
     /// No locally-trusted anchor is available for the record's epoch (the previous epoch record,
     /// or the genesis committee, is not stored locally), so the record cannot be validated.
     /// Callers should retry once the anchor is available rather than treat the record as invalid.
@@ -337,7 +386,7 @@ pub enum CertifiedRecordError {
     InvalidCertificate(Epoch, EpochDigest),
     /// Resolving the record or its certificate failed at the storage layer for a reason other
     /// than genuine absence (I/O error, CRC mismatch, decode failure, or an unreachable
-    /// database thread — everything [`fetch_error_is_absent`] rejects). The underlying error is
+    /// database thread — everything `fetch_error_is_absent` rejects). The underlying error is
     /// logged at `error!` at the classification site; only the epoch is carried so the enum
     /// stays `Copy`. Never retryable: polling corrupt bytes can only mask the corruption behind
     /// a misleading "missing" timeout.
@@ -617,7 +666,7 @@ impl EpochRecordDb {
     ///
     /// Unlike the raw [`Self::record_by_epoch`] / [`Self::cert_by_digest`] fetches, the reads
     /// here do NOT collapse storage failures into absence: only a genuine miss (per the shared
-    /// absence classification, [`fetch_error_is_absent`]) reports
+    /// absence classification, `fetch_error_is_absent`) reports
     /// [`CertifiedRecordError::MissingRecord`] / [`CertifiedRecordError::MissingCertificate`];
     /// corruption or an unreachable db thread reports the non-retryable
     /// [`CertifiedRecordError::Storage`] so the timeout variant fails loudly at once instead of
@@ -825,9 +874,26 @@ impl EpochRecordDb {
         })?
     }
 
+    /// Take ownership and clean-close the DB asynchronously, so `Drop` does not block a thread on a
+    /// `join()`. Only closes if this is the last reference; awaits confirmation that the background
+    /// thread sealed the packs. Essentially an async drop (mirrors `ConsensusPack::close`).
+    pub async fn close(self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            let Some(_handle) = self.handle.lock().take() else {
+                // Already closed; this check should always pass.
+                return;
+            };
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send(EpochDbMessage::AsyncShutdown(tx)).await.is_ok() {
+                // Async wait for the clean-close confirmation instead of a sync `join()`.
+                let _ = rx.await;
+            }
+        }
+    }
+
     /// Retrieve the committee keys for `epoch` if available.
     /// Tries the exact epoch first; falls back to the previous epoch's `next_committee`.
-    /// Returns as a [`BTreeSet`] to enforce a stable order.
+    /// Returns as a `BTreeSet` to enforce a stable order.
     pub async fn get_committee_keys(
         &self,
         epoch: Epoch,
@@ -846,7 +912,7 @@ impl EpochRecordDb {
     /// Retrieve the epoch record and certificate (if available) by epoch number.
     ///
     /// One actor round trip: the record and cert are resolved together on the background thread
-    /// (see [`EpochDbMessage::EpochByNumber`]) rather than as two separate lookups.
+    /// (see `EpochDbMessage::EpochByNumber`) rather than as two separate lookups.
     pub async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
@@ -884,7 +950,7 @@ impl EpochRecordDb {
     /// Retrieve the epoch record and certificate (if available) by record digest.
     ///
     /// One actor round trip: the record and cert are resolved together on the background thread
-    /// (see [`EpochDbMessage::EpochByHash`]) rather than as two separate lookups.
+    /// (see `EpochDbMessage::EpochByHash`) rather than as two separate lookups.
     pub async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
@@ -1037,7 +1103,7 @@ impl EpochRecordDb {
     /// Find the epoch for a consensus header number.
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
-    /// lookup. The vector is guaranteed sorted because [`update_finals`] enforces
+    /// lookup. The vector is guaranteed sorted because `update_finals` enforces
     /// sequential epoch insertion. If `number` is beyond the last stored epoch,
     /// returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
@@ -1085,12 +1151,14 @@ impl EpochRecordDb {
     }
 }
 
+/// File name of the epoch-records data log within the epoch DB directory.
 pub const RECORDS_NAME: &str = Inner::RECORDS_NAME;
+/// File name of the epoch-certificates data log within the epoch DB directory.
 pub const CERTS_NAME: &str = Inner::CERTS_NAME;
 
 /// Lift a raw index/pack read into the non-collapsing shape: `Ok(Some(v))` on success,
 /// `Ok(None)` when the error means the key is genuinely not present (per
-/// [`fetch_error_is_absent`], the single absence classification shared with the consensus
+/// `fetch_error_is_absent`, the single absence classification shared with the consensus
 /// pack), and `Err` for every real storage failure.
 fn absent_to_none<T>(res: Result<T, FetchError>) -> Result<Option<T>, FetchError> {
     res.map(Some).or_else(|e| fetch_error_is_absent(&e).then_some(None).ok_or(e))
@@ -1132,7 +1200,7 @@ impl Inner {
     /// Sentinel pack-header tag for the certs file.
     const CERT_PACK_EPOCH: u64 = 1;
 
-    /// Truncate records and its indexes back to a consistent state.
+    /// Trim records and its indexes back to a consistent state.
     fn heal_records(
         records: &mut Pack<EpochRecord>,
         epoch_idx: &mut PositionIndex<u64>,
@@ -1141,7 +1209,7 @@ impl Inner {
         let records_len = records.file_len();
         let digest_final = record_digests.data_file_length();
         if records_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            records.truncate(digest_final)?;
+            records.rewind_to(digest_final);
         }
         let records_len = records.file_len();
         if !epoch_idx.is_empty() {
@@ -1164,13 +1232,28 @@ impl Inner {
                 idx -= 1;
             }
             if new_len != records_len {
-                records.truncate(new_len)?;
+                records.rewind_to(new_len);
             }
+        }
+        // A header-only log left at mmap capacity by an unclean close: nothing was ever appended,
+        // so neither the digest marker (== DATA_HEADER_BYTES) nor the position index (empty, or
+        // just wiped above because every entry was zero capacity-padding) bounds the log, and
+        // `raw_iter` would decode the zero padding as a CRC-failing 0-size record. Roll the logical
+        // end back to the header (INV1) with `rewind_to` — no physical truncate/remap (no SIGBUS
+        // window; keeps capacity so a first append doesn't re-grow), matching the consensus pack's
+        // save rollback. Content-gated (not `opened_unclean()`-gated) so a log whose padding a
+        // prior failed open already sealed under a sentinel heals too; `any_content_after`
+        // never trims real bytes.
+        if epoch_idx.is_empty()
+            && records.file_len() > DATA_HEADER_BYTES as u64
+            && !records.any_content_after(DATA_HEADER_BYTES as u64)
+        {
+            records.rewind_to(DATA_HEADER_BYTES as u64);
         }
         Ok(())
     }
 
-    /// Truncate the certs file back to a consistent state.
+    /// Trim the certs file back to a consistent state.
     fn heal_certs(
         certs: &mut Pack<EpochCertificate>,
         cert_digests: &HdxIndex,
@@ -1178,8 +1261,131 @@ impl Inner {
         let certs_len = certs.file_len();
         let digest_final = cert_digests.data_file_length();
         if certs_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            certs.truncate(digest_final)?;
+            certs.rewind_to(digest_final);
+        } else if certs_len > DATA_HEADER_BYTES as u64
+            && !certs.any_content_after(DATA_HEADER_BYTES as u64)
+        {
+            // Header-only padding: no cert was ever appended (see `heal_records`). Roll the logical
+            // end back to the header with `rewind_to` so a clean close does not seal 1 MiB of
+            // padding.
+            certs.rewind_to(DATA_HEADER_BYTES as u64);
         }
+        Ok(())
+    }
+
+    /// Open the position + digest indexes for append (writable). Mirrors the three index opens in
+    /// [`Self::open_append`]; factored out so [`Self::reset_indexes`] can reopen fresh copies after
+    /// wiping the sidecar directories.
+    fn try_open_indexes(
+        base_dir: &Path,
+        records: &Pack<EpochRecord>,
+        certs: &Pack<EpochCertificate>,
+    ) -> Result<(PositionIndex<u64>, HdxIndex, HdxIndex), OpenError> {
+        let epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
+            base_dir.join(Self::EPOCH_POS_NAME),
+            records.header(),
+            "index.pdx",
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let record_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::RECORD_HASH_NAME),
+            records.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let cert_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::CERT_HASH_NAME),
+            certs.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        Ok((epoch_idx, record_digests, cert_digests))
+    }
+
+    /// Discard the position + digest index sidecar directories and reopen fresh (empty) copies.
+    /// Used when an index fails to open or was left inconsistent by an unclean shutdown; the
+    /// caller then rebuilds them from the data logs (see [`Self::rebuild_indexes`]). A missing
+    /// directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    fn reset_indexes(
+        base_dir: &Path,
+        records: &Pack<EpochRecord>,
+        certs: &Pack<EpochCertificate>,
+    ) -> Result<(PositionIndex<u64>, HdxIndex, HdxIndex), EpochDbError> {
+        for name in [Self::EPOCH_POS_NAME, Self::RECORD_HASH_NAME, Self::CERT_HASH_NAME] {
+            match std::fs::remove_dir_all(base_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Self::try_open_indexes(base_dir, records, certs).map_err(Into::into)
+    }
+
+    /// Rebuild the position + digest indexes by replaying the data logs, the authoritative source
+    /// (mirrors `ConsensusPack::recover_pack`/`replay_wal`). For each log: capture
+    /// `logical_position()` before each `next()` as the record's stored offset, advance the
+    /// consistent end only past a fully-decoded record, and stop at the first torn/short record so
+    /// an incomplete tail is dropped; then roll the log back to that end and reconcile the
+    /// digest marker. The records log keys the position index by insertion order and the
+    /// record-digest index by [`EpochRecord::digest`]; the certs log keys the cert-digest index
+    /// by `EpochCertificate::epoch_hash` (the digest of the record it certifies).
+    fn rebuild_indexes(
+        records: &mut Pack<EpochRecord>,
+        certs: &mut Pack<EpochCertificate>,
+        epoch_idx: &mut PositionIndex<u64>,
+        record_digests: &mut HdxIndex,
+        cert_digests: &mut HdxIndex,
+    ) -> Result<(), EpochDbError> {
+        let mut iter = records.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+        let mut idx = 0u64;
+        let mut consistent_end = iter.logical_position();
+        loop {
+            let pos = iter.logical_position();
+            match iter.next() {
+                None => break,
+                Some(Ok(record)) => {
+                    epoch_idx
+                        .save(idx, pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("epoch position: {e}")))?;
+                    record_digests
+                        .save(record.digest().into(), pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
+                    idx += 1;
+                    consistent_end = iter.logical_position();
+                }
+                Some(Err(_)) => break,
+            }
+        }
+        // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
+        drop(iter);
+        if consistent_end < records.file_len() {
+            records.rewind_to(consistent_end);
+        }
+        record_digests.set_data_file_length(records.file_len());
+
+        let mut iter = certs.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+        let mut consistent_end = iter.logical_position();
+        loop {
+            let pos = iter.logical_position();
+            match iter.next() {
+                None => break,
+                Some(Ok(cert)) => {
+                    cert_digests
+                        .save(cert.epoch_hash.into(), pos)
+                        .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
+                    consistent_end = iter.logical_position();
+                }
+                Some(Err(_)) => break,
+            }
+        }
+        drop(iter);
+        if consistent_end < certs.file_len() {
+            certs.rewind_to(consistent_end);
+        }
+        cert_digests.set_data_file_length(certs.file_len());
         Ok(())
     }
 
@@ -1203,29 +1409,25 @@ impl Inner {
             EPOCH_PACK_VERSION,
         )?;
 
-        let mut epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
-            base_dir.join(Self::EPOCH_POS_NAME),
-            records.header(),
-            "index.pdx",
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut record_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::RECORD_HASH_NAME),
-            records.header(),
-            builder,
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut cert_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::CERT_HASH_NAME),
-            certs.header(),
-            builder,
-            false,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
+        // Open the position + digest indexes; if any is unreadable, fall back to a fresh set and
+        // force a rebuild from the data logs below rather than failing the open. A corrupt sidecar
+        // index must not brick the node -- the data logs are authoritative.
+        let (mut epoch_idx, mut record_digests, mut cert_digests, index_open_failed) =
+            match Self::try_open_indexes(base_dir, &records, &certs) {
+                Ok((epoch_idx, record_digests, cert_digests)) => {
+                    (epoch_idx, record_digests, cert_digests, false)
+                }
+                Err(e) => {
+                    warn!(
+                        target: "epoch-db",
+                        "epoch-records index failed to open ({e}); discarding and rebuilding all \
+                         indexes from the data logs"
+                    );
+                    let (epoch_idx, record_digests, cert_digests) =
+                        Self::reset_indexes(base_dir, &records, &certs)?;
+                    (epoch_idx, record_digests, cert_digests, true)
+                }
+            };
 
         if !have_records {
             // Freshly created: initialise the stored data lengths in all indexes.
@@ -1233,8 +1435,37 @@ impl Inner {
             cert_digests.set_data_file_length(certs.file_len());
         }
 
-        Self::heal_records(&mut records, &mut epoch_idx, &record_digests)?;
-        Self::heal_certs(&mut certs, &cert_digests)?;
+        // Rebuild the indexes from the authoritative data logs when they were unreadable (above),
+        // were not cleanly sealed, or their tracked data length disagrees with the log -- e.g. an
+        // hdx split whose new buckets reached disk but whose header/`data_file_length` did not,
+        // silently dropping the moved keys (see `ConsensusPack::recover_pack`). Do NOT run the
+        // index-trusting `heal_*` first: a stale position index could mis-bound the log and
+        // permanently drop durable records. On a clean open the indexes are trusted and only the
+        // cheap `heal_*` validation runs.
+        let must_rebuild = index_open_failed
+            || records.opened_unclean()
+            || certs.opened_unclean()
+            || epoch_idx.opened_unclean()
+            || record_digests.opened_unclean()
+            || cert_digests.opened_unclean()
+            || record_digests.data_file_length() != records.file_len()
+            || cert_digests.data_file_length() != certs.file_len();
+        if must_rebuild {
+            let (idx, rdig, cdig) = Self::reset_indexes(base_dir, &records, &certs)?;
+            epoch_idx = idx;
+            record_digests = rdig;
+            cert_digests = cdig;
+            Self::rebuild_indexes(
+                &mut records,
+                &mut certs,
+                &mut epoch_idx,
+                &mut record_digests,
+                &mut cert_digests,
+            )?;
+        } else {
+            Self::heal_records(&mut records, &mut epoch_idx, &record_digests)?;
+            Self::heal_certs(&mut certs, &cert_digests)?;
+        }
 
         // Derive start_epoch from the first stored record if present.
         let start_epoch = if !epoch_idx.is_empty() {
@@ -1348,7 +1579,7 @@ impl Inner {
     /// Non-collapsing read of the record for `epoch`.
     ///
     /// `Ok(None)` only on genuine absence — an index or pack lookup failing with an error
-    /// [`fetch_error_is_absent`] accepts. Every other storage failure (I/O, CRC mismatch,
+    /// `fetch_error_is_absent` accepts. Every other storage failure (I/O, CRC mismatch,
     /// decode) surfaces as `Err` so the certified read path can classify it as
     /// [`CertifiedRecordError::Storage`] instead of a retryable "missing".
     fn try_record_by_epoch(&mut self, epoch: Epoch) -> Result<Option<EpochRecord>, FetchError> {
@@ -1472,23 +1703,38 @@ impl Inner {
     }
 }
 
+/// Errors returned by the epoch-records database.
 #[derive(Debug, Clone)]
 pub enum EpochDbError {
+    /// An underlying I/O error.
     IO(Arc<io::Error>),
+    /// Failed to load or decode a record header.
     HeaderLoad(String),
+    /// Failed to append a record to a data log.
     Append(String),
+    /// Failed to append an entry to an index.
     IndexAppend(String),
+    /// Failed to open a data file or one of its indexes.
     Open(Arc<OpenError>),
+    /// A record for this epoch was already saved.
     EpochAlreadySaved,
+    /// Epoch records must be saved in order (expected, got).
     EpochOutOfOrder(Epoch, Epoch),
+    /// No certificate is stored for the epoch.
     MissingCertificate(Epoch),
+    /// No record is stored for the epoch.
     MissingRecord(Epoch),
+    /// Failed to send a request to the database's background task.
     SendFailed,
+    /// Failed to receive a response from the database's background task.
     ReceiveFailed,
+    /// Failed to durably persist the database.
     PersistError(String),
+    /// The epoch-records database is corrupt.
     CorruptDb,
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
+    /// Failed to join a background thread for the database.
     JoinError,
 }
 
@@ -1700,7 +1946,7 @@ mod test {
         archive::pack::DATA_HEADER_BYTES,
         epoch_records::{
             epoch_committee_valid, CertifiedRecordError, EpochDbError, EpochRecordDb,
-            EpochRecordValidation, CERTS_NAME, RECORDS_NAME,
+            EpochRecordValidation, Inner, CERTS_NAME, RECORDS_NAME,
         },
     };
 
@@ -2115,8 +2361,10 @@ mod test {
             .write(true)
             .open(&records_path)
             .expect("open records file");
+        // The clean close appended an 8-byte sentinel past the last record; strip it and one more
+        // byte so the truncation actually damages the final record (not just the sentinel).
         let original_len = f.seek(SeekFrom::End(0)).expect("seek");
-        f.set_len(original_len - 1).expect("truncate -1");
+        f.set_len(original_len - crate::archive::data_file::SENTINEL_LEN - 1).expect("truncate");
         drop(f);
 
         // Reopen should heal: last record is dropped, all others remain readable.
@@ -2168,6 +2416,220 @@ mod test {
         let mut f = OpenOptions::new().read(true).open(&records_path).expect("open records file");
         let healed_len = f.seek(SeekFrom::End(0)).expect("seek");
         assert_eq!(extended_len, healed_len, "garbage bytes should be removed on reopen");
+    }
+
+    /// `EpochRecordDb::close` is an async drop: it must seal the epochs + certs packs before
+    /// returning, so a reopen finds every record without needing a rebuild.
+    #[tokio::test]
+    async fn test_epoch_record_db_close_seals() {
+        let temp_dir = TempDir::with_prefix("test_epoch_db_close").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        let mut records = Vec::new();
+        for epoch in 0..5u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert).await.expect("save");
+            records.push(record);
+        }
+        // Async-close (sole reference) instead of dropping.
+        db.close().await;
+
+        // Reopen and confirm every record survived the close.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
+        for record in &records {
+            let back = db.record_by_epoch(record.epoch).await.expect("record by epoch after close");
+            assert_eq!(back.digest(), record.digest());
+        }
+    }
+
+    #[test]
+    fn test_fresh_unclean_reopen_heals_header_only_padding() {
+        // Regression for the crash where a fresh (never-appended) EpochRecordDb, grown to mmap
+        // capacity (1 MiB) on the header write, could not reopen after an unclean exit: heal left
+        // the zero padding in place and `EpochRecordDb::open`'s raw_iter decoded it as a
+        // CRC-failing 0-size record, so the node could not restart.
+        let dir = TempDir::with_prefix("test_fresh_unclean_reopen").expect("temp dir");
+
+        // Create the packs (writes headers, grows files to 1 MiB) then skip Drop to model a crash
+        // before any clean close — no sentinel is written, so the reopen sees padded files.
+        let inner = Inner::open_append(dir.path(), 0).expect("fresh open_append");
+        std::mem::forget(inner);
+
+        // With the fix the padding is trimmed and the reopen succeeds (was: CorruptDb / crc
+        // mismatch).
+        let db = EpochRecordDb::open(dir.path()).expect("reopen after unclean fresh exit");
+        drop(db); // clean close seals both packs at the header
+
+        // Both packs are back to header + sentinel — no 1 MiB of sealed padding.
+        // Mirrors the drop-then-stat assertion in `test_epoch_record_db`.
+        let sealed = DATA_HEADER_BYTES as u64 + crate::archive::data_file::SENTINEL_LEN;
+        for name in [RECORDS_NAME, CERTS_NAME] {
+            let len = std::fs::metadata(dir.path().join(name)).expect("stat").len();
+            assert_eq!(len, sealed, "{name} not trimmed to header");
+        }
+
+        // Idempotent: a second reopen still succeeds.
+        EpochRecordDb::open(dir.path()).expect("second reopen");
+    }
+
+    #[tokio::test]
+    async fn test_epoch_index_open_failure_rebuilds() {
+        // Regression for finding #8(b): an unreadable sidecar index must not brick
+        // `EpochRecordDb::open`. The data logs are authoritative, so a corrupt position/digest
+        // index is discarded and rebuilt from them instead of failing the open (was:
+        // `OpenError::IndexFileOpen` -> node cannot start).
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // One case per index file; each is destructive so needs its own fresh DB.
+        for (dir_name, file_name) in [
+            (Inner::EPOCH_POS_NAME, "index.pdx"),
+            (Inner::RECORD_HASH_NAME, "index.hdx"),
+            (Inner::CERT_HASH_NAME, "index.hdx"),
+        ] {
+            let temp_dir = TempDir::with_prefix("epoch_index_open_failure").expect("temp dir");
+
+            // Populate and cleanly close so the sidecar indexes exist on disk.
+            let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+            let mut pairs = Vec::new();
+            let mut parent = EpochDigest::default();
+            for epoch in 0..12u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                db.save(record.clone(), cert.clone()).await.expect("save");
+                pairs.push((record, cert));
+            }
+            db.close().await;
+
+            // Corrupt the index header so it fails to open (mirrors `break_index_file`).
+            let index_path = temp_dir.path().join(dir_name).join(file_name);
+            let f =
+                OpenOptions::new().write(true).open(&index_path).expect("open index to corrupt");
+            f.set_len(4).expect("truncate index header");
+            drop(f);
+
+            // Reopen: the unreadable index is discarded and rebuilt from the data logs, so the open
+            // succeeds and every record + cert is still reachable.
+            let db = EpochRecordDb::open(temp_dir.path())
+                .unwrap_or_else(|e| panic!("reopen must rebuild {dir_name}/{file_name}: {e}"));
+            for (record, cert) in &pairs {
+                let by_epoch = db.record_by_epoch(record.epoch).await.expect("record by epoch");
+                assert_eq!(by_epoch.digest(), record.digest());
+                let by_digest =
+                    db.record_by_digest(record.digest()).await.expect("record by digest");
+                assert_eq!(by_digest.digest(), record.digest());
+                let cert_back = db.cert_by_digest(record.digest()).await.expect("cert by digest");
+                assert_eq!(cert_back.epoch_hash, cert.epoch_hash);
+            }
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epoch_unclean_reopen_rebuilds_indexes() {
+        // Regression for finding #8(a): after an unclean shutdown a digest index can be stale (an
+        // hdx split whose new buckets reached disk but whose header did not), silently losing keys.
+        // The reopen must detect the unclean state and rebuild every index from the authoritative
+        // data logs, so all persisted records/certs stay reachable and a re-save is idempotent (no
+        // duplicate cert appended -- the #8 duplicate-append symptom).
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("epoch_unclean_rebuild").expect("temp dir");
+
+        // Populate + persist (durable data logs + synced markers) via the sync `Inner`, then
+        // `mem::forget` to skip the clean close: models a crash -- durable logs, no sentinel.
+        let mut pairs = Vec::new();
+        {
+            let mut inner = Inner::open_append(temp_dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..16u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save(record.clone(), cert.clone()).expect("save");
+                pairs.push((record, cert));
+            }
+            inner.persist().expect("persist");
+            std::mem::forget(inner);
+        }
+
+        // Reopen: unclean (no sentinel) -> indexes rebuilt from the logs; everything reachable.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after unclean exit");
+        for (record, cert) in &pairs {
+            let by_epoch = db.record_by_epoch(record.epoch).await.expect("record by epoch");
+            assert_eq!(by_epoch.digest(), record.digest());
+            let cert_back = db.cert_by_digest(record.digest()).await.expect("cert by digest");
+            assert_eq!(cert_back.epoch_hash, cert.epoch_hash);
+        }
+
+        // Re-saving an already-stored pair must be idempotent: the rebuilt cert-digest index still
+        // resolves the key, so no duplicate cert is appended.
+        let (record, cert) = pairs[0].clone();
+        db.save(record, cert).await.expect("idempotent re-save");
+        db.persist().await.expect("persist");
+        db.close().await;
+        let certs = EpochRecordDb::read_certs_from_pack(temp_dir.path().join(CERTS_NAME))
+            .expect("read certs");
+        assert_eq!(
+            certs.len(),
+            pairs.len(),
+            "re-save must not append a duplicate cert (got {} certs)",
+            certs.len()
+        );
+    }
+
+    /// After an unclean reopen of a DB that has records but no certs, the header-only
+    /// padded `epoch_certs.pack` must be trimmed so a later cert append does not seal a 1 MiB zero
+    /// gap that breaks every sequential walk (`read_certs_from_pack`, `db load-state` ->
+    /// `CorruptDb`). Subsumed by the #8 unclean-reopen rebuild, which replays the certs log (0
+    /// certs -> trim to the header) instead of the old `heal_certs`; this locks in the specific
+    /// symptom.
+    #[test]
+    fn test_unclean_reopen_records_no_certs_keeps_cert_log_readable() {
+        let dir = TempDir::with_prefix("test_records_no_certs_unclean").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // Save records ONLY (no certs), persist them (durable), then skip the clean close: models a
+        // crash that leaves `epoch_certs.pack` header-only + mmap-padded and unclean.
+        let mut pairs = Vec::new();
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..5u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save_record(record.clone()).expect("save record");
+                pairs.push((record, cert));
+            }
+            inner.persist().expect("persist");
+            std::mem::forget(inner);
+        }
+
+        // Reopen writable: the unclean certs log is rebuilt -> trimmed to the header (no 1 MiB
+        // gap). Append one cert now; it must land right after the header, not after the
+        // padding.
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("reopen after unclean exit");
+            let (record, cert) = pairs[0].clone();
+            inner.save(record, cert).expect("save cert after reopen");
+            inner.persist().expect("persist");
+            // clean close on drop seals the gap-free cert log
+        }
+
+        // The sequential walk the finding broke must succeed and see exactly the one cert.
+        let certs = EpochRecordDb::read_certs_from_pack(dir.path().join(CERTS_NAME))
+            .expect("read_certs_from_pack must not be CorruptDb");
+        assert_eq!(certs.len(), 1, "exactly the one appended cert, no padding gap");
+        assert_eq!(certs[0].epoch_hash, pairs[0].0.digest());
+
+        // Records survived the unclean reopen too.
+        let records = EpochRecordDb::read_records_from_pack(dir.path().join(RECORDS_NAME))
+            .expect("read_records_from_pack");
+        assert_eq!(records.len(), pairs.len());
     }
 
     /// Generate a deterministic test BLS public key from a seed.

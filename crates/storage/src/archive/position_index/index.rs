@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, DataFile},
+    data_file::{fsync_directory, MmapDataFile},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -45,7 +45,7 @@ impl PdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(hdx_file: &mut DataFile) -> Result<Self, LoadHeaderError> {
+    fn load_header(hdx_file: &mut MmapDataFile) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
@@ -75,7 +75,7 @@ impl PdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header(&mut self, hdx_file: &mut DataFile) -> Result<(), io::Error> {
+    fn write_header(&mut self, hdx_file: &mut MmapDataFile) -> Result<(), io::Error> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut pos = 0;
@@ -111,7 +111,7 @@ impl PdxHeader {
 #[derive(Debug)]
 pub struct PositionIndex<T> {
     _header: PdxHeader,
-    pdx_file: DataFile,
+    pdx_file: MmapDataFile,
     _index_dir: PathBuf,
     _phantom: PhantomData<T>,
 }
@@ -123,7 +123,7 @@ impl<T: PosIndexValue> PositionIndex<T> {
         dir.join(file_name).exists()
     }
 
-    /// Open a PDX index file and return the open index.
+    /// Open a PDX index file (memory-mapped) and return the open index.
     pub fn open_pdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
@@ -137,14 +137,16 @@ impl<T: PosIndexValue> PositionIndex<T> {
             "PosIndexValue::buffer_len() exceeds VALUE_MAX_BYTES"
         );
         let dir = dir.as_ref();
-        let dir_created = fs::create_dir(dir).is_ok();
+        // A read-only open must not create the sidecar directory (see `HdxIndex::open_hdx_file`);
+        // an absent dir still fails `NotFound` below.
+        let dir_created = !read_only && fs::create_dir(dir).is_ok();
         if dir_created {
             // The index directory is brand new; fsync the parent so the entry survives a crash.
             if let Some(parent) = dir.parent() {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = DataFile::open(dir.join(file_name), read_only)?;
+        let mut pdx_file = MmapDataFile::open(dir.join(file_name), read_only)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {
@@ -179,14 +181,18 @@ impl<T: PosIndexValue> PositionIndex<T> {
         let buffer_len = T::buffer_len() as u64;
         let record_bytes = index.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64);
         if !record_bytes.is_multiple_of(buffer_len) {
-            if read_only {
-                // Can't repair a read-only file, and a stride mismatch means this `T` cannot
-                // read it safely; reject rather than return garbage.
+            // A cleanly-sealed file can only be misaligned by a stride (`T`) mismatch, never a torn
+            // tail: clean close truncates to the exact logical end. Only heal an *unclean* file;
+            // otherwise reject rather than truncate bytes of a complete record (a read-only open
+            // cannot repair, and a writable one must not silently drop committed data). This cannot
+            // brick a pack open -- `open_indexes_for_append` discards and rebuilds on any
+            // `LoadHeaderError`.
+            if read_only || !index.pdx_file.opened_unclean() {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Writable: drop a torn trailing partial record so appends stay aligned.  Without
-            // this, the next append (always at the true EOF) would land mid-stride and shift
-            // every subsequent record.
+            // Unclean writable: drop a torn trailing partial record so appends stay aligned.
+            // Without this, the next append (always at the true EOF) would land
+            // mid-stride and shift every subsequent record.
             let aligned = PDX_HEADER_SIZE as u64 + (index.len() as u64 * buffer_len);
             index.pdx_file.set_len(aligned)?;
         }
@@ -202,6 +208,13 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// True if there are no keys stored in this index.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// True when the backing pdx file was opened without a valid clean-close sentinel — it was not
+    /// sealed by a clean shutdown, so a consistency check should treat the index as needing
+    /// rebuild.
+    pub fn opened_unclean(&self) -> bool {
+        self.pdx_file.opened_unclean()
     }
 
     /// Return an iterator over file positions with up to len items.
@@ -240,6 +253,19 @@ impl<T: PosIndexValue> PositionIndex<T> {
     pub fn truncate_all(&mut self) -> Result<(), io::Error> {
         let pos = PDX_HEADER_SIZE as u64;
         self.pdx_file.set_len(pos)
+    }
+
+    /// Roll the index's logical end back to exactly `len` whole entries, dropping any beyond it, by
+    /// moving the pdx's logical write pointer ([`MmapDataFile::rewind_to`]) — NOT a physical
+    /// truncate/remap, so it opens no read-only-mmap SIGBUS window (matching the data log's save
+    /// rollback). The abandoned entries become capacity padding that a clean close truncates away
+    /// and a crash rebuild (from the WAL) discards. A no-op when `len >= self.len()`.
+    pub fn rewind_to_len(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+        let pos = PDX_HEADER_SIZE as u64 + (len as u64 * T::buffer_len() as u64);
+        self.pdx_file.rewind_to(pos);
     }
 }
 
@@ -291,16 +317,31 @@ pub struct PositionIter<T> {
 
 impl<T: PosIndexValue> PositionIter<T> {
     /// New position iter over data.
-    fn new(data: Vec<u8>) -> Self {
+    fn new(mut data: Vec<u8>) -> Self {
+        Self::drop_partial_trailing_entry(&mut data);
         let done = data.is_empty();
         Self { data, pos: 0, done, reverse: false, _phantom: PhantomData }
     }
 
     /// New reverse iter over data.
-    fn new_rev(data: Vec<u8>) -> Self {
+    fn new_rev(mut data: Vec<u8>) -> Self {
+        Self::drop_partial_trailing_entry(&mut data);
         let done = data.is_empty();
         let pos = data.len().saturating_sub(T::buffer_len());
         Self { data, pos, done, reverse: true, _phantom: PhantomData }
+    }
+
+    /// Truncate `data` to a whole number of fixed-width entries, so `next`'s unchecked fixed-width
+    /// slice is sound for *any* input. Defense-in-depth: the public `iter`/`rev_iter` already pass
+    /// a whole number of entries (their length is capped to `len()`, and `read_exact` would
+    /// error on a short file first), so a partial trailing entry never reaches here today.
+    /// Normalizing anyway removes the footgun and keeps the iterator self-safe if that ever
+    /// changes. Dropping a partial trailing entry is harmless: it is not a committed position,
+    /// and the position index is rebuilt from the data-log WAL whenever `files_consistent`
+    /// fails.
+    fn drop_partial_trailing_entry(data: &mut Vec<u8>) {
+        let whole = data.len() / T::buffer_len() * T::buffer_len();
+        data.truncate(whole);
     }
 }
 
@@ -354,7 +395,12 @@ impl PosIndexValue for u64 {
 
     fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() != 8 {
-            panic!("u64 buffer not 8 bytes");
+            // Fed on-disk bytes: a wrong length means a truncated/corrupt PDX entry -> error, not
+            // a panic (corruption is reported, never crashed on).
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "u64 position index entry is not 8 bytes",
+            )));
         }
         let mut buf = [0_u8; 8];
         buf.copy_from_slice(bytes);
@@ -377,7 +423,12 @@ impl PosIndexValue for (u64, u64) {
 
     fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() != 16 {
-            panic!("(u64, u64) buffer not 16 bytes");
+            // Fed on-disk bytes: a wrong length means a truncated/corrupt PDX entry -> error, not
+            // a panic (corruption is reported, never crashed on).
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "(u64, u64) position index entry is not 16 bytes",
+            )));
         }
         let mut buf = [0_u8; 8];
         buf.copy_from_slice(&bytes[..8]);
@@ -399,6 +450,28 @@ mod tests {
     use crate::archive::pack::PackCompression;
 
     use super::*;
+
+    #[test]
+    fn test_position_iter_drops_partial_trailing_entry_no_panic() {
+        // A ragged buffer (not a whole multiple of the 8-byte entry width) must not panic the
+        // fixed-width slicing in `next`; the partial trailing bytes are dropped.
+        let mut data = 1u64.to_le_bytes().to_vec();
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // 3 stray bytes = a torn third entry
+        let forward: Vec<u64> =
+            PositionIter::<u64>::new(data.clone()).map(|r| r.expect("decode")).collect();
+        assert_eq!(forward, vec![1, 2], "partial trailing entry must be ignored");
+        let reverse: Vec<u64> =
+            PositionIter::<u64>::new_rev(data).map(|r| r.expect("decode")).collect();
+        assert_eq!(reverse, vec![2, 1], "reverse must also ignore the partial entry");
+    }
+
+    #[test]
+    fn test_pos_index_value_decode_rejects_short_input() {
+        // Wrong-length on-disk bytes must return an error, never panic.
+        assert!(matches!(<u64 as PosIndexValue>::decode(&[0u8; 4]), Err(FetchError::IO(_))));
+        assert!(matches!(<(u64, u64) as PosIndexValue>::decode(&[0u8; 9]), Err(FetchError::IO(_))));
+    }
 
     #[test]
     fn test_archive_pdx_index_single() {
@@ -553,10 +626,15 @@ mod tests {
             idx.sync().expect("sync");
         }
 
-        // Simulate a torn final record: append a few stray (sub-record) bytes.
-        let before = fs::metadata(&file).expect("metadata").len();
+        // Simulate a torn final record. The clean close appended an 8-byte sentinel; strip it first
+        // (as a reopened writer would) so the stray bytes land at the logical end, then append a
+        // few stray (sub-record) bytes.
+        let before =
+            fs::metadata(&file).expect("metadata").len() - crate::archive::data_file::SENTINEL_LEN;
         {
-            let mut f = fs::OpenOptions::new().append(true).open(&file).expect("open append");
+            let mut f = fs::OpenOptions::new().write(true).open(&file).expect("open rw");
+            f.set_len(before).expect("strip clean-close sentinel");
+            f.seek(SeekFrom::End(0)).expect("seek end");
             f.write_all(&[0xAB, 0xCD, 0xEF]).expect("write torn bytes");
             f.sync_all().expect("sync");
         }

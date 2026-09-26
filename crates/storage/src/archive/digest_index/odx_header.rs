@@ -2,11 +2,10 @@
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::fsync_directory,
+    data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::load_header::LoadHeaderError,
 };
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -29,20 +28,19 @@ pub struct OdxHeader {
 }
 
 impl OdxHeader {
-    /// Open the index overflow file (odx file) and return the open file and header.
-    pub fn open_odx_file<P: AsRef<Path>>(
+    fn open_header<F, P>(
+        file: &mut F,
         version: u16,
         uid: u64,
         appnum: u32,
         path: P,
         read_only: bool,
-    ) -> Result<(File, OdxHeader), LoadHeaderError> {
+    ) -> Result<OdxHeader, LoadHeaderError>
+    where
+        F: Write + Read + Seek + ?Sized,
+        P: AsRef<Path>,
+    {
         let path = path.as_ref();
-        let mut file = if read_only {
-            OpenOptions::new().read(true).write(false).open(path)?
-        } else {
-            OpenOptions::new().read(true).append(true).create(true).open(path)?
-        };
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
@@ -50,7 +48,7 @@ impl OdxHeader {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let header = OdxHeader::new(version, uid, appnum, read_only);
-            header.write_header(&mut file)?;
+            header.write_header(file)?;
             // New odx file was just created and its header written; fsync the parent so the entry
             // is durable.
             if let Some(parent) = path.parent() {
@@ -58,7 +56,7 @@ impl OdxHeader {
             }
             header
         } else {
-            let header = OdxHeader::load_header(&mut file, read_only)?;
+            let header = OdxHeader::load_header(file, read_only)?;
             // Basic validation of the odx header.
             if header.version() != version {
                 return Err(LoadHeaderError::InvalidIndexVersion);
@@ -71,6 +69,28 @@ impl OdxHeader {
             }
             header
         };
+        Ok(header)
+    }
+
+    /// Open the index overflow file (odx file) and return the open file and header.
+    pub fn open_odx_file_mmap<P: AsRef<Path>>(
+        version: u16,
+        uid: u64,
+        appnum: u32,
+        path: P,
+        read_only: bool,
+    ) -> Result<(MmapDataFile, OdxHeader), LoadHeaderError> {
+        let path = path.as_ref();
+        // The digest index does point lookups over fixed-offset hash buckets — random
+        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        let opts = MmapFileOptions {
+            write_mode: WriteMode::Random,
+            access: MmapAccess::Random,
+            ..Default::default()
+        };
+        let mut file = MmapDataFile::open_with(path, read_only, opts)?;
+
+        let header = Self::open_header(&mut file, version, uid, appnum, path, read_only)?;
         Ok((file, header))
     }
 
@@ -83,8 +103,8 @@ impl OdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header<R: Read + Seek>(
-        source: &mut R,
+    fn load_header<F: Read + Seek + ?Sized>(
+        source: &mut F,
         read_only: bool,
     ) -> Result<Self, LoadHeaderError> {
         let header_size = MIN_HEADER_SIZE;
@@ -117,7 +137,7 @@ impl OdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), LoadHeaderError> {
+    fn write_header<F: Write + Seek + ?Sized>(&self, sync: &mut F) -> Result<(), LoadHeaderError> {
         if self.read_only {
             return Err(LoadHeaderError::ReadOnly);
         }

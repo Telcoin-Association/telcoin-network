@@ -24,7 +24,7 @@
 //! `Header` and `GenesisAccount` cannot survive it — their serde derives use
 //! `skip_serializing_if` and `alloy_serde::quantity`, which only round-trip through
 //! self-describing formats. So headers are stored in their canonical **RLP** form and
-//! accounts in a small primitive wire struct ([`AccountRecord`]); the public API still
+//! accounts in a small primitive wire struct (`AccountRecord`); the public API still
 //! speaks in [`ExecHeader`] / [`GenesisAccount`], converting at the boundary.
 //!
 //! ## Verification scope
@@ -110,8 +110,8 @@ pub struct ExecStateMeta {
 
 /// A single account plus its storage and code, mirroring the genesis-account shape so
 /// the import side can feed reth's genesis machinery directly. This is the public
-/// account type; on disk it is stored as a BCS-safe [`AccountRecord`] header followed by
-/// [`ExecStateRecord::Storage`] chunks, so storage of any size round-trips.
+/// account type; on disk it is stored as a BCS-safe `AccountRecord` header followed by
+/// `ExecStateRecord::Storage` chunks, so storage of any size round-trips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecStateAccount {
     /// Account address.
@@ -134,7 +134,7 @@ pub struct ExecStateStats {
 
 /// On-disk wire form of an account *header* — only primitive types that round-trip through the
 /// container's BCS codec. Balance is the account's [`U256`] as 32 big-endian bytes. Storage is NOT
-/// inline: it follows as zero or more [`ExecStateRecord::Storage`] chunks, so an account with
+/// inline: it follows as zero or more `ExecStateRecord::Storage` chunks, so an account with
 /// arbitrarily large storage never exceeds the container's per-record limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AccountRecord {
@@ -298,7 +298,7 @@ impl ExecStatePackWriter {
     /// Append one account (header + storage chunks) to the pack, updating the running tallies.
     ///
     /// The account's storage is split into [`STORAGE_CHUNK_SLOTS`]-sized
-    /// [`ExecStateRecord::Storage`] records so an account with arbitrarily large storage always
+    /// `ExecStateRecord::Storage` records so an account with arbitrarily large storage always
     /// stays under the container's per-record limit. Callers that must also bound *write*
     /// memory can drive [`append_account_header`](Self::append_account_header) +
     /// [`append_storage_chunk`](Self::append_storage_chunk) directly.
@@ -703,7 +703,7 @@ pub enum ExecStatePackError {
     TooManyHeaders {
         /// Header count declared by the pack meta.
         declared: u32,
-        /// Maximum accepted count ([`MAX_HEADER_COUNT`]).
+        /// Maximum accepted count (`MAX_HEADER_COUNT`).
         max: u32,
     },
     /// The pack declares fewer headers than the `BLOCKHASH` lookback floor for its tip block. A

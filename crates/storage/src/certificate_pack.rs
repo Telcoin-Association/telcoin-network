@@ -11,11 +11,11 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     archive::{
-        digest_index::index::HdxIndex,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -114,12 +114,37 @@ fn run_pack_loop(
 impl Drop for CertificatePack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            if let Some(_handle) = self.handle.lock().take() {
-                error!(target: "certificate_pack", "DID NOT CALL SHUTDOWN on certificate pack for epoch {}", self.epoch);
-                // Make an effort to shutdown anyway but this may not have time to run.
-                // Ideally would wait on the handle to join but don't block the Drop or mess around
-                // with an async runtime- not calling shutdown is the root problem.
-                let _ = self.tx.try_send(PackMessage::Shutdown);
+            // Reaching this with a live handle means shutdown() was NOT used: a correct
+            // shutdown().await already took the handle, so the block below is skipped. Drop is the
+            // safety net; the proper async path is shutdown().await. Mirrors ConsensusPack /
+            // EpochRecordDb / LatestConsensus so all four actors seal consistently on a dropped
+            // last reference.
+            if let Some(handle) = self.handle.lock().take() {
+                warn!(target: "certificate_pack", "CertificatePack for epoch {} dropped without calling shutdown(); persisting as a fallback", self.epoch);
+                if self.tx.try_send(PackMessage::Shutdown).is_err() {
+                    // Full bounded channel -- detach. The actor still persists when the last Sender
+                    // drops (Inner's Drop clean-closes); only the synchronous "persisted on return"
+                    // wait is lost, and only on this misuse path.
+                    error!(target: "certificate_pack", "Failed to send shutdown message to CertificatePack (should be using shutdown())");
+                    return;
+                }
+                let epoch = self.epoch;
+                let join = move || {
+                    if let Err(e) = handle.join() {
+                        error!(target: "certificate_pack", ?e, epoch, "Failed to join certificate pack thread");
+                    }
+                };
+                // Never block a multi-threaded runtime worker on the persist/fsync: offload the
+                // join to the blocking pool. On a current-thread runtime (nothing
+                // else to starve) or no runtime, a synchronous join keeps
+                // "persisted on return" for callers/tests that drop
+                // then immediately reopen. `shutdown().await` is still the intended path.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                        rt.spawn_blocking(join);
+                    }
+                    _ => join(),
+                }
             }
         }
     }
@@ -265,6 +290,7 @@ impl CertificatePack {
     }
 }
 
+/// Base filename of the certificate pack's data file (`"cert_data"`) within an epoch directory.
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 
 #[derive(Debug)]
@@ -276,6 +302,69 @@ struct Inner {
 impl Inner {
     const DATA_NAME: &str = "cert_data";
     const HASH_NAME: &str = "cert_hash";
+
+    /// Open the certificate digest index. Factored out so [`Self::reset_index`] can reopen a fresh
+    /// copy after wiping the sidecar directory.
+    fn try_open_index(
+        base_dir: &Path,
+        data: &Pack<Certificate>,
+        read_only: bool,
+    ) -> Result<HdxIndex, PackError> {
+        HdxIndex::open_hdx_file(
+            base_dir.join(Self::HASH_NAME),
+            data.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            read_only,
+        )
+        .map_err(OpenError::IndexFileOpen)
+        .map_err(Into::into)
+    }
+
+    /// Discard the digest index sidecar directory and reopen a fresh (empty) copy for rebuild. A
+    /// missing directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    fn reset_index(base_dir: &Path, data: &Pack<Certificate>) -> Result<HdxIndex, PackError> {
+        match std::fs::remove_dir_all(base_dir.join(Self::HASH_NAME)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Self::try_open_index(base_dir, data, false)
+    }
+
+    /// Rebuild the digest index by replaying the data log, the authoritative source (mirrors
+    /// `ConsensusPack::recover_pack`). Capture `logical_position()` before each `next()` as the
+    /// cert's stored offset, advance the consistent end only past a fully-decoded cert, and stop at
+    /// the first torn/short cert so an incomplete tail is dropped; then roll the log back to that
+    /// end and reconcile the digest marker. Keyed by `Certificate::digest`, matching
+    /// [`Self::save`].
+    fn rebuild_index(
+        data: &mut Pack<Certificate>,
+        digest_idx: &mut HdxIndex,
+    ) -> Result<(), PackError> {
+        let mut iter = data.raw_iter().map_err(OpenError::DataFileOpen)?;
+        let mut consistent_end = iter.logical_position();
+        loop {
+            let pos = iter.logical_position();
+            match iter.next() {
+                None => break,
+                Some(Ok(cert)) => {
+                    let digest = B256::from_slice(cert.digest().as_ref());
+                    digest_idx
+                        .save(digest, pos)
+                        .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+                    consistent_end = iter.logical_position();
+                }
+                Some(Err(_)) => break,
+            }
+        }
+        // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
+        drop(iter);
+        if consistent_end < data.file_len() {
+            data.rewind_to(consistent_end);
+        }
+        digest_idx.set_data_file_length(data.file_len());
+        Ok(())
+    }
 
     fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, PackError> {
         let base_dir = path.as_ref();
@@ -289,27 +378,42 @@ impl Inner {
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut digest_idx = HdxIndex::open_hdx_file(
-            base_dir.join(Self::HASH_NAME),
-            data.header(),
-            builder,
-            read_only,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
+
+        // Open the digest index; on a writable open, if it is unreadable discard it and rebuild
+        // from the data log below rather than latching (a corrupt sidecar index must not
+        // silently disable cert archiving -- the data log is authoritative). A read-only
+        // open surfaces the error as before (it cannot mutate to repair).
+        let mut digest_idx = match Self::try_open_index(base_dir, &data, read_only) {
+            Ok(idx) => idx,
+            Err(e) if !read_only => {
+                warn!(
+                    target: "cert-pack",
+                    "certificate index failed to open ({e}); discarding and rebuilding from the \
+                     data log"
+                );
+                Self::reset_index(base_dir, &data)?
+            }
+            Err(e) => return Err(e),
+        };
 
         if !read_only {
-            // Repair: if the pack was extended past what the index tracked (e.g. crash mid-write),
-            // truncate back to the last known-good boundary.
-            let pack_len = data.file_len();
-            let idx_len = digest_idx.data_file_length();
-            if pack_len > idx_len && idx_len >= DATA_HEADER_BYTES as u64 {
-                data.truncate(idx_len)?;
-            }
-            // On a brand-new file the index's tracked length starts at DATA_HEADER_BYTES (the
-            // pack header size). Sync it if it hasn't been set yet.
+            // On a brand-new file the index's tracked length starts below the pack-header size;
+            // initialise it so the consistency check below does not treat a fresh pack as unclean.
             if digest_idx.data_file_length() < DATA_HEADER_BYTES as u64 {
                 digest_idx.set_data_file_length(data.file_len());
+            }
+            // If the pack or index was not cleanly sealed, or the index's tracked data length
+            // disagrees with the log (a crash mid-write, or an hdx split whose new buckets reached
+            // disk but whose header/`data_file_length` did not -- silently dropping the moved
+            // keys), the index may be stale or torn. The data log is authoritative, so
+            // discard the index and rebuild by replaying the log (mirrors
+            // `ConsensusPack::recover_pack`).
+            let unclean = data.opened_unclean()
+                || digest_idx.opened_unclean()
+                || digest_idx.data_file_length() != data.file_len();
+            if unclean {
+                digest_idx = Self::reset_index(base_dir, &data)?;
+                Self::rebuild_index(&mut data, &mut digest_idx)?;
             }
         }
         Ok(Self { data, digest_idx })
@@ -361,18 +465,34 @@ impl Inner {
     }
 }
 
+/// Error type for [`CertificatePack`] operations, surfaced by the background pack loop.
 #[derive(Debug, Clone)]
 pub enum PackError {
+    /// An underlying I/O error touching the pack's files.
     IO(Arc<io::Error>),
+    /// Appending a certificate to the data file failed; holds the source error's text.
     Append(String),
+    /// Recording a saved certificate's offset in the digest index failed; holds the source
+    /// error's text.
     IndexAppend(String),
+    /// Opening (or creating) the pack's data file or digest index failed.
     Open(Arc<OpenError>),
+    /// Reading/fetching a certificate back from the data file failed; holds the source error's
+    /// text.
     ReadError(String),
+    /// The channel to the background pack thread is closed, so the message could not be sent.
     SendFailed,
+    /// The bounded channel to the background pack thread is full
+    /// ([`try_save`](CertificatePack::try_save) only).
     SendFull,
+    /// The background pack thread's reply was dropped before it could be received.
     ReceiveFailed,
+    /// Flushing the data file and/or syncing the index to disk failed; holds the source error's
+    /// text.
     PersistError(String),
+    /// The pack file was detected to be corrupt.
     CorruptPack,
+    /// The background pack thread failed to join on shutdown.
     JoinFailed,
 }
 
@@ -478,6 +598,90 @@ mod test {
             let loaded = pack.get(digest).await.expect("should load cert read-only");
             assert_eq!(loaded.digest(), digest);
         }
+    }
+
+    /// Like [`make_test_cert`] but varies the header round so each cert has a distinct digest
+    /// (`make_test_cert` alone only cycles four authors -> four unique digests).
+    fn make_unique_cert(fixture: &CommitteeFixture<MemDatabase>, i: usize) -> Certificate {
+        let mut cert = make_test_cert(fixture, i);
+        cert.update_header_round_for_test(i as u32 + 1);
+        cert
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_certificate_index_open_failure_rebuilds() {
+        // Regression for finding #8(b): an unreadable digest index must not latch and silently
+        // disable cert archiving. The data log is authoritative, so a corrupt index is discarded
+        // and rebuilt from it (was: `OpenError::IndexFileOpen` -> archiving disabled for
+        // the epoch).
+        let temp_dir = TempDir::with_prefix("cert_index_open_failure").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        // Populate and cleanly close (Drop commits + syncs the index).
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..32usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+        }
+
+        // Corrupt the digest index header so it fails to open (mirrors `break_index_file`).
+        let hdx = dir.join(super::Inner::HASH_NAME).join("index.hdx");
+        let f = std::fs::OpenOptions::new().write(true).open(&hdx).expect("open hdx to corrupt");
+        f.set_len(4).expect("truncate hdx header");
+        drop(f);
+
+        // Reopen writable: the unreadable index is discarded and rebuilt from the data log, so the
+        // open succeeds and every cert is reachable.
+        let mut inner = super::Inner::open(&dir, false).expect("reopen must rebuild the index");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "cert missing after rebuild");
+            let loaded = inner.get(cert.digest()).expect("cert should load after rebuild");
+            assert_eq!(loaded.digest(), cert.digest());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_certificate_unclean_reopen_rebuilds() {
+        // Regression for finding #8(a): after an unclean shutdown a digest index can be stale (an
+        // hdx split whose new buckets reached disk but whose header did not), silently losing keys.
+        // A writable reopen must detect the unclean state and rebuild the index from the
+        // authoritative data log, so every persisted cert stays reachable and a re-save is
+        // idempotent (no duplicate appended -- the #8 duplicate-append symptom).
+        let temp_dir = TempDir::with_prefix("cert_unclean_rebuild").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        // Populate + persist (durable log + synced marker), then `mem::forget` to skip the clean
+        // close: models a crash -- durable log, no sentinel.
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..32usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+            std::mem::forget(inner);
+        }
+
+        // Reopen: unclean (no sentinel) -> index rebuilt from the log; every cert reachable.
+        let mut inner = super::Inner::open(&dir, false).expect("reopen after unclean exit");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "cert missing after rebuild");
+        }
+
+        // Re-saving an already-stored cert must be idempotent: the rebuilt index resolves the key,
+        // so no duplicate is appended (the logical log length stays put).
+        let len_before = inner.data.file_len();
+        inner.save(&certs[0]).expect("idempotent re-save");
+        assert_eq!(inner.data.file_len(), len_before, "re-save must not append a duplicate cert");
     }
 
     #[tokio::test(flavor = "multi_thread")]
