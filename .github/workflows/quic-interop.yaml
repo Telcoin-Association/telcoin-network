@@ -1,0 +1,114 @@
+name: QUIC release interoperability
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quic-interop-${{ github.event.merge_group.head_ref || github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  build:
+    name: Build QUIC ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["0.13.1", "0.14.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository toolchain and Clippy
+        run: |
+          rustup show active-toolchain
+          rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: testing/quic-interop/releases/${{ matrix.release }}
+          key: quic-${{ matrix.release }}
+      - name: Check configuration mapping
+        run: cargo test --locked --manifest-path testing/quic-interop/releases/${{ matrix.release }}/Cargo.toml
+      - name: Lint fixture and configuration source
+        run: cargo clippy --locked --manifest-path testing/quic-interop/releases/${{ matrix.release }}/Cargo.toml --all-targets --no-deps -- -D warnings
+      - name: Build independent process
+        run: cargo build --locked --manifest-path testing/quic-interop/releases/${{ matrix.release }}/Cargo.toml
+      - name: Record dependency and toolchain evidence
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: |
+          mkdir -p evidence
+          rustc -Vv > evidence/rustc.txt
+          cargo tree --locked --manifest-path "testing/quic-interop/releases/$RELEASE/Cargo.toml" > evidence/dependencies.txt
+          cp "testing/quic-interop/releases/$RELEASE/Cargo.lock" evidence/Cargo.lock
+          git rev-parse HEAD > evidence/candidate.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quic-binary-${{ matrix.release }}
+          path: testing/quic-interop/releases/${{ matrix.release }}/target/debug/quic-interop
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-build-evidence-${{ matrix.release }}
+          path: evidence/
+          if-no-files-found: warn
+
+  interoperability:
+    name: Dial ${{ matrix.dialer }} to listener ${{ matrix.listener }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dialer: ["0.13.1", "0.14.0"]
+        listener: ["0.13.1", "0.14.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quic-binary-*
+          path: binaries
+      - name: Run connection, stream, reconnect and deadline fixtures
+        env:
+          DIALER: ${{ matrix.dialer }}
+          LISTENER: ${{ matrix.listener }}
+        run: |
+          chmod +x binaries/quic-binary-*/quic-interop
+          python3 testing/quic-interop/run.py \
+            --listener "$PWD/binaries/quic-binary-$LISTENER/quic-interop" \
+            --dialer "$PWD/binaries/quic-binary-$DIALER/quic-interop" \
+            --listener-release "$LISTENER" --dialer-release "$DIALER" \
+            --output evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-results-${{ matrix.dialer }}-to-${{ matrix.listener }}
+          path: evidence/
+          if-no-files-found: error
+
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - name: Check the independent fixture sources
+        run: cargo +nightly fmt --manifest-path testing/quic-interop/releases/0.14.0/Cargo.toml -- --check

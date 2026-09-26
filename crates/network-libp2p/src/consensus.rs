@@ -609,16 +609,7 @@ where
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
-                config
-            })
+            .with_quic_config(|config| network_config.quic_config().apply_to(config))
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
