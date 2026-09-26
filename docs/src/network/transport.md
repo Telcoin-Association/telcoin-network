@@ -1,6 +1,9 @@
 # Transport
 
 Telcoin Network nodes speak libp2p over QUIC and nothing else.
+
+The [validated handshake-start accounting contract](handshake-starts.md) describes the
+process budget API and the transport integration and calibration required before enabling it.
 This page states what a node opens on the wire, the two keys that identify it, where its listener addresses come from, and the full set of chain-namespaced protocol IDs its substreams negotiate.
 
 It is written for RPC providers, dapp and indexer operators, bridge partners, and validators who need to predict what a node dials, what it accepts, and why a peer that looks reachable can still never exchange a message.
