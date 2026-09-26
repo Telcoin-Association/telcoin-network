@@ -1,0 +1,523 @@
+{
+  "schema": 1,
+  "versions": {
+    "libp2p-tls": "0.7.0",
+    "rustls": "0.23.37",
+    "aws-lc-rs": "1.16.2",
+    "aws-lc-sys": "0.39.1",
+    "rustls-webpki": "0.103.10"
+  },
+  "platform": "macOS-26.4-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: aarch64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8",
+  "source_revision": "5736cc30012c5ff25913898e318a74df308f13d9",
+  "source_status": "A  .github/workflows/quic-handshake-profile.yaml\nA  testing/quic-handshake/.gitignore\nA  testing/quic-handshake/Cargo.lock\nA  testing/quic-handshake/Cargo.toml\nAM testing/quic-handshake/README.md\nA  testing/quic-handshake/prepare.py\nA  testing/quic-handshake/profile.rs\nAM testing/quic-handshake/run.py\nAM testing/quic-handshake/src/main.rs",
+  "binary_sha256": "9ac7766d08d954f51fc8a08e42fabb13272992f9ceab87201fe1fb9870806beb",
+  "node_lock_sha256": "04073dbf14576db48b3cc23741055631ade9ca25dfb9b78dd6210fd2381f7b31",
+  "source_sha256": {
+    "Cargo.toml": "cba83260aa521f78b7d08c1def2000a2b124ee6edcbd73683f0cd2a9bc52fedf",
+    "Cargo.lock": "d524c48dbda0fbe2c55317fc0509d231dd9f402d14c48cb560a215d589606679",
+    "prepare.py": "866fe333979eca7029672a0de38720c1e00a01dc96c9037ec56dd4f0c420850f",
+    "profile.rs": "4d1f3d177597af713999d412784ac2164514376eecb983f80a06495c0a3f4f11",
+    "src/main.rs": "1f8845dba6405a40451130600fd50d588016c1c8fdcfa8dc315782b5902c7bb1",
+    "run.py": "c12abebbbbc244fb35a184f6a72398f5b3074a3d540fffa4db90da3a8c83548d"
+  },
+  "samples_per_scenario": 1000,
+  "timing_scope": "Instrumented in-memory QUIC TLS, Ed25519 identity, P-256 certificate. No UDP or packet protection.",
+  "cpu_scope": "Child process user+system CPU, both peers, setup, sampling and JSON output included.",
+  "scenarios": {
+    "default": {
+      "raw_sha256": "7122282137b705ffa4145de13e2d290c7f138048c4998a23c66d82754fc83099",
+      "process_wall_seconds": 1.704581416968722,
+      "process_cpu_seconds": 1.116805,
+      "group": "X25519MLKEM768",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1030.167,
+          "p95_us": 1637.042
+        },
+        "server_first_flight_ns": {
+          "median_us": 106.083,
+          "p95_us": 177.209
+        },
+        "server_read_ns": {
+          "median_us": 445.833,
+          "p95_us": 646.459
+        },
+        "server_peer_id_ns": {
+          "median_us": 117.959,
+          "p95_us": 147.625
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 19.374,
+          "p95_us": 35.666
+        },
+        "certificate_signature": {
+          "median_us": 201.042,
+          "p95_us": 254.792
+        },
+        "extension_signature": {
+          "median_us": 131.291,
+          "p95_us": 183.417
+        },
+        "transcript_signature": {
+          "median_us": 69.166,
+          "p95_us": 91.75
+        }
+      }
+    },
+    "reverse-server": {
+      "raw_sha256": "418eae6312a577f84f7148dc49352a2a53f1eb2a584e72f33c5102fff2e5af6f",
+      "process_wall_seconds": 1.1886697500012815,
+      "process_cpu_seconds": 1.159083,
+      "group": "X25519MLKEM768",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1075.791,
+          "p95_us": 1352.458
+        },
+        "server_first_flight_ns": {
+          "median_us": 110.75,
+          "p95_us": 170.875
+        },
+        "server_read_ns": {
+          "median_us": 458.834,
+          "p95_us": 597.916
+        },
+        "server_peer_id_ns": {
+          "median_us": 118.416,
+          "p95_us": 152.5
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 19.708,
+          "p95_us": 32.125
+        },
+        "certificate_signature": {
+          "median_us": 203.542,
+          "p95_us": 253.708
+        },
+        "extension_signature": {
+          "median_us": 131.0,
+          "p95_us": 161.749
+        },
+        "transcript_signature": {
+          "median_us": 69.833,
+          "p95_us": 83.625
+        }
+      }
+    },
+    "reverse-client": {
+      "raw_sha256": "46a375c718e780214c980dac4abd9ee2a7351405331cdaf67d62f8efb4b94b9f",
+      "process_wall_seconds": 1.4348358749994077,
+      "process_cpu_seconds": 1.4021719999999998,
+      "group": "secp384r1",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1348.125,
+          "p95_us": 1537.916
+        },
+        "server_first_flight_ns": {
+          "median_us": 274.625,
+          "p95_us": 337.416
+        },
+        "server_read_ns": {
+          "median_us": 613.458,
+          "p95_us": 708.125
+        },
+        "server_peer_id_ns": {
+          "median_us": 117.792,
+          "p95_us": 136.0
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 19.417,
+          "p95_us": 28.334
+        },
+        "certificate_signature": {
+          "median_us": 201.083,
+          "p95_us": 225.041
+        },
+        "extension_signature": {
+          "median_us": 130.583,
+          "p95_us": 149.375
+        },
+        "transcript_signature": {
+          "median_us": 69.167,
+          "p95_us": 75.167
+        }
+      }
+    },
+    "x25519": {
+      "raw_sha256": "b924752c38f3ba52965df857a3a18ac5314f9e65ea5089c40ae329c60e80a891",
+      "process_wall_seconds": 0.9694420419982634,
+      "process_cpu_seconds": 0.9587249999999995,
+      "group": "X25519",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 889.375,
+          "p95_us": 1013.833
+        },
+        "server_first_flight_ns": {
+          "median_us": 78.334,
+          "p95_us": 109.666
+        },
+        "server_read_ns": {
+          "median_us": 388.958,
+          "p95_us": 453.208
+        },
+        "server_peer_id_ns": {
+          "median_us": 107.75,
+          "p95_us": 125.584
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 17.791,
+          "p95_us": 25.041
+        },
+        "certificate_signature": {
+          "median_us": 184.916,
+          "p95_us": 204.5
+        },
+        "extension_signature": {
+          "median_us": 118.624,
+          "p95_us": 132.751
+        },
+        "transcript_signature": {
+          "median_us": 63.833,
+          "p95_us": 68.667
+        }
+      }
+    },
+    "p256": {
+      "raw_sha256": "ec77bb7f8a9c8235d6cf7e55286fd8984f71ce2f2bab72e6252fb31ce9d134db",
+      "process_wall_seconds": 1.307912459014915,
+      "process_cpu_seconds": 1.1831280000000004,
+      "group": "secp256r1",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1130.25,
+          "p95_us": 1825.958
+        },
+        "server_first_flight_ns": {
+          "median_us": 123.5,
+          "p95_us": 209.458
+        },
+        "server_read_ns": {
+          "median_us": 492.5,
+          "p95_us": 787.749
+        },
+        "server_peer_id_ns": {
+          "median_us": 120.667,
+          "p95_us": 195.792
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 21.375,
+          "p95_us": 43.124
+        },
+        "certificate_signature": {
+          "median_us": 205.167,
+          "p95_us": 310.833
+        },
+        "extension_signature": {
+          "median_us": 134.251,
+          "p95_us": 223.458
+        },
+        "transcript_signature": {
+          "median_us": 70.417,
+          "p95_us": 107.0
+        }
+      }
+    },
+    "p384": {
+      "raw_sha256": "d26292028c378e39ed9db0ff721589c3f534b273b7ca8255d0c681813be03655",
+      "process_wall_seconds": 1.536715791968163,
+      "process_cpu_seconds": 1.4692319999999999,
+      "group": "secp384r1",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1382.292,
+          "p95_us": 1719.459
+        },
+        "server_first_flight_ns": {
+          "median_us": 278.917,
+          "p95_us": 375.0
+        },
+        "server_read_ns": {
+          "median_us": 624.959,
+          "p95_us": 799.459
+        },
+        "server_peer_id_ns": {
+          "median_us": 118.417,
+          "p95_us": 154.458
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 19.625,
+          "p95_us": 33.166
+        },
+        "certificate_signature": {
+          "median_us": 201.458,
+          "p95_us": 247.125
+        },
+        "extension_signature": {
+          "median_us": 132.042,
+          "p95_us": 168.583
+        },
+        "transcript_signature": {
+          "median_us": 69.708,
+          "p95_us": 80.417
+        }
+      }
+    },
+    "hybrid": {
+      "raw_sha256": "81bf66d155a13869c7d90f5e149218952399b7bdaeeb5fccc613f0dbe8af4baa",
+      "process_wall_seconds": 1.0871098330244422,
+      "process_cpu_seconds": 1.0690720000000011,
+      "group": "X25519MLKEM768",
+      "kind": "Full",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 1014.166,
+          "p95_us": 1175.083
+        },
+        "server_first_flight_ns": {
+          "median_us": 103.959,
+          "p95_us": 139.209
+        },
+        "server_read_ns": {
+          "median_us": 438.166,
+          "p95_us": 513.001
+        },
+        "server_peer_id_ns": {
+          "median_us": 116.833,
+          "p95_us": 136.541
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 3,
+        "certificate_signature": 3,
+        "extension_signature": 3,
+        "transcript_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 19.291,
+          "p95_us": 27.958
+        },
+        "certificate_signature": {
+          "median_us": 200.709,
+          "p95_us": 221.834
+        },
+        "extension_signature": {
+          "median_us": 128.417,
+          "p95_us": 141.542
+        },
+        "transcript_signature": {
+          "median_us": 68.708,
+          "p95_us": 75.333
+        }
+      }
+    },
+    "reconnect": {
+      "raw_sha256": "70256344e1c33d62409e892ef1571fe863514a32383999df41f60bc3acc09250",
+      "process_wall_seconds": 0.3895928330020979,
+      "process_cpu_seconds": 0.3826640000000009,
+      "group": "X25519MLKEM768",
+      "kind": "Resumed",
+      "warm_samples": 999,
+      "timings": {
+        "wall_ns": {
+          "median_us": 326.458,
+          "p95_us": 397.334
+        },
+        "server_first_flight_ns": {
+          "median_us": 76.208,
+          "p95_us": 94.667
+        },
+        "server_read_ns": {
+          "median_us": 102.083,
+          "p95_us": 126.75
+        },
+        "server_peer_id_ns": {
+          "median_us": 108.541,
+          "p95_us": 128.209
+        }
+      },
+      "verification_counts_per_handshake": {
+        "parse": 1,
+        "certificate_signature": 1,
+        "extension_signature": 1
+      },
+      "verification_timings": {
+        "parse": {
+          "median_us": 6.166,
+          "p95_us": 9.292
+        },
+        "certificate_signature": {
+          "median_us": 61.667,
+          "p95_us": 68.167
+        },
+        "extension_signature": {
+          "median_us": 39.917,
+          "p95_us": 44.167
+        }
+      }
+    },
+    "incompatible": {
+      "raw_sha256": "0b0e129704805d5146710ecbe393bba583a3a2a4a74456cea96d2b67c8a4875a",
+      "process_wall_seconds": 0.07398049999028444,
+      "process_cpu_seconds": 0.0691029999999988,
+      "rejections": 1000,
+      "reason": "TLS: peer is incompatible: NoKxGroupsInCommon"
+    },
+    "wrong-peer": {
+      "raw_sha256": "88ec066c559a2e15b64422195540fdebcdd82f3394ac37de087baae1ca84399c",
+      "process_wall_seconds": 0.35574695898685604,
+      "process_cpu_seconds": 0.3496400000000002,
+      "rejections": 1000,
+      "reason": "TLS: invalid peer certificate: ApplicationVerificationFailure"
+    },
+    "kx-x25519": {
+      "raw_sha256": "a501c43132638bf4d2671ffb662bfc47be404a4da70eb69b8ad66eb4fe4b79a8",
+      "process_wall_seconds": 0.12057345797074959,
+      "process_cpu_seconds": 0.11649500000000124,
+      "group": "X25519",
+      "warm_samples": 999,
+      "timings": {
+        "client_start_ns": {
+          "median_us": 11.083,
+          "p95_us": 14.083
+        },
+        "server_exchange_ns": {
+          "median_us": 36.25,
+          "p95_us": 41.542
+        },
+        "client_complete_ns": {
+          "median_us": 25.334,
+          "p95_us": 27.5
+        }
+      }
+    },
+    "kx-p256": {
+      "raw_sha256": "6c5476e612020371e881cde3aeb2eb9d3c8e0d48f777ff818a67ac6aeb0a444d",
+      "process_wall_seconds": 0.16752183402422816,
+      "process_cpu_seconds": 0.16348300000000016,
+      "group": "secp256r1",
+      "warm_samples": 999,
+      "timings": {
+        "client_start_ns": {
+          "median_us": 14.417,
+          "p95_us": 17.542
+        },
+        "server_exchange_ns": {
+          "median_us": 60.166,
+          "p95_us": 65.625
+        },
+        "client_complete_ns": {
+          "median_us": 45.792,
+          "p95_us": 49.292
+        }
+      }
+    },
+    "kx-p384": {
+      "raw_sha256": "12242d118fd6ab82ce56b8abcb4b9486938c27dd47e8221e56f99a2ee99e3195",
+      "process_wall_seconds": 0.4781929170130752,
+      "process_cpu_seconds": 0.4714419999999997,
+      "group": "secp384r1",
+      "warm_samples": 999,
+      "timings": {
+        "client_start_ns": {
+          "median_us": 56.917,
+          "p95_us": 68.291
+        },
+        "server_exchange_ns": {
+          "median_us": 208.25,
+          "p95_us": 239.125
+        },
+        "client_complete_ns": {
+          "median_us": 151.875,
+          "p95_us": 176.0
+        }
+      }
+    },
+    "kx-hybrid": {
+      "raw_sha256": "5b19574983e01a67c0f2611fef9c7f83d1b5f54fdcbfe310ec866b2977340687",
+      "process_wall_seconds": 0.17223979101981968,
+      "process_cpu_seconds": 0.16529099999999974,
+      "group": "X25519MLKEM768",
+      "warm_samples": 999,
+      "timings": {
+        "client_start_ns": {
+          "median_us": 26.625,
+          "p95_us": 31.292
+        },
+        "server_exchange_ns": {
+          "median_us": 51.625,
+          "p95_us": 58.166
+        },
+        "client_complete_ns": {
+          "median_us": 39.333,
+          "p95_us": 42.5
+        }
+      }
+    }
+  }
+}
