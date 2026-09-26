@@ -22,6 +22,12 @@ pub(crate) struct EpochMetrics {
 }
 
 impl EpochMetrics {
+    /// Count peer-wait timeouts by worker so operators can identify a degraded batch lane.
+    pub(crate) fn record_worker_peer_wait_timeout(worker_id: tn_types::WorkerId) {
+        metrics::counter!("tn_epoch.worker_peer_wait_timeouts_total", "worker_id" => worker_id.to_string())
+            .increment(1);
+    }
+
     /// Record a `run_epoch` iteration by mode.
     ///
     /// Counts epoch transitions AND mid-epoch restarts/mode changes - a node cycling
@@ -65,6 +71,7 @@ mod tests {
             metrics.replayed_outputs_total.increment(2);
             metrics.record_epoch_run(&RunEpochMode::Initial);
             EpochMetrics::record_provider_fault_retry("epoch-entry state read");
+            EpochMetrics::record_worker_peer_wait_timeout(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -80,6 +87,9 @@ mod tests {
         let (key, _, _, value) = find("tn_epoch.runs_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         assert!(key.key().labels().any(|l| l.key() == "mode" && l.value() == "initial"));
+        let (key, _, _, value) = find("tn_epoch.worker_peer_wait_timeouts_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key.key().labels().any(|l| l.key() == "worker_id" && l.value() == "1"));
         find("tn_epoch.boundary_timestamp_seconds");
         find("tn_epoch.replayed_outputs_total");
         let (key, _, _, value) = find("tn_epoch.provider_fault_retries_total");
