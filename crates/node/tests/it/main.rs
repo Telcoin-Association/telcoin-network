@@ -3,6 +3,8 @@
 // unused deps lint confusion
 #![allow(unused_crate_dependencies)]
 
+mod multi_worker;
+
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
