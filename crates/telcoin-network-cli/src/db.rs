@@ -28,7 +28,7 @@ use tn_reth::{
 };
 use tn_storage::{
     consensus::ConsensusChain,
-    consensus_pack::{ConsensusPack, EpochRepair, DATA_NAME},
+    consensus_pack::{ConsensusPack, EpochMigrate, EpochRepair, DATA_NAME},
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
     pack_validate::{classify_physical_corruption, validate_pack_file, validate_pack_file_bounded},
@@ -61,6 +61,11 @@ enum DbSubcommand {
     /// The node MUST be stopped. Dry-run by default; pass `--force` to apply.
     Repair(DbRepairArgs),
 
+    /// Migrate legacy (pre-v2) consensus epoch packs up to the current v2 format: rewrite the data
+    /// log header-first, rebuild indexes, and re-seal. The node MUST be stopped. Dry-run by
+    /// default; pass `--force` to apply.
+    Migrate(DbMigrateArgs),
+
     /// Load an EVM state-export pack into a new reth database under the datadir.
     LoadState(DbLoadStateArgs),
 }
@@ -92,6 +97,7 @@ impl DbCommand {
             }
             DbSubcommand::Validate(args) => args.execute()?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
+            DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
         }
         Ok(())
@@ -365,6 +371,112 @@ impl DbRepairArgs {
             println!(
                 "\nsummary: {actionable} epoch(s) {verb}, {lost} unrepairable (data loss / re-sync)."
             );
+            Ok::<(), eyre::Report>(())
+        })?;
+        Ok(())
+    }
+}
+
+/// Migrate legacy (pre-v2) consensus epoch pack files up to the current v2 format.
+///
+/// v2 is the only writable pack format: it carries the clean-close sentinel that lets recovery tell
+/// a truncatable unacked tail from at-rest corruption of committed data. A pre-v2 pack (v0
+/// batches-first or v1 header-first, from before this format existed) never carried a sentinel, so
+/// leaving it in place makes recovery/repair guess at "sealed" and risks truncating committed data.
+/// Migration rewrites the data log into a fresh v2 log (reordering a v0 batches-first log
+/// header-first), rebuilds the indexes, and installs it atomically. A node reopening its current
+/// epoch after an upgrade migrates it automatically; this command lets an operator upgrade every
+/// epoch at once (it may become mandatory in a future release).
+///
+/// The node MUST be stopped: with `--force` this rewrites pack files, which would corrupt a running
+/// node's memory mapping. There is no lock to detect a running node, so the command is a dry run by
+/// default and requires `--force` to apply. A legacy pack whose data log is damaged below the acked
+/// frontier is reported (re-sync required), never truncated.
+#[derive(Debug, Args)]
+pub struct DbMigrateArgs {
+    /// Migrate only this epoch. Without it, every legacy epoch is migrated.
+    #[arg(long)]
+    pub epoch: Option<Epoch>,
+
+    /// Apply migrations. Without this the command is a dry run: it reports what it would migrate
+    /// but writes nothing. Stop the node before passing `--force`.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbMigrateArgs {
+    /// Assess (and, with `--force`, apply) the v1/v0→v2 migration of consensus epoch packs under
+    /// the datadir.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+
+        // Loud safety banner in both modes (stderr; the report goes to stdout).
+        eprintln!(
+            "WARNING: `db migrate` rewrites consensus pack files. The node MUST be stopped first — \
+             there is no lock to detect a running node, and rewriting files a running node holds \
+             mapped will corrupt them."
+        );
+        if !self.force {
+            eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
+        }
+
+        let all = ConsensusPack::epoch_dirs(&epochs_dir)
+            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+        if let Some(e) = self.epoch {
+            if !all.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
+        let targets: Vec<Epoch> = match self.epoch {
+            Some(e) => vec![e],
+            None => all,
+        };
+
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        runtime.block_on(async {
+            // `actionable` counts applied migrations (`--force` → `Migrated`) or dry-run findings
+            // (`WouldMigrate`); the two are mutually exclusive per invocation.
+            let mut actionable = 0usize;
+            let mut already = 0usize;
+            let mut corrupt = 0usize;
+            for epoch in &targets {
+                match ConsensusPack::migrate_epoch(&epochs_dir, *epoch, self.force).await {
+                    Ok(EpochMigrate::AlreadyCurrent) => {
+                        already += 1;
+                        println!("epoch {epoch}: already v2");
+                    }
+                    Ok(EpochMigrate::Migrated(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: MIGRATED — {what}");
+                    }
+                    Ok(EpochMigrate::WouldMigrate(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: would migrate — {what}");
+                    }
+                    Ok(EpochMigrate::Corrupt(why)) => {
+                        corrupt += 1;
+                        println!("epoch {epoch}: CORRUPT — {why}");
+                    }
+                    Err(e) => {
+                        corrupt += 1;
+                        println!("epoch {epoch}: ERROR — {e}");
+                    }
+                }
+            }
+
+            let verb = if self.force { "migrated" } else { "to migrate (dry run)" };
+            println!(
+                "\nsummary: {actionable} epoch(s) {verb}, {already} already v2, {corrupt} corrupt \
+                 (re-sync required)."
+            );
+            // Non-zero exit when any pack could not be migrated, so scripts/operators notice.
+            if corrupt > 0 {
+                bail!("{corrupt} epoch(s) could not be migrated (see report above)");
+            }
             Ok::<(), eyre::Report>(())
         })?;
         Ok(())

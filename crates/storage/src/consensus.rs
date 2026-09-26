@@ -741,15 +741,17 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.replaced` directories under
-    /// `base_path` (stale from a prior run — the last is a rename-aside backup left by a crash
-    /// during [`Self::install_imported_epoch_dir`]).
+    /// Remove any leftover `staging-*`, `import-*`, `epoch-*.migrating`, or `epoch-*.replaced`
+    /// directories under `base_path` (stale from a prior run — `*.migrating` is a half-built pack
+    /// from an interrupted v1/v0→v2 migration and `*.replaced` is a rename-aside backup left by a
+    /// crash during [`Self::install_imported_epoch_dir`] or the pack migration install).
     fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
                 if entry.file_name().to_str().is_some_and(|n| {
                     n.starts_with("staging-")
                         || n.starts_with("import-")
+                        || n.ends_with(".migrating")
                         || n.ends_with(".replaced")
                 }) {
                     let _ = std::fs::remove_dir_all(entry.path());

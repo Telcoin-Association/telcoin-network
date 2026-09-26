@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     archive::{
-        data_file::create_dir_synced,
+        data_file::{create_dir_synced, fsync_directory},
         digest_index::HdxIndex,
         error::{
             fetch::FetchError,
@@ -302,6 +302,33 @@ impl EpochRepair {
     }
 }
 
+/// Outcome of [`ConsensusPack::migrate_epoch`] for one epoch's consensus pack: migrating a
+/// pre-v2 (v0 batches-first / v1 header-first) pack up to the current v2 format.
+#[derive(Debug)]
+pub enum EpochMigrate {
+    /// The pack is already v2 (or newer); nothing was done.
+    AlreadyCurrent,
+    /// The pack is a migratable legacy format but this was a dry run (`apply == false`); no write
+    /// happened. The string describes what a migration would do.
+    WouldMigrate(String),
+    /// The pack was migrated to v2 (data log rewritten header-first, indexes rebuilt, re-sealed).
+    /// The string describes what was done.
+    Migrated(String),
+    /// The legacy pack's data log is damaged and cannot be migrated without losing committed data;
+    /// nothing was written and the epoch must be re-synced from peers. The string is the
+    /// operator-facing reason.
+    Corrupt(String),
+}
+
+/// Internal outcome of a migration copy/build step: either the source pack is damaged (reported to
+/// the operator, nothing changed) or an I/O/build error occurred (propagated).
+enum MigrateAbort {
+    /// The source pack is damaged; nothing on disk was changed.
+    Corrupt(String),
+    /// An I/O or build error unrelated to the source's integrity.
+    Fatal(PackError),
+}
+
 impl ConsensusPack {
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
@@ -441,6 +468,36 @@ impl ConsensusPack {
     ) -> Result<EpochRepair, PackError> {
         let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
         let data_file = epoch_dir.join(Inner::DATA_NAME);
+        // A pre-v2 (v0/v1) pack predates the clean-close sentinel, so the seal-based classifier
+        // below would mis-read a damaged legacy tail as a truncatable torn tail and drop
+        // committed data. Never truncate a legacy pack: migrate it up to v2 (which rebuilds
+        // indexes and re-seals from the data log) or, if its log is genuinely damaged below
+        // the acked frontier, report it unrepairable. Peek the version read-only; a
+        // header/open failure falls through to the normal classifier path (a corrupt
+        // 28-byte header is handled there).
+        let legacy = matches!(
+            Pack::<PackRecord>::open(&data_file, epoch as u64, true, PackCompression::ZStd, PACK_VERSION),
+            Ok(p) if p.version() < SENTINEL_MIN_VERSION
+        );
+        if legacy {
+            match Inner::migrate_pack(epochs_dir, epoch, apply)? {
+                EpochMigrate::AlreadyCurrent => return Ok(EpochRepair::Healthy),
+                EpochMigrate::WouldMigrate(what) => return Ok(EpochRepair::WouldRepair(what)),
+                EpochMigrate::Corrupt(why) => return Ok(EpochRepair::Unrepairable(why)),
+                EpochMigrate::Migrated(what) => {
+                    // Confirm the migrated pack now opens read-only cleanly AND fully validates.
+                    Self::open_static(epochs_dir, epoch)?.close().await;
+                    let report = crate::pack_validate::validate_pack_file(&data_file, epoch, None)?;
+                    if report.verdict != crate::pack_validate::Verdict::Valid {
+                        return Ok(EpochRepair::Unrepairable(format!(
+                            "epoch {epoch}: migrated to v2 but validation still reports damage; the \
+                             data itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+                        )));
+                    }
+                    return Ok(EpochRepair::Repaired(what));
+                }
+            }
+        }
         // Healthy requires BOTH a clean read-only open AND full validation. `open_static` proves
         // the seal, cross-file lengths, final position entry, and the FIRST digest-index
         // bucket's CRC — but it does NOT scan the other buckets or the data stream, so on
@@ -596,6 +653,36 @@ impl ConsensusPack {
             )));
         }
         Ok(EpochRepair::Repaired(plan))
+    }
+
+    /// Migrate one epoch's pack from a pre-v2 (v0 batches-first / v1 header-first) format up to the
+    /// current v2 format so it becomes a first-class, writable, sentinel-sealed pack.
+    ///
+    /// v2 is the only writable format: it carries the clean-close sentinel that lets recovery tell
+    /// a truncatable unacked tail from at-rest corruption of committed data. A pre-v2 pack
+    /// never carried a sentinel, so leaving it in place forces every recovery path to guess at
+    /// "sealed" and risks truncating committed data. Migration rewrites the data log into a
+    /// fresh v2 log (reordering a v0 batches-first log into the v1/v2 header-first layout),
+    /// rebuilds the indexes from that log, and installs it atomically (rename-aside), so the
+    /// original is untouched until the replacement is durably in place.
+    ///
+    /// The source is validated as it is read: any record that fails to decode, a size-prefix that
+    /// desyncs the walk past a committed output, or a v0 output whose batch count disagrees with
+    /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the operator
+    /// re-syncs). An unacked crash tail of a header-first log is dropped, exactly as normal
+    /// recovery would.
+    ///
+    /// Runs on the blocking pool: it is synchronous file work with no live actor, and can rewrite a
+    /// large log, so it must not stall an async worker.
+    pub async fn migrate_epoch(
+        epochs_dir: &Path,
+        epoch: Epoch,
+        apply: bool,
+    ) -> Result<EpochMigrate, PackError> {
+        let epochs_dir = epochs_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Inner::migrate_pack(&epochs_dir, epoch, apply))
+            .await
+            .map_err(|e| PackError::PersistError(format!("migrate task join error: {e}")))?
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -1452,6 +1539,417 @@ impl Inner {
         }
     }
 
+    /// Migrate an `epoch-{epoch}` pack under `epochs_dir` from a pre-v2 format to v2. See
+    /// [`ConsensusPack::migrate_epoch`] for the operator-facing contract. Synchronous; no live
+    /// actor.
+    fn migrate_pack(
+        epochs_dir: &Path,
+        epoch: Epoch,
+        apply: bool,
+    ) -> Result<EpochMigrate, PackError> {
+        let base_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        let data_file = base_dir.join(Self::DATA_NAME);
+        // Read-only peek of the on-disk version. A pack already at (or past) the current format
+        // needs no migration.
+        let src = Pack::<PackRecord>::open(
+            &data_file,
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )?;
+        let version = src.version();
+        if version >= PACK_VERSION {
+            return Ok(EpochMigrate::AlreadyCurrent);
+        }
+
+        // Dry run: validate and count without writing anything.
+        if !apply {
+            return Ok(
+                match Self::migrate_copy(&src, None, version, &base_dir, &data_file, epoch) {
+                    Ok(n) => EpochMigrate::WouldMigrate(format!(
+                        "v{version} -> v{PACK_VERSION}, {n} output(s)"
+                    )),
+                    Err(MigrateAbort::Corrupt(why)) => EpochMigrate::Corrupt(why),
+                    Err(MigrateAbort::Fatal(e)) => return Err(e),
+                },
+            );
+        }
+
+        // Apply: build a fresh v2 pack in a sibling temp dir, then install it atomically. The
+        // original `epoch-{epoch}` dir is untouched until the replacement is durably in place, so a
+        // crash or an error leaves the legacy pack readable and re-migratable.
+        let migrate_dir = epochs_dir.join(format!("epoch-{epoch}.migrating"));
+        let _ = std::fs::remove_dir_all(&migrate_dir);
+        create_dir_synced(&migrate_dir)?;
+        let n = match Self::build_migrated_pack(
+            &src,
+            version,
+            &base_dir,
+            &data_file,
+            epoch,
+            &migrate_dir,
+        ) {
+            Ok(n) => n,
+            Err(MigrateAbort::Corrupt(why)) => {
+                let _ = std::fs::remove_dir_all(&migrate_dir);
+                return Ok(EpochMigrate::Corrupt(why));
+            }
+            Err(MigrateAbort::Fatal(e)) => {
+                let _ = std::fs::remove_dir_all(&migrate_dir);
+                return Err(e);
+            }
+        };
+        // Release the read handle on the old data file before the rename-aside install.
+        drop(src);
+        Self::install_migrated_dir(epochs_dir, epoch, &migrate_dir)?;
+        Ok(EpochMigrate::Migrated(format!("v{version} -> v{PACK_VERSION}, {n} output(s)")))
+    }
+
+    /// If an existing `epoch-{epoch}` pack under `epochs_dir` is a pre-v2 format, migrate it up to
+    /// v2 before it is opened for write — v2 is the only writable format, so writing v2
+    /// records/sentinels onto a v0/v1-versioned header would produce an inconsistent
+    /// mixed-format pack. A cheap read-only no-op for a pack already at v2 (the common case). A
+    /// genuinely corrupt legacy log aborts with [`PackError::CorruptPack`] (re-sync) — the same
+    /// failure class as an unreadable meta.
+    fn migrate_legacy_if_needed(epochs_dir: &Path, epoch: Epoch) -> Result<(), PackError> {
+        // Only a readable pre-v2 pack is migrated. If the data file cannot even be opened read-only
+        // (an unwritten all-zero first write, or a corrupt data header), migration does not apply —
+        // leave it to the normal writable open path, which reinitializes an unwritten file or
+        // surfaces its own error. A pack already at v2 is likewise left untouched.
+        let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Self::DATA_NAME);
+        let is_legacy = matches!(
+            Pack::<PackRecord>::open(&data_file, epoch as u64, true, PackCompression::ZStd, PACK_VERSION),
+            Ok(p) if p.version() < SENTINEL_MIN_VERSION
+        );
+        if !is_legacy {
+            return Ok(());
+        }
+        match Self::migrate_pack(epochs_dir, epoch, true)? {
+            EpochMigrate::Migrated(what) => {
+                info!(target: "consensus_pack", epoch, %what, "migrated legacy pack to v2 on open");
+            }
+            EpochMigrate::AlreadyCurrent => {}
+            EpochMigrate::Corrupt(why) => return Err(PackError::CorruptPack(why)),
+            // `apply == true` never returns a dry-run verdict.
+            EpochMigrate::WouldMigrate(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Build a fresh v2 pack (data log + indexes, sealed) in `migrate_dir` from the legacy `src`.
+    /// Returns the number of outputs written.
+    fn build_migrated_pack(
+        src: &Pack<PackRecord>,
+        version: u16,
+        base_dir: &Path,
+        data_file: &Path,
+        epoch: Epoch,
+        migrate_dir: &Path,
+    ) -> Result<u64, MigrateAbort> {
+        let dst_file = migrate_dir.join(Self::DATA_NAME);
+        let mut dst = Pack::<PackRecord>::open(
+            &dst_file,
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .map_err(|e| MigrateAbort::Fatal(e.into()))?;
+        Self::migrate_copy(src, Some(&mut dst), version, base_dir, data_file, epoch)?;
+        dst.commit().map_err(|e| MigrateAbort::Fatal(PackError::PersistError(e.to_string())))?;
+        // Load the freshly-written epoch meta (the first record) for the `Inner` we build to
+        // rebuild the indexes and seal.
+        let epoch_meta = dst
+            .fetch(DATA_HEADER_BYTES as u64)
+            .map_err(|e| MigrateAbort::Fatal(PackError::ReadError(e.to_string())))?
+            .into_epoch()
+            .map_err(MigrateAbort::Fatal)?;
+        // Rebuild the indexes from the fresh v2 log via the standard recovery path (empty indexes
+        // -> full replay-rebuild), then persist + drop so every backing file gets its
+        // clean-close sentinel. The log we just wrote is complete and header-first, so
+        // recovery finds no torn tail; it simply repopulates the indexes.
+        let (pos, cd, bd) = Self::open_indexes_for_append(migrate_dir, dst.header())
+            .map_err(MigrateAbort::Fatal)?;
+        let (pos, cd, bd) =
+            Self::recover_pack(&mut dst, migrate_dir, pos, cd, bd).map_err(MigrateAbort::Fatal)?;
+        let count = pos.len() as u64;
+        let mut inner = Inner {
+            data: dst,
+            consensus_pos_idx: pos,
+            consensus_digests: cd,
+            batch_digests: bd,
+            epoch_meta,
+            #[cfg(test)]
+            fail_save_after_append: false,
+        };
+        inner.persist().map_err(MigrateAbort::Fatal)?;
+        // Drop seals every backing file (msync + truncate-to-`end` + clean-close sentinel).
+        drop(inner);
+        Ok(count)
+    }
+
+    /// Walk the legacy `src` data log record-by-record, validating as it reads. When `dst` is
+    /// `Some`, each record is re-appended to the fresh v2 log in header-first order (reordering a
+    /// v0 batches-first log). When `dst` is `None` this only validates and counts (the dry-run
+    /// path). Returns the number of outputs.
+    fn migrate_copy(
+        src: &Pack<PackRecord>,
+        mut dst: Option<&mut Pack<PackRecord>>,
+        version: u16,
+        base_dir: &Path,
+        data_file: &Path,
+        epoch: Epoch,
+    ) -> Result<u64, MigrateAbort> {
+        // For a header-first (v1) log, compute the safe consistent end with the same WAL replay +
+        // committed-data guards recovery uses: an unacked crash tail past `end` is dropped, but a
+        // committed output is never silently lost. A v0 (batches-first) log cannot be replayed; it
+        // is validated by the reordering walk below and any decode failure is reported as
+        // corruption (every v0 pack on disk is a sealed, complete historic epoch).
+        let end = if version >= 1 {
+            Self::migrate_consistent_end(src, base_dir, data_file, epoch)?
+        } else {
+            u64::MAX
+        };
+        let mut iter = src.raw_iter().map_err(|e| MigrateAbort::Fatal(DataFileOpen(e).into()))?;
+        // The first record must be the epoch meta.
+        match iter.next() {
+            Some(Ok(PackRecord::EpochMeta(m))) => {
+                if let Some(d) = dst.as_deref_mut() {
+                    d.append(&PackRecord::EpochMeta(m))
+                        .map_err(|e| MigrateAbort::Fatal(PackError::Append(e.to_string())))?;
+                }
+            }
+            Some(Ok(_)) => {
+                return Err(MigrateAbort::Corrupt(format!(
+                    "epoch {epoch}: first record is not the epoch meta"
+                )))
+            }
+            Some(Err(e)) => {
+                return Err(MigrateAbort::Corrupt(format!(
+                    "epoch {epoch}: epoch meta unreadable: {e}"
+                )))
+            }
+            None => {
+                return Err(MigrateAbort::Corrupt(format!(
+                    "epoch {epoch}: empty pack (no epoch meta)"
+                )))
+            }
+        }
+        if version == 0 {
+            Self::migrate_copy_v0(&mut iter, dst, epoch)
+        } else {
+            Self::migrate_copy_v1(&mut iter, dst, end, epoch)
+        }
+    }
+
+    /// Compute the recoverable end of a header-first legacy log and reject any damage below the
+    /// acked frontier (never a silent truncate of committed data). Mirrors
+    /// [`Self::recover_pack`]'s pass-1 guards, plus a length-attestation seal test that stands
+    /// in for the clean-close sentinel a pre-v2 pack never carried.
+    fn migrate_consistent_end(
+        src: &Pack<PackRecord>,
+        base_dir: &Path,
+        data_file: &Path,
+        epoch: Epoch,
+    ) -> Result<u64, MigrateAbort> {
+        // A pre-v2 pack has no clean-close sentinel, so `replay_wal` (which reads "sealed" from the
+        // sentinel) treats every legacy log as unclean and would truncate a damaged tail. Recover
+        // the real completeness signal the pre-mmap build used: the cross-file LENGTH
+        // attestation. If the source's own indexes still attest data-len == last output_end
+        // == both digest lengths, the pack is COMPLETE (sealed-equivalent), so a replay
+        // that stops short of that end is at-rest corruption of committed data — never a
+        // truncatable tail. When the attestation does not hold (a current epoch's unacked
+        // crash tail, or lagging/damaged indexes) we fall back to the tail-truncation logic
+        // below, gated by the commit marker / position-index guards.
+        let logically_sealed = match Self::try_open_indexes(base_dir, src.header(), true) {
+            Ok((mut pos, cd, bd)) => Self::files_consistent(src, &mut pos, &cd, &bd),
+            Err(_) => false,
+        };
+        let end = match Self::replay_wal(src, base_dir, None) {
+            Ok(end) => end,
+            Err(PackError::CorruptPack(m)) => return Err(MigrateAbort::Corrupt(m)),
+            Err(e) => return Err(MigrateAbort::Fatal(e)),
+        };
+        if logically_sealed && end < src.file_len() {
+            return Err(MigrateAbort::Corrupt(format!(
+                "epoch {epoch}: a complete (length-consistent) legacy pack replays only to {end} of \
+                 {}; committed data is damaged, not a truncatable tail. Re-sync the epoch from peers.",
+                src.file_len()
+            )));
+        }
+        if let Some(committed_end) = src.committed_end() {
+            if end < committed_end {
+                return Err(MigrateAbort::Corrupt(format!(
+                    "epoch {epoch}: the data log replays only to {end} but a durable commit marker \
+                     attests {committed_end}; committed data is damaged. Re-sync the epoch from peers."
+                )));
+            }
+        }
+        if attested_output_survives_past(data_file, epoch, end) {
+            return Err(MigrateAbort::Corrupt(format!(
+                "epoch {epoch}: a committed output starts past the recoverable end {end}; committed \
+                 data is damaged. Re-sync the epoch from peers."
+            )));
+        }
+        Ok(end)
+    }
+
+    /// Copy a header-first (v1) log up to `end`, output by output (`Consensus` header followed by
+    /// the exact number of `Batch` records its sub-dag names). Records at/after `end` are the
+    /// discarded unacked tail.
+    fn migrate_copy_v1(
+        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
+        mut dst: Option<&mut Pack<PackRecord>>,
+        end: u64,
+        epoch: Epoch,
+    ) -> Result<u64, MigrateAbort> {
+        let mut count = 0u64;
+        loop {
+            if iter.logical_position() >= end {
+                break;
+            }
+            match iter.next() {
+                None => break,
+                Some(Ok(PackRecord::Consensus(header))) => {
+                    let expected = Self::expected_batch_count(&header);
+                    if let Some(d) = dst.as_deref_mut() {
+                        d.append(&PackRecord::Consensus(header))
+                            .map_err(|e| MigrateAbort::Fatal(PackError::Append(e.to_string())))?;
+                    }
+                    for _ in 0..expected {
+                        match iter.next() {
+                            Some(Ok(PackRecord::Batch(batch))) => {
+                                if let Some(d) = dst.as_deref_mut() {
+                                    d.append(&PackRecord::Batch(batch)).map_err(|e| {
+                                        MigrateAbort::Fatal(PackError::Append(e.to_string()))
+                                    })?;
+                                }
+                            }
+                            Some(Ok(_)) => {
+                                return Err(MigrateAbort::Corrupt(format!(
+                                    "epoch {epoch}: output {count} expected a batch record"
+                                )))
+                            }
+                            Some(Err(e)) => {
+                                return Err(MigrateAbort::Corrupt(format!(
+                                    "epoch {epoch}: output {count} batch decode failed: {e}"
+                                )))
+                            }
+                            None => {
+                                return Err(MigrateAbort::Corrupt(format!(
+                                    "epoch {epoch}: output {count} truncated before its batches"
+                                )))
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+                Some(Ok(_)) => {
+                    return Err(MigrateAbort::Corrupt(format!(
+                        "epoch {epoch}: unexpected record where a consensus header was expected"
+                    )))
+                }
+                Some(Err(e)) => {
+                    return Err(MigrateAbort::Corrupt(format!(
+                        "epoch {epoch}: record decode failed: {e}"
+                    )))
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Copy a v0 batches-first log, reordering each output into header-first form: batches are
+    /// buffered until their `Consensus` header appears, then the header and its batches are
+    /// appended. Any decode failure or a batch count that disagrees with the header is
+    /// corruption.
+    fn migrate_copy_v0(
+        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
+        mut dst: Option<&mut Pack<PackRecord>>,
+        epoch: Epoch,
+    ) -> Result<u64, MigrateAbort> {
+        let mut count = 0u64;
+        let mut pending: Vec<Batch> = Vec::new();
+        loop {
+            match iter.next() {
+                None => {
+                    if !pending.is_empty() {
+                        return Err(MigrateAbort::Corrupt(format!(
+                            "epoch {epoch}: {} trailing batch record(s) with no consensus header (v0)",
+                            pending.len()
+                        )));
+                    }
+                    break;
+                }
+                Some(Ok(PackRecord::Batch(batch))) => pending.push(batch),
+                Some(Ok(PackRecord::Consensus(header))) => {
+                    let expected = Self::expected_batch_count(&header);
+                    if pending.len() != expected {
+                        return Err(MigrateAbort::Corrupt(format!(
+                            "epoch {epoch}: v0 output {count} has {} batch record(s) but its header \
+                             names {expected}",
+                            pending.len()
+                        )));
+                    }
+                    if let Some(d) = dst.as_deref_mut() {
+                        d.append(&PackRecord::Consensus(header))
+                            .map_err(|e| MigrateAbort::Fatal(PackError::Append(e.to_string())))?;
+                        for batch in pending.drain(..) {
+                            d.append(&PackRecord::Batch(batch)).map_err(|e| {
+                                MigrateAbort::Fatal(PackError::Append(e.to_string()))
+                            })?;
+                        }
+                    } else {
+                        pending.clear();
+                    }
+                    count += 1;
+                }
+                Some(Ok(PackRecord::EpochMeta(_))) => {
+                    return Err(MigrateAbort::Corrupt(format!(
+                        "epoch {epoch}: a second epoch-meta record (v0)"
+                    )))
+                }
+                Some(Err(e)) => {
+                    return Err(MigrateAbort::Corrupt(format!(
+                        "epoch {epoch}: v0 record decode failed: {e}"
+                    )))
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Atomically install a freshly-built `epoch-{epoch}.migrating` dir at `epochs_dir`, replacing
+    /// the live `epoch-{epoch}` via rename-aside: the old dir is moved to `epoch-{epoch}.replaced`
+    /// and only removed after the new one is renamed in and the parent is fsync'd. On a rename
+    /// failure the old dir is restored. A crash mid-swap leaves a `*.replaced` (and possibly the
+    /// `*.migrating`) dir that startup cleanup sweeps. Mirrors
+    /// `ConsensusStore::install_imported_epoch_dir`.
+    fn install_migrated_dir(
+        epochs_dir: &Path,
+        epoch: Epoch,
+        migrate_dir: &Path,
+    ) -> Result<(), PackError> {
+        let base_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        let aside = epochs_dir.join(format!("epoch-{epoch}.replaced"));
+        let _ = std::fs::remove_dir_all(&aside);
+        let had_old = std::fs::exists(&base_dir).unwrap_or_default();
+        if had_old {
+            std::fs::rename(&base_dir, &aside)?;
+        }
+        let installed = std::fs::rename(migrate_dir, &base_dir);
+        if installed.is_err() && had_old {
+            let _ = std::fs::rename(&aside, &base_dir);
+        }
+        installed?;
+        fsync_directory(epochs_dir)?;
+        if had_old {
+            let _ = std::fs::remove_dir_all(&aside);
+        }
+        Ok(())
+    }
+
     /// Return the version of the underlying data pack file.
     fn version(&self) -> u16 {
         self.data.version()
@@ -1595,6 +2093,12 @@ impl Inner {
         create_dir_synced(&base_dir)?;
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
+        // Migrate a pre-sentinel legacy pack up to v2 before we ever write to it. Skipped when the
+        // caller explicitly requests a legacy `version` (the test helper that *creates* v0/v1
+        // packs); production always requests `PACK_VERSION`.
+        if have_pack && version >= SENTINEL_MIN_VERSION {
+            Self::migrate_legacy_if_needed(path.as_ref(), epoch)?;
+        }
         let mut data: Pack<PackRecord> =
             Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
         let start_consensus_number =
@@ -1735,6 +2239,11 @@ impl Inner {
                 io::Error::new(io::ErrorKind::NotFound, pack_file.display().to_string()),
             )))));
         }
+
+        // v2 is the only writable format: migrate a pre-sentinel legacy pack up before opening it
+        // for append (this door reopens an existing epoch, so it is the path a node takes
+        // to continue writing a current epoch that was last written by a pre-mmap build).
+        Self::migrate_legacy_if_needed(path.as_ref(), epoch)?;
 
         let mut data = Pack::<PackRecord>::open(
             &pack_file,
@@ -3406,6 +3915,7 @@ pub(crate) mod test {
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
         num::NonZeroUsize,
+        path::Path,
         sync::Arc,
         time::Duration,
     };
@@ -3422,7 +3932,8 @@ pub(crate) mod test {
     use crate::{
         archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
         consensus_pack::{
-            max_batches_per_output, ConsensusPack, EpochRepair, Inner, PackRecord, PACK_VERSION,
+            max_batches_per_output, ConsensusPack, EpochMigrate, EpochRepair, Inner, PackRecord,
+            PACK_VERSION,
         },
         mem_db::MemDatabase,
     };
@@ -5052,6 +5563,183 @@ pub(crate) mod test {
         }
     }
 
+    /// Peek the on-disk data-file format version of an epoch-0 pack (read-only, no mutation).
+    fn peek_pack_version(data_path: &Path) -> u16 {
+        Pack::<PackRecord>::open(data_path, 0, true, PackCompression::ZStd, PACK_VERSION)
+            .expect("open data read-only")
+            .version()
+    }
+
+    /// Strip the 8-byte clean-close sentinel the current build appends on close, synthesizing the
+    /// genuine pre-PR on-disk shape of a v0/v1 pack (physical == logical, no sentinel).
+    fn strip_sentinel(data_path: &Path) -> u64 {
+        let f = OpenOptions::new().write(true).open(data_path).expect("open data");
+        let len = f.metadata().expect("meta").len();
+        let stripped = len - crate::archive::data_file::SENTINEL_LEN;
+        f.set_len(stripped).expect("strip sentinel");
+        stripped
+    }
+
+    /// F6: a legacy v0 (batches-first) or v1 (header-first) pack migrates 1:1 into a current v2
+    /// pack. After migration the pack is v2, opens through the sentinel-gated read-only door,
+    /// and every consensus output round-trips unchanged. Re-running the migration is a no-op
+    /// (`AlreadyCurrent`).
+    #[tokio::test]
+    async fn test_migrate_legacy_pack_roundtrip() {
+        for version in [0_u16, 1] {
+            let temp_dir = TempDir::with_prefix("test_migrate_roundtrip").expect("temp dir");
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let committee = fixture.committee();
+            let previous_epoch = test_previous_epoch(&committee);
+            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
+                .await;
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            strip_sentinel(&data_path);
+            assert_eq!(peek_pack_version(&data_path), version, "precondition: on-disk v{version}");
+
+            // Capture the original outputs for a 1:1 comparison after migration.
+            let before =
+                ConsensusPack::open_static(temp_dir.path(), 0).expect("open legacy static");
+            let mut expected = Vec::new();
+            for i in 1..=3 {
+                expected.push(before.get_consensus_output(i).await.expect("read legacy output"));
+            }
+            before.close().await;
+
+            match ConsensusPack::migrate_epoch(temp_dir.path(), 0, true).await.expect("migrate") {
+                EpochMigrate::Migrated(_) => {}
+                other => panic!("v{version}: expected Migrated, got {other:?}"),
+            }
+
+            // Now v2, opens read-only clean, and every output matches the pre-migration bytes.
+            assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "v{version} -> v2");
+            let after = ConsensusPack::open_static(temp_dir.path(), 0).unwrap_or_else(|e| {
+                panic!("v{version}: migrated pack must open_static, got {e:?}")
+            });
+            for (i, want) in expected.iter().enumerate() {
+                let got =
+                    after.get_consensus_output(i as u64 + 1).await.expect("read migrated output");
+                assert_eq!(
+                    got.digest(),
+                    want.digest(),
+                    "v{version}: output {} must survive migration unchanged",
+                    i + 1
+                );
+            }
+            after.close().await;
+
+            // Idempotent: a second migration finds it already current and writes nothing.
+            match ConsensusPack::migrate_epoch(temp_dir.path(), 0, true).await.expect("migrate 2") {
+                EpochMigrate::AlreadyCurrent => {}
+                other => panic!("v{version}: re-migrate expected AlreadyCurrent, got {other:?}"),
+            }
+            // No temp/aside dirs are left behind.
+            assert!(!temp_dir.path().join("epoch-0.migrating").exists());
+            assert!(!temp_dir.path().join("epoch-0.replaced").exists());
+        }
+    }
+
+    /// F6: a migration dry run (`apply == false`) reports what it would do but writes nothing — the
+    /// on-disk version and length are unchanged and no temp dir is left behind.
+    #[tokio::test]
+    async fn test_migrate_dry_run_writes_nothing() {
+        let temp_dir = TempDir::with_prefix("test_migrate_dry").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let len_before = strip_sentinel(&data_path);
+
+        match ConsensusPack::migrate_epoch(temp_dir.path(), 0, false).await.expect("dry run") {
+            EpochMigrate::WouldMigrate(_) => {}
+            other => panic!("expected WouldMigrate, got {other:?}"),
+        }
+        assert_eq!(peek_pack_version(&data_path), 1, "dry run must not change the version");
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("meta").len(),
+            len_before,
+            "dry run must not change the data file"
+        );
+        assert!(!temp_dir.path().join("epoch-0.migrating").exists());
+    }
+
+    /// F6 regression (the core bug): a legacy pack whose committed final record is damaged must NOT
+    /// be silently truncated. `db repair --force` (via `repair_epoch`) on such a v1 pack reports it
+    /// Unrepairable and leaves the pack byte-for-byte untouched (still v1, same length, no
+    /// temp/aside dirs) — never the old "REPAIRED" that dropped the committed output.
+    #[tokio::test]
+    async fn test_repair_legacy_damaged_tail_is_not_truncated() {
+        let temp_dir = TempDir::with_prefix("test_migrate_f6").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let len = strip_sentinel(&data_path);
+
+        // Corrupt the final committed record by flipping the last byte (part of its CRC). The pack
+        // is length-consistent (a complete, sealed-equivalent legacy pack), so this is
+        // at-rest damage, not a truncatable unacked tail.
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&data_path, &bytes).expect("write corrupted data");
+
+        match ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("repair") {
+            EpochRepair::Unrepairable(_) => {}
+            other => panic!("F6: a damaged legacy tail must be Unrepairable, got {other:?}"),
+        }
+        // Untouched: still v1 and the same length (no truncation, no partial migration installed).
+        assert_eq!(peek_pack_version(&data_path), 1, "must not migrate a corrupt legacy pack");
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("meta").len(),
+            len,
+            "F6: the committed data must not be truncated"
+        );
+        assert!(!temp_dir.path().join("epoch-0.migrating").exists());
+        assert!(!temp_dir.path().join("epoch-0.replaced").exists());
+    }
+
+    /// A node reopening its current epoch for append after an upgrade migrates the legacy pack to
+    /// v2 transparently through `open_append_exists`, then keeps appending: the pack becomes
+    /// v2, the pre-upgrade outputs still read back, and a freshly appended output reads back
+    /// too.
+    #[tokio::test]
+    async fn test_open_append_auto_migrates_legacy() {
+        let temp_dir = TempDir::with_prefix("test_migrate_open_append").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        strip_sentinel(&data_path);
+
+        // Reopen the (legacy) current epoch for append — this migrates it up to v2 in place.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+            .expect("open_append_exists must migrate and open a legacy pack");
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "reopened pack must be v2");
+
+        // Continue writing: append a 4th output chained off output 3.
+        let parent = pack.get_consensus_output(3).await.expect("read output 3").digest();
+        let output = make_test_output(&committee, 3, chain.clone(), 4, parent);
+        pack.save_consensus_output(output).await.expect("append after migration");
+        pack.persist().await.expect("persist");
+        pack.close().await;
+
+        // All four outputs read back through the sentinel-gated read-only door.
+        let ro =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open migrated+appended pack");
+        for i in 1..=4 {
+            assert!(ro.get_consensus_output(i).await.is_ok(), "output {i} must read back");
+        }
+        ro.close().await;
+    }
+
     /// New packs are written at the current `PACK_VERSION`, the sentinel-era format: a freshly
     /// built, cleanly-closed pack reports a version at or above [`SENTINEL_MIN_VERSION`] and opens
     /// through the read-only door — which for a sentinel-era pack only succeeds when the
@@ -5074,12 +5762,13 @@ pub(crate) mod test {
         );
     }
 
-    /// The v0 (batches-first) legacy format cannot be rebuilt by the header-first WAL replay, so an
-    /// *inconsistent* v0 pack opened for append is rejected with an honest re-sync message rather
-    /// than mis-replayed as v1 corruption. (A *consistent* v0 pack opens fine — it never reaches
-    /// replay; see `test_open_static_accepts_sentinelless_legacy_pack`.)
+    /// A v0 (batches-first) pack whose sidecar indexes were lost is RECOVERED on a writable open:
+    /// the migration to v2 reorders the intact data log header-first and rebuilds the indexes from
+    /// it, so the pack opens and every output reads back. (Before v0→v2 migration existed the
+    /// header-first WAL replay could not rebuild a v0 log, so this was rejected with a re-sync
+    /// message; migration makes it recoverable.)
     #[tokio::test]
-    async fn test_recover_rejects_inconsistent_v0_pack() {
+    async fn test_open_append_migrates_v0_pack_with_lost_indexes() {
         let temp_dir = TempDir::with_prefix("test_v0_recover").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -5087,23 +5776,25 @@ pub(crate) mod test {
         let previous_epoch = test_previous_epoch(&committee);
         build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
 
-        // Force inconsistency the writable door cannot short-circuit past: drop the sidecar indexes
-        // so `files_consistent` fails and `recover_pack` is entered. For v1/v2 that replays the
-        // WAL; for v0 the guard must fire first.
+        // Drop the sidecar indexes; only the intact v0 data log survives.
         let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
         for name in ["idx", "hash", "bhash"] {
             std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
         }
 
-        match ConsensusPack::open_append_exists(temp_dir.path(), 0) {
-            Err(super::PackError::CorruptPack(msg)) => assert!(
-                msg.contains("v0"),
-                "an inconsistent v0 pack must be rejected with the honest v0 re-sync message, got: {msg}"
-            ),
-            other => panic!(
-                "open_append_exists on an inconsistent v0 pack must return CorruptPack, got {other:?}"
-            ),
+        // The writable door migrates the v0 log up to v2 (reordering it and rebuilding the
+        // indexes).
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+            .expect("open_append_exists must migrate + recover a v0 pack with lost indexes");
+        pack.close().await;
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "recovered pack must be v2");
+
+        let ro = ConsensusPack::open_static(temp_dir.path(), 0).expect("open recovered pack");
+        for i in 1..=3 {
+            assert!(ro.get_consensus_output(i).await.is_ok(), "output {i} must read back");
         }
+        ro.close().await;
     }
 
     /// Recovery rebuilds BOTH indexes purely from the data-log WAL: after the position and digest
@@ -5648,25 +6339,23 @@ pub(crate) mod test {
         assert_pack_reads_back(&temp_dir, 3).await;
     }
 
-    /// Finding #4: `repair_epoch` must PROVE the data-log WAL replays before wiping the digest
-    /// indexes. A pack that opens read-only clean but whose log cannot be rebuilt — here a sealed
-    /// v0 (batches-first) pack, which the header-first `replay_wal` cannot replay — must be
-    /// reported `Unrepairable` with nothing changed, so it still opens afterwards. Without the
-    /// guard the wipe happens first and `open_static` then fails on every later open. The dry
-    /// run must predict the same verdict as the apply.
+    /// `db repair` on a legacy v0 pack whose derived index is corrupt MIGRATES it to v2: the
+    /// migration rebuilds the indexes purely from the intact data log, so the corrupt bucket is
+    /// discarded and the repaired pack validates clean. The dry run predicts the apply (both
+    /// actionable). (The Finding #4 "prove WAL replays before wiping the indexes" guard still
+    /// governs the non-legacy v2 path in `repair_epoch`; a v0 log is now replayable via
+    /// migration, so it is no longer an example of an unrebuildable pack.)
     #[tokio::test]
-    async fn test_repair_epoch_unrebuildable_preserves_indexes() {
+    async fn test_repair_migrates_legacy_v0_pack_with_corrupt_index() {
         use crate::pack_validate::{validate_pack_file, Verdict};
 
         const HDX_BUCKET: usize = 16 + (32 + 8) * 32;
 
-        let temp_dir = TempDir::with_prefix("test_repair_unrebuildable").expect("temp dir");
+        let temp_dir = TempDir::with_prefix("test_repair_v0_migrate").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
-        // A sealed v0 pack opens read-only clean post-migration, but its batches-first log cannot
-        // be replayed by the header-first `replay_wal`.
         build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 0).await;
 
         let epoch_dir = temp_dir.path().join("epoch-0");
@@ -5674,45 +6363,46 @@ pub(crate) mod test {
         let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
 
         // Corrupt a non-first bucket so `open_static` (first-bucket-only) still succeeds but full
-        // validation fails, driving repair_epoch into the opens-clean-but-invalid branch.
+        // validation fails — the corrupt-index setup.
         {
             let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
             let n = bytes.len();
             bytes[n - HDX_BUCKET + 12] ^= 0xFF;
             std::fs::write(&hdx_path, &bytes).expect("write hdx");
         }
-
-        assert!(
-            ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
-            "the corrupt non-first bucket must still pass the read-only open (the bug setup)"
-        );
         assert_eq!(
             validate_pack_file(&data_path, 0, None).expect("validate").verdict,
             Verdict::Invalid,
-            "the full validator must flag the corrupt bucket"
+            "the full validator must flag the corrupt bucket before repair"
         );
 
-        // Dry run must predict the apply verdict: Unrepairable, not WouldRepair.
+        // Dry run predicts the apply: a legacy pack is actionable (would migrate), not
+        // Unrepairable.
         let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
             .await
             .expect("dry run must not err");
         assert!(
-            matches!(dry, EpochRepair::Unrepairable(_)),
-            "an unreplayable v0 pack must be Unrepairable on a dry run, got {dry:?}"
+            matches!(dry, EpochRepair::WouldRepair(_)),
+            "a legacy v0 pack must be actionable (would migrate) on a dry run, got {dry:?}"
         );
 
-        // Apply must also report Unrepairable AND must not have wiped the indexes.
+        // Apply migrates it to v2, rebuilding the indexes from the data log.
         let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
             .await
             .expect("apply must not err");
         assert!(
-            matches!(applied, EpochRepair::Unrepairable(_)),
-            "an unreplayable v0 pack must be Unrepairable on apply, got {applied:?}"
+            matches!(applied, EpochRepair::Repaired(_)),
+            "a legacy v0 pack must be Repaired (migrated) on apply, got {applied:?}"
+        );
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "repaired pack must be v2");
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Valid,
+            "the migrated pack must validate clean (corrupt bucket rebuilt from the log)"
         );
         assert!(
             ConsensusPack::open_static(temp_dir.path(), 0).is_ok(),
-            "repair must not have wiped the indexes: open_static must still succeed after an \
-             Unrepairable apply"
+            "open_static must succeed on the migrated pack"
         );
     }
 
@@ -8549,10 +9239,18 @@ pub(crate) mod test {
         let dir = TempDir::with_prefix("golden_legacy_non_adiri").expect("temp dir");
         let data_file = write_golden_legacy_data_file(dir.path());
 
-        // the warm-restart door: the meta fails to decode, so the open fails
+        // the warm-restart door: the pack is a pre-v2 format, so this door first tries to migrate
+        // it up to v2 — but the legacy-layout meta cannot decode on a post-fork build, so
+        // the migration reports the pack corrupt (re-sync) and the open fails loudly rather
+        // than misparsing the committee. (Before the pre-v2 pack was opened directly and
+        // failed with `EpochLoad`; either way the meta-decode failure is surfaced, never
+        // silently accepted.)
         let warm = ConsensusPack::open_append_exists(dir.path(), LEGACY_PACK_EPOCH);
         assert!(
-            matches!(warm, Err(super::PackError::EpochLoad(_))),
+            matches!(
+                warm,
+                Err(super::PackError::CorruptPack(_)) | Err(super::PackError::EpochLoad(_))
+            ),
             "expected the legacy-layout meta to fail decoding, got {:?}",
             warm.map(|pack| pack.epoch())
         );
