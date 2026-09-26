@@ -211,7 +211,8 @@ impl ExecutionNode {
 
     /// Initialize the worker's transaction pool and public RPC.
     ///
-    /// This method should be called on node startup.
+    /// This method can run before startup synchronization. Call
+    /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -221,7 +222,6 @@ impl ExecutionNode {
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
-        network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
         worker_base_fee: WorkerBaseFee,
@@ -231,13 +231,7 @@ impl ExecutionNode {
     {
         let mut guard = self.internal.write().await;
         guard
-            .initialize_worker_components(
-                worker_id,
-                network_handle,
-                engine_to_primary,
-                base_fee,
-                worker_base_fee,
-            )
+            .initialize_worker_components(worker_id, engine_to_primary, base_fee, worker_base_fee)
             .await
     }
 
@@ -256,7 +250,7 @@ impl ExecutionNode {
 
     /// Respawn one worker's network tasks with its own handle for the new epoch.
     ///
-    /// This method should be called on epoch rollover.
+    /// Call once at every epoch entry, including for a worker whose RPC bound during startup.
     pub async fn respawn_worker_network_tasks(
         &self,
         worker_id: WorkerId,

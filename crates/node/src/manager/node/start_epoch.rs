@@ -208,7 +208,6 @@ where
         // create config for consensus
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
 
-        let consensus_bus_app = consensus_bus.app().clone();
         let primary = self
             .create_primary_node_components(
                 &consensus_config,
@@ -218,33 +217,7 @@ where
             )
             .await?;
 
-        let public_key = self.key_config.public_key();
-        let node_info = RpcNodeInfo {
-            chain_id: engine.get_reth_env().await.chainspec().chain_id(),
-            name: self.builder.tn_config.node_info.name.clone(),
-            bls_public_key: public_key,
-            authority_id: public_key.into(),
-            execution_address: self.builder.tn_config.node_info.execution_address,
-            primary_network_key: self.key_config.primary_network_public_key(),
-            // The worker-specific fields are filled in when each RPC server starts.
-            worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
-            primary_external_address: self
-                .builder
-                .tn_config
-                .node_info
-                .primary_network_address()
-                .clone(),
-            worker_external_address: self
-                .builder
-                .tn_config
-                .node_info
-                .worker_network_address(DEFAULT_WORKER_ID)
-                .ok_or_eyre("no worker network address in node info")?
-                .clone(),
-            version: self.version_str,
-        };
-        let engine_to_primary =
-            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone(), node_info);
+        let engine_to_primary = self.engine_to_primary_rpc(engine).await?;
         let workers = self
             .spawn_worker_node_components(
                 &consensus_config,
@@ -430,6 +403,45 @@ where
         PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync)
     }
 
+    /// Build the process-lifetime TN RPC handler before any epoch needs to start.
+    ///
+    /// Worker 0 uses this information during startup synchronization. Additional workers replace
+    /// the worker-specific fields when their RPC servers are initialized at epoch entry.
+    pub(super) async fn engine_to_primary_rpc(
+        &self,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<EngineToPrimaryRpc> {
+        let public_key = self.key_config.public_key();
+        let node_info = RpcNodeInfo {
+            chain_id: engine.get_reth_env().await.chainspec().chain_id(),
+            name: self.builder.tn_config.node_info.name.clone(),
+            bls_public_key: public_key,
+            authority_id: public_key.into(),
+            execution_address: self.builder.tn_config.node_info.execution_address,
+            primary_network_key: self.key_config.primary_network_public_key(),
+            worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
+            primary_external_address: self
+                .builder
+                .tn_config
+                .node_info
+                .primary_network_address()
+                .clone(),
+            worker_external_address: self
+                .builder
+                .tn_config
+                .node_info
+                .worker_network_address(DEFAULT_WORKER_ID)
+                .ok_or_eyre("no worker network address in node info")?
+                .clone(),
+            version: self.version_str,
+        };
+        Ok(EngineToPrimaryRpc::new(
+            self.consensus_bus.clone(),
+            self.consensus_chain.clone(),
+            node_info,
+        ))
+    }
+
     /// Construct every worker in the committee's on-chain worker range, in id order.
     ///
     /// Refresh each active handle before creating its pool, RPC server, validator and network.
@@ -531,17 +543,15 @@ where
                 engine
                     .initialize_worker_components(
                         worker_id,
-                        network_handle.clone(),
                         engine_to_primary,
                         base_fee_container,
                         worker_base_fee,
                     )
                     .await?;
-            } else {
-                // We updated our epoch task spawner so make sure worker network tasks are
-                // restarted.
-                engine.respawn_worker_network_tasks(worker_id, network_handle.clone()).await?;
             }
+
+            // Each epoch owns one peer-count task, including for RPCs bound before startup sync.
+            engine.respawn_worker_network_tasks(worker_id, network_handle.clone()).await?;
         }
 
         // Ensure the worker's transaction pool charges the accumulator's base fee for this epoch.
@@ -1120,7 +1130,7 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
-    /// The epoch startup path initializes every worker, then reuses its RPC and pool on re-entry.
+    /// Epoch entry reuses worker 0's early RPC, initializes other workers and refreshes sync state.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
@@ -1185,6 +1195,35 @@ mod tests {
             NetworkConfig::default(),
         )?;
         let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
+
+        accumulator.base_fee(DEFAULT_WORKER_ID).set_base_fee(100_000_000);
+        // The startup listener needs no worker network or epoch tasks. It must report syncing
+        // even though the node-mode watch has not yet identified this node's role.
+        engine
+            .initialize_worker_components(
+                DEFAULT_WORKER_ID,
+                manager.engine_to_primary_rpc(&engine).await?,
+                accumulator.base_fee(DEFAULT_WORKER_ID),
+                accumulator.worker_base_fee(DEFAULT_WORKER_ID),
+            )
+            .await?;
+        let rpc_zero = engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?;
+        let startup_client = engine
+            .worker_http_client(&DEFAULT_WORKER_ID)
+            .await?
+            .ok_or_else(|| eyre!("startup RPC"))?;
+        let syncing: serde_json::Value =
+            startup_client.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
+        assert!(syncing.is_object(), "startup RPC must report sync progress: {syncing}");
+        assert_eq!(
+            engine
+                .get_worker_transaction_pool(&DEFAULT_WORKER_ID)
+                .await?
+                .block_info()
+                .pending_basefee,
+            100_000_000
+        );
+
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
         let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
@@ -1255,6 +1294,18 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_eq!(engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?, rpc_zero);
+        let syncing: serde_json::Value =
+            startup_client.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
+        assert_eq!(syncing, serde_json::Value::Bool(false));
+        assert_eq!(
+            engine
+                .get_worker_transaction_pool(&DEFAULT_WORKER_ID)
+                .await?
+                .block_info()
+                .pending_basefee,
+            100_000_001
+        );
         let rpc_one = engine.worker_http_local_address(&1).await?;
         assert!(rpc_one.is_some());
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
