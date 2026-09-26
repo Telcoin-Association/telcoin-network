@@ -7,7 +7,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -369,6 +372,12 @@ pub struct ConsensusChain {
     latest_consensus: LatestConsensus,
     /// Simple cache of recent pack files.
     recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
+    /// Bumped every time an `epoch-{N}` directory is installed/replaced or the current pack is
+    /// swapped (`stream_import` install, `new_epoch` handoff). `get_static` snapshots it
+    /// before its unlocked `open_static` and refuses to cache the opened handle if it changed
+    /// meanwhile — so a pack opened against a since-replaced (stale) inode is served once but
+    /// never poisons the cache.
+    install_generation: Arc<AtomicU64>,
     epochs: Arc<EpochRecordDb>,
     /// Serializes epoch-{N} directory mutation between `new_epoch` (open/append)
     /// and `stream_import` (remove+rename), preventing a transient-ENOENT crash.
@@ -396,8 +405,14 @@ impl ConsensusChain {
         committee_zero: Committee,
     ) -> Result<ConsensusChain, ConsensusChainError> {
         let latest_consensus = LatestConsensus::new(&base_path)?;
-        // If we have a pack for the last epoch open it so we can read data early.
 
+        // Roll back any interrupted install/migration BEFORE opening the current pack: restore an
+        // `epoch-N.replaced` aside whose `epoch-N` went missing (a crash between the two install
+        // renames), so the hint-epoch open below cannot brick and no past epoch is lost. Must run
+        // before both the open and the sweep.
+        Self::recover_incomplete_installs(&base_path);
+
+        // If we have a pack for the last epoch open it so we can read data early.
         let current_pack = if latest_consensus.number() == 0 && latest_consensus.epoch() == 0 {
             // If we are just starting then we need to pre-open the epoch 0 pack.
             let previous_epoch = EpochRecord {
@@ -436,6 +451,7 @@ impl ConsensusChain {
             current_pack,
             latest_consensus,
             recent_packs,
+            install_generation: Arc::new(AtomicU64::new(0)),
             epochs,
             pack_install,
             staging,
@@ -521,6 +537,8 @@ impl ConsensusChain {
             return Err(e.into());
         }
         *self.current_pack.lock() = pack;
+        // The live pack just changed; invalidate any `get_static` open racing this handoff.
+        self.install_generation.fetch_add(1, Ordering::Release);
         if let Some(staging_epoch) = self.staging_epoch() {
             // If we have moved past the staging pack then clear it.
             // Should get cleared in the normal course but this is
@@ -530,7 +548,20 @@ impl ConsensusChain {
             }
         }
         // `old_pack` is the last handle to the just-replaced previous-epoch pack; async-close it so
-        // its background-thread join does not block a tokio worker on the way out.
+        // its background-thread join does not block a tokio worker on the way out. If another
+        // handle is still alive (a reader holding a `current_pack()` clone across an
+        // await), `close()` no-ops and the clean-close seal is DEFERRED to that handle's
+        // eventual `Drop` — during which a `get_static` of this previous epoch can briefly
+        // see it unsealed. Log it so that window is observable (the get_static retry
+        // tolerates it).
+        if !old_pack.is_sole_handle() {
+            warn!(
+                target: "consensus::store",
+                epoch = old_pack.epoch(),
+                "previous-epoch pack still has live handle(s) at handoff; its clean-close seal is \
+                 deferred until they drop"
+            );
+        }
         old_pack.close().await;
         Ok(())
     }
@@ -634,13 +665,15 @@ impl ConsensusChain {
                 // the parent is fsync'd, so a rename failure never leaves
                 // `current_pack` writing to an unlinked inode (on failure
                 // the old dir is restored and the error propagates).
-                Self::install_imported_epoch_dir(&self.base_path, epoch, &path_base_dir)?;
-                // Invalidate the cache now the new dir is durably in place: a concurrent get_static
-                // that missed the cache and opened FDs on the old (now-unlinked) inode must not
-                // leave a stale entry behind. Only a SUCCESSFUL install unlinks the
-                // old inode, so this runs only on success — a failed-and-restored
-                // install keeps the same inode, so cached handles stay valid.
-                // Readers after this point fall through and see the new on-disk pack.
+                let install_result =
+                    Self::install_imported_epoch_dir(&self.base_path, epoch, &path_base_dir);
+                // Invalidate the cache and bump the install generation regardless of the install
+                // outcome: a post-rename `fsync_directory` failure still leaves the NEW inode in
+                // place, so any concurrent get_static that opened FDs on the old
+                // inode must not leave a stale entry (and a racing open must not
+                // cache the stale handle — see the generation guard
+                // in `get_static`). Harmless when the rename failed and the old inode was restored
+                // (same inode; the re-open below just re-reads it).
                 let evicted: Vec<ConsensusPack> = {
                     let mut recents = self.recent_packs.lock();
                     let mut kept = VecDeque::with_capacity(recents.len());
@@ -655,9 +688,12 @@ impl ConsensusChain {
                     *recents = kept;
                     evicted
                 };
+                self.install_generation.fetch_add(1, Ordering::Release);
                 for p in evicted {
                     p.close().await;
                 }
+                // Surface a genuine install failure only AFTER invalidating the cache above.
+                install_result?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
                     // Swap the old pack out under the lock, then async-close it after the guard
@@ -741,10 +777,14 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*`, `import-*`, `epoch-*.migrating`, or `epoch-*.replaced`
-    /// directories under `base_path` (stale from a prior run — `*.migrating` is a half-built pack
-    /// from an interrupted v1/v0→v2 migration and `*.replaced` is a rename-aside backup left by a
-    /// crash during [`Self::install_imported_epoch_dir`] or the pack migration install).
+    /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.migrating` directories under
+    /// `base_path` (stale from a prior run — `*.migrating` is a half-built pack from an interrupted
+    /// v1/v0→v2 migration; both are always re-fetchable/re-derivable so deleting them is safe).
+    ///
+    /// `epoch-N.replaced` is deliberately NOT swept here — it is a rename-aside backup that may be
+    /// the only surviving copy of `epoch-N` if a crash landed between the two install renames.
+    /// [`Self::recover_incomplete_installs`] (run first, at startup) restores or removes it based
+    /// on whether `epoch-N` exists.
     fn remove_all_staging_and_import_dirs(base_path: &Path) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
@@ -752,9 +792,54 @@ impl ConsensusChain {
                     n.starts_with("staging-")
                         || n.starts_with("import-")
                         || n.ends_with(".migrating")
-                        || n.ends_with(".replaced")
                 }) {
                     let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Roll back any interrupted install/migration before the current pack is opened. Both
+    /// [`Self::install_imported_epoch_dir`] and the pack-format migration move the live `epoch-N`
+    /// aside to `epoch-N.replaced` and only then rename the replacement into place; a crash between
+    /// those two renames (or an install failure whose restore rename also failed) can leave NO
+    /// `epoch-N`. For each `epoch-N.replaced`: if `epoch-N` is MISSING, restore it (the aside
+    /// is the last good copy) so startup does not fail on the hint epoch or silently lose a
+    /// past epoch; if `epoch-N` EXISTS, the aside is a stale backup from a completed install
+    /// and is removed. Deleting `.replaced` unconditionally (the old behavior) could brick
+    /// startup or lose an epoch.
+    fn recover_incomplete_installs(base_path: &Path) {
+        let Ok(entries) = std::fs::read_dir(base_path) else { return };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue };
+            // `epoch-N.replaced` -> live dir name `epoch-N`.
+            let Some(live_name) = name.strip_suffix(".replaced") else { continue };
+            if !live_name.starts_with("epoch-") {
+                continue;
+            }
+            let aside = entry.path();
+            let live = base_path.join(live_name);
+            if std::fs::exists(&live).unwrap_or(false) {
+                // Completed install left a stale backup; drop it.
+                let _ = std::fs::remove_dir_all(&aside);
+            } else {
+                // Interrupted install: restore the old good copy.
+                match std::fs::rename(&aside, &live) {
+                    Ok(()) => {
+                        let _ = fsync_directory(base_path);
+                        warn!(
+                            target: "consensus::store",
+                            dir = %live.display(),
+                            "restored epoch dir from an interrupted install (epoch-N.replaced -> epoch-N)"
+                        );
+                    }
+                    Err(e) => error!(
+                        target: "consensus::store",
+                        %e,
+                        aside = %aside.display(),
+                        "failed to restore epoch dir from .replaced; manual recovery may be required"
+                    ),
                 }
             }
         }
@@ -765,8 +850,8 @@ impl ConsensusChain {
     /// and only removed after the import is renamed into place and the parent directory is
     /// fsync'd. If the install rename fails, the old dir is restored (same inode) so a live
     /// `current_pack` is never left writing to an unlinked inode. A crash mid-swap leaves a
-    /// `*.replaced` dir that [`Self::remove_all_staging_and_import_dirs`] sweeps on the next
-    /// start.
+    /// `*.replaced` dir that [`Self::recover_incomplete_installs`] restores (or removes) on the
+    /// next start.
     fn install_imported_epoch_dir(
         base_path: &Path,
         epoch: Epoch,
@@ -785,8 +870,17 @@ impl ConsensusChain {
         let installed = std::fs::rename(import_dir, &base_dir);
         if installed.is_err() && had_old {
             // Restore the old dir (same inode) so current_pack / open_append_exists keep a valid
-            // path.
-            let _ = std::fs::rename(&aside, &base_dir);
+            // path. If even the restore fails, `epoch-N` is now only at `epoch-N.replaced` — log
+            // loudly; startup's `recover_incomplete_installs` rolls it back on the next boot.
+            if let Err(restore_err) = std::fs::rename(&aside, &base_dir) {
+                error!(
+                    target: "consensus::store",
+                    %restore_err,
+                    epoch,
+                    "install rename failed AND the restore rename failed; epoch-{epoch} is only at \
+                     epoch-{epoch}.replaced and will be rolled back on next startup"
+                );
+            }
         }
         installed?;
         // Durably commit the new dir entry before the import is treated as complete.
@@ -1522,11 +1616,24 @@ impl ConsensusChain {
         // corruption and surfaces. Safe from re-entrancy: no `get_static` caller holds
         // `pack_install` (new_epoch/replace_current use `open_static` directly), and the guard is
         // scoped to this match arm so it is not held across the cache-dedup `.await`s below.
+        // Snapshot the install generation BEFORE the unlocked open below; if an install/handoff
+        // completes while we open, the handle may point at a since-replaced inode and must not be
+        // cached.
+        let gen_before = self.install_generation.load(Ordering::Acquire);
         let pack = match ConsensusPack::open_static(&self.base_path, epoch) {
             Ok(pack) => pack,
             Err(e) if e.is_missing_static_files() => return Err(e),
             Err(_) => {
                 let _install = self.pack_install.lock().await;
+                // After waiting out the in-flight handoff/import, the epoch we want may now BE the
+                // live current pack — e.g. a `get_static(N+1)` that raced `new_epoch(N+1)`. Serve
+                // the live pack directly instead of `open_static`-ing the active
+                // writer (which fails the clean-close sentinel gate and would
+                // misreport a healthy epoch as CorruptPack).
+                let live = self.current_pack();
+                if live.epoch() == epoch {
+                    return Ok(live);
+                }
                 ConsensusPack::open_static(&self.base_path, epoch)?
             }
         };
@@ -1539,6 +1646,13 @@ impl ConsensusChain {
             let mut recents = self.recent_packs.lock();
             if let Some(p) = recents.iter().find(|p| p.epoch() == epoch) {
                 (Some(p.clone()), None)
+            } else if self.install_generation.load(Ordering::Acquire) != gen_before {
+                // An install/handoff completed while we were opening `open_static` unlocked, so
+                // this handle may point at the pre-install (stale) inode. Serve it
+                // to this caller (it holds a correct prefix of the same chain) but
+                // do NOT cache it — a later `get_static` opens
+                // the freshly-installed inode.
+                (None, None)
             } else {
                 // Re-check the cap here too: two concurrent opens of distinct uncached epochs can
                 // each clear the eviction block above and then both push, overshooting
@@ -1881,6 +1995,37 @@ mod test {
     };
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
+
+    /// An interrupted install leaves `epoch-N.replaced` with `epoch-N` missing (a crash
+    /// between the two install renames). Startup must ROLL BACK — restore `epoch-N` from the
+    /// aside — not delete it (which would brick startup on the hint epoch or lose a past
+    /// epoch). A stale aside next to an existing `epoch-N` is removed.
+    #[test]
+    fn test_recover_incomplete_installs_rolls_back_and_cleans() {
+        let temp_dir = TempDir::with_prefix("recover_installs").expect("temp dir");
+        let base = temp_dir.path();
+
+        // Interrupted install: only `epoch-5.replaced` exists (the last good copy), no `epoch-5`.
+        std::fs::create_dir(base.join("epoch-5.replaced")).expect("mk aside");
+        std::fs::write(base.join("epoch-5.replaced").join("marker"), b"good").expect("marker");
+
+        // Completed install left a stale aside next to a live `epoch-6`.
+        std::fs::create_dir(base.join("epoch-6")).expect("mk live");
+        std::fs::create_dir(base.join("epoch-6.replaced")).expect("mk stale aside");
+
+        ConsensusChain::recover_incomplete_installs(base);
+
+        // epoch-5 restored from its aside (marker preserved), aside gone.
+        assert!(base.join("epoch-5").is_dir(), "epoch-5 must be restored from .replaced");
+        assert!(
+            base.join("epoch-5").join("marker").exists(),
+            "restored epoch-5 must keep its contents"
+        );
+        assert!(!base.join("epoch-5.replaced").exists(), "the aside must be consumed");
+        // epoch-6 untouched, its stale aside removed.
+        assert!(base.join("epoch-6").is_dir(), "existing epoch-6 must be left in place");
+        assert!(!base.join("epoch-6.replaced").exists(), "a stale aside must be removed");
+    }
 
     #[tokio::test]
     async fn test_consensus_store_latest_consensus() {

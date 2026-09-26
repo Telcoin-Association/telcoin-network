@@ -13,7 +13,10 @@ use std::{
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -115,6 +118,10 @@ pub struct EpochRecordDb {
     /// Vector to map epochs to the last consensus header number.
     /// Used for quickly deducing an epoch for a given consensus header number.
     final_numbers: Arc<Mutex<Vec<u64>>>,
+    /// Set the first time a read wrapper sees the actor's channel closed, so a dead actor is
+    /// logged once per handle rather than on every poll (`cert_by_digest_with_timeout` polls
+    /// every 200 ms).
+    dead_logged: Arc<AtomicBool>,
 }
 
 fn run_db_loop(
@@ -472,6 +479,7 @@ impl EpochRecordDb {
             handle: Arc::new(Mutex::new(Some(handle))),
             error,
             final_numbers: Arc::new(Mutex::new(final_numbers)),
+            dead_logged: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -614,14 +622,51 @@ impl EpochRecordDb {
         Ok(())
     }
 
+    /// True while the background actor's command channel is open. A dead actor answers every read
+    /// as "not found" (see [`Self::ask`]); callers that must distinguish an empty DB from a
+    /// dead one can check this. Mirrors
+    /// [`ConsensusPack::is_alive`](crate::consensus_pack::ConsensusPack::is_alive).
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// `error!`-log a dead actor once per handle (throttled by `dead_logged`), so a closed channel
+    /// is surfaced instead of silently masquerading as an empty DB — but a 200 ms poll loop
+    /// does not spam.
+    fn log_dead_actor(&self, op: &str) {
+        if !self.dead_logged.swap(true, Ordering::Relaxed) {
+            error!(
+                target: "epoch-db",
+                op,
+                "epoch-records db actor unavailable (channel closed); reporting not-found"
+            );
+        }
+    }
+
+    /// Send a query to the actor and await its reply, returning `dead_default` and logging once if
+    /// the channel is closed or the reply is dropped (a dead/dying actor). A dead actor is NOT
+    /// a real miss; silently collapsing it to `None`/`false` makes the state-sync collector
+    /// re-download and the vote collector/RPC misreport. Mirrors the ConsensusPack #21 read
+    /// wrappers.
+    async fn ask<T>(
+        &self,
+        make_msg: impl FnOnce(oneshot::Sender<T>) -> EpochDbMessage,
+        dead_default: T,
+        op: &str,
+    ) -> T {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(make_msg(tx)).await.is_ok() {
+            if let Ok(v) = rx.await {
+                return v;
+            }
+        }
+        self.log_dead_actor(op);
+        dead_default
+    }
+
     /// Retrieve an [`EpochRecord`] by epoch number.
     pub async fn record_by_epoch(&self, epoch: Epoch) -> Option<EpochRecord> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::RecordByEpoch(epoch, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(|tx| EpochDbMessage::RecordByEpoch(epoch, tx), None, "record_by_epoch").await
     }
 
     /// Poll `lookup` every [`POLL_INTERVAL`] until it yields a value or `timeout` elapses,
@@ -793,22 +838,12 @@ impl EpochRecordDb {
 
     /// Retrieve an [`EpochRecord`] by its digest.
     pub async fn record_by_digest(&self, digest: EpochDigest) -> Option<EpochRecord> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::RecordByDigest(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(|tx| EpochDbMessage::RecordByDigest(digest, tx), None, "record_by_digest").await
     }
 
     /// Retrieve an [`EpochCertificate`] by its `epoch_hash` digest.
     pub async fn cert_by_digest(&self, digest: EpochDigest) -> Option<EpochCertificate> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::CertByDigest(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(|tx| EpochDbMessage::CertByDigest(digest, tx), None, "cert_by_digest").await
     }
 
     /// Retrieve an [`EpochCertificate`] by its `epoch_hash` digest.
@@ -830,42 +865,27 @@ impl EpochRecordDb {
 
     /// True if the database contains a record for the given epoch number.
     pub async fn contains_epoch(&self, epoch: Epoch) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::ContainsEpoch(epoch, tx)).await.is_ok() {
-            rx.await.unwrap_or(false)
-        } else {
-            false
-        }
+        self.ask(|tx| EpochDbMessage::ContainsEpoch(epoch, tx), false, "contains_epoch").await
     }
 
     /// True if the database contains a dummy record for epoch 0.
     pub async fn contains_dummy_epoch0(&self) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::ContainsDummyEpoch0(tx)).await.is_ok() {
-            rx.await.unwrap_or(false)
-        } else {
-            false
-        }
+        self.ask(EpochDbMessage::ContainsDummyEpoch0, false, "contains_dummy_epoch0").await
     }
 
     /// True if the database contains a record with the given digest.
     pub async fn contains_record_digest(&self, digest: EpochDigest) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::ContainsRecordDigest(digest, tx)).await.is_ok() {
-            rx.await.unwrap_or(false)
-        } else {
-            false
-        }
+        self.ask(
+            |tx| EpochDbMessage::ContainsRecordDigest(digest, tx),
+            false,
+            "contains_record_digest",
+        )
+        .await
     }
 
     /// Return the latest (highest epoch number) [`EpochRecord`] stored, if any.
     pub async fn latest_record(&self) -> Option<EpochRecord> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::LatestRecord(tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(EpochDbMessage::LatestRecord, None, "latest_record").await
     }
 
     /// Flush all pending writes to disk.
@@ -928,12 +948,7 @@ impl EpochRecordDb {
         &self,
         epoch: Epoch,
     ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::EpochByNumber(epoch, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(|tx| EpochDbMessage::EpochByNumber(epoch, tx), None, "get_epoch_by_number").await
     }
 
     /// Scan the historical epochs `0..tip_epoch` and return the first whose certificate (or record)
@@ -947,15 +962,15 @@ impl EpochRecordDb {
     /// `tip_epoch` itself is EXCLUDED: the exported tip's own cert is only aggregated at the next
     /// epoch's start, so it is normally still pending at export time and is waited for separately.
     pub async fn first_missing_historical_cert(&self, tip_epoch: Epoch) -> Option<Epoch> {
-        let (tx, rx) = oneshot::channel();
         // On a dead or dying actor, report epoch 0 as unconfirmed (whenever any historical epoch
         // exists) so the caller skips the export rather than proceeding blind; the per-epoch
-        // lookups this scan replaced degraded the same way.
-        if self.tx.send(EpochDbMessage::FirstMissingHistoricalCert(tip_epoch, tx)).await.is_ok() {
-            rx.await.unwrap_or_else(|_| (tip_epoch > 0).then_some(0))
-        } else {
-            (tip_epoch > 0).then_some(0)
-        }
+        // lookups this scan replaced degraded the same way. `ask` also logs the dead actor once.
+        self.ask(
+            |tx| EpochDbMessage::FirstMissingHistoricalCert(tip_epoch, tx),
+            (tip_epoch > 0).then_some(0),
+            "first_missing_historical_cert",
+        )
+        .await
     }
 
     /// Retrieve the epoch record and certificate (if available) by record digest.
@@ -966,12 +981,7 @@ impl EpochRecordDb {
         &self,
         hash: EpochDigest,
     ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(EpochDbMessage::EpochByHash(hash, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.ask(|tx| EpochDbMessage::EpochByHash(hash, tx), None, "get_epoch_by_hash").await
     }
 
     /// Write a bounded export bundle covering epochs `0..=through_epoch` into fresh records/certs
@@ -2475,6 +2485,11 @@ mod test {
         // Latest record should be the last one saved.
         let latest = db.latest_record().await.expect("latest record");
         assert_eq!(latest.epoch, num_records - 1);
+
+        // A live actor reports alive, and the `ask`-based wrappers return real values on it
+        // (not the dead-actor default). The dead-actor path returns None/false and logs
+        // once per handle.
+        assert!(db.is_alive(), "a running db actor must report alive");
 
         db.persist().await.expect("persist");
         drop(db);

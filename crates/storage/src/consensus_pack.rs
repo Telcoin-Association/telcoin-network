@@ -1027,6 +1027,14 @@ impl ConsensusPack {
         }
     }
 
+    /// True when this is the only live handle to the pack, so [`Self::close`] will actually seal it
+    /// (rather than no-op because another clone keeps the actor alive and defers the seal to a
+    /// later `Drop`). Best-effort/racy — for diagnostics at an epoch handoff, not a
+    /// synchronization point.
+    pub fn is_sole_handle(&self) -> bool {
+        Arc::strong_count(&self.handle) == 1
+    }
+
     /// Take ownership and close async so we Drop does not get a chance to block any threads.
     /// Note, will only close if this is the last reference to this pack.
     /// Essentially this an async drop.
@@ -2497,60 +2505,86 @@ impl Inner {
             #[cfg(test)]
             fail_save_after_append: false,
         };
-        loop {
-            // The header's parent link is verified INSIDE the decoder via
-            // `HeaderExpectation::Parent` — early (before batches) on the v1 header-first path — so
-            // a forked/forged output is rejected before its batches are buffered. `parent_digest`
-            // advances to this output's digest for the next iteration below.
-            let output = if stream_iter.version() == 0 {
-                match iter_to_output_legacy(
-                    &mut stream_iter,
-                    timeout,
-                    &pack.epoch_meta.committee,
-                    parent_digest_expectation,
-                )
-                .await
-                {
-                    Ok(output) => output,
-                    Err(PackError::NotConsensus) => break,
-                    Err(e) => return Err(e),
+        // Fill the pack from the stream. Any error abandons the partial pack cheaply: a peer can
+        // stream data and then send a bad record, and letting `pack` drop normally would msync +
+        // seal (sentinel + fsync) the whole partial import on the tokio worker right before
+        // `ImportPath::drop` deletes it. `discard_import` marks every backing file remove-on-drop
+        // so the drop is cheap.
+        let fill: Result<(), PackError> = 'fill: {
+            loop {
+                // The header's parent link is verified INSIDE the decoder via
+                // `HeaderExpectation::Parent` — early (before batches) on the v1 header-first path
+                // — so a forked/forged output is rejected before its batches are
+                // buffered. `parent_digest` advances to this output's digest for
+                // the next iteration below.
+                let output = if stream_iter.version() == 0 {
+                    match iter_to_output_legacy(
+                        &mut stream_iter,
+                        timeout,
+                        &pack.epoch_meta.committee,
+                        parent_digest_expectation,
+                    )
+                    .await
+                    {
+                        Ok(output) => output,
+                        Err(PackError::NotConsensus) => break,
+                        Err(e) => break 'fill Err(e),
+                    }
+                } else {
+                    match iter_to_output(
+                        &mut stream_iter,
+                        timeout,
+                        &pack.epoch_meta.committee,
+                        parent_digest_expectation,
+                    )
+                    .await
+                    {
+                        Ok(output) => output,
+                        Err(PackError::NotConsensus) => break,
+                        Err(e) => break 'fill Err(e),
+                    }
+                };
+                let consensus_number = output.number();
+                if consensus_number > final_consensus_number {
+                    break 'fill Err(PackError::InvalidConsensusNumber(
+                        consensus_number,
+                        final_consensus_number,
+                    ));
                 }
-            } else {
-                match iter_to_output(
-                    &mut stream_iter,
-                    timeout,
-                    &pack.epoch_meta.committee,
-                    parent_digest_expectation,
-                )
-                .await
-                {
-                    Ok(output) => output,
-                    Err(PackError::NotConsensus) => break,
-                    Err(e) => return Err(e),
+                // A streamed import builds a fresh pack strictly in order: the next output MUST be
+                // exactly the next consensus number. A repeat or gap is peer misbehavior --
+                // not the idempotent local replay `save_consensus_output` tolerates (`idx <
+                // len` there) -- so reject it here. Otherwise a non-advancing parent-linked
+                // chain is accepted-and-ignored forever and pins the import (see finding
+                // #10); `InvalidConsensusNumber` charges the peer a Severe penalty.
+                let expected =
+                    pack.epoch_meta.start_consensus_number + pack.consensus_pos_idx.len() as u64;
+                if consensus_number != expected {
+                    break 'fill Err(PackError::InvalidConsensusNumber(expected, consensus_number));
                 }
-            };
-            let consensus_number = output.number();
-            if consensus_number > final_consensus_number {
-                return Err(PackError::InvalidConsensusNumber(
-                    consensus_number,
-                    final_consensus_number,
-                ));
+                parent_digest_expectation = HeaderExpectation::Parent(output.digest());
+                if let Err(e) = pack.save_consensus_output(&output) {
+                    break 'fill Err(e);
+                }
             }
-            // A streamed import builds a fresh pack strictly in order: the next output MUST be
-            // exactly the next consensus number. A repeat or gap is peer misbehavior --
-            // not the idempotent local replay `save_consensus_output` tolerates (`idx <
-            // len` there) -- so reject it here. Otherwise a non-advancing parent-linked
-            // chain is accepted-and-ignored forever and pins the import (see finding
-            // #10); `InvalidConsensusNumber` charges the peer a Severe penalty.
-            let expected =
-                pack.epoch_meta.start_consensus_number + pack.consensus_pos_idx.len() as u64;
-            if consensus_number != expected {
-                return Err(PackError::InvalidConsensusNumber(expected, consensus_number));
-            }
-            parent_digest_expectation = HeaderExpectation::Parent(output.digest());
-            pack.save_consensus_output(&output)?;
+            Ok(())
+        };
+        if let Err(e) = fill {
+            pack.discard_import();
+            return Err(e);
         }
         Ok(pack)
+    }
+
+    /// Abandon this partial, never-persisted import pack: mark every backing file to be removed
+    /// (not sealed) when it drops, so a failed/aborted `stream_import`'s drop skips the msync +
+    /// truncate + clean-close sentinel + fsync of data that is about to be deleted anyway (the
+    /// caller's `ImportPath::drop` removes the directory).
+    fn discard_import(&mut self) {
+        self.data.set_remove_on_drop();
+        self.consensus_digests.set_remove_on_drop();
+        self.batch_digests.set_remove_on_drop();
+        self.consensus_pos_idx.set_remove_on_drop();
     }
 
     /// Write the batches for consensus to the pack file.
@@ -5793,7 +5827,7 @@ pub(crate) mod test {
         ro.close().await;
     }
 
-    /// F13: `validate_pack_file` cross-checks every derived index entry against the data log, so a
+    /// `validate_pack_file` cross-checks every derived index entry against the data log, so a
     /// zeroed BLOOM filter (which the bucket-CRC scan cannot see — the buckets are still valid) now
     /// flips the verdict to `Invalid` via an `IndexMismatch`, and `db repair` rebuilds it back to
     /// `Valid`/`Healthy`. Before the cross-check this reported `Valid`+`Healthy` while every lookup
@@ -5854,7 +5888,7 @@ pub(crate) mod test {
         );
     }
 
-    /// F33: a tear INSIDE the in-flight output (header + some batches durable, the last batch torn
+    /// A tear INSIDE the in-flight output (header + some batches durable, the last batch torn
     /// — the ordinary crash shape) must not report the unwritten batches as false "absent".
     /// Bounding the prefix walk at the WAL `consistent_end` (last COMPLETE output) is Valid;
     /// the old bound at the first-bad-record offset falsely reported INVALID with absent
@@ -5912,7 +5946,7 @@ pub(crate) mod test {
         );
     }
 
-    /// F37: `pack_unsealed_version` reports whether a pack carries the clean-close sentinel — the
+    /// `pack_unsealed_version` reports whether a pack carries the clean-close sentinel — the
     /// signal the `db validate` warning uses to flag a pack a writer may still be finishing,
     /// whatever its epoch number.
     #[tokio::test]

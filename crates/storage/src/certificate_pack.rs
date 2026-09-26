@@ -341,8 +341,15 @@ impl Inner {
         data: &mut Pack<Certificate>,
         digest_idx: &mut HdxIndex,
     ) -> Result<(), PackError> {
+        // A cleanly-SEALED log is complete by construction (the clean-close sentinel is written
+        // only after the tail is msync'd and truncated to `end`), so any tear in it is
+        // at-rest corruption of committed certificates, not a truncatable unacked tail.
+        // Only an unclean log can have a truncatable tail. (Mirrors the ConsensusPack /
+        // EpochRecordDb sealed-log discipline.)
+        let sealed = !data.opened_unclean();
         let mut iter = data.raw_iter().map_err(OpenError::DataFileOpen)?;
         let mut consistent_end = iter.logical_position();
+        let mut torn = false;
         loop {
             let pos = iter.logical_position();
             match iter.next() {
@@ -354,12 +361,33 @@ impl Inner {
                         .map_err(|e| PackError::IndexAppend(e.to_string()))?;
                     consistent_end = iter.logical_position();
                 }
-                Some(Err(_)) => break,
+                Some(Err(_)) => {
+                    torn = true;
+                    break;
+                }
             }
         }
         // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
         drop(iter);
-        if consistent_end < data.file_len() {
+        let file_len = data.file_len();
+        if torn && consistent_end < file_len {
+            let dropped = file_len - consistent_end;
+            if sealed {
+                // Fail closed rather than zeroing committed, durably-acked certificates (INV4).
+                return Err(PackError::CorruptLog(format!(
+                    "a record at offset {consistent_end} failed to decode in a cleanly-sealed \
+                     certificate log; {dropped} committed byte(s) follow it. This is at-rest \
+                     corruption, not a torn tail — refusing to truncate."
+                )));
+            }
+            // An unclean log's torn tail is an unacked partial write: drop it, but say so (INV1).
+            warn!(
+                target: "cert-pack",
+                consistent_end,
+                file_len,
+                dropped_bytes = dropped,
+                "certificate log has a torn tail; truncating the unacked bytes and rebuilding the index"
+            );
             data.rewind_to(consistent_end);
         }
         digest_idx.set_data_file_length(data.file_len());
@@ -498,6 +526,10 @@ pub enum PackError {
     PersistError(String),
     /// The pack file was detected to be corrupt.
     CorruptPack,
+    /// A cleanly-sealed data log stopped decoding partway through: at-rest corruption of committed
+    /// certificates that must not be silently truncated (INV4). Holds an operator-facing
+    /// description.
+    CorruptLog(String),
     /// The background pack thread failed to join on shutdown.
     JoinFailed,
 }
@@ -517,6 +549,7 @@ impl Display for PackError {
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             PackError::CorruptPack => write!(f, "Pack file is corrupt"),
+            PackError::CorruptLog(e) => write!(f, "Certificate log corrupt: {e}"),
             PackError::JoinFailed => write!(f, "Pack file thread failed to join"),
         }
     }
@@ -688,6 +721,99 @@ mod test {
         let len_before = inner.data.file_len();
         inner.save(&certs[0]).expect("idempotent re-save");
         assert_eq!(inner.data.file_len(), len_before, "re-save must not append a duplicate cert");
+    }
+
+    /// A cleanly-SEALED cert log that has a mid-log corrupt record must NOT be silently
+    /// truncated on a rebuild — that would zero every committed cert after the first bad one.
+    /// The rebuild fails closed (`CorruptLog`) and leaves the data file untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_sealed_log_tear_fails_closed() {
+        let temp_dir = TempDir::with_prefix("cert_sealed_tear").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        // Populate and cleanly close (normal drop seals the data file with the clean-close
+        // sentinel).
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..8usize {
+                inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
+            }
+            inner.persist().expect("persist");
+        }
+
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let len_before = std::fs::metadata(&data_path).expect("meta").len();
+
+        // Corrupt a mid-log record (avoid the 28-byte header and the trailing 8-byte sentinel).
+        {
+            let mut bytes = std::fs::read(&data_path).expect("read data");
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0xFF;
+            std::fs::write(&data_path, &bytes).expect("write corrupted data");
+        }
+        // Break the digest index so the reopen is forced to rebuild from the (sealed) data log.
+        let hdx = dir.join(super::Inner::HASH_NAME).join("index.hdx");
+        let f = std::fs::OpenOptions::new().write(true).open(&hdx).expect("open hdx");
+        f.set_len(4).expect("truncate hdx header");
+        drop(f);
+
+        // Rebuild hits the corrupt record in a SEALED log: fail closed, do not truncate committed
+        // data.
+        match super::Inner::open(&dir, false) {
+            Err(super::PackError::CorruptLog(_)) => {}
+            other => panic!("a sealed-log tear must be CorruptLog, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("meta").len(),
+            len_before,
+            "a sealed cert log must not be truncated"
+        );
+    }
+
+    /// An UNCLEAN cert log with a torn tail (an unacked partial write) is truncated back to
+    /// the last complete cert on rebuild — the surviving certs stay, the torn one is dropped,
+    /// and no error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_unclean_torn_tail_truncates() {
+        let temp_dir = TempDir::with_prefix("cert_unclean_tear").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..8usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+            // Normal drop cleanly closes: truncates the mmap padding to the exact logical end and
+            // writes the 8-byte clean-close sentinel. This leaves the file with NO padding, so the
+            // strip below lands inside the last real record rather than in padding.
+        }
+
+        // Make it unclean with a torn final record: remove the sentinel (8 bytes) AND one more
+        // byte, which falls inside the last cert's CRC so its read comes up short (a torn
+        // unacked tail).
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let len = f.metadata().expect("meta").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN - 1)
+                .expect("strip sentinel + 1");
+        }
+
+        // Unclean + torn tail: rebuild truncates the incomplete last cert and keeps the rest (no
+        // error).
+        let mut inner = super::Inner::open(&dir, false).expect("reopen truncates the torn tail");
+        assert!(inner.contains(certs[0].digest()), "surviving certs must remain");
+        assert!(inner.contains(certs[6].digest()), "surviving certs must remain");
+        assert!(
+            !inner.contains(certs[7].digest()),
+            "the torn final cert must be dropped by the tail truncation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -224,6 +224,12 @@ impl<T: PosIndexValue> PositionIndex<T> {
         self.pdx_file.mark_consistent();
     }
 
+    /// Mark the backing pdx file to be removed (not sealed) when this handle drops. Used to abandon
+    /// a partial/failed build cheaply.
+    pub fn set_remove_on_drop(&mut self) {
+        self.pdx_file.set_remove_on_drop();
+    }
+
     /// Return an iterator over file positions with up to len items.
     pub fn iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };

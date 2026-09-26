@@ -487,6 +487,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.odx_file.mark_consistent();
     }
 
+    /// Mark both index files to be removed (not synced) when this handle drops. Used to abandon a
+    /// partial/failed build cheaply, skipping the drop-time `ordered_sync`.
+    pub fn set_remove_on_drop(&mut self) {
+        self.hdx_file.set_remove_on_drop();
+        self.odx_file.set_remove_on_drop();
+    }
+
     /// Set the data_file_length field. This tracks information about another file but does not
     /// affect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
@@ -910,8 +917,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if bucket != split_bucket && bucket != new_bucket {
                 // A rehash landing outside the split pair means the on-disk index is corrupt. Fail
                 // the save (the pack rebuilds from the WAL) rather than panicking the pack's worker
-                // thread and wedging every later request.
-                return Err(AppendError::CrcError);
+                // thread and wedging every later request. `CorruptIndex` (not `CrcError` — no CRC
+                // was computed here) is the accurate classification for a rehash
+                // that disagrees with the stored bucket geometry.
+                return Err(AppendError::CorruptIndex(format!(
+                    "split rehash of bucket {split_bucket} landed in {bucket} (expected \
+                     {split_bucket} or {new_bucket})"
+                )));
             }
             if bucket == split_bucket {
                 self.save_to_bucket_buffer(hash.as_slice(), rec_pos, split_pos, false)?;

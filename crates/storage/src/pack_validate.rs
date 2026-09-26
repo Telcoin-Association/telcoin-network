@@ -771,6 +771,11 @@ fn verify_v0_data(
 ) -> Result<PackValidationReport, PackError> {
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
+    // Set once if the file's own (untrusted, `previous: None`) `start_consensus_number` overflows
+    // `u64` when the position-based expected number is computed — so the sequence check is skipped
+    // for the rest of the walk and a single meta issue is reported instead of panicking (debug)
+    // / wrapping (release) into spurious `NonSequentialConsensusNumber`s.
+    let mut meta_overflow_reported = false;
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
     // Per-group sets, cleared after every consensus header exactly like `stream_import`.
@@ -812,12 +817,30 @@ fn verify_v0_data(
                 // number outright, so check it explicitly here. Keeping `expected` position-based
                 // (not "previous number + 1") means one bad header doesn't cascade into spurious
                 // issues for every following header.
-                let expected_number = start_consensus_number + (consensus_count - 1);
-                if number != expected_number {
-                    issues.push(PackIssue::NonSequentialConsensusNumber {
-                        expected: expected_number,
-                        found: number,
-                    });
+                // `consensus_count - 1` cannot underflow (incremented above). `start + (count-1)`
+                // can overflow only on a corrupt/wrong meta; report it once and
+                // stop sequence-checking.
+                match start_consensus_number.checked_add(consensus_count - 1) {
+                    Some(expected_number) if !meta_overflow_reported => {
+                        if number != expected_number {
+                            issues.push(PackIssue::NonSequentialConsensusNumber {
+                                expected: expected_number,
+                                found: number,
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !meta_overflow_reported {
+                            meta_overflow_reported = true;
+                            issues.push(PackIssue::EpochMetaMismatch {
+                                detail: format!(
+                                    "start_consensus_number {start_consensus_number} overflows u64 \
+                                     with {consensus_count} header(s); the epoch meta is corrupt"
+                                ),
+                            });
+                        }
+                    }
                 }
 
                 // 1. Chain continuity (skip when we have no anchor yet).
@@ -901,6 +924,11 @@ fn verify_v1_data(
 ) -> Result<PackValidationReport, PackError> {
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
+    // Set once if the file's own (untrusted, `previous: None`) `start_consensus_number` overflows
+    // `u64` when the position-based expected number is computed — so the sequence check is skipped
+    // for the rest of the walk and a single meta issue is reported instead of panicking (debug)
+    // / wrapping (release) into spurious `NonSequentialConsensusNumber`s.
+    let mut meta_overflow_reported = false;
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
 
@@ -945,12 +973,30 @@ fn verify_v1_data(
                 // Sequential numbering and chain continuity, identical to `verify_v0_data`. See the
                 // comments there for why `expected` is position-based and why the trailing header
                 // needs the explicit sequential check.
-                let expected_number = start_consensus_number + (consensus_count - 1);
-                if number != expected_number {
-                    issues.push(PackIssue::NonSequentialConsensusNumber {
-                        expected: expected_number,
-                        found: number,
-                    });
+                // `consensus_count - 1` cannot underflow (incremented above). `start + (count-1)`
+                // can overflow only on a corrupt/wrong meta; report it once and
+                // stop sequence-checking.
+                match start_consensus_number.checked_add(consensus_count - 1) {
+                    Some(expected_number) if !meta_overflow_reported => {
+                        if number != expected_number {
+                            issues.push(PackIssue::NonSequentialConsensusNumber {
+                                expected: expected_number,
+                                found: number,
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !meta_overflow_reported {
+                            meta_overflow_reported = true;
+                            issues.push(PackIssue::EpochMetaMismatch {
+                                detail: format!(
+                                    "start_consensus_number {start_consensus_number} overflows u64 \
+                                     with {consensus_count} header(s); the epoch meta is corrupt"
+                                ),
+                            });
+                        }
+                    }
                 }
                 if let Some(parent) = expected_parent {
                     if consensus_header.parent_hash != parent {
@@ -1718,7 +1764,7 @@ mod test {
         }
     }
 
-    /// F34: the `TornTrailingTail` remediation is honest about past epochs — it no longer says the
+    /// The `TornTrailingTail` remediation is honest about past epochs — it no longer says the
     /// unconditional "no action needed" (true only for the current epoch) and points a past epoch
     /// at `db repair`.
     #[test]
@@ -1736,7 +1782,7 @@ mod test {
         assert!(text.contains("db repair"), "must point a past epoch at db repair: {text}");
     }
 
-    /// F14: the index-degraded remediation no longer tells operators to delete `hash`/`bhash` by
+    /// The index-degraded remediation no longer tells operators to delete `hash`/`bhash` by
     /// hand (which turns a sealed past epoch absent) — it points at `db repair`.
     #[test]
     fn test_index_degraded_remediation_points_at_db_repair() {
@@ -1760,7 +1806,7 @@ mod test {
         assert!(text.contains("Do NOT delete"), "must warn against deleting by hand: {text}");
     }
 
-    /// F35: `has_data_logical_issue` distinguishes an unfixable data-log defect (a rebuild cannot
+    /// `has_data_logical_issue` distinguishes an unfixable data-log defect (a rebuild cannot
     /// help) from purely index damage (rebuildable) — the discriminator `db repair` uses to
     /// give the same verdict on a dry run and an apply.
     #[test]
@@ -1795,5 +1841,44 @@ mod test {
             PackIssue::EmptySubDag { number: 1 },
         ])
         .has_data_logical_issue());
+    }
+
+    /// A CRC-valid but wrong `EpochMeta.start_consensus_number` near `u64::MAX` must not
+    /// overflow the position-based `start + (count - 1)` sequence check (debug panic / release
+    /// wrap into spurious `NonSequentialConsensusNumber`s). It is reported once as an
+    /// `EpochMetaMismatch` and the sequence check is skipped for the rest of the walk.
+    #[test]
+    fn test_validate_meta_start_overflow_reported_not_panicked() {
+        for version in [0u16, 1] {
+            let (temp_dir, committee, chain) = setup();
+            let outputs = make_outputs(&committee, chain, 3);
+            let mut meta = epoch0_meta(&committee);
+            meta.start_consensus_number = u64::MAX; // wrong/corrupt meta
+            let (records, _) = build_records(meta, &outputs, version);
+            let path = temp_dir.path().join("data");
+            write_records(&path, &records, version);
+
+            // Must not panic (debug) or wrap (release). Reaching here already proves no overflow
+            // panic.
+            let report = validate_pack_file(&path, 0, None).expect("validate");
+            let meta_overflow = report.issues.iter().any(|i| {
+                matches!(
+                    i,
+                    PackIssue::EpochMetaMismatch { detail } if detail.contains("overflows")
+                )
+            });
+            assert!(
+                meta_overflow,
+                "v{version}: expected a meta-overflow EpochMetaMismatch: {:?}",
+                report.issues
+            );
+            // Exactly one meta-overflow issue (reported once, not per header).
+            let overflow_count = report
+                .issues
+                .iter()
+                .filter(|i| matches!(i, PackIssue::EpochMetaMismatch { detail } if detail.contains("overflows")))
+                .count();
+            assert_eq!(overflow_count, 1, "v{version}: meta overflow must be reported once");
+        }
     }
 }

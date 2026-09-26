@@ -200,6 +200,13 @@ where
         self.inner.destroy();
     }
 
+    /// Mark the underlying data file to be removed (not sealed) when this handle drops. Used to
+    /// abandon a partial/failed build cheaply, skipping the clean-close
+    /// msync+truncate+sentinel+fsync.
+    pub fn set_remove_on_drop(&mut self) {
+        self.inner.data_file.set_remove_on_drop();
+    }
+
     /// Rename the pack file to name.
     pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         self.inner.rename(path)
@@ -665,6 +672,23 @@ where
 {
     value_buffer.clear();
     encode_into_buffer(value_buffer, value).map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Reject an oversized record by its DECODED size, before compressing. Every read path
+    // (`read_record_into`, `PackIter`/`AsyncPackIter`) caps the *decompressed* payload at
+    // `MAX_RECORD_SIZE`, so a value that compresses to <= the cap but decodes above it would be
+    // appended and acked yet could never be fetched, iterated, replayed, or served to a peer (and
+    // an unclean reopen would then see `CorruptPack`). Checking the uncompressed length here
+    // mirrors the read side exactly, so nothing readable today is rejected. Same non-poisoning
+    // `InvalidInput` kind as the framed-size check below (a caller/value error, not a failed-DB
+    // state).
+    if value_buffer.len() > MAX_RECORD_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "record decoded size {} exceeds the maximum {MAX_RECORD_SIZE}",
+                value_buffer.len()
+            ),
+        ));
+    }
     let buffer = match compression {
         PackCompression::None => value_buffer,
         PackCompression::ZStd => {
@@ -1007,6 +1031,38 @@ mod tests {
         assert_eq!(recs.len(), 1, "only the non-oversized record should be present");
         assert_eq!(recs[0].idx, 2);
         assert_eq!(recs[0].name, "ok");
+    }
+
+    #[test]
+    fn append_rejects_zstd_record_oversized_when_decoded() {
+        // With ZStd the framed-size guard sees the COMPRESSED size, so a highly-compressible
+        // value that decodes past `MAX_RECORD_SIZE` but compresses under it would (without
+        // the decoded-size check) be appended and acked yet be unreadable (every read path
+        // caps the decompressed size). The decoded-size check rejects it at append instead.
+        let tmp_path = TempDir::with_prefix("test_pack_oversize_zstd").expect("temp dir");
+        let path = tmp_path.path().join("pack_oversize_zstd");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
+
+        // All-'x' compresses to a few hundred bytes, but decodes to > 16 MiB.
+        let oversized = TestRec { idx: 1, name: "x".repeat(MAX_RECORD_SIZE as usize + 1) };
+        let err =
+            db.append(&oversized).expect_err("a ZStd record oversized when decoded is rejected");
+        assert!(
+            matches!(&err, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::InvalidInput),
+            "expected an InvalidInput rejection, got: {err:?}"
+        );
+
+        // Not poisoned: a normal append still succeeds and reads back.
+        db.append(&TestRec { idx: 2, name: "ok".to_string() }).expect("pack must not be poisoned");
+        db.commit().expect("commit must succeed");
+        drop(db);
+        let db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("reopen pack");
+        let recs: Vec<TestRec> =
+            db.raw_iter().expect("raw iter").map(|r| r.expect("decode")).collect();
+        assert_eq!(recs.len(), 1, "only the readable record should be present");
+        assert_eq!(recs[0].idx, 2);
     }
 
     fn archive_pack_(compression: PackCompression) {

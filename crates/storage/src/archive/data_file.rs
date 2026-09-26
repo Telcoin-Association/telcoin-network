@@ -999,6 +999,13 @@ impl MmapDataFile {
         self.remove_on_drop = true;
     }
 
+    /// Like [`Self::delete`] but keeps the handle: the file is removed (not sealed) when this
+    /// handle eventually drops. Used to abandon a partial/failed build cheaply — its `Drop`
+    /// skips the whole msync + truncate + sentinel + fsync clean-close.
+    pub fn set_remove_on_drop(&mut self) {
+        self.remove_on_drop = true;
+    }
+
     /// Rename the underlying file, fsync'ing affected directories so the rename is durable. The
     /// active mapping is backed by the open handle, not the path, so it stays valid across the
     /// move.
