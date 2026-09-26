@@ -55,6 +55,53 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[path = "tests/network_tests.rs"]
 mod network_tests;
 
+#[cfg(test)]
+#[path = "tests/loop_budget_tests.rs"]
+mod loop_budget_tests;
+
+/// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
+/// [`next_loop_event`].
+#[derive(Debug)]
+enum LoopEvent<E, C> {
+    /// The record-refresh interval ticked.
+    Refresh,
+    /// The swarm produced an event.
+    Swarm(E),
+    /// The command channel produced a command.
+    Command(C),
+    /// Every command sender is gone, so the network loop must shut down.
+    CommandsClosed,
+}
+
+/// Wait for the next unit of work of the network loop: a record-refresh tick, a swarm event or a
+/// command.
+///
+/// [`ConsensusNetwork::run`] calls this once per loop iteration. `events` is generic so tests can
+/// drive this exact function with a synthetic, always-ready event source.
+///
+/// Every call first spends one unit of the tokio cooperative budget. The swarm stream spends no
+/// budget (libp2p events, QUIC accepts and futures channels are not budget-aware). Without this
+/// charge, a flood of ready swarm events never makes the loop return `Pending`, so the task never
+/// yields: other tasks on the same worker thread do not run and, on a `current_thread` runtime,
+/// the time driver does not turn, so no interval fires. With the charge, the loop serves at most
+/// one budget of iterations per scheduler poll, then yields and wakes itself. The charge comes
+/// before the `select!`, so a yield never drops a swarm event or a command.
+async fn next_loop_event<S, C>(
+    record_refresh: &mut tokio::time::Interval,
+    events: &mut S,
+    commands: &mut Receiver<C>,
+) -> LoopEvent<S::Item, C>
+where
+    S: futures::Stream + futures::stream::FusedStream + Unpin,
+{
+    tokio::task::coop::consume_budget().await;
+    tokio::select! {
+        _ = record_refresh.tick() => LoopEvent::Refresh,
+        event = events.select_next_some() => LoopEvent::Swarm(event),
+        command = commands.recv() => command.map_or(LoopEvent::CommandsClosed, LoopEvent::Command),
+    }
+}
+
 /// Hard cap on the number of distinct peers retained in
 /// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
 /// already pushed our [`NodeRecord`] to.
@@ -770,24 +817,26 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            tokio::select! {
-                _ = record_refresh.tick() => self.refresh_own_record(),
-                event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
-                    error!(target: "network", ?e, "network event error");
-                    if let NetworkError::AllListenersClosed = e {
-                        // In this case go ahead and kill the node.
-                        return Err(e);
+            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+                LoopEvent::Refresh => self.refresh_own_record(),
+                LoopEvent::Swarm(event) => {
+                    if let Err(e) = self.process_event(event).await {
+                        error!(target: "network", ?e, "network event error");
+                        if let NetworkError::AllListenersClosed = e {
+                            // In this case go ahead and kill the node.
+                            return Err(e);
+                        }
                     }
-                },
-                command = self.commands.recv() => match command {
-                    Some(c) => if let Err(e) = self.process_command(c) {
+                }
+                LoopEvent::Command(c) => {
+                    if let Err(e) = self.process_command(c) {
                         error!(target: "network", ?e, "network command error")
-                    },
-                    None => {
-                        info!(target: "network", "network shutting down...");
-                        return Ok(())
                     }
-                },
+                }
+                LoopEvent::CommandsClosed => {
+                    info!(target: "network", "network shutting down...");
+                    return Ok(());
+                }
             }
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
