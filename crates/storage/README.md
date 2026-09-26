@@ -243,7 +243,10 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     production path refreshes a clamped read-only handle. Not a live SIGBUS.
 15. **Trailing-CRC "dirty" (zero) sentinel in `crc.rs`.** A zeroed trailing CRC is a deliberate
     "written but not yet CRC'd" marker (`crc_state` distinguishes Dirty from Corrupt), not a missing
-    checksum.
+    checksum. A Dirty bucket is trusted only for a bucket the current handle actually wrote this
+    sync-cycle (`HdxIndex::unsynced_buckets`); a Dirty bucket at rest on a clean/read-only index is
+    treated as corruption (a lookup miss in it returns `CorruptIndex`, and a write to it is refused
+    rather than laundering it valid).
 16. **`eyre`-everywhere error style (`StoreResult<T> = eyre::Result<T>`).** Returning `eyre` errors
     (rather than a bespoke error enum per module) is an intentional, pre-existing convention for this
     crate; not a "define a proper error type" finding.

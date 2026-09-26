@@ -50,7 +50,7 @@ use crate::archive::{
     pack::{DataHeader, DATA_HEADER_BYTES},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     fs,
     hash::{BuildHasher, BuildHasherDefault},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -274,6 +274,14 @@ pub struct HdxIndex<
     read_only: bool,
     synced: bool,
     bloom: Bloom,
+    /// Bucket indices this handle has written (or split-cleared) since the last `ordered_sync`.
+    /// Their all-zero CRC trailer is a legitimate lazy-write marker, not corruption; a `Dirty`
+    /// bucket NOT in this set is at-rest damage on an index that opened clean (a clean close
+    /// CRC-stamps every bucket, and an unclean index is rebuilt rather than opened). The
+    /// read/write/sync paths consult it to tell the two apart; it is empty on open (so
+    /// read-only handles trust no `Dirty` bucket) and cleared each sync (`crc_dirty_buckets`
+    /// stamps exactly this set).
+    unsynced_buckets: HashSet<u64>,
     _index_dir: PathBuf,
     /// Test-only: when set, the next bucket split fails mid-way (after both buckets are zeroed) to
     /// exercise the rollback in [`Self::split_one_bucket`].
@@ -446,6 +454,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             read_only,
             synced: true,
             bloom,
+            unsynced_buckets: HashSet::new(),
             _index_dir: dir.to_owned(),
             #[cfg(test)]
             fail_next_split: false,
@@ -457,6 +466,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     #[cfg(test)]
     fn fail_next_split_for_test(&mut self) {
         self.fail_next_split = true;
+    }
+
+    /// Record that this handle has written (or split-cleared) `bucket` since the last sync, so its
+    /// zero-CRC trailer is treated as a legitimate lazy-write marker rather than at-rest
+    /// corruption.
+    fn mark_unsynced(&mut self, bucket: u64) {
+        self.unsynced_buckets.insert(bucket);
+    }
+
+    /// True if this handle wrote `bucket` since the last sync (so a `Dirty` trailer on it is
+    /// expected).
+    fn is_unsynced(&self, bucket: u64) -> bool {
+        self.unsynced_buckets.contains(&bucket)
     }
 
     /// Number of keys hashed in this index.
@@ -614,12 +636,26 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 // A miss is the one outcome at-rest damage to this bucket could silently fabricate
                 // (a flipped slot no longer matches `key`). Only bucket 0 is CRC-checked at open
                 // and reads are otherwise CRC-free, so verify the bucket CRC before
-                // trusting the miss. `Dirty` (zero CRC) is a live unsynced write
-                // and is fine -- only `Corrupt` errors.
-                if crc_state(buf) == CrcState::Corrupt {
-                    return Err(FetchError::CorruptIndex(format!(
-                        "bucket {bucket} failed its CRC"
-                    )));
+                // trusting the miss. A `Dirty` (all-zero-CRC) trailer is a
+                // legitimate lazy-write marker ONLY for a bucket this handle wrote
+                // since the last sync; on a clean/read-only index no bucket is
+                // legitimately `Dirty` (a clean close CRC-stamps every one), so a `Dirty` bucket
+                // NOT in `unsynced_buckets` is at-rest damage (e.g. a zeroed page)
+                // — reject it rather than trusting the fabricated miss. `check_crc`
+                // admits the ~2^-32 legacy bucket whose genuine CRC is 0.
+                match crc_state(buf) {
+                    CrcState::Corrupt => {
+                        return Err(FetchError::CorruptIndex(format!(
+                            "bucket {bucket} failed its CRC"
+                        )))
+                    }
+                    CrcState::Dirty if !self.is_unsynced(bucket) && !check_crc(buf) => {
+                        return Err(FetchError::CorruptIndex(format!(
+                            "bucket {bucket} has an all-zero CRC on a bucket this handle did not \
+                             write (at-rest corruption, not a live unsynced write)"
+                        )))
+                    }
+                    _ => {}
                 }
                 Self::read_overflow_pos(buf)
             }
@@ -676,6 +712,25 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
+                // Mirror `find_in_bucket`: never gather+redistribute a bucket that is corrupt at
+                // rest (that would launder garbage into fresh buckets). A `Corrupt`
+                // trailer, or an unexpected `Dirty` (all-zero CRC on a bucket this
+                // handle did not write, i.e. at-rest damage), is corruption;
+                // `check_crc` admits the ~2^-32 legacy CRC==0 bucket.
+                match crc_state(buf) {
+                    CrcState::Corrupt => {
+                        return Err(AppendError::CorruptIndex(format!(
+                            "split source bucket {bucket} failed its CRC"
+                        )))
+                    }
+                    CrcState::Dirty if !self.is_unsynced(bucket) && !check_crc(buf) => {
+                        return Err(AppendError::CorruptIndex(format!(
+                            "split source bucket {bucket} has an all-zero CRC it was not written with \
+                             (at-rest corruption)"
+                        )))
+                    }
+                    _ => {}
+                }
                 Self::collect_from_buffer(buf, &mut out, &mut seen)?;
                 Self::read_overflow_pos(buf)
             }
@@ -705,6 +760,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                     )))
                 }
             };
+            // Overflow records are eagerly CRC'd at write time, so any CRC failure here is genuine
+            // corruption — do not redistribute its (garbage) elements into the fresh buckets.
+            if !check_crc(buf) {
+                return Err(AppendError::CorruptIndex(format!(
+                    "split source odx record at {overflow_pos} failed its CRC"
+                )));
+            }
             Self::collect_from_buffer(buf, &mut out, &mut seen)?;
             upper_bound = overflow_pos;
             overflow_pos = Self::read_overflow_pos(buf);
@@ -903,6 +965,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                     .to_string(),
             ));
         }
+        // Both buckets were just zeroed by this handle, so their all-zero CRC is a legitimate lazy
+        // marker (not at-rest damage): record them as unsynced so the read/collect/sync paths treat
+        // their `Dirty` trailer as expected. `save_to_bucket_buffer` (the redistribute writes
+        // below) bypasses the single-save guard, so mark them here.
+        self.mark_unsynced(split_bucket);
+        self.mark_unsynced(new_bucket);
 
         // Test-only: simulate a mid-split failure with both buckets already zeroed (the worst case
         // for element loss) so the caller's rollback is exercised.
@@ -939,7 +1007,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         let bucket = self.hash_to_bucket(key);
         let bucket_pos = self.bucket_pos(bucket);
-        self.save_to_bucket_inner(key, record_pos, bucket_pos)
+        self.save_to_bucket_inner(bucket, key, record_pos, bucket_pos)
     }
 
     /// Read-modify-write body of [`Self::save_to_bucket`]: rewrites the bucket in place through the
@@ -949,10 +1017,36 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// CRC still matches the bucket bytes).
     fn save_to_bucket_inner(
         &mut self,
+        bucket: u64,
         key: &[u8],
         record_pos: u64,
         bucket_pos: u64,
     ) -> Result<(), AppendError> {
+        // Before the FIRST mutation of a bucket this sync-cycle, require it to be CRC-valid at
+        // rest. Otherwise a `save()` into a bucket that is `Corrupt` (stale CRC) or `Dirty`
+        // at rest (a zeroed page) would overwrite it and the bulk CRC at `sync()` would
+        // stamp it `Valid` — laundering at-rest corruption into a permanent silent
+        // wrong-answer that even `bucket_crc_scan` can no longer see. Refusing here
+        // surfaces `CorruptIndex`, and the caller rebuilds from the WAL (the durable source
+        // of truth). `check_crc` admits the ~2^-32 legacy CRC==0 bucket. Once a bucket
+        // is in `unsynced_buckets` (written this cycle, legitimately `Dirty`) the check is skipped.
+        if !self.is_unsynced(bucket) {
+            let ok =
+                match self.hdx_file.slice(bucket_pos, Self::BUCKET_SIZE) {
+                    Some(buf) => matches!(crc_state(buf), CrcState::Valid) || check_crc(buf),
+                    None => return Err(AppendError::CorruptIndex(
+                        "hdx bucket is past the mapped end -- the index is truncated or corrupt"
+                            .to_string(),
+                    )),
+                };
+            if !ok {
+                return Err(AppendError::CorruptIndex(format!(
+                    "refusing to write bucket {bucket}: not CRC-valid at rest (writing it would \
+                     launder at-rest corruption); rebuild the index from the data log"
+                )));
+            }
+            self.mark_unsynced(bucket);
+        }
         self.save_to_bucket_buffer(key, record_pos, bucket_pos, true)?;
         // Zero the trailer to mark the bucket dirty (CRC'd in bulk at `sync()`); the zero also lets
         // recovery tell a dirty bucket from a corrupt one.
@@ -1022,7 +1116,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// while skipping untouched/clean buckets after a cheap 4-byte check — no CRC is computed for
     /// them. Overflow records in the odx were already CRC'd when appended.
     fn crc_dirty_buckets(&mut self) {
-        for bucket in 0..self.buckets() as u64 {
+        // Stamp ONLY the buckets this handle wrote/split-cleared since the last sync — never a
+        // `Dirty` bucket it did not touch. Iterating `0..buckets` (the old behavior) would re-stamp
+        // an at-rest zeroed bucket as `Valid`, laundering the corruption; restricting to
+        // the tracked set keeps that bucket `Dirty` so a later lookup / `bucket_crc_scan`
+        // still flags it. Also makes sync O(written), not O(buckets). The set is consumed
+        // here (cleared for the next cycle).
+        let unsynced = std::mem::take(&mut self.unsynced_buckets);
+        for bucket in unsynced {
             let pos = self.bucket_pos(bucket);
             if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
                 if crc_is_zero(buffer) {
@@ -1254,6 +1355,79 @@ mod tests {
             "out-of-range mapping must be CorruptIndex, got {res:?}"
         );
         assert!(!matches!(res, Err(FetchError::NotFound)));
+    }
+
+    /// A bucket zeroed AT REST (e.g. a lost/zeroed page) in a cleanly-sealed index must not be
+    /// laundered back to valid by a later sync, and a lookup that misses in it must surface
+    /// `CorruptIndex` — not a silent `NotFound`. A `Dirty` (zero-CRC) trailer is a legitimate
+    /// lazy-write marker ONLY for a bucket the handle wrote this cycle; on a sealed/read-only index
+    /// no bucket is legitimately `Dirty`.
+    #[test]
+    fn test_zeroed_bucket_not_laundered_and_errors_on_read() {
+        let tmp = TempDir::with_prefix("test_hdx_zeroed_bucket").expect("temp dir");
+        let path = tmp.path();
+        let k = {
+            let mut idx = open_index(path);
+            for i in 0..256u64 {
+                idx.save(key(i), i).expect("save");
+            }
+            idx.sync().expect("sync"); // all buckets now Valid; the unsynced set is cleared
+            let (k, bucket) = (0..256u64)
+                .map(key)
+                .map(|k| (k, idx.hash_to_bucket(k.as_slice())))
+                .find(|(_, b)| *b >= 1)
+                .expect("some key must land in a non-first bucket");
+            // Simulate at-rest damage: zero the whole bucket page (count=0, CRC trailer=0 ->
+            // Dirty).
+            let pos = idx.bucket_pos(bucket);
+            idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice").fill(0);
+            // Sync again: `crc_dirty_buckets` stamps only buckets THIS handle wrote (the set is
+            // empty), so the at-rest zeroed bucket is NOT re-stamped valid — no laundering.
+            idx.sync().expect("resync");
+            assert_eq!(
+                idx.bucket_crc_scan(),
+                BucketCrcReport { dirty: 1, corrupt: 0 },
+                "the at-rest zeroed bucket must stay dirty after sync (not laundered to valid)"
+            );
+            k
+        };
+        // Reopen READ-ONLY (empty unsynced set): a miss in the still-Dirty bucket is CorruptIndex.
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let mut ro: HdxIndex = HdxIndex::open_hdx_file(
+            path.join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .expect("reopen read-only");
+        assert!(
+            matches!(ro.load(k), Err(FetchError::CorruptIndex(_))),
+            "a lookup in an at-rest zeroed bucket must be CorruptIndex, not a silent NotFound"
+        );
+    }
+
+    /// A `save()` into a bucket that is not CRC-valid at rest (here: zeroed) must be refused with
+    /// `CorruptIndex`, rather than overwriting it and having the bulk CRC at `sync()` stamp it
+    /// valid — which would launder at-rest corruption into a permanent silent wrong-answer.
+    #[test]
+    fn test_save_into_at_rest_dirty_bucket_is_refused() {
+        let tmp = TempDir::with_prefix("test_hdx_write_guard").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        for i in 0..256u64 {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync"); // clears the unsynced set; all buckets Valid
+        let (k, bucket) = (0..256u64)
+            .map(key)
+            .map(|k| (k, idx.hash_to_bucket(k.as_slice())))
+            .find(|(_, b)| *b >= 1)
+            .expect("some key must land in a non-first bucket");
+        let pos = idx.bucket_pos(bucket);
+        idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("slice").fill(0);
+        assert!(
+            matches!(idx.save(k, 999), Err(AppendError::CorruptIndex(_))),
+            "a save into an at-rest dirty/corrupt bucket must be refused (no laundering)"
+        );
     }
 
     /// A broken split invariant must surface as corruption via `checked_sub`, not wrap to a huge

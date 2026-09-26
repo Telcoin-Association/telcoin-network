@@ -287,10 +287,11 @@ impl Display for PhysicalCorruption {
 /// (Deleting the dirs by hand is unsafe — a past epoch is only opened read-only and never rebuilds
 /// them on its own, so it would read as absent until repaired.)
 ///
-/// Note (known residual, not a format change): a fully-zeroed bucket page presents as `dirty`, and
-/// a live node's next `ordered_sync` would stamp a valid CRC over the zeros, "laundering" it into a
-/// valid empty bucket. This scan is the detector for that window; run it (via `db validate`) before
-/// restarting a node whose index is suspect.
+/// A fully-zeroed bucket page presents as `dirty`. This is now caught at runtime, not just here: a
+/// handle only stamps (at `ordered_sync`) the buckets it actually wrote this cycle, so it can no
+/// longer "launder" an at-rest zeroed bucket into a valid empty one, and a lookup that misses in
+/// such a bucket returns `CorruptIndex` (see `HdxIndex::unsynced_buckets`). This scan remains the
+/// offline detector; run it (via `db validate`) before restarting a node whose index is suspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexBucketScan {
     /// Bucket-CRC report for the consensus-header digest index (`hash`).

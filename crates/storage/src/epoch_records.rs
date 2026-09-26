@@ -1779,8 +1779,22 @@ impl Inner {
         &mut self,
         digest: EpochDigest,
     ) -> Result<Option<EpochCertificate>, FetchError> {
-        absent_to_none(self.cert_digests.load(digest.into()))?
-            .map_or(Ok(None), |pos| absent_to_none(self.certs.fetch(pos)))
+        let Some(pos) = absent_to_none(self.cert_digests.load(digest.into()))? else {
+            return Ok(None);
+        };
+        let Some(cert) = absent_to_none(self.certs.fetch(pos))? else {
+            return Ok(None);
+        };
+        // The hash index has no per-hit CRC; verify the fetched cert is actually keyed by the
+        // requested digest so a mis-keyed/damaged index entry can't return a cert for a different
+        // epoch (mirrors `record_by_digest` / `ConsensusPack::batch`).
+        if cert.epoch_hash != digest {
+            return Err(FetchError::CorruptIndex(format!(
+                "cert-digest index for {digest} resolved a certificate for {}",
+                cert.epoch_hash
+            )));
+        }
+        Ok(Some(cert))
     }
 
     fn contains_epoch(&self, epoch: Epoch) -> bool {
@@ -2184,6 +2198,25 @@ mod test {
         }
         let cert = EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
         (record, cert)
+    }
+
+    /// Build an [`EpochCertificate`] correctly keyed to `record` (`epoch_hash == record.digest()`)
+    /// but signed by `foreign_signers` instead of the record's own committee — so it is filed
+    /// and looked up cleanly (the digest matches) yet fails cryptographic verification against
+    /// `record`.
+    fn make_cert_signed_by(
+        record: &EpochRecord,
+        foreign_signers: &[TestSigner],
+    ) -> EpochCertificate {
+        let sigs: Vec<BlsSignature> =
+            foreign_signers.iter().map(|s| record.sign_vote(s).signature).collect();
+        let signature =
+            BlsAggregateSignature::aggregate(&sigs, true).expect("aggregate").to_signature();
+        let mut signed_authorities = RoaringBitmap::new();
+        for i in 0..foreign_signers.len() as u32 {
+            signed_authorities.push(i);
+        }
+        EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities }
     }
 
     #[tokio::test]
@@ -2906,6 +2939,32 @@ mod test {
         assert!(matches!(err, FetchError::CorruptIndex(_)), "unexpected error: {err:?}");
     }
 
+    /// If a cert-digest index slot is mis-keyed (points at another epoch's certificate — e.g.
+    /// at-rest damage to the stored offset), the by-digest read must fail loud (`CorruptIndex`)
+    /// instead of returning a certificate for the wrong digest.
+    #[test]
+    fn test_try_cert_by_digest_detects_wrong_digest() {
+        use crate::archive::{error::fetch::FetchError, index::Index as _};
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_cert_miskey").expect("temp dir");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (_rec1, cert1) = make_test_pair(1, &signers, rec0.digest());
+        inner.save_certificate(cert0.epoch_hash, cert0.clone()).expect("save cert0");
+        inner.save_certificate(cert1.epoch_hash, cert1.clone()).expect("save cert1");
+        // Point cert0's digest slot at cert1's stored offset (a mis-keyed/damaged index entry).
+        let pos_of_cert1 =
+            inner.cert_digests.load(cert1.epoch_hash.into()).expect("load cert1 slot");
+        inner
+            .cert_digests
+            .save(cert0.epoch_hash.into(), pos_of_cert1)
+            .expect("overwrite cert0 slot");
+        let err =
+            inner.try_cert_by_digest(cert0.epoch_hash).expect_err("mis-keyed cert slot must error");
+        assert!(matches!(err, FetchError::CorruptIndex(_)), "unexpected error: {err:?}");
+    }
+
     /// After an unclean reopen of a DB that has records but no certs, the header-only
     /// padded `epoch_certs.pack` must be trimmed so a later cert append does not seal a 1 MiB zero
     /// gap that breaks every sequential walk (`read_certs_from_pack`, `db load-state` ->
@@ -3499,8 +3558,10 @@ mod test {
         let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
         let (rec0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
         db.save_record(rec0.clone()).await.expect("save record without cert");
-        let (_other_rec, other_cert) = make_test_pair(0, &others, EpochDigest::default());
-        db.save_certificate(rec0.digest(), other_cert).await.expect("file foreign cert");
+        // A cert correctly keyed to rec0 (so the by-digest lookup returns it) but signed by a
+        // DIFFERENT committee, so it fails cryptographic verification against rec0's committee.
+        let foreign_cert = make_cert_signed_by(&rec0, &others);
+        db.save_certificate(rec0.digest(), foreign_cert).await.expect("file foreign cert");
 
         let err = db
             .certified_record_by_epoch(0)
