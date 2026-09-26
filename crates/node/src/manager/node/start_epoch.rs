@@ -24,7 +24,10 @@
 
 use super::{read_num_workers_at_epoch_entry, run_epoch::retry_provider_faults};
 use crate::{
-    engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
+    engine::{ExecutionNode, WorkerState},
+    manager::EpochManager,
+    primary::PrimaryNode,
+    worker::WorkerNode,
     EngineToPrimaryRpc,
 };
 use eyre::{eyre, OptionExt, WrapErr as _};
@@ -434,7 +437,8 @@ where
     ///
     /// Refresh each active handle before creating its pool, RPC server, validator and network.
     /// Sequential initialization preserves the engine's contiguous worker indexing. Extra
-    /// configured swarms stay idle until a future epoch activates their ids.
+    /// configured swarms stay idle until a future epoch activates their ids. Workers removed
+    /// from the committee stop their RPC listeners before the new epoch's workers start.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
@@ -452,6 +456,8 @@ where
                 handle.update_task_spawner(epoch_task_spawner.clone());
                 handle.update_epoch(consensus_config.committee().epoch());
             });
+
+        engine.deactivate_workers_above(consensus_config.committee().number_of_workers()).await;
 
         // Follow mode changes while workers initialize and wait for network peers.
         let engine_for_sync_status = engine.clone();
@@ -518,29 +524,34 @@ where
             // Also initialize if workers are empty: this happens when the first epoch returns
             // early from replay_missed_consensus (epoch boundary hit) before create_consensus
             // is reached, leaving workers uninitialized.
-            if !engine.is_worker_initialized(worker_id).await {
-                engine_to_primary.node_info.worker_network_key =
-                    self.key_config.worker_network_public_key(worker_id);
-                engine_to_primary.node_info.worker_external_address = self
-                    .builder
-                    .tn_config
-                    .node_info
-                    .worker_network_address(worker_id)
-                    .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
-                    .clone();
-                engine
-                    .initialize_worker_components(
-                        worker_id,
-                        network_handle.clone(),
-                        engine_to_primary,
-                        base_fee_container,
-                        worker_base_fee,
-                    )
-                    .await?;
-            } else {
-                // We updated our epoch task spawner so make sure worker network tasks are
-                // restarted.
-                engine.respawn_worker_network_tasks(worker_id, network_handle.clone()).await?;
+            match engine.worker_state(worker_id).await {
+                WorkerState::Uninitialized => {
+                    engine_to_primary.node_info.worker_network_key =
+                        self.key_config.worker_network_public_key(worker_id);
+                    engine_to_primary.node_info.worker_external_address = self
+                        .builder
+                        .tn_config
+                        .node_info
+                        .worker_network_address(worker_id)
+                        .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
+                        .clone();
+                    engine
+                        .initialize_worker_components(
+                            worker_id,
+                            network_handle.clone(),
+                            engine_to_primary,
+                            base_fee_container,
+                            worker_base_fee,
+                        )
+                        .await?;
+                }
+                WorkerState::Stopped | WorkerState::Running => {
+                    // Restore this epoch's fee before a removed worker starts accepting again.
+                    engine.restart_worker_rpc(worker_id, base_fee).await?;
+                    // We updated our epoch task spawner so make sure worker network tasks are
+                    // restarted.
+                    engine.respawn_worker_network_tasks(worker_id, network_handle.clone()).await?;
+                }
             }
         }
 
@@ -1120,7 +1131,8 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
-    /// The epoch startup path initializes every worker, then reuses its RPC and pool on re-entry.
+    /// Epoch entry reuses active workers and stops and reactivates removed workers over their
+    /// pools.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
@@ -1132,8 +1144,8 @@ mod tests {
         use tn_network_libp2p::types::NetworkCommand;
         use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
         use tn_storage::mem_db::MemDatabase;
-        use tn_test_utils::CommitteeFixture;
-        use tn_types::{BlsKeypair, P2pNode};
+        use tn_test_utils::{wait_until, CommitteeFixture};
+        use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
 
         tn_reth::init_reth_defaults();
         let temp = tempfile::TempDir::new()?;
@@ -1178,13 +1190,14 @@ mod tests {
         let engine = ExecutionNode::new(&builder, reth_env)?;
         let db = MemDatabase::default();
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
-            config,
+            config.clone(),
             db.clone(),
             keys.clone(),
-            committee,
+            committee.clone(),
             NetworkConfig::default(),
         )?;
-        let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
+        let mut manager =
+            EpochManager::new(builder, datadir.clone(), db.clone(), keys, "test").await?;
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
         let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
@@ -1241,6 +1254,7 @@ mod tests {
         );
         accumulator.base_fee(0).set_base_fee(100_000_001);
         accumulator.base_fee(1).set_base_fee(100_000_002);
+        assert_eq!(engine.worker_state(1).await, WorkerState::Uninitialized);
         let mut epoch_tasks = TaskManager::default();
         let workers = manager
             .spawn_worker_node_components(
@@ -1255,8 +1269,11 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_eq!(engine.worker_state(1).await, WorkerState::Running);
+        let rpc_zero = engine.worker_http_local_address(&0).await?;
         let rpc_one = engine.worker_http_local_address(&1).await?;
-        assert!(rpc_one.is_some());
+        let worker_one_address = rpc_one.ok_or_else(|| eyre!("worker one address"))?;
+        let retained_pool = engine.get_worker_transaction_pool(&1).await?;
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
         let info: serde_json::Value = client.request("tn_info", jsonrpsee::rpc_params![]).await?;
         assert_eq!(
@@ -1277,15 +1294,15 @@ mod tests {
         epoch_tasks.abort_all_tasks();
         epoch_tasks.wait_for_task_shutdown().await;
         drop(epoch_tasks);
-        let next_tasks = TaskManager::default();
+        let mut next_tasks = TaskManager::default();
         accumulator.base_fee(1).set_base_fee(100_000_003);
         let restarted = manager
             .spawn_worker_node_components(
                 &consensus_config,
                 &engine,
                 next_tasks.get_spawner(),
-                rpc,
-                accumulator,
+                rpc.clone(),
+                accumulator.clone(),
                 HashSet::new(),
             )
             .await?;
@@ -1294,6 +1311,85 @@ mod tests {
         assert_eq!(
             engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
             100_000_003
+        );
+
+        drop(restarted);
+        next_tasks.update_tasks();
+        next_tasks.abort_all_tasks();
+        next_tasks.wait_for_task_shutdown().await;
+        drop(next_tasks);
+        accumulator.set_num_workers(1);
+        let smaller_committee = ConsensusConfig::new_with_committee_for_test(
+            config,
+            db,
+            manager.key_config.clone(),
+            committee.with_num_workers(NonZeroUsize::MIN),
+            NetworkConfig::default(),
+        )?;
+        let mut shrink_tasks = TaskManager::default();
+        let shrunk = manager
+            .spawn_worker_node_components(
+                &smaller_committee,
+                &engine,
+                shrink_tasks.get_spawner(),
+                rpc.clone(),
+                accumulator.clone(),
+                HashSet::new(),
+            )
+            .await?;
+        assert_eq!(shrunk.len(), 1);
+        assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+        assert!(!engine.is_worker_initialized(1).await);
+        assert!(engine.worker_http_client(&1).await.is_err());
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
+        assert!(engine.is_worker_initialized(0).await);
+        assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+        wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
+            Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
+        })
+        .await?;
+
+        // Repeated deactivation and mode updates must not make the removed worker ready.
+        engine.deactivate_workers_above(1).await;
+        engine.set_workers_syncing(false).await;
+        assert!(!engine.is_worker_initialized(1).await);
+        drop(shrunk);
+        shrink_tasks.update_tasks();
+        shrink_tasks.abort_all_tasks();
+        shrink_tasks.wait_for_task_shutdown().await;
+        drop(shrink_tasks);
+
+        accumulator.set_num_workers(2);
+        accumulator.base_fee(1).set_base_fee(100_000_004);
+        let regrow_tasks = TaskManager::default();
+        let regrown = manager
+            .spawn_worker_node_components(
+                &consensus_config,
+                &engine,
+                regrow_tasks.get_spawner(),
+                rpc,
+                accumulator,
+                HashSet::new(),
+            )
+            .await?;
+        assert_eq!(regrown.len(), 2);
+        assert!(engine.is_worker_initialized(1).await);
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
+        assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
+        let reactivated =
+            engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
+        let syncing: serde_json::Value =
+            reactivated.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
+        assert_eq!(syncing, serde_json::Value::Bool(false));
+        let history: serde_json::Value = reactivated
+            .request("eth_feeHistory", jsonrpsee::rpc_params!["0x1", "latest", Vec::<f64>::new()])
+            .await?;
+        assert_eq!(
+            history
+                .get("baseFeePerGas")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|fees| fees.last()),
+            Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
         Ok(())
     }
