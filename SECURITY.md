@@ -35,6 +35,15 @@ Please include:
 - Theoretical vulnerabilities without proof of concept
 - Social engineering attacks
 
+## Carried transport dependencies
+
+Maintainers carrying changes to transport dependencies must complete the
+[transport patch record](docs/transport-patches/README.md), including advisory
+ownership and evidence for the dependency's actual Cargo source form. Dependency
+vulnerabilities should still be reported to the dependency maintainer, as described
+above; confidential Telcoin impact and coordination use this policy's reporting
+channel. Keep private advisory details and TLS key material out of public records.
+
 ## Disclosure Policy
 
 - All vulnerability reports and associated communications are considered confidential.
