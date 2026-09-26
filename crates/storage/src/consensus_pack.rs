@@ -521,9 +521,10 @@ impl ConsensusPack {
             }
             Err(_) => false,
         };
+        let validation = crate::pack_validate::validate_pack_file(&data_file, epoch, None).ok();
         let validates_clean = matches!(
-            crate::pack_validate::validate_pack_file(&data_file, epoch, None),
-            Ok(report) if report.verdict == crate::pack_validate::Verdict::Valid
+            &validation,
+            Some(report) if report.verdict == crate::pack_validate::Verdict::Valid
         );
         if opens_clean && validates_clean {
             return Ok(EpochRepair::Healthy);
@@ -532,7 +533,24 @@ impl ConsensusPack {
         let plan = match &corruption {
             // The data log is physically sound; open_static failed on the indexes / seal / a length
             // disagreement — all of which recover_pack + the index rebuild fix.
-            None => "rebuild indexes and re-seal".to_string(),
+            None => {
+                // ...UNLESS validation flagged a defect in the data log itself (chain break, bad
+                // number, missing/extra/unsorted batches, empty sub-dag, epoch-meta mismatch): a
+                // rebuild-from-log cannot fix that, so report it Unrepairable up front -- on BOTH
+                // the dry run and the apply -- rather than letting the dry run say
+                // WouldRepair and the apply wipe+rebuild the indexes only to end
+                // Unrepairable (dry run must predict apply).
+                if validation.as_ref().is_some_and(|r| r.has_data_logical_issue()) {
+                    return Ok(EpochRepair::Unrepairable(format!(
+                        "epoch {epoch}: the data log has a logical defect a rebuild cannot fix (a \
+                         chain break, non-sequential number, missing/extra/unsorted batches, an empty \
+                         sub-dag, or an epoch-meta mismatch); the indexes are not the problem. Re-sync \
+                         the epoch from peers.\n{}",
+                        validation.as_ref().map(ToString::to_string).unwrap_or_default()
+                    )));
+                }
+                "rebuild indexes and re-seal".to_string()
+            }
             Some(c) => match &c.kind {
                 CorruptionKind::TornTrailingTail => {
                     "truncate the torn trailing record and rebuild indexes".to_string()
@@ -1069,6 +1087,41 @@ pub(crate) fn attested_output_survives_past(data_path: &Path, epoch: Epoch, from
         .iter()
         .filter(|&&pos| pos > from)
         .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
+}
+
+/// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
+/// read-only WAL replay (no index is read or written). This is the safe point an unclean pack's
+/// torn tail truncates back to; `db validate` bounds its logical prefix walk here so an in-flight
+/// output's unwritten batches are not misreported as absent. Read-only; opens its own handle.
+pub fn wal_consistent_end(data_path: &Path, epoch: Epoch) -> Result<u64, PackError> {
+    let data = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    )?;
+    let base_dir = data_path.parent().ok_or_else(|| {
+        PackError::ReadError(format!("data path {} has no parent dir", data_path.display()))
+    })?;
+    Inner::replay_wal(&data, base_dir, None)
+}
+
+/// Read-only peek of a pack's on-disk format `version` and whether it was NOT cleanly sealed
+/// (`opened_unclean` — no clean-close sentinel). `None` if the data file cannot be opened. Used by
+/// the `db validate` current-epoch warning to flag any pack a live writer may still be finishing
+/// (the live current epoch, or a padded-unsealed previous epoch mid-handoff), whatever its epoch
+/// number.
+pub fn pack_unsealed_version(data_path: &Path, epoch: Epoch) -> Option<(u16, bool)> {
+    let data = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    )
+    .ok()?;
+    Some((data.version(), data.opened_unclean()))
 }
 
 #[derive(Debug)]
@@ -5738,6 +5791,154 @@ pub(crate) mod test {
             assert!(ro.get_consensus_output(i).await.is_ok(), "output {i} must read back");
         }
         ro.close().await;
+    }
+
+    /// F13: `validate_pack_file` cross-checks every derived index entry against the data log, so a
+    /// zeroed BLOOM filter (which the bucket-CRC scan cannot see — the buckets are still valid) now
+    /// flips the verdict to `Invalid` via an `IndexMismatch`, and `db repair` rebuilds it back to
+    /// `Valid`/`Healthy`. Before the cross-check this reported `Valid`+`Healthy` while every lookup
+    /// silently missed.
+    #[tokio::test]
+    async fn test_validate_cross_check_catches_zeroed_bloom() {
+        use crate::pack_validate::{validate_pack_file, PackIssue, Verdict};
+
+        let temp_dir = TempDir::with_prefix("test_xcheck_bloom").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // Control: a clean pack validates and repairs as Healthy.
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Valid,
+            "a clean pack must validate"
+        );
+
+        // Zero ONLY the bloom region of the consensus (hash) index — the buckets after it stay CRC
+        // valid, so the bucket scan still passes; only the cross-check can catch this.
+        let hdx = temp_dir.path().join("epoch-0").join("hash").join("index.hdx");
+        {
+            // hdx layout: [68-byte header][BLOOM_SIZE_BYTES bloom][buckets...].
+            const HDX_HEADER: usize = 68;
+            let bloom = crate::archive::digest_index::bloom::BLOOM_SIZE_BYTES;
+            let mut bytes = std::fs::read(&hdx).expect("read hdx");
+            for b in &mut bytes[HDX_HEADER..HDX_HEADER + bloom] {
+                *b = 0;
+            }
+            std::fs::write(&hdx, &bytes).expect("write hdx");
+        }
+
+        let report = validate_pack_file(&data_path, 0, None).expect("validate");
+        assert_eq!(report.verdict, Verdict::Invalid, "zeroed bloom must be Invalid: {report}");
+        assert!(
+            report.issues.iter().any(|i| matches!(i, PackIssue::IndexMismatch { .. })),
+            "must be flagged as an index/log mismatch: {report}"
+        );
+        assert!(
+            report.index_scan.is_none_or(|s| s.is_clean()),
+            "the bucket scan must be clean — this is a bloom (cross-check) miss, not a bucket defect"
+        );
+
+        // `db repair` rebuilds the index (bloom included) and it validates clean again.
+        match ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("repair") {
+            EpochRepair::Repaired(_) => {}
+            other => panic!("expected Repaired, got {other:?}"),
+        }
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("re-validate").verdict,
+            Verdict::Valid,
+            "repair must rebuild the bloom back to Valid"
+        );
+    }
+
+    /// F33: a tear INSIDE the in-flight output (header + some batches durable, the last batch torn
+    /// — the ordinary crash shape) must not report the unwritten batches as false "absent".
+    /// Bounding the prefix walk at the WAL `consistent_end` (last COMPLETE output) is Valid;
+    /// the old bound at the first-bad-record offset falsely reported INVALID with absent
+    /// batches.
+    #[tokio::test]
+    async fn test_validate_bounded_at_consistent_end_no_false_absent() {
+        use crate::pack_validate::{
+            classify_physical_corruption, validate_pack_file_bounded, BatchClass, Verdict,
+        };
+
+        let temp_dir = TempDir::with_prefix("test_tear_in_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // Make it an unclean pack with a tear inside the final output: strip the sentinel, then lop
+        // one byte off the last batch record (its CRC read now falls short).
+        strip_sentinel(&data_path);
+        {
+            let f = OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let len = f.metadata().expect("meta").len();
+            f.set_len(len - 1).expect("truncate 1 byte");
+        }
+
+        let corruption = classify_physical_corruption(&data_path, 0)
+            .expect("classify")
+            .expect("a tear was introduced");
+        assert!(
+            corruption.kind.is_truncatable(),
+            "a torn in-flight tail must be truncatable, got {:?}",
+            corruption.kind
+        );
+
+        // Old bound (first bad record offset) walks into the incomplete output and false-reports
+        // its unwritten batches as absent.
+        let at_offset = validate_pack_file_bounded(&data_path, 0, None, Some(corruption.offset))
+            .expect("bounded at offset");
+        assert_eq!(at_offset.verdict, Verdict::Invalid, "old bound should show the false-absent");
+        assert!(
+            at_offset.missing_batch_count(BatchClass::Absent) > 0,
+            "old bound should report absent batches (the false positive we are fixing)"
+        );
+
+        // New bound (WAL consistent end = last complete output) is clean.
+        let end = super::wal_consistent_end(&data_path, 0).expect("consistent end");
+        let at_end =
+            validate_pack_file_bounded(&data_path, 0, None, Some(end)).expect("bounded at end");
+        assert_eq!(
+            at_end.verdict,
+            Verdict::Valid,
+            "bounding at the WAL consistent end must be Valid (no false-absent): {at_end}"
+        );
+    }
+
+    /// F37: `pack_unsealed_version` reports whether a pack carries the clean-close sentinel — the
+    /// signal the `db validate` warning uses to flag a pack a writer may still be finishing,
+    /// whatever its epoch number.
+    #[tokio::test]
+    async fn test_pack_unsealed_version_reports_seal_state() {
+        let temp_dir = TempDir::with_prefix("test_unsealed_probe").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // A cleanly-sealed pack reports sealed (opened_unclean == false).
+        assert_eq!(
+            super::pack_unsealed_version(&data_path, 0),
+            Some((PACK_VERSION, false)),
+            "a sealed pack must report not-unsealed"
+        );
+
+        // After stripping the sentinel it reports unsealed.
+        strip_sentinel(&data_path);
+        assert_eq!(
+            super::pack_unsealed_version(&data_path, 0),
+            Some((PACK_VERSION, true)),
+            "a sentinel-less pack must report unsealed"
+        );
     }
 
     /// New packs are written at the current `PACK_VERSION`, the sentinel-era format: a freshly

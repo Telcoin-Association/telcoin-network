@@ -28,10 +28,15 @@ use tn_reth::{
 };
 use tn_storage::{
     consensus::ConsensusChain,
-    consensus_pack::{ConsensusPack, EpochMigrate, EpochRepair, DATA_NAME},
+    consensus_pack::{
+        pack_unsealed_version, wal_consistent_end, ConsensusPack, EpochMigrate, EpochRepair,
+        DATA_NAME,
+    },
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
-    pack_validate::{classify_physical_corruption, validate_pack_file, validate_pack_file_bounded},
+    pack_validate::{
+        classify_physical_corruption, validate_pack_file, validate_pack_file_bounded, Verdict,
+    },
 };
 use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -146,17 +151,28 @@ impl DbValidateArgs {
             print!("{corruption}");
             // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
             // committed prefix before it must still be logically checked — otherwise `db validate`
-            // reports nothing useful for the normal shape of any crashed current epoch. Walk the
-            // prefix bounded to the corruption offset and print that report too.
+            // reports nothing useful for the normal shape of any crashed current epoch. Bound the
+            // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
+            // first bad record offset: a tear inside the in-flight output would
+            // otherwise report that output's unwritten batches as false "absent" and
+            // flip the verdict INVALID right after "SAFE".
+            let mut prefix_invalid = false;
             if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
-                eprintln!(
-                    "\nValidating the intact prefix before the tear (up to byte {})...",
-                    corruption.offset
-                );
-                match validate_pack_file_bounded(&data_file, epoch, None, Some(corruption.offset)) {
-                    Ok(report) => print!("{report}"),
+                let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
+                eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
+                match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
+                    Ok(report) => {
+                        prefix_invalid = report.verdict == Verdict::Invalid;
+                        print!("{report}");
+                    }
                     Err(e) => eprintln!("bounded validation of the intact prefix failed: {e}"),
                 }
+            }
+            // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
+            // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
+            // problem → non-zero exit so scripts/operators notice.
+            if !corruption.kind.is_truncatable() || prefix_invalid {
+                bail!("pack {} is corrupt (see report above)", data_file.display());
             }
             return Ok(());
         }
@@ -166,6 +182,11 @@ impl DbValidateArgs {
 
         // Report goes to stdout (tracing/logs go to stderr/file).
         print!("{report}");
+        // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
+        // corrupt one by exit status.
+        if report.verdict == Verdict::Invalid {
+            bail!("pack {} is INVALID (see report above)", data_file.display());
+        }
         Ok(())
     }
 }
@@ -206,21 +227,34 @@ fn resolve_data_file_and_epoch(
     Ok((data_file, epoch))
 }
 
-/// Best-effort warning when `data_file` is the CURRENT/latest epoch's pack — the one a running node
-/// holds open for append. `db validate` maps it read-only, so a node truncating (on epoch-close) or
-/// growing it concurrently can SIGBUS this process. Only fires for the standard
-/// `<epochs>/epoch-NN/data` layout (so the sibling epochs can be listed); a bare path elsewhere
-/// falls back to the arg-help caveat. Never refuses — validation is read-only and is a valid
-/// operation once the node is stopped.
+/// Best-effort warning when `data_file` is a pack a running node may still be WRITING — which
+/// `db validate` maps read-only, so a concurrent truncate/grow could SIGBUS this process. Past
+/// epochs are safe to validate live ONCE SEALED, but there is no single "current epoch" number:
+/// just after an epoch transition the previous epoch is briefly padded-and-unsealed while it
+/// finishes closing, and a catching-up node holds an older epoch open while newer epoch dirs
+/// already exist. So warn on two signals, whatever the epoch number: (a) it is the highest
+/// `epoch-NN` dir (the usual live epoch), or (b) the pack carries no clean-close sentinel
+/// (`opened_unclean` — a writer is still finishing it). Never refuses — validation is read-only and
+/// is valid once the node is stopped.
 fn warn_if_current_epoch(data_file: &Path, epoch: Epoch) {
-    let Some(epochs_dir) = data_file.parent().and_then(Path::parent) else { return };
-    let Ok(all) = ConsensusPack::epoch_dirs(epochs_dir) else { return };
-    if all.last().copied() == Some(epoch) {
+    let is_highest = data_file
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
+        .is_some_and(|all| all.last().copied() == Some(epoch));
+    // `None` if the pack cannot be opened — leave that to the classifier/validator below.
+    let unsealed = matches!(pack_unsealed_version(data_file, epoch), Some((_, true)));
+    if is_highest || unsealed {
+        let why = if is_highest {
+            "it is the current/latest epoch a running node holds open for append"
+        } else {
+            "it has no clean-close sentinel — a writer may still be finishing it (an epoch just \
+             transitioned, or a catching-up node holds it open)"
+        };
         eprintln!(
-            "WARNING: epoch {epoch} is the current/latest epoch — a running node holds this pack \
-             open for append. `db validate` maps it read-only; if the node truncates or grows the \
-             file concurrently this command can crash (SIGBUS). Validate the current epoch only with \
-             the node STOPPED. (Node data is not modified either way.)"
+            "WARNING: epoch {epoch} may be written by a running node ({why}). `db validate` maps it \
+             read-only; if the node truncates or grows the file concurrently this command can crash \
+             (SIGBUS). Validate it only with the node STOPPED. (Node data is not modified either way.)"
         );
     }
 }
@@ -320,7 +354,8 @@ impl DbRepairArgs {
             // (`WouldRepair`); the two variants are mutually exclusive per invocation, and the
             // summary verb below reflects which one actually ran.
             let mut actionable = 0usize;
-            let mut lost = 0usize;
+            let mut unrepairable = 0usize;
+            let mut errored = 0usize;
             for epoch in &targets {
                 match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
                     Ok(EpochRepair::Healthy) => println!("epoch {epoch}: OK"),
@@ -333,11 +368,11 @@ impl DbRepairArgs {
                         println!("epoch {epoch}: would repair — {what}");
                     }
                     Ok(EpochRepair::Unrepairable(why)) => {
-                        lost += 1;
+                        unrepairable += 1;
                         println!("epoch {epoch}: UNREPAIRABLE — {why}");
                     }
                     Err(e) => {
-                        lost += 1;
+                        errored += 1;
                         println!("epoch {epoch}: ERROR — {e}");
                     }
                 }
@@ -358,10 +393,13 @@ impl DbRepairArgs {
                              left them inconsistent)"
                         );
                     }
-                    Err(e) => println!(
-                        "epoch-records DB: could not open to heal ({e}); re-sync/restore may be \
-                         required"
-                    ),
+                    Err(e) => {
+                        errored += 1;
+                        println!(
+                            "epoch-records DB: could not open to heal ({e}); re-sync/restore may be \
+                             required"
+                        );
+                    }
                 }
             } else {
                 println!("epoch-records DB: would be opened and auto-healed with `--force`");
@@ -369,8 +407,17 @@ impl DbRepairArgs {
 
             let verb = if self.force { "repaired" } else { "to repair (dry run)" };
             println!(
-                "\nsummary: {actionable} epoch(s) {verb}, {lost} unrepairable (data loss / re-sync)."
+                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (data loss / \
+                 re-sync), {errored} error(s)."
             );
+            // Non-zero exit when anything could not be made healthy, so automation can distinguish a
+            // clean datadir from one needing attention (a dry run that only found `WouldRepair` items
+            // is still success — nothing is wrong yet that this tool refused to handle).
+            if unrepairable > 0 || errored > 0 {
+                bail!(
+                    "{unrepairable} epoch(s) unrepairable, {errored} error(s) (see report above)"
+                );
+            }
             Ok::<(), eyre::Report>(())
         })?;
         Ok(())

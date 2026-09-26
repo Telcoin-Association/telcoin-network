@@ -43,6 +43,7 @@ use crate::{
         digest_index::{BucketCrcReport, HdxIndex},
         error::fetch::FetchError,
         fxhasher::FxHasher,
+        index::Index as _,
         pack::{DataHeader, Pack, PackCompression},
         pack_iter::PackIter,
     },
@@ -143,6 +144,16 @@ pub enum PackIssue {
         /// Which index and the underlying open error.
         detail: String,
     },
+    /// A derived index does not agree with the data log: a record present in the log does not
+    /// resolve to its logged offset through the digest index. Unlike [`IndexBucketScan`]
+    /// (which only CRC-scans the main hdx buckets), this catches a corrupt odx overflow record
+    /// or a damaged/zeroed bloom filter — both of which pass the bucket scan yet make lookups
+    /// miss. The data log is intact; the index must be rebuilt (`db repair --epoch N
+    /// --force`).
+    IndexMismatch {
+        /// What disagreed (record kind, log offset, and the index's answer).
+        detail: String,
+    },
 }
 
 /// Overall verdict for a pack file.
@@ -178,7 +189,10 @@ pub enum CorruptionKind {
     /// unreachable without the meta. Data loss for this epoch.
     CorruptMetaWithData,
     /// A record past the meta is unreadable and no complete record follows: a torn trailing tail.
-    /// Truncatable — `recover_pack` drops it automatically on the next append-open.
+    /// Truncatable — but only the CURRENT epoch self-heals (the node append-opens it and
+    /// `recover_pack` drops the tail). A PAST epoch is only ever `open_static`'d, which refuses an
+    /// unsealed pack and never heals it, so it keeps failing `CorruptPack` until an operator runs
+    /// `db repair --epoch N --force` with the node stopped.
     TornTrailingTail,
     /// A record is unreadable and complete records still follow: mid-log corruption. The damaged
     /// record and everything after it are lost.
@@ -247,8 +261,10 @@ impl Display for PhysicalCorruption {
             ),
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
-                "SAFE — `recover_pack` truncates this unacked tail automatically on the next \
-                 append-open; no action needed."
+                "truncatable unacked tail. If this is the CURRENT/latest epoch, the node heals it \
+                 automatically on the next append-open (no action needed). If it is a PAST epoch, the \
+                 node will NOT heal it (past epochs are only opened read-only) — stop the node and run \
+                 `telcoin-network db repair --epoch N --force`."
             ),
             CorruptionKind::CorruptMetaWithData
             | CorruptionKind::MidLogCorruption
@@ -266,8 +282,10 @@ impl Display for PhysicalCorruption {
 /// [`HdxIndex::bucket_crc_scan`]. `dirty` buckets are written-but-unstamped (a zeroed CRC trailer);
 /// on a cleanly-closed index that should be `0` — a non-zero count means the index was not synced
 /// or a bucket page was lost/zeroed. `corrupt` buckets have a non-zero CRC that fails to verify
-/// (bit rot). Either way the *data log is intact* (the index is rebuildable): the fix is to remove
-/// the `hash`/`bhash` dirs so the index rebuilds from the data WAL on next open.
+/// (bit rot). Either way the *data log is intact* (the index is rebuildable): the fix is to stop
+/// the node and run `db repair --epoch N --force`, which rebuilds the index from the data WAL.
+/// (Deleting the dirs by hand is unsafe — a past epoch is only opened read-only and never rebuilds
+/// them on its own, so it would read as absent until repaired.)
 ///
 /// Note (known residual, not a format change): a fully-zeroed bucket page presents as `dirty`, and
 /// a live node's next `ordered_sync` would stamp a valid CRC over the zeros, "laundering" it into a
@@ -397,7 +415,10 @@ pub fn validate_pack_file_bounded(
     if let Some(bound) = read_bound {
         pack.set_read_bound(bound);
     }
-    validate_pack_file_impl(path, pack, epoch, previous)
+    // A bounded walk validates the intact PREFIX of an unclean (torn-tail) pack, whose sidecar
+    // indexes legitimately lag the data log — so dirty buckets are expected there and the full
+    // index-vs-log cross-check would spuriously fail. Both are gated on this flag.
+    validate_pack_file_impl(path, pack, epoch, previous, read_bound.is_some())
 }
 
 fn validate_pack_file_impl(
@@ -405,6 +426,7 @@ fn validate_pack_file_impl(
     pack: Pack<PackRecord>,
     epoch: Epoch,
     previous: Option<&EpochRecord>,
+    bounded: bool,
 ) -> Result<PackValidationReport, PackError> {
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = BoundedIssues::default();
@@ -458,7 +480,15 @@ fn validate_pack_file_impl(
     // Best-effort: also scan the sidecar digest indexes' bucket CRCs — the one detector for a
     // lost/corrupt or zeroed bucket page, which nothing else runs (`files_consistent` only compares
     // lengths, and the data-stream walk above ignores the indexes entirely).
-    scan_index_buckets(path, pack.header(), &mut report);
+    scan_index_buckets(path, pack.header(), bounded, &mut report);
+    // On a sealed pack (its indexes are synced by the clean close) also cross-check every derived
+    // index entry against the data log: this is what makes a `Valid`/`Healthy` verdict mean
+    // "every derived index agrees with the log", catching an odx overflow record or a zeroed
+    // bloom that the bucket scan cannot see. Skipped for a bounded/unclean walk (indexes
+    // legitimately lag there).
+    if !bounded && !pack.opened_unclean() {
+        cross_check_indexes(path, &pack, &mut report);
+    }
     Ok(report)
 }
 
@@ -468,7 +498,12 @@ fn validate_pack_file_impl(
 /// `index_scan = None` (bare-data-file validation); an unreadable index becomes an issue. Any dirty
 /// or corrupt bucket flips the verdict to `Invalid` even when the data stream is clean — the data
 /// is intact but the index must be rebuilt.
-fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackValidationReport) {
+fn scan_index_buckets(
+    data_path: &Path,
+    header: &DataHeader,
+    bounded: bool,
+    report: &mut PackValidationReport,
+) {
     let Some(dir) = data_path.parent() else { return };
     let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
     let batch_dir = dir.join(BATCH_DIGEST_NAME);
@@ -498,7 +533,16 @@ fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackVa
     let batch = scan(batch_dir, "batch (bhash)");
     if let (Some(consensus), Some(batch)) = (consensus, batch) {
         let index_scan = IndexBucketScan { consensus, batch };
-        if !index_scan.is_clean() {
+        // On a bounded walk (the intact prefix of an unclean/torn-tail pack) the indexes are not
+        // yet synced, so DIRTY (written-but-unstamped) buckets are expected and must not
+        // flip the verdict. CORRUPT buckets (a non-zero CRC that fails) are still real
+        // damage on any pack.
+        let index_problem = if bounded {
+            index_scan.consensus.corrupt > 0 || index_scan.batch.corrupt > 0
+        } else {
+            !index_scan.is_clean()
+        };
+        if index_problem {
             report.verdict = Verdict::Invalid;
         }
         report.index_scan = Some(index_scan);
@@ -507,6 +551,92 @@ fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackVa
     // keep `index_scan = None` so the report shows the read failure rather than partial counts.
     if !report.issues.is_empty() {
         report.verdict = Verdict::Invalid;
+    }
+}
+
+/// Cross-check every derived digest-index entry against the data log: re-walk the log and confirm
+/// each consensus header resolves through the `hash` index to its logged offset, and each batch
+/// resolves through the `bhash` index. This catches corruption the bucket-CRC scan cannot — a
+/// corrupt odx overflow record (a `load` that walks the chain errors) and a damaged/zeroed bloom (a
+/// `load` on a known-present digest returns a false miss) — so a `Valid` verdict means every lookup
+/// path agrees with the log. Read-only; opens its own index handles. Best-effort: absent/unreadable
+/// index dirs are left to [`scan_index_buckets`]. Mismatches are bounded to `MAX_MISMATCHES`
+/// reported rows.
+fn cross_check_indexes(
+    data_path: &Path,
+    pack: &Pack<PackRecord>,
+    report: &mut PackValidationReport,
+) {
+    const MAX_MISMATCHES: usize = 100;
+    let Some(dir) = data_path.parent() else { return };
+    let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
+    let batch_dir = dir.join(BATCH_DIGEST_NAME);
+    if !consensus_dir.is_dir() || !batch_dir.is_dir() {
+        return;
+    }
+    let open = |idx_dir: std::path::PathBuf| {
+        HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            idx_dir,
+            pack.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+    };
+    let (Ok(mut consensus_idx), Ok(mut batch_idx)) = (open(consensus_dir), open(batch_dir)) else {
+        // A read failure is already reported by `scan_index_buckets` as `IndexUnreadable`.
+        return;
+    };
+    let Ok(mut iter) = pack.raw_iter() else { return };
+
+    let mut mismatches = 0usize;
+    let mut push = |report: &mut PackValidationReport, detail: String| -> bool {
+        report.issues.push(PackIssue::IndexMismatch { detail });
+        report.verdict = Verdict::Invalid;
+        mismatches += 1;
+        mismatches >= MAX_MISMATCHES
+    };
+    loop {
+        let pos = iter.logical_position();
+        match iter.next() {
+            None => break,
+            // The epoch meta carries no digest-index entry.
+            Some(Ok(PackRecord::EpochMeta(_))) => continue,
+            Some(Ok(PackRecord::Consensus(header))) => {
+                // Each consensus header is unique, so its index entry must point at this exact
+                // record.
+                let stop = match consensus_idx.load(header.digest().into()) {
+                    Ok(off) if off == pos => false,
+                    Ok(off) => push(
+                        report,
+                        format!("consensus header at offset {pos} is indexed at {off}"),
+                    ),
+                    Err(e) => push(
+                        report,
+                        format!("consensus header at offset {pos} does not resolve via the hash index: {e}"),
+                    ),
+                };
+                if stop {
+                    break;
+                }
+            }
+            Some(Ok(PackRecord::Batch(batch))) => {
+                // A batch digest is stored once (deduped), so only require that it RESOLVES — a
+                // false miss means a damaged bloom or a corrupt odx chain. (Callers
+                // re-hash a fetched batch, so a wrong-but-present offset is
+                // self-defending and not flagged here.)
+                if let Err(e) = batch_idx.load(batch.digest()) {
+                    if push(
+                        report,
+                        format!("batch at offset {pos} does not resolve via the bhash index: {e}"),
+                    ) {
+                        break;
+                    }
+                }
+            }
+            // A physical framing failure is classified by `classify_physical_corruption`; stop
+            // here.
+            Some(Err(_)) => break,
+        }
     }
 }
 
@@ -950,6 +1080,21 @@ fn finalize_report(
     }
 }
 
+impl PackValidationReport {
+    /// True if the report holds a defect in the DATA LOG itself — one a rebuild-from-log cannot fix
+    /// (chain break, non-sequential number, missing/extra/unsorted batches, empty sub-dag,
+    /// epoch-meta mismatch). Index-only problems
+    /// ([`PackIssue::IndexUnreadable`]/[`PackIssue::IndexMismatch`] and a not-clean
+    /// [`IndexBucketScan`]) are excluded — those ARE rebuildable. `db repair` uses this to give
+    /// the same verdict on a dry run and an apply (a data-logical defect is `Unrepairable` up
+    /// front, never `WouldRepair`).
+    pub fn has_data_logical_issue(&self) -> bool {
+        self.issues.iter().any(|i| {
+            !matches!(i, PackIssue::IndexUnreadable { .. } | PackIssue::IndexMismatch { .. })
+        })
+    }
+}
+
 impl Display for PackValidationReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Number of detail rows to print before truncating (a pathological pack can have
@@ -965,6 +1110,7 @@ impl Display for PackValidationReport {
         let mut meta = 0usize;
         let mut empty_subdag = 0usize;
         let mut index_unreadable = 0usize;
+        let mut index_mismatch = 0usize;
         for issue in &self.issues {
             match issue {
                 PackIssue::ChainBreak { .. } => chain_breaks += 1,
@@ -978,6 +1124,7 @@ impl Display for PackValidationReport {
                 PackIssue::EpochMetaMismatch { .. } => meta += 1,
                 PackIssue::EmptySubDag { .. } => empty_subdag += 1,
                 PackIssue::IndexUnreadable { .. } => index_unreadable += 1,
+                PackIssue::IndexMismatch { .. } => index_mismatch += 1,
             }
         }
 
@@ -1006,11 +1153,25 @@ impl Display for PackValidationReport {
                     scan.batch.dirty,
                     scan.batch.corrupt
                 )?;
-                if !scan.is_clean() {
+                let has_corrupt = scan.consensus.corrupt > 0 || scan.batch.corrupt > 0;
+                if has_corrupt || (!scan.is_clean() && self.verdict == Verdict::Invalid) {
                     writeln!(
                         f,
-                        "  the data log is intact but a digest index is degraded; remove the \
-                         `hash`/`bhash` dirs to rebuild it from the data log on next open."
+                        "  the data log is intact but a digest index is degraded; stop the node and \
+                         run `telcoin-network db repair --epoch N --force` to rebuild it from the data \
+                         log. Do NOT delete the `hash`/`bhash` dirs by hand — a past epoch is only \
+                         opened read-only and never rebuilds them on its own, so it would then read as \
+                         absent until repaired."
+                    )?;
+                } else if !scan.is_clean() {
+                    // Dirty-only on a walk that did not flag the verdict: this is the intact prefix
+                    // of an unclean pack whose indexes are simply unsynced.
+                    // Recovery rebuilds them.
+                    writeln!(
+                        f,
+                        "  dirty (unstamped) buckets are unsynced writes — expected when validating \
+                         the intact prefix of an unclean pack; recovery rebuilds them on the next \
+                         append-open. No action needed for these."
                     )?;
                 }
             }
@@ -1038,6 +1199,7 @@ impl Display for PackValidationReport {
         writeln!(f, "  epoch meta mismatches:  {meta}")?;
         writeln!(f, "  empty sub-dags:         {empty_subdag}")?;
         writeln!(f, "  unreadable indexes:     {index_unreadable}")?;
+        writeln!(f, "  index/log mismatches:   {index_mismatch}")?;
 
         if self.issues.is_empty() {
             return Ok(());
@@ -1071,6 +1233,9 @@ impl Display for PackValidationReport {
                 PackIssue::IndexUnreadable { detail } => {
                     writeln!(f, "  INDEX UNREADABLE  {detail}")?
                 }
+                PackIssue::IndexMismatch { detail } => {
+                    writeln!(f, "  INDEX MISMATCH    {detail}")?
+                }
             }
         }
         if self.issues.len() > MAX_ROWS {
@@ -1091,10 +1256,13 @@ mod test {
 
     use super::{
         classify_physical_corruption, validate_pack_file, validate_pack_file_bounded, BatchClass,
-        PackIssue, Verdict,
+        IndexBucketScan, PackIssue, PackValidationReport, Verdict,
     };
     use crate::{
-        archive::pack::{Pack, PackCompression},
+        archive::{
+            digest_index::BucketCrcReport,
+            pack::{Pack, PackCompression},
+        },
         consensus_pack::{test::make_test_output, EpochMeta, PackRecord},
         mem_db::MemDatabase,
     };
@@ -1548,5 +1716,84 @@ mod test {
                 PackIssue::NonSequentialConsensusNumber { expected: 3, found: 7 }
             ));
         }
+    }
+
+    /// F34: the `TornTrailingTail` remediation is honest about past epochs — it no longer says the
+    /// unconditional "no action needed" (true only for the current epoch) and points a past epoch
+    /// at `db repair`.
+    #[test]
+    fn test_torn_trailing_tail_remediation_is_epoch_aware() {
+        let corruption = super::PhysicalCorruption {
+            kind: super::CorruptionKind::TornTrailingTail,
+            offset: 4096,
+            records_ok_before: 3,
+            decodable_after: false,
+            detail: "short read".to_string(),
+        };
+        let text = corruption.to_string();
+        assert!(text.contains("CURRENT"), "must qualify the current-epoch case: {text}");
+        assert!(text.contains("PAST epoch"), "must distinguish past epochs: {text}");
+        assert!(text.contains("db repair"), "must point a past epoch at db repair: {text}");
+    }
+
+    /// F14: the index-degraded remediation no longer tells operators to delete `hash`/`bhash` by
+    /// hand (which turns a sealed past epoch absent) — it points at `db repair`.
+    #[test]
+    fn test_index_degraded_remediation_points_at_db_repair() {
+        let report = PackValidationReport {
+            epoch: 0,
+            start_consensus_number: 1,
+            batch_count: 4,
+            consensus_count: 1,
+            first_consensus_number: Some(1),
+            last_consensus_number: Some(1),
+            issues: Vec::new(),
+            dropped_issues: 0,
+            index_scan: Some(IndexBucketScan {
+                consensus: BucketCrcReport { dirty: 0, corrupt: 1 },
+                batch: BucketCrcReport::default(),
+            }),
+            verdict: Verdict::Invalid,
+        };
+        let text = report.to_string();
+        assert!(text.contains("db repair"), "must point at db repair: {text}");
+        assert!(text.contains("Do NOT delete"), "must warn against deleting by hand: {text}");
+    }
+
+    /// F35: `has_data_logical_issue` distinguishes an unfixable data-log defect (a rebuild cannot
+    /// help) from purely index damage (rebuildable) — the discriminator `db repair` uses to
+    /// give the same verdict on a dry run and an apply.
+    #[test]
+    fn test_has_data_logical_issue_discriminates_index_from_data() {
+        let base = |issues: Vec<PackIssue>| PackValidationReport {
+            epoch: 0,
+            start_consensus_number: 1,
+            batch_count: 0,
+            consensus_count: 0,
+            first_consensus_number: None,
+            last_consensus_number: None,
+            issues,
+            dropped_issues: 0,
+            index_scan: None,
+            verdict: Verdict::Invalid,
+        };
+        // Index-only damage → rebuildable → not a data-logical issue.
+        assert!(
+            !base(vec![PackIssue::IndexMismatch { detail: "x".into() }]).has_data_logical_issue()
+        );
+        assert!(
+            !base(vec![PackIssue::IndexUnreadable { detail: "x".into() }]).has_data_logical_issue()
+        );
+        assert!(!base(Vec::new()).has_data_logical_issue());
+        // A defect in the data log itself → a rebuild cannot fix it.
+        assert!(base(vec![PackIssue::NonSequentialConsensusNumber { expected: 2, found: 5 }])
+            .has_data_logical_issue());
+        assert!(base(vec![PackIssue::EmptySubDag { number: 3 }]).has_data_logical_issue());
+        // Mixed: the data-logical defect dominates.
+        assert!(base(vec![
+            PackIssue::IndexMismatch { detail: "x".into() },
+            PackIssue::EmptySubDag { number: 1 },
+        ])
+        .has_data_logical_issue());
     }
 }
