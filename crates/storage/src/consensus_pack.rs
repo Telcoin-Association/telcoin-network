@@ -1040,16 +1040,46 @@ impl ConsensusPack {
     /// Essentially this an async drop.
     pub async fn close(self) {
         if Arc::strong_count(&self.handle) == 1 {
-            let Some(_handle) = self.handle.lock().take() else {
-                // Already closed...
-                // This check should always pass.
-                return;
-            };
-            let (tx, rx) = oneshot::channel();
-            if self.tx.send(PackMessage::AsyncShutdown(tx)).await.is_ok() {
-                // Lets do an async wait for confirmition vs a sync join() on the thread.
-                let _ = rx.await;
-            }
+            self.seal_now().await;
+        }
+    }
+
+    /// Seal the pack now (clean-close: msync + truncate + sentinel via the actor's
+    /// `AsyncShutdown`), REGARDLESS of how many clones remain. Idempotent and drop-safe: the
+    /// join handle is taken under the lock, so only the first caller actually seals and a later
+    /// call — or a surviving clone's `Drop` — finds it gone and no-ops (no double-seal, no
+    /// panic).
+    ///
+    /// Used only at graceful shutdown, when a clone (e.g. a winding-down RPC connection) outlived
+    /// the sole-owner drain: sealing under that clone is strictly better than leaving the pack
+    /// unsealed and forcing a WAL recovery on the next start. The normal (sole-owner) path is
+    /// [`Self::close`].
+    ///
+    /// ## Why this is memory-safe under a live clone
+    /// The seal truncates the `data` file (dropping the mmap capacity padding) and stops the actor,
+    /// but a surviving clone cannot dangle on the freed mapping, because a `ConsensusPack` clone is
+    /// a CHANNEL-ONLY handle: it holds just `tx` + `handle` + `Copy` metadata, never a
+    /// `MmapDataFile`. The mmaps live solely in the actor's `Inner`, and every read/write is
+    /// mediated by a `PackMessage` on `tx` — so all mmap access happens on the one actor
+    /// thread, never concurrently with (or after) the seal it runs itself. `MmapDataFile::drop`
+    /// also unmaps BEFORE it truncates, and only the read-write current pack truncates
+    /// (read-only static/staging packs early-return) — and only the padding past `end`, which
+    /// no valid read touches. External byte-stream readers (`get_epoch_stream`, state export)
+    /// use a cloned fd + `pread` bounded to `end`, never the shared mmap. Once the actor exits,
+    /// a surviving clone's `tx.send`/`rx.await` return closed-channel errors — reads/writes
+    /// fail cleanly (`None`/`Err`, logged), never touching freed memory.
+    ///
+    /// **Invariant this relies on:** never hand a clone direct mmap/file access to a pack's data —
+    /// keep every read and write channel-mediated — or this guarantee breaks.
+    pub(crate) async fn seal_now(&self) {
+        let Some(_handle) = self.handle.lock().take() else {
+            // Already sealed by a prior `seal_now`/`close` or a Drop; nothing to do.
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::AsyncShutdown(tx)).await.is_ok() {
+            // Async wait for the clean-close confirmation instead of a sync `join()`.
+            let _ = rx.await;
         }
     }
 }
@@ -5965,6 +5995,61 @@ pub(crate) mod test {
             Verdict::Valid,
             "bounding at the WAL consistent end must be Valid (no false-absent): {at_end}"
         );
+    }
+
+    /// `seal_now` seals the pack even while another handle (clone) is still alive — the graceful-
+    /// shutdown case where an RPC clone outlived the sole-owner drain. The gated `close()` would
+    /// have no-op'd under the clone, leaving the pack unsealed (and a WAL recovery on the next
+    /// start); this asserts the forced seal ran (read-only reopen succeeds — which for a v2
+    /// pack requires the clean-close sentinel) and that dropping the sibling clone afterwards
+    /// does not double-seal/panic.
+    #[tokio::test]
+    async fn test_seal_now_seals_under_a_live_clone() {
+        let temp_dir = TempDir::with_prefix("test_seal_now_clone").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Open a live (unsealed) pack and write a few outputs.
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open append");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            pack.save_consensus_output(output).await.expect("save output");
+        }
+        pack.persist().await.expect("persist");
+
+        // Hold a second handle so the actor is NOT sole-owned, then force-seal through the clone.
+        let clone = pack.clone();
+        assert!(!pack.is_sole_handle(), "precondition: a clone keeps the pack non-sole");
+        clone.seal_now().await;
+
+        // The actor has sealed and exited, but `pack` (the sibling clone) is still alive. Its
+        // reads/writes must fail CLEANLY on the now-closed channel — no panic, no hang, and
+        // crucially no access to the truncated/unmapped file (a clone is a channel-only
+        // handle, so there is no mmap to dangle). This is the direct answer to "should
+        // reads/writes now error?": yes, safely.
+        assert!(
+            pack.get_consensus_output(1).await.is_err(),
+            "a read on a clone whose actor was force-sealed must error, not touch freed memory"
+        );
+        assert!(!pack.contains_batch(BlockHash::default()).await);
+        assert!(pack.consensus_header_by_digest(ConsensusHeaderDigest::default()).await.is_none());
+        drop(clone);
+        drop(pack); // Drop finds the handle already taken by seal_now -> no-op (no double-seal/panic).
+
+        // The pack really sealed: the sentinel-gated read-only door opens and every output reads
+        // back.
+        let ro = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("open_static must succeed on the force-sealed pack");
+        for i in 1..=3 {
+            assert!(ro.get_consensus_output(i).await.is_ok(), "output {i} must read back");
+        }
+        ro.close().await;
     }
 
     /// `pack_unsealed_version` reports whether a pack carries the clean-close sentinel — the

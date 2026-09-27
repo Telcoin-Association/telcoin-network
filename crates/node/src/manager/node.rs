@@ -1261,13 +1261,17 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
-        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error —
-        // `wait_for_task_shutdown()` drops the task-held `consensus_chain` clones. (The worker RPC
-        // servers hold one more clone that is NOT a `node_task_manager` task; it is released as the
-        // jsonrpsee task winds down after `engine` drops, which `shutdown()` waits out via
-        // `wait_until_sole_owner` before `close()`.) Surfacing the persist error before draining (a
-        // bare `?`) would skip that drain; the `Drop` fallback is now runtime-safe regardless.
-        // Persist error still takes precedence over `result`.
+        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error.
+        // The task-held `consensus_chain` clones are released by `node_task_manager`'s own `Drop`,
+        // which notifies `local_shutdown` (every task `select!`s on it) — this happens when `run`
+        // returns, before `shutdown()`, so those clones are gone within milliseconds; the drain
+        // below just awaits the tasks' exit. (The worker RPC servers hold one more clone
+        // that is NOT a `node_task_manager` task; it is released as the jsonrpsee task
+        // winds down after `engine` drops, which `shutdown()` waits out via
+        // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
+        // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
+        // persist error before draining (a bare `?`) would skip that drain; the `Drop`
+        // fallback is runtime-safe regardless. Persist error still takes precedence over `result`.
         let persist_result = self.consensus_chain.persist_current().await;
         node_task_manager.wait_for_task_shutdown().await;
         persist_result?;
@@ -1283,9 +1287,9 @@ where
     /// stop-less `RpcServerHandle` releases the servers' `EngineToPrimaryRpc` →
     /// `ConsensusChain` clone only as the jsonrpsee task winds down. So first wait (bounded)
     /// for that clone to drop; then `close()` holds the last reference and seals off-worker. If
-    /// it does not release in time, `close()` is a no-op and the now runtime-safe `Drop`
-    /// fallback seals it (an unclean pack is recovered on next open) — so this never stalls a
-    /// worker regardless.
+    /// it does not release in time, `close()` FORCE-seals under the surviving clone (that clone's
+    /// in-flight reads then fail — benign at shutdown) instead of leaving the pack unsealed, so the
+    /// next start skips a full WAL recovery. Either way this never stalls a worker.
     pub(crate) async fn shutdown(self) {
         if !self.consensus_chain.wait_until_sole_owner(std::time::Duration::from_secs(2)).await {
             warn!(

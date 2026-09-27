@@ -66,9 +66,10 @@ where
             tracing::error!("Error running node: {err}");
         }
         // Async-close consensus storage so its background-thread joins don't block this tokio
-        // worker on `Drop` (the runtime is still alive here, inside `block_on`). `run()`
-        // has already persisted and awaited task shutdown, so `epoch_manager` now holds the
-        // last reference.
+        // worker on `Drop` (the runtime is still alive here, inside `block_on`). `run()` has
+        // already persisted and awaited task shutdown, so `epoch_manager` normally holds
+        // the last reference; if a winding-down RPC clone briefly outlives it, `shutdown()`
+        // bounds the wait and then force-seals rather than leaving the pack unsealed.
         epoch_manager.shutdown().await;
         result
     })

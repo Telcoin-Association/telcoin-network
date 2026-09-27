@@ -327,21 +327,21 @@ impl LatestConsensus {
         self.state.lock().number = number;
     }
 
-    /// Take ownership and close async so we Drop does not get a chance to block any threads.
-    /// Note, will only close if this is the last reference to this object.
-    /// Essentially this an async drop.
-    async fn close(self) {
-        if Arc::strong_count(&self.handle) == 1 {
-            let Some(_handle) = self.handle.lock().take() else {
-                // Already closed...
-                // This check should always pass.
-                return;
-            };
-            let (tx, rx) = oneshot::channel();
-            if self.tx.send(LatestConsensusCommand::AsyncShutdown(tx)).await.is_ok() {
-                // Lets do an async wait for confirmition vs a sync join() on the thread.
-                let _ = rx.await;
-            }
+    /// Clean-close now REGARDLESS of remaining clones (mirrors `ConsensusPack::seal_now`, incl. its
+    /// channel-only-handle memory-safety argument: a surviving clone holds only `tx`/`handle`, so
+    /// its reads/writes fail cleanly on the closed channel after the actor exits — nothing
+    /// dangles). Idempotent/drop-safe: the join handle is taken under the lock, so only the
+    /// first caller seals; a later call or a surviving clone's `Drop` finds it gone and no-ops.
+    /// `ConsensusChain::close` calls this at graceful shutdown (the `Drop` fallback still
+    /// covers non-graceful paths).
+    async fn seal_now(&self) {
+        let Some(_handle) = self.handle.lock().take() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(LatestConsensusCommand::AsyncShutdown(tx)).await.is_ok() {
+            // Lets do an async wait for confirmition vs a sync join() on the thread.
+            let _ = rx.await;
         }
     }
 
@@ -1404,29 +1404,69 @@ impl ConsensusChain {
     /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
     /// instead of letting each object's `Drop` run a blocking thread `join()`.
     ///
-    /// Each inner close runs only when this holds the LAST `ConsensusChain` reference (per-field
-    /// `Arc::try_unwrap`); an object still shared by another clone is left for its own (now
-    /// runtime-safe) `Drop`. Callers should first drop/await out every other clone — see
-    /// [`Self::wait_until_sole_owner`], which bounds the wait for the RPC clone. Intended for
-    /// graceful shutdown.
+    /// When this holds the LAST `ConsensusChain` reference (per-field `Arc::try_unwrap`) each inner
+    /// `close` seals on the sole-owner path. When a clone outlived the drain (see
+    /// [`Self::wait_until_sole_owner`] — in practice a winding-down RPC connection), the component
+    /// is force-sealed via `seal_now` instead of left unsealed: sealing under that clone (whose
+    /// in-flight reads then fail — benign at shutdown) avoids a full WAL recovery on the next
+    /// start. Only called at graceful shutdown, so a still-present clone here is exactly the
+    /// timed-out case.
+    ///
+    /// Force-sealing under a live clone is memory-safe: each component is an actor whose mmaps live
+    /// only on its own thread and whose clones are channel-only handles, so the truncate/unmap runs
+    /// on the owning thread and a surviving clone's later reads/writes fail cleanly on the
+    /// closed channel — see the safety note on `ConsensusPack::seal_now`.
     pub async fn close(self) {
         let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
-        if let Ok(pack) = Arc::try_unwrap(current_pack) {
-            pack.into_inner().close().await;
-        }
-        if let Ok(packs) = Arc::try_unwrap(recent_packs) {
-            for pack in packs.into_inner() {
-                pack.close().await;
+        match Arc::try_unwrap(current_pack) {
+            Ok(pack) => pack.into_inner().close().await,
+            Err(shared) => {
+                warn!(
+                    target: "consensus::store",
+                    "current pack still shared at shutdown (a clone outlived the drain); \
+                     force-sealing so the next start skips WAL recovery"
+                );
+                // Clone the handle out of the guard, then DROP the guard before the `.await`
+                // (a `parking_lot` guard must not be held across an await point).
+                let pack = shared.lock().clone();
+                pack.seal_now().await;
             }
         }
-        if let Ok(staged) = Arc::try_unwrap(staging) {
-            if let Some(staged) = staged.into_inner() {
-                staged.pack.close().await;
+        match Arc::try_unwrap(recent_packs) {
+            Ok(packs) => {
+                for pack in packs.into_inner() {
+                    pack.close().await;
+                }
+            }
+            Err(shared) => {
+                let packs: Vec<_> = shared.lock().iter().cloned().collect();
+                for pack in packs {
+                    pack.seal_now().await;
+                }
             }
         }
-        latest_consensus.close().await;
-        if let Ok(epochs) = Arc::try_unwrap(epochs) {
-            epochs.close().await;
+        match Arc::try_unwrap(staging) {
+            Ok(staged) => {
+                if let Some(staged) = staged.into_inner() {
+                    staged.pack.close().await;
+                }
+            }
+            Err(shared) => {
+                let staged = shared.lock().clone();
+                if let Some(staged) = staged {
+                    staged.pack.seal_now().await;
+                }
+            }
+        }
+        // `latest_consensus` is an owned field (internally `Arc`-backed); a surviving
+        // `ConsensusChain` clone keeps a sharing clone alive, so `close`'s sole-owner gate
+        // would skip it. Force-seal unconditionally: idempotent, and at shutdown this is
+        // the same result as the sole-owner path.
+        latest_consensus.seal_now().await;
+        match Arc::try_unwrap(epochs) {
+            Ok(epochs) => epochs.close().await,
+            // `seal_now` is `&self`, so call it straight through the still-shared `Arc`.
+            Err(shared) => shared.seal_now().await,
         }
     }
 

@@ -910,15 +910,29 @@ impl EpochRecordDb {
     /// thread sealed the packs. Essentially an async drop (mirrors `ConsensusPack::close`).
     pub async fn close(self) {
         if Arc::strong_count(&self.handle) == 1 {
-            let Some(_handle) = self.handle.lock().take() else {
-                // Already closed; this check should always pass.
-                return;
-            };
-            let (tx, rx) = oneshot::channel();
-            if self.tx.send(EpochDbMessage::AsyncShutdown(tx)).await.is_ok() {
-                // Async wait for the clean-close confirmation instead of a sync `join()`.
-                let _ = rx.await;
-            }
+            self.seal_now().await;
+        }
+    }
+
+    /// Clean-close the DB now REGARDLESS of remaining clones (mirrors `ConsensusPack::seal_now`).
+    /// Idempotent/drop-safe: the join handle is taken under the lock, so only the first caller
+    /// seals. Used at graceful shutdown when a clone outlived the sole-owner drain — sealing
+    /// then is better than leaving the packs unsealed and forcing a rebuild on the next open.
+    /// Normal path: `close`.
+    ///
+    /// Memory-safe under a live clone for the same reason as
+    /// [`ConsensusPack::seal_now`](crate::consensus_pack::ConsensusPack::seal_now): a clone is a
+    /// channel-only handle (`tx` + `handle`), the record/cert `MmapDataFile`s live solely in the
+    /// actor's `Inner`, and a surviving clone's reads/writes fail cleanly on the closed channel
+    /// after the actor exits.
+    pub(crate) async fn seal_now(&self) {
+        let Some(_handle) = self.handle.lock().take() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(EpochDbMessage::AsyncShutdown(tx)).await.is_ok() {
+            // Async wait for the clean-close confirmation instead of a sync `join()`.
+            let _ = rx.await;
         }
     }
 
