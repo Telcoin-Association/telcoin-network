@@ -2574,8 +2574,10 @@ impl Inner {
                 // exactly the next consensus number. A repeat or gap is peer misbehavior --
                 // not the idempotent local replay `save_consensus_output` tolerates (`idx <
                 // len` there) -- so reject it here. Otherwise a non-advancing parent-linked
-                // chain is accepted-and-ignored forever and pins the import (see finding
-                // #10); `InvalidConsensusNumber` charges the peer a Severe penalty.
+                // chain is accepted-and-ignored forever and pins the import. When this error
+                // surfaces over the peer-import sync path the requester charges the
+                // peer a Severe penalty (the import classifies it as a peer-caused
+                // stream fault).
                 let expected =
                     pack.epoch_meta.start_consensus_number + pack.consensus_pos_idx.len() as u64;
                 if consensus_number != expected {
@@ -8692,13 +8694,13 @@ pub(crate) mod test {
         assert!(matches!(err, PackError::EmptySubDag), "got {err:?}");
     }
 
-    /// Finding #10: a streamed import builds a fresh pack strictly in order, so a header whose
-    /// number does not advance must be rejected — not accepted-and-ignored. Here two outputs
-    /// share number 1 with a valid parent link, so only the number is wrong. Without the
-    /// advancement check the second is a silent no-op (`save_consensus_output`'s idempotent
-    /// `idx < len` path) and an endless such chain pins the import forever; with it, the second
-    /// output is `InvalidConsensusNumber` (a Severe peer penalty), so this returns `Err`
-    /// instead of `Ok`.
+    /// A streamed import builds a fresh pack strictly in order, so a header whose number does not
+    /// advance must be rejected — not accepted-and-ignored. Here two outputs share number 1 with a
+    /// valid parent link, so only the number is wrong. Without the advancement check the second is
+    /// a silent no-op (`save_consensus_output`'s idempotent `idx < len` path) and an endless
+    /// such chain pins the import forever; with it, the second output is
+    /// `InvalidConsensusNumber`, so this returns `Err` instead of `Ok`. (Over the peer-import
+    /// sync path the requester then charges the peer a Severe penalty.)
     #[tokio::test]
     async fn test_stream_import_rejects_non_advancing_number() {
         use crate::{

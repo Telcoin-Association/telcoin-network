@@ -150,13 +150,22 @@ code constructs them today, only tests
 | Location                                          | Handler                                    | Source of penalty                                  |
 | ------------------------------------------------- | ------------------------------------------ | -------------------------------------------------- |
 | `crates/consensus/primary/src/network/mod.rs:749` | `try_sync_consensus_output_exchange`       | `Self::consensus_chain_error_to_penalty(&e)`       |
+| `try_sync_epoch_pack_exchange` (`SyncFrame::Ack` import arm) | epoch-pack sync import | `consensus_chain_error_to_penalty(&e)`, gated by `import_fault_is_peer_caused(&e)` |
 | `crates/consensus/primary/src/network/mod.rs:1343` | `process_vote_request`                     | `(&PrimaryNetworkError).into() -> Option<Penalty>` |
 | `crates/consensus/primary/src/network/mod.rs:1401` | `process_epoch_record_request`             | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:1440` | `process_gossip`                           | `(&PrimaryNetworkError).into()`                    |
 
-Three peer-facing primary paths deliberately apply no penalty and so have no row above:
+The epoch-pack sync import charges a penalty ONLY for a fault attributable solely to the peer's
+streamed bytes — a structural/framing/over-a-resource-bound `PackError`, or
+`ConsensusChainError::{EmptyImport, InvalidImport}` — as decided by `import_fault_is_peer_caused`. It
+deliberately does NOT penalise a local/ambiguous error raised while importing (a full disk, a failed
+mmap/index write, `CorruptPack` — which local recovery also produces — or a local chain-state
+mismatch), so an honest peer is never banned for this node's own storage failure. Committee/allowlisted
+peers remain score-exempt (`Peer::apply_penalty` only warns for them), so this bans a non-committee
+Sybil/observer that ships an OOM/wedge pack but never a validator.
+
+Two peer-facing primary paths deliberately apply no penalty and so have no row above:
 the certificate fetch (`fetch_certificates`, `crates/consensus/primary/src/network/mod.rs:457`),
-the epoch-pack sync import (`crates/consensus/primary/src/network/mod.rs:1080-1111`),
 and the inbound sync-stream serve (`process_inbound_sync_stream`, `crates/consensus/primary/src/network/mod.rs:1462-1584`).
 See the restraint invariants in section 6.
 
@@ -280,7 +289,7 @@ These are deliberate tolerances for benign failures. Changing any of these from
 - `WorkerNetworkError::Timeout` / `DBInsert` / `DBCommit` / `DBRead` / `StreamClosed` / `Network` / `BatchEpochMismatch` / `Internal` — local failures or epoch-boundary races. `crates/consensus/worker/src/network/error.rs:129-136`.
 - The worker sync-batch stream applies no penalty on either side: a requester that opens with a non-`Req` frame or never sends a readable request is warned and dropped after a bounded error write (`crates/consensus/worker/src/network/mod.rs:430-437,467-471`), and the responder signals its own failures with `SyncFrame::Err` rather than charging them (`crates/consensus/worker/src/network/handler.rs:317-320`).
 - `fetch_certificates` — the primary's certificate fetch is penalty-exempt end to end; a failed exchange only advances the staggered fan-out to the next peer. `crates/consensus/primary/src/network/mod.rs:454,457`.
-- Epoch-pack sync import — a bad or undecodable pack is classified `EpochPackAttempt::Failed` (try the next peer) with no penalty. `crates/consensus/primary/src/network/mod.rs:1078-1079,1080-1111`.
+- Epoch-pack sync import — a peer-caused stream fault (a structural/framing/over-a-resource-bound `PackError`, or `ConsensusChainError::{EmptyImport, InvalidImport}`) IS penalised via `consensus_chain_error_to_penalty`, gated by `import_fault_is_peer_caused`; a local/ambiguous error raised while importing (IO/Append/Persist/Open/EpochDb, `CorruptPack`, or a local chain-state mismatch) is NOT (it would ban an honest peer for this node's own storage failure). Either way the pack is still classified `EpochPackAttempt::Failed` so the probe tries the next peer.
 - `process_inbound_sync_stream` — an unexpected opening sync frame is signalled with `SyncFrame::Err(Malformed)` and dropped, metrics-only. `crates/consensus/primary/src/network/mod.rs:1558-1559`, `crates/consensus/primary/src/network/handler.rs:1403-1404`.
 - `PrimaryNetworkError::UnavailableEpoch` / `UnavailableEpochDigest` — a peer "might not have this yet" during sync. `crates/consensus/primary/src/error/network.rs:196-197`.
 - `PrimaryNetworkError::UnknownConsensusOutput` — a benign miss: observers legitimately request outputs this node has not served yet, so honest catch-up sync is not banned. `crates/consensus/primary/src/error/network.rs:188`.
