@@ -812,7 +812,20 @@ impl MmapDataFile {
             return;
         }
         if let Backing::Rw(map) = &mut self.backing {
-            map[new_len as usize..self.end as usize].fill(0);
+            // Zero only the chunks that actually hold non-zero bytes (the torn tail). `[new_len,
+            // end)` on an unclean open is mostly sparse capacity padding (holes that
+            // already read as zero); reading a hole maps the shared zero page and
+            // allocates nothing, whereas `fill(0)` over the whole range would
+            // write-fault and allocate every hole page (up to a 128 MiB growth
+            // step) — dirtying the page cache and allocating disk blocks at writeback only to
+            // truncate them at clean close, and SIGBUS-ing on a nearly-full disk.
+            // Skipping already-zero chunks keeps the "padding reads as zeros" invariant
+            // at a fraction of the cost.
+            for chunk in map[new_len as usize..self.end as usize].chunks_mut(64 << 10) {
+                if chunk.iter().any(|&b| b != 0) {
+                    chunk.fill(0);
+                }
+            }
         }
         self.end = new_len;
         // The tail is gone; clamp the append watermark so a later write is flushed, and pull a
@@ -1650,6 +1663,34 @@ mod tests {
         df.read_exact(&mut buf).expect("read");
         assert_eq!(&buf[..80], &pattern(80)[..], "kept prefix survives");
         assert_eq!(&buf[80..], &pattern(20)[..], "append landed at the rewound end");
+    }
+
+    #[test]
+    fn rewind_to_clears_a_multi_chunk_torn_tail() {
+        // Drive the chunked skip-zero loop in `rewind_to` across several 64 KiB chunks: a torn tail
+        // spanning multiple chunks must be fully cleared (no stale bytes survive a re-append +
+        // reopen), exercising the chunk bounds beyond the single-chunk case above.
+        let tmp = TempDir::with_prefix("mmap_df_rewind_big").expect("temp dir");
+        let path = tmp.path().join("data");
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        const BIG: usize = 200 * 1024; // > three 64 KiB rewind chunks
+        df.write_all(&pattern(BIG)).expect("write");
+        assert_eq!(df.len(), BIG as u64);
+
+        df.rewind_to(100);
+        assert_eq!(df.len(), 100, "logical end moved back across many chunks");
+
+        // Re-append and reopen: exactly [kept 100][appended 40], nothing from the cleared tail.
+        df.seek(SeekFrom::End(0)).expect("seek end");
+        df.write_all(&pattern(40)).expect("append after rewind");
+        drop(df);
+        let mut df = MmapDataFile::open(&path, false).expect("reopen");
+        assert!(!df.opened_unclean());
+        assert_eq!(df.len(), 140);
+        let mut buf = vec![0u8; 140];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..100], &pattern(100)[..], "kept prefix survives");
+        assert_eq!(&buf[100..], &pattern(40)[..], "append landed at the rewound end");
     }
 
     #[test]

@@ -665,7 +665,9 @@ pub fn classify_physical_corruption(
 
     let mut records_ok_before: u64 = 0;
     loop {
-        let offset = iter.position().map_err(|e| PackError::ReadError(e.to_string()))?;
+        // Captured at a frame boundary (before `next()`), where the logical position equals the
+        // physical one — and syscall-free (no per-frame `lseek`; see `PackIter::logical_position`).
+        let offset = iter.logical_position();
         match iter.next() {
             None => {
                 // No error surfaced. A record torn *within* its 4-byte size prefix reads as EOF
@@ -746,13 +748,15 @@ pub fn classify_physical_corruption(
 /// past EOF (the iterator's logical position does not advance on that read): if a repeated error
 /// makes no forward progress, stop rather than spin.
 fn probe_decodable_after(iter: &mut PackIter<PackRecord, File>) -> bool {
-    let mut last_pos = iter.position().unwrap_or(u64::MAX);
+    // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
+    // forward-progress signal — advanced by each frame's on-disk size, no per-frame `lseek`.
+    let mut last_pos = iter.logical_position();
     loop {
         match iter.next() {
             None => return false,
             Some(Ok(_)) => return true,
             Some(Err(_)) => {
-                let pos = iter.position().unwrap_or(u64::MAX);
+                let pos = iter.logical_position();
                 if pos <= last_pos {
                     // No forward progress (extent-past-EOF): treat as nothing readable after.
                     return false;

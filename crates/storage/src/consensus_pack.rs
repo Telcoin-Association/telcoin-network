@@ -1411,6 +1411,10 @@ impl Inner {
         // Only the very first record may be an EpochMeta; a second one mid-log is
         // append-order-impossible (see the EpochMeta arm below).
         let mut first_record = true;
+        // Throttled progress so a long unclean-restart replay (this runs synchronously in
+        // `ConsensusChain::new`, and can be seconds for a multi-GB epoch) is observable between the
+        // start/finish lines `recover_pack` logs — at most one line every few seconds.
+        let mut last_progress = std::time::Instant::now();
 
         loop {
             let header_pos = iter.logical_position();
@@ -1481,6 +1485,16 @@ impl Inner {
                     }
                     idx += 1;
                     consistent_end = output_end;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(5) {
+                        info!(
+                            target: "consensus_pack",
+                            dir = %base_dir.display(),
+                            outputs = idx,
+                            recovered_bytes = consistent_end,
+                            "pack WAL recovery in progress"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
                 // A torn record where the next output's header would start. The last complete
                 // output is already finalized; this ends the consistent prefix. In a sealed log any
@@ -1580,16 +1594,21 @@ impl Inner {
     fn output_after_tear(
         iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
     ) -> bool {
-        let mut last_pos = iter.position().unwrap_or(u64::MAX);
+        // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
+        // position — it advances by each frame's on-disk size, including a CRC-failed
+        // zero-padding frame, so it gives the same monotonic forward-progress signal as the
+        // physical position without an `lseek` per frame (a 128 MiB zero-padding walk on an
+        // unclean open is otherwise ~5 s of lseeks).
+        let mut last_pos = iter.logical_position();
         loop {
             match iter.next() {
                 None => return false,
                 // A later output began → an output was written past the tear → corruption.
                 Some(Ok(PackRecord::Consensus(_))) => return true,
                 // A stray batch/meta of the torn in-flight output: not a new output; keep scanning.
-                Some(Ok(_)) => last_pos = iter.position().unwrap_or(u64::MAX),
+                Some(Ok(_)) => last_pos = iter.logical_position(),
                 Some(Err(_)) => {
-                    let pos = iter.position().unwrap_or(u64::MAX);
+                    let pos = iter.logical_position();
                     if pos <= last_pos {
                         return false; // no forward progress (extent past EOF): nothing readable
                                       // after

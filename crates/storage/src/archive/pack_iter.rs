@@ -81,17 +81,6 @@ where
         self.version
     }
 
-    /// Physical stream position of the underlying reader (bytes consumed from the file).
-    ///
-    /// NOTE: this is the raw `BufReader` position, which is only equal to the logical record
-    /// boundary [`Self::logical_position`] immediately after a *successful* `next()` (or right
-    /// after open). After a torn/short read it can sit mid-record, past the last complete
-    /// record. Callers that need a byte offset to *truncate* the log to (e.g. recovery) must
-    /// use [`Self::logical_position`], which only advances by whole record frames.
-    pub fn position(&mut self) -> io::Result<u64> {
-        self.reader.stream_position()
-    }
-
     /// Byte offset just past the last record `next()` returned (the header + all whole record
     /// frames consumed so far). After a successful `next()` this is a record boundary — the
     /// safe point to truncate a torn log back to. It is NOT a valid boundary after `next()`
