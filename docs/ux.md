@@ -60,6 +60,25 @@ branch that introduced the docs and its successors.
   Interactive elements still show their native cursors (pointer, text).
   (da39018d, 06a7e888, a9a126d1)
 
+## Icons and link previews
+
+- **Favicon.** `theme/favicon.svg` is the TEL badge from the `TEL.svg` master
+  with its fixed width/height dropped so browsers scale it to the tab icon;
+  `theme/favicon.png` is the same badge at 32px for browsers without SVG icon
+  support (Safari).
+- **Home-screen icons and manifest.** `src/assets/site.webmanifest` names the
+  site and lists `icon-192.png` and `icon-512.png` (transparent ground) plus
+  `icon-maskable-512.png` (badge on the navy `--bg`, kept inside the maskable
+  safe zone). `apple-touch-icon.png` is the same navy-ground badge at 180px,
+  opaque because iOS paints black behind transparent touch icons. Every raster
+  is rendered from the badge SVG at its exact pixel size.
+- **Link previews.** `theme/head.hbs` (mdBook's stock `{{> head}}` hook, not
+  a TN-EDIT to index.hbs) adds Open Graph and Twitter card tags. The card is
+  `assets/og-image.png` (1200x630, badge centered on the navy ground).
+  Scrapers ignore relative image URLs and mdBook exposes no site origin to
+  templates, so head.hbs points every version at
+  `https://docs.telcoin.network/assets/og-image.png`.
+
 ## Sidebar
 
 - **Whole-row links.** Each chapter row is one visual pill: hovering

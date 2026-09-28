@@ -11,8 +11,10 @@ create-missing = false
 [output.html]
 git-repository-url = "https://github.com/Telcoin-Association/telcoin-network"
 edit-url-template = "https://github.com/Telcoin-Association/telcoin-network/edit/main/docs/src/{path}"
-# GitHub Pages project-site prefix; flip to "/" when docs.telcoin.network DNS cuts over.
-site-url = "/telcoin-network/"
+# Served at the root of docs.telcoin.network (the GitHub Pages custom domain).
+# Only the 404 page's <base href> depends on this; the docs workflow overrides
+# it per version build and must agree (SITE_ROOT in .github/workflows/docs.yaml).
+site-url = "/"
 
 # Theme (docs/theme/): light + navy only; the header switch offers Light/System/Dark.
 # "navy" must stay the dark theme id — book.js keys highlight-css switching on it.

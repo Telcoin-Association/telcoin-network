@@ -295,7 +295,8 @@ mod tests {
             .expect("generate keys command");
 
         // Create config files or the run() below will fail.
-        assert!(Config::load_or_default(&temp_dir.path().to_path_buf(), "test").is_ok());
+        Config::load_or_default(&temp_dir.path().to_path_buf(), "test")
+            .expect("default config files written to tempdir");
         std::env::set_var("RUST_LOG", "info,evm=debug");
         let tn = Cli::<NoArgs>::try_parse_args_from([
             "tn",
