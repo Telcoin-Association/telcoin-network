@@ -37,6 +37,61 @@ async fn test_empty_proposal() {
     // TODO: assert header el state present
 }
 
+/// The primary publishes one header retaining the digest-to-worker mapping for three workers.
+#[tokio::test]
+async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
+    use std::num::NonZeroUsize;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .number_of_workers(NonZeroUsize::new(3).ok_or_else(|| eyre::eyre!("worker count"))?)
+        .build();
+    let primary = fixture.first_authority();
+    let config = primary.consensus_config();
+    let committee = fixture.committee();
+    let cb = ConsensusBus::new();
+    let mut rx_headers = cb.subscribe_headers();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        config.clone(),
+        primary.id(),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+    let payload: IndexMap<_, _> =
+        (0_u8..3).map(|id| (B256::repeat_byte(id), u16::from(id))).collect();
+    proposer.digests = payload
+        .iter()
+        .map(|(digest, worker_id)| {
+            (
+                *worker_id,
+                VecDeque::from([ProposerDigest { digest: *digest, worker_id: *worker_id }]),
+            )
+        })
+        .collect();
+    let selected = proposer.drain_digests_for_header();
+    let identity = HeaderIdentity {
+        round: 1,
+        epoch: config.epoch(),
+        author: primary.id(),
+        prior_epoch_record: proposer.prior_epoch_record,
+        key_config: config.key_config().clone(),
+    };
+    let header = Proposer::propose_header(
+        identity,
+        config.node_storage().clone(),
+        &cb,
+        proposer.last_parents,
+        selected,
+    )
+    .await?;
+
+    assert_eq!(header.payload(), &payload);
+    assert!(header.validate(&committee).is_ok());
+    assert_eq!(rx_headers.try_recv()?.digest(), header.digest());
+    Ok(())
+}
+
 /// A header off the REAL proposer path carries a seed signature that verifies against THAT header's
 /// own `(epoch, round)`.
 ///
