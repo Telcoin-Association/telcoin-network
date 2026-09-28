@@ -10,7 +10,7 @@ use crate::{
 };
 use std::{collections::BTreeSet, ops::RangeInclusive, time::Duration};
 use tempfile::TempDir;
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, PriorEpoch};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
@@ -1063,8 +1063,7 @@ async fn spawn_and_collect(
         fixture_config.committee().clone(),
         fixture_config.network_config().clone(),
         fixture_config.next_committee_keys().to_vec(),
-        fixture_config.prior_epoch_record(),
-        prior_epoch_close,
+        PriorEpoch { record: fixture_config.prior_epoch_record(), close: prior_epoch_close },
     )
     .expect("fixture parameters satisfy the epoch constructor");
     assert_eq!(config.prior_epoch_close(), prior_epoch_close);

@@ -33,15 +33,34 @@ struct ConsensusConfigInner<DB> {
     local_networks: BTreeMap<WorkerId, LocalNetwork>,
     network_config: NetworkConfig,
     genesis: HashMap<HeaderDigest, Certificate>,
+    /// What this epoch inherits from the close of the previous epoch.
+    ///
+    /// See [`ConsensusConfig::prior_epoch_record`] and [`ConsensusConfig::prior_epoch_close`].
+    prior_epoch: PriorEpoch,
+}
+
+/// What an epoch inherits from the close of the epoch before it.
+///
+/// Both values are read at the previous epoch's closing block.
+/// Epoch 0 follows genesis rather than a closed epoch; build it with [`PriorEpoch::genesis`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriorEpoch {
     /// Digest of the previous epoch's `EpochRecord` ([`EpochDigest::default`] for epoch 0).
     ///
     /// Single source of truth for the canonical epoch-close seed message: proposers sign it and
     /// voters verify header seed signatures against it, so both sides must read the same value.
-    prior_epoch_record: EpochDigest,
+    pub record: EpochDigest,
     /// Timestamp, in seconds, of the previous epoch's closing EVM block (`None` for epoch 0).
     ///
     /// See [`ConsensusConfig::prior_epoch_close`].
-    prior_epoch_close: Option<TimestampSec>,
+    pub close: Option<TimestampSec>,
+}
+
+impl PriorEpoch {
+    /// Epoch 0: no prior record and no close to floor on.
+    pub fn genesis() -> Self {
+        Self { record: EpochDigest::default(), close: None }
+    }
 }
 
 /// The configuration for consensus.
@@ -66,7 +85,6 @@ where
     ///
     /// This is the primary constructor that loads configuration from the filesystem,
     /// including committee membership and worker topology from YAML files.
-    #[allow(clippy::too_many_arguments)]
     pub fn new<TND: TelcoinDirs + 'static>(
         config: Config,
         tn_datadir: &TND,
@@ -74,8 +92,7 @@ where
         key_config: KeyConfig,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
-        prior_epoch_record: EpochDigest,
-        prior_epoch_close: Option<TimestampSec>,
+        prior_epoch: PriorEpoch,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors that the shared, test-facing
         // `new_with_committee` deliberately skips so DAG test fixtures may use small `gc_depth`
@@ -95,8 +112,7 @@ where
             committee,
             network_config,
             next_committee_keys,
-            prior_epoch_record,
-            prior_epoch_close,
+            prior_epoch,
         )
     }
 
@@ -119,8 +135,7 @@ where
             committee,
             network_config,
             vec![],
-            EpochDigest::default(),
-            None,
+            PriorEpoch::genesis(),
         )
     }
 
@@ -147,8 +162,7 @@ where
             committee,
             network_config,
             vec![],
-            prior_epoch_record,
-            None,
+            PriorEpoch { record: prior_epoch_record, close: None },
         )
     }
 
@@ -157,14 +171,13 @@ where
     /// This constructor is used during epoch transitions to initialize configuration
     /// with updated committee membership and worker topology for the new epoch.
     ///
-    /// `prior_epoch_close` is the timestamp, in seconds, of the previous epoch's closing EVM block,
-    /// or `None` for epoch 0 (see [`Self::prior_epoch_close`]).
+    /// `prior_epoch` carries the previous epoch's record digest and closing timestamp, or
+    /// [`PriorEpoch::genesis`] for epoch 0 (see [`PriorEpoch`]).
     ///
     /// Fails when the parameters violate their operational floors, or when `vote_timeout` is
     /// shorter than `max_header_delay` plus the network config's
     /// `max_header_time_drift_tolerance` (rounded up to whole seconds while the sub-second gate
     /// is dormant for the epoch), or not below the libp2p request timeout.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_for_epoch(
         config: Config,
         node_storage: DB,
@@ -172,8 +185,7 @@ where
         committee: Committee,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
-        prior_epoch_record: EpochDigest,
-        prior_epoch_close: Option<TimestampSec>,
+        prior_epoch: PriorEpoch,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors (see
         // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
@@ -188,8 +200,7 @@ where
             committee,
             network_config,
             next_committee_keys,
-            prior_epoch_record,
-            prior_epoch_close,
+            prior_epoch,
         )
     }
 
@@ -200,7 +211,6 @@ where
     /// - Resolving authority status within the committee
     /// - Creating genesis certificates
     /// - Initializing shutdown notification system
-    #[allow(clippy::too_many_arguments)]
     fn new_with_committee(
         config: Config,
         node_storage: DB,
@@ -208,8 +218,7 @@ where
         committee: Committee,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
-        prior_epoch_record: EpochDigest,
-        prior_epoch_close: Option<TimestampSec>,
+        prior_epoch: PriorEpoch,
     ) -> eyre::Result<Self> {
         // Reject a configuration whose consensus parameters exceed the protocol ceilings the
         // consensus-pack reader relies on, so a node can never commit an output it cannot later
@@ -251,8 +260,7 @@ where
                 local_networks,
                 network_config,
                 genesis,
-                prior_epoch_record,
-                prior_epoch_close,
+                prior_epoch,
             }),
             shutdown,
         })
@@ -298,7 +306,7 @@ where
     /// canonical epoch-close seed message: proposers sign over it and voters verify header
     /// seed signatures against it.
     pub fn prior_epoch_record(&self) -> EpochDigest {
-        self.inner.prior_epoch_record
+        self.inner.prior_epoch.record
     }
 
     /// Returns the timestamp, in seconds, of the previous epoch's closing EVM block.
@@ -307,7 +315,7 @@ where
     /// sub-second timestamps active, consensus floors the epoch's first commit timestamp on this
     /// value so EVM time does not run backwards across the epoch seam.
     pub fn prior_epoch_close(&self) -> Option<TimestampSec> {
-        self.inner.prior_epoch_close
+        self.inner.prior_epoch.close
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -502,7 +510,8 @@ fn validate_vote_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_epoch_timing, validate_vote_timeout, ConsensusConfig, LIBP2P_REQUEST_TIMEOUT,
+        validate_epoch_timing, validate_vote_timeout, ConsensusConfig, PriorEpoch,
+        LIBP2P_REQUEST_TIMEOUT,
     };
     use crate::{Config, KeyConfig, NetworkConfig, Parameters, SyncConfig};
     use rand::{rngs::StdRng, SeedableRng as _};
@@ -631,8 +640,7 @@ mod tests {
             committee,
             NetworkConfig::default(),
             vec![],
-            EpochDigest::default(),
-            prior_epoch_close,
+            PriorEpoch { record: EpochDigest::default(), close: prior_epoch_close },
         )
         .expect("default test config passes new_for_epoch validation")
     }

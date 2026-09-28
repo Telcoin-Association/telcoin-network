@@ -35,7 +35,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, TelcoinDirs};
+use tn_config::{
+    Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
+};
 use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
@@ -340,8 +342,7 @@ where
             committee,
             network_config.clone(),
             next_committee_keys,
-            prior_epoch_record,
-            prior_epoch_close,
+            PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
         )?;
 
         Ok(consensus_config)
