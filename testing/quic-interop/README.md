@@ -11,12 +11,17 @@ Two independent Cargo workspaces build the same process fixture against
 libp2p-quic 0.13.1 (libp2p 0.56.0) and 0.14.0 (libp2p 0.57.0). Each has its own
 committed lockfile and target directory. No process links both transport versions.
 The current fixture's libp2p, QUIC, TLS, Quinn, quinn-proto and rustls versions must
-match the node's root lockfile. The controller fails on drift.
+match the node's root lockfile. The controller fails on version drift. Both fixtures
+use published transport releases; the node's vendored Retry patch is not included.
 
 Both binaries compile the production `QuicConfig` source, including defaults and
 the exact mapping called by `ConsensusNetwork`. They accept a JSON configuration
 file with the same fields as the node's `quic_config` section. An empty object
-selects production defaults. This isolates the transport from consensus, storage,
+selects production defaults. Configuration events compare the six shared transport
+settings against the applied values. The node's `retry_unvalidated_incoming` setting
+is recorded separately under `node_incoming_policy` with `applied: false`; the
+published releases do not expose the node's incoming policy API. This isolates the
+transport from consensus, storage,
 peer management and swarm policy; it does not instantiate a complete node.
 
 The four-direction matrix includes both mixed-release directions and the two

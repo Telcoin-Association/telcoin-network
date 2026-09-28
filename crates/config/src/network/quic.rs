@@ -26,6 +26,12 @@ pub struct QuicConfig {
     /// Max unacknowledged data in bytes that may be sent in total on all streams
     /// of a connection.
     pub max_connection_data: u32,
+    /// Answer every incoming QUIC connection attempt whose source address is not
+    /// validated with a QUIC Retry packet (RFC 9000 section 8.1) before the listener
+    /// creates connection state. The remote must echo the token from its address.
+    ///
+    /// Default `true`. Set `false` only as an operator rollback switch.
+    pub retry_unvalidated_incoming: bool,
 }
 
 impl Default for QuicConfig {
@@ -40,12 +46,16 @@ impl Default for QuicConfig {
             // maximum throughput = (buffer size / round-trip time)
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
+            retry_unvalidated_incoming: true,
         }
     }
 }
 
 impl QuicConfig {
-    /// Apply the node's transport settings while preserving libp2p's identity and other defaults.
+    /// Apply the shared transport settings while preserving libp2p's identity and other defaults.
+    ///
+    /// The node applies its incoming connection policy separately because the release fixtures
+    /// use transports without that policy API.
     pub fn apply_to(&self, mut config: libp2p::quic::Config) -> libp2p::quic::Config {
         config.handshake_timeout = self.handshake_timeout;
         config.max_idle_timeout = self.max_idle_timeout;
@@ -72,6 +82,7 @@ mod tests {
             max_concurrent_stream_limit: 19,
             max_stream_data: 12_345,
             max_connection_data: 54_321,
+            ..QuicConfig::default()
         };
         let key = libp2p::identity::Keypair::generate_ed25519();
         let config = settings.apply_to(libp2p::quic::Config::new(&key));

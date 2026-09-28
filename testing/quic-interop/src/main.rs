@@ -246,7 +246,15 @@ async fn main() -> Result<(), Error> {
     let key = Keypair::generate_ed25519();
     let config = settings.apply_to(quic::Config::new(&key));
     report(json!({"event": "configuration", "release": env!("CARGO_PKG_VERSION"),
-        "peer": key.public().to_peer_id().to_string(), "settings": settings,
+        "peer": key.public().to_peer_id().to_string(),
+        "settings": {"handshake_timeout": settings.handshake_timeout,
+            "max_idle_timeout": settings.max_idle_timeout,
+            "keep_alive_interval": settings.keep_alive_interval,
+            "max_concurrent_stream_limit": settings.max_concurrent_stream_limit,
+            "max_stream_data": settings.max_stream_data,
+            "max_connection_data": settings.max_connection_data},
+        "node_incoming_policy": {"applied": false,
+            "retry_unvalidated_incoming": settings.retry_unvalidated_incoming},
         "applied": {"handshake_timeout": config.handshake_timeout,
             "max_idle_timeout": config.max_idle_timeout,
             "keep_alive_interval": config.keep_alive_interval,
