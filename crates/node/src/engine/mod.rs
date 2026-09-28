@@ -276,10 +276,10 @@ impl ExecutionNode {
 
     /// Returns true if the worker identified by `worker_id` has been initialized.
     ///
-    /// A worker's components (RPC server + transaction pool) are created once on
-    /// the node's first epoch and are not torn down across epoch transitions, so
-    /// this reflects "this worker is up and accepting transactions" rather than
-    /// any per-epoch state. Backs the `/health/workers` readiness endpoint.
+    /// A worker's components (RPC server + transaction pool) are created once and never torn
+    /// down across epoch transitions. Worker 0 is created during process startup, before
+    /// startup epoch-record sync; other workers on the first epoch entry where their id is
+    /// active. Backs the `/health/workers` readiness endpoint.
     pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
         self.internal.read().await.workers.get(worker_id as usize).is_some()
     }

@@ -793,12 +793,14 @@ where
     /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip`, before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], restore execution state with
-    /// [`try_restore_state`](Self::try_restore_state), and spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
+    /// [`try_restore_state`](Self::try_restore_state), pin the epoch-start committee, seed fees
+    /// for epochs after epoch 0, publish the locally known node mode, and bind worker 0's RPC.
+    /// Spawn the long-running p2p networks ([`spawn_node_networks`](Self::spawn_node_networks)),
+    /// register bootstrap peers, bind all
     /// p2p listeners, schedule process-lifetime bootstrap dials, spawn the vote collector, and
-    /// re-vote durable records. Read the epoch-start-pinned committee, seed the in-memory epoch-0
+    /// re-vote durable records. Reuse the startup-pinned committee, seed the in-memory epoch-0
     /// anchor if needed, then poll for peers and sync epoch records within `STARTUP_SYNC_TIMEOUT`.
-    /// Seed the node-mode watch using both committee views before spawning the background record
+    /// Refresh the node-mode watch using both committee views before spawning the background record
     /// collector and the engine-update task. It then launches the epoch pack fetch workers before
     /// requesting any missing epoch pack files, followed by the recent-consensus fetch task.
     ///
@@ -935,6 +937,20 @@ where
             .apply(&gas_accumulator);
         }
 
+        let public_key = self.key_config.primary_public_key();
+        let is_committee_member = committee.authority_by_key(&public_key).is_some();
+        let initial_mode =
+            if is_committee_member { NodeMode::CvvActive } else { NodeMode::Observer };
+        // Publish before tn_nodeMode is reachable; the post-sync seed re-applies the record veto.
+        seed_node_mode_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.node_mode(),
+            &public_key,
+            committee.epoch(),
+            initial_mode,
+        )
+        .await;
+
         // Bind worker 0's RPC before either startup synchronization or epoch peer waits. Its
         // network shim reports syncing until the first epoch publishes the node's mode.
         engine
@@ -1068,8 +1084,7 @@ where
         // collectors must not race.
         // Reuse the committee pinned before RPC startup, so a mid-epoch governance burn cannot
         // change the startup membership decision.
-        let public_key = self.key_config.primary_public_key();
-        let initial_mode = if committee.authority_by_key(&public_key).is_some() {
+        if is_committee_member {
             // Committee dials run concurrently with bounded epoch-record synchronization.
             committee
                 .bls_keys()
@@ -1083,10 +1098,7 @@ where
                         node_task_spawner.clone(),
                     );
                 });
-            NodeMode::CvvActive
-        } else {
-            NodeMode::Observer
-        };
+        }
         if !self.consensus_chain.epochs().contains_epoch(0).await {
             eyre::ensure!(
                 committee.epoch() == 0,

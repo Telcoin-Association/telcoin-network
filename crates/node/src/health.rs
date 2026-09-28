@@ -62,9 +62,8 @@ struct WorkerReadiness {
     /// Whether the worker is up and accepting transactions.
     ///
     /// True once the worker's RPC server + transaction pool are initialized.
-    /// These are created on the node's first epoch and are not torn down across
-    /// epoch transitions, so this stays true for the life of the process once
-    /// the node has started. A node that is down answers no request at all,
+    /// These are not torn down across epoch transitions, so this stays true for
+    /// the life of the process once initialized. A node that is down answers no request at all,
     /// which the polling gateway treats as not-ready (fail-closed).
     accepting_transactions: bool,
 }

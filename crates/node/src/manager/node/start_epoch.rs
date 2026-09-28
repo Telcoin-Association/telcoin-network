@@ -525,11 +525,10 @@ where
                 .get(usize::from(worker_id))
                 .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?;
 
-            // initialize worker components on startup
-            // This will use the new epoch_task_spawner and epoch on network_handle.
-            // Also initialize if workers are empty: this happens when the first epoch returns
-            // early from replay_missed_consensus (epoch boundary hit) before create_consensus
-            // is reached, leaving workers uninitialized.
+            // Worker 0 is initialized in EpochManager::run before startup sync. Other workers are
+            // initialized on the first epoch entry where their id is active, including ids
+            // activated later by governance. Network tasks are attached below on every
+            // entry.
             if !engine.is_worker_initialized(worker_id).await {
                 engine_to_primary.node_info.worker_network_key =
                     self.key_config.worker_network_public_key(worker_id);
