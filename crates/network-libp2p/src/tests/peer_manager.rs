@@ -543,11 +543,11 @@ async fn test_process_peer_exchange() {
     assert!(peer_manager.next_dial_request().is_none());
 }
 
+/// Peer exchange entries keyed by their authenticated BLS key.
+type EligibleExchangeMap = HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>;
+
 /// Helper to build an exchange map of `count` eligible peers, returning the map and its ids.
-fn eligible_exchange_map(
-    count: usize,
-    seed: u8,
-) -> (HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>, HashSet<PeerId>) {
+fn eligible_exchange_map(count: usize, seed: u8) -> (EligibleExchangeMap, HashSet<PeerId>) {
     let mut rng = StdRng::from_seed([seed; 32]);
     (0..count).fold(
         (HashMap::new(), HashSet::new()),

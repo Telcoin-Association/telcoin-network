@@ -5,9 +5,10 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
-    kad::KadStore,
+    kad::{node_record_key, KadStore},
     metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -54,6 +55,57 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/admission_contention.rs"]
+mod admission_contention;
+
+#[cfg(test)]
+#[path = "tests/loop_budget_tests.rs"]
+mod loop_budget_tests;
+
+/// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
+/// [`next_loop_event`].
+#[derive(Debug)]
+enum LoopEvent<E, C> {
+    /// The record-refresh interval ticked.
+    Refresh,
+    /// The swarm produced an event.
+    Swarm(E),
+    /// The command channel produced a command.
+    Command(C),
+    /// Every command sender is gone, so the network loop must shut down.
+    CommandsClosed,
+}
+
+/// Wait for the next unit of work of the network loop: a record-refresh tick, a swarm event or a
+/// command.
+///
+/// [`ConsensusNetwork::run`] calls this once per loop iteration. `events` is generic so tests can
+/// drive this exact function with a synthetic, always-ready event source.
+///
+/// Every call first spends one unit of the tokio cooperative budget. The swarm stream spends no
+/// budget (libp2p events, QUIC accepts and futures channels are not budget-aware). Without this
+/// charge, a flood of ready swarm events never makes the loop return `Pending`, so the task never
+/// yields: other tasks on the same worker thread do not run and, on a `current_thread` runtime,
+/// the time driver does not turn, so no interval fires. With the charge, the loop serves at most
+/// one budget of iterations per scheduler poll, then yields and wakes itself. The charge comes
+/// before the `select!`, so a yield never drops a swarm event or a command.
+async fn next_loop_event<S, C>(
+    record_refresh: &mut tokio::time::Interval,
+    events: &mut S,
+    commands: &mut Receiver<C>,
+) -> LoopEvent<S::Item, C>
+where
+    S: futures::Stream + futures::stream::FusedStream + Unpin,
+{
+    tokio::task::coop::consume_budget().await;
+    tokio::select! {
+        _ = record_refresh.tick() => LoopEvent::Refresh,
+        event = events.select_next_some() => LoopEvent::Swarm(event),
+        command = commands.recv() => command.map_or(LoopEvent::CommandsClosed, LoopEvent::Command),
+    }
+}
 
 /// Hard cap on the number of distinct peers retained in
 /// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
@@ -343,6 +395,9 @@ where
     published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
+    /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
+    quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -559,6 +614,14 @@ where
 
         let network_pubkey = keypair.public().into();
 
+        // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
+        let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
+        let quic_limits = QuicIncomingLimits::new(
+            network_config.peer_config().max_priority_peers(),
+            MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+        );
+        let quic_stats = std::sync::Arc::clone(&quic_incoming);
+
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -570,6 +633,11 @@ where
                     network_config.quic_config().max_concurrent_stream_limit;
                 config.max_stream_data = network_config.quic_config().max_stream_data;
                 config.max_connection_data = network_config.quic_config().max_connection_data;
+                quic_limits.apply(
+                    &mut config,
+                    network_config.quic_config().retry_unvalidated_incoming,
+                    quic_stats,
+                );
                 config
             })
             .with_behaviour(|_| behavior)
@@ -616,6 +684,7 @@ where
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
+            quic_incoming,
         })
     }
 
@@ -656,7 +725,7 @@ where
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
-        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        let key = node_record_key(&self.key_config.primary_public_key());
         // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
         // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
         // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
@@ -770,28 +839,31 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            tokio::select! {
-                _ = record_refresh.tick() => self.refresh_own_record(),
-                event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
-                    error!(target: "network", ?e, "network event error");
-                    if let NetworkError::AllListenersClosed = e {
-                        // In this case go ahead and kill the node.
-                        return Err(e);
+            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+                LoopEvent::Refresh => self.refresh_own_record(),
+                LoopEvent::Swarm(event) => {
+                    if let Err(e) = self.process_event(event).await {
+                        error!(target: "network", ?e, "network event error");
+                        if let NetworkError::AllListenersClosed = e {
+                            // In this case go ahead and kill the node.
+                            return Err(e);
+                        }
                     }
-                },
-                command = self.commands.recv() => match command {
-                    Some(c) => if let Err(e) = self.process_command(c) {
+                }
+                LoopEvent::Command(c) => {
+                    if let Err(e) = self.process_command(c) {
                         error!(target: "network", ?e, "network command error")
-                    },
-                    None => {
-                        info!(target: "network", "network shutting down...");
-                        return Ok(())
                     }
-                },
+                }
+                LoopEvent::CommandsClosed => {
+                    info!(target: "network", "network shutting down...");
+                    return Ok(());
+                }
             }
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
 
@@ -1140,7 +1212,7 @@ where
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
-                let record_key = kad::RecordKey::new(&key);
+                let record_key = node_record_key(&key);
                 let record = self
                     .swarm
                     .behaviour_mut()
@@ -1820,7 +1892,7 @@ where
                 // non-committee re-arms the key.
                 for bls_key in missing {
                     if self.kad_record_queries.values().all(|q| q.request != bls_key) {
-                        let key = kad::RecordKey::new(&bls_key);
+                        let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
                     } else {

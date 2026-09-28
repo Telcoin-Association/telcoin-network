@@ -205,34 +205,35 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         base_fee: u64,
     ) -> eyre::Result<()> {
-        if let Some(worker) = self.workers.get(worker_id as usize) {
-            let pool = worker.pool();
-            let mut block_info = pool.block_info();
-            block_info.pending_basefee = base_fee;
-            pool.set_block_info(block_info);
-        } else {
+        let worker = self.workers.get(usize::from(worker_id)).ok_or_else(|| {
             warn!(
                 target: "tn::execution",
                 worker_id,
                 initialized_workers = self.workers.len(),
                 "set_worker_base_fee: dropping base-fee update for uninitialized worker"
             );
-            return Err(eyre!(
+            eyre!(
                 "set_worker_base_fee: worker {worker_id} uninitialized ({} workers initialized)",
                 self.workers.len()
-            ));
-        }
+            )
+        })?;
+        worker.pool().set_epoch_base_fee(base_fee);
         Ok(())
     }
 
-    /// Respawn any tasks on the worker network when we get a new epoch task manager.
+    /// Respawn one worker's peer-count task using that worker's epoch network handle.
     ///
-    /// This method should be called on epoch rollover.
-    /// Will take care of all workers.
-    pub(super) async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
-        for worker in &self.workers {
-            worker.worker_network().respawn_peer_count(network_handle.clone());
-        }
+    /// A handle for one worker must never drive another worker's RPC network shim.
+    pub(super) fn respawn_worker_network_tasks(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+    ) -> eyre::Result<()> {
+        let worker = self.workers.get(usize::from(worker_id)).ok_or_else(|| {
+            eyre!("cannot respawn network tasks for uninitialized worker {worker_id}")
+        })?;
+        worker.worker_network().respawn_peer_count(network_handle);
+        Ok(())
     }
 
     /// Push the node's consensus catch-up state into every worker's RPC network shim.

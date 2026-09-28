@@ -69,7 +69,8 @@ where
     })
 }
 
-#[derive(Debug)]
+/// Consensus and node metadata exposed by each worker's RPC server.
+#[derive(Clone, Debug)]
 pub struct EngineToPrimaryRpc {
     /// Container for consensus channels.
     consensus_bus: ConsensusBusApp,

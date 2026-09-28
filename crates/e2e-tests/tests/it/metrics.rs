@@ -1,24 +1,12 @@
 //! E2e test for the prometheus `/metrics` endpoint (`--metrics` CLI flag).
 
-use std::{
-    io::{Read, Write},
-    net::TcpStream,
-    time::Duration,
-};
+use std::time::Duration;
 use tn_types::get_available_tcp_port;
 use tracing::info;
 
-use crate::common::{network_advancing, start_validator, start_validator_with_args, ProcessGuard};
-
-/// Scrape the metrics endpoint with a raw HTTP GET (no client deps).
-fn scrape_metrics(addr: &str) -> eyre::Result<String> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
-}
+use crate::common::{
+    network_advancing, scrape_metrics, start_validator, start_validator_with_args, ProcessGuard,
+};
 
 /// Poll the endpoint until the body contains all expected substrings (or time out).
 fn scrape_until_contains(addr: &str, expected: &[&str], attempts: usize) -> eyre::Result<String> {

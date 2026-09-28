@@ -4,7 +4,7 @@ use crate::common::get_block;
 
 use super::common::{
     create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
-    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR,
+    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR, NODE_PASSWORD,
 };
 use alloy::{
     primitives::Bytes,
@@ -20,7 +20,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::WORKER_CONFIGS_ADDRESS;
+use tn_config::{
+    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, NodeInfo, WORKER_CONFIGS_ADDRESS,
+};
 use tn_reth::{
     system_calls::{ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
@@ -33,7 +35,8 @@ use tn_types::{
         leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
         seed_signature_active,
     },
-    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256, U256,
+    get_available_udp_port, keccak256, Address, BootstrapServer, Epoch, EpochCertificate,
+    EpochRecord, Genesis, P2pNode, B256, U256,
 };
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -48,8 +51,8 @@ const MIN_EPOCHS_TO_TEST: usize = 6;
 // not shrink with the epoch cadence.
 const EPOCH_DURATION: u64 = 5;
 
-/// Environment variable selecting the multi-workers fork epoch (#554) for this process and
-/// every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
+/// Environment variable selecting the multi-workers fork epoch (issue #554) for this process
+/// and every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
 const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
 
 /// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
@@ -534,9 +537,9 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin every fork epoch this suite depends on, the multi-workers fork (#554), the seed-signature
-/// fork (#1032), and the leader-seeded-ordering fork (#1260), for this process and every node it
-/// spawns.
+/// Pin three fork epochs for this process and every node it spawns: the multi-workers fork
+/// (issue #554), the seed-signature fork (#1032), and the leader-seeded-ordering fork (#1260). The
+/// PREVRANDAO and governance-Safe forks are not pinned here; see below.
 ///
 /// Step 8 decodes sealed pack bytes in the harness, and that reaches the first two gates: the
 /// `EpochMeta`'s [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every
@@ -550,10 +553,18 @@ fn assert_sealed_packs_unchanged(
 /// not consult it; it is pinned here for the children (and against a latched-earlier override),
 /// with the always-armed `0` default `TestBinary::command` forwards for it.
 ///
-/// Every fork is pinned, not just the one a given test is about. Pinning only some leaves the rest
+/// All three are pinned, not just the one a given test is about. Pinning only some leaves the rest
 /// asymmetric whenever the suite runs outside the Makefile wrapper that exports them, and the
 /// symptom is misleading: children write dormant-layout headers, the harness decodes them as
 /// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
+///
+/// The other two forks cannot put the harness and the nodes at odds. PREVRANDAO changes only the
+/// executed block's `mix_hash`, which step 8 never decodes and no test in this file checks, so
+/// children run whatever `TestBinary::command` forwards: the lane's `TN_PREVRANDAO_FORK_EPOCH`,
+/// else the dormant `u32::MAX`. Everything the governance-Safe fork is made of is `adiri`-gated,
+/// so it is compiled out of this harness and of the default e2e node binary; only the
+/// `make test-e2e-governance-safe` lane runs it, and that lane runs `test_governance_safe_fork`
+/// alone.
 ///
 /// Each `force_*` argument states that fork epoch outright, for a test whose claim is about a
 /// specific boundary. `None` inherits whatever the lane exported, defaulting to what
@@ -805,11 +816,43 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
     Ok(())
 }
 
+/// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
+///
+/// Keytool currently generates only worker 0. Derive the second identity from the same keys
+/// the node loads at startup, and share both workers' addresses before starting any processes.
+fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> eyre::Result<()> {
+    let bootstrap_peers = committee
+        .iter()
+        .map(|(name, _)| {
+            let dir = temp_path.join(name);
+            let path = dir.join("node-info.yaml");
+            let keys = KeyConfig::read_config(&dir, Some(NODE_PASSWORD.to_string()))?;
+            let mut info: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+            eyre::ensure!(info.p2p_info.num_workers() == 1, "fixture must start with one worker");
+            let port = get_available_udp_port("127.0.0.1")
+                .ok_or_else(|| eyre::eyre!("no UDP port available for worker 1"))?;
+            info.p2p_info.workers.push(P2pNode {
+                network_key: keys.worker_network_public_key(1),
+                network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse()?,
+                rpc: None,
+            });
+            Config::write_to_path(path, &info, ConfigFmt::YAML)?;
+            Ok((
+                info.bls_public_key,
+                BootstrapServer::new(info.p2p_info.primary, info.p2p_info.workers),
+            ))
+        })
+        .collect::<eyre::Result<BTreeMap<_, _>>>()?;
+    let network: NetworkConfig =
+        serde_json::from_value(serde_json::json!({ "bootstrap_peers": bootstrap_peers }))?;
+    committee.iter().try_for_each(|(name, _)| network.write_config(&temp_path.join(name)))
+}
+
 /// Governance can grow and shrink the protocol worker count while validators keep running.
 ///
-/// Every node starts with one configured worker. Growing to two therefore exercises the live
-/// epoch-entry shortfall after startup; no second worker key or swarm appears. The original
-/// processes must still close epochs and accept the subsequent decrease back to one worker.
+/// Every node provisions two workers while genesis activates only one. The original processes
+/// must start worker 1 at epoch entry, close epochs with both workers, and accept a decrease
+/// back to one worker without restarting. A local capacity shortfall is covered by node tests.
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()> {
@@ -834,6 +877,7 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         EPOCH_DURATION,
     )?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    provision_second_workers(temp_dir.path(), &committee)?;
     let (children, endpoints) = start_nodes(temp_dir.path(), &committee, "worker_count", 1)?;
     let mut guard = ProcessGuard::new(children);
     // A quorum can commit governance before the final validator has opened its RPC listener.
@@ -891,8 +935,8 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
-/// Test that an epoch pack archive spanning the multi-workers fork boundary (#554) survives a
-/// restart.
+/// Test that an epoch pack archive spanning the multi-workers fork boundary (issue #554)
+/// survives a restart.
 ///
 /// The same kill/restart scenario as [`test_epoch_sync`], with the fork pinned at
 /// [`CROSS_FORK_EPOCH`] so one datadir holds both committee layouts: epoch 0 written in the legacy

@@ -1226,6 +1226,220 @@ mod tests {
         Ok(())
     }
 
+    /// In-protocol governance-Safe fork over the PRE-fork testnet genesis.
+    ///
+    /// `test_genesis()` embeds the committed testnet `genesis.yaml`: the governance proxy sits
+    /// on the recompiled L1 `Safe` singleton with no fallback handler, the recompiled
+    /// singleton and factory occupy the canonical addresses, and none of the remaining
+    /// canonical v1.4.1 suite exists. The epoch-closing block that concludes
+    /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` installs the full canonical suite and migrates the
+    /// governance proxy onto SafeL2 (see `apply_governance_safe_fork`).
+    ///
+    /// Asserts: every suite account carries its pinned canonical code hash post-fork (the two
+    /// swap targets moved OFF their pre-fork pins, with balance + nonce + threshold storage
+    /// preserved); SafeL2 seeds `threshold = 1` and the EIP-161 contract nonce; the governance
+    /// proxy's slot 0 flipped to SafeL2 and its handler slot to the canonical
+    /// CompatibilityFallbackHandler while its code, balance, account nonce, owner count,
+    /// threshold, and an owner linked-list entry are byte-identical; the Safe Singleton
+    /// Factory's deployer EOA moves from nonce 0 to the mainnet-genesis nonce-1 marker while
+    /// staying code-free; and the fork block's
+    /// `state_root` is identical across two independent executions. All post-fork reads go
+    /// through a fresh `StateProvider` over the canonicalized chain — the same path a
+    /// restarted node takes to read the migrated state back.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_migrates_proxy_to_safe_l2() -> eyre::Result<()> {
+        use reth_provider::StateProvider as _;
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+        use tn_types::forks::{
+            governance_safe_fork_canonical_address, GOVERNANCE_SAFE_FORK_CANONICAL_SUITE,
+        };
+
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`
+        let handler_slot = alloy::primitives::keccak256(b"fallback_manager.handler.address");
+        // an arbitrary owner linked-list entry from the committed genesis, proving untouched
+        // storage survives the migration byte-identically
+        let owner_slot: B256 =
+            "0x0fe3dc9300fae4e3f10c2aa6fd7984ca49afa61ba70631199528bcaa11f4ddaa".parse()?;
+        // by name, not by index: the table's row order is coupled to `tn-reth`'s vendored
+        // bytecode list, so a future reordering must not silently repoint these at other
+        // contracts
+        let suite_address = |name: &str| {
+            governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+        let (safe_l1, safe_l2, fallback_handler) = (
+            suite_address("Safe"),
+            suite_address("SafeL2"),
+            suite_address("CompatibilityFallbackHandler"),
+        );
+        let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+        // mirrors `SAFE_SINGLETON_FACTORY_DEPLOYER` in `block.rs::apply_governance_safe_fork`.
+        // Mainnet genesis allocates it `nonce: 0x1, balance: 0x0` with no code, marking its
+        // nonce-0 presigned factory-deployment transaction as spent; adiri never ran that
+        // transaction, so the fork writes the marker to close the last parity leaf.
+        const SAFE_SINGLETON_FACTORY_DEPLOYER: Address =
+            alloy::primitives::address!("0xE1CB04A0fA36DdD16a06ea828007E35e1a3cBC37");
+
+        // fork fires when the concluding epoch + 1 == FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+        // one payload, cloned across both executions, so the determinism check compares
+        // byte-identical inputs
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("governance fork env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None).unwrap();
+
+        // pre-fork fixture guards (a readable failure here means the committed genesis was
+        // regenerated and no longer mirrors the live chain this fork targets)
+        let (pre_balance, pre_nonce, pre_owner_entry) = {
+            let pre = env1.latest()?;
+            let account = pre
+                .basic_account(&GOVERNANCE_SAFE_ADDRESS)?
+                .expect("testnet genesis must allocate the governance proxy");
+            assert_eq!(
+                pre.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+                Some(as_slot_value(safe_l1)),
+                "pre-fork governance proxy must sit on the L1 Safe singleton"
+            );
+            assert_eq!(
+                pre.storage(GOVERNANCE_SAFE_ADDRESS, handler_slot)?.unwrap_or_default(),
+                U256::ZERO,
+                "pre-fork governance proxy must have no fallback handler"
+            );
+            assert!(
+                pre.account_code(&safe_l2)?.is_none(),
+                "pre-fork genesis must not deploy SafeL2"
+            );
+            assert_eq!(
+                pre.basic_account(&SAFE_SINGLETON_FACTORY_DEPLOYER)?
+                    .map(|account| account.nonce)
+                    .unwrap_or_default(),
+                0,
+                "pre-fork genesis must leave the singleton-factory deployer EOA at nonce 0 \
+                 (unallocated, or allocated without the mainnet marker)"
+            );
+            let owner_entry = pre
+                .storage(GOVERNANCE_SAFE_ADDRESS, owner_slot)?
+                .expect("committed genesis carries the probed owner linked-list entry");
+            (account.balance, account.nonce, owner_entry)
+        };
+
+        // --- produce the fork boundary block on the production path ---
+        let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let produced_state_root = block.recovered_block.clone_sealed_header().state_root;
+
+        // --- post-fork reads through a fresh StateProvider (restart-shaped) ---
+        let post = env1.latest()?;
+
+        // the full canonical suite is installed at the pinned hashes
+        for (name, address, canonical_hash) in GOVERNANCE_SAFE_FORK_CANONICAL_SUITE {
+            let code = post
+                .account_code(&address)?
+                .unwrap_or_else(|| panic!("{name} must have code post-fork"));
+            assert_eq!(
+                code.0.hash_slow(),
+                canonical_hash,
+                "{name} must carry its canonical code hash post-fork"
+            );
+        }
+        // the swap targets moved OFF their pre-fork pins with account state preserved
+        let singleton_account =
+            post.basic_account(&safe_l1)?.expect("Safe singleton account survives the swap");
+        assert_eq!(singleton_account.nonce, 0, "swap preserves the singleton's genesis nonce");
+        assert_eq!(
+            post.storage(safe_l1, B256::with_last_byte(4))?,
+            Some(U256::ONE),
+            "swap preserves the singleton's constructor threshold = 1 storage"
+        );
+        // fresh SafeL2 seeds the constructor threshold and the EIP-161 contract nonce
+        assert_eq!(
+            post.storage(safe_l2, B256::with_last_byte(4))?,
+            Some(U256::ONE),
+            "etched SafeL2 must seed threshold = 1"
+        );
+        assert_eq!(
+            post.basic_account(&safe_l2)?.expect("SafeL2 account exists post-fork").nonce,
+            1,
+            "etched SafeL2 must carry the EIP-161 contract-account nonce"
+        );
+
+        // the singleton-factory deployer EOA carries the mainnet-genesis marker, nonce-only
+        let deployer_account = post
+            .basic_account(&SAFE_SINGLETON_FACTORY_DEPLOYER)?
+            .expect("the fork must materialize the singleton-factory deployer EOA");
+        assert_eq!(
+            deployer_account.nonce, 1,
+            "the fork must mark the singleton-factory deployer's presigned deployment as spent"
+        );
+        assert!(
+            deployer_account.bytecode_hash.is_none(),
+            "the deployer marker is nonce-only: its account leaf must carry no code hash"
+        );
+        assert!(
+            post.account_code(&SAFE_SINGLETON_FACTORY_DEPLOYER)?.is_none(),
+            "the deployer marker is nonce-only: the EOA must stay code-free"
+        );
+
+        // governance proxy: exactly two slots moved, everything else byte-identical
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+            Some(as_slot_value(safe_l2)),
+            "governance proxy slot 0 must flip to the SafeL2 singleton"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, handler_slot)?,
+            Some(as_slot_value(fallback_handler)),
+            "governance proxy must reference the canonical fallback handler"
+        );
+        let post_account = post
+            .basic_account(&GOVERNANCE_SAFE_ADDRESS)?
+            .expect("governance proxy account survives the migration");
+        assert_eq!(post_account.balance, pre_balance, "migration must not touch the TEL balance");
+        assert_eq!(post_account.nonce, pre_nonce, "migration must not touch the account nonce");
+        assert_eq!(
+            post.account_code(&GOVERNANCE_SAFE_ADDRESS)?
+                .expect("proxy keeps its code")
+                .0
+                .hash_slow(),
+            tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+            "migration must not touch the proxy code"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::with_last_byte(3))?,
+            Some(U256::from(7)),
+            "owner count must be preserved"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::with_last_byte(4))?,
+            Some(U256::from(3)),
+            "threshold must be preserved"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, owner_slot)?,
+            Some(pre_owner_entry),
+            "owner linked-list storage must be preserved byte-identically"
+        );
+
+        // --- determinism: an independent execution of the identical block yields the same root ---
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("governance fork env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        assert_eq!(
+            block2.recovered_block.clone_sealed_header().state_root,
+            produced_state_root,
+            "governance fork block state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
     /// Pre-fork epoch conclusion over the LIVE adiri registry code must speak the legacy ABI.
     ///
     /// `test_genesis()` embeds the committed testnet `genesis.yaml` — the registry account

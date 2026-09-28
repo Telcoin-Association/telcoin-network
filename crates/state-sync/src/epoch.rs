@@ -3,7 +3,11 @@
 #[cfg(test)]
 use tn_test_utils as _;
 
-use std::time::Duration;
+use futures::StreamExt as _;
+use std::{
+    future::{ready, Future},
+    time::Duration,
+};
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordValidation};
@@ -12,6 +16,117 @@ use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
+
+/// Maximum time spent collecting epoch records before startup continues.
+const STARTUP_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Give each startup pass one background retry interval to make database progress.
+const STARTUP_SYNC_PASS_TIMEOUT: Duration = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
+
+/// Cadence for checking whether a startup dial has established a connection.
+const STARTUP_PEER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cursor and injected operations carried between startup collection passes.
+struct StartupSyncState<Collect, Progress> {
+    /// Last collected epoch, or the predecessor of the certified prefix after a capped pass.
+    last_epoch: Epoch,
+    /// A completed pass to compare against the next result when detecting quiescence.
+    previous_pass: Option<Epoch>,
+    /// Fetch and validate records from the current cursor.
+    collect: Collect,
+    /// Read the first epoch without a historical certificate.
+    progress: Progress,
+}
+
+/// Collect epoch records before the first epoch starts.
+///
+/// The caller must seed the trusted genesis committee before calling this function and start the
+/// background record collector afterward. Records use the same locally anchored validation as
+/// background collection. Peer readiness is polled until a connection is established. Network
+/// failures never fail startup: two equal consecutive pass results, a capped pass without
+/// certified-prefix progress, shutdown, or a thirty-second deadline stop collection. The deadline
+/// includes the peer wait. Each pass has a five-second cap, so connected peers that cannot yet
+/// serve certificates do not consume the full deadline.
+pub async fn sync_epoch_records_to_tip(
+    consensus_chain: &ConsensusChain,
+    primary_handle: &PrimaryNetworkHandle,
+    consensus_bus: &ConsensusBusApp,
+    node_shutdown: Noticer,
+) {
+    drive_epoch_record_sync(
+        || async { primary_handle.inner_handle().established_peer_count().await.unwrap_or(0) },
+        |epoch| collect_epoch_records(epoch, consensus_chain, primary_handle, consensus_bus),
+        || async {
+            // This cached scan also detects certificate backfill below the latest stored record,
+            // including replacement of the dummy epoch 0 with a certified record.
+            consensus_chain
+                .epochs()
+                .first_missing_historical_cert(Epoch::MAX)
+                .await
+                .unwrap_or(Epoch::MAX)
+        },
+        node_shutdown,
+    )
+    .await;
+}
+
+/// Drive startup collection with independently bounded passes and a process-wide stop condition.
+///
+/// `progress` returns the first epoch without a certificate, so a capped pass continues only when
+/// it extended the certified prefix. Separate scheduling from transport to exercise repair,
+/// stalled peers, and shutdown deterministically.
+async fn drive_epoch_record_sync<Peers, Collect, Progress>(
+    peer_count: impl FnMut() -> Peers,
+    collect: impl FnMut(Epoch) -> Collect,
+    progress: impl FnMut() -> Progress,
+    shutdown: impl Future<Output = ()>,
+) where
+    Peers: Future<Output = usize>,
+    Collect: Future<Output = Epoch>,
+    Progress: Future<Output = Epoch>,
+{
+    let sync = async {
+        // Await each borrowed peer query inside the polling future. Passing it through
+        // `then(identity)` prevents `Send` inference for node startup on Rust 1.94.
+        futures::stream::unfold(peer_count, |mut peer_count| async move {
+            Some((peer_count().await, peer_count))
+        })
+        .take_while(|peers| ready(*peers == 0))
+        .for_each(|_| tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL))
+        .await;
+
+        futures::stream::unfold(
+            StartupSyncState { last_epoch: 0, previous_pass: None, collect, progress },
+            |mut state| async move {
+                let before = (state.progress)().await;
+                let collected = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(STARTUP_SYNC_PASS_TIMEOUT) => None,
+                    epoch = (state.collect)(state.last_epoch) => Some(epoch),
+                };
+                // A backward step repairs an anchor; only equality establishes quiescence.
+                let quiescent = collected.is_some_and(|epoch| state.previous_pass == Some(epoch));
+                let after = (state.progress)().await;
+                let stalled = collected.is_none() && after == before;
+                state.last_epoch = collected.unwrap_or_else(|| after.saturating_sub(1));
+                state.previous_pass = collected;
+                // Keep the outer deadline and shutdown responsive for immediately ready passes.
+                tokio::task::yield_now().await;
+                (!quiescent && !stalled).then_some(((), state))
+            },
+        )
+        .for_each(|()| ready(()))
+        .await;
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown => {},
+        _ = tokio::time::sleep(STARTUP_SYNC_TIMEOUT) => {
+            info!(target: "epoch-manager", "startup epoch record sync reached its deadline");
+        },
+        _ = sync => {},
+    }
+}
 
 /// Asks peers for records from last_epoch to requested_epoch.
 /// Returns the Epoch that was last retrieved.
@@ -188,6 +303,11 @@ pub async fn spawn_epoch_record_collector(
     });
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "epoch/startup_tests.rs"]
+mod startup_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,11 +354,14 @@ mod tests {
     fn mock_epoch_record_network(
         served: HashMap<Epoch, (EpochRecord, EpochCertificate)>,
         peer: BlsPublicKey,
+        established_peers: usize,
     ) -> PrimaryNetworkHandle {
         let (tx, mut rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                if let NetworkCommand::SendRequestAny { request, reply } = cmd {
+                if let NetworkCommand::EstablishedPeerCount { reply } = cmd {
+                    let _ = reply.send(established_peers);
+                } else if let NetworkCommand::SendRequestAny { request, reply } = cmd {
                     let PrimaryRequest::EpochRecord { epoch: Some(epoch), .. } = request else {
                         continue;
                     };
@@ -307,7 +430,7 @@ mod tests {
 
         let served =
             HashMap::from([(1, (rec1.clone(), cert1.clone())), (2, (rec2.clone(), cert2.clone()))]);
-        let handle = mock_epoch_record_network(served, keys[0]);
+        let handle = mock_epoch_record_network(served, keys[0], 1);
         let consensus_bus = ConsensusBus::new();
 
         let collected =
@@ -364,7 +487,7 @@ mod tests {
         assert!(rec1_bad.verify_with_cert(&cert1_bad), "cert alone verifies");
 
         let served = HashMap::from([(1, (rec1_bad.clone(), cert1_bad))]);
-        let handle = mock_epoch_record_network(served, keys[0]);
+        let handle = mock_epoch_record_network(served, keys[0], 1);
         let consensus_bus = ConsensusBus::new();
 
         let collected =
@@ -373,5 +496,71 @@ mod tests {
 
         // The rejected record was never saved.
         assert!(consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+    }
+
+    /// The public gate replaces the dummy anchor and saves a peer's certified epoch chain.
+    #[tokio::test]
+    async fn startup_sync_downloads_from_dummy_anchor() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let peer = keys.first().copied().ok_or_else(|| eyre::eyre!("empty committee fixture"))?;
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        let record0 = EpochRecord {
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        chain.epochs().save_dummy_epoch0(record0.clone()).await?;
+        let record1 = EpochRecord {
+            epoch: 1,
+            parent_hash: record0.digest(),
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+        let cert0 = make_cert(&record0, &signers, &[0, 1, 2]);
+        let cert1 = make_cert(&record1, &signers, &[0, 1, 2]);
+        let handle = mock_epoch_record_network(
+            HashMap::from([(0, (record0, cert0)), (1, (record1.clone(), cert1.clone()))]),
+            peer,
+            1,
+        );
+        let bus = ConsensusBus::new();
+        let shutdown = tn_types::ShutdownNotifier::new();
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(1));
+        assert!(!chain.epochs().contains_dummy_epoch0().await);
+        assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((record1, Some(cert1))));
+        Ok(())
+    }
+
+    /// Pending dials cannot make an isolated node fetch a record, even if the mock could serve it.
+    #[tokio::test(start_paused = true)]
+    async fn startup_sync_zero_peers_preserves_dummy() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let peer = keys.first().copied().ok_or_else(|| eyre::eyre!("empty committee fixture"))?;
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        let record =
+            EpochRecord { committee: keys.clone(), next_committee: keys, ..Default::default() };
+        chain.epochs().save_dummy_epoch0(record.clone()).await?;
+        let cert = make_cert(&record, &signers, &[0, 1, 2]);
+        let handle = mock_epoch_record_network(HashMap::from([(0, (record, cert))]), peer, 0);
+        let bus = ConsensusBus::new();
+        let shutdown = tn_types::ShutdownNotifier::new();
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(0));
+        assert!(chain.epochs().contains_dummy_epoch0().await);
+        Ok(())
     }
 }

@@ -24,5 +24,8 @@ tn-config = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 telcoin-network-cli = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
 [lints]
 workspace = true

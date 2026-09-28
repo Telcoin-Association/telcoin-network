@@ -7,13 +7,13 @@
 //! re-sorts it - Θ(N² · M) per output, with the merged work discarded after every
 //! block because the provider's `OnceLock` cache is cloned empty into each delegated
 //! call. TN bypasses that reth-side path (it is NOT fixed upstream): the engine keeps
-//! ONE [`OutputTrieOverlay`] per consensus output, extends it in place with each
+//! ONE [`OutputTrieOverlay`] per consensus output, geometrically compacts each
 //! built block's already-sorted deltas, and drives each block's state root directly
 //! against the database transaction with layered in-memory cursors
 //! ([`OutputTrieOverlay::layered_root_with_updates`]).
 //!
 //! Layer precedence (outermost wins, wipes and `None` tombstones shadow inner
-//! layers): current block's sorted deltas > accumulated ancestor overlay > database.
+//! layers): current block's sorted deltas > newest through oldest runs > database.
 //! The cursor factories are self-composable, so stacking replaces reth's
 //! merge+clone+re-sort; prefix sets come from the current block's own hashed state
 //! only, exactly as in reth's path (ancestors contribute empty prefix sets there).
@@ -28,31 +28,39 @@ use reth_provider::{
     StorageRootProvider,
 };
 use reth_trie::{
-    hashed_cursor::HashedPostStateCursorFactory,
-    trie_cursor::InMemoryTrieCursorFactory,
-    updates::{TrieUpdates, TrieUpdatesSorted},
-    AccountProof, HashedPostState, HashedPostStateSorted, HashedStorage, MultiProof,
-    MultiProofTargets, StateRoot, StorageMultiProof, TrieInput,
+    hashed_cursor::HashedPostStateCursorFactory, updates::TrieUpdates, AccountProof,
+    HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StateRoot, StorageMultiProof,
+    TrieInput,
 };
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
 use tn_types::{Address, B256};
 
 use crate::traits::TelcoinNode;
 
-/// Accumulated sorted trie deltas of the blocks built so far within ONE consensus output.
+mod cursors;
+mod sorted_runs;
+mod storage_cursor;
+
+#[cfg(test)]
+mod tests;
+
+use cursors::RunCursorFactory;
+use sorted_runs::SortedTrieRuns;
+use storage_cursor::OverlayCursorFactory;
+
+/// Geometrically compacted trie deltas for the blocks built within one consensus output.
 ///
 /// Starts empty at the beginning of `execute_consensus_output` (the database tip is the
 /// overlay's anchor: TN persistence is strictly sequential and happens only after the
-/// whole output builds, and no reorg path exists) and is extended in place after each
-/// built block via [`Self::extend_from_block`]. The extension is one linear merge pass
-/// per structure (`extend_ref_and_sort`), so the accumulated size is bounded by the
-/// DISTINCT keys touched across the output rather than the sum of per-block delta sizes.
+/// whole output builds, and no reorg path exists) and is extended after each built
+/// block via [`Self::extend_from_block`]. Equal-level runs merge, bounding cumulative
+/// merge work by `O(N M log N)` for `N` blocks of at most `M` delta entries. Roots
+/// borrow at most `O(log N)` runs directly; they never flatten the accumulated data.
+/// Repeated keys can remain in separate runs, with the newest run taking precedence.
 #[derive(Debug, Default)]
 pub struct OutputTrieOverlay {
-    /// Accumulated ancestor hashed-state deltas, sorted and merged in place.
-    state: Arc<HashedPostStateSorted>,
-    /// Accumulated ancestor trie-node updates, sorted and merged in place.
-    nodes: Arc<TrieUpdatesSorted>,
+    /// Chronological state and trie-node runs, compacted together.
+    runs: SortedTrieRuns,
 }
 
 impl OutputTrieOverlay {
@@ -61,17 +69,28 @@ impl OutputTrieOverlay {
         Self::default()
     }
 
-    /// Extend the overlay in place with a just-built block's sorted trie deltas.
+    /// Extend the overlay with a just-built block's sorted trie deltas.
     ///
-    /// Uses `Arc::make_mut` + `extend_ref_and_sort` on both structures: one linear
-    /// merge-insert pass each, no clone of the accumulated data and no re-sort. The
-    /// `Arc`s are the same ones carried by the block's `ComputedTrieData`, so nothing
-    /// is recomputed here. Call this only after every borrow of the overlay taken for
-    /// the block's root computation is dropped - an outstanding `Arc` clone would turn
-    /// `Arc::make_mut` into a deep copy.
+    /// Shares the block's immutable `Arc`s until compaction is needed. Only adjacent
+    /// equal-level runs merge, with newer writes taking precedence. Reth's general
+    /// sorted merge allocates a replacement vector, but no full accumulated merge
+    /// is performed after every block. Persistence remains output-scoped.
     pub fn extend_from_block(&mut self, trie_data: &ComputedTrieData) {
-        Arc::make_mut(&mut self.state).extend_ref_and_sort(&trie_data.hashed_state);
-        Arc::make_mut(&mut self.nodes).extend_ref_and_sort(&trie_data.trie_updates);
+        self.runs.extend(Arc::clone(&trie_data.hashed_state), Arc::clone(&trie_data.trie_updates));
+    }
+
+    /// Feed pre-sorted deltas to the production accumulator for allocation benchmarks.
+    ///
+    /// Accepts the same shared data as [`Self::extend_from_block`] without requiring
+    /// unrelated block metadata in the benchmark fixture.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn extend_sorted(
+        &mut self,
+        state: Arc<reth_trie::HashedPostStateSorted>,
+        nodes: Arc<reth_trie::updates::TrieUpdatesSorted>,
+    ) {
+        self.runs.extend(state, nodes);
     }
 
     /// Compute a block's state root and trie updates with layered in-memory cursors
@@ -80,11 +99,14 @@ impl OutputTrieOverlay {
     /// Mirrors reth's `DatabaseStateRoot::overlay_root_from_nodes_with_updates` plus
     /// one extra layer for the current block: prefix sets are constructed from the
     /// CURRENT block's hashed state only, the current block's sorted deltas form the
-    /// outermost hashed-cursor layer, this overlay's accumulated state and nodes form
-    /// the middle layers, and the database cursors sit at the bottom. Precedence is
-    /// current > accumulated > database, including destroyed-account (`None`) and
+    /// outermost hashed-cursor layer, this overlay's runs form the middle layers,
+    /// and the database cursors sit at the bottom. Precedence is
+    /// current > newer runs > older runs > database, including destroyed-account (`None`) and
     /// wiped-storage shadowing - pinned by the differential tests in
     /// `tests/it/trie_overlay.rs`.
+    /// Storage emptiness is checked across the complete overlay before consulting the
+    /// raw database, so newer zeros shadow older values without changing Reth's exact
+    /// choice between a deleted-trie marker and individual node removals.
     pub fn layered_root_with_updates<TX: DbTx>(
         &self,
         tx: &TX,
@@ -93,12 +115,14 @@ impl OutputTrieOverlay {
         let prefix_sets = current.construct_prefix_sets().freeze();
         let current_sorted = current.into_sorted();
         Ok(StateRoot::new(
-            InMemoryTrieCursorFactory::new(DatabaseTrieCursorFactory::new(tx), self.nodes.as_ref()),
-            HashedPostStateCursorFactory::new(
+            RunCursorFactory::new(DatabaseTrieCursorFactory::new(tx), &self.runs),
+            OverlayCursorFactory::new(
                 HashedPostStateCursorFactory::new(
-                    DatabaseHashedCursorFactory::new(tx),
-                    self.state.as_ref(),
+                    RunCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &self.runs),
+                    &current_sorted,
                 ),
+                DatabaseHashedCursorFactory::new(tx),
+                &self.runs,
                 &current_sorted,
             ),
         )

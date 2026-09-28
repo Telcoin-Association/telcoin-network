@@ -113,21 +113,20 @@ impl RethEnv {
     /// `state_root_with_updates` re-merges, deep-copies, and re-sorts EVERY in-memory
     /// ancestor's deltas per block - the second, reth-side `O(N^2 * M)` term, which is
     /// bypassed here rather than fixed upstream. Instead the caller-supplied `overlay`
-    /// accumulates the output's already-sorted per-block deltas in place, and the root
+    /// geometrically compacts the output's already-sorted per-block deltas, and the root
     /// runs against a fresh read-only database transaction with layered in-memory
     /// cursors: current block's sorted deltas over the accumulated overlay over the
     /// database, prefix sets from the current block only (see
     /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
     /// still resolve through reth's memory overlay, unchanged.
     ///
-    /// Honest bound (in-place-merge variant, the one that landed): per block,
-    /// `O(M log M)` to sort the block's own deltas, an `O(M)`-driven trie walk, and
-    /// ONE linear merge pass `O(|accumulated| + M)`. Per output the merges sum to
-    /// `O(N * D + N * M)` where `D` is the DISTINCT keys touched across the output;
-    /// with fully disjoint keys the raw element copies still sum to `O(N^2 * M)` - but
-    /// as a single pass with no allocation churn, versus reth's three passes plus full
-    /// clone plus re-sort. This is NOT a flat `O(N * M)`; the LSM-style layered-runs
-    /// variant would achieve `O(N * M log)` and was not needed.
+    /// For `N` blocks with at most `M` delta entries each, sorting remains
+    /// `O(M log M)` per block. Equal-level sorted runs compact with cumulative
+    /// `O(N M log N)` merge work. General Reth merges allocate replacement vectors;
+    /// geometric compaction bounds this work without merging the entire accumulated
+    /// overlay each block. Root cursors traverse at most `O(log N)` ancestor layers,
+    /// with prefix sets still derived only from the current block's delta. This bound
+    /// describes overlay compaction, not the total cost of block execution or trie walks.
     ///
     /// Callers that persist every block before building the next (tests, e2e helpers)
     /// pass a fresh empty overlay per block: the database then already holds the
