@@ -99,7 +99,7 @@ type is `Send + Sync + Clone`.
 |------|------|-----------|
 | `open_append` | writable, creates | header-only ⇒ write+fsync meta; then recover |
 | `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes) |
-| `open_static` | read-only (sealed past epoch) | **refuses** an inconsistent pack (cannot heal read-only) |
+| `open_static` | read-only (sealed past epoch) | rebuilds derived indexes from the WAL if the data log is clean; **refuses** (→ `db repair`) if the data log itself is torn |
 | `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then per-output |
 
 ### 5. Recovery model — four invariants
@@ -232,9 +232,13 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    node-stopped contract. The lock is advisory: PID reuse and separate PID namespaces sharing a volume
    (e.g. two containers) are accepted false-negative edges, so the loud banner and the stop-the-node
    contract remain. Do not flag "`--epoch` bypasses the current-epoch skip".
-10. **`db repair` / `open_append_exists` mutate pack files on open.** Truncating a torn tail and
-    rebuilding derived indexes from the authoritative log is the *point*. Gated by the node-stopped
-    contract above. Not an "unsafe destructive operation".
+10. **`db repair` / `open_append_exists` mutate pack files on open; `open_static` may rebuild derived
+    indexes.** Truncating a torn tail and rebuilding derived indexes from the authoritative log is the
+    *point* (`db repair`/`open_append_exists`, gated by the node-stopped contract above). A read-only
+    `open_static` additionally rebuilds the derived indexes from the WAL when the data log is clean but
+    an index will not open (e.g. after an index-format change), serialized under `pack_install`; it
+    never rewrites the data log — a torn/unclean data log stays terminal (→ `db repair`). Not an
+    "unsafe destructive operation".
 11. **Fail-fast `expect`/`panic` in DB-open startup paths** (e.g. `open_db`). A datadir that cannot be
     opened is unrecoverable and must abort node start; this is intentional fail-fast, not a library
     `unwrap`.

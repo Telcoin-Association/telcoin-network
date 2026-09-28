@@ -417,6 +417,43 @@ impl ConsensusPack {
         })
     }
 
+    /// Read-side self-heal for [`Self::open_static`]: rebuild a sealed epoch's derived indexes from
+    /// its data-log WAL, in place, when the data log is clean but an index will not open or is
+    /// inconsistent (e.g. after an index-format change). Leaves the pack sealed.
+    ///
+    /// Refuses — returning the terminal corrupt error — if the data log itself is unclean/torn or
+    /// unreadable: a damaged past-epoch data log requires `db repair`, never a read-side heal
+    /// (INV1/INV4). The data log is never rewritten here; only the derived indexes are rebuilt.
+    ///
+    /// Callers MUST serialize this (it is invoked under `ConsensusChain::pack_install`): it wipes
+    /// and recreates the index directories, so two concurrent rebuilds of the same epoch would
+    /// race.
+    pub(crate) fn heal_static_indexes<P: AsRef<Path>>(
+        path: P,
+        epoch: Epoch,
+    ) -> Result<(), PackError> {
+        let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let pack_file = base_dir.join(Inner::DATA_NAME);
+        // Only a present, valid, cleanly-sealed data log may be healed read-side.
+        if !matches!(pack_unsealed_version(&pack_file, epoch), Some((_, false))) {
+            return Err(Inner::corrupt_pack(&base_dir));
+        }
+        warn!(
+            target: "consensus::pack",
+            epoch,
+            dir = %base_dir.display(),
+            "sealed epoch has a clean data log but an unreadable/inconsistent index; \
+             rebuilding indexes from the WAL"
+        );
+        // `open_append_exists` rebuilds every index from the WAL (open_indexes_for_append +
+        // recover_pack); a clean data log is not truncated. Dropping the writable `Inner` seals it:
+        // indexes are synced and the data sentinel is re-stamped to the same value (set_len(end) is
+        // a no-op on a clean pack, so no truncation and no SIGBUS for a concurrent reader).
+        let rebuilt = Inner::open_append_exists(path.as_ref(), epoch)?;
+        drop(rebuilt);
+        Ok(())
+    }
+
     /// Enumerate the epoch numbers that have an `epoch-{N}` directory under `epochs_dir`, sorted
     /// ascending. The highest is the current/live epoch (the one a running node holds open for
     /// append).

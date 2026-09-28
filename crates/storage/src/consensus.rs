@@ -1685,7 +1685,21 @@ impl ConsensusChain {
                 if live.epoch() == epoch {
                     return Ok(live);
                 }
-                ConsensusPack::open_static(&self.base_path, epoch)?
+                // A sealed epoch whose DATA log is clean but whose derived index will not open or
+                // is inconsistent (e.g. after an index-format change) is
+                // self-healable: rebuild the indexes from the WAL here under
+                // `pack_install` (serialized against concurrent rebuilds of the
+                // same epoch), then open. A torn/unclean DATA log stays terminal —
+                // `heal_static_indexes` refuses and we surface the original remediation.
+                match ConsensusPack::open_static(&self.base_path, epoch) {
+                    Ok(pack) => pack,
+                    Err(e) if e.is_missing_static_files() => return Err(e),
+                    Err(e) => {
+                        ConsensusPack::heal_static_indexes(&self.base_path, epoch)
+                            .map_err(|_| e)?;
+                        ConsensusPack::open_static(&self.base_path, epoch)?
+                    }
+                }
             }
         };
         // Final check after grabbing the lock again that another task did not also create the pack.
@@ -2675,6 +2689,89 @@ mod test {
             result.is_err(),
             "genuine at-rest corruption must surface through get_static's retry: {result:?}"
         );
+    }
+
+    /// A sealed past epoch whose DATA log is clean but whose digest index will not open (e.g. an
+    /// index-format change, or at-rest index damage) self-heals on read: `get_static` rebuilds the
+    /// derived indexes from the WAL and returns the data instead of refusing. (A torn/unclean DATA
+    /// log is NOT healed this way — see `test_get_static_retry_still_surfaces_corruption`.)
+    #[tokio::test]
+    async fn test_get_static_rebuilds_indexes_for_clean_pack() {
+        use crate::consensus_pack::{pack_unsealed_version, DATA_NAME};
+
+        let temp_dir = TempDir::with_prefix("test_static_index_heal").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let epoch0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(epoch0.clone(), committee.clone()).await.unwrap();
+
+        // Three outputs in epoch 0.
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeaderDigest::default();
+        for n in 1..=3u64 {
+            let output = make_test_output(&committee, (n as usize) % 4, chain.clone(), n, parent);
+            parent = output.digest();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        // Advance to epoch 1: this seals epoch 0 (clean-close sentinel) and makes it a sealed past
+        // epoch that is opened read-only from now on.
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            parent_hash: epoch0.digest(),
+            final_consensus: ConsensusNumHash { number: 3, hash: ConsensusHeaderDigest::default() },
+            ..Default::default()
+        };
+        let committee1 = committee.advance_epoch_for_test(1);
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain.new_epoch(record0.clone(), committee1).await.unwrap();
+        consensus_chain.epochs().save_record(record0).await.unwrap();
+
+        // Break epoch 0's consensus-digest index so it will not open, leaving the DATA log (and its
+        // clean-close sentinel) intact — truncating the hdx below its header forces an index-open
+        // failure without touching the source of truth.
+        let hdx = temp_dir.path().join("epoch-0").join("hash").join("index.hdx");
+        assert!(hdx.exists(), "sealed epoch 0 must have a digest index at {}", hdx.display());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hdx)
+            .expect("open hdx")
+            .set_len(16)
+            .expect("truncate hdx");
+        // Precondition for the read-side heal: the DATA log is still cleanly sealed.
+        let clean = pack_unsealed_version(&temp_dir.path().join("epoch-0").join(DATA_NAME), 0);
+        assert!(
+            matches!(clean, Some((_, false))),
+            "epoch 0 data must be cleanly sealed: {clean:?}"
+        );
+
+        // Reading a past-epoch output opens epoch 0 read-only, hits the broken index, and must
+        // self-heal (rebuild from the WAL) rather than error.
+        let got = consensus_chain
+            .consensus_output_by_number(1)
+            .await
+            .expect("read must self-heal a clean pack's broken index, not error")
+            .expect("output 1 must resolve after the index rebuild");
+        compare_outputs(&got, &outputs[0]);
+
+        // A second read hits the now-rebuilt index and still resolves correctly.
+        let again = consensus_chain
+            .consensus_header_by_number(3)
+            .await
+            .expect("second read must not error")
+            .expect("output 3 must resolve from the rebuilt index");
+        assert_eq!(again.digest(), outputs[2].consensus_header().digest());
     }
 
     /// `install_imported_epoch_dir` must never unlink the live epoch dir before the
