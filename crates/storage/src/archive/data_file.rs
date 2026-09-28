@@ -358,7 +358,7 @@ impl MmapDataFile {
         // empty). Existing content (including a clean file's trailing sentinel, which sits in the
         // `[end, capacity)` padding region and is overwritten by the next append) is mapped as-is;
         // any trailing padding a crashed writer left is handled by the pack's heal path.
-        let (backing, capacity) = if orig_len == 0 {
+        let (mut backing, capacity) = if orig_len == 0 {
             (Backing::Empty, 0)
         } else if read_only {
             // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
@@ -380,6 +380,20 @@ impl MmapDataFile {
             let map = unsafe { MmapMut::map_mut(&file)? };
             (Backing::Rw(map), orig_len)
         };
+
+        // On a clean writable reopen the mapping spans the 8-byte clean-close sentinel, which now
+        // sits in the capacity padding at `[logical_end, capacity)` (the logical end was stripped
+        // back past it above). Zero it so the "capacity padding reads as zero" invariant
+        // holds from open: otherwise a later `ensure_len` that grows `end` into that gap
+        // would expose the stale sentinel bytes rather than zeros. Cheap and one-time (8
+        // bytes); the page is padding past `end` — never force-synced, and truncated away
+        // by the clean-close `Drop`. Unclean and fresh opens have no such gap (`capacity ==
+        // logical_end`, or no mapping), so this is a no-op there.
+        if !read_only {
+            if let Backing::Rw(map) = &mut backing {
+                map[logical_end as usize..capacity as usize].fill(0);
+            }
+        }
 
         let df = Self {
             file,
@@ -746,13 +760,12 @@ impl MmapDataFile {
 
     /// Ensure the logical length is at least `new_len`, extending the mapping (growing capacity
     /// geometrically if needed) so `[end, new_len)` becomes addressable for `slice`/`slice_mut`.
-    /// A FRESH grow is zero-filled, but the extended region is NOT guaranteed zero: after a
-    /// clean-close reopen the first `SENTINEL_LEN` bytes past `end` hold the previous clean-close
-    /// sentinel (the map spans `[0, disk_len)` with `end = disk_len - SENTINEL_LEN`), so a caller
-    /// growing into that gap must zero what it reads (e.g. `HdxIndex::redistribute_split`). Never
-    /// shrinks. Unlike [`Self::set_len`], growth is geometric (a remap only when a step crosses the
-    /// current capacity), so repeated one-record extensions (e.g. the digest index adding a bucket
-    /// per split) do not remap every call.
+    /// The extended region reads as zero: a fresh grow is zero-filled (preallocation /
+    /// ftruncate-extend), and the one historical exception — the previous clean-close sentinel
+    /// sitting in the `[end, end + SENTINEL_LEN)` padding after a clean reopen — is now zeroed
+    /// at open (see `open_with`). Never shrinks. Unlike [`Self::set_len`], growth is geometric
+    /// (a remap only when a step crosses the current capacity), so repeated one-record
+    /// extensions (e.g. the digest index adding a bucket per split) do not remap every call.
     pub fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
         if new_len <= self.end {
             return Ok(());
@@ -894,10 +907,14 @@ impl MmapDataFile {
             ));
         }
         let Backing::Rw(map) = &self.backing else {
-            // No live mapping -- a prior `remap` failed and released it. Any tail dirtied through
-            // the released mmap still sits in the page cache; only an fsync can push it
-            // out now, and only a durable flush may advance the append watermark. A
-            // silent `Ok(())` here would let the clean-close sentinel be stamped over a
+            // No live mapping -- a prior `remap` failed and released it. NOTE: `remap` also
+            // *poisons* on failure (see `remap`), so the `is_poisoned()` check above normally
+            // returns `Err` before control reaches here — this branch is effectively unreachable
+            // while that invariant holds. It is retained as defense-in-depth (still correct if the
+            // poison-on-remap-failure guarantee ever regresses): any tail dirtied through the
+            // released mmap still sits in the page cache; only an fsync can push it out now, and
+            // only a durable flush may advance the append watermark. A silent `Ok(())`
+            // here would let the clean-close sentinel be stamped over a
             // possibly-non-durable tail.
             if sync && self.flushed_end.load(Ordering::Relaxed) < self.end {
                 self.file.sync_all().inspect_err(|_| self.poison())?;
@@ -1628,6 +1645,32 @@ mod tests {
         df.read_exact(&mut buf).expect("read");
         assert_eq!(&buf[..first.len()], &first[..]);
         assert_eq!(&buf[first.len()..], &second[..]);
+    }
+
+    /// A clean close leaves an 8-byte sentinel in the padding past `end`; on a writable reopen that
+    /// region is still mapped (`capacity == end + SENTINEL_LEN`). It must read as zero so a later
+    /// `ensure_len` that grows `end` into it exposes zeros, not the stale sentinel bytes.
+    #[test]
+    fn clean_reopen_zeroes_stale_sentinel_padding() {
+        let tmp = TempDir::with_prefix("mmap_df_reopen_zero").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(100);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write"); // clean close on drop: truncate padding + sentinel
+        }
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("reopen");
+        assert!(!df.opened_unclean(), "a clean-closed file must reopen clean");
+        let end_before = df.len();
+        assert_eq!(end_before, data.len() as u64);
+        // Grow `end` into the former sentinel region — no physical grow (capacity == end +
+        // SENTINEL_LEN).
+        df.ensure_len(end_before + SENTINEL_LEN).expect("grow into the padding gap");
+        let gap = df.slice(end_before, SENTINEL_LEN as usize).expect("gap is now addressable");
+        assert!(
+            gap.iter().all(|&b| b == 0),
+            "the stale clean-close sentinel must be zeroed at open, got {gap:?}"
+        );
     }
 
     #[test]
