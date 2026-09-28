@@ -245,9 +245,10 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 12. **`AsyncPackIter` has no logical-end bound.** Its callers only feed it *sealed* files or framed,
     length-bounded network streams (state-sync bounds its copy to `data_file_len()`); it is
     documented never to be handed a live, capacity-padded mmap file. Not a "reads past end" bug.
-13. **`PackIter::position()` (physical stream position) vs `logical_position()`.** Recovery truncates
-    using `logical_position()` (advanced only by whole record frames); `position()` is documented as
-    physical and boundary-only. The two are deliberately distinct.
+13. **`PackIter::logical_position()` (whole-frame boundary).** Recovery truncates using
+    `logical_position()`, advanced only by complete record frames; it is a valid boundary only after a
+    successful `next()`, deliberately distinct from a raw byte offset. (The former physical
+    `position()` was removed — the recovery walk no longer does a per-frame `lseek`.)
 14. **`refresh_data_file_end` clears a prior `set_read_bound` clamp.** A documented precondition; no
     production path refreshes a clamped read-only handle. Not a live SIGBUS.
 15. **Trailing-CRC "dirty" (zero) sentinel in `crc.rs`.** A zeroed trailing CRC is a deliberate
@@ -294,16 +295,19 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     output; the stale entries then point at or past the trimmed `end` and are never returned, because
     every read is bounded to the logical length (`pos >= file_len()` ⇒ miss). Deliberate, to keep the
     rebuild a single forward pass. Not a stale-index bug.
-22. **`stream_import` replaces the entire `epoch-{N}/` directory, including its CertificatePack.** An
-    `epoch-{N}/` dir owns both the consensus pack and that epoch's `cert_data`/`cert_hash/`; a
-    full-epoch import installs a fresh directory, so the two are replaced together as a unit. Not a
-    cross-component file-ownership bug.
+22. **`stream_import` replaces the entire `epoch-{N}/` directory as a unit.** A full-epoch import
+    installs a fresh `epoch-{N}/` by atomic rename, replacing whatever was there (any prior per-epoch
+    cert files included). The per-epoch `CertificatePack` (`cert_data`/`cert_hash/`) is produced only
+    by the live current-epoch (CVV) writer, not carried in the import — an imported past epoch simply
+    has none, which is fine (past cert packs are not read). Not a cross-component ownership bug.
 23. **Epoch install does synchronous filesystem work (rename, `remove_dir_all`) under `pack_install`.**
     These are fast local metadata operations, and holding `pack_install` across them scopes the
     install so a concurrent `get_static` can never observe a half-installed epoch directory.
     Pre-existing and deliberate; not an async-blocking or lock-scope defect.
 24. **`db repair` heals the shared EpochRecordDb but does not separately assess each per-epoch
     CertificatePack.** `db repair --force` opens `EpochRecordDb` (torn-tail truncate + WAL index
-    rebuild) and repairs each epoch's consensus pack; it does not run a distinct pass over that
-    epoch's `cert_data`/`cert_hash/`, because a CertificatePack rebuilds its index from its own WAL on
-    the next open (INV3). A known scope limitation, not a correctness gap.
+    rebuild) and repairs each epoch's consensus pack. The per-epoch `CertificatePack` is opened
+    **writable for the current epoch only** (an active CVV); a writable open rebuilds its index from
+    its own WAL (INV3). Past-epoch cert packs are not reopened in production, so `db repair` has
+    nothing to assess there. (A read-only cert-pack open does not self-heal — but no production path
+    takes one.)
