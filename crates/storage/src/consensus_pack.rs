@@ -2685,6 +2685,16 @@ impl Inner {
                 ),
             ));
         }
+        // A consensus number below this epoch's first number can't index into this pack: reject it
+        // rather than letting the `saturating_sub` above fold it onto index 0, where it would
+        // either masquerade as an already-saved output or overwrite output 0. Symmetric
+        // with the above-range check below.
+        if consensus_number < self.epoch_meta.start_consensus_number {
+            return Err(PackError::InvalidConsensusNumber(
+                self.epoch_meta.start_consensus_number,
+                consensus_number,
+            ));
+        }
         // Make sure this number is valid before we write anything...
         if (consensus_idx as usize) < self.consensus_pos_idx.len() {
             // If we have saved this output already then ignore it.
@@ -4413,6 +4423,35 @@ pub(crate) mod test {
         assert!(
             matches!(err, Err(super::PackError::InvalidEpoch(..))),
             "expected InvalidEpoch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pack_save_below_start_number_rejected() {
+        let temp_dir = TempDir::with_prefix("test_pack_below_start").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+
+        // Epoch 0's first consensus number is `start_consensus_number` (1). A correct-epoch output
+        // whose number is below that must be rejected, not folded onto index 0 by `saturating_sub`
+        // (where it would masquerade as already-saved or overwrite output 0).
+        let parent = ConsensusHeader::default().digest();
+        let below = make_test_output(&committee, 0, chain.clone(), 0, parent);
+        assert_eq!(below.sub_dag().leader_epoch(), committee.epoch());
+        let err = pack.save_consensus_output(below).await;
+
+        assert!(
+            matches!(err, Err(super::PackError::InvalidConsensusNumber(1, 0))),
+            "expected InvalidConsensusNumber(1, 0), got {err:?}"
         );
     }
 

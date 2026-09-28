@@ -1476,8 +1476,19 @@ impl ConsensusChain {
     /// records (`[0, end)`, immutable append-only bytes) and never the trailing padding — a raw
     /// read-to-EOF copy would otherwise include the padding and fail the importer's record-CRC
     /// walk. Bounding by length needs no truncation and is immune to any concurrent append.
-    pub async fn current_data_len(&self) -> Result<u64, ConsensusChainError> {
-        Ok(self.current_pack().data_file_len().await?)
+    ///
+    /// `expected_epoch` guards against an epoch handoff racing between the caller deriving its
+    /// epoch (and the source path it pairs this length with) and this read: it errors with
+    /// `InvalidPackEpoch` rather than returning a length that belongs to a different epoch's pack.
+    pub async fn current_data_len(
+        &self,
+        expected_epoch: Epoch,
+    ) -> Result<u64, ConsensusChainError> {
+        let pack = self.current_pack();
+        if pack.epoch() != expected_epoch {
+            return Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), expected_epoch));
+        }
+        Ok(pack.data_file_len().await?)
     }
 
     /// Return the latest consensus header for `epoch` by reading directly from the pack index,
@@ -3431,6 +3442,39 @@ mod test {
                 .expect("imported output readable after restart");
             compare_outputs(&got, output);
         }
+    }
+
+    /// `current_data_len` must reject a mismatched epoch: the state export pairs the returned
+    /// length with a source path built from a separately-derived epoch, so a length read from a
+    /// different (handoff-raced) current pack would bound the wrong file. It returns the length
+    /// for the matching epoch and `InvalidPackEpoch` otherwise.
+    #[tokio::test]
+    async fn test_current_data_len_guards_epoch() {
+        let temp_dir = TempDir::with_prefix("test_current_data_len_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+        assert_eq!(consensus_chain.current_pack().epoch(), 0);
+
+        // Matching epoch: returns the current pack's logical length.
+        let len = consensus_chain.current_data_len(0).await.expect("len for the current epoch");
+        assert_eq!(len, consensus_chain.current_pack().data_file_len().await.unwrap());
+
+        // Mismatched epoch: refuse rather than return another epoch's length.
+        let err =
+            consensus_chain.current_data_len(1).await.expect_err("must reject a mismatched epoch");
+        assert!(
+            matches!(err, ConsensusChainError::InvalidPackEpoch(0, 1)),
+            "expected InvalidPackEpoch(0, 1), got {err:?}"
+        );
     }
 
     /// A same-epoch `new_epoch` re-entry whose committee differs from the pack's persisted

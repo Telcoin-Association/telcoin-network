@@ -268,3 +268,38 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     (rebuild pending) rather than silently trust a stale mapping — that is the intended signal, not a
     bug. (Duplicate batches across outputs cannot arise under honest consensus — Bullshark commits
     each certificate once — so this path is defense-in-depth.)
+18. **Clean close truncates to `end`, then appends and fsyncs the 8-byte sentinel.** A crash in that
+    sub-millisecond window leaves the file at exactly `end` bytes with no sentinel, which the next open
+    reads as unclean and recovers with no data loss (`[0, end)` is already durable). Writing the
+    sentinel before the truncate was considered; the truncate-first order is intentional, and the CRC
+    sentinel makes a padded file masquerading as clean a ~2⁻⁶⁴ event. Not a durability bug.
+19. **Recovery reads the WAL through a cloned fd + `BufReader` (pread), not the mmap.** `recover_pack`
+    and the index rebuilds walk the data log with syscall reads rather than faulting the whole file
+    into the page cache through the mapping, and `PositionIndex::sync` issues a harmless extra
+    `MS_ASYNC` beside its fsync. These are deliberate, low-priority performance choices; the per-frame
+    `lseek` that once made the cold-recovery walk expensive was already removed. Not a bug.
+20. **Digest-index bucket placement is stable across compiler upgrades by design.** Placement feeds
+    the raw key bytes straight to the vendored `FxHasher` (`HdxIndex::stable_hash` → `Hasher::write`),
+    deliberately bypassing `impl Hash for [u8]`, whose length-prefix encoding is not stable across Rust
+    versions. The salt/pepper marker is derived with the same primitive, so the open-time drift check
+    exercises the exact placement hash and routes any mismatch to a WAL rebuild (INV3). Do not
+    "simplify" this back to `hash_one`/`Hash for [u8]` — that would reintroduce toolchain-dependent
+    placement and force an index rebuild on every compiler upgrade.
+21. **Index rebuild adds an output's digests before it confirms the output is complete.** Recovery
+    pass 2 indexes a header and its batch digests, then the completeness check trims a torn final
+    output; the stale entries then point at or past the trimmed `end` and are never returned, because
+    every read is bounded to the logical length (`pos >= file_len()` ⇒ miss). Deliberate, to keep the
+    rebuild a single forward pass. Not a stale-index bug.
+22. **`stream_import` replaces the entire `epoch-{N}/` directory, including its CertificatePack.** An
+    `epoch-{N}/` dir owns both the consensus pack and that epoch's `cert_data`/`cert_hash/`; a
+    full-epoch import installs a fresh directory, so the two are replaced together as a unit. Not a
+    cross-component file-ownership bug.
+23. **Epoch install does synchronous filesystem work (rename, `remove_dir_all`) under `pack_install`.**
+    These are fast local metadata operations, and holding `pack_install` across them scopes the
+    install so a concurrent `get_static` can never observe a half-installed epoch directory.
+    Pre-existing and deliberate; not an async-blocking or lock-scope defect.
+24. **`db repair` heals the shared EpochRecordDb but does not separately assess each per-epoch
+    CertificatePack.** `db repair --force` opens `EpochRecordDb` (torn-tail truncate + WAL index
+    rebuild) and repairs each epoch's consensus pack; it does not run a distinct pass over that
+    epoch's `cert_data`/`cert_hash/`, because a CertificatePack rebuilds its index from its own WAL on
+    the next open (INV3). A known scope limitation, not a correctness gap.

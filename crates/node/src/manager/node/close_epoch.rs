@@ -591,7 +591,7 @@ where
         // the importer's record-CRC walk. Bounding by length needs no truncation of the live pack
         // and is immune to any concurrent append (an append only extends past `end`). Skip on
         // error.
-        let data_len = match self.consensus_chain.current_data_len().await {
+        let data_len = match self.consensus_chain.current_data_len(epoch).await {
             Ok(len) => len,
             Err(e) => {
                 warn!(target: "tn::snapshot", epoch, error = %e, "could not read consensus pack length; skipping export");

@@ -52,7 +52,7 @@ use crate::archive::{
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    hash::{BuildHasher, BuildHasherDefault},
+    hash::{BuildHasher, BuildHasherDefault, Hasher},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -302,6 +302,20 @@ pub struct BucketCrcReport {
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// Stable hash for on-disk placement and the salt/pepper marker.
+    ///
+    /// Feeds the raw bytes straight to the (vendored) hasher via `Hasher::write`, deliberately
+    /// bypassing `impl Hash for [u8]` — whose length-prefix encoding is not guaranteed stable
+    /// across Rust compiler versions. The vendored `FxHasher`'s `write`/`finish` are pinned
+    /// in-repo, so an on-disk bucket never moves merely because the toolchain was upgraded.
+    /// Used for both bucket placement (`hash_to_bucket`) and the salt/pepper drift marker, so
+    /// the marker check exercises the exact primitive that places keys.
+    fn stable_hash(hasher_builder: &S, bytes: &[u8]) -> u64 {
+        let mut hasher = hasher_builder.build_hasher();
+        hasher.write(bytes);
+        hasher.finish()
+    }
+
     /// Bytes of one bucket element: a KSIZE-byte digest plus its u64 record position.
     const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
     /// Elements a bucket holds before overflowing to the odx log.
@@ -314,9 +328,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
     /// Open (creating if empty) a memory-mapped HDX index in directory `dir`.
     ///
-    /// Note you MUST supply a stable hasher (e.g. fxhasher); the default Rust hasher is not stable
-    /// across instances and would invalidate the index. The index always uses the memory-mapped
-    /// file backend (the non-mmap backend was removed).
+    /// Note you MUST supply a stable hasher (e.g. the vendored `fxhasher`); the default Rust hasher
+    /// is not stable across instances and would invalidate the index. Bucket placement feeds raw
+    /// key bytes to that hasher via [`Self::stable_hash`] (bypassing `Hash for [u8]`, whose
+    /// length-prefix encoding is not stable across Rust versions), so an index survives a
+    /// compiler upgrade without a rebuild — not just repeated process instances. The index
+    /// always uses the memory-mapped file backend (the non-mmap backend was removed).
     pub fn open_hdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
@@ -349,8 +366,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
-            let salt = hasher_builder.hash_one(data_header.uid());
-            let pepper = hasher_builder.hash_one(salt);
+            let salt = Self::stable_hash(&hasher_builder, &data_header.uid().to_le_bytes());
+            let pepper = Self::stable_hash(&hasher_builder, &salt.to_le_bytes());
             let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
             header.write_header(&mut hdx_file)?;
             let bloom = Bloom::new();
@@ -404,8 +421,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if file_end < needed {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Check the salt/pepper to confirm the same (stable) hasher is in use.
-            if header.pepper() != hasher_builder.hash_one(header.salt()) {
+            // Check the salt/pepper to confirm the same (stable) hasher AND placement scheme is in
+            // use. This recomputes with `stable_hash` — the exact primitive `hash_to_bucket` uses —
+            // so a change to bucket placement (not just the hasher) is detected here and routes the
+            // index to a rebuild instead of silently relocating every key.
+            if header.pepper() != Self::stable_hash(&hasher_builder, &header.salt().to_le_bytes()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
             let mut bloom_bits = vec![0_u8; BLOOM_SIZE_BYTES];
@@ -553,7 +573,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Return the bucket that will contain hash.
     fn hash_to_bucket(&self, key: &[u8]) -> u64 {
         debug_assert_eq!(key.len(), KSIZE, "key wrong size, expected {KSIZE}, got {}", key.len());
-        let hash = self.hasher_builder.hash_one(key);
+        let hash = Self::stable_hash(&self.hasher_builder, key);
         let modulus = self.modulus as u64;
         let bucket = hash % modulus;
         if bucket >= self.buckets() as u64 {
@@ -1246,6 +1266,26 @@ mod tests {
             false,
         )
         .expect("hdx mmap")
+    }
+
+    /// Pin the on-disk bucket-placement primitive. `stable_hash` feeds raw bytes to the vendored
+    /// `FxHasher` (pure integer arithmetic over in-repo constants), so its output must be identical
+    /// on every platform and every compiler version — that is the whole point of the fix. A
+    /// change here means existing digest indexes would relocate keys and silently miss until
+    /// rebuilt: if this test fails you changed the hash, so bump the index scheme and handle
+    /// migration rather than editing the constants.
+    #[test]
+    fn stable_hash_placement_is_pinned() {
+        let bh = BuildHasherDefault::<FxHasher>::default();
+        let got = (
+            Idx::stable_hash(&bh, &[0u8; 32]),
+            Idx::stable_hash(&bh, &[0xABu8; 32]),
+            Idx::stable_hash(&bh, b"telcoin"),
+        );
+        // The on-disk contract. All-zero input hashes to 0 (a known FxHasher-with-seed-0 property;
+        // real 32-byte digests are effectively never all-zero, so bucket distribution is
+        // unaffected).
+        assert_eq!(got, (0, 2136556723766712957, 11061511725181032976));
     }
 
     /// The CRC-free read path must reject an out-of-range on-disk element count with an error,
