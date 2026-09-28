@@ -414,6 +414,151 @@ mod tests {
         }
     }
 
+    /// Parse the real `set-rpc` argument definitions without constructing the outer node command.
+    fn set_rpc_args(arguments: &[&str]) -> eyre::Result<SetRpcArgs> {
+        let matches = <SetRpcArgs as clap::Args>::augment_args(clap::Command::new("set-rpc"))
+            .try_get_matches_from(std::iter::once("set-rpc").chain(arguments.iter().copied()))?;
+        <SetRpcArgs as clap::FromArgMatches>::from_arg_matches(&matches).map_err(Into::into)
+    }
+
+    /// Generation derives every worker from its own ID, reserves distinct sockets, and only
+    /// applies the legacy RPC flags to worker 0.
+    #[tokio::test]
+    async fn test_generate_multiple_worker_records() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        let http: Url = "https://worker-0.example.com/".parse()?;
+        KeygenArgs { workers: 2, rpc_http: Some(http.clone()), ..keygen_args(None) }
+            .execute(&datadir, None)?;
+        let info: NodeInfo =
+            Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML)?;
+        let keys = tn_config::KeyConfig::read_config(&datadir, None)?;
+        assert_eq!(info.p2p_info.num_workers(), 2);
+        info.p2p_info.workers.iter().zip([0, 1]).for_each(|(worker, worker_id)| {
+            assert_eq!(worker.network_key, keys.worker_network_public_key(worker_id));
+            assert_eq!(
+                worker.network_address.iter().last(),
+                Some(tn_types::Protocol::P2p(worker.network_key.clone().into()))
+            );
+        });
+        let listeners: std::collections::HashSet<tn_types::Multiaddr> =
+            std::iter::once(&info.p2p_info.primary)
+                .chain(info.p2p_info.workers.iter())
+                .map(|node| {
+                    node.network_address
+                        .iter()
+                        .filter(|protocol| !matches!(protocol, tn_types::Protocol::P2p(_)))
+                        .collect()
+                })
+                .collect();
+        assert_eq!(listeners.len(), 3, "primary and workers must use distinct listen sockets");
+        assert_eq!(
+            info.p2p_info.worker(0).and_then(|worker| worker.rpc.as_ref()),
+            Some(&RpcInfo { http, ws: None })
+        );
+        assert!(info.p2p_info.worker(1).is_some_and(|worker| worker.rpc.is_none()));
+        Ok(())
+    }
+
+    /// Explicit worker addresses retain their order and receive the matching derived peer ID.
+    #[tokio::test]
+    async fn test_generate_multiple_worker_external_addresses() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        let addresses: Vec<tn_types::Multiaddr> = [41000, 41001]
+            .into_iter()
+            .map(|port| format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse())
+            .collect::<Result<_, _>>()?;
+        KeygenArgs {
+            workers: 2,
+            external_worker_addrs: Some(addresses.clone()),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)?;
+        let info: NodeInfo =
+            Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML)?;
+        assert_eq!(info.p2p_info.num_workers(), 2);
+        info.p2p_info.workers.iter().zip(addresses).try_for_each(|(worker, address)| {
+            let expected = address
+                .with_p2p(worker.network_key.clone().into())
+                .map_err(|_| eyre::eyre!("test address unexpectedly has a peer ID"))?;
+            assert_eq!(worker.network_address, expected);
+            Ok(())
+        })
+    }
+
+    /// Missing, surplus, or duplicate listen addresses fail before a keystore is written,
+    /// including addresses with different peer IDs on the same socket.
+    #[tokio::test]
+    async fn test_generate_rejects_invalid_worker_layouts() -> eyre::Result<()> {
+        use tn_config::TelcoinDirs as _;
+
+        let address: tn_types::Multiaddr = "/ip4/127.0.0.1/udp/41000/quic-v1".parse()?;
+        let same_socket_with_peer_ids = (0..2)
+            .map(|_| {
+                address.clone().with(tn_types::Protocol::P2p(
+                    tn_types::NetworkKeypair::generate_ed25519().public().to_peer_id(),
+                ))
+            })
+            .collect();
+        [
+            vec![],
+            vec![address.clone()],
+            vec![address.clone(); 3],
+            vec![address; 2],
+            same_socket_with_peer_ids,
+        ]
+        .into_iter()
+        .try_for_each(|addresses| -> eyre::Result<()> {
+            let tempdir = tempfile::TempDir::new()?;
+            let datadir = tempdir.path().to_path_buf();
+            let result = KeygenArgs {
+                workers: 2,
+                external_worker_addrs: Some(addresses),
+                ..keygen_args(None)
+            }
+            .execute(&datadir, None);
+            assert!(result.is_err());
+            assert!(!datadir.node_keys_path().exists());
+            assert!(!datadir.node_info_path().exists());
+            Ok(())
+        })
+    }
+
+    /// Both node roles accept the full WorkerId count range and reject empty or overflowing
+    /// layouts.
+    #[test]
+    fn test_generate_worker_count_cli_bounds() {
+        ["validator", "observer"].into_iter().for_each(|role| {
+            ["1", "2", "5", "65536"].into_iter().for_each(|count| {
+                assert!(Cli::<NoArgs>::try_parse_from([
+                    "telcoin-network",
+                    "keytool",
+                    "generate",
+                    role,
+                    "--address",
+                    "0",
+                    "--workers",
+                    count,
+                ])
+                .is_ok());
+            });
+            ["0", "65537"].into_iter().for_each(|count| {
+                assert!(Cli::<NoArgs>::try_parse_from([
+                    "telcoin-network",
+                    "keytool",
+                    "generate",
+                    role,
+                    "--address",
+                    "0",
+                    "--workers",
+                    count,
+                ])
+                .is_err());
+            });
+        });
+    }
+
     /// `generate pop` re-signs the proof of possession for a new execution address
     /// using the node's *existing* keys: the BLS key, p2p info, and name are
     /// unchanged; only `execution_address` and `proof_of_possession` change, and
@@ -800,7 +945,7 @@ mod tests {
     /// `node-info.yaml` and touches nothing else: the primary RPC stays unset and
     /// the node identity (BLS key, name, execution address) is unchanged.
     #[tokio::test]
-    async fn test_set_rpc_sets_worker_rpc() {
+    async fn test_set_rpc_sets_worker_rpc() -> eyre::Result<()> {
         let tempdir = tempfile::TempDir::new().expect("tempdir created");
         let datadir = tempdir.path().to_path_buf();
         keygen_args(None).execute(&datadir, None).expect("generate keys");
@@ -816,7 +961,7 @@ mod tests {
 
         let http = Url::parse("https://validator.example.com:8545/").expect("http url");
         let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
-        SetRpcArgs { http: Some(http.clone()), ws: Some(ws.clone()), clear: false }
+        set_rpc_args(&["--http", http.as_str(), "--ws", ws.as_str()])?
             .execute(&datadir)
             .expect("set-rpc sets worker rpc");
 
@@ -838,11 +983,12 @@ mod tests {
             before.execution_address, after.execution_address,
             "execution address must not change"
         );
+        Ok(())
     }
 
     /// `set-rpc --clear` removes a previously-set worker RPC descriptor.
     #[tokio::test]
-    async fn test_set_rpc_clear() {
+    async fn test_set_rpc_clear() -> eyre::Result<()> {
         let tempdir = tempfile::TempDir::new().expect("tempdir created");
         let datadir = tempdir.path().to_path_buf();
         keygen_args(None).execute(&datadir, None).expect("generate keys");
@@ -850,7 +996,7 @@ mod tests {
 
         // set, then clear.
         let http = Url::parse("https://validator.example.com:8545/").expect("http url");
-        SetRpcArgs { http: Some(http), ws: None, clear: false }
+        set_rpc_args(&["--http", http.as_str()])?
             .execute(&datadir)
             .expect("set-rpc sets worker rpc");
         let set = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
@@ -860,25 +1006,24 @@ mod tests {
             "worker rpc should be set before clearing"
         );
 
-        SetRpcArgs { http: None, ws: None, clear: true }
-            .execute(&datadir)
-            .expect("set-rpc clears worker rpc");
+        set_rpc_args(&["--clear"])?.execute(&datadir)?;
         let cleared = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
             .expect("node info loaded after clear");
         assert!(
             cleared.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
             "worker rpc should be cleared"
         );
+        Ok(())
     }
 
     /// `set-rpc` errors with a "generate keys first" hint when `node-info.yaml`
     /// is missing, rather than creating a fresh node-info with default identity.
     #[tokio::test]
-    async fn test_set_rpc_missing_node_info_errors() {
+    async fn test_set_rpc_missing_node_info_errors() -> eyre::Result<()> {
         let tempdir = tempfile::TempDir::new().expect("tempdir created");
         let datadir = tempdir.path().to_path_buf();
         let http = Url::parse("https://validator.example.com:8545/").expect("http url");
-        let err = SetRpcArgs { http: Some(http), ws: None, clear: false }
+        let err = set_rpc_args(&["--http", http.as_str()])?
             .execute(&datadir)
             .expect_err("set-rpc must error when node-info.yaml is missing");
         let msg = format!("{err:#}");
@@ -886,19 +1031,20 @@ mod tests {
             msg.contains("generate keys first"),
             "missing node-info hint should tell the operator to generate keys first, got: {msg}"
         );
+        Ok(())
     }
 
     /// `set-rpc` applies the same scheme validation node startup runs: a non-http
     /// scheme parses as a URL but is rejected, and nothing is persisted.
     #[tokio::test]
-    async fn test_set_rpc_rejects_bad_scheme() {
+    async fn test_set_rpc_rejects_bad_scheme() -> eyre::Result<()> {
         let tempdir = tempfile::TempDir::new().expect("tempdir created");
         let datadir = tempdir.path().to_path_buf();
         keygen_args(None).execute(&datadir, None).expect("generate keys");
 
         // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
         let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
-        let err = SetRpcArgs { http: Some(http), ws: None, clear: false }
+        let err = set_rpc_args(&["--http", http.as_str()])?
             .execute(&datadir)
             .expect_err("set-rpc must reject a non-http(s) scheme");
         let msg = format!("{err:#}");
@@ -917,6 +1063,70 @@ mod tests {
             after.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
             "rejected endpoint must not be persisted"
         );
+        Ok(())
+    }
+
+    /// Setting and clearing worker 1 preserves worker 0's endpoint and the rest of node-info.
+    #[tokio::test]
+    async fn test_set_rpc_selects_worker_and_preserves_other_records() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        KeygenArgs {
+            workers: 2,
+            rpc_http: Some("https://worker-0.example.com/".parse()?),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)?;
+        let path = datadir.join("node-info.yaml");
+        let mut expected: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        let http: Url = "https://worker-1.example.com/".parse()?;
+        let ws: Url = "wss://worker-1.example.com/".parse()?;
+        set_rpc_args(&["--worker-id", "1", "--http", http.as_str(), "--ws", ws.as_str()])?
+            .execute(&datadir)?;
+        expected
+            .p2p_info
+            .worker_mut(1)
+            .ok_or_else(|| eyre::eyre!("missing generated worker 1"))?
+            .rpc = Some(RpcInfo { http, ws: Some(ws) });
+        let after: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        assert_eq!(serde_json::to_value(&after)?, serde_json::to_value(&expected)?);
+
+        set_rpc_args(&["--worker-id", "1", "--clear"])?.execute(&datadir)?;
+        expected
+            .p2p_info
+            .worker_mut(1)
+            .ok_or_else(|| eyre::eyre!("missing generated worker 1"))?
+            .rpc = None;
+        let cleared: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        assert_eq!(serde_json::to_value(&cleared)?, serde_json::to_value(&expected)?);
+        Ok(())
+    }
+
+    /// A nonexistent worker errors without changing the file, for both set and clear.
+    #[tokio::test]
+    async fn test_set_rpc_rejects_missing_worker_without_writing() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        KeygenArgs { workers: 2, ..keygen_args(None) }.execute(&datadir, None)?;
+        let path = datadir.join("node-info.yaml");
+        let before = std::fs::read(&path)?;
+        ["2", "65535"].into_iter().try_for_each(|worker_id| -> eyre::Result<()> {
+            [vec!["--http", "https://worker.example.com/"], vec!["--clear"]]
+                .into_iter()
+                .try_for_each(|arguments| -> eyre::Result<()> {
+                    let arguments: Vec<_> =
+                        ["--worker-id", worker_id].into_iter().chain(arguments).collect();
+                    let error = set_rpc_args(&arguments)?
+                        .execute(&datadir)
+                        .err()
+                        .ok_or_else(|| eyre::eyre!("missing worker must fail"))?;
+                    assert!(error.to_string().contains(&format!("has no worker {worker_id}")));
+                    assert_eq!(std::fs::read(&path)?, before);
+                    Ok(())
+                })
+        })?;
+        assert!(set_rpc_args(&["--worker-id", "65536", "--clear"]).is_err());
+        Ok(())
     }
 
     /// The `set-rpc` clap relations: `--http` is required unless `--clear`, and
