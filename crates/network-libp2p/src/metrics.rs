@@ -49,6 +49,15 @@ struct SwarmMetricHandles {
     quic_incoming_budget_yields_total: Counter,
 }
 
+/// The `connection_limits` bound that refused an inbound connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboundDenial {
+    /// The pending inbound ceiling refused a handshake before the remote was authenticated.
+    PendingIncomingLimit,
+    /// The per-peer established ceiling refused an authenticated connection.
+    EstablishedPerPeerLimit,
+}
+
 /// Swarm-level metrics owned by `ConsensusNetwork`.
 #[derive(Clone, Debug)]
 pub(crate) struct SwarmMetrics {
@@ -110,6 +119,20 @@ impl SwarmMetrics {
             "tn_network.outbound_request_failures_total",
             "network" => self.network.clone(),
             "kind" => kind,
+        )
+        .increment(1);
+    }
+
+    /// Record an inbound connection refused by a `connection_limits` bound, by bound.
+    pub(crate) fn record_inbound_denied(&self, denial: &InboundDenial) {
+        let reason = match denial {
+            InboundDenial::PendingIncomingLimit => "pending_incoming_limit",
+            InboundDenial::EstablishedPerPeerLimit => "established_per_peer_limit",
+        };
+        metrics::counter!(
+            "tn_network.inbound_connections_denied_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
         )
         .increment(1);
     }
@@ -258,6 +281,7 @@ mod tests {
             swarm.record_gossip_rejected();
             swarm.set_pending(1, 2);
             swarm.record_outbound_failure("timeout");
+            swarm.record_inbound_denied(&InboundDenial::PendingIncomingLimit);
 
             let peers = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
             peers.set_peer_counts(4, 10, 3, 1);
@@ -288,6 +312,13 @@ mod tests {
 
         let (key, _, _, _) = find("tn_network.outbound_request_failures_total");
         assert!(key.key().labels().any(|l| l.key() == "kind" && l.value() == "timeout"));
+
+        let (key, _, _, value) = find("tn_network.inbound_connections_denied_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key
+            .key()
+            .labels()
+            .any(|l| l.key() == "reason" && l.value() == "pending_incoming_limit"));
 
         let (key, _, _, _) = find("tn_network.peer_penalties_total");
         assert!(key.key().labels().any(|l| l.key() == "severity" && l.value() == "severe"));
@@ -322,6 +353,7 @@ mod tests {
             [&first, &second].into_iter().for_each(|swarm| {
                 swarm.record_gossip_published();
                 swarm.record_outbound_failure("timeout");
+                swarm.record_inbound_denied(&InboundDenial::PendingIncomingLimit);
             });
 
             let first = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
@@ -366,6 +398,7 @@ mod tests {
             [
                 "tn_network.gossip_published_total",
                 "tn_network.outbound_request_failures_total",
+                "tn_network.inbound_connections_denied_total",
                 "tn_network.connections_established_total",
                 "tn_network.peer_penalties_total",
             ]
