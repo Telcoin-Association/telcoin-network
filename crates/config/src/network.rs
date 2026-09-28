@@ -392,6 +392,12 @@ pub struct QuicConfig {
     /// Max unacknowledged data in bytes that may be sent in total on all streams
     /// of a connection.
     pub max_connection_data: u32,
+    /// Answer every incoming QUIC connection attempt whose source address is not
+    /// validated with a QUIC Retry packet (RFC 9000 section 8.1) before the listener
+    /// creates connection state. The remote must echo the token from its address.
+    ///
+    /// Default `true`. Set `false` only as an operator rollback switch.
+    pub retry_unvalidated_incoming: bool,
 }
 
 impl Default for QuicConfig {
@@ -406,6 +412,7 @@ impl Default for QuicConfig {
             // maximum throughput = (buffer size / round-trip time)
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
+            retry_unvalidated_incoming: true,
         }
     }
 }

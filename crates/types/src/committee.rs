@@ -335,9 +335,9 @@ impl<'de> Deserialize<'de> for Authority {
 
 /// The committee lists all validators that participate in consensus.
 ///
-/// Deliberately carries no serde derives: the binary wire layout is epoch-gated (#554, gated by
-/// [`crate::forks::multi_workers_fork_active`]), so every encode and decode path routes through the
-/// hand-written impls below. Human-readable formats keep the derive's exact behavior through
+/// Deliberately carries no serde derives: the binary wire layout is epoch-gated (issue #554; gated
+/// by [`crate::forks::multi_workers_fork_active`]), so every encode and decode path routes through
+/// the hand-written impls below. Human-readable formats keep the derive's exact behavior through
 /// [`CommitteeInnerHr`].
 #[derive(Debug, Eq)]
 struct CommitteeInner {
@@ -488,9 +488,10 @@ struct CommitteeInnerHr {
 /// Used only by the pre-fork arm of [`CommitteeInner`]'s binary serializer. The shape cannot
 /// represent more than one worker, so the view fails closed rather than silently dropping the
 /// rest: a committee that the legacy layout cannot express must be unrepresentable, not
-/// mis-encoded. Callers below the fork epoch are structurally single-worker (the pre-fork
-/// on-chain registry exposes no path that raises the count), so this error means a bug or a
-/// governance action taken too early, never routine operation.
+/// mis-encoded. Callers below the fork epoch are single-worker: the pre-fork registry that ran
+/// before epoch 407 had no path that raises the count, and from 407 onward governance must hold
+/// it at one until the fork epoch begins. This error therefore means a bug or a governance action
+/// taken too early, never routine operation.
 struct BootstrapServerLegacyRef<'a>(&'a BootstrapServer);
 
 impl Serialize for BootstrapServerLegacyRef<'_> {
@@ -1261,7 +1262,7 @@ mod tests {
     /// no field for a worker count: the encoder refuses a committee it cannot represent rather
     /// than write one that decodes as single-worker on every node.
     ///
-    /// The adiri fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in this lane.
+    /// The adiri fork epoch is 570 (floored at 407), so epoch 7 is pre-fork in this lane.
     /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
@@ -1440,12 +1441,12 @@ mod tests {
     /// Epoch of the legacy-layout fixtures: 406, one epoch below `CONSENSUS_REGISTRY_FORK_EPOCH`
     /// (407), which is the documented arming floor of the multi-workers fork.
     ///
-    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
-    /// 407: the gate is `>=`, so 407 would become post-fork and every anti-vacuity assert below
-    /// would fail — with the frozen vectors then tempting exactly the re-freeze they forbid. 406
-    /// is structurally pre-fork under every legal arming, whichever epoch the arming PR picks, so
-    /// `adiri` encodes it in the legacy layout while staying adjacent to the floor: the pre-fork
-    /// region with the least margin for error.
+    /// One below the floor rather than the floor itself, because the floor is a legal fork epoch:
+    /// the gate is `>=`, so arming AT 407 would make 407 post-fork and every anti-vacuity assert
+    /// below would fail — with the frozen vectors then tempting exactly the re-freeze they forbid.
+    /// 406 is structurally pre-fork under every legal arming, the current 570 included, so `adiri`
+    /// encodes it in the legacy layout while staying adjacent to the floor: the pre-fork region
+    /// with the least margin for error.
     ///
     /// Moving this constant is the one legitimate reason to re-freeze the vectors below. The epoch
     /// is a field of the encoded value, so its bytes move with it; any OTHER divergence is a
@@ -1453,12 +1454,12 @@ mod tests {
     const LEGACY_FIXTURE_EPOCH: Epoch = 406;
 
     /// Epoch of the post-fork-layout fixtures: `u32::MAX`, the one epoch that carries the
-    /// multi-worker layout under every build, armed or not.
+    /// multi-worker layout under every build and every value of the fork constant.
     ///
-    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= MULTI_WORKERS_FORK_EPOCH`
-    /// and that constant is the `u32::MAX` placeholder, so the top epoch is post-fork even while
-    /// the fork is dormant — and stays post-fork once the epoch-setting PR lowers the constant. One
-    /// frozen vector therefore pins the post-fork bytes on every lane, before and after arming.
+    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= MULTI_WORKERS_FORK_EPOCH`,
+    /// and no value of that constant exceeds `u32::MAX`, so the top epoch is post-fork on adiri
+    /// too and stays post-fork wherever the fork epoch is set. One frozen vector therefore pins the
+    /// post-fork bytes on every lane.
     const V1_FIXTURE_EPOCH: Epoch = u32::MAX;
 
     /// Seed tag marking a fixture primary's network key, so no primary shares a key with a worker.
@@ -1736,9 +1737,9 @@ mod tests {
     /// Pre-fork differential: the epoch-gated [`Committee`] and the derived legacy shadow encode
     /// to the same bytes, and each side reads what the other wrote.
     ///
-    /// The `adiri` multi-workers fork epoch is a `u32::MAX` placeholder, so every epoch is
-    /// pre-fork in this lane. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage
-    /// that: the override's `OnceLock` is process-wide and the whole test binary shares one
+    /// The `adiri` multi-workers fork epoch is 570 (floored at 407), so [`LEGACY_FIXTURE_EPOCH`]
+    /// (406) is pre-fork in this lane. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to
+    /// stage that: the override's `OnceLock` is process-wide and the whole test binary shares one
     /// process.
     #[cfg(feature = "adiri")]
     #[test]
@@ -1748,7 +1749,8 @@ mod tests {
         assert!(
             !crate::forks::multi_workers_fork_active(committee.epoch()),
             "epoch {} must be pre-fork for this differential to mean anything; is \
-             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?",
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
+             or below epoch 406?",
             committee.epoch()
         );
 
@@ -1856,7 +1858,8 @@ mod tests {
         assert!(
             !crate::forks::multi_workers_fork_active(LEGACY_FIXTURE_EPOCH),
             "epoch {LEGACY_FIXTURE_EPOCH} must be pre-fork for this pin to mean anything; is \
-             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?"
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
+             or below epoch 406?"
         );
 
         let committee = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3).committee();

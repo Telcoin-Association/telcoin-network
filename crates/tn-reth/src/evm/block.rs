@@ -30,7 +30,16 @@
 //!    sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
 //!    `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
 //!    block.
-//! 2. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
+//! 2. (`adiri` builds only) `apply_governance_safe_fork` — fires only when the concluding epoch,
+//!    plus one (checked), equals `governance_safe_fork_epoch()` (`GOVERNANCE_SAFE_FORK_EPOCH`, 554
+//!    on adiri, so it runs once, in the block that closes epoch 553; a `test-utils` build can move
+//!    it through `TN_GOVERNANCE_SAFE_FORK_EPOCH`). It etches the canonical Safe v1.4.1 suite, swaps
+//!    the `Safe` singleton and `SafeProxyFactory` code, and moves the governance Safe proxy onto
+//!    `SafeL2`, failing closed unless the singleton, factory and proxy code hashes and the proxy's
+//!    slot 0 match their pre-fork pins. Nothing in the close reads Safe state, so its position
+//!    after the registry pair and before the boundary calls is the fork-leads convention, not a
+//!    data dependency.
+//! 3. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
 //!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`, then
 //!    `setWorkerConfigsData(uint16[],uint184[])`. The reward infos carry the leader counts from
 //!    `ctx.gas_accumulator`'s rewards counter; committee membership is drawn by the
@@ -1377,14 +1386,15 @@ where
         // - **already canonical** — the write is a no-op and drops straight out of the changeset
         //   via the `is_changed` filter, so the `state_root` is unaffected.
         // - **a third-party handler** — reachable at any time: `setFallbackHandler` is `authorized`
-        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot between the
-        //   arming PR and the boundary. The fork overwrites it anyway. Aborting would stall the
-        //   entire fleet on the epoch-closing block over a slot the migration defines, and the
-        //   canonical handler is the value the post-fork SafeL2 stack expects; getting the intended
-        //   storage and bytecode in place is what the boundary is for. The overwrite is loud rather
-        //   than silent — the `warn!` below records the displaced address alongside its
-        //   replacement, so the prior value stays recoverable from the node record and the owners
-        //   can re-install it afterwards with an ordinary `execTransaction`.
+        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot at any point
+        //   before the boundary (on adiri, the block that closes epoch 553; the fork epoch is 554).
+        //   The fork overwrites it anyway. Aborting would stall the entire fleet on the
+        //   epoch-closing block over a slot the migration defines, and the canonical handler is the
+        //   value the post-fork SafeL2 stack expects; getting the intended storage and bytecode in
+        //   place is what the boundary is for. The overwrite is loud rather than silent — the
+        //   `warn!` below records the displaced address alongside its replacement, so the prior
+        //   value stays recoverable from the node record and the owners can re-install it
+        //   afterwards with an ordinary `execTransaction`.
         let handler_slot = U256::from_be_bytes(
             alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
         );
@@ -2584,10 +2594,11 @@ mod tests {
     /// fail closed, while the fallback-handler slot is one the migration defines and therefore
     /// writes through every reachable pre-state.
     ///
-    /// The slot is genuinely owner-mutable between the arming PR and the boundary —
-    /// `FallbackManager.setFallbackHandler` is `authorized` (`msg.sender == address(this)`),
-    /// so a quorum of the live 3-of-7 Safe can point it anywhere, including at an address with
-    /// no code. `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
+    /// The slot is genuinely owner-mutable right up to the boundary (on adiri, the block that
+    /// closes epoch 553; the fork epoch is 554) — `FallbackManager.setFallbackHandler` is
+    /// `authorized` (`msg.sender == address(this)`), so a quorum of the live 3-of-7 Safe can
+    /// point it anywhere, including at an address with no code.
+    /// `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
     /// unset -> canonical transition that the committed genesis fixture exhibits; nothing else
     /// in the tree seeds a non-zero pre-state, so without this test the overwrite branch is
     /// unexercised.
