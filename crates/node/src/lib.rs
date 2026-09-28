@@ -52,6 +52,20 @@ where
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
     tokio::spawn(async move {
+        // Refuse to run a second writer against this datadir. Take the PID lockfile before any
+        // heavy init and hold the guard for the node's whole lifetime: it is released on
+        // the clean-shutdown path below, and on any early error or panic via the guard's
+        // `Drop`. A stale lock left by a previous crash (its PID no longer alive) is
+        // reclaimed automatically. This is TN-owned and does not depend on the execution
+        // engine's own database lock.
+        let _pid_lock = match tn_config::PidLock::acquire(&tn_datadir) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::error!("Error running node (datadir already locked): {err}");
+                return Err(err);
+            }
+        };
+
         // create the epoch manager
         let mut epoch_manager =
             match EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await {

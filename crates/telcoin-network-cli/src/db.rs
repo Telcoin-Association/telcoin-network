@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs as _};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
     iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, DatabaseArguments,
     DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv, RethMdbxError,
@@ -114,9 +114,10 @@ impl DbCommand {
 /// Read-only: this never mutates the pack. It opens the `data` stream read-only via mmap, so
 /// validating the CURRENT/latest epoch — the one a running node holds open for append — is unsafe:
 /// the node truncates that file on epoch-close and remaps it on growth, and a concurrent truncate
-/// can crash this command with a SIGBUS (node data is never harmed). There is no lock to detect a
-/// running node, so validate the current epoch only with the node STOPPED. Sealed past epochs are
-/// always safe to validate live.
+/// can crash this command with a SIGBUS (node data is never harmed). `validate` takes a pack path
+/// rather than the datadir, so it does not consult the `telcoin.pid` lock — validate the
+/// current/latest epoch only with the node STOPPED. A sealed past epoch is safe to validate live,
+/// except briefly during an epoch handoff before the just-sealed pack has its clean-close sentinel.
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
     /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
@@ -296,10 +297,12 @@ fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Optio
 /// touched.
 ///
 /// The node MUST be stopped: with `--force` this opens packs for append and rewrites them, which
-/// would corrupt a running node's memory mapping. There is no lock to detect a running node, so the
-/// command is a dry run by default (read-only classification, no writes) and requires `--force` to
-/// apply. In repair-all mode the current/latest epoch (the one a running node holds open for
-/// append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed stopped.
+/// would corrupt a running node's memory mapping. It refuses to run while the datadir PID lock
+/// (`telcoin.pid`) is held by a live node, and it takes that lock for its own run so a node cannot
+/// start mid-repair. It is a dry run by default (read-only classification, no writes) and requires
+/// `--force` to apply. In repair-all mode the current/latest epoch (the one a running node holds
+/// open for append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed
+/// stopped.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -323,12 +326,18 @@ impl DbRepairArgs {
         // Loud safety banner in both modes (stderr; the report goes to stdout).
         eprintln!(
             "WARNING: `db repair` rewrites consensus pack files. The node MUST be stopped first — \
-             there is no lock to detect a running node, and repairing files a running node holds \
-             mapped will corrupt them."
+             repairing files a running node holds mapped will corrupt them."
         );
         if !self.force {
             eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
         }
+
+        // Refuse to touch pack files a live node holds mapped. Take the datadir PID lock (writing
+        // our own PID) so a node cannot start mid-repair either; both are released when
+        // this returns. A stale lock from a previous crash is reclaimed. Do this before any
+        // read, in both dry-run and apply modes, so operators get a clear error rather than
+        // a confusing partial report.
+        let _pid_lock = PidLock::acquire(&datadir)?;
 
         let all = ConsensusPack::epoch_dirs(&epochs_dir)
             .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
@@ -436,9 +445,10 @@ impl DbRepairArgs {
 /// epoch at once (it may become mandatory in a future release).
 ///
 /// The node MUST be stopped: with `--force` this rewrites pack files, which would corrupt a running
-/// node's memory mapping. There is no lock to detect a running node, so the command is a dry run by
-/// default and requires `--force` to apply. A legacy pack whose data log is damaged below the acked
-/// frontier is reported (re-sync required), never truncated.
+/// node's memory mapping. It refuses to run while the datadir PID lock (`telcoin.pid`) is held by a
+/// live node (and takes that lock for its own run), and is a dry run by default, requiring
+/// `--force` to apply. A legacy pack whose data log is damaged below the acked frontier is reported
+/// (re-sync required), never truncated.
 #[derive(Debug, Args)]
 pub struct DbMigrateArgs {
     /// Migrate only this epoch. Without it, every legacy epoch is migrated.
@@ -463,12 +473,16 @@ impl DbMigrateArgs {
         // Loud safety banner in both modes (stderr; the report goes to stdout).
         eprintln!(
             "WARNING: `db migrate` rewrites consensus pack files. The node MUST be stopped first — \
-             there is no lock to detect a running node, and rewriting files a running node holds \
-             mapped will corrupt them."
+             rewriting files a running node holds mapped will corrupt them."
         );
         if !self.force {
             eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
         }
+
+        // Refuse to run while a live node holds the datadir PID lock, and take it for our own run
+        // so a node cannot start mid-migration; released when this returns. A stale lock is
+        // reclaimed.
+        let _pid_lock = PidLock::acquire(&datadir)?;
 
         let all = ConsensusPack::epoch_dirs(&epochs_dir)
             .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
@@ -1358,6 +1372,32 @@ mod tests {
         // Explicit --epoch targets exactly that epoch (including the current one), no skip.
         assert_eq!(repair_targets(&[0, 1, 2], Some(2)), (vec![2], None));
         assert_eq!(repair_targets(&[0, 1, 2], Some(0)), (vec![0], None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_repair_refuses_while_a_live_node_holds_the_datadir_lock() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        // `db repair` reaches the datadir lock only after the epochs dir exists.
+        fs::create_dir_all(datadir.epochs_db_path()).unwrap();
+
+        // A live, foreign PID (init) stands in for a running node holding the lock.
+        fs::write(datadir.node_pid_path(), "1").unwrap();
+        let err = super::DbRepairArgs { epoch: None, force: true }
+            .execute(datadir.clone())
+            .expect_err("repair must refuse while a live PID holds the lock");
+        assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+        // The refusal must not disturb the running node's lock.
+        assert_eq!(fs::read_to_string(datadir.node_pid_path()).unwrap().trim(), "1");
+
+        // With no live holder, a dry-run repair takes the lock and releases it on exit.
+        fs::remove_file(datadir.node_pid_path()).unwrap();
+        super::DbRepairArgs { epoch: None, force: false }
+            .execute(datadir.clone())
+            .expect("dry-run repair should succeed on an empty epochs dir with no lock held");
+        assert!(!datadir.node_pid_path().exists(), "repair must release its lock on exit");
     }
 
     #[test]

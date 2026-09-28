@@ -143,6 +143,13 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     /// Return the path to `network_config` file.
     fn network_config_path(&self) -> PathBuf;
 
+    /// Return the path to the node PID lockfile at the datadir root.
+    ///
+    /// The running node writes its PID here on startup and removes it on clean shutdown. Node
+    /// startup and `db repair` refuse to proceed when this file holds a *live* PID, and reclaim it
+    /// when the PID is stale. See [`crate::pid_lock`].
+    fn node_pid_path(&self) -> PathBuf;
+
     /// Return the path to consensus's epoch storage for a specific epoch.
     fn epochs_db_path(&self) -> PathBuf {
         self.consensus_db_path().join("epochs")
@@ -187,5 +194,9 @@ where
 
     fn network_config_path(&self) -> PathBuf {
         self.as_ref().join("network-config")
+    }
+
+    fn node_pid_path(&self) -> PathBuf {
+        self.as_ref().join("telcoin.pid")
     }
 }

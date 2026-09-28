@@ -181,7 +181,8 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
 issues. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
-re-sync, never "fixed".
+re-sync, never "fixed". `db repair` and `db migrate` refuse to run while a live node holds the
+`<datadir>/telcoin.pid` lock (intentional-design item 9).
 
 ---
 
@@ -220,13 +221,17 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 8. **`msync` as the default write barrier (not `fsync`).** Durability comes from fsync'ing every size
    extension plus the msync default for data within an fsync'd size (see the module docs, incl. the
    macOS `F_FULLFSYNC` caveat). This is a deliberate performance choice, not a durability bug.
-9. **No OS file lock on the datadir; single-writer by construction.** The node is the sole writer;
-   the crate takes no advisory lock. `db repair` therefore cannot *detect* a running node and instead
-   requires the operator to stop it (dry-run by default, `--force` to apply, current epoch skipped in
-   all-mode). Naming `--epoch N` explicitly — including the current/latest epoch — is intentionally
-   allowed and rewrites that pack under the same operator-stopped contract; the loud banner, not a
-   lock, is the guard (`--force` is sufficient by design). Do not flag "missing file lock / TOCTOU"
-   or "`--epoch` bypasses the current-epoch skip".
+9. **Single-writer datadir, enforced by a `telcoin.pid` lockfile.** The node is the sole writer of
+   its datadir and records its PID in `<datadir>/telcoin.pid` on startup, removing it on clean
+   shutdown (`tn_config::pid_lock`). Node startup and the at-rest writers (`db repair`, `db migrate`)
+   refuse to run when that file holds a *live* PID, and reclaim it when the PID is stale (a previous
+   crash). This guard is TN-owned; it does not depend on the execution engine's own database lock.
+   `db repair`/`db migrate` also take the lock for their run, so a node cannot start mid-repair. They
+   stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming `--epoch N`
+   explicitly — including the current/latest epoch — is intentionally allowed under the same
+   node-stopped contract. The lock is advisory: PID reuse and separate PID namespaces sharing a volume
+   (e.g. two containers) are accepted false-negative edges, so the loud banner and the stop-the-node
+   contract remain. Do not flag "`--epoch` bypasses the current-epoch skip".
 10. **`db repair` / `open_append_exists` mutate pack files on open.** Truncating a torn tail and
     rebuilding derived indexes from the authoritative log is the *point*. Gated by the node-stopped
     contract above. Not an "unsafe destructive operation".
