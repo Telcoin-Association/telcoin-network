@@ -8,6 +8,7 @@ use crate::{
     kad::{node_record_key, KadStore},
     metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -390,6 +391,9 @@ where
     published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
+    /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
+    quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -606,6 +610,14 @@ where
 
         let network_pubkey = keypair.public().into();
 
+        // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
+        let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
+        let quic_limits = QuicIncomingLimits::new(
+            network_config.peer_config().max_priority_peers(),
+            MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+        );
+        let quic_stats = std::sync::Arc::clone(&quic_incoming);
+
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -617,6 +629,11 @@ where
                     network_config.quic_config().max_concurrent_stream_limit;
                 config.max_stream_data = network_config.quic_config().max_stream_data;
                 config.max_connection_data = network_config.quic_config().max_connection_data;
+                quic_limits.apply(
+                    &mut config,
+                    network_config.quic_config().retry_unvalidated_incoming,
+                    quic_stats,
+                );
                 config
             })
             .with_behaviour(|_| behavior)
@@ -663,6 +680,7 @@ where
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
+            quic_incoming,
         })
     }
 
@@ -841,6 +859,7 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
 
