@@ -1,0 +1,23 @@
+name: QUIC qualification tooling
+
+on:
+  pull_request:
+    paths:
+      - etc/quic-qualification/**
+      - .github/workflows/quic-qualification.yaml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  collector-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test parsers and Linux collection
+        run: python3 -I -m unittest discover -s etc/quic-qualification -p 'test_*.py' -v

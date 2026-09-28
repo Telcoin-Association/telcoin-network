@@ -47,6 +47,17 @@ struct SwarmMetricHandles {
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
     outbound_requests_pending: Gauge,
+    /// Incoming QUIC attempts answered with a Retry (source address not validated).
+    quic_incoming_retried_total: Counter,
+    /// Incoming QUIC attempts accepted into a handshake.
+    quic_incoming_accepted_total: Counter,
+    /// Incoming QUIC attempts refused with a connection close: refused by the listener or
+    /// failed in the quinn accept.
+    quic_incoming_refused_total: Counter,
+    /// Incoming QUIC attempts dropped without a reply.
+    quic_incoming_ignored_total: Counter,
+    /// Times the QUIC listener yielded after its per-poll outcome cap.
+    quic_incoming_budget_yields_total: Counter,
 }
 
 /// Swarm-level metrics owned by `ConsensusNetwork`.
@@ -119,6 +130,16 @@ impl SwarmMetrics {
     pub(crate) fn set_pending(&self, px_disconnects: usize, outbound_requests: usize) {
         self.handles.px_disconnects_pending.set(px_disconnects as f64);
         self.handles.outbound_requests_pending.set(outbound_requests as f64);
+    }
+
+    /// Mirror the QUIC listener decision counters (absolute values; called once per
+    /// event-loop iteration). No address labels.
+    pub(crate) fn record_quic_incoming(&self, stats: &libp2p::quic::IncomingStats) {
+        self.handles.quic_incoming_retried_total.absolute(stats.retried());
+        self.handles.quic_incoming_accepted_total.absolute(stats.accepted());
+        self.handles.quic_incoming_refused_total.absolute(stats.refused());
+        self.handles.quic_incoming_ignored_total.absolute(stats.ignored());
+        self.handles.quic_incoming_budget_yields_total.absolute(stats.budget_yields());
     }
 
     /// Record an outbound request failure by failure kind.

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "run_id": "REPLACE_WITH_UNIQUE_RUN_ID",
+  "build": {
+    "node_commit": null,
+    "dirty_diff_artifact": null,
+    "lockfile_sha256": null,
+    "minimum_retry_revision": null,
+    "integrated_scheduling_revision": null,
+    "build_command": null,
+    "rust_toolchain": null,
+    "features": []
+  },
+  "deployment": {
+    "topology_artifact": null,
+    "representative_hardware_rationale": null,
+    "link_speed_bps": null,
+    "mtu": null,
+    "node_cpu_affinity": null,
+    "node_runtime_threads": null,
+    "node_cgroup_limits": null,
+    "generator_hosts_and_cpu_allocation": null,
+    "collector_cpu_allocation": null,
+    "firewall_disabled_evidence": null,
+    "clock_synchronization_evidence": null
+  },
+  "workload": {
+    "case": "baseline",
+    "repetition": 1,
+    "swarm_scope": "one",
+    "listener_addresses_and_roles": [],
+    "generator_revision_and_command": null,
+    "source_address_population": null,
+    "packet_sizes_and_offered_rates": null,
+    "warmup_seconds": null,
+    "steady_state_seconds": null,
+    "ip_family": null
+  },
+  "predeclared_acceptance": {
+    "maximum_ingress_bps": null,
+    "maximum_link_utilization_fraction": null,
+    "minimum_honest_throughput": null,
+    "maximum_honest_p99_latency_ms": null,
+    "maximum_honest_connection_failure_fraction": null,
+    "required_honest_sample_count": null,
+    "maximum_collector_overhead_fraction": null
+  },
+  "external_evidence": {
+    "achieved_ingress_timeseries": null,
+    "established_committee_results": null,
+    "new_honest_connection_results": null,
+    "endpoint_lock_profile": null,
+    "driver_cpu_profile": null,
+    "task_scheduling_profile": null,
+    "collector_overhead_control": null
+  }
+}
