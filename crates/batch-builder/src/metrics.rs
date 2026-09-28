@@ -24,6 +24,8 @@ pub(crate) struct BatchBuilderMetrics {
     pub(crate) seal_duration_seconds: Histogram,
     /// Total transactions skipped because a validated peer batch already carries them (#1329).
     pub(crate) peer_deferred_txs_total: Counter,
+    /// Total transactions evicted for whole-batch limit violations, excluding descendants.
+    pub(crate) unpackable_txs_total: Counter,
 }
 
 impl BatchBuilderMetrics {
@@ -70,6 +72,7 @@ mod tests {
             metrics.base_fee.set(1_000.0);
             metrics.pending_pool_transactions.set(3.0);
             metrics.batches_sealed_total.increment(1);
+            metrics.unpackable_txs_total.increment(2);
             metrics.seal_duration_seconds.record(0.25);
             metrics.record_seal_failure(0, &BlockSealError::Timeout);
         });
@@ -84,6 +87,9 @@ mod tests {
 
         let (_, _, _, value) = find("tn_batch_builder.batches_sealed_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+
+        let (_, _, _, value) = find("tn_batch_builder.unpackable_txs_total");
+        assert!(matches!(value, DebugValue::Counter(2)));
 
         let (_, _, _, value) = find("tn_batch_builder.base_fee");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 1_000.0));
