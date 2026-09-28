@@ -57,6 +57,10 @@ use tracing::{debug, error, info, instrument, trace, warn};
 mod network_tests;
 
 #[cfg(test)]
+#[path = "tests/admission_contention.rs"]
+mod admission_contention;
+
+#[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]
 mod loop_budget_tests;
 
