@@ -1657,6 +1657,22 @@ impl ConsensusChain {
         if let Some(old) = evicted {
             old.close().await;
         }
+        // Auto-migrate a legacy (pre-v2) sealed epoch before opening it read-only. Its on-disk
+        // digest indexes were written under the old key placement, so a by-digest lookup
+        // would silently miss present records (the by-number position index is
+        // placement-independent and is unaffected). Migration rebuilds the indexes under
+        // the current placement and re-seals the pack as v2; it is one-time and idempotent.
+        // Serialize it under `pack_install` (the guard the recovery/heal path already uses)
+        // and re-check under the lock in case a concurrent `get_static` already
+        // migrated it. The live current epoch was returned early above, so this only ever touches a
+        // sealed past epoch — never the active writer. A genuine migration failure (a corrupt
+        // legacy log) surfaces rather than serving a stale-index handle.
+        if ConsensusPack::epoch_is_legacy(&self.base_path, epoch) {
+            let _install = self.pack_install.lock().await;
+            if ConsensusPack::epoch_is_legacy(&self.base_path, epoch) {
+                ConsensusPack::heal_static_indexes(&self.base_path, epoch)?;
+            }
+        }
         // `new_epoch` swaps `current_pack` and only THEN seals the previous writer
         // (`old_pack.close().await` stamps the clean-close sentinels and truncates the mmap
         // padding, under `pack_install`); `stream_import`'s replace-current renames under

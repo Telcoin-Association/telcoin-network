@@ -434,16 +434,29 @@ impl ConsensusPack {
     ) -> Result<(), PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let pack_file = base_dir.join(Inner::DATA_NAME);
-        // Only a present, valid, cleanly-sealed data log may be healed read-side.
-        if !matches!(pack_unsealed_version(&pack_file, epoch), Some((_, false))) {
+        // Heal read-side only when rebuilding cannot lose committed data:
+        //  - a present, cleanly-SEALED log (a v2 rebuild just re-derives the indexes), or
+        //  - a present pre-v2 (legacy) log: `open_append_exists` migrates it up to v2, and
+        //    migration copies the committed outputs and refuses a log damaged below the acked
+        //    frontier — it never truncates committed data — so routing a legacy pack here is safe.
+        //    Legacy packs predate the clean-close sentinel and so always read back `opened_unclean
+        //    == true`; gating them on the seal (as v2 packs are) would wrongly reject every legacy
+        //    pack.
+        // A torn/unclean v2 log stays terminal (→ db repair): it is neither sealed nor legacy.
+        let healable = match pack_unsealed_version(&pack_file, epoch) {
+            Some((_, false)) => true, // present & cleanly sealed (any version)
+            Some((v, true)) => v < SENTINEL_MIN_VERSION, // present legacy: migration handles it
+            None => false,            // absent / unopenable
+        };
+        if !healable {
             return Err(Inner::corrupt_pack(&base_dir));
         }
         warn!(
             target: "consensus::pack",
             epoch,
             dir = %base_dir.display(),
-            "sealed epoch has a clean data log but an unreadable/inconsistent index; \
-             rebuilding indexes from the WAL"
+            "epoch has a recoverable data log but a stale/unreadable index (or is a pre-v2 legacy \
+             pack); rebuilding indexes from the WAL (migrating to v2 if legacy)"
         );
         // `open_append_exists` rebuilds every index from the WAL (open_indexes_for_append +
         // recover_pack); a clean data log is not truncated. Dropping the writable `Inner` seals it:
@@ -452,6 +465,17 @@ impl ConsensusPack {
         let rebuilt = Inner::open_append_exists(path.as_ref(), epoch)?;
         drop(rebuilt);
         Ok(())
+    }
+
+    /// Read-only check: does epoch `epoch`'s on-disk consensus pack predate the v2 (sentinel-era)
+    /// format? A pre-v2 pack's digest indexes were written under the old key-placement scheme, so
+    /// its by-digest lookups would silently miss present records until it is migrated. `false` if
+    /// the pack is missing/unopenable (that case is handled by the normal open path). Used by
+    /// `get_static` to migrate a legacy sealed epoch on read (encapsulates `SENTINEL_MIN_VERSION`
+    /// and the data-file name so `consensus.rs` need not know either).
+    pub(crate) fn epoch_is_legacy<P: AsRef<Path>>(path: P, epoch: Epoch) -> bool {
+        let data_file = path.as_ref().join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+        matches!(pack_unsealed_version(&data_file, epoch), Some((v, _)) if v < SENTINEL_MIN_VERSION)
     }
 
     /// Enumerate the epoch numbers that have an `epoch-{N}` directory under `epochs_dir`, sorted
@@ -2997,10 +3021,14 @@ impl Inner {
 
     /// The latest stored consensus number. Unlike [`Self::latest_consensus_header`], this is
     /// defined even for a meta-only pack (no outputs): `start + len - 1` is `start - 1` there —
-    /// the previous epoch's final consensus number. `start_consensus_number >= 1` (epoch 0
-    /// starts at 1), so this never underflows.
+    /// the previous epoch's final consensus number. `start_consensus_number >= 1` (epoch 0 starts
+    /// at 1) so this is always well-defined; the `saturating_sub` is defense-in-depth — a malformed
+    /// meta with `start == 0` and no outputs fails safe to `0` (which the startup hint-clamp then
+    /// treats as "no durable tip" and clamps down to) rather than wrapping to `u64::MAX` in release
+    /// and silently defeating [`Self::clamp_latest_to_pack`].
     fn latest_consensus_number(&self) -> u64 {
-        self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1
+        (self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64)
+            .saturating_sub(1)
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
@@ -5792,6 +5820,81 @@ pub(crate) mod test {
         let stripped = len - crate::archive::data_file::SENTINEL_LEN;
         f.set_len(stripped).expect("strip sentinel");
         stripped
+    }
+
+    /// HIGH-1: a sealed legacy (pre-v2) pack's on-disk digest index was written under the OLD key
+    /// placement, so a by-digest lookup would silently miss present records. `heal_static_indexes`
+    /// — the path `get_static` now routes a legacy pack through on read — must ACCEPT the
+    /// legacy pack (previously rejected: a legacy pack has no sentinel so it reads back
+    /// `opened_unclean == true`, which the old seal-only guard rejected), migrate it to v2, and
+    /// rebuild the indexes under the current placement, so by-digest AND by-number both resolve
+    /// afterward.
+    ///
+    /// (This build can only write the current `stable_hash` placement, so the fixture cannot
+    /// reproduce the exact old-placement bytes; the test instead pins the mechanism that closes the
+    /// gap — heal accepts a legacy pack, migrates it to v2, and every header resolves by digest
+    /// after migration. Pre-fix this test fails at the `heal_static_indexes` call, which
+    /// returned `CorruptPack` for a legacy pack.)
+    #[tokio::test]
+    async fn test_heal_static_indexes_migrates_legacy_pack_by_digest() {
+        for version in [0_u16, 1] {
+            let temp_dir = TempDir::with_prefix("heal_legacy_by_digest").expect("temp dir");
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let committee = fixture.committee();
+            let previous_epoch = test_previous_epoch(&committee);
+            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
+                .await;
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            strip_sentinel(&data_path);
+            assert_eq!(peek_pack_version(&data_path), version, "precondition: on-disk v{version}");
+            assert!(
+                ConsensusPack::epoch_is_legacy(temp_dir.path(), 0),
+                "v{version}: pack must be detected as legacy before healing"
+            );
+
+            // Capture each header's digest (by number, the placement-independent path).
+            let before =
+                ConsensusPack::open_static(temp_dir.path(), 0).expect("open legacy static");
+            let mut digests = Vec::new();
+            for i in 1..=3u64 {
+                digests
+                    .push(before.consensus_header_by_number(i).await.expect("legacy hdr").digest());
+            }
+            before.close().await;
+
+            // Read-side heal: a legacy pack must be accepted, migrated to v2, and its indexes
+            // rebuilt.
+            ConsensusPack::heal_static_indexes(temp_dir.path(), 0).unwrap_or_else(|e| {
+                panic!("v{version}: heal must migrate a legacy pack, got {e:?}")
+            });
+            assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "v{version}: migrated to v2");
+            assert!(
+                !ConsensusPack::epoch_is_legacy(temp_dir.path(), 0),
+                "v{version}: pack must no longer be legacy after migration"
+            );
+
+            // Every header now resolves by digest (placement-dependent) AND by number.
+            let after =
+                ConsensusPack::open_static(temp_dir.path(), 0).expect("open migrated static");
+            for (idx, digest) in digests.iter().enumerate() {
+                let n = idx as u64 + 1;
+                assert!(
+                    after.contains_consensus_header(*digest).await,
+                    "v{version}: header {n} missing by digest after heal"
+                );
+                let by_digest =
+                    after.consensus_header_by_digest(*digest).await.unwrap_or_else(|| {
+                        panic!("v{version}: header {n} not found by digest after heal")
+                    });
+                assert_eq!(by_digest.digest(), *digest, "v{version}: wrong header by digest");
+                assert!(
+                    after.get_consensus_output(n).await.is_ok(),
+                    "v{version}: output {n} must read back by number"
+                );
+            }
+            after.close().await;
+        }
     }
 
     /// F6: a legacy v0 (batches-first) or v1 (header-first) pack migrates 1:1 into a current v2

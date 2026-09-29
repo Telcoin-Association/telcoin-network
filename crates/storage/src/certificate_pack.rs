@@ -297,6 +297,11 @@ pub const DATA_NAME: &str = Inner::DATA_NAME;
 struct Inner {
     data: Pack<Certificate>,
     digest_idx: HdxIndex,
+    /// Test-only: when set, the next digest-index save fails right after the data append so tests
+    /// can exercise the atomic rollback in [`Self::save`]. Consumed once. (Mirrors
+    /// `EpochRecordDb`'s `fail_index_save_after_append`.)
+    #[cfg(test)]
+    fail_index_save_after_append: bool,
 }
 
 impl Inner {
@@ -450,7 +455,12 @@ impl Inner {
                 digest_idx.mark_consistent();
             }
         }
-        Ok(Self { data, digest_idx })
+        Ok(Self {
+            data,
+            digest_idx,
+            #[cfg(test)]
+            fail_index_save_after_append: false,
+        })
     }
 
     fn save(&mut self, cert: &Certificate) -> Result<(), PackError> {
@@ -459,11 +469,35 @@ impl Inner {
         if self.digest_idx.load(digest).is_ok() {
             return Ok(());
         }
+        // Atomic append+index (same rollback discipline as `EpochRecordDb::save_cert_atomic`): if
+        // the index write fails after the append lands, roll the log back to before the orphaned
+        // append and invalidate the index's data-length marker (`0` is never a valid length -> the
+        // next open's `data_file_length() != file_len()` check fails -> rebuild from the log).
+        // Without this a post-append index failure would orphan the cert bytes and a retry
+        // would append a duplicate (the index write never happened, so the idempotent check
+        // above misses).
+        let data_start = self.data.file_len();
+        if let Err(e) = self.append_and_index(digest, cert) {
+            self.data.rewind_to(data_start);
+            self.digest_idx.set_data_file_length(0);
+            return Err(e);
+        }
+        self.digest_idx.set_data_file_length(self.data.file_len());
+        Ok(())
+    }
+
+    /// Append `cert` to the data log and index it by `digest`. Split out from [`Self::save`] so the
+    /// caller can roll back atomically on any failure.
+    fn append_and_index(&mut self, digest: B256, cert: &Certificate) -> Result<(), PackError> {
         let position = self.data.append(cert).map_err(|e| PackError::Append(e.to_string()))?;
+        // Test-only injection: fail the index save after the append to exercise the rollback.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_index_save_after_append) {
+            return Err(PackError::IndexAppend("injected post-append index failure".to_string()));
+        }
         self.digest_idx
             .save(digest, position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
-        self.digest_idx.set_data_file_length(self.data.file_len());
         Ok(())
     }
 
@@ -721,6 +755,49 @@ mod test {
         let len_before = inner.data.file_len();
         inner.save(&certs[0]).expect("idempotent re-save");
         assert_eq!(inner.data.file_len(), len_before, "re-save must not append a duplicate cert");
+    }
+
+    /// A post-append index-write failure must roll the data log back (no orphan) so a retry
+    /// re-appends cleanly with no duplicate, and a reopen still finds every cert. Regression for
+    /// the `CertificatePack::save` non-atomicity: pre-fix, the failed attempt left orphan bytes
+    /// in the log (`file_len() > len_before`) and the retry appended a second copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_save_atomic_rollback_and_retry() {
+        let temp_dir = TempDir::with_prefix("cert_save_atomic").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+        let mut inner = super::Inner::open(&dir, false).expect("open pack");
+
+        // Save a few certs cleanly.
+        let mut certs = Vec::new();
+        for i in 0..4usize {
+            let cert = make_unique_cert(&fixture, i);
+            inner.save(&cert).expect("save");
+            certs.push(cert);
+        }
+        let len_before = inner.data.file_len();
+
+        // Arm the injected post-append index failure and attempt one more cert.
+        let extra = make_unique_cert(&fixture, 4);
+        inner.fail_index_save_after_append = true;
+        let err = inner.save(&extra).expect_err("index save must fail");
+        assert!(matches!(err, super::PackError::IndexAppend(_)), "unexpected error: {err:?}");
+        // Rolled back: no orphan bytes left in the log, and the failed cert is not resolvable.
+        assert_eq!(inner.data.file_len(), len_before, "data log must be rewound (no orphan)");
+        assert!(!inner.contains(extra.digest()), "failed cert must not be indexed");
+
+        // Retry (the flag auto-cleared) re-appends at the same offset and succeeds, no duplicate.
+        inner.save(&extra).expect("retry save");
+        assert!(inner.contains(extra.digest()), "cert present after retry");
+        certs.push(extra);
+        inner.persist().expect("persist");
+        drop(inner); // clean close (seals)
+
+        // Reopen: every saved cert is present (and the rollback+retry left the log rebuildable).
+        let mut inner = super::Inner::open(&dir, false).expect("reopen");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "cert missing after reopen");
+        }
     }
 
     /// A cleanly-SEALED cert log that has a mid-log corrupt record must NOT be silently

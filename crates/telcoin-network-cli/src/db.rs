@@ -1377,23 +1377,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn db_repair_refuses_while_a_live_node_holds_the_datadir_lock() {
-        use tn_config::TelcoinDirs as _;
+        use tn_config::{PidLock, TelcoinDirs as _};
         let dir = tempfile::tempdir().unwrap();
         let datadir = dir.path().to_path_buf();
         // `db repair` reaches the datadir lock only after the epochs dir exists.
         fs::create_dir_all(datadir.epochs_db_path()).unwrap();
 
-        // A live, foreign PID (init) stands in for a running node holding the lock.
-        fs::write(datadir.node_pid_path(), "1").unwrap();
+        // A held advisory lock stands in for a running node holding the datadir.
+        let held = PidLock::acquire(&datadir).expect("acquire datadir lock");
         let err = super::DbRepairArgs { epoch: None, force: true }
             .execute(datadir.clone())
-            .expect_err("repair must refuse while a live PID holds the lock");
+            .expect_err("repair must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
-        // The refusal must not disturb the running node's lock.
-        assert_eq!(fs::read_to_string(datadir.node_pid_path()).unwrap().trim(), "1");
+        // The refusal must not disturb the running node's lockfile.
+        assert_eq!(
+            fs::read_to_string(datadir.node_pid_path()).unwrap().trim().parse::<u32>().unwrap(),
+            std::process::id(),
+            "the held lock's PID must be left intact"
+        );
 
-        // With no live holder, a dry-run repair takes the lock and releases it on exit.
-        fs::remove_file(datadir.node_pid_path()).unwrap();
+        // Once the node releases the lock (drop removes the file), a dry-run repair takes the lock
+        // and releases it on exit.
+        drop(held);
         super::DbRepairArgs { epoch: None, force: false }
             .execute(datadir.clone())
             .expect("dry-run repair should succeed on an empty epochs dir with no lock held");
