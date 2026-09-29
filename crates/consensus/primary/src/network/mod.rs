@@ -1228,6 +1228,7 @@ impl PrimaryNetworkHandle {
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
                 | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConflictingOutput { .. }
                 | PackError::ConsensusNumberTooLow
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => None,
@@ -1302,6 +1303,7 @@ impl PrimaryNetworkHandle {
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
                 | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConflictingOutput { .. }
                 | PackError::ConsensusNumberTooLow
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => false,

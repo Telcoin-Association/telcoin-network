@@ -3263,9 +3263,8 @@ impl Inner {
     /// Write the batches for consensus to the pack file.
     fn save_consensus_batches(
         &mut self,
-        consensus: &ConsensusOutput,
+        batches: BTreeMap<BlockHash, Batch>,
     ) -> Result<Option<u64>, PackError> {
-        let batches = collect_batches(consensus);
         let mut first_batch_pos = None;
         // Save all the required batches into the pack file.
         for (batch_digest, batch) in batches.into_iter() {
@@ -3319,10 +3318,17 @@ impl Inner {
         }
         // Make sure this number is valid before we write anything...
         if (consensus_idx as usize) < self.consensus_pos_idx.len() {
-            // If we have saved this output already then ignore it.
-            // Note this can be important when we replay consensus from downloaded pack files.
-            // We do need to return the bytes this output requires in the pack file.
+            // Already saved: a no-op, which matters when consensus is replayed over outputs already
+            // in the pack (e.g. after a restart). But only for the SAME output: a different output
+            // under a stored number must not be reported as persisted (and then executed) while
+            // the pack keeps the other one. We do need to return the bytes this output requires in
+            // the pack file.
             let pos = self.consensus_pos_idx.load(consensus_idx)?;
+            let stored = self.data.fetch(pos.consensus_header)?.into_consensus()?.digest();
+            let got = consensus.consensus_header_hash();
+            if stored != got {
+                return Err(PackError::ConflictingOutput { number: consensus_number, stored, got });
+            }
             return Ok(pos.output_end.saturating_sub(pos.output_start));
         } else if consensus_idx as usize != self.consensus_pos_idx.len() {
             return Err(PackError::InvalidConsensusNumber(
@@ -3330,10 +3336,27 @@ impl Inner {
                 consensus_number,
             ));
         }
+        // The pack stores exactly the batches the output's sub-dag declares, and recovery replays
+        // each output expecting exactly those batch records: an output carrying a partial or
+        // extra batch set would be written fine but make the pack unrecoverable after the next
+        // unclean shutdown. Refuse it before anything is written. An output carrying NO batches is
+        // exempt: production only builds one for a sub-dag with no payload (the subscriber
+        // fetches every declared batch otherwise), while test fixtures save committed sub-dags
+        // whose batches do not exist through `ConsensusChain::write_subdag_for_test`.
+        let batches = collect_batches(consensus);
+        if !batches.is_empty() {
+            let declared = sub_dag_batch_digests(consensus.sub_dag());
+            if declared.iter().any(|digest| !batches.contains_key(digest)) {
+                return Err(PackError::MissingBatches);
+            }
+            if batches.len() != declared.len() {
+                return Err(PackError::ExtraBatches);
+            }
+        }
         // Snapshot the exact pre-append state so any mid-save error rolls back to it atomically.
         let data_start = self.data.file_len();
         let pos_idx_start = self.consensus_pos_idx.len();
-        match self.append_output_records(consensus, consensus_idx) {
+        match self.append_output_records(consensus, consensus_idx, batches) {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
                 self.rollback_output(data_start, pos_idx_start);
@@ -3349,18 +3372,24 @@ impl Inner {
         &mut self,
         consensus: &ConsensusOutput,
         consensus_idx: u64,
+        batches: BTreeMap<BlockHash, Batch>,
     ) -> Result<u64, PackError> {
-        let first_batch_pos =
-            if self.version() == 0 { self.save_consensus_batches(consensus)? } else { None };
+        // v0 (batches-first) writes the batches before the header, v1+ after it.
+        let (before_header, after_header) =
+            if self.version() == 0 { (Some(batches), None) } else { (None, Some(batches)) };
+        let first_batch_pos = match before_header {
+            Some(batches) => self.save_consensus_batches(batches)?,
+            None => None,
+        };
         // Now save the consensus header.
         let consensus_digest = consensus.consensus_header_hash();
         let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
-        if self.version() > 0 {
-            self.save_consensus_batches(consensus)?;
-        };
+        if let Some(batches) = after_header {
+            self.save_consensus_batches(batches)?;
+        }
         let batch_pos = if let Some(batch_pos) = first_batch_pos { batch_pos } else { position };
         self.consensus_digests
             .save(consensus_digest.into(), position)
@@ -3725,12 +3754,12 @@ pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
 /// of batch records (and their order) the header-first layout stores after the header, matching
 /// what [`collect_batches`] writes for a locally-saved output.
 fn declared_batch_digests(header: &ConsensusHeader) -> BTreeSet<BlockHash> {
-    header
-        .sub_dag
-        .headers()
-        .iter()
-        .flat_map(|cert_header| cert_header.payload().keys().copied())
-        .collect()
+    sub_dag_batch_digests(&header.sub_dag)
+}
+
+/// The dedup'd, sorted set of batch digests `sub_dag`'s certificates reference.
+fn sub_dag_batch_digests(sub_dag: &CommittedSubDag) -> BTreeSet<BlockHash> {
+    sub_dag.headers().iter().flat_map(|cert_header| cert_header.payload().keys().copied()).collect()
 }
 
 /// Gathers all the batches from consensus into an ordered Map by digest.
@@ -4545,6 +4574,16 @@ pub enum PackError {
     NotBatch,
     /// Expected the epoch-meta record but found another kind (or none).
     NotEpoch,
+    /// A different output is already stored under this consensus number: saving `got` would be
+    /// reported as persisted while the pack keeps `stored`.
+    ConflictingOutput {
+        /// The consensus number both outputs claim.
+        number: u64,
+        /// Digest of the output already in the pack.
+        stored: ConsensusHeaderDigest,
+        /// Digest of the output being saved.
+        got: ConsensusHeaderDigest,
+    },
     /// Error reading from a record stream: a transport failure or timeout, which says nothing
     /// about the bytes the sender produced.
     ReadError(String),
@@ -4707,6 +4746,11 @@ impl Display for PackError {
             PackError::NotBatch => write!(f, "Record is not a Batch"),
             PackError::NotEpoch => write!(f, "Record is not an EpochMeta"),
             PackError::ReadError(error) => write!(f, "Read Error {error}"),
+            PackError::ConflictingOutput { number, stored, got } => write!(
+                f,
+                "a different output is already stored for consensus number {number} (stored \
+                 {stored}, saving {got})"
+            ),
             PackError::UnexpectedRecord(error) => write!(f, "Unexpected record ({error})"),
             PackError::UndecodableRecord(error) => write!(f, "Undecodable record ({error})"),
             PackError::MissingAuthority => write!(f, "Missing authority"),
@@ -7614,6 +7658,90 @@ pub(crate) mod test {
             io::Error::from(io::ErrorKind::PermissionDenied)
         ))))
         .is_environmental_index_error());
+    }
+
+    /// Re-saving the output already stored under a number is an idempotent no-op (restart replay),
+    /// but a DIFFERENT output under that number must be refused rather than reported as persisted
+    /// while the pack keeps the other one.
+    #[tokio::test]
+    async fn test_save_refuses_a_conflicting_output_under_a_stored_number() {
+        let temp_dir = TempDir::with_prefix("test_save_conflict").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone()).unwrap();
+        let parent = ConsensusHeader::default().digest();
+        let stored = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let other = make_test_output(&committee, 1, chain.clone(), 1, parent);
+        assert_ne!(stored.digest(), other.digest(), "fixture outputs must differ");
+
+        let bytes = pack.save_consensus_output(stored.clone()).await.expect("save");
+        assert_eq!(
+            pack.save_consensus_output(stored).await.expect("idempotent re-save"),
+            bytes,
+            "re-saving the stored output is a no-op reporting its size"
+        );
+        let err = pack.save_consensus_output(other).await.expect_err("conflict must be refused");
+        assert!(
+            matches!(err, super::PackError::ConflictingOutput { number: 1, .. }),
+            "got {err:?}"
+        );
+        pack.close().await;
+    }
+
+    /// An output whose batches are not exactly the set its sub-dag declares would be written but
+    /// make the pack unrecoverable (replay expects exactly the declared batch records), so it is
+    /// refused before anything is written.
+    #[tokio::test]
+    async fn test_save_refuses_an_output_whose_batches_do_not_match_its_sub_dag() {
+        let temp_dir = TempDir::with_prefix("test_save_batch_set").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone()).unwrap();
+        let parent = ConsensusHeader::default().digest();
+        let full = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let len_before = pack.data_file_len().await.expect("len");
+
+        let with_batches = |batches: Vec<Batch>| {
+            let mut certified = full.batches().to_vec();
+            certified[0].batches = batches;
+            ConsensusOutput::new(
+                full.sub_dag().clone(),
+                parent,
+                1,
+                false,
+                full.batch_digests().clone(),
+                certified,
+            )
+        };
+        let mut partial = full.batches()[0].batches.clone();
+        let dropped = partial.pop().expect("fixture has batches");
+        let err = pack
+            .save_consensus_output(with_batches(partial.clone()))
+            .await
+            .expect_err("a partial batch set must be refused");
+        assert!(matches!(err, super::PackError::MissingBatches), "partial: {err:?}");
+
+        let stray = make_test_output(&committee, 1, chain.clone(), 2, parent).batches()[0].batches
+            [0]
+        .clone();
+        let mut extra = full.batches()[0].batches.clone();
+        extra.push(stray);
+        let err = pack
+            .save_consensus_output(with_batches(extra))
+            .await
+            .expect_err("an extra batch must be refused");
+        assert!(matches!(err, super::PackError::ExtraBatches), "extra: {err:?}");
+
+        assert_eq!(pack.data_file_len().await.expect("len"), len_before, "nothing was written");
+        partial.push(dropped);
+        pack.save_consensus_output(with_batches(partial)).await.expect("the full set saves");
+        pack.close().await;
     }
 
     /// An unclean pack can end in an incomplete output whose last record happens to end the file

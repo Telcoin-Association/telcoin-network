@@ -304,6 +304,14 @@ pub struct Consensus<DB> {
     certificate_pack: Option<CertificatePack>,
 }
 
+/// Whether to keep using a certificate pack whose `try_save` returned `error`. Only a full channel
+/// is transient backpressure. Any other error is permanent for this pack: a latched open or save
+/// failure is returned by every later call, and a closed channel means its thread is gone. Keeping
+/// such a pack would only log the same failure once per certificate.
+fn keep_certificate_pack_after(error: &PackError) -> bool {
+    matches!(error, PackError::SendFull)
+}
+
 /// Resolve the epoch seed chain anchor from the two cursors recovered at startup, failing closed
 /// on every inconsistent combination.
 ///
@@ -472,12 +480,12 @@ impl<DB: Database> Consensus<DB> {
         }
         if let Some(certificate_pack) = &self.certificate_pack {
             if let Err(e) = certificate_pack.try_save(certificate.clone()) {
-                tracing::error!(target: "telcoin::consensus_state", ?e, "Failed to save certificate to cert pack file");
-                // The certificate pack is in a failed state so stop using it.
-                // This is not a critical path so not stopping but if the DB gets in a failed
-                // state the node is probably not long for world...
-                // If the sender is overflowed then can try again later.
-                if let PackError::SendFailed = e {
+                // Not a critical path, so a failed pack does not stop consensus (but a node whose
+                // storage is failing is probably not long for this world).
+                if keep_certificate_pack_after(&e) {
+                    tracing::warn!(target: "telcoin::consensus_state", ?e, "cert pack is backed up; this certificate was not archived");
+                } else {
+                    tracing::error!(target: "telcoin::consensus_state", ?e, "cert pack failed; no longer archiving certificates this epoch");
                     self.certificate_pack = None;
                 }
             }

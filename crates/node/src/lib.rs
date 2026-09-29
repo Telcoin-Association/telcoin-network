@@ -46,14 +46,14 @@ pub fn launch_node<P>(
 where
     P: TelcoinDirs + Clone + 'static,
 {
-    let consensus_db = manager::open_consensus_db(&tn_datadir);
-
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
     tokio::spawn(async move {
-        // Refuse to run a second writer against this datadir. Take the PID lockfile before any
-        // heavy init and hold the guard for the node's whole lifetime: it is released on
+        // Refuse to run a second writer against this datadir. Take the PID lockfile before
+        // touching anything in the datadir (including opening the consensus DB, whose open is
+        // fail-fast and would otherwise panic on a datadir another node holds before this clear
+        // error is reached) and hold the guard for the node's whole lifetime: it is released on
         // the clean-shutdown path below, and on any early error or panic via the guard's
         // `Drop`. A crashed holder never blocks a restart: the kernel releases its `flock` when
         // the process exits. This is TN-owned and does not depend on the execution engine's own
@@ -65,6 +65,7 @@ where
                 return Err(err);
             }
         };
+        let consensus_db = manager::open_consensus_db(&tn_datadir);
 
         // create the epoch manager
         let mut epoch_manager =

@@ -574,14 +574,18 @@ fn assert_sealed_packs_unchanged(
 ///
 /// Call once per test, before the first node spawn and before anything in the process reads any
 /// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
-/// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
-/// plain `cargo test` two of these tests in one process would fight over it, and the assertions
-/// below are what turn that into a loud failure instead of a mis-decoded pack.
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`). Under
+/// plain `cargo test`, two of these tests in one process would fight over it, and a later pin
+/// would re-point the environment an already-running test spawns its nodes with. So only the
+/// first pin in a process is allowed ([`FORKS_PINNED_BY`]); any later one fails at once, before
+/// touching the environment, naming the test that holds the pins.
 fn pin_fork_epochs(
     force_multi_workers: Option<Epoch>,
     force_seed_signature: Option<Epoch>,
     force_leader_seeded: Option<Epoch>,
 ) {
+    claim_fork_pins();
+
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
     // stated per-fork default when it exported nothing. an unparseable value normalizes to the
     // same default the gate would have fallen back to.
@@ -609,6 +613,22 @@ fn pin_fork_epochs(
         LEADER_SEEDED_ORDERING_FORK_ENV,
         force_leader_seeded.unwrap_or_else(|| lane(LEADER_SEEDED_ORDERING_FORK_ENV, 0)),
         leader_seeded_ordering_fork_epoch_override,
+    );
+}
+
+/// The test (libtest names each test's thread after it) that pinned this process's fork epochs.
+static FORKS_PINNED_BY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Claim this process's fork pins for the current test, or fail with how to run the tests apart.
+fn claim_fork_pins() {
+    let me = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    let holder = FORKS_PINNED_BY.get_or_init(|| me.clone());
+    assert_eq!(
+        holder, &me,
+        "fork epochs are process-wide and `{holder}` already pinned them in this process, so \
+         `{me}` cannot run here. Run each e2e test in its own process: nextest \
+         (`make test-e2e` / `make test-epochs`), or `cargo test -p e2e-tests --test it -- \
+         <test> --exact --include-ignored`"
     );
 }
 
