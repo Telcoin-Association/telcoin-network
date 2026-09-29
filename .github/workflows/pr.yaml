@@ -23,7 +23,8 @@
 # suite can have covered it and nothing can attest it; a lane that required it would hang
 # the queue. It gates entry instead: a PR cannot be queued until its head sha is attested,
 # and a push to a queued PR removes it from the queue with a new head that is unattested
-# until a maintainer runs `make attest` again.
+# until a maintainer runs `make attest` again. That holds for a PR that leaves the gate
+# alone; the `attest` job below says what stops a PR that edits it.
 #
 # The compile lanes restore their dependency caches and never save them (`save-if:
 # "false"`). A cache saved by a pull_request run is scoped to that PR's branch and one
@@ -140,7 +141,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # The script comes from the PR's base commit, checked out into `trusted/`, and the
+      # PR's own tree is never checked out in this job. A bare checkout on `pull_request`
+      # is the PR's merge commit, so the script judging the PR would be supplied by the
+      # PR: an `exit 0` or a different CONTRACT_ADDRESS would turn this check green with
+      # no attestation. `base.sha` is a commit on main (the trigger only accepts PRs into
+      # main): the tip of main when the PR was opened or last pushed. The author cannot
+      # choose it, only leave it old by not pushing.
+      #
+      # The consequence to expect: a PR that changes verify_commit_hash.sh is judged by
+      # the old script. The new one takes effect for the PRs after it lands; a PR already
+      # open keeps its old base, and so the old script, until it is pushed again, because
+      # `base.sha` does not follow main. Requesting a review or re-running the job does
+      # not move it.
+      #
+      # What this does not cover: the job definition below and the `CI Success` allowlist
+      # still come from the PR's merge commit, and a PR can edit those instead. Such a PR
+      # is stopped by the required code-owner review (.github/CODEOWNERS), not here.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
       # cast, for the read-only registry call
       - name: Install Foundry
@@ -149,7 +172,7 @@ jobs:
       - name: Verify attestation on adiri
         env:
           COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
-        run: .github/scripts/verify_commit_hash.sh
+        run: trusted/.github/scripts/verify_commit_hash.sh
 
   # Format check - no compilation needed, finishes in ~30s
   fmt:
