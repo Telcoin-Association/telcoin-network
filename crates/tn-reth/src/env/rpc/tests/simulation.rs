@@ -9,7 +9,6 @@ use alloy::{
     },
 };
 use futures::future::try_join_all;
-use reth_chainspec::EthChainSpec;
 
 /// A funded transfer with an explicit EIP-1559 cap and zero priority fee.
 fn priced_transfer(fee_cap: u128) -> TransactionRequest {
