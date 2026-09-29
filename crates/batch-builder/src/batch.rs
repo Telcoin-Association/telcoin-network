@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use tn_reth::{ChangedAccount, TxPool};
 use tn_types::{
-    max_batch_gas, max_batch_size, Address, Batch, BatchBuilderArgs, Encodable2718 as _,
-    TransactionTrait as _, TxHash, WorkerId, U256,
+    max_batch_gas, max_batch_size, Address, Batch, BatchBuilderArgs, Encodable2718 as _, TxHash,
+    WorkerId, U256,
 };
 use tracing::{debug, warn};
 
@@ -100,7 +100,7 @@ pub fn build_batch<P: TxPool>(
     while let Some(pool_tx) = best_txs.next() {
         // Check whole-batch limits before peer or remaining-capacity deferrals. A transaction
         // that cannot fit an empty batch must be evicted even when higher-priority traffic
-        // exhausts capacity on every build. Check gas first to avoid encoding oversized gas.
+        // exhausts capacity on every build. Clone and encode only transactions selected below.
         if pool_tx.gas_limit() > gas_limit {
             best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
             warn!(target: "worker::batch_builder", tx_hash = ?pool_tx.hash(), tx_gas_limit = pool_tx.gas_limit(), batch_gas_limit = gas_limit, epoch, "removing tx whose gas limit exceeds the batch limit");
@@ -108,45 +108,35 @@ pub fn build_batch<P: TxPool>(
             continue;
         }
 
-        // convert tx to a signed transaction
-        //
-        // NOTE: `ValidPoolTransaction::size()` is private
-        let tx = pool_tx.to_consensus();
-
         // ignore any transaction type outside the executable allowlist (EIP-4844
         // blobs and EIP-7702 today): the batch validator rejects such batches, so
         // packing one would cost this node a peer penalty on every vote request
-        if !tn_types::batch_allowlisted_tx_type(&tx) {
-            if tx.is_eip4844() {
+        if !tn_types::batch_allowlisted_tx_type(&pool_tx.transaction) {
+            if pool_tx.is_eip4844() {
                 best_txs.ignore_eip4844(&pool_tx);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
-                blob_transactions.push(*tx.hash());
+                blob_transactions.push(*pool_tx.hash());
             } else {
                 best_txs.ignore_eip7702(&pool_tx);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted tx type invalid");
-                unsupported_transactions.push(*tx.hash());
+                unsupported_transactions.push(*pool_tx.hash());
             }
             continue;
         }
 
-        // encode the transaction once and measure the batch by the encoded
-        // (EIP-2718) byte length.  Peers size a batch by exactly this value in
-        // the batch validator (`validate_batch_size_bytes` sums `tx.len()` over
-        // the encoded byte vectors against `max_batch_size(epoch)`), so the
-        // producer must cap on the same measurement.  The earlier heuristic
-        // (`TxnSize`, Reth's `InMemorySize`) estimates heap and struct memory,
-        // not the wire length; for access-list-heavy transactions it undercounts
-        // the encoded length and lets the producer build a batch that its own
-        // accounting accepts but every peer rejects, stalling the worker lane
-        // (issue #1248).
-        let tx_gas_limit = tx.gas_limit();
-        let encoded = tx.into_inner().encoded_2718();
+        // The pool caches the EIP-2718 encoded length at admission. For allowlisted types,
+        // this equals the consensus encoding measured by `validate_batch_size_bytes`.
+        // Blob sidecars would change that measure, but blobs were excluded above. Unlike
+        // `InMemorySize`, this includes all wire bytes (issue #1248) without cloning or
+        // encoding transactions that will be evicted or deferred.
+        let tx_gas_limit = pool_tx.gas_limit();
+        let encoded_size = pool_tx.encoded_length();
 
         match () {
-            () if encoded.len() > max_size => {
+            () if encoded_size > max_size => {
                 // Use the validator's encoded-byte measurement before transient limits.
-                best_txs.max_batch_size(&pool_tx, encoded.len(), max_size);
-                warn!(target: "worker::batch_builder", tx_hash = ?pool_tx.hash(), encoded_size = encoded.len(), batch_size_limit = max_size, epoch, "removing tx whose encoded size exceeds the batch limit");
+                best_txs.max_batch_size(&pool_tx, encoded_size, max_size);
+                warn!(target: "worker::batch_builder", tx_hash = ?pool_tx.hash(), encoded_size, batch_size_limit = max_size, epoch, "removing tx whose encoded size exceeds the batch limit");
                 unpackable_transactions.push(*pool_tx.hash());
             }
             () if pool.is_peer_deferred(pool_tx.hash()) => {
@@ -162,11 +152,12 @@ pub fn build_batch<P: TxPool>(
                 best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             }
-            () if encoded.len() > max_size.saturating_sub(total_bytes_size) => {
-                best_txs.max_batch_size(&pool_tx, encoded.len(), max_size);
+            () if encoded_size > max_size.saturating_sub(total_bytes_size) => {
+                best_txs.max_batch_size(&pool_tx, encoded_size, max_size);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             }
             () => {
+                let encoded = pool_tx.to_consensus().into_inner().encoded_2718();
                 // txs are not executed, so use the gas_limit
                 total_possible_gas += tx_gas_limit;
                 total_bytes_size += encoded.len();
