@@ -173,6 +173,74 @@ One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 
 Pinning `1.94.x` would make the rotation explicit and deliberate.
 That is a decision to make, not one made here.
 
+## Action pins
+
+Every `uses:` in `.github/workflows/` names the action by a full 40-character commit SHA, with the release it stands for in a trailing comment on the same line (`actions/checkout@<sha> # v7.0.1`).
+A tag such as `v4` is a pointer the action's owner can move at any time.
+A moved tag runs new code in the gate on the next run, with no change in this repository and nothing for a reviewer to see.
+A SHA cannot be moved, so the code that runs is the code that was reviewed when the pin was set.
+Three positions made this worth doing:
+
+- `taiki-e/install-action` runs in `cache-deps.yaml`'s `warm-test-cache` job, which writes
+  the `main`-scope cache entry that every PR and queue run restores.
+- `foundry-rs/foundry-toolchain` supplies the `cast` binary whose answer decides
+  `verify-on-chain`.
+- `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
+
+The current pins (the SHAs are in the workflows, and only there):
+
+| Action | Release | Runtime |
+|---|---|---|
+| `actions/checkout` | v7.0.1 | node24 |
+| `taiki-e/install-action` | v2.87.22 | composite (shell steps only) |
+| `foundry-rs/foundry-toolchain` | v1.9.1 | node24 |
+| `actions/upload-pages-artifact` | v5.0.0 | composite (runs `actions/upload-artifact` v7.0.0, node24, itself pinned by SHA) |
+| `actions/deploy-pages` | v5.0.1 | node24 |
+
+`Swatinem/rust-cache` is left out of the table: its pin moves on its own terms, and "Caches" above covers it.
+The runtime column matters because GitHub removed Node 20 from the hosted runners on 2026-09-23 and now forces any node20 action onto Node 24, which it was not written for.
+
+### How a pin moves
+
+Dependabot (`.github/dependabot.yaml`) checks the actions weekly and opens one grouped pull request for all of them except `Swatinem/rust-cache`, with each SHA and its version comment rewritten together.
+It proposes a release only once the release is 7 days old, so one that is pulled or found to be compromised in its first days never reaches a pull request.
+The grouping is for the attestation: a pull request cannot enter the queue until a maintainer has run the full local suite on its head and attested it, and `taiki-e/install-action` alone releases about five times a week.
+`Swatinem/rust-cache` arrives as a pull request of its own, because a release that changes how the cache key is computed has to reach `cache-deps.yaml` before `pr.yaml`.
+
+Whoever reviews such a pull request:
+
+- reads the release notes for every bump in it, all of them between the old release and
+  the new one. A changed default is how `upload-pages-artifact` v5 came to drop mdBook's
+  `.nojekyll` (see the comment in `docs.yaml`).
+- treats it as a change to the gate. It is under `.github/`, so it needs a code owner's
+  approval, and its head needs `make attest` like any other. Its own workflow runs get a
+  read-only token and no secrets; the new code first runs with more than that after it
+  lands, in `cache-deps.yaml` (the `main` cache) and `docs.yaml` (the Pages deployment).
+
+A new `uses:` takes the same form, SHA plus `# vX.Y.Z` on the same line; Dependabot rewrites the comment only when it is on the line it updates.
+
+One limit to know: Dependabot raises no security alert for an action pinned by SHA, only for one referenced by a version.
+The weekly version update is therefore the only channel through which a fixed release of a pinned action arrives, and the cooldown holds it back 7 days.
+A fix that cannot wait has to be pinned by hand.
+
+### Checking a pin by hand
+
+```sh
+git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>' 'refs/tags/<tag>^{}'
+```
+
+For an annotated tag this prints two lines, and the `^{}` line is the commit to pin; the other is the tag object.
+For a lightweight tag it prints one line, and that is the commit.
+Every action in the table is on a lightweight tag today; `Swatinem/rust-cache` tags are annotated.
+
+### What a pin does not cover
+
+A pin fixes the action's own code, not what that code downloads when it runs.
+`foundry-rs/foundry-toolchain` installs the current `stable` Foundry release on every run (its `version` input defaults to `stable`), so the `cast` behind `verify-on-chain` still changes whenever Foundry releases.
+The runner image (`ubuntu-latest`) is not pinned either, and with it everything preinstalled on it.
+
+One thing a pin does newly fix: `taiki-e/install-action` resolves a tool requested without a version (`tool: cargo-nextest`) from the manifest in the pinned commit, with a checksum, so the cargo-nextest version stays the same until the pin moves.
+
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.
 
