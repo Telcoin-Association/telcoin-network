@@ -2602,7 +2602,9 @@ mod tests {
             );
             assert_eq!(state.basic_account(&created_later)?, None);
             assert_eq!(state.basic_account(&absent)?, None);
-            assert_eq!(state.storage(contract, word(2))?, None);
+            // With a history checkpoint, reth falls back to plain state for an unindexed slot
+            // and returns zero when that slot is absent.
+            assert_eq!(state.storage(contract, word(2))?, Some(U256::ZERO));
             Ok(())
         })?;
         let latest = provider.history_by_block_number(k)?;
