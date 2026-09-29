@@ -45,8 +45,14 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    /// Accepts files stamped at or below `version` and rejects newer ones with
+    /// [`LoadHeaderError::InvalidVersion`], the same gate as `PackInner::open_data_file`.
+    pub fn open(mut reader: R, uid_idx: u64, version: u16) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
+        if header.version() > version {
+            // Do not allow a newer version than we request but allow an older.
+            return Err(LoadHeaderError::InvalidVersion);
+        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }
@@ -176,11 +182,17 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    /// Accepts files stamped at or below `version` and rejects newer ones with
+    /// [`LoadHeaderError::InvalidVersion`], the same gate as `PackInner::open_data_file`.
+    pub async fn open(mut reader: R, uid_idx: u64, version: u16) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
-        // so the (peer-facing) async path rejects future/foreign formats instead of parsing
-        // them with current-format logic.
+        // Same version/appnum gate as PackIter::open and PackInner::open_data_file: allow files
+        // stamped at or below the requested version (v0 legacy streams stay readable), reject
+        // newer ones so this (peer-facing) async path never parses a future layout with
+        // current-format logic.
+        if header.version() > version {
+            return Err(LoadHeaderError::InvalidVersion);
+        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }
