@@ -150,26 +150,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # The script comes from the PR's base commit, checked out into `trusted/`, and the
-      # PR's own tree is never checked out in this job. A bare checkout on `pull_request`
-      # is the PR's merge commit, so the script judging the PR would be supplied by the
-      # PR: an `exit 0` or a different CONTRACT_ADDRESS would turn this check green with
-      # no attestation. `base.sha` is a commit on main (the trigger only accepts PRs into
-      # main): the tip of main when the PR was opened or last pushed. The author cannot
-      # choose it, only leave it old by not pushing.
+      # The script comes from main as it stands when this job starts, checked out into
+      # `trusted/`, and the PR's own tree is never checked out in this job. A bare
+      # checkout on `pull_request` is the PR's merge commit, so the script judging the PR
+      # would be supplied by the PR: an `exit 0` or a different CONTRACT_ADDRESS would
+      # turn this check green with no attestation. main moves only through the ruleset or
+      # an admin bypassing it, so the author cannot choose what is checked out here, nor
+      # keep an old copy by not pushing, as `pull_request.base.sha` would allow: that does
+      # not follow main, and neither a review request nor a re-run moves it.
+      #
+      # The ref is spelled `refs/heads/main`, fully qualified so that a tag named `main`
+      # cannot be picked up, rather than taken from `github.base_ref` or
+      # `pull_request.base.ref`: the trigger only accepts PRs into main today, and a
+      # literal stays main if that filter is ever widened, so no PR can have the script
+      # read from a branch its author can push to.
       #
       # The consequence to expect: a PR that changes verify_commit_hash.sh is judged by
-      # the old script. The new one takes effect for the PRs after it lands; a PR already
-      # open keeps its old base, and so the old script, until it is pushed again, because
-      # `base.sha` does not follow main. Requesting a review or re-running the job does
-      # not move it.
+      # the old script, and every run after it lands uses the new one, on every open PR.
       #
       # What this does not cover: the job definition below and the `CI Success` allowlist
       # still come from the PR's merge commit, and a PR can edit those instead. Such a PR
       # is stopped by the required code-owner review (.github/CODEOWNERS), not here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: refs/heads/main
           path: trusted
           sparse-checkout: .github/scripts
           persist-credentials: false
