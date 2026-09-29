@@ -139,30 +139,46 @@ The admin role can bypass the `main` ruleset, and with it both the approval and 
 
 ## Caches
 
-`main` is the only cache writer.
+`main` is the only writer of the cache entries the lanes restore.
 `.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-Two properties of `Swatinem/rust-cache` shape all of this:
+Three properties of `Swatinem/rust-cache` (v2.9.2) shape all of this:
 
-- The key is `<prefix-key>-<shared-key>-<os>-<hash of rustc and every CARGO*/RUST*
-  variable in the environment>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`. So the `env:` block and the steps
-  before the cache step must be identical in `cache-deps.yaml` and `pr.yaml`; they are,
-  and both files say so. The clippy jobs hash seven variables (the six in `env:` plus
-  `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
-  Each cache step prints what it computed in its "Cache Configuration" log group (Restore
-  Key, Cache Key, Environment considered). When a restore misses, compare that group
-  between the two workflows first.
+- The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo
+  manifests, lockfiles and toolchain/config files>`, so the two entries start with
+  `v1-rust-clippy-cache-Linux-x64-` and `v1-rust-test-cache-Linux-x64-`. The env hash
+  covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every
+  variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and
+  whose value is non-empty. So the `env:` block and the steps before the cache step,
+  including every step that installs a toolchain, must be identical in `cache-deps.yaml`
+  and `pr.yaml`; they are, and both files say so. The clippy jobs hash seven variables
+  (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step);
+  the test jobs hash six. The toolchains hashed are the stable Rust preinstalled on the
+  runner image, the stable pinned in `rust-toolchain.toml`, and in the clippy jobs the
+  pinned nightly. Each cache step prints what it computed in its "Cache Configuration"
+  log group: Restore Key, Cache Key, and the environment considered, which includes a
+  "Rust Versions:" list of every toolchain it hashed. When a restore misses, compare that
+  group between the two workflows first.
 - Entries are immutable, and an exact key hit skips the save. So changing *what* a warm job
   builds (a lane added, a feature set changed) writes nothing until the key changes: bump
   `prefix-key` in both workflows, `cache-deps.yaml` first, then `pr.yaml` once `main` has
   written the new entries. (Or delete the entries under Settings -> Actions -> Caches and
   re-run the warm.) Both workflows now use `prefix-key: v1-rust`; the old
-  `v0-rust-*` entries can be deleted after the first successful PR and merge-group
-  runs restore `v1-rust-*`.
+  `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` entries can be deleted after the
+  first successful PR and merge-group runs restore `v1-rust-*`.
+- How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
+  changes it is a change of key like any other: `cache-deps.yaml` first, `pr.yaml` once
+  `main` has written the new entries. Dependabot sends rust-cache bumps as a pull request
+  of their own for exactly this reason (`.github/dependabot.yaml`). Whoever reviews one
+  reads the release notes of every release it covers for anything about the key,
+  hashing or cached paths, and if there is any, splits the bump into two pull requests:
+  the first moves `cache-deps.yaml` (and `durable-e2e.yaml`, which reads only the entry
+  it writes itself), the second moves `pr.yaml` after the warm on `main` has succeeded.
+  Comparing the "Cache Key" a warm prints before and after the bump shows it too.
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
@@ -172,6 +188,32 @@ Check the total under Settings -> Actions -> Caches now and then: three entries 
 One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 1.94.x point release changes the rustc version, which is in the key, and every entry misses with no fallback until the next warm (the schedule within 3-4 days, or a manual dispatch).
 Pinning `1.94.x` would make the rotation explicit and deliberate.
 That is a decision to make, not one made here.
+
+A second exposure, new with v2.9.2: the stable Rust preinstalled on the `ubuntu-latest` image is one of the toolchains hashed into every key, and this repository does not control it.
+When GitHub updates the image to a new Rust release (roughly every six weeks, plus point releases, rolled out to the runners over several days), every entry misses with no fallback until the next warm, and while the rollout is in progress a writer and a reader can land on different images and compute different keys.
+A missed restore whose "Rust Versions:" list shows a new stable is the sign.
+There are two ways out.
+One is to dispatch a warm by hand when it happens.
+The other is to make the installed set deterministic by removing the image's own toolchain before the cache step, in both workflows and in lockstep; that is untested on a runner.
+That too is a decision to make, not one made here.
+
+### STAGE 2: the rust-cache v2.9.2 bump is half done
+
+The move from v2.7.7 to v2.9.2 changes the key: v2.9.2 adds the CPU architecture (`Linux-x64-` where v2.7.7 wrote `Linux-`) and hashes every installed toolchain, so neither release can restore what the other wrote.
+It moves in two pull requests.
+The first moved the writers: `cache-deps.yaml` and `durable-e2e.yaml` are on v2.9.2.
+The three cache steps in `pr.yaml` are held on v2.7.7 and restore the entries the last v2.7.7 warm wrote.
+Had all six moved together, that pull request's own merge-queue run, and every queue entry after it, would have restored nothing and built every dependency cold until `main` had warmed.
+
+The remaining step moves the three pins in `pr.yaml` to v2.9.2 and removes every passage marked `STAGE 2:` under `.github/`, this subsection included.
+It can land once `main` has warmed: the *Warm dependency cache* run that the first pull request's merge triggered has succeeded, and Settings -> Actions -> Caches lists `v1-rust-clippy-cache-Linux-x64-...` and `v1-rust-test-cache-Linux-x64-...`.
+Dependabot may open the same bump by itself once `.github/dependabot.yaml` is on `main`, because `pr.yaml` is then the only file behind the latest release.
+That pull request can serve as stage 2, but it carries only the pins: hold it until `main` has warmed, and remove the `STAGE 2:` passages with it.
+Do not let the gap run long.
+Until it closes, the warm no longer refreshes the entries `pr.yaml` reads: they stay alive only while some run restores them at least once in 7 days, and after a `Cargo.lock` change on `main` a lane falls back to the restore-key prefix and gets a partly stale entry.
+
+Until the old entries expire (7 days without a restore), the cache list holds both generations, so the "three entries should be there" check above reads six for a while.
+Once stage 2 has landed, the old `v1-rust-clippy-cache-Linux-<hash>`, `v1-rust-test-cache-Linux-<hash>` and `v0-rust-durable-e2e-cache-Linux-<hash>` entries (no `x64` after `Linux-`) can be deleted there.
 
 ## Action pins
 
