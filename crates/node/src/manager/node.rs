@@ -186,6 +186,7 @@ fn prepare_worker_networks<Events: Clone>(
     );
 
     let mut addresses = HashSet::with_capacity(configured);
+    let mut rpc_endpoints = HashSet::with_capacity(configured);
     workers
         .iter()
         .zip(event_streams)
@@ -211,6 +212,16 @@ fn prepare_worker_networks<Events: Clone>(
                     "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in node config"
                 )
             })?;
+            if configured > 1 && p2p.rpc.is_none() {
+                warn!(target: "epoch-manager", worker_id,
+                    "worker advertises no JSON-RPC endpoint: observers cannot forward transactions to this node on this worker's lane; configure it with `keytool set-rpc --worker-id {worker_id} --http URL`");
+            }
+            p2p.rpc.iter().for_each(|rpc| {
+                if !rpc_endpoints.insert(&rpc.http) {
+                    warn!(target: "epoch-manager", worker_id, http = %rpc.http,
+                        "workers advertise the same JSON-RPC endpoint; ensure the gateway routes transactions to the correct worker");
+                }
+            });
             Ok(PreparedWorkerNetwork {
                 worker_id,
                 p2p: p2p.clone(),
@@ -1851,6 +1862,24 @@ mod tests {
             },
         )?;
         Ok(())
+    }
+
+    /// Private worker lanes and shared RPC gateways are supported configurations, even though
+    /// startup warns about their effect on observer forwarding.
+    #[test]
+    fn prepare_worker_networks_accepts_private_workers_and_shared_gateways() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let first = worker_p2p(&keys, 0)?;
+        [None, first.rpc.clone()].into_iter().try_for_each(|rpc| -> eyre::Result<()> {
+            let second = P2pNode { rpc, ..worker_p2p(&keys, 1)? };
+            let workers = [first.clone(), second];
+            let prepared = prepare_worker_networks(&workers, &[(), ()], &keys, Epoch::MAX, 2)?;
+            assert_eq!(prepared.len(), 2);
+            prepared.iter().zip(workers).for_each(|(prepared, configured)| {
+                assert_eq!(prepared.p2p, configured);
+            });
+            Ok(())
+        })
     }
 
     /// Both missing and surplus event streams are rejected instead of silently truncating `zip`.

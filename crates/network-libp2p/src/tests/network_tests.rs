@@ -4543,8 +4543,8 @@ fn connection_limit_caps_established_connections_per_peer() {
         },
     };
 
-    // exactly the behaviour installed in production
-    let mut limits = super::connection_limits_behaviour();
+    // the behaviour installed in production; the pending inbound budget is not under test here
+    let mut limits = super::connection_limits_behaviour(u32::MAX);
     let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
 
     let peer = PeerId::random();
@@ -4612,5 +4612,316 @@ fn connection_limit_caps_established_connections_per_peer() {
             )
             .is_ok(),
         "after one of the peer's connections closes, a fresh connection from it must be admitted"
+    );
+}
+
+/// Regression: the swarm must bound the number of concurrent pending inbound connections (accepted
+/// handshakes that are not yet established) across all peers. Before the fix
+/// `connection_limits_behaviour` set only the per-peer established ceiling, so unfinished inbound
+/// handshakes had no node-selected budget.
+///
+/// This drives the behaviour the production path installs through every slot transition the swarm
+/// can deliver and asserts that each owned slot is released exactly once:
+/// - the budget denies the first pending connection over it with a pending-incoming
+///   [`libp2p::connection_limits::Exceeded`], and the denied connection takes no slot;
+/// - `FromSwarm::ListenFailure` (refusal, failure, timeout or abort) frees the slot of its id;
+/// - establishment frees the slot;
+/// - a second release of the same id, and a release of an id that holds no slot, free nothing;
+/// - after all ids are released, the full budget is available again.
+///
+/// The swarm-level test `connection_limit_swarm_frees_slot_of_timed_out_pending_connection` shows
+/// that the swarm delivers `FromSwarm::ListenFailure` when a pending handshake times out.
+#[test]
+fn connection_limit_bounds_pending_incoming_connections() {
+    use libp2p::{
+        connection_limits::{Behaviour, Exceeded},
+        swarm::{
+            behaviour::ListenFailure, ConnectionId, FromSwarm, ListenError, NetworkBehaviour as _,
+        },
+    };
+
+    const CAP: u32 = 3;
+    let mut limits = super::connection_limits_behaviour(CAP);
+    let addr = create_multiaddr(None);
+
+    // the swarm asks for a pending inbound slot for connection `id`
+    let pending = |limits: &mut Behaviour, id: usize| {
+        limits.handle_pending_inbound_connection(ConnectionId::new_unchecked(id), &addr, &addr)
+    };
+    // true if connection `id` is admitted as pending
+    let admit = |limits: &mut Behaviour, id: usize| pending(limits, id).is_ok();
+    // true if connection `id` is denied by the pending inbound budget (and not for another reason)
+    let denied_by_budget = |limits: &mut Behaviour, id: usize| {
+        pending(limits, id).err().is_some_and(|denied| {
+            denied.downcast_ref::<Exceeded>().is_some_and(|exceeded| {
+                exceeded.limit() == CAP
+                    && exceeded.to_string().contains("pending incoming connections")
+            })
+        })
+    };
+    // the swarm reports that inbound connection `id` failed before it was established
+    let fail = |limits: &mut Behaviour, id: usize| {
+        limits.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &addr,
+            send_back_addr: &addr,
+            error: &ListenError::Aborted,
+            connection_id: ConnectionId::new_unchecked(id),
+            peer_id: None,
+        }));
+    };
+    // the swarm establishes inbound connection `id`
+    let establish = |limits: &mut Behaviour, id: usize| {
+        limits
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(id),
+                PeerId::random(),
+                &addr,
+                &addr,
+            )
+            .is_ok()
+    };
+
+    // fill the budget: slots {0, 1, 2}
+    assert!([0, 1, 2].into_iter().all(|id| admit(&mut limits, id)), "within budget is admitted");
+    assert!(denied_by_budget(&mut limits, 3), "first connection over the budget is denied");
+
+    // the swarm follows a pending refusal with `ListenFailure`; the denied id owns no slot, so
+    // this frees nothing
+    fail(&mut limits, 3);
+    // a release of an id that was never reserved frees nothing
+    fail(&mut limits, 100);
+    assert!(denied_by_budget(&mut limits, 4), "unowned releases must not free a slot");
+
+    // failure after reservation frees exactly the one slot: {1, 2}
+    fail(&mut limits, 0);
+    assert!(admit(&mut limits, 5), "a failed pending connection frees its slot");
+    assert!(denied_by_budget(&mut limits, 6), "one failure frees exactly one slot");
+
+    // a second release of the same id frees nothing: still {1, 2, 5}
+    fail(&mut limits, 0);
+    assert!(denied_by_budget(&mut limits, 7), "a double release must not free a second slot");
+
+    // establishment frees the slot: {2, 5}
+    assert!(establish(&mut limits, 1), "establishment within the per-peer cap is admitted");
+    assert!(admit(&mut limits, 8), "an established connection frees its pending slot");
+    assert!(denied_by_budget(&mut limits, 9), "one establishment frees exactly one slot");
+
+    // a later established-hook refusal is followed by `ListenFailure` for the same id; the slot was
+    // already freed at establishment, so the failure frees nothing: {2, 5}
+    assert!(establish(&mut limits, 8), "establishment within the per-peer cap is admitted");
+    fail(&mut limits, 8);
+    assert!(admit(&mut limits, 10), "the established connection's slot is free");
+    assert!(denied_by_budget(&mut limits, 11), "establish then fail frees exactly one slot");
+
+    // release every held slot {2, 5, 10}: occupancy returns to baseline and the full budget is free
+    [2, 5, 10].into_iter().for_each(|id| fail(&mut limits, id));
+    assert!(
+        [20, 21, 22].into_iter().all(|id| admit(&mut limits, id)),
+        "after all releases the full budget is available"
+    );
+    assert!(denied_by_budget(&mut limits, 23), "the budget still binds after a full cycle");
+}
+
+/// How long the swarm-level pending slot test waits for one listener event.
+const SWARM_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1)`,
+/// so it holds at most one pending inbound connection, and `connection_timeout` bounds every
+/// handshake.
+fn quic_connection_limits_swarm(
+    connection_timeout: Duration,
+) -> Swarm<connection_limits::Behaviour> {
+    SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| super::connection_limits_behaviour(1))
+        .expect("the behaviour constructor is infallible")
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
+        .with_connection_timeout(connection_timeout)
+        .build()
+}
+
+/// Poll only `listener` until `pick` keeps an event, and return what `pick` returns.
+async fn next_listener_event<T>(
+    listener: &mut Swarm<connection_limits::Behaviour>,
+    mut pick: impl FnMut(SwarmEvent<std::convert::Infallible>) -> Option<T>,
+) -> T {
+    timeout(
+        SWARM_EVENT_TIMEOUT,
+        listener.by_ref().filter_map(|event| futures::future::ready(pick(event))).next(),
+    )
+    .await
+    .expect("the listener emits the expected event in time")
+    .expect("the listener event stream stays open")
+}
+
+/// Keep a listener event that decides a step of the pending slot test: an inbound connection that
+/// becomes pending, an inbound connection that fails or is refused, or an established connection.
+fn decisive_listener_event(
+    event: SwarmEvent<std::convert::Infallible>,
+) -> Option<SwarmEvent<std::convert::Infallible>> {
+    matches!(
+        event,
+        SwarmEvent::IncomingConnection { .. }
+            | SwarmEvent::IncomingConnectionError { .. }
+            | SwarmEvent::ConnectionEstablished { .. }
+    )
+    .then_some(event)
+}
+
+/// Regression at the swarm level: a pending inbound connection that times out must free its slot.
+///
+/// `connection_limit_bounds_pending_incoming_connections` drives the behaviour directly, so it
+/// cannot show that the swarm delivers `FromSwarm::ListenFailure` when a pending handshake times
+/// out. This test runs real QUIC swarms on localhost. The listener has a budget of one pending
+/// inbound connection and a 2 second transport timeout:
+/// - client A sends one QUIC Initial datagram through a UDP relay and then goes silent, so its
+///   handshake never completes and it holds the only slot;
+/// - client B1 is refused by the pending budget while A holds the slot;
+/// - the handshake of A times out, and the swarm reports a transport error, not a refusal;
+/// - client B2 then connects, so the timeout freed the slot.
+#[tokio::test]
+async fn connection_limit_swarm_frees_slot_of_timed_out_pending_connection() {
+    use libp2p::{multiaddr::Protocol, swarm::ListenError};
+    use std::net::Ipv4Addr;
+    use tokio::net::UdpSocket;
+
+    // the QUIC address of a UDP port on localhost
+    let quic_addr = |port: u16| {
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            .with(Protocol::Udp(port))
+            .with(Protocol::QuicV1)
+    };
+
+    // build every swarm before the first slot is taken, so the steps before the timeout run fast
+    let mut listener = quic_connection_limits_swarm(Duration::from_secs(2));
+    let mut client_a = quic_connection_limits_swarm(Duration::from_secs(10));
+    let mut client_b1 = quic_connection_limits_swarm(Duration::from_secs(10));
+    let mut client_b2 = quic_connection_limits_swarm(Duration::from_secs(10));
+    let b2_peer_id = *client_b2.local_peer_id();
+
+    listener.listen_on(quic_addr(0)).expect("listen on localhost");
+    let listen_addr = next_listener_event(&mut listener, |event| {
+        if let SwarmEvent::NewListenAddr { address, .. } = event {
+            Some(address)
+        } else {
+            None
+        }
+    })
+    .await;
+    let listen_port = listen_addr
+        .iter()
+        .find_map(|protocol| if let Protocol::Udp(port) = protocol { Some(port) } else { None })
+        .expect("the listen address has a UDP port");
+
+    // A dials `front`, and the test relays the first datagram of A to the listener from `back`.
+    // Nothing else is relayed and `back` is never read, so the handshake of A never completes, and
+    // later retransmissions of A cannot open a second pending connection after the listener drops
+    // the first. Both sockets stay open to the end of the test.
+    let front = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the front socket");
+    let back = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the back socket");
+    let front_port = front.local_addr().expect("front socket address").port();
+    let back_port = back.local_addr().expect("back socket address").port();
+    client_a.dial(quic_addr(front_port)).expect("client A dials the relay");
+    tokio::spawn(client_a.for_each(|_| futures::future::ready(())));
+    let mut datagram = vec![0u8; 65_535];
+    let (len, _) = timeout(SWARM_EVENT_TIMEOUT, front.recv_from(&mut datagram))
+        .await
+        .expect("client A sends its first datagram in time")
+        .expect("receive the first datagram of client A");
+    back.send_to(&datagram[..len], (Ipv4Addr::LOCALHOST, listen_port))
+        .await
+        .expect("relay the first datagram of client A");
+
+    // step 1: the handshake of A is pending and holds the only slot
+    let a_id = match next_listener_event(&mut listener, decisive_listener_event).await {
+        SwarmEvent::IncomingConnection { connection_id, send_back_addr, .. }
+            if send_back_addr == quic_addr(back_port) =>
+        {
+            Ok(connection_id)
+        }
+        other => Err(other),
+    }
+    .expect("the relayed handshake of client A must be pending");
+
+    // step 2: the pending budget refuses B1 before the remote is authenticated
+    client_b1.dial(listen_addr.clone()).expect("client B1 dials the listener");
+    tokio::spawn(client_b1.for_each(|_| futures::future::ready(())));
+    let event = next_listener_event(&mut listener, decisive_listener_event).await;
+    assert!(
+        matches!(
+            &event,
+            SwarmEvent::IncomingConnectionError {
+                connection_id,
+                error: ListenError::Denied { cause },
+                peer_id: None,
+                ..
+            } if *connection_id != a_id
+                && cause
+                    .downcast_ref::<connection_limits::Exceeded>()
+                    .is_some_and(|exceeded| exceeded.limit() == 1)
+        ),
+        "client B1 must be refused by the pending budget while client A holds the slot, got \
+         {event:?}"
+    );
+
+    // step 3: the handshake of A times out; the swarm reports it, so the slot is freed
+    let event = next_listener_event(&mut listener, decisive_listener_event).await;
+    assert!(
+        matches!(
+            &event,
+            SwarmEvent::IncomingConnectionError {
+                connection_id,
+                error: ListenError::Transport(_),
+                ..
+            } if *connection_id == a_id
+        ),
+        "the pending handshake of client A must time out, got {event:?}"
+    );
+
+    // step 4: B2 takes the freed slot and connects
+    client_b2.dial(listen_addr).expect("client B2 dials the listener");
+    tokio::spawn(client_b2.for_each(|_| futures::future::ready(())));
+    let event = next_listener_event(&mut listener, decisive_listener_event).await;
+    assert!(
+        matches!(&event, SwarmEvent::IncomingConnection { .. }),
+        "the handshake of client B2 must take the freed slot, got {event:?}"
+    );
+    let event = next_listener_event(&mut listener, decisive_listener_event).await;
+    assert!(
+        matches!(&event, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == b2_peer_id),
+        "client B2 must connect through the freed slot, got {event:?}"
+    );
+}
+
+/// The inbound denial warning stays silent for a short burst of refusals and fires once per window
+/// when refusals persist.
+#[test]
+fn inbound_denial_warning_fires_only_when_refusals_persist() {
+    let start = tokio::time::Instant::now();
+    let interval = INBOUND_DENIAL_WARN_INTERVAL;
+    let mut warning = InboundDenialWarning::default();
+
+    assert_eq!(warning.record(start), None, "the first refusal opens a window");
+    assert_eq!(
+        warning.record(start + interval / 2),
+        None,
+        "a refusal inside the window is counted"
+    );
+    assert_eq!(
+        warning.record(start + interval),
+        Some(3),
+        "a refusal at the end of the window fires the warning with the window count"
+    );
+    assert_eq!(
+        warning.record(start + interval),
+        None,
+        "the warning closes the window, so the next refusal opens a new one"
+    );
+    assert_eq!(
+        warning.record(start + interval * 2),
+        Some(2),
+        "refusals that persist for a second window fire the warning again"
     );
 }

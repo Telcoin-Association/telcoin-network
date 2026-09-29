@@ -6,7 +6,7 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::{node_record_key, KadStore},
-    metrics::{PeerManagerMetrics, SwarmMetrics},
+    metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
@@ -162,17 +162,91 @@ enum RecordFreshness {
 /// of connections instead of an unbounded fan-out.
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
-/// Build the [`connection_limits::Behaviour`] that caps concurrent established connections per peer
-/// at [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`].
+/// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
+/// established) for one swarm.
 ///
-/// Only the per-peer bound is set; the other `connection_limits` dimensions (pending / established
-/// totals and per-direction caps) are intentionally left unbounded so this change adds exactly the
-/// missing per-peer ceiling and nothing else. Shared by [`TNBehavior::new`] and its regression test
-/// so both exercise the identical limit.
-fn connection_limits_behaviour() -> connection_limits::Behaviour {
+/// This is a last-resort memory bound, not an admission policy. With QUIC Retry enabled (the
+/// default), the listener validates the source address before accepting a handshake, so occupying
+/// a slot requires a validated round trip. If `retry_unvalidated_incoming` is disabled as an
+/// operator rollback, a forged QUIC Initial datagram can hold a slot for the transport timeout
+/// (about 10 seconds, see [`connection_limits_behaviour`]). A full budget refuses every new inbound
+/// handshake, committee peers included, so the value is sized to bound memory only.
+///
+/// The value does not depend on [`PeerConfig`]. The peer manager has no inbound admission ceiling
+/// for this budget to mirror: it admits every connection that is not banned and disconnects excess
+/// peers that are not important only after establishment, and validators and allowlisted peers have
+/// no count ceiling. A dial that this budget refuses is retried only by `dial_peer_bls` (committee
+/// dials at epoch start, with a bounded backoff that gives up once other peers are connected).
+///
+/// Established connections do not count against this budget, so connected peers are not affected
+/// when it is full, and neither are this node's own outbound dials.
+const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 1024;
+
+/// Minimum time between two operator warnings about inbound connections that a
+/// `connection_limits` bound refuses (see [`InboundDenialWarning`]).
+const INBOUND_DENIAL_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the operator warning about inbound connections that a `connection_limits` bound
+/// refuses.
+///
+/// Every refusal is counted in the `tn_network.inbound_connections_denied_total` metric and logged
+/// at `debug`. The warning fires only when refusals persist: the first refusal opens a window, and
+/// the first refusal at least [`INBOUND_DENIAL_WARN_INTERVAL`] after the window opened fires the
+/// warning with the number of refusals in the window and closes the window.
+#[derive(Debug, Default)]
+struct InboundDenialWarning {
+    /// When the current window opened, or `None` if no refusal was counted since the last warning.
+    window_start: Option<tokio::time::Instant>,
+    /// The number of refusals counted in the current window.
+    denied: u64,
+}
+
+impl InboundDenialWarning {
+    /// Count one refusal at `now`. Return the number of refusals in the window when the warning is
+    /// due, and `None` otherwise.
+    fn record(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        let window_start = *self.window_start.get_or_insert(now);
+        self.denied = self.denied.saturating_add(1);
+        (now.saturating_duration_since(window_start) >= INBOUND_DENIAL_WARN_INTERVAL)
+            .then(|| std::mem::take(self).denied)
+    }
+}
+
+/// Build the [`connection_limits::Behaviour`] for one swarm.
+///
+/// It sets two bounds:
+/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
+///   (issue #1010);
+/// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
+///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
+/// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
+///   the count is below the budget. Otherwise it denies the connection with
+///   [`connection_limits::Exceeded`] and takes no slot. A refusal by an earlier sub-behaviour (for
+///   example the banned-IP check in `peer_manager`) happens before this point, so it takes no slot
+///   either.
+/// - release: `handle_established_inbound_connection` frees the slot before the per-peer check, and
+///   `FromSwarm::ListenFailure` frees it on every other outcome. The swarm emits `ListenFailure`
+///   when a pending hook refuses the connection, when an established hook refuses it, and when the
+///   pending upgrade fails, times out or is aborted. The slots are a set of `ConnectionId`s, so a
+///   second release of the same id and a release of an id that holds no slot free nothing.
+///
+/// Hold time: the libp2p `SwarmBuilder` wraps the transport in a `TransportTimeout` with a 10
+/// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
+/// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
+///
+/// The budget applies to each swarm separately. Each primary and worker network builds its own
+/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+///
+/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
+/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
+/// exercise the identical limits.
+fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER)),
+            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
 
@@ -198,12 +272,13 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer connection ceiling (issue #1010).
+    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
+    /// inbound connections (see [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
-    /// peer is rejected before it is counted here), and before the remaining behaviors so an
-    /// over-cap connection is denied before `req_res` / `gossipsub` / `kademlia` register any
-    /// per-peer state for it.
+    /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
+    /// remaining behaviors so an over-cap connection is denied before `req_res` / `gossipsub` /
+    /// `kademlia` register any per-peer state for it.
     pub(crate) connection_limits: connection_limits::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
@@ -241,7 +316,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour();
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -382,6 +457,9 @@ where
     published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// Rate limit for the warning about inbound connections that a `connection_limits` bound
+    /// refuses.
+    inbound_denial_warning: InboundDenialWarning,
     /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
     /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
     quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
@@ -671,6 +749,7 @@ where
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
+            inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
     }
@@ -908,6 +987,43 @@ where
                     error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
                     return Err(NetworkError::AllListenersClosed);
                 }
+            }
+            // an inbound connection refused by a `connection_limits` bound (the pending inbound
+            // ceiling or the per-peer established ceiling); count it, and log only the configured
+            // limit and the fixed limit description, never peer-supplied data
+            SwarmEvent::IncomingConnectionError {
+                error: libp2p::swarm::ListenError::Denied { cause },
+                peer_id,
+                ..
+            } => {
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        // the pending hook runs before the remote is authenticated, so only a
+                        // refusal at establishment (the per-peer ceiling) carries a peer id
+                        let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
+                            InboundDenial::EstablishedPerPeerLimit
+                        });
+                        self.metrics.record_inbound_denied(&denial);
+                        debug!(
+                            target: "network",
+                            ?denial,
+                            limit = exceeded.limit(),
+                            %exceeded,
+                            "inbound connection refused by connection limit"
+                        );
+                        self.inbound_denial_warning
+                            .record(tokio::time::Instant::now())
+                            .into_iter()
+                            .for_each(|denied| {
+                                warn!(
+                                    target: "network",
+                                    denied,
+                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                    "inbound connections keep being refused by connection limits"
+                                );
+                            });
+                    },
+                );
             }
             // other events handled by peer manager and other behaviors
             _ => {}
