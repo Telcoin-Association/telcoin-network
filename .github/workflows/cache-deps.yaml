@@ -101,6 +101,9 @@ jobs:
       - name: Build both clippy passes
         run: ./etc/ci-lanes.sh clippy
 
+      - name: Check all workspace targets required by buildplan
+        run: cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps -j 2 -- -D warnings
+
   # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs.
   warm-test-cache:
     runs-on: ubuntu-latest
