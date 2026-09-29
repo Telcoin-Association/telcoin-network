@@ -421,6 +421,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if file_end < needed {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
+            // `load_factor` scales the split threshold; a `0` would make `expand_threshold` return
+            // `0` so `expand_buckets` would split forever. And `buckets` must stay
+            // below `2^31` so `(buckets + 1).next_power_of_two()` cannot overflow the
+            // `u32` `modulus`. The file-length check above already bounds `buckets` far
+            // below that, but a CRC-valid-yet-absurd header must be rejected outright
+            // rather than looped/overflowed on.
+            if header.load_factor == 0 || header.buckets > (u32::MAX >> 1) {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
             // Check the salt/pepper to confirm the same (stable) hasher AND placement scheme is in
             // use. This recomputes with `stable_hash` — the exact primitive `hash_to_bucket` uses —
             // so a change to bucket placement (not just the hasher) is detected here and routes the
@@ -920,6 +929,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                         .to_string(),
                 )),
             };
+        // Whether the split bucket was ALREADY dirty (a lazy write this cycle) before the split.
+        // Its `original` bytes are then legitimately `Dirty`, so on rollback it must stay
+        // marked unsynced -- see the rollback below.
+        let split_was_unsynced = self.is_unsynced(split_bucket);
 
         if let Err(e) = self.redistribute_split(split_bucket, split_pos, elements) {
             // Restore the pre-split state: the bucket/modulus counters revert, and rewriting the
@@ -936,6 +949,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if let Some(buf) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
                 buf.copy_from_slice(&original);
             }
+            // `redistribute_split` marked both buckets unsynced when it zeroed them. We've restored
+            // the split bucket's ORIGINAL bytes: if it was NOT dirty before the split (its original
+            // CRC is valid), drop the now-spurious mark so its at-rest-corruption write guard
+            // (`is_unsynced`) is not left disabled until the next sync. If it WAS dirty before (a
+            // lazy write this cycle), keep the mark -- those original bytes are
+            // legitimately `Dirty`. The new bucket (index == the reverted count
+            // `old_buckets`) is beyond the count and inert, so always drop its stale
+            // mark (a later split re-creates and re-marks it, and sync must not
+            // try to CRC a bucket past the count).
+            if !split_was_unsynced {
+                self.unsynced_buckets.remove(&split_bucket);
+            }
+            self.unsynced_buckets.remove(&(old_buckets as u64));
             return Err(e);
         }
         Ok(())

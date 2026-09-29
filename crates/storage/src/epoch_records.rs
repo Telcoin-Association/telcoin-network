@@ -1262,7 +1262,7 @@ impl Inner {
                     let size_res = records.record_size(last_record);
                     if size_res.is_ok() {
                         epoch_idx.truncate_to_index(idx)?;
-                        new_len = last_record + size_res.unwrap_or_default() as u64;
+                        new_len = last_record.saturating_add(size_res.unwrap_or_default() as u64);
                         break;
                     }
                 }

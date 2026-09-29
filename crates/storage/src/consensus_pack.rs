@@ -2561,20 +2561,18 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         create_dir_synced(&base_dir)?;
-        let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
-            .await
-            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        let mut stream_iter =
+            AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
+                .await
+                .map_err(|e| PackError::ReadError(e.to_string()))?;
         // Materialize the imported epoch in the SOURCE stream's format, not the local current
         // format. The bytes written must stay byte-identical to what the peer sent so a peer still
         // on a pre-sentinel build can read this epoch back verbatim when we later serve it (the
         // golden-legacy byte-identity tests pin exactly this). A brand-new local epoch created via
         // `open_append` is stamped the current `PACK_VERSION`; a replicated epoch keeps its origin
-        // version. Reject a source newer than this build understands rather than mis-parsing it
-        // with current-format logic.
+        // version. `AsyncPackIter::open` above already rejected a source newer than `PACK_VERSION`
+        // (its `max_version`), so `import_version <= PACK_VERSION` here.
         let import_version = stream_iter.version();
-        if import_version > PACK_VERSION {
-            return Err(PackError::InvalidVersion(PACK_VERSION, import_version));
-        }
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
@@ -2656,10 +2654,18 @@ impl Inner {
                 };
                 let consensus_number = output.number();
                 if consensus_number > final_consensus_number {
-                    break 'fill Err(PackError::InvalidConsensusNumber(
-                        consensus_number,
-                        final_consensus_number,
-                    ));
+                    // Over the requester-supplied final. `final_consensus_number` is LOCAL state
+                    // (the requester's epoch record), not peer bytes: a peer
+                    // cannot forge valid outputs beyond the epoch's real end
+                    // (that needs committee signatures), so an over-final
+                    // output means the requester's cap is stale (e.g. a not-yet-repaired dummy `0`)
+                    // -- not peer misbehavior. Surface a NON-peer-faulting stop
+                    // (`ConsensusNumberTooHigh` is classified as
+                    // local/ambiguous, so it charges no penalty) so the import fails
+                    // and retries once the record refreshes, instead of banning an honest peer. The
+                    // strict-in-order check below IS peer-derived and keeps its peer-faulting
+                    // error.
+                    break 'fill Err(PackError::ConsensusNumberTooHigh);
                 }
                 // A streamed import builds a fresh pack strictly in order: the next output MUST be
                 // exactly the next consensus number. A repeat or gap is peer misbehavior --
@@ -3943,7 +3949,10 @@ pub enum PackError {
     ReceiveFailed,
     /// Failed to durably persist the pack.
     PersistError(String),
-    /// A consensus number was outside the range this pack accepts (got, limit).
+    /// A consensus number did not match what the pack expected next, in the order `(expected,
+    /// got)` — matching the `Display` impl and every construction site. (An out-of-range
+    /// number the pack simply can't serve uses [`Self::ConsensusNumberTooLow`] /
+    /// [`Self::ConsensusNumberTooHigh`].)
     InvalidConsensusNumber(u64, u64),
     /// The consensus output for this number was already written.
     ConsensusNumberAlreadyAdded,

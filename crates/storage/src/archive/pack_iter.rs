@@ -226,15 +226,22 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    pub async fn open(
+        mut reader: R,
+        uid_idx: u64,
+        max_version: u16,
+    ) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        // Reject an unexpected `appnum` so the (peer-facing) async path rejects foreign formats
-        // instead of parsing them with current-format logic. The pack-format VERSION is not checked
-        // here: the sole caller (`ConsensusPack::stream_import`) enforces `version <= PACK_VERSION`
-        // after open. A future caller of `AsyncPackIter::open` must do the same (or take a
-        // max-version parameter).
+        // This is a peer-facing parser: reject a foreign `appnum`, and reject a pack-format version
+        // newer than the caller understands, UP FRONT — so no caller can forget to bound the
+        // version and end up parsing an unknown future format with current-format logic.
+        // `max_version` is the caller's supported ceiling (e.g. `PACK_VERSION`); pass
+        // `u16::MAX` to accept any version.
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
+        }
+        if header.version() > max_version {
+            return Err(LoadHeaderError::InvalidVersion);
         }
         Ok(AsyncPackIter {
             _val: PhantomData,

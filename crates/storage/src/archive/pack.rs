@@ -1400,7 +1400,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter =
+            AsyncPackIter::<TestRec, _>::open(file, 0, u16::MAX).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1446,7 +1447,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter =
+            AsyncPackIter::<TestRec, _>::open(file, 0, u16::MAX).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),

@@ -475,6 +475,12 @@ impl MmapDataFile {
     /// size, and growing past it requires writing (a non-zero header first), so a larger all-zero
     /// file is not a first-write artifact ("something else is wrong"). Bounding here both excludes
     /// that case and keeps a pathological large all-zero file from bogging down the open.
+    ///
+    /// This assumes `opts.initial_size` is stable across opens of the same file. A file grown to a
+    /// larger *old* initial size and then reopened with a *smaller* one could be mis-classified as
+    /// not-unwritten — but that only downgrades error precision (it still fails safe, as a
+    /// corrupt/unwritten open), and in practice every pack type opens with a fixed per-file
+    /// `initial_size`.
     pub fn is_unwritten(&self) -> bool {
         self.end != 0
             && self.end <= self.opts.initial_size
@@ -786,8 +792,13 @@ impl MmapDataFile {
         Ok(())
     }
 
-    /// Truncate or extend the logical (and physical) file to `len`. Used by the pack heal/truncate
-    /// path; leaves the physical file exactly `len` bytes.
+    /// Truncate the logical (and physical) file to `len`, leaving it exactly `len` bytes. This is a
+    /// SHRINK-only operation (the pack heal/truncate path: position-index alignment heal, torn-tail
+    /// truncate, `set_len(0)` reset), so `len` must be `<= capacity`. To GROW, use
+    /// [`Self::ensure_len`] / [`Self::ensure_capacity`], which preallocate through `grow_to`;
+    /// extending here via the bare `remap` below would leave a sparse (unbacked) region that
+    /// SIGBUSes on the first store when the disk is full — the very footgun the preallocation
+    /// path exists to close.
     pub fn set_len(&mut self, len: u64) -> io::Result<()> {
         if self.read_only {
             return Err(io::Error::new(
@@ -795,6 +806,18 @@ impl MmapDataFile {
                 "file not open for write",
             ));
         }
+        // Match every other write/grow/sync entry point: refuse once poisoned so a prior durability
+        // failure is never papered over by a later truncate.
+        if self.is_poisoned() {
+            return Err(io::Error::other(
+                "data file poisoned by an earlier write/sync failure; refusing to truncate",
+            ));
+        }
+        debug_assert!(
+            len <= self.capacity,
+            "set_len is truncate-only (len {len} > capacity {}); use ensure_len to grow",
+            self.capacity
+        );
         self.remap(len)?;
         self.end = len;
         // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
