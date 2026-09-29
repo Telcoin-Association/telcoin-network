@@ -50,16 +50,6 @@
 # and the new one for anything about the key or hashing, or compare the "Cache Key" a
 # warm prints before and after the bump.
 #
-# STAGE 2: v2.7.7 -> v2.9.2 is such a release. The key gained the CPU architecture and
-# the env hash now covers every installed toolchain, so no v2.9.2 key matches a v2.7.7
-# entry. This file and durable-e2e.yaml (which reads and writes only its own entry) are
-# on v2.9.2; pr.yaml's three cache steps are held on v2.7.7 and restore the entries the
-# last v2.7.7 warm wrote, which this file no longer rewrites. The one remaining step: once
-# a "Warm dependency cache" run on main has succeeded on v2.9.2 and written the
-# v1-rust-*-Linux-x64-* entries, move pr.yaml's three pins to v2.9.2 and remove every
-# passage marked like this one. Do not let the gap run long; .github/ACTIONS.md
-# ("Caches") says what it costs.
-#
 # No `cache-on-failure`: a warm job that died mid-build would freeze a partial target dir
 # under the exact key, permanently. A failed warm saves nothing; fix it and re-dispatch.
 name: Warm dependency cache

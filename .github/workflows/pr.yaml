@@ -32,10 +32,10 @@
 # read either; the upload would only add minutes to the critical path and consume quota
 # that evicts the entries the queue does read. Those are written on main by
 # .github/workflows/cache-deps.yaml, and the cache steps here must stay in lockstep with
-# it: same env block, same steps before the cache step. The one deliberate exception is
-# the rust-cache release: a release that changes the key reaches cache-deps.yaml first,
-# and this file only once main has written entries with it. cache-deps.yaml's header has
-# the details.
+# it: same env block, same steps before the cache step, same rust-cache release. A
+# release that changes the key is the one thing that moves out of step, and only for a
+# while: it reaches cache-deps.yaml first, and this file once main has written entries
+# with it. cache-deps.yaml's header has the details.
 #
 # The fmt, clippy and test lanes below do not spell out their own commands. They call
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
@@ -239,19 +239,8 @@ jobs:
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
       # Restore only; cache-deps.yaml writes the v1-rust entries on main.
-      #
-      # STAGE 2: this pin and the two in `test` and `adiri-test` are held one release
-      # behind cache-deps.yaml, which is on v2.9.2. v2.9.2 computes a different key (it
-      # adds the CPU architecture and hashes every installed toolchain), so neither
-      # release can restore what the other wrote. Had these moved in the same PR as the
-      # writers, that PR's own merge-queue run, and every queue entry after it, would
-      # have missed and built every dependency cold until main had warmed. Meanwhile
-      # these three restore the entries the last v2.7.7 warm wrote. Move all three to
-      # v2.9.2 once a "Warm dependency cache" run on main has succeeded on v2.9.2, and
-      # remove every passage marked like this one (cache-deps.yaml header,
-      # .github/ACTIONS.md "Caches").
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy-cache
@@ -287,7 +276,7 @@ jobs:
 
       # Restore only; see the clippy job.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: test-cache
@@ -334,7 +323,7 @@ jobs:
       # both test lanes into one target dir, where the adiri variants of the shared
       # dependencies coexist with the default ones.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: test-cache
