@@ -238,8 +238,24 @@ impl WorkerTxPool {
     /// Set this epoch's fee in both the pool and its canonical-update fee handle.
     ///
     /// A worker that is removed and later reactivated gets a new accumulator slot. Its
-    /// persistent pool still holds the old container, so update that container too before
-    /// canonical maintenance can overwrite the pool's pending fee with a stale value.
+    /// persistent pool still holds the old container, so update that container as well as the
+    /// pool's pending fee.
+    ///
+    /// Store the container before reading and writing the pool's `BlockInfo`.
+    /// [`Self::update_canonical_state`] samples the container outside reth's pool lock, then
+    /// applies the sampled fee under that lock. Publishing the container first ensures that
+    /// canonical updates sampling it afterwards use the current epoch's fee.
+    ///
+    /// This sequence is not atomic: reth exposes no API to hold the pool lock across
+    /// `block_info()` and `set_block_info()`. A canonical update that already sampled the
+    /// previous fee can still overwrite `pending_basefee` after this method returns. The next
+    /// canonical commit that samples the updated container restores the fee. Conversely, a
+    /// canonical update between our `block_info()` read and `set_block_info()` write can have
+    /// its other `BlockInfo` fields overwritten by our older snapshot.
+    ///
+    /// Reth's `TxPool::set_block_info` calls `update_basefee` to reclassify transactions already
+    /// in the pool: a fee increase demotes transactions that no longer meet it, while a decrease
+    /// can promote transactions from the base-fee subpool. No separate re-sort is needed.
     pub fn set_epoch_base_fee(&self, base_fee: u64) {
         self.2.set_base_fee(base_fee);
         let mut block_info = self.block_info();
