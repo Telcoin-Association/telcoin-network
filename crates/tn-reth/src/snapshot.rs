@@ -79,9 +79,11 @@ use reth_db::{
 use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{
     BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, HashingWriter,
-    HistoryWriter, ProviderError, StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
-    StaticFileSegment, StaticFileWriter, StorageSettingsCache, TrieWriter,
+    HistoryWriter, ProviderError, PruneCheckpointWriter, StageCheckpointWriter, StateWriter,
+    StaticFileProviderFactory, StaticFileSegment, StaticFileWriter, StorageSettingsCache,
+    TrieWriter,
 };
+use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
 use reth_revm::{
     bytecode::Bytecode,
     db::states::{PlainStorageChangeset, StateChangeset},
@@ -502,6 +504,10 @@ impl SnapshotRestorer {
 
     /// Write a header-only chain scaffold up to the snapshot's final block `B`.
     ///
+    /// Account and storage history checkpoints make reth reject state reads below `B`, including
+    /// RPC reads that bypass the restored-state floor on [`RethEnv`]. Window headers remain
+    /// available for block lookups and `BLOCKHASH`.
+    ///
     /// `window` is a contiguous, ascending, parent-hash-linked run of the real headers that end at
     /// `final_state` (block `B`); it must not include genesis, and it must cover the EVM
     /// `BLOCKHASH` lookback: its first block must be at or below
@@ -616,6 +622,22 @@ impl SnapshotRestorer {
         );
 
         let provider_rw = self.reth_env.blockchain_provider().database_provider_rw()?;
+
+        // Reth compares the requested block plus one with the checkpoint plus one. The checkpoint
+        // must therefore be B, not B - 1, to refuse every state read below the restored state.
+        // These availability markers share the scaffold transaction and do not enable pruning.
+        [PruneSegment::AccountHistory, PruneSegment::StorageHistory].into_iter().try_for_each(
+            |segment| {
+                provider_rw.save_prune_checkpoint(
+                    segment,
+                    PruneCheckpoint {
+                        block_number: Some(b),
+                        tx_number: None,
+                        prune_mode: PruneMode::Before(b.saturating_add(1)),
+                    },
+                )
+            },
+        )?;
 
         // drop the genesis alloc so an on-chain-zeroed genesis slot cannot survive the import
         {
@@ -2398,6 +2420,203 @@ mod tests {
         let mut reader = ExecStatePackReader::open(pack_dir)?;
         restorer.import_state(&mut reader)?;
         Ok(restorer)
+    }
+
+    /// RPC's provider refuses missing pre-snapshot state and reconstructs later history without
+    /// losing the real header window, unchanged accounts, or changes written after restore.
+    #[tokio::test]
+    async fn restored_rpc_history_respects_snapshot_floor() -> eyre::Result<()> {
+        use reth_db::{
+            models::{AccountBeforeTx, BlockNumberAddress},
+            tables::{AccountChangeSets, StorageChangeSets},
+        };
+        use reth_provider::{
+            BlockHashReader, BlockNumReader, BlockWriter, HistoryWriter, ProviderError,
+            StageCheckpointWriter, StateProviderFactory, StaticFileProviderFactory,
+            StaticFileSegment, StaticFileWriter,
+        };
+        use reth_stages_types::{StageCheckpoint, StageId};
+        use tn_types::{BlockBody, SealedBlock};
+
+        let unchanged = Address::from([0xaa; 20]);
+        let contract = Address::from([0xcc; 20]);
+        let created_later = Address::from([0xdd; 20]);
+        let absent = Address::from([0xee; 20]);
+        let slot = word(1);
+        let genesis = test_genesis().extend_accounts([
+            (unchanged, GenesisAccount { balance: U256::from(7), ..Default::default() }),
+            (
+                contract,
+                GenesisAccount {
+                    balance: U256::from(42),
+                    code: Some(Bytes::from_static(CODE)),
+                    storage: Some(BTreeMap::from([(slot, word(111))])),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("RPC History Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let state_root = source
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre!("missing genesis header"))?
+            .state_root;
+        let b = 300u64;
+        let first = b.saturating_sub(BLOCKHASH_ANCESTORS - 1);
+        let window: Vec<_> = std::iter::successors(
+            Some(synthetic_header(first, B256::ZERO, state_root)),
+            |header| {
+                (header.number < b)
+                    .then(|| synthetic_header(header.number + 1, header.hash(), state_root))
+            },
+        )
+        .collect();
+        let tip = window.last().ok_or_else(|| eyre!("missing snapshot header"))?;
+        let final_state = BlockNumHash::new(b, tip.hash());
+        let headers: Vec<_> = window.iter().rev().map(|header| header.header().clone()).collect();
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &headers, pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("RPC History Restored");
+        let (reth_config, db) = temp_config_and_db(chain, dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db.clone(), &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut pack = ExecStatePackReader::open(pack_dir.path())?;
+        assert_eq!(restorer.import_state(&mut pack)?, state_root);
+        restorer.finish(final_state)?;
+        let restored =
+            RethEnv::new(&reth_config, &dst_tm, db.clone(), None, GasAccumulator::default())?;
+
+        // Cover B as the latest state before advancing the chain.
+        {
+            let state = restored.blockchain_provider().history_by_block_number(b)?;
+            assert_eq!(state.account_balance(&unchanged)?, Some(U256::from(7)));
+            assert_eq!(state.account_balance(&contract)?, Some(U256::from(42)));
+            assert_eq!(state.storage(contract, slot)?, Some(U256::from(111)));
+            assert_eq!(
+                state.account_code(&contract)?.map(|code| code.original_bytes()),
+                Some(Bytes::from_static(CODE))
+            );
+        }
+
+        // Model persisted execution at k with actual before-values for a changed contract and an
+        // account first created after B. The unchanged account retains only its imported history.
+        let k = b + 3;
+        let provider_rw = restored.blockchain_provider().database_provider_rw()?;
+        let old_account = provider_rw
+            .tx_ref()
+            .get::<PlainAccountState>(contract)?
+            .ok_or_else(|| eyre!("missing restored contract"))?;
+        let new_account = Account { balance: U256::from(99), ..old_account };
+        provider_rw.tx_ref().put::<PlainAccountState>(contract, new_account)?;
+        provider_rw.tx_ref().put::<AccountChangeSets>(
+            k,
+            AccountBeforeTx { address: contract, info: Some(old_account) },
+        )?;
+        provider_rw.tx_ref().put::<PlainAccountState>(created_later, new_account)?;
+        provider_rw
+            .tx_ref()
+            .put::<AccountChangeSets>(k, AccountBeforeTx { address: created_later, info: None })?;
+        provider_rw.insert_account_history_index([(contract, [k]), (created_later, [k])])?;
+        provider_rw
+            .tx_ref()
+            .cursor_dup_write::<PlainStorageState>()?
+            .upsert(contract, &StorageEntry::new(slot, U256::from(222)))?;
+        provider_rw.tx_ref().put::<StorageChangeSets>(
+            BlockNumberAddress((k, contract)),
+            StorageEntry::new(slot, U256::from(111)),
+        )?;
+        provider_rw.insert_storage_history_index([((contract, slot), [k])])?;
+
+        std::iter::successors(
+            Some(synthetic_header(b + 1, final_state.hash, state_root)),
+            |header| {
+                (header.number < k)
+                    .then(|| synthetic_header(header.number + 1, header.hash(), state_root))
+            },
+        )
+        .try_for_each(|header| -> eyre::Result<()> {
+            let block = SealedBlock::from_sealed_parts(header, BlockBody::default())
+                .try_recover()
+                .map_err(|error| eyre!("cannot recover test block: {error:?}"))?;
+            provider_rw.insert_block(&block)?;
+            Ok(())
+        })?;
+        StageId::ALL.into_iter().try_for_each(|stage| {
+            provider_rw.save_stage_checkpoint(stage, StageCheckpoint::new(k))
+        })?;
+        let static_files = provider_rw.static_file_provider();
+        if static_files.get_highest_static_file_block(StaticFileSegment::Receipts).is_some() {
+            let mut receipts = static_files.latest_writer(StaticFileSegment::Receipts)?;
+            (b + 1..=k).try_for_each(|number| receipts.increment_block(number))?;
+        }
+        static_files.commit()?;
+        provider_rw.commit()?;
+        drop(restored);
+        let restored = RethEnv::new(&reth_config, &dst_tm, db, None, GasAccumulator::default())?;
+        let provider = restored.blockchain_provider();
+
+        [0, first, b.saturating_sub(2), b.saturating_sub(1)].into_iter().try_for_each(
+            |number| -> eyre::Result<()> {
+                let state = provider.history_by_block_number(number)?;
+                assert!(
+                    matches!(
+                        state.basic_account(&contract),
+                        Err(ProviderError::StateAtBlockPruned(_))
+                    ),
+                    "account read at {number} must fail"
+                );
+                assert!(
+                    matches!(
+                        state.storage(contract, slot),
+                        Err(ProviderError::StateAtBlockPruned(_))
+                    ),
+                    "storage read at {number} must fail"
+                );
+                assert!(state.account_code(&contract).is_err(), "code read at {number} must fail");
+                assert!(
+                    state.basic_account(&absent).is_err(),
+                    "absent account at {number} must fail"
+                );
+                let hash =
+                    provider.block_hash(number)?.ok_or_else(|| eyre!("missing block hash"))?;
+                assert!(
+                    provider.history_by_block_hash(hash)?.basic_account(&contract).is_err(),
+                    "by-hash read at {number} must fail"
+                );
+                Ok(())
+            },
+        )?;
+        [b, b + 1, b + 2].into_iter().try_for_each(|number| -> eyre::Result<()> {
+            let state = provider.history_by_block_number(number)?;
+            assert_eq!(state.account_balance(&unchanged)?, Some(U256::from(7)));
+            assert_eq!(state.account_balance(&contract)?, Some(U256::from(42)));
+            assert_eq!(state.storage(contract, slot)?, Some(U256::from(111)));
+            assert_eq!(
+                state.account_code(&contract)?.map(|code| code.original_bytes()),
+                Some(Bytes::from_static(CODE))
+            );
+            assert_eq!(state.basic_account(&created_later)?, None);
+            assert_eq!(state.basic_account(&absent)?, None);
+            assert_eq!(state.storage(contract, word(2))?, None);
+            Ok(())
+        })?;
+        let latest = provider.history_by_block_number(k)?;
+        assert_eq!(latest.account_balance(&contract)?, Some(U256::from(99)));
+        assert_eq!(latest.account_balance(&created_later)?, Some(U256::from(99)));
+        assert_eq!(latest.storage(contract, slot)?, Some(U256::from(222)));
+
+        // Historical EVM BLOCKHASH and header lookups retain every real window header.
+        let state = provider.history_by_block_number(b)?;
+        window.iter().try_for_each(|header| -> eyre::Result<()> {
+            assert_eq!(state.block_hash(header.number)?, Some(header.hash()));
+            assert_eq!(provider.block_number(header.hash())?, Some(header.number));
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// A genuine epoch-boundary snapshot passes the entry-readiness precondition end to end: the
