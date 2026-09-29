@@ -48,8 +48,8 @@ use crate::{
         pack_iter::PackIter,
     },
     consensus_pack::{
-        attested_output_survives_past, verify_epoch_meta, PackError, PackRecord, BATCH_DIGEST_NAME,
-        CONSENSUS_DIGEST_NAME, PACK_VERSION,
+        attested_output_survives_past, read_position_entries, verify_epoch_meta, PackError,
+        PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME, PACK_VERSION,
     },
 };
 
@@ -572,9 +572,6 @@ fn cross_check_indexes(
     let Some(dir) = data_path.parent() else { return };
     let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
     let batch_dir = dir.join(BATCH_DIGEST_NAME);
-    if !consensus_dir.is_dir() || !batch_dir.is_dir() {
-        return;
-    }
     let open = |idx_dir: std::path::PathBuf| {
         HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
             idx_dir,
@@ -583,10 +580,29 @@ fn cross_check_indexes(
             true,
         )
     };
-    let (Ok(mut consensus_idx), Ok(mut batch_idx)) = (open(consensus_dir), open(batch_dir)) else {
-        // A read failure is already reported by `scan_index_buckets` as `IndexUnreadable`.
-        return;
+    // A digest-index read failure is already reported by `scan_index_buckets` as
+    // `IndexUnreadable`; only cross-check digest indexes that open.
+    let mut digests = if consensus_dir.is_dir() && batch_dir.is_dir() {
+        match (open(consensus_dir), open(batch_dir)) {
+            (Ok(consensus_idx), Ok(batch_idx)) => Some((consensus_idx, batch_idx)),
+            _ => None,
+        }
+    } else {
+        None
     };
+    let positions = match read_position_entries(data_path, pack.header()) {
+        Ok(positions) => positions,
+        Err(e) => {
+            report
+                .issues
+                .push(PackIssue::IndexUnreadable { detail: format!("position index (idx): {e}") });
+            report.verdict = Verdict::Invalid;
+            None
+        }
+    };
+    if digests.is_none() && positions.is_none() {
+        return;
+    }
     let Ok(mut iter) = pack.raw_iter() else { return };
 
     let mut mismatches = 0usize;
@@ -596,22 +612,31 @@ fn cross_check_indexes(
         mismatches += 1;
         mismatches >= MAX_MISMATCHES
     };
+    // Each consensus header's offset and the offset just past its record, in log order, for the
+    // position-index check below; plus the log's end when the walk reaches it cleanly.
+    let mut headers: Vec<(u64, u64)> = Vec::new();
+    let mut walked_to_end = None;
     loop {
         let pos = iter.logical_position();
         match iter.next() {
-            None => break,
-            // The epoch meta carries no digest-index entry.
+            None => {
+                walked_to_end = Some(pos);
+                break;
+            }
+            // The epoch meta carries no index entry.
             Some(Ok(PackRecord::EpochMeta(_))) => continue,
             Some(Ok(PackRecord::Consensus(header))) => {
+                headers.push((pos, iter.logical_position()));
                 // Each consensus header is unique, so its index entry must point at this exact
                 // record.
-                let stop = match consensus_idx.load(header.digest().into()) {
-                    Ok(off) if off == pos => false,
-                    Ok(off) => push(
+                let stop = match digests.as_mut().map(|(c, _)| c.load(header.digest().into())) {
+                    None => false,
+                    Some(Ok(off)) if off == pos => false,
+                    Some(Ok(off)) => push(
                         report,
                         format!("consensus header at offset {pos} is indexed at {off}"),
                     ),
-                    Err(e) => push(
+                    Some(Err(e)) => push(
                         report,
                         format!("consensus header at offset {pos} does not resolve via the hash index: {e}"),
                     ),
@@ -625,7 +650,7 @@ fn cross_check_indexes(
                 // false miss means a damaged bloom or a corrupt odx chain. (Callers
                 // re-hash a fetched batch, so a wrong-but-present offset is
                 // self-defending and not flagged here.)
-                if let Err(e) = batch_idx.load(batch.digest()) {
+                if let Some(Err(e)) = digests.as_mut().map(|(_, b)| b.load(batch.digest())) {
                     if push(
                         report,
                         format!("batch at offset {pos} does not resolve via the bhash index: {e}"),
@@ -637,6 +662,53 @@ fn cross_check_indexes(
             // A physical framing failure is classified by `classify_physical_corruption`; stop
             // here.
             Some(Err(_)) => break,
+        }
+    }
+    // The position index serves every by-number read (and restart's `read_last_committed` /
+    // `count_leaders` walk it), but opening a pack only checks its LAST entry. Check every entry
+    // against the log so a corrupt one is reported here — and `db repair` rebuilds it — rather than
+    // passing as healthy. Only when the walk reached the end cleanly, so every output is known.
+    if let (Some(entries), Some(end)) = (positions, walked_to_end) {
+        let header_first = pack.version() > 0;
+        if entries.len() != headers.len() {
+            push(
+                report,
+                format!(
+                    "position index holds {} entries but the log holds {} outputs",
+                    entries.len(),
+                    headers.len()
+                ),
+            );
+        }
+        for (i, (entry, &(header_pos, after_header))) in entries.iter().zip(&headers).enumerate() {
+            // Header-first (v1+): an output runs from its header to the next header (or the end of
+            // the log). v0 (batches-first): it ends right after its header.
+            let expected_end = if header_first {
+                headers.get(i + 1).map_or(end, |next| next.0)
+            } else {
+                after_header
+            };
+            let detail = match entry {
+                Err(e) => Some(format!("position entry {i} is unreadable: {e}")),
+                Ok((consensus_header, output_start, output_end))
+                    if *consensus_header != header_pos
+                        || *output_end != expected_end
+                        || (header_first && *output_start != header_pos)
+                        || *output_start > header_pos =>
+                {
+                    Some(format!(
+                        "position entry {i} is ({consensus_header}, {output_start}, {output_end}) \
+                         but the log places that output's header at {header_pos} and its end at \
+                         {expected_end}"
+                    ))
+                }
+                Ok(_) => None,
+            };
+            if let Some(detail) = detail {
+                if push(report, detail) {
+                    break;
+                }
+            }
         }
     }
 }

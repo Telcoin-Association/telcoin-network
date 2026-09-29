@@ -698,9 +698,12 @@ impl MmapDataFile {
         }
         // F_PREALLOCATE reserves blocks from the physical EOF (== `from` while open) but does NOT
         // change the file size, so a `set_len` still follows to grow the logical size. Try a
-        // contiguous reservation first, then allow a fragmented one.
+        // contiguous reservation first, then allow a fragmented one. Both requests carry
+        // `F_ALLOCATEALL` (all or nothing): without it the call may succeed having reserved only
+        // part of the range, and `set_len` would then extend over unreserved blocks — the SIGBUS
+        // this preallocation exists to prevent.
         let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATECONTIG,
+            fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
             fst_posmode: libc::F_PEOFPOSMODE,
             fst_offset: 0,
             fst_length: len as libc::off_t,
@@ -718,6 +721,10 @@ impl MmapDataFile {
                 return self.file.set_len(to);
             }
             return Err(err);
+        }
+        // Belt and braces: never extend past what was actually reserved.
+        if (store.fst_bytesalloc as u64) < len {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         self.file.set_len(to)
     }
@@ -814,11 +821,15 @@ impl MmapDataFile {
                 "data file poisoned by an earlier write/sync failure; refusing to truncate",
             ));
         }
-        debug_assert!(
-            len <= self.capacity,
-            "truncate is shrink-only (len {len} > capacity {}); use ensure_len to grow",
-            self.capacity
-        );
+        if len > self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "truncate is shrink-only (len {len} > capacity {}); use ensure_len to grow",
+                    self.capacity
+                ),
+            ));
+        }
         self.remap(len)?;
         self.end = len;
         // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
@@ -918,17 +929,21 @@ impl MmapDataFile {
     /// picks a durable `MS_SYNC` (which then advances the append watermark) over a fire-and-forget
     /// `MS_ASYNC`.
     fn flush_dirty(&self, sync: bool) -> io::Result<()> {
-        if self.read_only || self.end == 0 {
+        if self.read_only {
             return Ok(());
         }
         // A prior failure poisoned this handle: return `Err` without retrying. A retried `msync`
         // after a writeback error can spuriously return success on Linux (errseq) while the dirty
         // pages were already dropped, so a retry would launder lost data and could advance
-        // `flushed_end` over a tail that never reached disk.
+        // `flushed_end` over a tail that never reached disk. Checked before any early return so a
+        // poisoned handle never reports a successful sync.
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "data file poisoned by an earlier write/sync failure; refusing to sync",
             ));
+        }
+        if self.end == 0 {
+            return Ok(());
         }
         let Backing::Rw(map) = &self.backing else {
             // No live mapping -- a prior `remap` failed and released it. NOTE: `remap` also
@@ -976,13 +991,16 @@ impl MmapDataFile {
     /// region (e.g. the header page) with this so it lands durably last. No-op when read-only,
     /// empty, or unmapped.
     pub fn sync_range(&self, start: u64, len: u64) -> io::Result<()> {
-        if self.read_only || self.end == 0 || len == 0 {
+        if self.read_only {
             return Ok(());
         }
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "data file poisoned by an earlier write/sync failure; refusing to sync",
             ));
+        }
+        if self.end == 0 || len == 0 {
+            return Ok(());
         }
         let Backing::Rw(map) = &self.backing else {
             return Ok(());
@@ -1207,13 +1225,15 @@ impl Drop for MmapDataFile {
             return;
         }
         // Seal with the clean-close sentinel ONLY when this handle was opened clean (or a
-        // successful recovery cleared `opened_unclean` via `mark_consistent`) AND no
-        // write/sync/remap failed this session. Sealing an unclean (still-padded/torn) file
-        // would hide its tail from the next open's recovery — turning a truncatable tail
-        // into a permanent `CorruptPack`; sealing a poisoned file would vouch for a tail of
-        // unknown durability. In either case leave the file exactly as-is (no truncate, no
-        // sentinel) so the next open re-runs recovery/heal.
-        if self.opened_unclean || self.is_poisoned() {
+        // successful recovery cleared `opened_unclean` via `mark_consistent`), no
+        // write/sync/remap failed this session, and the owner is not unwinding from a panic.
+        // Sealing an unclean (still-padded/torn) file would hide its tail from the next open's
+        // recovery — turning a truncatable tail into a permanent `CorruptPack`; sealing a
+        // poisoned file would vouch for a tail of unknown durability; and a panic can strike
+        // mid-write (e.g. between an output's header and its last batch), so sealing then would
+        // certify a half-written record set as complete. In each case leave the file exactly as-is
+        // (no truncate, no sentinel) so the next open re-runs recovery/heal.
+        if self.opened_unclean || self.is_poisoned() || std::thread::panicking() {
             // Best-effort push of any committed data. A poisoned handle's `flush_dirty` returns
             // `Err` without retrying (never launder a failed sync); a merely-unclean handle msyncs
             // its tail so committed bytes are durable even though the file stays unsealed.
@@ -1532,6 +1552,25 @@ mod tests {
             "growth must preallocate real blocks (allocated {allocated} >= physical {physical}); a \
              sparse hole would report far fewer"
         );
+    }
+
+    /// A handle dropped while its thread unwinds from a panic (which can strike mid-write) must
+    /// not seal the file: it is left unsealed so the next open runs recovery instead of trusting a
+    /// possibly half-written tail.
+    #[test]
+    fn drop_during_panic_leaves_file_unsealed() {
+        let tmp = TempDir::with_prefix("mmap_df_panic").expect("temp dir");
+        let path = tmp.path().join("data");
+        let thread_path = path.clone();
+        let joined = std::thread::spawn(move || {
+            let mut df = MmapDataFile::open_with(&thread_path, false, tiny_opts()).expect("open");
+            df.write_all(&pattern(100)).expect("write");
+            panic!("simulated panic mid-write");
+        })
+        .join();
+        assert!(joined.is_err(), "the writer thread must have panicked");
+        let df = MmapDataFile::open_with(&path, true, tiny_opts()).expect("reopen");
+        assert!(df.opened_unclean(), "a file dropped during a panic must not be sealed");
     }
 
     #[test]

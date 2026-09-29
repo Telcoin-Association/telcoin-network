@@ -19,7 +19,7 @@ use crate::{
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        pack::{Pack, PackCompression},
     },
     consensus_pack::PACK_VERSION,
     error_latch::latch_first_error,
@@ -292,6 +292,8 @@ impl CertificatePack {
 
 /// Base filename of the certificate pack's data file (`"cert_data"`) within an epoch directory.
 pub const DATA_NAME: &str = Inner::DATA_NAME;
+/// Directory name of the certificate pack's digest index (`"cert_hash"`) within an epoch directory.
+pub const HASH_NAME: &str = Inner::HASH_NAME;
 
 #[derive(Debug)]
 struct Inner {
@@ -326,7 +328,8 @@ impl Inner {
     }
 
     /// Discard the digest index sidecar directory and reopen a fresh (empty) copy for rebuild. A
-    /// missing directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    /// missing directory is tolerated. Mirrors `ConsensusPack`'s index reset
+    /// (`open_indexes_for_append`).
     fn reset_index(base_dir: &Path, data: &Pack<Certificate>) -> Result<HdxIndex, PackError> {
         match std::fs::remove_dir_all(base_dir.join(Self::HASH_NAME)) {
             Ok(()) => {}
@@ -404,6 +407,7 @@ impl Inner {
         if !read_only {
             let _ = std::fs::create_dir_all(base_dir);
         }
+        let fresh = !base_dir.join(Self::DATA_NAME).exists();
         let mut data: Pack<Certificate> = Pack::open(
             base_dir.join(Self::DATA_NAME),
             0,
@@ -430,9 +434,11 @@ impl Inner {
         };
 
         if !read_only {
-            // On a brand-new file the index's tracked length starts below the pack-header size;
-            // initialise it so the consistency check below does not treat a fresh pack as unclean.
-            if digest_idx.data_file_length() < DATA_HEADER_BYTES as u64 {
+            // On a brand-new pack, initialise the index's tracked length so the consistency check
+            // below does not treat it as unclean. Gate on the data file being new, not on the
+            // marker's value: a failed save deliberately leaves the marker at `0` to force a
+            // rebuild on the next open, and that must not be mistaken for a fresh index.
+            if fresh {
                 digest_idx.set_data_file_length(data.file_len());
             }
             // If the pack or index was not cleanly sealed, or the index's tracked data length

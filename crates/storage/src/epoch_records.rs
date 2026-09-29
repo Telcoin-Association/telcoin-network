@@ -483,6 +483,41 @@ impl EpochRecordDb {
         })
     }
 
+    /// Read-only prediction of what [`Self::open`] would do with the epoch-record logs under
+    /// `path`, for `db repair`'s dry run. Nothing is written.
+    ///
+    /// - `Ok(None)`: both logs are cleanly sealed and decode to the end.
+    /// - `Ok(Some(what))`: `open` would heal them (an unclean log's torn tail truncated, indexes
+    ///   rebuilt), or would create them.
+    /// - `Err`: what `open` would refuse with: a sealed log that does not decode, or acked records
+    ///   damaged behind a tear.
+    pub fn assess<P: AsRef<Path>>(path: P) -> Result<Option<String>, EpochDbError> {
+        let dir = path.as_ref();
+        if !dir.join(Inner::RECORDS_NAME).exists() {
+            return Ok(Some("no epoch-record logs yet; they would be created".to_string()));
+        }
+        let records = Pack::<EpochRecord>::open(
+            dir.join(Inner::RECORDS_NAME),
+            Inner::PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )?;
+        let mut heals = Vec::new();
+        Inner::assess_log(&records, &dir.join(Inner::RECORD_HASH_NAME), "records", &mut heals)?;
+        if dir.join(Inner::CERTS_NAME).exists() {
+            let certs = Pack::<EpochCertificate>::open(
+                dir.join(Inner::CERTS_NAME),
+                Inner::CERT_PACK_EPOCH,
+                true,
+                PackCompression::ZStd,
+                EPOCH_PACK_VERSION,
+            )?;
+            Inner::assess_log(&certs, &dir.join(Inner::CERT_HASH_NAME), "certs", &mut heals)?;
+        }
+        Ok((!heals.is_empty()).then(|| heals.join("; ")))
+    }
+
     /// Read every [`EpochRecord`] from a bare records pack file (e.g. an `epoch_records` file
     /// copied out of an export bundle) without needing its sidecar indexes. Records come back
     /// in stored (epoch-ascending) order.
@@ -1349,7 +1384,7 @@ impl Inner {
     /// Discard the position + digest index sidecar directories and reopen fresh (empty) copies.
     /// Used when an index fails to open or was left inconsistent by an unclean shutdown; the
     /// caller then rebuilds them from the data logs (see [`Self::rebuild_indexes`]). A missing
-    /// directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    /// directory is tolerated. Mirrors `ConsensusPack`'s index reset (`open_indexes_for_append`).
     fn reset_indexes(
         base_dir: &Path,
         records: &Pack<EpochRecord>,
@@ -1380,13 +1415,30 @@ impl Inner {
         record_digests: &mut HdxIndex,
         cert_digests: &mut HdxIndex,
     ) -> Result<(), EpochDbError> {
+        let consistent_end = Self::replay_records(records, epoch_idx, record_digests)?;
+        Self::drop_torn_tail(records, consistent_end, "records")?;
+        record_digests.set_data_file_length(records.file_len());
+
+        let consistent_end = Self::replay_certs(certs, cert_digests)?;
+        Self::drop_torn_tail(certs, consistent_end, "certs")?;
+        cert_digests.set_data_file_length(certs.file_len());
+        Ok(())
+    }
+
+    /// Replay the records log into the position + record-digest indexes, returning the end of its
+    /// last fully-decoded record.
+    ///
+    /// The position index is keyed by the record's OWN epoch (relative to the first record's
+    /// epoch), not by a running ordinal: an interrupted-then-retried save can leave a duplicate
+    /// record in the log, and an ordinal counter would give it a second slot and shift every later
+    /// epoch. A duplicate epoch (slot below the next expected) is skipped first-write-wins, and a
+    /// gap (slot above it) is corruption in a contiguous chain and fails closed.
+    fn replay_records(
+        records: &Pack<EpochRecord>,
+        epoch_idx: &mut PositionIndex<u64>,
+        record_digests: &mut HdxIndex,
+    ) -> Result<u64, EpochDbError> {
         let mut iter = records.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
-        // Key the position index by the record's OWN epoch (relative to the first record's epoch),
-        // not by a running ordinal: an interrupted-then-retried save can leave a duplicate record
-        // in the log, and an ordinal counter would give it a second slot and shift every
-        // later epoch. `expected_slot` stays a dense sequential append; a duplicate epoch
-        // (slot below it) is skipped first-write-wins, and a gap (slot above it) is
-        // corruption in a contiguous chain and fails closed.
         let mut expected_slot = 0u64;
         let mut base_epoch: Option<Epoch> = None;
         let mut consistent_end = iter.logical_position();
@@ -1401,8 +1453,7 @@ impl Inner {
                         .ok_or(EpochDbError::CorruptDb)?; // non-ascending epoch → corrupt
                     if slot < expected_slot {
                         // Duplicate of an already-indexed epoch: first-write-wins, skip it. It
-                        // stays as dead bytes in the log but no index
-                        // references it.
+                        // stays as dead bytes in the log but no index references it.
                         consistent_end = iter.logical_position();
                         continue;
                     }
@@ -1422,32 +1473,16 @@ impl Inner {
                 Some(Err(_)) => break,
             }
         }
-        // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
-        drop(iter);
-        if consistent_end < records.file_len() {
-            if !records.opened_unclean() {
-                // A cleanly-sealed log is complete by construction: a decode failure part-way
-                // through is at-rest corruption, not an unacked torn tail — fail
-                // closed instead of silently dropping acked records (INV4).
-                return Err(EpochDbError::CorruptLog(format!(
-                    "sealed records log stops decoding at offset {consistent_end} of {}; at-rest \
-                     corruption, re-sync required",
-                    records.file_len()
-                )));
-            }
-            // Unclean shutdown: the trailing record was interrupted mid-write (unacked). Drop it
-            // (INV1), but log it so a truncation is never invisible.
-            warn!(
-                target: "epoch-db",
-                log = "records",
-                offset = consistent_end,
-                bytes_dropped = records.file_len() - consistent_end,
-                "truncating torn tail of unclean log"
-            );
-            records.rewind_to(consistent_end);
-        }
-        record_digests.set_data_file_length(records.file_len());
+        Ok(consistent_end)
+    }
 
+    /// Replay the certs log into the cert-digest index (keyed by `EpochCertificate::epoch_hash`,
+    /// the digest of the record it certifies), returning the end of its last fully-decoded
+    /// certificate.
+    fn replay_certs(
+        certs: &Pack<EpochCertificate>,
+        cert_digests: &mut HdxIndex,
+    ) -> Result<u64, EpochDbError> {
         let mut iter = certs.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         let mut consistent_end = iter.logical_position();
         loop {
@@ -1463,27 +1498,149 @@ impl Inner {
                 Some(Err(_)) => break,
             }
         }
-        drop(iter);
-        if consistent_end < certs.file_len() {
-            if !certs.opened_unclean() {
-                // See the records log above: a sealed cert log is complete, so a decode failure is
-                // at-rest corruption, not a torn tail — fail closed rather than silently truncate.
-                return Err(EpochDbError::CorruptLog(format!(
-                    "sealed certs log stops decoding at offset {consistent_end} of {}; at-rest \
-                     corruption, re-sync required",
-                    certs.file_len()
-                )));
-            }
-            warn!(
-                target: "epoch-db",
-                log = "certs",
-                offset = consistent_end,
-                bytes_dropped = certs.file_len() - consistent_end,
-                "truncating torn tail of unclean log"
-            );
-            certs.rewind_to(consistent_end);
+        Ok(consistent_end)
+    }
+
+    /// Roll `log` back to `consistent_end` (the end of its last fully-decoded record) when a replay
+    /// stopped short of its end. A cleanly-sealed log is complete by construction, so there a
+    /// decode failure is at-rest corruption, not an unacked torn tail: fail closed instead of
+    /// silently dropping acked records (INV4). In an unclean log the trailing record was
+    /// interrupted mid-write (unacked): drop it (INV1), logged so a truncation is never invisible.
+    fn drop_torn_tail<V>(
+        log: &mut Pack<V>,
+        consistent_end: u64,
+        name: &str,
+    ) -> Result<(), EpochDbError>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        if consistent_end >= log.file_len() {
+            return Ok(());
         }
-        cert_digests.set_data_file_length(certs.file_len());
+        if !log.opened_unclean() {
+            return Err(EpochDbError::CorruptLog(format!(
+                "sealed {name} log stops decoding at offset {consistent_end} of {}; at-rest \
+                 corruption, re-sync required",
+                log.file_len()
+            )));
+        }
+        warn!(
+            target: "epoch-db",
+            log = name,
+            offset = consistent_end,
+            bytes_dropped = log.file_len() - consistent_end,
+            "truncating torn tail of unclean log"
+        );
+        log.rewind_to(consistent_end);
+        Ok(())
+    }
+
+    /// One log's part of [`EpochRecordDb::assess`]: decode it read-only and classify it the way
+    /// [`Self::open_append`] would. `digest_dir` is its digest index, whose on-disk data length
+    /// attests the acked end. A heal is described into `heals`; a refusal is returned.
+    fn assess_log<V>(
+        log: &Pack<V>,
+        digest_dir: &Path,
+        name: &str,
+        heals: &mut Vec<String>,
+    ) -> Result<(), EpochDbError>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let mut iter = log.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+        let mut consistent_end = iter.logical_position();
+        let decodes_to_end = loop {
+            match iter.next() {
+                None => break true,
+                Some(Ok(_)) => consistent_end = iter.logical_position(),
+                Some(Err(_)) => break false,
+            }
+        };
+        drop(iter);
+        if !log.opened_unclean() {
+            if decodes_to_end {
+                return Ok(());
+            }
+            return Err(EpochDbError::CorruptLog(format!(
+                "sealed {name} log stops decoding at offset {consistent_end} of {}; at-rest \
+                 corruption, re-sync required",
+                log.file_len()
+            )));
+        }
+        if let Ok(index) = HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            digest_dir,
+            log.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        ) {
+            Self::refuse_dropping_acked(log, index.data_file_length(), name)?;
+        }
+        heals.push(format!(
+            "{name} log was not cleanly closed: {} byte(s) past offset {consistent_end} would be \
+             truncated and its indexes rebuilt",
+            log.file_len().saturating_sub(consistent_end)
+        ));
+        Ok(())
+    }
+
+    /// Does `log` hold a record that still decodes AFTER its first undecodable one and ends within
+    /// `attested_end`, the durably synced (acked) data length? Such a record was acked after the
+    /// damaged one, so the damage is at-rest corruption of acked data, not an unacked torn tail.
+    /// (Mirrors `ConsensusPack`'s `output_after_tear`.) Records past `attested_end` were never
+    /// acked (a crash can persist unacked records out of order) and do not count, and a
+    /// physically truncated tail has nothing after it, so both still heal (INV1). CRC-failed
+    /// frames are skipped while the walk makes forward progress.
+    fn acked_record_after_tear<V>(log: &Pack<V>, attested_end: u64) -> bool
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let Ok(mut iter) = log.raw_iter() else { return false };
+        let mut torn = false;
+        let mut last_pos = iter.logical_position();
+        loop {
+            match iter.next() {
+                None => return false,
+                Some(Ok(_)) => {
+                    let end = iter.logical_position();
+                    if torn && end <= attested_end {
+                        return true;
+                    }
+                    last_pos = end;
+                }
+                Some(Err(_)) => {
+                    torn = true;
+                    let pos = iter.logical_position();
+                    if pos <= last_pos {
+                        return false; // no forward progress: nothing readable after
+                    }
+                    last_pos = pos;
+                }
+            }
+        }
+    }
+
+    /// Before an unclean log's indexes are discarded and rebuilt, refuse (`CorruptLog`, nothing
+    /// changed) if the rebuild would drop an ACKED record: one that still decodes after a tear
+    /// and ends within `attested_end`, the old digest index's on-disk `data_file_length`. That
+    /// marker reaches disk only through an ordered sync after the data it covers. Checking
+    /// BEFORE the indexes are reset keeps the refusal repeatable: a retry still sees the same
+    /// attested end. A `0` (invalidated) or header-only marker attests nothing.
+    fn refuse_dropping_acked<V>(
+        log: &Pack<V>,
+        attested_end: u64,
+        name: &str,
+    ) -> Result<(), EpochDbError>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        if attested_end > DATA_HEADER_BYTES as u64
+            && Self::acked_record_after_tear(log, attested_end)
+        {
+            return Err(EpochDbError::CorruptLog(format!(
+                "{name} log has an undecodable record followed by acked records (durably synced \
+                 through offset {attested_end}); at-rest corruption of acked data, re-sync required"
+            )));
+        }
         Ok(())
     }
 
@@ -1549,6 +1706,16 @@ impl Inner {
             || record_digests.data_file_length() != records.file_len()
             || cert_digests.data_file_length() != certs.file_len();
         if must_rebuild {
+            // Validate before mutating: a recovery that fails must leave the state a retry needs,
+            // so check the replay against the attested ends while the old indexes still exist.
+            if !index_open_failed {
+                Self::refuse_dropping_acked(
+                    &records,
+                    record_digests.data_file_length(),
+                    "records",
+                )?;
+                Self::refuse_dropping_acked(&certs, cert_digests.data_file_length(), "certs")?;
+            }
             let (idx, rdig, cdig) = Self::reset_indexes(base_dir, &records, &certs)?;
             epoch_idx = idx;
             record_digests = rdig;
@@ -2822,6 +2989,11 @@ mod test {
             std::mem::forget(inner);
         }
 
+        // The read-only assessment predicts a heal (not a refusal) for a plain unclean exit.
+        assert!(
+            matches!(EpochRecordDb::assess(temp_dir.path()), Ok(Some(_))),
+            "an unclean exit must assess as healable"
+        );
         // Reopen: unclean (no sentinel) -> indexes rebuilt from the logs; everything reachable.
         let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after unclean exit");
         for (record, cert) in &pairs {
@@ -2844,6 +3016,54 @@ mod test {
             pairs.len(),
             "re-save must not append a duplicate cert (got {} certs)",
             certs.len()
+        );
+    }
+
+    /// After an unclean shutdown the logs are rebuilt from their WAL, dropping only an unacked torn
+    /// tail. At-rest damage to an ACKED record (below the digest index's durably synced data
+    /// length) must instead fail the open with `CorruptLog`, not silently truncate every later
+    /// certified record. The refusal must change nothing, so a second open refuses too.
+    #[test]
+    fn test_unclean_rebuild_refuses_to_drop_acked_records() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_acked_tear").expect("temp dir");
+        let damaged_at = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..8u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save(record, cert).expect("save");
+            }
+            inner.persist().expect("persist");
+            let pos = inner.epoch_idx.load(2).expect("epoch 2 offset");
+            std::mem::forget(inner); // crash: durable logs, no clean-close sentinel
+            pos
+        };
+
+        // Flip a payload byte of epoch 2's (persisted, acked) record.
+        let path = dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        bytes[damaged_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write records log");
+
+        // `db repair`'s dry run predicts the refusal.
+        assert!(
+            matches!(EpochRecordDb::assess(dir.path()), Err(EpochDbError::CorruptLog(_))),
+            "the read-only assessment must predict the refusal"
+        );
+        for attempt in 1..=2 {
+            let err = EpochRecordDb::open(dir.path())
+                .err()
+                .unwrap_or_else(|| panic!("open {attempt} must refuse to drop acked records"));
+            assert!(matches!(err, EpochDbError::CorruptLog(_)), "open {attempt}: {err:?}");
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read records log"),
+            bytes,
+            "a refused recovery must leave the log untouched"
         );
     }
 

@@ -99,8 +99,8 @@ type is `Send + Sync + Clone`.
 |------|------|-----------|
 | `open_append` | writable, creates | header-only ⇒ write+fsync meta; then recover |
 | `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes) |
-| `open_static` | read-only (sealed past epoch) | rebuilds derived indexes from the WAL if the data log is clean; **refuses** (→ `db repair`) if the data log itself is torn |
-| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then per-output |
+| `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; **refuses** (→ `db repair`) if the data log itself is torn |
+| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2) |
 
 ### 5. Recovery model — four invariants
 
@@ -119,7 +119,9 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   repaired**. The meta is fsync'd the instant it is written, so a torn meta is not a normal state.
 - **INV3 — indexes are rebuildable.** Any index anomaly (corrupt/torn/missing index, stale marker,
   unclean seal) triggers a full rebuild from the WAL — including a corrupt index *header* that won't
-  open (the writable doors wipe+recreate the index dirs). Index problems never brick a writable open.
+  open (the writable doors discard and recreate the index that failed, then rebuild all of them; an
+  environmental open failure such as fd/memory exhaustion is surfaced instead). Index problems never
+  brick a writable open.
 - **INV4 — the data file is the source of truth.** Recovery replays the data log to rebuild indexes;
   indexes never override the data file, no durably-acked data is dropped, and reads/serving are
   bounded to the logical length.
@@ -133,7 +135,9 @@ epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption
 
 Ties the epochs together under `<datadir>/consensus-db/epochs/`. It opens the **current** epoch
 writable (`open_append_exists`, which runs recovery on restart), serves **sealed past** epochs
-read-only via `open_static` (behind a small `recent_packs` cache), imports a full epoch from peers with
+read-only via `open_static` (behind a small `recent_packs` cache; a legacy or index-damaged sealed epoch
+is healed read-side first — built off the async runtime and outside `pack_install` into a side directory,
+data log opened read-only, then swapped in by rename), imports a full epoch from peers with
 `stream_import` (into an `import-{N}/` dir, then an install-locked rename to `epoch-{N}/`; a read-only
 partial-prefix pack instead stages under `staging-{N}/` and is never renamed), and drives epoch handoff.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
@@ -215,30 +219,35 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    network addresses) cannot be reconstructed from the epoch alone, so recovery is a re-sync, not a
    local rewrite. `db repair` reports these as `Unrepairable`.
 7. **Indexes are wiped and rebuilt from the data log, never preserved.** `recover_pack`/
-   `reset_all_indexes`/`db repair` intentionally `remove_dir_all` the derived `idx/`,`hash/`,`bhash/`
+   `open_indexes_for_append`/`db repair` intentionally `remove_dir_all` the derived `idx/`,`hash/`,`bhash/`
    directories and replay the WAL. This never touches the `data` log or the chain-data dirs
    (`db`, `static_files`, `consensus-db`); rebuilding a derived index is not destructive.
 8. **`msync` as the default write barrier (not `fsync`).** Durability comes from fsync'ing every size
    extension plus the msync default for data within an fsync'd size (see the module docs, incl. the
    macOS `F_FULLFSYNC` caveat). This is a deliberate performance choice, not a durability bug.
 9. **Single-writer datadir, enforced by a `telcoin.pid` lockfile.** The node is the sole writer of
-   its datadir and records its PID in `<datadir>/telcoin.pid` on startup, removing it on clean
-   shutdown (`tn_config::pid_lock`). Node startup and the at-rest writers (`db repair`, `db migrate`)
-   refuse to run when that file holds a *live* PID, and reclaim it when the PID is stale (a previous
-   crash). This guard is TN-owned; it does not depend on the execution engine's own database lock.
-   `db repair`/`db migrate` also take the lock for their run, so a node cannot start mid-repair. They
-   stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming `--epoch N`
-   explicitly — including the current/latest epoch — is intentionally allowed under the same
-   node-stopped contract. The lock is advisory: PID reuse and separate PID namespaces sharing a volume
-   (e.g. two containers) are accepted false-negative edges, so the loud banner and the stop-the-node
+   its datadir and holds an exclusive advisory `flock` on `<datadir>/telcoin.pid` for its lifetime,
+   recording its PID in it for operators (`tn_config::pid_lock`). Node startup and the at-rest writers
+   (`db repair`, `db migrate`) refuse to run while another process holds the lock; the kernel releases
+   it when the holder exits or crashes, so a crash never blocks a restart. The file is never unlinked
+   (a release just clears the PID) — deleting it would let two processes lock two different inodes at
+   the same path. This guard is TN-owned; it does not depend on the execution engine's own database
+   lock. `db repair`/`db migrate` also take the lock for their run, so a node cannot start mid-repair.
+   They stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming
+   `--epoch N` explicitly — including the current/latest epoch — is intentionally allowed under the
+   same node-stopped contract. The lock is advisory (only TN processes take it) and network
+   filesystems with unreliable `flock` are out of scope, so the loud banner and the stop-the-node
    contract remain. Do not flag "`--epoch` bypasses the current-epoch skip".
-10. **`db repair` / `open_append_exists` mutate pack files on open; `open_static` may rebuild derived
-    indexes.** Truncating a torn tail and rebuilding derived indexes from the authoritative log is the
-    *point* (`db repair`/`open_append_exists`, gated by the node-stopped contract above). A read-only
-    `open_static` additionally rebuilds the derived indexes from the WAL when the data log is clean but
-    an index will not open (e.g. after an index-format change), serialized under `pack_install`; it
-    never rewrites the data log — a torn/unclean data log stays terminal (→ `db repair`). Not an
-    "unsafe destructive operation".
+10. **`db repair` / `open_append_exists` mutate pack files on open; a past-epoch read may rebuild
+    derived indexes or migrate a legacy pack.** Truncating a torn tail and rebuilding derived indexes
+    from the authoritative log is the *point* (`db repair`/`open_append_exists`, gated by the
+    node-stopped contract above). `ConsensusChain::get_static` additionally heals a sealed past epoch
+    whose data log is clean but whose index will not open (e.g. after an index-format change), and
+    migrates a legacy (pre-v2) epoch whose indexes use the old key placement. The heal is built on a
+    blocking thread into a side directory (the data log opened read-only), serialized per epoch and
+    backed off after a failure; only the final renames run under `pack_install`. It never writes the
+    data log of a v2 pack — a torn/unclean data log stays terminal (→ `db repair`). Not an "unsafe
+    destructive operation".
 11. **Fail-fast `expect`/`panic` in DB-open startup paths** (e.g. `open_db`). A datadir that cannot be
     opened is unrecoverable and must abort node start; this is intentional fail-fast, not a library
     `unwrap`.
@@ -295,15 +304,18 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     output; the stale entries then point at or past the trimmed `end` and are never returned, because
     every read is bounded to the logical length (`pos >= file_len()` ⇒ miss). Deliberate, to keep the
     rebuild a single forward pass. Not a stale-index bug.
-22. **`stream_import` replaces the entire `epoch-{N}/` directory as a unit.** A full-epoch import
+22. **`stream_import` replaces the entire `epoch-{N}/` directory as a unit, and always writes v2.** A
+    full-epoch import (whatever the source stream's version: v2 is the only writable format)
     installs a fresh `epoch-{N}/` by atomic rename, replacing whatever was there (any prior per-epoch
     cert files included). The per-epoch `CertificatePack` (`cert_data`/`cert_hash/`) is produced only
     by the live current-epoch (CVV) writer, not carried in the import — an imported past epoch simply
     has none, which is fine (past cert packs are not read). Not a cross-component ownership bug.
 23. **Epoch install does synchronous filesystem work (rename, `remove_dir_all`) under `pack_install`.**
     These are fast local metadata operations, and holding `pack_install` across them scopes the
-    install so a concurrent `get_static` can never observe a half-installed epoch directory.
-    Pre-existing and deliberate; not an async-blocking or lock-scope defect.
+    install so a concurrent `get_static` waits out a half-installed epoch directory (it retries under
+    the lock). Long work — a read-side index rebuild or legacy migration — is built outside the lock
+    on a blocking thread; only its install renames take `pack_install`. Deliberate; not an
+    async-blocking or lock-scope defect.
 24. **`db repair` heals the shared EpochRecordDb but does not separately assess each per-epoch
     CertificatePack.** `db repair --force` opens `EpochRecordDb` (torn-tail truncate + WAL index
     rebuild) and repairs each epoch's consensus pack. The per-epoch `CertificatePack` is opened

@@ -166,7 +166,11 @@ impl DbValidateArgs {
                         prefix_invalid = report.verdict == Verdict::Invalid;
                         print!("{report}");
                     }
-                    Err(e) => eprintln!("bounded validation of the intact prefix failed: {e}"),
+                    Err(e) => {
+                        // The prefix could not be checked, so it cannot be reported healthy.
+                        eprintln!("bounded validation of the intact prefix failed: {e}");
+                        prefix_invalid = true;
+                    }
                 }
             }
             // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
@@ -411,7 +415,22 @@ impl DbRepairArgs {
                     }
                 }
             } else {
-                println!("epoch-records DB: would be opened and auto-healed with `--force`");
+                // Predict, read-only, what the `--force` open would do, so a records DB that would
+                // refuse to open (and so block node startup) is reported now, not only on apply.
+                match EpochRecordDb::assess(epochs_dir.as_path()) {
+                    Ok(None) => println!("epoch-records DB: OK"),
+                    Ok(Some(what)) => {
+                        actionable += 1;
+                        println!("epoch-records DB: would heal with `--force` — {what}");
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        println!(
+                            "epoch-records DB: would fail to open ({e}); re-sync/restore may be \
+                             required"
+                        );
+                    }
+                }
             }
 
             let verb = if self.force { "repaired" } else { "to repair (dry run)" };
@@ -1396,13 +1415,19 @@ mod tests {
             "the held lock's PID must be left intact"
         );
 
-        // Once the node releases the lock (drop removes the file), a dry-run repair takes the lock
+        // Once the node releases the lock (drop clears the file), a dry-run repair takes the lock
         // and releases it on exit.
         drop(held);
         super::DbRepairArgs { epoch: None, force: false }
             .execute(datadir.clone())
             .expect("dry-run repair should succeed on an empty epochs dir with no lock held");
-        assert!(!datadir.node_pid_path().exists(), "repair must release its lock on exit");
+        // Released: the lockfile stays (it is never unlinked) but no longer records a holder, and a
+        // fresh acquire succeeds.
+        assert!(
+            fs::read_to_string(datadir.node_pid_path()).unwrap().is_empty(),
+            "repair must clear its PID on exit"
+        );
+        drop(PidLock::acquire(&datadir).expect("repair must release its lock on exit"));
     }
 
     #[test]

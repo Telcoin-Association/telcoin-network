@@ -16,9 +16,11 @@
 //! - The file *contents* (our PID) are **advisory only**: they exist so an operator (and our own
 //!   error message) can see which process holds the directory. Whoever wins the lock overwrites any
 //!   stale content.
-//! - The returned guard removes the file on drop — but only if it still holds *our* PID, so a lock
-//!   that another process has legitimately reclaimed is never deleted out from under it. (The
-//!   advisory lock itself is released regardless, when the guard's handle is dropped.)
+//! - The file itself is never deleted. Dropping the guard clears the PID it recorded (through the
+//!   still-locked handle) and closes the handle, which releases the lock. Deleting the file would
+//!   break the exclusion: a process that opened the old file just before the unlink could lock that
+//!   orphaned inode after we release it, while the next starter creates and locks a new file at the
+//!   same path — two holders. An empty file is simply "no holder recorded".
 //!
 //! The guard is advisory. Separate PID namespaces sharing a volume (e.g. two containers on the same
 //! mount) still coordinate correctly through `flock` on the shared file, but network filesystems
@@ -27,22 +29,21 @@
 use crate::TelcoinDirs;
 use eyre::{bail, eyre};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::PathBuf,
 };
 use tracing::warn;
 
-/// A held datadir lock. Dropping the guard releases the advisory lock and removes the file if we
-/// still own it.
+/// A held datadir lock. Dropping the guard clears the recorded PID and releases the advisory lock;
+/// the file stays in place.
 #[derive(Debug)]
 #[must_use = "the lock is released as soon as the guard is dropped"]
 pub struct PidLock {
     path: PathBuf,
-    pid: u32,
     /// The locked handle, held for the guard's lifetime. Dropping it closes the fd, which releases
-    /// the advisory `flock`. Never read directly — it exists purely to keep the lock held (RAII).
-    _file: File,
+    /// the advisory `flock`.
+    file: File,
 }
 
 impl PidLock {
@@ -88,7 +89,7 @@ impl PidLock {
         write_pid(&mut file, me)
             .map_err(|e| eyre!("failed to write PID lockfile {}: {e}", path.display()))?;
 
-        Ok(Self { path, pid: me, _file: file })
+        Ok(Self { path, file })
     }
 
     /// The lockfile path this guard owns.
@@ -99,22 +100,15 @@ impl PidLock {
 
 impl Drop for PidLock {
     fn drop(&mut self) {
-        // The advisory lock is released when `_file` is dropped (fd close) regardless of the below.
-        // Best-effort file cleanup: only remove it if it still holds our PID. If another process
-        // reclaimed the lock after we released it, its PID is in the file now and must be left
-        // alone.
-        let still_ours = fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|c| c.trim().parse::<u32>().ok())
-            .is_some_and(|p| p == self.pid);
-        if still_ours {
-            if let Err(e) = fs::remove_file(&self.path) {
-                warn!(
-                    target: "tn::pid_lock",
-                    path = %self.path.display(),
-                    "failed to remove PID lockfile on shutdown: {e}"
-                );
-            }
+        // Clear our PID through the handle we still hold locked (nobody else can hold the lock, so
+        // this cannot clobber another holder's record); the lock itself is released when `file` is
+        // dropped (fd close) right after. Never unlink the file — see the module docs.
+        if let Err(e) = self.file.set_len(0) {
+            warn!(
+                target: "tn::pid_lock",
+                path = %self.path.display(),
+                "failed to clear the PID lockfile on shutdown: {e}"
+            );
         }
     }
 }
@@ -159,10 +153,11 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
-    fn acquire_writes_our_pid_and_drop_removes_it() {
+    fn acquire_writes_our_pid_and_drop_clears_it() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("telcoin.pid");
         {
@@ -171,7 +166,8 @@ mod tests {
             let recorded = fs::read_to_string(&path).unwrap();
             assert_eq!(recorded.trim().parse::<u32>().unwrap(), std::process::id());
         }
-        assert!(!path.exists(), "drop must remove the lockfile we own");
+        assert!(path.exists(), "drop must never unlink the lockfile");
+        assert!(fs::read_to_string(&path).unwrap().is_empty(), "drop must clear the recorded PID");
     }
 
     #[test]
@@ -195,7 +191,7 @@ mod tests {
     fn released_lock_is_reclaimable() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("telcoin.pid");
-        // Dropping the guard releases the advisory lock and removes the file...
+        // Dropping the guard releases the advisory lock...
         drop(PidLock::acquire_at(path.clone()).unwrap());
         // ...so a fresh acquire succeeds.
         let _lock = PidLock::acquire_at(path.clone()).unwrap();
@@ -228,17 +224,22 @@ mod tests {
         );
     }
 
+    /// The race an unlink-on-drop would open: a starter opens the lockfile while the holder is
+    /// shutting down and locks it once the holder releases. Because the file is never unlinked,
+    /// that starter holds the lock on THE lockfile, so a third acquire is refused rather than
+    /// creating and locking a fresh file at the same path (two holders).
+    #[cfg(unix)]
     #[test]
-    fn drop_does_not_remove_a_reclaimed_lock() {
+    fn a_racing_opener_holds_the_one_lockfile() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("telcoin.pid");
-        let lock = PidLock::acquire_at(path.clone()).unwrap();
-        // Simulate another owner reclaiming the file after we (conceptually) exited. `flock` is
-        // advisory, so a plain write still succeeds; on drop we must see the foreign PID and leave
-        // the file alone.
-        fs::write(&path, "1").unwrap();
-        drop(lock);
-        assert!(path.exists(), "drop must not delete a lock reclaimed by another owner");
-        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "1");
+        let holder = PidLock::acquire_at(path.clone()).unwrap();
+        // The racer opened the path before the holder released it.
+        let racer = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert!(!try_lock_exclusive(&racer).unwrap(), "the holder still has the lock");
+        drop(holder);
+        assert!(try_lock_exclusive(&racer).unwrap(), "the racer takes the released lock");
+        let err = PidLock::acquire_at(path.clone()).unwrap_err();
+        assert!(err.to_string().contains("another telcoin process"), "got: {err}");
     }
 }

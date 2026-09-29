@@ -1237,7 +1237,8 @@ where
     ///
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
-    /// [`send_sync_epoch_pack_over_stream`] under a total timeout. A send failure is
+    /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
+    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
     /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
     /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
     /// during the item-6 rollout, like the legacy responder).

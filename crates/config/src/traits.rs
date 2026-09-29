@@ -145,9 +145,10 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
 
     /// Return the path to the node PID lockfile at the datadir root.
     ///
-    /// The running node writes its PID here on startup and removes it on clean shutdown. Node
-    /// startup and `db repair` refuse to proceed when this file holds a *live* PID, and reclaim it
-    /// when the PID is stale. See [`crate::pid_lock`].
+    /// The running node holds an exclusive advisory lock (`flock`) on this file for its lifetime
+    /// and records its PID in it for operators. Node startup and the at-rest writers (`db repair`,
+    /// `db migrate`) refuse to proceed while another process holds the lock; the kernel releases
+    /// it when the holder exits or crashes. See [`crate::pid_lock`].
     fn node_pid_path(&self) -> PathBuf;
 
     /// Return the path to consensus's epoch storage for a specific epoch.

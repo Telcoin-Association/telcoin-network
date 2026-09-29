@@ -55,9 +55,9 @@ where
         // Refuse to run a second writer against this datadir. Take the PID lockfile before any
         // heavy init and hold the guard for the node's whole lifetime: it is released on
         // the clean-shutdown path below, and on any early error or panic via the guard's
-        // `Drop`. A stale lock left by a previous crash (its PID no longer alive) is
-        // reclaimed automatically. This is TN-owned and does not depend on the execution
-        // engine's own database lock.
+        // `Drop`. A crashed holder never blocks a restart: the kernel releases its `flock` when
+        // the process exits. This is TN-owned and does not depend on the execution engine's own
+        // database lock.
         let _pid_lock = match tn_config::PidLock::acquire(&tn_datadir) {
             Ok(lock) => lock,
             Err(err) => {
