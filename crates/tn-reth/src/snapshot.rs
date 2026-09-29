@@ -2539,7 +2539,8 @@ mod tests {
             },
         )
         .try_for_each(|header| -> eyre::Result<()> {
-            let block = SealedBlock::from_sealed_parts(header, BlockBody::default())
+            let sealed: SealedBlock = SealedBlock::from_sealed_parts(header, BlockBody::default());
+            let block = sealed
                 .try_recover()
                 .map_err(|error| eyre!("cannot recover test block: {error:?}"))?;
             provider_rw.insert_block(&block)?;
