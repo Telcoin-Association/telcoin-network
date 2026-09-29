@@ -13,7 +13,7 @@ use crate::{
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     serde::RoaringBitmapSerde,
     Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderBuilder, HeaderDigest,
-    Round, TimestampSec, VotingPower,
+    Round, TimestampMs, TimestampSec, VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -394,6 +394,16 @@ impl Certificate {
     pub fn update_header_created_at_for_test(&mut self, created_at: TimestampSec) {
         let header_builder = HeaderBuilder::from_header(&self.header);
         self.header = header_builder.created_at(created_at).build();
+    }
+
+    /// Update the headers created_at, in milliseconds, for a test- not for production code.
+    ///
+    /// Sets both the whole seconds and the sub-second part through the header builder, so the
+    /// sub-second part is kept only when [`crate::forks::subsecond_timestamp_active`] holds for
+    /// the header's epoch: update the epoch first when a test changes both.
+    pub fn update_header_created_at_ms_for_test(&mut self, created_at: TimestampMs) {
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.created_at_ms(created_at).build();
     }
 }
 

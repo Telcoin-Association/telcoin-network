@@ -62,6 +62,20 @@ impl NodeTypesWithDB for TelcoinNode {
 /// `ValidationApi`, building an auth/engine server, or constructing the engine tree handler).
 /// Returning a descriptive error surfaces that regression at the first call, rather than letting a
 /// skipped check or a fabricated empty block propagate undetected. See issue #1048.
+///
+/// Delegating these methods to reth's `EthBeaconConsensus` is not an option either, because valid
+/// TN blocks routinely fail its post-merge header checks:
+///
+/// - `validate_header_against_parent` requires `timestamp > parent.timestamp`. The EVM `timestamp`
+///   has one-second granularity and TN executes one EVM block per batch of a consensus output, all
+///   carrying the output's `timestamp` (blocks of outputs committed within the same second tie as
+///   well), so equal parent and child timestamps are normal.
+/// - `validate_header` requires a zero `difficulty`, but TN packs the worker id and batch index
+///   into it.
+/// - It requires a zero `nonce`, but TN encodes the leader's epoch and round in it.
+/// - It requires the empty ommers root, but TN stores the batch digest in `ommers_hash`.
+///
+/// `TNExecution` therefore keeps its own fail-loud errors instead of delegating.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TNExecution;
 

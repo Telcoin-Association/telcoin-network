@@ -134,18 +134,23 @@ positional check those turn up is the pack reader above.
   hand-written `Serialize` impl writes (`primary/output.rs:84-92`), and the matching `Deserialize`
   hardcodes `close_epoch: false` (`:102`). **A deserialized `ConsensusOutput` always reports
   `false`**, as that type documents in place (`output.rs:79-83`).
-- every producer derives it locally as `output.committed_at() >= self.epoch_boundary`
-  (`crates/node/src/manager/node/run_epoch.rs:622` and `:681-690`; also `close_epoch.rs:196`,
-  `:225`, and `start_epoch.rs:100`). `committed_at()` is certified; `epoch_boundary` is the epoch
-  start plus `epoch_info.epochDuration`, read from the `ConsensusRegistry` at epoch entry
-  (`run_epoch.rs:150`).
+- every producer derives it locally as `output.reaches_epoch_boundary(self.epoch_boundary)`
+  (`crates/node/src/manager/node/run_epoch.rs:567` and `:626`; also `close_epoch.rs:240`,
+  `:269`, and `start_epoch.rs:100`). That delegates to `CommittedSubDag::reaches_epoch_boundary`
+  (`tn-types` `primary/output.rs:846`), the single boundary predicate. The boundary stays in
+  whole seconds while commits carry milliseconds: the predicate compares the commit's whole
+  seconds (`commit_timestamp()`, the floor of `commit_timestamp_ms()`) against the boundary with
+  `>=`, which holds exactly when the commit time is at least `1000 * epoch_boundary` ms, so the
+  sub-second part never moves the decision. The commit timestamp is certified; `epoch_boundary` is
+  the epoch start plus `epoch_info.epochDuration`, read from the `ConsensusRegistry` at epoch entry
+  (`run_epoch.rs:143`).
 
 So an unauthenticated boolean, computed from one certified value and one chain read, gates the
 epoch-close system calls. Both inputs are chain-consistent, so honest nodes agree: this is a
 **reproducibility** guarantee, not an authentication one. It is load-bearing in both directions —
 one of those system calls records every worker's next-epoch base fee, and the following epoch's
 entry read consumes exactly that write and halts the node when it is unreadable
-(`read_base_fees_for_entered_epoch`, `run_epoch.rs:213`). A wrong `close_epoch` does not
+(`read_base_fees_for_entered_epoch`, defined in `node.rs:594`, called from `run_epoch.rs:206`). A wrong `close_epoch` does not
 produce a bad block; it strands the next epoch.
 
 Determinism rules for block production live in `crates/tn-reth/README.md` ("Determinism rules"). The
