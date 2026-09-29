@@ -237,7 +237,7 @@ where
     ) -> Option<ConsensusHeaderDigest> {
         // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
-            let result = if output.committed_at() >= self.epoch_boundary {
+            let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                 // stash the boundary header for the caller's close-and-write sequence
                 self.last_consensus_header = Some(output.clone().into());
                 Some(output.consensus_header_hash())
@@ -266,7 +266,7 @@ where
             for number in (last_sent + 1)..=latest_db {
                 match self.consensus_chain.get_consensus_output_current(number).await {
                     Ok(output) => {
-                        let result = if output.committed_at() >= self.epoch_boundary {
+                        let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                             // stash the boundary header for the caller's close-and-write sequence
                             self.last_consensus_header = Some(output.clone().into());
                             Some(output.consensus_header_hash())

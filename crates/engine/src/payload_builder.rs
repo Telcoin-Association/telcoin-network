@@ -10,8 +10,8 @@ use tn_reth::{
     RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, EngineUpdate,
-    Hash as _, SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, ConsensusOutput,
+    EngineUpdate, Hash as _, SealedHeader, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span, warn};
@@ -171,6 +171,7 @@ pub fn execute_consensus_output(
             mix_hash,
             0, // Use worker 0 becuase we have to provide on.
         );
+        report_timestamp_clamp(&payload, &output);
 
         debug!(target: "engine", "executing empty batch payload");
 
@@ -253,6 +254,7 @@ pub fn execute_consensus_output(
                 mix_hash,
                 batch.worker_id,
             );
+            report_timestamp_clamp(&payload, &output);
 
             // execute the payload and update the current canonical header
             let executed = execute_payload(
@@ -357,6 +359,30 @@ fn execute_payload(
     executed_blocks.push(next_canonical_block);
 
     Ok(canonical_header)
+}
+
+/// Count and log a payload whose EVM `timestamp` is not the output's `committed_at`.
+///
+/// Once the sub-second timestamp fork is active for the leader's epoch, `TNPayload::new` clamps
+/// the timestamp up to the parent block's so the EVM chain cannot move backwards. Consensus is
+/// meant to produce non-decreasing commit times on its own, so a clamp that changes the value
+/// means consensus let commit time go backwards. The block stays deterministic (every node
+/// applies the same clamp to the same inputs); the counter and warning keep the underlying
+/// consensus bug visible.
+fn report_timestamp_clamp(payload: &TNPayload, output: &ConsensusOutput) {
+    let committed_at = output.committed_at();
+    if payload.timestamp == committed_at {
+        return;
+    }
+
+    crate::metrics::ENGINE_METRICS.evm_timestamp_clamped_total.increment(1);
+    warn!(
+        target: "engine",
+        block = payload.parent_header.number.saturating_add(1),
+        committed_at,
+        timestamp = payload.timestamp,
+        "evm timestamp clamped to parent"
+    );
 }
 
 /// Total attempts (first try + retries) for the durable output persist in

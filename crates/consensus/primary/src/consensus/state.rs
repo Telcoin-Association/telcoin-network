@@ -15,11 +15,12 @@ use tn_storage::{
     CertificateStore,
 };
 use tn_types::{
-    now, AuthorityIdentifier, Certificate, CommittedSubDag, Committee, ConsensusChainReader,
-    Database, Epoch, EpochSeedChainError, EpochSeedChainValue, Hash as _, HeaderDigest, Noticer,
-    Round, TaskManager, TnReceiver, TnSender,
+    forks::subsecond_timestamp_active, AuthorityIdentifier, Certificate, CommittedSubDag,
+    Committee, ConsensusChainReader, Database, Epoch, EpochSeedChainError, EpochSeedChainValue,
+    Hash as _, HeaderDigest, Noticer, Round, TaskManager, TimestampMs, TimestampSec, TnReceiver,
+    TnSender,
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -51,6 +52,14 @@ pub struct ConsensusState {
     /// value of a sub-dag that was actually committed. Any other provenance would re-root the
     /// chain and fork execution permanently.
     seed_chain: EpochSeedChainValue,
+    /// The lower bound for the epoch's first commit timestamp (see
+    /// [`CommittedSubDag::new_with_commit_floor`]).
+    ///
+    /// Private and never mutated: it is resolved once from committed history when consensus
+    /// starts the epoch (see [`Consensus::spawn`]). It is kept apart from
+    /// [`Self::last_committed_sub_dag`] because that field also seeds reputation scores, so it
+    /// cannot stand in for a commit from the previous epoch.
+    epoch_commit_floor: Option<TimestampMs>,
 }
 
 impl ConsensusState {
@@ -67,6 +76,7 @@ impl ConsensusState {
             dag: Default::default(),
             last_committed_sub_dag: None,
             seed_chain: EpochSeedChainValue::genesis_placeholder(),
+            epoch_commit_floor: None,
         }
     }
 
@@ -84,12 +94,22 @@ impl ConsensusState {
         self.seed_chain = seed_chain;
     }
 
+    /// The lower bound for the epoch's first commit timestamp, in milliseconds.
+    ///
+    /// `None` when no floor applies (see [`resolve_epoch_commit_floor`]). Once the epoch has
+    /// committed, [`CommittedSubDag::new_with_commit_floor`] clamps against the previous sub-dag
+    /// and ignores this value.
+    pub fn epoch_commit_floor(&self) -> Option<TimestampMs> {
+        self.epoch_commit_floor
+    }
+
     fn new_from_store<DB: Database>(
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
         latest_sub_dag: Option<CommittedSubDag>,
         seed_chain: EpochSeedChainValue,
+        epoch_commit_floor: Option<TimestampMs>,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -110,6 +130,7 @@ impl ConsensusState {
             last_committed_sub_dag,
             dag,
             seed_chain,
+            epoch_commit_floor,
         }
     }
 
@@ -343,6 +364,52 @@ pub(crate) fn resolve_seed_chain_anchor(
     }
 }
 
+/// Resolve the lower bound for the first commit timestamp of the epoch being started.
+///
+/// With sub-second timestamps active, [`CommittedSubDag::new_with_commit_floor`] raises the
+/// epoch's first commit to at least 1 ms past this floor, so EVM time does not run backwards
+/// across the epoch seam. The inputs are the fork schedule and committed history, never local
+/// clocks or node progress, so every honest node resolves the same floor for the same epoch:
+///
+/// - `gate_active` false: `None`. Pre-fork commit timestamps are whole seconds and never take a
+///   floor.
+/// - `latest_sub_dag` present: `None`. The epoch has already committed, so this is a restart within
+///   the epoch and the next commit clamps against the recovered sub-dag instead.
+/// - `epoch` 0: `None`. The first epoch follows genesis rather than a closed epoch.
+/// - Otherwise: `prior_epoch_close` in milliseconds (whole seconds, sub-second part 0). A config
+///   without a close yields `None` and logs a warning; the node's epoch startup supplies one for
+///   every epoch after 0, and only test configs omit it.
+///
+/// Commit milliseconds therefore strictly increase within an epoch but not across the seam. The
+/// closing EVM block keeps only whole seconds, so this floor drops the sub-second part of the
+/// previous epoch's last commit: the epoch's first commit lands after the closing second but can
+/// sit up to 998 ms below that last commit. The whole seconds, and so the EVM timestamp, never
+/// decrease.
+///
+/// `gate_active` is [`subsecond_timestamp_active`] for `epoch`. The caller evaluates it so every
+/// branch stays testable under any build's fork schedule.
+fn resolve_epoch_commit_floor(
+    gate_active: bool,
+    latest_sub_dag: Option<&CommittedSubDag>,
+    epoch: Epoch,
+    prior_epoch_close: Option<TimestampSec>,
+) -> Option<TimestampMs> {
+    if !gate_active || latest_sub_dag.is_some() || epoch == 0 {
+        return None;
+    }
+    let Some(close_secs) = prior_epoch_close else {
+        // production epoch startup always supplies the close, so reaching this is a tripwire for
+        // a config built without one
+        warn!(
+            target: "tn::consensus",
+            epoch,
+            "sub-second gate active but no prior epoch close was supplied; first commit of the epoch is not floored against the previous epoch"
+        );
+        return None;
+    };
+    Some(TimestampMs::from_parts(close_secs, 0))
+}
+
 impl<DB: Database> Consensus<DB> {
     pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
@@ -393,6 +460,13 @@ impl<DB: Database> Consensus<DB> {
             current_epoch,
         )?;
 
+        let epoch_commit_floor = resolve_epoch_commit_floor(
+            subsecond_timestamp_active(current_epoch),
+            latest_sub_dag.as_ref(),
+            current_epoch,
+            consensus_config.prior_epoch_close(),
+        );
+
         // restore local dag
         let state = ConsensusState::new_from_store(
             last_committed_round,
@@ -400,6 +474,7 @@ impl<DB: Database> Consensus<DB> {
             recovered_last_committed,
             latest_sub_dag,
             seed_chain,
+            epoch_commit_floor,
             consensus_config.node_storage().clone(),
         );
 
@@ -524,12 +599,12 @@ impl<DB: Database> Consensus<DB> {
                     }
                 }
 
-                // Metric: subdag committed + commit latency (second granularity - the
-                // leader timestamp is in whole seconds; flags pathological commits)
+                // metric: subdag committed + commit latency in fractional seconds. pre-fork
+                // leaders carry whole seconds only, so their latency reads up to 1s high
                 let metrics = self.consensus_bus.app().metrics();
                 metrics.subdags_committed_total.increment(1);
-                let leader_created = *committed_sub_dag.leader().created_at();
-                metrics.commit_latency_seconds.record(now().saturating_sub(leader_created) as f64);
+                let commit_latency = committed_sub_dag.leader().created_at_ms().elapsed();
+                metrics.commit_latency_seconds.record(commit_latency.as_secs_f64());
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
@@ -573,5 +648,48 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod epoch_commit_floor_tests {
+    use super::resolve_epoch_commit_floor;
+    use tn_types::{CommittedSubDag, Epoch, TimestampMs, TimestampSec};
+
+    /// The previous epoch's closing EVM block timestamp used by every case.
+    const CLOSE_SECS: TimestampSec = 1_700_000_000;
+
+    /// Any epoch after 0.
+    const EPOCH: Epoch = 3;
+
+    #[test]
+    fn epoch_commit_floor_is_none_when_gate_inactive() {
+        assert_eq!(resolve_epoch_commit_floor(false, None, EPOCH, Some(CLOSE_SECS)), None);
+    }
+
+    #[test]
+    fn epoch_commit_floor_is_none_after_in_epoch_commit() {
+        let latest_sub_dag = CommittedSubDag::default();
+        assert_eq!(
+            resolve_epoch_commit_floor(true, Some(&latest_sub_dag), EPOCH, Some(CLOSE_SECS)),
+            None
+        );
+    }
+
+    #[test]
+    fn epoch_commit_floor_is_none_for_epoch_zero() {
+        assert_eq!(resolve_epoch_commit_floor(true, None, 0, Some(CLOSE_SECS)), None);
+    }
+
+    #[test]
+    fn epoch_commit_floor_is_prior_epoch_close_in_whole_seconds() {
+        let floor = resolve_epoch_commit_floor(true, None, EPOCH, Some(CLOSE_SECS));
+        assert_eq!(floor, Some(TimestampMs::from_parts(CLOSE_SECS, 0)));
+        assert_eq!(floor.map(TimestampMs::as_millis), Some(CLOSE_SECS * 1000));
+    }
+
+    #[test]
+    fn epoch_commit_floor_is_none_without_prior_epoch_close() {
+        assert_eq!(resolve_epoch_commit_floor(true, None, EPOCH, None), None);
     }
 }
