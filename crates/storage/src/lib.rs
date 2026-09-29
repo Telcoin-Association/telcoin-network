@@ -458,6 +458,7 @@ mod test {
         assert_eq!(None, iter.next());
     }
 
+    /// Check clearing empty, populated, and single-entry tables.
     pub(crate) fn test_clear<DB: Database>(db: DB) {
         // Test clear of empty map
         let _ = db.clear_table::<TestTable>();
@@ -479,6 +480,8 @@ mod test {
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear with one item
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
+        // Wait for the layered database to persist the row and remove its in-memory copy.
+        db.sync_persist();
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
         db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
