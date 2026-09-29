@@ -1191,7 +1191,12 @@ impl PrimaryNetworkHandle {
                 PackError::MissingBatch
                 | PackError::NotConsensus
                 | PackError::NotBatch
-                | PackError::NotEpoch => Some(Penalty::Medium),
+                | PackError::NotEpoch
+                // A record out of place or not what the header declares, or one that frames but
+                // fails its CRC/decode: the sender's bytes are bad. Medium, not Severe: an honest
+                // peer serving a pack damaged at rest on its own disk produces the same bytes.
+                | PackError::UnexpectedRecord(_)
+                | PackError::UndecodableRecord(_) => Some(Penalty::Medium),
                 PackError::InvalidConsensusChain
                 | PackError::ExtraBatches
                 | PackError::MissingBatches
@@ -1266,6 +1271,8 @@ impl PrimaryNetworkHandle {
                 | PackError::NotConsensus
                 | PackError::NotBatch
                 | PackError::NotEpoch
+                | PackError::UnexpectedRecord(_)
+                | PackError::UndecodableRecord(_)
                 | PackError::InvalidConsensusChain
                 | PackError::ExtraBatches
                 | PackError::MissingBatches

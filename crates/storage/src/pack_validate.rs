@@ -48,8 +48,9 @@ use crate::{
         pack_iter::PackIter,
     },
     consensus_pack::{
-        attested_output_survives_past, read_position_entries, verify_epoch_meta, PackError,
-        PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME, PACK_VERSION,
+        attested_output_survives_past, pack_unsealed_version, read_position_entries,
+        verify_epoch_meta, wal_consistent_end, PackError, PackRecord, BATCH_DIGEST_NAME,
+        CONSENSUS_DIGEST_NAME, PACK_VERSION,
     },
 };
 
@@ -711,6 +712,39 @@ fn cross_check_indexes(
             }
         }
     }
+}
+
+/// For a pack that was not cleanly closed, the end of its last COMPLETE output when the only thing
+/// past it is an incomplete output, i.e. the unacked in-flight write recovery truncates (INV1).
+///
+/// A torn tail usually shows up as a framing failure ([`classify_physical_corruption`] reports
+/// `TornTrailingTail`). But a crash can also leave an output whose header and some of its batches
+/// are complete records with nothing (no padding) after them: every record frames, so the
+/// physical walk is clean, while a full validation reports the output's missing batches as a data
+/// defect. That is not corruption. This returns `Some(end)` when the WAL replay stops short of the
+/// file end (and recovery would accept stopping there) and everything before `end` validates
+/// without a data-logical issue; `None` for a sealed pack, a log that replays to its end, a replay
+/// recovery would refuse, or a defect inside the complete prefix.
+pub fn incomplete_trailing_output(data_path: &Path, epoch: Epoch) -> Option<u64> {
+    let (_, unclean) = pack_unsealed_version(data_path, epoch)?;
+    if !unclean {
+        return None;
+    }
+    let data_len = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    )
+    .ok()?
+    .file_len();
+    let end = wal_consistent_end(data_path, epoch).ok()?;
+    if end >= data_len {
+        return None;
+    }
+    let prefix = validate_pack_file_bounded(data_path, epoch, None, Some(end)).ok()?;
+    (!prefix.has_data_logical_issue()).then_some(end)
 }
 
 /// Walk a pack's `data` stream read-only and classify the first physical (record-framing) failure,

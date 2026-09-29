@@ -2658,6 +2658,20 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(peer_caused(cc(PackError::MissingBatch)));
     assert!(peer_caused(ConsensusChainError::EmptyImport));
     assert!(peer_caused(ConsensusChainError::InvalidImport));
+    // A record out of place / not what the header declares, or one that fails its CRC/decode, is
+    // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
+    // same).
+    assert!(peer_caused(cc(PackError::UnexpectedRecord("batch before header".into()))));
+    assert!(peer_caused(cc(PackError::UndecodableRecord("crc failed".into()))));
+    for error in [
+        PackError::UnexpectedRecord("batch before header".into()),
+        PackError::UndecodableRecord("crc failed".into()),
+    ] {
+        assert!(matches!(
+            PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(error)),
+            Some(Penalty::Medium)
+        ));
+    }
     // Severity check: the whitelisted OOM/wedge faults are Severe.
     assert!(matches!(
         PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(PackError::BatchTooLarge {
@@ -2672,6 +2686,8 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
     assert!(!peer_caused(cc(PackError::Append("io".into()))));
     assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // A transport failure or timeout says nothing about the sender's bytes.
+    assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
     assert!(!peer_caused(ConsensusChainError::EpochMismatch));
     assert!(!peer_caused(ConsensusChainError::PrevCommitteeEpochMismatch));
     assert!(!peer_caused(ConsensusChainError::CrcError));

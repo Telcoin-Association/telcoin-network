@@ -695,15 +695,27 @@ impl ConsensusPack {
                 // WouldRepair and the apply wipe+rebuild the indexes only to end
                 // Unrepairable (dry run must predict apply).
                 if validation.as_ref().is_some_and(|r| r.has_data_logical_issue()) {
-                    return Ok(EpochRepair::Unrepairable(format!(
-                        "epoch {epoch}: the data log has a logical defect a rebuild cannot fix (a \
-                         chain break, non-sequential number, missing/extra/unsorted batches, an empty \
-                         sub-dag, or an epoch-meta mismatch); the indexes are not the problem. Re-sync \
-                         the epoch from peers.\n{}",
-                        validation.as_ref().map(ToString::to_string).unwrap_or_default()
-                    )));
+                    // ...except an unclean pack whose only "defect" is an incomplete trailing
+                    // output ending on a record boundary: the unacked in-flight write recovery
+                    // truncates (INV1), not corruption.
+                    match crate::pack_validate::incomplete_trailing_output(&data_file, epoch) {
+                        Some(end) => format!(
+                            "truncate the incomplete trailing output past offset {end} and rebuild \
+                             indexes"
+                        ),
+                        None => {
+                            return Ok(EpochRepair::Unrepairable(format!(
+                                "epoch {epoch}: the data log has a logical defect a rebuild cannot \
+                                 fix (a chain break, non-sequential number, missing/extra/unsorted \
+                                 batches, an empty sub-dag, or an epoch-meta mismatch); the indexes \
+                                 are not the problem. Re-sync the epoch from peers.\n{}",
+                                validation.as_ref().map(ToString::to_string).unwrap_or_default()
+                            )));
+                        }
+                    }
+                } else {
+                    "rebuild indexes and re-seal".to_string()
                 }
-                "rebuild indexes and re-seal".to_string()
             }
             Some(c) => match &c.kind {
                 CorruptionKind::TornTrailingTail => {
@@ -3053,10 +3065,12 @@ impl Inner {
             None => return Ok(None),
             Some(PackRecord::Consensus(header)) => *header,
             Some(PackRecord::EpochMeta(_)) => {
-                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+                return Err(PackError::UnexpectedRecord(
+                    "unexpected epoch meta data found".to_string(),
+                ))
             }
             Some(PackRecord::Batch(_)) => {
-                return Err(PackError::BatchLoad("unexpected batch found".to_string()))
+                return Err(PackError::UnexpectedRecord("unexpected batch found".to_string()))
             }
         };
         check_header_expectation(&header, expectation)?;
@@ -3069,19 +3083,19 @@ impl Inner {
                 Some(PackRecord::Batch(batch)) => batch,
                 None => return Err(PackError::MissingBatch),
                 Some(PackRecord::EpochMeta(_)) => {
-                    return Err(PackError::EpochLoad(
+                    return Err(PackError::UnexpectedRecord(
                         "unexpected epoch meta data found".to_string(),
                     ))
                 }
                 Some(PackRecord::Consensus(_)) => {
-                    return Err(PackError::EpochLoad(
+                    return Err(PackError::UnexpectedRecord(
                         "unexpected consensusheader found".to_string(),
                     ))
                 }
             };
             let got = batch.digest();
             if got != expected {
-                return Err(PackError::EpochLoad(format!(
+                return Err(PackError::UnexpectedRecord(format!(
                     "unexpected batch found, expected {expected}, got {got}"
                 )));
             }
@@ -4041,6 +4055,15 @@ async fn next_output_record<R: AsyncRead + Unpin>(
 ) -> Result<Option<PackRecord>, PackError> {
     match tokio::time::timeout(timeout, iter.next()).await {
         Ok(Some(Ok(rec))) => Ok(Some(rec)),
+        // Bytes that frame but fail their CRC, do not deserialize, or declare an oversized record
+        // are a fault of whoever produced them. A transport error (including a truncated stream,
+        // a throughput-floor cut or a peer abort) or a timeout says nothing about those bytes.
+        Ok(Some(Err(
+            e @ (FetchError::CrcFailed
+            | FetchError::DeserializeValue(_)
+            | FetchError::RequestedSizeTooLarge(..)
+            | FetchError::RequestedDecompressSizeTooLarge(_)),
+        ))) => Err(PackError::UndecodableRecord(e.to_string())),
         Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
         Ok(None) => Ok(None),
         Err(_) => Err(PackError::ReadError("timeout".to_string())),
@@ -4058,10 +4081,12 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     let consensus_header = if let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
-                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+                return Err(PackError::UnexpectedRecord(
+                    "unexpected epoch meta data found".to_string(),
+                ))
             }
             PackRecord::Batch(_batch) => {
-                return Err(PackError::BatchLoad("unexpected batch found".to_string()))
+                return Err(PackError::UnexpectedRecord("unexpected batch found".to_string()))
             }
             PackRecord::Consensus(consensus_header) => consensus_header,
         }
@@ -4121,15 +4146,17 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
-                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+                return Err(PackError::UnexpectedRecord(
+                    "unexpected epoch meta data found".to_string(),
+                ))
             }
             PackRecord::Batch(batch) => {
                 let Some(expected_digest) = expected_batch_digests.next() else {
-                    return Err(PackError::EpochLoad("unexpected batch found".to_string()));
+                    return Err(PackError::UnexpectedRecord("unexpected batch found".to_string()));
                 };
                 let digest = batch.digest();
                 if expected_digest != digest {
-                    return Err(PackError::EpochLoad(format!(
+                    return Err(PackError::UnexpectedRecord(format!(
                         "unexpected batch found, expected {expected_digest}, got {}",
                         digest
                     )));
@@ -4168,7 +4195,9 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                 }
             }
             PackRecord::Consensus(_consensus_header) => {
-                return Err(PackError::EpochLoad("unexpected consensusheader found".to_string()))
+                return Err(PackError::UnexpectedRecord(
+                    "unexpected consensusheader found".to_string(),
+                ))
             }
         }
     }
@@ -4345,7 +4374,9 @@ async fn read_legacy_output<R: AsyncRead + Unpin>(
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
-                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+                return Err(PackError::UnexpectedRecord(
+                    "unexpected epoch meta data found".to_string(),
+                ))
             }
             PackRecord::Batch(batch) => {
                 // Bound how many batch records a (possibly hostile) stream can deliver before the
@@ -4514,8 +4545,17 @@ pub enum PackError {
     NotBatch,
     /// Expected the epoch-meta record but found another kind (or none).
     NotEpoch,
-    /// Error reading from a record stream.
+    /// Error reading from a record stream: a transport failure or timeout, which says nothing
+    /// about the bytes the sender produced.
     ReadError(String),
+    /// A record in a consensus-output stream (a peer's epoch pack or requested output, or a pack
+    /// being decoded) is out of place or is not what its header declares: an `EpochMeta` or header
+    /// where a batch belongs, a batch before any header, or a batch whose digest is not the next
+    /// one the header declares.
+    UnexpectedRecord(String),
+    /// A record in a consensus-output stream framed but failed its CRC, did not deserialize, or
+    /// declared an oversized record.
+    UndecodableRecord(String),
     /// A certificate author is not present in the pack's committee.
     MissingAuthority,
     /// The consensus headers do not form a valid parent-linked chain.
@@ -4667,6 +4707,8 @@ impl Display for PackError {
             PackError::NotBatch => write!(f, "Record is not a Batch"),
             PackError::NotEpoch => write!(f, "Record is not an EpochMeta"),
             PackError::ReadError(error) => write!(f, "Read Error {error}"),
+            PackError::UnexpectedRecord(error) => write!(f, "Unexpected record ({error})"),
+            PackError::UndecodableRecord(error) => write!(f, "Undecodable record ({error})"),
             PackError::MissingAuthority => write!(f, "Missing authority"),
             PackError::InvalidConsensusChain => write!(f, "Broken consensus record chain"),
             PackError::ExtraBatches => write!(f, "Extra batches in pack file"),
@@ -5458,7 +5500,7 @@ pub(crate) mod test {
         )
         .await;
         // New format will fail by starting with a batch.  This would be TooManyBatches with v0.
-        assert!(matches!(res, Err(PackError::BatchLoad(_))), "expected BatchLoad");
+        assert!(matches!(res, Err(PackError::UnexpectedRecord(_))), "expected UnexpectedRecord");
     }
 
     /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than the
@@ -7572,6 +7614,78 @@ pub(crate) mod test {
             io::Error::from(io::ErrorKind::PermissionDenied)
         ))))
         .is_environmental_index_error());
+    }
+
+    /// An unclean pack can end in an incomplete output whose last record happens to end the file
+    /// (no torn frame, no padding). Every record frames, so the physical walk finds nothing,
+    /// and a full validation reports the output's missing batches. It is still the unacked
+    /// in-flight write recovery truncates: `db repair` must plan that truncation (dry run and
+    /// apply), not call the pack Unrepairable.
+    #[tokio::test]
+    async fn test_repair_truncates_incomplete_output_on_a_record_boundary() {
+        use crate::pack_validate::{
+            classify_physical_corruption, incomplete_trailing_output, validate_pack_file,
+        };
+
+        let temp_dir = TempDir::with_prefix("test_repair_incomplete_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // Record starts: 0 meta, 1-5 output 1, 6-10 output 2, 11 output 3's header, 12-15 its
+        // batches.
+        let mut starts = Vec::new();
+        {
+            let pack =
+                Pack::<PackRecord>::open(&data_path, 0, true, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            let mut iter = pack.raw_iter().expect("iter");
+            loop {
+                let pos = iter.logical_position();
+                match iter.next() {
+                    None => break,
+                    Some(record) => {
+                        record.expect("clean record");
+                        starts.push(pos);
+                    }
+                }
+            }
+        }
+        assert_eq!(starts.len(), 16, "fixture layout changed");
+        // Keep output 3's header and two of its batches, ending exactly on a record boundary; the
+        // cut also drops the clean-close sentinel, so the pack reads as unclean.
+        OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .expect("open data")
+            .set_len(starts[14])
+            .expect("cut data");
+
+        assert!(
+            classify_physical_corruption(&data_path, 0).expect("classify").is_none(),
+            "precondition: every record frames"
+        );
+        assert!(
+            validate_pack_file(&data_path, 0, None).expect("validate").has_data_logical_issue(),
+            "precondition: a full validation sees output 3's missing batches"
+        );
+        assert_eq!(incomplete_trailing_output(&data_path, 0), Some(starts[11]));
+
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false)
+            .await
+            .expect("dry run must not err");
+        assert!(matches!(dry, EpochRepair::WouldRepair(_)), "dry run: {dry:?}");
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("apply must not err");
+        assert!(matches!(applied, EpochRepair::Repaired(_)), "apply: {applied:?}");
+        assert_pack_reads_back(&temp_dir, 2).await;
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open repaired");
+        assert!(pack.get_consensus_output(3).await.is_err(), "the incomplete output is gone");
+        pack.close().await;
     }
 
     /// The same R4 blind spot for the POSITION index: opening a pack checks only its last entry,
@@ -9945,6 +10059,68 @@ pub(crate) mod test {
             matches!(buffered_res, Err(super::PackError::OutputTooLarge { .. })),
             "a v0 import buffers each output and must stay budget-bounded, got {buffered_res:?}"
         );
+    }
+
+    /// At the import boundary, bytes the sender produced badly are told apart from a transport
+    /// failure: a record that frames but fails its CRC is `UndecodableRecord` (the requester
+    /// charges the peer), while a stream cut off mid-record is a `ReadError` (never charged).
+    #[tokio::test]
+    async fn test_stream_import_classifies_bad_bytes_vs_transport_failures() {
+        let source = TempDir::with_prefix("test_import_fault_src").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&source, &committee, &chain, &previous_epoch, 3, PACK_VERSION)
+            .await;
+        let data_file = source.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut logical = std::fs::read(&data_file).expect("read pack");
+        logical.truncate(logical.len() - crate::archive::data_file::SENTINEL_LEN as usize);
+        // Record start offsets: meta, then per output its header and its 4 batches.
+        let mut starts = Vec::new();
+        {
+            let pack =
+                Pack::<PackRecord>::open(&data_file, 0, true, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            let mut iter = pack.raw_iter().expect("iter");
+            loop {
+                let pos = iter.logical_position();
+                match iter.next() {
+                    None => break,
+                    Some(record) => {
+                        record.expect("clean record");
+                        starts.push(pos as usize);
+                    }
+                }
+            }
+        }
+        // A batch record of output 2 (records: 0 meta, 1-5 output 1, 6-10 output 2).
+        let batch = starts[8];
+        let import = |bytes: Vec<u8>| {
+            let previous_epoch = previous_epoch.clone();
+            async move {
+                let target = TempDir::with_prefix("test_import_fault_dst").expect("temp dir");
+                ConsensusPack::stream_import(
+                    target.path(),
+                    std::io::Cursor::new(bytes),
+                    0,
+                    &previous_epoch,
+                    3,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("a damaged stream must not import")
+            }
+        };
+
+        let mut corrupt = logical.clone();
+        corrupt[batch + 8] ^= 0xFF;
+        let err = import(corrupt).await;
+        assert!(matches!(err, super::PackError::UndecodableRecord(_)), "CRC-bad record: {err:?}");
+
+        let cut = logical[..batch + 6].to_vec();
+        let err = import(cut).await;
+        assert!(matches!(err, super::PackError::ReadError(_)), "stream cut mid-record: {err:?}");
     }
 
     /// The import stops reading at the requested final: outputs a peer streams past it are never

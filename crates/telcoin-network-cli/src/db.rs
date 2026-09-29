@@ -35,7 +35,8 @@ use tn_storage::{
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
     pack_validate::{
-        classify_physical_corruption, validate_pack_file, validate_pack_file_bounded, Verdict,
+        classify_physical_corruption, incomplete_trailing_output, validate_pack_file,
+        validate_pack_file_bounded, Verdict,
     },
 };
 use tn_types::{
@@ -178,6 +179,25 @@ impl DbValidateArgs {
             // problem → non-zero exit so scripts/operators notice.
             if !corruption.kind.is_truncatable() || prefix_invalid {
                 bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
+            return Ok(());
+        }
+
+        // Every record frames, but an unclean pack can still end in an incomplete output whose
+        // last record happens to end the file: an unacked in-flight write that recovery truncates,
+        // not corruption. Report it as such and validate the complete prefix before it.
+        if let Some(end) = incomplete_trailing_output(&data_file, epoch) {
+            println!(
+                "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
+                 (bytes past offset {end}); this unacked in-flight write is truncated by a node \
+                 restart or `db repair --force`."
+            );
+            eprintln!("\nValidating the complete prefix (up to byte {end})...");
+            let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
+                .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
+            print!("{report}");
+            if report.verdict == Verdict::Invalid {
+                bail!("pack {} is INVALID (see report above)", data_file.display());
             }
             return Ok(());
         }
