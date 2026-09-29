@@ -21,8 +21,14 @@ fn process_budget_caps_each_swarm_and_releases_closed_connections() -> Result<()
         "max_receive_credit_bytes": 4000
     }))?;
     let allocation = budget.allocate().map_err(std::io::Error::other)?;
-    let mut primary = super::connection_limits_behaviour(Some(allocation));
-    let mut worker = super::connection_limits_behaviour(Some(allocation));
+    let mut primary = super::connection_limits_behaviour(
+        super::MAX_PENDING_INCOMING_CONNECTIONS,
+        Some(allocation),
+    );
+    let mut worker = super::connection_limits_behaviour(
+        super::MAX_PENDING_INCOMING_CONNECTIONS,
+        Some(allocation),
+    );
     let peer = PeerId::random();
     let other_peer = PeerId::random();
     let addr = Multiaddr::empty();

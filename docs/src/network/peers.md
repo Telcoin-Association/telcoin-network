@@ -96,6 +96,12 @@ The remaining three values — 45 priority peers, 9 target outbound, and 6 minim
 A separate per-peer ceiling caps concurrent established connections from a single peer at **8**.
 A peer needs at most one inbound and one outbound connection at a time, so eight is headroom for reconnection churn while bounding a hostile peer to a fixed, small fan-out.
 
+Each swarm also caps pending inbound connections (handshakes that are not yet established) at **1024**.
+This cap is a memory bound only, not an admission policy.
+QUIC Retry, enabled by default, validates the source address before a handshake can occupy a slot.
+If `retry_unvalidated_incoming` is disabled as an operator rollback, a forged QUIC Initial datagram can hold a slot for the 10 second transport timeout, so a small cap would let a cheap flood refuse honest peers.
+Refusals show in `inbound_connections_denied_total`.
+
 Dial attempts time out after 15 seconds; a peer still dialing past that is marked disconnected, because dialing peers count against the inbound limit.
 
 ## The heartbeat
@@ -172,6 +178,7 @@ Every series below is exported under the `tn_network` prefix and carries a `netw
 | `connections_established_total` | Connections established, labelled `direction` with `in` or `out`. |
 | `connections_closed_total` | Connections closed, all directions. |
 | `dial_failures_total` | Failed dial attempts. |
+| `inbound_connections_denied_total` | Inbound connections refused by a connection limit, labelled `reason` with `pending_incoming_limit` or `established_per_peer_limit`. A sustained `pending_incoming_limit` rate means the pending ceiling is full. |
 | `external_addr_confirmed` | `1` once any external address is confirmed, meaning NAT traversal is possible. Stuck at `0` means inbound connectivity is unlikely. |
 | `gossip_published_total` | Gossip messages published by this node. |
 | `gossip_received_total` | Gossip messages received from peers. |
