@@ -921,7 +921,7 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
     use tn_types::test_utils::CommandParser;
 
     let _permit = super::common::acquire_test_permit();
-    pin_fork_epochs(Some(0), None, None);
+    pin_fork_epochs(Some(0), None, None, None);
     let temp_dir = tempfile::TempDir::with_prefix("worker_rpc")?;
     e2e_tests::config_local_testnet_with_worker_fee_configs(
         temp_dir.path(),
