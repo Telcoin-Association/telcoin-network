@@ -4,7 +4,7 @@
 //! Rather than buffered `read`/`write` syscalls, it maps the file into memory and does reads/writes
 //! as `memcpy` against the mapping, so there is no per-IO syscall and no read/write buffers. It
 //! implements `Read`/`Write`/`Seek` plus the inherent methods a pack needs (`slice`, `sync_all`,
-//! `try_clone`, `set_len`, …), and takes mmap-specific open options ([`MmapFileOptions`]).
+//! `try_clone`, `truncate`, …), and takes mmap-specific open options ([`MmapFileOptions`]).
 //!
 //! ## Growth
 //!
@@ -769,7 +769,7 @@ impl MmapDataFile {
     /// The extended region reads as zero: a fresh grow is zero-filled (preallocation /
     /// ftruncate-extend), and the one historical exception — the previous clean-close sentinel
     /// sitting in the `[end, end + SENTINEL_LEN)` padding after a clean reopen — is now zeroed
-    /// at open (see `open_with`). Never shrinks. Unlike [`Self::set_len`], growth is geometric
+    /// at open (see `open_with`). Never shrinks. Unlike [`Self::truncate`], growth is geometric
     /// (a remap only when a step crosses the current capacity), so repeated one-record
     /// extensions (e.g. the digest index adding a bucket per split) do not remap every call.
     pub fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
@@ -793,13 +793,14 @@ impl MmapDataFile {
     }
 
     /// Truncate the logical (and physical) file to `len`, leaving it exactly `len` bytes. This is a
-    /// SHRINK-only operation (the pack heal/truncate path: position-index alignment heal, torn-tail
-    /// truncate, `set_len(0)` reset), so `len` must be `<= capacity`. To GROW, use
+    /// SHRINK-only operation (the pack heal path: position-index alignment heal, torn-tail
+    /// truncate, `truncate(0)` reset), so `len` must be `<= capacity`. To GROW, use
     /// [`Self::ensure_len`] / [`Self::ensure_capacity`], which preallocate through `grow_to`;
     /// extending here via the bare `remap` below would leave a sparse (unbacked) region that
     /// SIGBUSes on the first store when the disk is full — the very footgun the preallocation
-    /// path exists to close.
-    pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+    /// path exists to close. For a cheap LOGICAL shrink that keeps the physical file (no
+    /// ftruncate/remap), use [`Self::rewind_to`] instead.
+    pub fn truncate(&mut self, len: u64) -> io::Result<()> {
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::ReadOnlyFilesystem,
@@ -815,7 +816,7 @@ impl MmapDataFile {
         }
         debug_assert!(
             len <= self.capacity,
-            "set_len is truncate-only (len {len} > capacity {}); use ensure_len to grow",
+            "truncate is shrink-only (len {len} > capacity {}); use ensure_len to grow",
             self.capacity
         );
         self.remap(len)?;
@@ -833,7 +834,7 @@ impl MmapDataFile {
     /// Roll the logical end back to `new_len`, zeroing the abandoned region `[new_len, end)` in the
     /// mapping, WITHOUT physically truncating or re-`mmap`ping the file.
     ///
-    /// Unlike [`Self::set_len`] this keeps the current capacity (no `ftruncate`, no remap), so it
+    /// Unlike [`Self::truncate`] this keeps the current capacity (no `ftruncate`, no remap), so it
     /// opens no read-only-mmap SIGBUS window and is cheap. The abandoned bytes become ordinary
     /// capacity padding: every read/slice/iterator is bounded to `end`, a clean close truncates the
     /// padding away, and recovery bounds it out via the index-attested length. Zeroing keeps the
@@ -865,7 +866,7 @@ impl MmapDataFile {
         }
         self.end = new_len;
         // The tail is gone; clamp the append watermark so a later write is flushed, and pull a
-        // past-end read cursor back (mirrors `set_len`).
+        // past-end read cursor back (mirrors `truncate`).
         let fe = self.flushed_end.load(Ordering::Relaxed).min(new_len);
         self.flushed_end.store(fe, Ordering::Relaxed);
         if self.seek_pos > new_len {
@@ -1534,14 +1535,14 @@ mod tests {
     }
 
     #[test]
-    fn set_len_truncates_and_persists() {
+    fn truncate_shrinks_and_persists() {
         let tmp = TempDir::with_prefix("mmap_df_setlen").expect("temp dir");
         let path = tmp.path().join("data");
         let data = pattern(100);
         {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
             df.write_all(&data).expect("write");
-            df.set_len(40).expect("truncate");
+            df.truncate(40).expect("truncate");
             assert_eq!(df.len(), 40);
             df.seek(SeekFrom::Start(0)).expect("seek");
             let mut buf = vec![0u8; 40];

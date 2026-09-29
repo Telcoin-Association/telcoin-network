@@ -194,7 +194,7 @@ impl<T: PosIndexValue> PositionIndex<T> {
             // Without this, the next append (always at the true EOF) would land
             // mid-stride and shift every subsequent record.
             let aligned = PDX_HEADER_SIZE as u64 + (index.len() as u64 * buffer_len);
-            index.pdx_file.set_len(aligned)?;
+            index.pdx_file.truncate(aligned)?;
         }
         Ok(index)
     }
@@ -254,25 +254,25 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// to a key at or beyond the current length would otherwise *extend* the file with
     /// zero-filled records, so this is a no-op in that case.
     ///
-    /// Precondition: this physically shrinks the pdx file (`set_len` → ftruncate + remap), so it is
-    /// sound only while no read-only mmap of the same pdx is live — a read-only handle mapped
-    /// before the shrink would SIGBUS on any touch past the new EOF. The pack model upholds
-    /// this: recovery and heal run only on the writable append open, never concurrently with an
-    /// `open_static` read-only map of the same epoch.
+    /// Precondition: this physically shrinks the pdx file (`truncate` → ftruncate + remap), so it
+    /// is sound only while no read-only mmap of the same pdx is live — a read-only handle
+    /// mapped before the shrink would SIGBUS on any touch past the new EOF. The pack model
+    /// upholds this: recovery and heal run only on the writable append open, never concurrently
+    /// with an `open_static` read-only map of the same epoch.
     pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
         if key as usize >= self.len() {
             return Ok(());
         }
         let buffer_len = T::buffer_len() as u64;
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len) + buffer_len;
-        self.pdx_file.set_len(pos)
+        self.pdx_file.truncate(pos)
     }
 
     /// Truncate the index to just the header. Same read-only-mmap SIGBUS precondition as
     /// [`Self::truncate_to_index`] (physical shrink; no live read-only map of this pdx).
     pub fn truncate_all(&mut self) -> Result<(), io::Error> {
         let pos = PDX_HEADER_SIZE as u64;
-        self.pdx_file.set_len(pos)
+        self.pdx_file.truncate(pos)
     }
 
     /// Roll the index's logical end back to exactly `len` whole entries, dropping any beyond it, by

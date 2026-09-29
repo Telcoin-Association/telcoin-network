@@ -501,7 +501,7 @@ where
             if never_written {
                 // Reset the sized-but-unwritten file to empty; this discards only zeros, so it is a
                 // fresh initialization, not a repair of any committed data.
-                data_file.set_len(0)?;
+                data_file.truncate(0)?;
             }
             let header = DataHeader::new(uid_idx, compression, version);
             header.write_header(data_file)?;
