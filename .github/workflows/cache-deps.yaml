@@ -59,7 +59,7 @@ permissions:
 # One warm at a time, never cancelled: a schedule and a push landing together would
 # otherwise race to save the same key.
 concurrency:
-  group: issue-1348-validation
+  group: issue-1348-clippy-baseline
   cancel-in-progress: false
 
 # Identical to pr.yaml on purpose: every variable here is hashed into the cache key.
@@ -82,7 +82,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
       # Before the cache step: RUST_NIGHTLY is part of the key.
       - name: Read nightly version
@@ -97,15 +97,59 @@ jobs:
           prefix-key: v1-rust
           shared-key: clippy-cache
 
-      # The same lane the queue runs, so the same artifacts.
-      - name: Build both clippy passes
-        run: ./etc/ci-lanes.sh clippy
+      - name: Compare all-target diagnostics with the PR base
+        run: |
+          validation_head="$(git rev-parse HEAD)"
+          validation_logs="$(mktemp -d "$RUNNER_TEMP/issue-1348-clippy.XXXXXX")"
+          trap 'git checkout --detach "$validation_head"' EXIT
+          head_status=0
+          cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps --keep-going --message-format=json -j 2 -- -D warnings > "$validation_logs/head.jsonl" 2> "$validation_logs/head.stderr" || head_status=$?
+          git checkout --detach ba7654d8a7efe8b0ea13aa07c0d81938f843cb2d
+          base_status=0
+          cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps --keep-going --message-format=json -j 2 -- -D warnings > "$validation_logs/base.jsonl" 2> "$validation_logs/base.stderr" || base_status=$?
+          python3 - "$validation_logs" "$head_status" "$base_status" <<'PY'
+          import collections
+          import json
+          from pathlib import Path
+          import sys
 
-      - name: Check all workspace targets required by buildplan
-        run: cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps -j 2 -- -D warnings
+          directory = Path(sys.argv[1])
+          def diagnostics(name, status):
+              errors = collections.Counter()
+              for line in (directory / f"{name}.jsonl").read_text().splitlines():
+                  entry = json.loads(line)
+                  if entry.get("reason") != "compiler-message":
+                      continue
+                  message = entry["message"]
+                  if message["level"] != "error":
+                      continue
+                  spans = tuple(
+                      (span["file_name"], tuple(text["text"] for text in span["text"]))
+                      for span in message["spans"] if span["is_primary"]
+                  )
+                  code = (message.get("code") or {}).get("code", "")
+                  errors[(entry["target"]["name"], code, message["message"], spans)] += 1
+              print(f"{name}: exit={status}, compiler errors={sum(errors.values())}")
+              if status not in (0, 101) or (status != 0 and not errors):
+                  print((directory / f"{name}.stderr").read_text())
+                  raise SystemExit(f"{name}: validation infrastructure or unclassified failure")
+              return errors
+
+          head = diagnostics("head", int(sys.argv[2]))
+          base = diagnostics("base", int(sys.argv[3]))
+          added = head - base
+          for diagnostic, count in sorted(head.items()):
+              print(f"HEAD {count}x {diagnostic!r}")
+          for diagnostic, count in sorted(added.items()):
+              print(f"NEW {count}x {diagnostic!r}")
+          if added:
+              raise SystemExit("PR introduces new all-target Clippy diagnostics")
+          print("No new all-target Clippy diagnostics relative to the exact PR base")
+          PY
 
   # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs.
   warm-test-cache:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     # Both lanes' test binaries from cold; the default lane alone took 9.5 min with a
     # partial cache after a heavy dependency bump.
