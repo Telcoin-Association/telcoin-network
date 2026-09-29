@@ -59,7 +59,7 @@ permissions:
 # One warm at a time, never cancelled: a schedule and a push landing together would
 # otherwise race to save the same key.
 concurrency:
-  group: cache-deps
+  group: issue-1348-validation
   cancel-in-progress: false
 
 # Identical to pr.yaml on purpose: every variable here is hashed into the cache key.
@@ -132,7 +132,38 @@ jobs:
       # per selected package), so its dependency artifacts are distinct from the default
       # lane's; the two sets coexist in target/, and rust-cache keeps every variant of a
       # dependency it finds there. One entry keeps the quota predictable.
-      - name: Build the test binaries of both test lanes
+      - name: Run both test lanes for issue 1348
         run: |
-          ./etc/ci-lanes.sh test-default --build-only
-          ./etc/ci-lanes.sh test-adiri --build-only
+          ./etc/ci-lanes.sh test-default
+          ./etc/ci-lanes.sh test-adiri
+
+      - name: Verify epoch-fee regression tests detect an inverted block selector
+        shell: bash
+        run: |
+          trap 'git restore -- crates/tn-reth/src/rpc_call.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/tn-reth/src/rpc_call.rs')
+          source = path.read_text()
+          original = '    matches!(block_id, BlockId::Number(BlockNumberOrTag::Latest | BlockNumberOrTag::Pending))'
+          assert source.count(original) == 1, 'mutation target must be unique'
+          path.write_text(source.replace(original, original.replace('matches!', '!matches!')))
+          PY
+          set +e
+          cargo nextest run --locked --workspace -E 'test(test_rpc_simulation_)' --no-fail-fast 2>&1 | tee /tmp/issue-1348-mutant.log
+          mutant_status=${PIPESTATUS[0]}
+          set -e
+          test "$mutant_status" -ne 0
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          source = Path('crates/tn-reth/src/env/rpc/tests/simulation.rs').read_text()
+          expected = re.findall(r'async fn (test_rpc_simulation_\w+)', source)
+          log = re.sub(r'\x1b\[[0-9;]*m', '', Path('/tmp/issue-1348-mutant.log').read_text())
+          missing = [name for name in expected if not any('FAIL' in line and name in line for line in log.splitlines())]
+          assert len(expected) == 6 and not missing, f'mutation did not fail all six tests: {missing}'
+          print('Mutation confirmed: all six epoch-fee regression tests failed.')
+          PY
+          git restore -- crates/tn-reth/src/rpc_call.rs
+          cargo nextest run --locked --workspace -E 'test(test_rpc_simulation_)'
+          git diff --exit-code -- Cargo.lock crates/tn-reth/src/rpc_call.rs
