@@ -1,0 +1,19 @@
+# Code owners for the CI gate: the workflows and the attestation check (.github/), the
+# lanes and scripts they call (etc/), and the Makefile targets that drive them, `make
+# attest` among them. The `main` ruleset has require_code_owner_review on, so a PR that
+# changes any path below needs an approving review from one of the owners listed on it.
+# This file is under /.github/, so the same holds for a change to it.
+#
+# GitHub reads CODEOWNERS from the pull request's base branch, never from the PR itself,
+# so a PR cannot change who has to review it. An edit here takes effect once it is on
+# main.
+#
+# Keep the owners in step with MAINTAINERS in the `ci-scope` job of
+# .github/workflows/pr.yaml. That list is lowercase; GitHub logins are case-insensitive.
+#
+# Paths not listed here need the ruleset's approval, but not a code owner's. There is
+# deliberately no `*` line: it would change review policy for the whole repository.
+
+/.github/   @grantkee @sstanfield @MavenRain @Huwonk
+/etc/       @grantkee @sstanfield @MavenRain @Huwonk
+/Makefile   @grantkee @sstanfield @MavenRain @Huwonk
