@@ -80,7 +80,7 @@ jobs:
     # took 11.5 min with a partial cache.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -93,7 +93,7 @@ jobs:
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
         with:
           prefix-key: v1-rust
           shared-key: clippy-cache
@@ -109,7 +109,7 @@ jobs:
     # partial cache after a heavy dependency bump.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -118,12 +118,12 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
         with:
           prefix-key: v1-rust
           shared-key: test-cache

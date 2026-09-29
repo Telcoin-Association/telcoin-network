@@ -38,6 +38,12 @@
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
 # enforces and what a maintainer attests locally are the same commands by construction
 # rather than by inspection. Change a lane there, not here.
+#
+# Every action the workflows use is pinned to a full commit SHA, with the release it
+# stands for in a trailing comment on the same line. A tag such as `v4` can be repointed
+# upstream, and the gate would then run new code with no change in this repository.
+# Dependabot proposes the bumps (.github/dependabot.yaml); the procedure is in
+# .github/ACTIONS.md, under "Action pins".
 name: Pull Request and Merge Queue Checks
 
 on:
@@ -158,16 +164,18 @@ jobs:
       # What this does not cover: the job definition below and the `CI Success` allowlist
       # still come from the PR's merge commit, and a PR can edit those instead. Such a PR
       # is stopped by the required code-owner review (.github/CODEOWNERS), not here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: trusted
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      # cast, for the read-only registry call
+      # cast, for the read-only registry call. The pin fixes this action's code, not the
+      # Foundry it installs: `version` defaults to `stable`, so each run fetches whatever
+      # Foundry release is current when the job starts.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
 
       - name: Verify attestation on adiri
         env:
@@ -181,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read nightly version
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
@@ -209,7 +217,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -225,7 +233,7 @@ jobs:
 
       # Restore only; cache-deps.yaml writes the v1-rust entries on main.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
         with:
           prefix-key: v1-rust
           shared-key: clippy-cache
@@ -246,7 +254,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -255,13 +263,13 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
 
       # Restore only; see the clippy job.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
         with:
           prefix-key: v1-rust
           shared-key: test-cache
@@ -291,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -300,7 +308,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
 
@@ -308,7 +316,7 @@ jobs:
       # both test lanes into one target dir, where the adiri variants of the shared
       # dependencies coexist with the default ones.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
         with:
           prefix-key: v1-rust
           shared-key: test-cache
@@ -332,7 +340,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Assert no pruning entry point in the node
         run: ./etc/archive-mode-guard.sh
