@@ -75,13 +75,12 @@ The nightly `durable-e2e` lane is the backstop for what still slips through.
 ### Repository settings this requires
 
 The workflow changes are not enough on their own.
-In order of urgency:
+In order of importance:
 
-1. **Add `CI Success` as a required status check. It is missing today.** The `main` ruleset
-   has no `required_status_checks` rule at all, so the queue gates nothing yet: a PR can be
-   queued unattested with no green lane, and the queue merges each entry as soon as GitHub
-   has built it. Add the check with *Require branches to be up to date before merging*
-   **off**: strict mode would force a re-push, and so a re-attestation, every time `main`
+1. **`CI Success` is the required status check** (the `main` ruleset, source GitHub
+   Actions). Without it the queue would gate nothing: a PR could be queued unattested with
+   no green lane. Keep *Require branches to be up to date before merging* **off**, as it is
+   now: strict mode would force a re-push, and so a re-attestation, every time `main`
    moved, and the queue already tests `main + PR`. Require `CI Success` only, not
    `verify-on-chain`, which is a job inside `pr.yaml` that `CI Success` already depends on.
    GitHub matches a required check by name, so a job called `CI Success` in any workflow
@@ -91,11 +90,15 @@ In order of urgency:
    behind the organization's runner concurrency. Raise the status check timeout from 60 to
    **90 minutes**: it counts from the group's creation, runner backlog included, so 60 can
    eject a lane that took 45 after queueing for 15.
-3. **Pull request rule.** *Dismiss stale pull request approvals when new commits are pushed*
-   (already set) is, together with (1), what makes a late push cost a re-approval.
-   Recommended: *Require approval of the most recent reviewable push*, so the author of that
-   push cannot approve it themselves. `require_code_owner_review` is a latent switch with no
-   CODEOWNERS file to consult; leave it off.
+3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
+   when new commits are pushed* (already set) is, together with (1), what makes a late push
+   cost a re-approval. *Require review from Code Owners* (`require_code_owner_review`) is
+   on, and `.github/CODEOWNERS` assigns `/.github/`, `/etc/` and `/Makefile` to the four
+   accounts in `MAINTAINERS` (the `ci-scope` job in `pr.yaml`), so a PR that touches any of
+   them needs one of those four to approve it. GitHub reads CODEOWNERS from the PR's base
+   branch, so a PR cannot change who has to review it. Other paths need the one approval,
+   but not a code owner's. Recommended, and still off: *Require approval of the most recent
+   reviewable push*, so the author of that push cannot approve it themselves.
 4. **Repository settings** (Settings -> General -> Pull Requests). *Allow auto-merge* is not
    in the ruleset and does not look related, so it is the one that gets missed: the "Merge
    when ready" button calls the `enablePullRequestAutoMerge` GraphQL mutation even on a
@@ -103,14 +106,15 @@ In order of urgency:
    every attempt to queue a PR fails with *"failed enabling auto-merge for pull request"*,
    however green the PR is. Also *Allow squash merging*, with the default squash message
    set to the PR title and description.
-5. **Delete the `merge-into-main` environment** (Settings -> Environments) and drop the
-   empty `required_deployments` rule from the `main` ruleset. The old
+5. **Delete the `merge-into-main` environment** (Settings -> Environments). The old
    `maintainer-verify.yaml` workflow ran in that environment; it was folded into `pr.yaml`
-   and deleted, and the replacement lane deliberately has no `environment:` of its own: it
-   reads a public RPC and uses no secrets, and an environment that ever gained a protection
-   rule would park the merge queue on a manual approval until the queue timed out. The
-   `required_deployments` rule lists no environments, so it enforces nothing while leaving
-   a live switch that would hang the queue if anyone filled it in.
+   and deleted, and no workflow names the environment now. The replacement lane
+   deliberately has no `environment:` of its own: it reads a public RPC and uses no
+   secrets, and an environment with a protection rule would park the merge queue on a
+   manual approval until the queue timed out. The `main` ruleset no longer has a
+   `required_deployments` rule, so nothing requires a deployment to it either. The
+   environment still carries a required-reviewers protection rule, which makes it a switch
+   that would hang the queue if a job ever named it again.
 6. **Escape hatch.** If the `merge_group` path of `CI Success` is ever broken, no PR can
    land to fix it, because the fix itself has to pass through the queue. An admin has to
    remove the required check temporarily (or use a bypass) to land the fix, then put it
@@ -120,8 +124,18 @@ In order of urgency:
 
 GitHub's own answer is only "anyone with write access", and there is no finer-grained setting.
 The real gate here is the attestation plus the approval: `CI Success` depends on `verify-on-chain`, required checks must pass *before* a PR can be queued, and `verify-on-chain` passes only for a commit hash already written to the registry by a holder of the MAINTAINER key.
-So a contributor cannot make their own PR queue-eligible -- a maintainer has to run `test-and-attest.sh` against that exact commit first, which is a stronger claim than a CODEOWNERS entry makes.
-This is documented, not enforced by GitHub: nothing stops a maintainer from queueing an attested PR without a review, other than the approval rule.
+That binds a PR that leaves the gate alone, and only such a PR.
+
+`verify-on-chain` runs `.github/scripts/verify_commit_hash.sh` from the PR's base commit, not from the PR, so editing the script does nothing for the PR that edits it.
+The new script judges the PRs opened or pushed after it lands on `main`; a PR already open keeps its old base, and the old script, until it is pushed again.
+The `attest` job definition and the `CI Success` allowlist still come from the PR's merge commit, though, and the queue run uses the PR's `pr.yaml` and skips `verify-on-chain`.
+So a PR that edits the job or the allowlist can turn `CI Success` green without an attestation, on the PR and in the queue.
+The lanes are in the same position: the queue runs `etc/ci-lanes.sh` from the merge commit, so a PR that edits it is tested by its own edit.
+Nothing inside `pr.yaml` can take these out of the PR's hands; that needs a decision at the ruleset level.
+
+What stops such a PR is the required code-owner review (item 3 above).
+Whoever approves must treat any change under `.github/`, `etc/` or `Makefile` as a change to the gate itself: a green `CI Success` on such a PR does not by itself show that it was attested or tested.
+The admin role can bypass the `main` ruleset, and with it both the approval and `CI Success`.
 
 ## Caches
 
