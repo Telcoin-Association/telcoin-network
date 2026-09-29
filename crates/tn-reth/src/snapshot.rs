@@ -2521,10 +2521,17 @@ mod tests {
             .tx_ref()
             .put::<AccountChangeSets>(k, AccountBeforeTx { address: created_later, info: None })?;
         provider_rw.insert_account_history_index([(contract, [k]), (created_later, [k])])?;
-        provider_rw
-            .tx_ref()
-            .cursor_dup_write::<PlainStorageState>()?
-            .upsert(contract, &StorageEntry::new(slot, U256::from(222)))?;
+        // PlainStorageState is DupSort, so an upsert alone adds a second entry for the slot and
+        // reads still return the imported value. Remove that entry first, as reth's writer does.
+        {
+            let mut storage = provider_rw.tx_ref().cursor_dup_write::<PlainStorageState>()?;
+            storage
+                .seek_by_key_subkey(contract, slot)?
+                .filter(|entry| entry.key == slot)
+                .map(|_| storage.delete_current())
+                .transpose()?;
+            storage.upsert(contract, &StorageEntry::new(slot, U256::from(222)))?;
+        }
         provider_rw.tx_ref().put::<StorageChangeSets>(
             BlockNumberAddress((k, contract)),
             StorageEntry::new(slot, U256::from(111)),
