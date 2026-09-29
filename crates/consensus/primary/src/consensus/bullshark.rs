@@ -250,12 +250,13 @@ impl Bullshark {
             // The seed chain folds in the existing oldest-first `pop_front` commit order, which is
             // the same order the sub-dags are sent on the `sequence` channel and the same order the
             // consensus header chain records them, so every honest node folds identical inputs.
-            let sub_dag: CommittedSubDag = CommittedSubDag::new(
+            let sub_dag: CommittedSubDag = CommittedSubDag::new_with_commit_floor(
                 sequence,
                 leader.clone(),
                 sub_dag_index,
                 reputation_score.clone(),
-                state.last_committed_sub_dag.clone(),
+                state.last_committed_sub_dag.as_ref(),
+                state.epoch_commit_floor(),
                 state.seed_chain(),
             );
 
