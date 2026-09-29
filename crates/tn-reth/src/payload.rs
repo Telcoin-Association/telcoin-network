@@ -154,15 +154,33 @@ impl TNPayload {
     /// WARNING: only use this for tests. Data is invalid.
     #[cfg(any(feature = "test-utils", test))]
     pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
+        Self::new_for_test_with(
+            parent_header,
+            output,
+            Address::random(),
+            B256::random(),
+            B256::random(),
+        )
+    }
+
+    /// Create a test payload with explicit values for all otherwise randomized fields.
+    ///
+    /// Pair this with a fixed genesis and consensus-output timestamp for reproducible execution.
+    /// WARNING: only use this for tests. Data is invalid.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn new_for_test_with(
+        parent_header: SealedHeader,
+        output: &ConsensusOutput,
+        beneficiary: Address,
+        batch_digest: B256,
+        mix_hash: B256,
+    ) -> Self {
         use tn_types::{Hash as _, MIN_PROTOCOL_BASE_FEE};
 
-        let beneficiary = Address::random();
         let batch_index = 0;
-        let batch_digest = B256::random();
         let consensus_header_digest = output.digest().into();
         let base_fee_per_gas = parent_header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE);
         let gas_limit = parent_header.gas_limit;
-        let mix_hash = B256::random();
 
         Self::new(
             parent_header,

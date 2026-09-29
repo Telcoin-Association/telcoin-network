@@ -20,8 +20,13 @@ use std::sync::Arc;
 /// This is usable for many unit tests but it lacks the genesis contracts and storage.
 /// Go throuigh ['GenesisArgs'] to generate a complete genesis.
 pub fn test_genesis() -> Genesis {
-    let mut genesis = Genesis { timestamp: now(), ..Default::default() };
-    set_genesis_defaults(&mut genesis);
+    test_genesis_at(now())
+}
+
+/// Provide the funded test genesis with an explicit timestamp for reproducible block hashes.
+pub fn test_genesis_at(timestamp: u64) -> Genesis {
+    let mut genesis = Genesis::default();
+    set_genesis_defaults_at(&mut genesis, timestamp);
     genesis.config.chain_id = 2017;
     let default_factory_accounts = vec![
         (
@@ -57,6 +62,11 @@ pub fn test_genesis() -> Genesis {
 
 /// Set the genesis default config.
 pub fn set_genesis_defaults(genesis: &mut Genesis) {
+    set_genesis_defaults_at(genesis, now());
+}
+
+/// Set the genesis default config and the supplied timestamp without consulting the clock.
+fn set_genesis_defaults_at(genesis: &mut Genesis, timestamp: u64) {
     // Configure hardforks or Reth will be cross with us...
     genesis.config.homestead_block = Some(0);
     genesis.config.eip150_block = Some(0);
@@ -73,8 +83,7 @@ pub fn set_genesis_defaults(genesis: &mut Genesis) {
     genesis.config.prague_time = Some(0);
     genesis.config.osaka_time = None;
     // Configure some misc genesis stuff.
-    // chain_id and maybe timestamp should probably be a command line option...
-    genesis.timestamp = now();
+    genesis.timestamp = timestamp;
     genesis.config.terminal_total_difficulty_passed = true;
     genesis.config.terminal_total_difficulty = Some(U256::from(0));
     genesis.gas_limit = 30_000_000;
