@@ -94,12 +94,14 @@ In order of importance:
 3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
    when new commits are pushed* (already set) is, together with (1), what makes a late push
    cost a re-approval. *Require review from Code Owners* (`require_code_owner_review`) is
-   on, and `.github/CODEOWNERS` assigns `/.github/`, `/etc/` and `/Makefile` to the four
-   accounts in `MAINTAINERS` (the `ci-scope` job in `pr.yaml`), so a PR that touches any of
-   them needs one of those four to approve it. GitHub reads CODEOWNERS from the PR's base
-   branch, so a PR cannot change who has to review it. Other paths need the one approval,
-   but not a code owner's. Recommended, and still off: *Require approval of the most recent
-   reviewable push*, so the author of that push cannot approve it themselves.
+   on, and `.github/CODEOWNERS` assigns `/.github/`, `/etc/`, `/Makefile` and the tool
+   configuration the lanes read (`.cargo/`, `.config/`, the toolchain pins, and every
+   `rustfmt.toml` and `clippy.toml`) to the four accounts in `MAINTAINERS` (the `ci-scope`
+   job in `pr.yaml`), so a PR that touches any of them needs one of those four to approve
+   it. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
+   review it. Other paths need the one approval, but not a code owner's. Recommended, and
+   still off: *Require approval of the most recent reviewable push*, so the author of that
+   push cannot approve it themselves.
 4. **Repository settings** (Settings -> General -> Pull Requests). *Allow auto-merge* is not
    in the ruleset and does not look related, so it is the one that gets missed: the "Merge
    when ready" button calls the `enablePullRequestAutoMerge` GraphQL mutation even on a
@@ -135,8 +137,11 @@ The lanes are in the same position: the queue runs `etc/ci-lanes.sh` from the me
 Nothing inside `pr.yaml` can take these out of the PR's hands; that needs a decision at the ruleset level.
 
 What stops such a PR is the required code-owner review (item 3 above).
-Whoever approves must treat any change under `.github/`, `etc/` or `Makefile` as a change to the gate itself: a green `CI Success` on such a PR does not by itself show that it was attested or tested.
+Whoever approves must treat any change to a path `.github/CODEOWNERS` lists as a change to the gate itself: a green `CI Success` on such a PR does not by itself show that it was attested or tested.
+That includes the tool configuration: `[profile.ci]` in `.config/nextest.toml` is read only by the CI lanes (`NEXTEST_PROFILE: ci` in `pr.yaml`), so `make attest` never exercises an edit to it.
 The admin role can bypass the `main` ruleset, and with it both the approval and `CI Success`.
+All four code owners hold that role, so the code-owner review is a check on everyone but them: any one of the four can land a change to the gate that no second owner has read, and so can every other account with admin on the repository (Settings -> Collaborators and teams), code owner or not.
+The bypass mode is *Always allow*, which also lets an admin push to `main` with no pull request at all; *For pull requests only* would keep the escape hatch in item 6 and leave a pull request behind every bypass.
 
 ## Caches
 

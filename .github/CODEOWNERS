@@ -1,8 +1,9 @@
 # Code owners for the CI gate: the workflows and the attestation check (.github/), the
-# lanes and scripts they call (etc/), and the Makefile targets that drive them, `make
-# attest` among them. The `main` ruleset has require_code_owner_review on, so a PR that
-# changes any path below needs an approving review from one of the owners listed on it.
-# This file is under /.github/, so the same holds for a change to it.
+# lanes and scripts they call (etc/), the Makefile targets that drive them, `make attest`
+# among them, and the tool configuration that decides what the lanes' commands do. The
+# `main` ruleset has require_code_owner_review on, so a PR that changes any path below
+# needs an approving review from one of the owners listed on it. This file is under
+# /.github/, so the same holds for a change to it.
 #
 # GitHub reads CODEOWNERS from the pull request's base branch, never from the PR itself,
 # so a PR cannot change who has to review it. An edit here takes effect once it is on
@@ -13,7 +14,24 @@
 #
 # Paths not listed here need the ruleset's approval, but not a code owner's. There is
 # deliberately no `*` line: it would change review policy for the whole repository.
+#
+# The tool configuration changes a lane without touching etc/ci-lanes.sh. `[profile.ci]`
+# in .config/nextest.toml is read only by the CI lanes (NEXTEST_PROFILE: ci in pr.yaml),
+# never by `make attest`; an alias in .cargo/ can stand in for `cargo nextest`, `cargo
+# clippy` or `cargo fmt` in both. Directories and `rust-toolchain*` are matched whole
+# because cargo prefers .cargo/config and rustup a bare rust-toolchain over the .toml
+# files; rustfmt and clippy read the nearest config above each crate, so those match at
+# any depth. The root Cargo.toml stays out: every dependency bump would need an owner,
+# and [workspace.lints] there can do no more than an #![allow] in a crate root.
 
-/.github/   @grantkee @sstanfield @MavenRain @Huwonk
-/etc/       @grantkee @sstanfield @MavenRain @Huwonk
-/Makefile   @grantkee @sstanfield @MavenRain @Huwonk
+/.github/          @grantkee @sstanfield @MavenRain @Huwonk
+/etc/              @grantkee @sstanfield @MavenRain @Huwonk
+/Makefile          @grantkee @sstanfield @MavenRain @Huwonk
+/.cargo/           @grantkee @sstanfield @MavenRain @Huwonk
+/.config/          @grantkee @sstanfield @MavenRain @Huwonk
+/rust-toolchain*   @grantkee @sstanfield @MavenRain @Huwonk
+/rust-nightly      @grantkee @sstanfield @MavenRain @Huwonk
+rustfmt.toml       @grantkee @sstanfield @MavenRain @Huwonk
+.rustfmt.toml      @grantkee @sstanfield @MavenRain @Huwonk
+clippy.toml        @grantkee @sstanfield @MavenRain @Huwonk
+.clippy.toml       @grantkee @sstanfield @MavenRain @Huwonk
