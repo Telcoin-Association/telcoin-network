@@ -2,9 +2,9 @@
 #
 # The workflows pin every action to a full commit SHA, with the release in a trailing
 # comment (the pr.yaml header says why). A pin that nobody revisits goes stale:
-# Swatinem/rust-cache sat on a node20 release for 21 months. Dependabot opens the bump as
-# a pull request and rewrites the SHA and the version comment together, which it does only
-# while the comment is on the same line as the `uses:`.
+# Swatinem/rust-cache sat on a node20 release from January 2025 until this file was added.
+# Dependabot opens the bump as a pull request and rewrites the SHA and the version comment
+# together, which it does only while the comment is on the same line as the `uses:`.
 #
 # A Dependabot pull request is a pull request like any other. It changes .github/, so it
 # needs a code owner's review (.github/CODEOWNERS), and its head needs an attestation
@@ -19,18 +19,20 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # A release is proposed only once it is 7 days old, so one that is pulled or found to
-    # be compromised in its first days never reaches a pull request. GitHub's own default
-    # is 3 days; the option accepts 1-90, and for this ecosystem only `default-days` is
-    # supported.
+    # Dependabot proposes a release only once it is 7 days old, so one that is pulled or
+    # found to be compromised in its first days never reaches one of its pull requests. A
+    # pin set by hand skips this wait (.github/ACTIONS.md, "How a pin moves"). GitHub's
+    # own default is 3 days; the option accepts 1-90, and for this ecosystem only
+    # `default-days` is supported.
     cooldown:
       default-days: 7
     commit-message:
       prefix: ci
     # One pull request a week for every action but rust-cache. A pull request here cannot
     # enter the merge queue until a maintainer has run the full local suite on its head
-    # commit and attested it (`make attest`), and taiki-e/install-action alone releases
-    # about five times a week. One grouped pull request a week is one attestation a week.
+    # commit and attested it (`make attest`), and taiki-e/install-action alone was
+    # released about five times a week in September 2026. One grouped pull request a week
+    # is one attestation a week.
     groups:
       actions:
         patterns:

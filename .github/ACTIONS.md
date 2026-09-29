@@ -86,11 +86,12 @@ In order of importance:
    `verify-on-chain`, which is a job inside `pr.yaml` that `CI Success` already depends on.
    GitHub matches a required check by name, so a job called `CI Success` in any workflow
    would satisfy it; keep the name unique to `pr.yaml`.
-2. **Merge queue.** Merge method `SQUASH` (already set). Start with a build concurrency of
-   **2**: each group runs seven jobs, so five groups is about 35 concurrent jobs queueing
-   behind the organization's runner concurrency. Raise the status check timeout from 60 to
-   **90 minutes**: it counts from the group's creation, runner backlog included, so 60 can
-   eject a lane that took 45 after queueing for 15.
+2. **Merge queue.** Merge method `SQUASH` (already set). Recommended, and not yet set: a
+   build concurrency of **2** (the ruleset has 5): each group runs seven jobs, so five
+   groups is about 35 concurrent jobs queueing behind the organization's runner
+   concurrency. And a status check timeout of **90 minutes** (it is 60): it counts from
+   the group's creation, runner backlog included, so 60 can eject a lane that took 45
+   after queueing for 15.
 3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
    when new commits are pushed* (already set) is, together with (1), what makes a late push
    cost a re-approval. *Require review from Code Owners* (`require_code_owner_review`) is
@@ -152,7 +153,8 @@ The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cach
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-Three properties of `Swatinem/rust-cache` (v2.9.2) shape all of this:
+Three properties of `Swatinem/rust-cache` shape all of this.
+They were checked against v2.9.2, and a later release can change them; the third says how a release that changes the key moves:
 
 - The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo
   manifests, lockfiles and toolchain/config files>`, so the two entries start with
@@ -189,7 +191,8 @@ Three properties of `Swatinem/rust-cache` (v2.9.2) shape all of this:
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
-Check the total under Settings -> Actions -> Caches now and then: three entries should be there (`clippy-cache`, `test-cache`, `durable-e2e-cache`), well inside the 10 GB quota.
+Check the total under Settings -> Actions -> Caches now and then: three current entries should be there (`clippy-cache`, `test-cache`, `durable-e2e-cache`), about 4.6 GB in September 2026 against the 10 GB quota.
+Each `Cargo.lock` change on `main` leaves the previous generation behind until it goes 7 days without a restore, and GitHub evicts the least recently used entries once the total passes the quota; superseded entries can be deleted there by hand once a warm has replaced them.
 
 One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 1.94.x point release changes the rustc version, which is in the key, and every entry misses with no fallback until the next warm (the schedule within 3-4 days, or a manual dispatch).
 Pinning `1.94.x` would make the rotation explicit and deliberate.
@@ -218,12 +221,12 @@ That pull request can serve as stage 2, but it carries only the pins: hold it un
 Do not let the gap run long.
 Until it closes, the warm no longer refreshes the entries `pr.yaml` reads: they stay alive only while some run restores them at least once in 7 days, and after a `Cargo.lock` change on `main` a lane falls back to the restore-key prefix and gets a partly stale entry.
 
-Until the old entries expire (7 days without a restore), the cache list holds both generations, so the "three entries should be there" check above reads six for a while.
+Until the old entries expire (7 days without a restore), the cache list holds both generations, so the "three current entries should be there" check above reads six for a while.
 Once stage 2 has landed, the old `v1-rust-clippy-cache-Linux-<hash>`, `v1-rust-test-cache-Linux-<hash>` and `v0-rust-durable-e2e-cache-Linux-<hash>` entries (no `x64` after `Linux-`) can be deleted there.
 
 ## Action pins
 
-Every `uses:` in `.github/workflows/` names the action by a full 40-character commit SHA, with the release it stands for in a trailing comment on the same line (`actions/checkout@<sha> # v7.0.1`).
+Every `uses:` in `.github/workflows/` names the action by a full 40-character commit SHA, with the release it stands for in a trailing comment on the same line (`actions/checkout@<sha> # vX.Y.Z`).
 A tag such as `v4` is a pointer the action's owner can move at any time.
 A moved tag runs new code in the gate on the next run, with no change in this repository and nothing for a reviewer to see.
 A SHA cannot be moved, so the code that runs is the code that was reviewed when the pin was set.
@@ -235,15 +238,15 @@ Three positions made this worth doing:
   `verify-on-chain`.
 - `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
 
-The current pins (the SHAs are in the workflows, and only there):
+The pinned actions and the runtime each one uses (each pin's SHA, and the release it stands for in the `# vX.Y.Z` comment beside it, are in the workflows, and only there):
 
-| Action | Release | Runtime |
-|---|---|---|
-| `actions/checkout` | v7.0.1 | node24 |
-| `taiki-e/install-action` | v2.87.22 | composite (shell steps only) |
-| `foundry-rs/foundry-toolchain` | v1.9.1 | node24 |
-| `actions/upload-pages-artifact` | v5.0.0 | composite (runs `actions/upload-artifact` v7.0.0, node24, itself pinned by SHA) |
-| `actions/deploy-pages` | v5.0.1 | node24 |
+| Action | Runtime |
+|---|---|
+| `actions/checkout` | node24 |
+| `taiki-e/install-action` | composite (shell steps only) |
+| `foundry-rs/foundry-toolchain` | node24 |
+| `actions/upload-pages-artifact` | composite (runs `actions/upload-artifact`, node24, itself pinned by SHA) |
+| `actions/deploy-pages` | node24 |
 
 `Swatinem/rust-cache` is left out of the table: its pin moves on its own terms, and "Caches" above covers it.
 The runtime column matters because GitHub removed Node 20 from the hosted runners on 2026-09-23 and now forces any node20 action onto Node 24, which it was not written for.
@@ -251,19 +254,21 @@ The runtime column matters because GitHub removed Node 20 from the hosted runner
 ### How a pin moves
 
 Dependabot (`.github/dependabot.yaml`) checks the actions weekly and opens one grouped pull request for all of them except `Swatinem/rust-cache`, with each SHA and its version comment rewritten together.
-It proposes a release only once the release is 7 days old, so one that is pulled or found to be compromised in its first days never reaches a pull request.
-The grouping is for the attestation: a pull request cannot enter the queue until a maintainer has run the full local suite on its head and attested it, and `taiki-e/install-action` alone releases about five times a week.
+It proposes a release only once the release is 7 days old, so one that is pulled or found to be compromised in its first days never reaches one of its pull requests; a pin set by hand skips that wait.
+The grouping is for the attestation: a pull request cannot enter the queue until a maintainer has run the full local suite on its head and attested it, and `taiki-e/install-action` alone was released about five times a week in September 2026.
 `Swatinem/rust-cache` arrives as a pull request of its own, because a release that changes how the cache key is computed has to reach `cache-deps.yaml` before `pr.yaml`.
 
 Whoever reviews such a pull request:
 
 - reads the release notes for every bump in it, all of them between the old release and
-  the new one. A changed default is how `upload-pages-artifact` v5 came to drop mdBook's
-  `.nojekyll` (see the comment in `docs.yaml`).
+  the new one. A changed default is how `upload-pages-artifact` came to drop mdBook's
+  `.nojekyll`: v4 changed it, and this repository went from v3 to v5 in one step (see
+  the comment in `docs.yaml`).
 - treats it as a change to the gate. It is under `.github/`, so it needs a code owner's
   approval, and its head needs `make attest` like any other. Its own workflow runs get a
   read-only token and no secrets; the new code first runs with more than that after it
-  lands, in `cache-deps.yaml` (the `main` cache) and `docs.yaml` (the Pages deployment).
+  lands, in `cache-deps.yaml` (the `main` cache the lanes restore), `durable-e2e.yaml`
+  (its own `main` cache entry, nightly) and `docs.yaml` (the Pages deployment).
 
 A new `uses:` takes the same form, SHA plus `# vX.Y.Z` on the same line; Dependabot rewrites the comment only when it is on the line it updates.
 
@@ -279,7 +284,6 @@ git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>' 'refs/tags/<ta
 
 For an annotated tag this prints two lines, and the `^{}` line is the commit to pin; the other is the tag object.
 For a lightweight tag it prints one line, and that is the commit.
-Every action in the table is on a lightweight tag today; `Swatinem/rust-cache` tags are annotated.
 
 ### What a pin does not cover
 

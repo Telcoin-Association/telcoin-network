@@ -15,7 +15,8 @@
 #                 the stable pin; read by `test` and `adiri-test`. Workspace test binaries
 #                 are rebuilt per run because rust-cache does not save workspace crates.
 #
-# rust-cache (v2.9.2 here) builds the key as
+# rust-cache builds the key as follows (checked against v2.9.2; a later release can
+# change it, and one that does moves as the paragraph on such releases below says):
 #
 #   <prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests,
 #   lockfiles and toolchain/config files>
