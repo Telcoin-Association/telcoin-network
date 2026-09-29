@@ -1032,12 +1032,26 @@ pub fn consensus_output_for_tests(
     subdag_index: u64,
     close_epoch: bool,
 ) -> ConsensusOutput {
+    consensus_output_for_tests_at(round, epoch, subdag_index, close_epoch, now())
+}
+
+/// Create a consensus output with an explicit commit timestamp for reproducible execution.
+///
+/// Like [`consensus_output_for_tests`], this seeds each output from the epoch root and does not
+/// model the seed chain across multiple commits in the same epoch.
+pub fn consensus_output_for_tests_at(
+    round: u32,
+    epoch: u32,
+    subdag_index: u64,
+    close_epoch: bool,
+    timestamp: u64,
+) -> ConsensusOutput {
     let mut leader = Certificate::default();
     // set signature for deterministic test results
     leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
         BlsSignature::default(),
     ));
-    leader.update_header_created_at_for_test(tn_types::now());
+    leader.update_header_created_at_for_test(timestamp);
     leader.update_header_round_for_test(round);
     leader.update_header_epoch_for_test(epoch);
     let reputation_scores = ReputationScores::default();

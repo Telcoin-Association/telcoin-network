@@ -10,14 +10,9 @@ Becoming an active validator requires three on-chain transactions:
 
 ### Prerequisites
 
-#### [Hardware Requirements](how-to-stake.md#hardware-requirements)
+#### Hardware Requirements
 
-| Component     | Minimum                        | Recommended                            |
-| ------------- | ------------------------------ | -------------------------------------- |
-| CPU           | 16 cores / 32 threads, x86/x64 | 32 cores, higher clock speed preferred |
-| CPU Benchmark | 4000+ Single Thread (PassMark) | -                                      |
-| Memory        | 128 GB DDR4/DDR5 ECC RDIMM     | 128 GB+ (highest MT/s possible)        |
-| Storage       | 4 TB TLC NVMe SSD              | 7.5 TB TLC NVMe SSD                    |
+Size the validator host from [Hardware Requirements](../getting-started/hardware-requirements.md).
 
 #### Network Requirements
 

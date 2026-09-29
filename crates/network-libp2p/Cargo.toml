@@ -20,6 +20,7 @@ libp2p = { workspace = true, features = [
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
+tn-node-record = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -39,7 +40,7 @@ metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
