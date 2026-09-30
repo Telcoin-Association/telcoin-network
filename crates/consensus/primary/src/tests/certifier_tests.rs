@@ -132,9 +132,18 @@ fn build_peer_response(
 
 /// Upper bound on every wait for the certifier's next network command.
 ///
-/// It must exceed the certifier's 10s vote-retry backoff ceiling; otherwise a wait could tie with a
-/// backoff tick and fail a test that is only waiting for a retry.
+/// Every test runs on tokio's paused clock, so this is virtual time. The clock auto-advances only
+/// while every task is idle: the wait costs no wall-clock time and expires only once the certifier
+/// genuinely has nothing left to send. It must exceed the certifier's 10s vote-retry backoff
+/// ceiling; otherwise a wait could tie with a backoff tick and fail a test that is only waiting for
+/// a retry.
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a test watches for something that must NOT happen, such as a certificate forming.
+///
+/// Virtual time on the paused clock, like [`STEP_TIMEOUT`]. It is longer than the certifier's 10s
+/// vote-retry ceiling, so any retry that was going to fire has fired before the window closes.
+const QUIET_WINDOW: Duration = Duration::from_secs(30);
 
 /// Receive the certifier's next network command, panicking if none arrives within
 /// [`STEP_TIMEOUT`].
@@ -207,7 +216,7 @@ async fn drive_vote_requests(
 // genesis parent certs. The certifier fetches the cert from the store and retries;
 // on the retry the peer returns a valid vote. A certificate still forms.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn missing_parents_happy_path() {
     let mut cx = CertifierContext::new();
     let committee = cx.fixture.committee();
@@ -308,7 +317,7 @@ async fn missing_parents_happy_path() {
 // set. The certifier filters them out (count mismatch) and fails that vote task.
 // When ALL peers return fake-digest MissingParents, no certificate forms.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn missing_parents_fake_digests() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -357,7 +366,7 @@ async fn missing_parents_fake_digests() {
 
     // No certificate should form.
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all peers return fake-digest MissingParents"
     );
 }
@@ -368,7 +377,7 @@ async fn missing_parents_fake_digests() {
 // parent set), but the cert store is empty so the certifier cannot satisfy the
 // request (count mismatch). The vote task fails and no certificate forms.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn missing_parents_store_miss() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -416,7 +425,7 @@ async fn missing_parents_store_miss() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when cert store cannot satisfy MissingParents"
     );
 }
@@ -427,7 +436,7 @@ async fn missing_parents_store_miss() {
 // valid vote on the retry. A certificate still forms — transient errors do not
 // permanently disqualify a peer.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn transient_network_error_retries() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -494,7 +503,7 @@ async fn transient_network_error_retries() {
 // cancels all outstanding vote tasks for header 1 and starts fresh for header 2.
 // Only a certificate for header 2 is produced.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn new_header_cancels_inflight() {
     let mut cx = CertifierContext::new();
     let proposer_id = cx.proposer().id();
@@ -589,7 +598,7 @@ async fn new_header_cancels_inflight() {
 // A header whose epoch does not match the committee's current epoch is rejected
 // by propose_header with DagError::InvalidEpoch. No certificate forms.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn wrong_epoch_header_rejected() {
     let mut cx = CertifierContext::new();
     let committee = cx.fixture.committee();
@@ -614,13 +623,13 @@ async fn wrong_epoch_header_rejected() {
 
     // No vote requests should arrive (certifier rejects before sending requests).
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cx.network_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cx.network_rx.recv()).await.is_err(),
         "certifier should not send vote requests for wrong-epoch header"
     );
 
     // No certificate should form.
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate for wrong-epoch header"
     );
 }
@@ -631,7 +640,7 @@ async fn wrong_epoch_header_rejected() {
 // the committee (authority_id() == None), it returns early. Sending a header
 // produces no vote requests.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn non_cvv_node_skips_certifier() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let any_auth = fixture.authorities().next().expect("committee has authorities");
@@ -670,7 +679,7 @@ async fn non_cvv_node_skips_certifier() {
     cb.headers().send(header).await.unwrap();
 
     // is_err() = timeout (no message); Ok(None) = channel closed (no message sent either.
-    let result = tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await;
+    let result = tokio::time::timeout(QUIET_WINDOW, network_rx.recv()).await;
     assert!(
         result.map_or(true, |opt| opt.is_none()),
         "non-CVV node must not send any vote requests"
@@ -683,7 +692,7 @@ async fn non_cvv_node_skips_certifier() {
 // The certifier rejects the vote (DagError::UnexpectedVote) and the vote task
 // for that peer fails. With all remaining peers also tampered, no cert forms.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_wrong_author() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -730,7 +739,7 @@ async fn vote_wrong_author() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes have wrong author"
     );
 }
@@ -740,7 +749,7 @@ async fn vote_wrong_author() {
 // A peer returns a vote whose `header_digest` field doesn't match the proposed
 // header. The certifier rejects the vote (DagError::UnexpectedVote).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_wrong_header_digest() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -782,7 +791,7 @@ async fn vote_wrong_header_digest() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes have wrong header_digest"
     );
 }
@@ -792,7 +801,7 @@ async fn vote_wrong_header_digest() {
 // A peer returns a vote whose `origin` field doesn't match the header's author.
 // The certifier rejects the vote (DagError::UnexpectedVote).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_wrong_origin() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -836,7 +845,7 @@ async fn vote_wrong_origin() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes have wrong origin"
     );
 }
@@ -846,7 +855,7 @@ async fn vote_wrong_origin() {
 // A peer returns a vote whose `epoch` field doesn't match the header's epoch.
 // The certifier rejects the vote (DagError::InvalidEpoch).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_epoch_mismatch() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -888,7 +897,7 @@ async fn vote_epoch_mismatch() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes have wrong epoch"
     );
 }
@@ -898,7 +907,7 @@ async fn vote_epoch_mismatch() {
 // A peer returns a vote whose `round` field doesn't match the header's round.
 // The certifier rejects the vote (DagError::InvalidRound).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_round_mismatch() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -940,7 +949,7 @@ async fn vote_round_mismatch() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes have wrong round"
     );
 }
@@ -950,7 +959,7 @@ async fn vote_round_mismatch() {
 // A peer returns a vote whose `author` is a key not in the committee at all.
 // The certifier rejects the vote (DagError::UnknownAuthority).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn vote_unknown_authority() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -995,7 +1004,7 @@ async fn vote_unknown_authority() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cert_rx.recv()).await.is_err(),
+        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
         "expected no certificate when all votes claim an unknown author"
     );
 }
@@ -1006,7 +1015,7 @@ async fn vote_unknown_authority() {
 // must be rejected with `DagError::AuthorityReuse`, while unique votes from the
 // remaining peers can still form a certificate.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn duplicate_vote_rejected_quorum_still_forms() {
     let cx = CertifierContext::new();
     let header = cx.proposer_header();
@@ -1045,7 +1054,7 @@ async fn duplicate_vote_rejected_quorum_still_forms() {
 // Certifier starts, it publishes that cert to the gossip network on startup
 // (NetworkCommand::Publish) before processing any new headers.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn startup_republish_highest_cert() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let proposer = fixture.authorities().last().expect("committee has authorities");
@@ -1080,7 +1089,7 @@ async fn startup_republish_highest_cert() {
 // validates the threshold boundary without hardcoding a number.
 // See Issue #646: always use committee.quorum_threshold(), never hardcode.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn minimum_quorum_exactly_threshold() {
     // 4-node committee: quorum is 3 out of 4 (f=1, 2f+1=3).
     let mut cx = CertifierContext::new();
@@ -1150,7 +1159,7 @@ async fn minimum_quorum_exactly_threshold() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_to_form_certificate() {
     let mut cx = CertifierContext::new();
     let committee = cx.fixture.committee();
@@ -1194,13 +1203,9 @@ async fn propose_header_failure() {
         .await;
 
     // Fatal peer errors should cause proposal failure without publishing a cert.
-    // Yield a few times so the certifier can process all vote task results, then
-    // assert the cert channel is still empty without relying on wall-clock time.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-
-    if let Ok(result) = cert_rx.try_recv() {
+    // The paused clock only reaches the end of the quiet window once every task is idle,
+    // so the certifier has processed all vote task results before this can pass.
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
         panic!("expected no certificate to form; got {result:?}");
     }
 
@@ -1286,11 +1291,11 @@ async fn run_vote_aggregator_with_param(
         assert_eq!(cert.header().digest(), proposed_digest);
     } else {
         // A cert is not expected; verify it times out without forming.
-        assert!(tokio::time::timeout(Duration::from_secs(5), cert_rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err());
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_shutdown_core() {
     let cx = CertifierContext::new();
     let config = cx.proposer().consensus_config().clone();
@@ -1298,7 +1303,8 @@ async fn test_shutdown_core() {
     // send request to spawn voting sub-tasks
     cx.consensus_bus.headers().send(Header::default()).await.expect("send header for proposal");
 
-    // sleep briefly so certifier has time to subscribe then shutdown the core
+    // on the paused clock this sleep ends only once every task is idle, so the certifier has
+    // subscribed before the core is shut down
     tokio::time::sleep(Duration::from_millis(100)).await;
     config.shutdown().notify();
     let mut task_manager = cx.task_manager;
@@ -1310,7 +1316,7 @@ async fn test_shutdown_core() {
 
 /// One vote request will produce an error, make sure the certificate is still formed with the good
 /// votes. I.E. the vote error does not derail the entire process leaving a broken DAG.
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_headers_one_bad() {
     let mut cx = CertifierContext::with_size(10);
     let committee = cx.fixture.committee();
