@@ -49,7 +49,7 @@ help:
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
 	@echo "make test-e2e-forked" ;
-	@echo "    :::> Run the e2e suite with the seed-signature, PREVRANDAO and leader-seeded-ordering forks armed from genesis." ;
+	@echo "    :::> Run the e2e suite with the seed-signature, PREVRANDAO, leader-seeded-ordering and sub-second-timestamp forks armed from genesis." ;
 	@echo ;
 	@echo "make test-e2e-governance-safe" ;
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
@@ -118,6 +118,9 @@ test:
 	cargo nextest run --workspace --no-fail-fast ;
 
 # run workspace unit tests with cargo test (fallback if nextest not installed)
+# NOTE: tests that pin fork epochs through TN_*_FORK_EPOCH (proposer, voter, sub-DAG clamp,
+# payload and engine tests) rely on nextest's one-process-per-test model; the overrides are
+# latched once per process, so under a single-process `cargo test` those tests fail loudly.
 test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 
@@ -178,10 +181,11 @@ E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
 # seed_signature_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 
-# Multi-workers fork epoch for the e2e lanes (#554). Same shape as the seed-signature
-# variable above and armed independently of it: defaults to u32::MAX so the default lanes run
-# the fork DORMANT (legacy single-worker committee layout, what adiri carries on disk);
-# non-adiri builds are otherwise active from genesis. Override for a fork-active lane:
+# Multi-workers fork epoch for the e2e lanes (issue #554). Same shape as the
+# seed-signature variable above and armed independently of it: defaults to u32::MAX so the
+# default lanes run the fork DORMANT (the legacy single-worker committee layout, which adiri
+# writes for every epoch below its compiled MULTI_WORKERS_FORK_EPOCH of 570); without the
+# override, non-adiri builds are active from genesis. Override for a fork-active lane:
 #   TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs
 # Only test-utils builds consult it (tn_types::forks::multi_workers_fork_epoch_override).
 # Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
@@ -190,8 +194,9 @@ TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
 
 # PREVRANDAO fork epoch for the e2e lanes (#1247). Same shape as the two variables above.
 # Defaults to u32::MAX so the default lanes run the fork DORMANT (the legacy
-# `output_digest ^ batch_digest` mix hash, what adiri has already executed); non-adiri builds
-# are otherwise active from genesis. NOT independent of the seed-signature variable in the
+# `output_digest ^ batch_digest` mix hash, which adiri executes for every epoch below its
+# compiled PREVRANDAO_FORK_EPOCH of 574); without the override, non-adiri builds are active
+# from genesis. NOT independent of the seed-signature variable in the
 # arming direction: `prevrandao_seed_active` requires `seed_signature_active`, so a lane needs
 # BOTH armed to reach the seeded derivation. That invocation is the `test-e2e-forked` target
 # below, which is what keeps the seeded arm from having zero process-level coverage.
@@ -214,13 +219,27 @@ TN_PREVRANDAO_FORK_EPOCH ?= 4294967295
 # leader_seeded_ordering_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_LEADER_SEEDED_ORDERING_FORK_EPOCH ?= 0
 
+# Sub-second-timestamp fork epoch for the e2e lanes. Defaults to 0 for the same reason as the
+# leader-seeded-ordering variable above: non-adiri builds are active from genesis for this fork,
+# and its gate (tn_types::forks::subsecond_timestamp_active) conjoins the seed-signature fork
+# fail-closed, so with TN_SEED_SIGNATURE_FORK_EPOCH left dormant every lane keeps the
+# seconds-only header layout and timestamp rules regardless of this value. test-e2e-forked (seed
+# fork 0) is the lane that runs millisecond timestamps. Override for a boundary-crossing lane:
+#   TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=1 make test-epochs
+# Only test-utils builds consult it (tn_types::forks::subsecond_timestamp_fork_epoch_override).
+# Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
+# subsecond_timestamp_override_is_inert_when_unset requires a process WITHOUT the variable.
+TN_SUBSECOND_TIMESTAMP_FORK_EPOCH ?= 0
+
 # Governance-Safe fork epoch for the e2e lanes. Defaults to u32::MAX so every lane below runs
-# the fork DORMANT (the state live adiri carries). UNLIKE the four variables above it cannot arm
-# the fork on those lanes at all: the entire mechanism — governance_safe_fork_epoch,
-# apply_governance_safe_fork, and the boundary trigger in tn-reth's `finish` — is
-# #[cfg(feature = "adiri")], with no unconditional entry point, and `build-e2e-bin` builds the
-# node binary WITHOUT `adiri`. On the test-restarts/test-epochs/test-e2e/test-e2e-forked binaries
-# the fork is therefore compiled out and this variable only decorates the child's startup log.
+# the fork DORMANT (the pre-fork Safe state, which live adiri keeps until its compiled
+# GOVERNANCE_SAFE_FORK_EPOCH of 554 fires in the block closing epoch 553). UNLIKE the five
+# variables above it cannot arm the fork on those lanes at all: the entire mechanism —
+# governance_safe_fork_epoch, apply_governance_safe_fork, and the boundary trigger in tn-reth's
+# `finish` — is #[cfg(feature = "adiri")], with no unconditional entry point, and
+# `build-e2e-bin` builds the node binary WITHOUT `adiri`. On the
+# test-restarts/test-epochs/test-e2e/test-e2e-forked binaries the fork is therefore compiled
+# out and this variable only decorates the child's startup log.
 # The one invocation that arms it is `make test-e2e-governance-safe` below, which runs the adiri
 # e2e binary and supplies its own TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH. Arming this variable on a
 # lane below is now a named test failure rather than a silent no-op — see
@@ -243,28 +262,32 @@ TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH ?= 2
 
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run the e2e tests with the PREVRANDAO fork ARMED, the only invocation that executes the
 # seeded mix hash on spawned nodes. Both variables are required and neither is redundant:
 # `prevrandao_seed_active` is their conjunction, so arming PREVRANDAO alone leaves the legacy
-# XOR in force. Until the arming PR lands this is the post-fork wire format's only
-# process-level coverage; a script still using the older one-variable
+# XOR in force. This lane is the post-fork wire format's only process-level coverage: every
+# other lane keeps the u32::MAX default, which on the adiri lane also overrides the compiled
+# PREVRANDAO_FORK_EPOCH of 574. A script still using the older one-variable
 # `TN_SEED_SIGNATURE_FORK_EPOCH=0 make test-e2e` form now exercises the legacy arm.
-# Arming the seed fork here also arms leader-seeded ordering (#1260), whose fork point
-# defaults to 0 and whose gate conjoins the seed fork: this lane runs the whole post-fork
-# world, which is what a non-adiri build does from genesis. Pass
-# TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295 to isolate the PREVRANDAO change instead.
+# Arming the seed fork here also arms leader-seeded ordering (#1260) and sub-second
+# timestamps, whose fork points default to 0 and whose gates conjoin the seed fork: this lane
+# runs the seed-signature, PREVRANDAO, leader-seeded-ordering and sub-second-timestamp forks
+# together, as a non-adiri build does from genesis (the multi-workers fork stays on its
+# u32::MAX default). Pass
+# TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295 TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=4294967295
+# to isolate the PREVRANDAO change instead.
 # Recursive rather than a second nextest line so the lane cannot drift from `test-e2e`;
 # command-line assignments override the `?=` defaults above.
 test-e2e-forked:
@@ -288,16 +311,18 @@ test-e2e-forked:
 # without the marker is a hard failure too, which is what stops the (previously advertised, and
 # false) `TN_GOVERNANCE_SAFE_FORK_EPOCH=2 make test-e2e` form from looking like it did something.
 #
-# All four sibling fork variables are pinned explicitly rather than left to the build: an adiri
-# build compiles DIFFERENT defaults for every one of them (383/407/...) than a default build, so
-# forwarding the same values the lanes above use is what keeps this lane differing from
+# All five sibling fork variables are pinned explicitly rather than left to the build: an adiri
+# build compiles DIFFERENT fork epochs for every one of them than a default build, which has
+# all five active from genesis (adiri: seed-signature 383, multi-workers 570, PREVRANDAO 574,
+# leader-seeded ordering 567, sub-second timestamps u32::MAX). Forwarding the same values the
+# lanes above use overrides those compiled constants and is what keeps this lane differing from
 # `test-epochs` in exactly one dimension — the governance-Safe fork. (adiri also compiles in
 # CONSENSUS_REGISTRY_FORK_EPOCH = 407 and ADIRI_DUP_BATCH_EPOCH = 160; the first is far outside a
 # 3-epoch run, the second only changes duplicate-batch attribution, which this lane never
 # produces.) The test itself runs at chain id 2017, which an adiri binary requires and every
 # other lane must not use.
 test-e2e-governance-safe: build-e2e-bin-adiri
-	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
+	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -375,8 +400,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

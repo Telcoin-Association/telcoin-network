@@ -27,9 +27,10 @@ use std::{
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
-    forks::seed_signature_active, now, AuthorityIdentifier, BlockHash, Certificate, Committee,
-    Database, Epoch, EpochDigest, EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager,
-    TaskSpawner, TnReceiver, TnSender, WorkerId,
+    forks::{seed_signature_active, subsecond_timestamp_active},
+    now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
+    EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
+    TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -273,22 +274,32 @@ impl<DB: Database> Proposer<DB> {
             prior_epoch_record,
             key_config,
         } = identity;
-        // check that the included timestamp is consistent with the parent's timestamp
-        //
-        // ie) the current time is *after* the timestamp in all included headers
-        //
-        // if not: log an error and sleep
-        let latest_parent = parents.iter().map(|c| *c.header().created_at()).max().unwrap_or(0);
-        let current_time = now();
-        if current_time < latest_parent {
-            let drift_sec = latest_parent - current_time;
-            error!(
-                ?current_time,
-                ?latest_parent,
-                "Current time earlier than most recent parent! Sleeping for {}sec until max parent time...",
-                drift_sec,
-            );
-            sleep(Duration::from_secs(drift_sec)).await;
+        // voters reject a header that is not timestamped after its parents: strictly later at
+        // millisecond granularity once the sub-second fork is active for this header's epoch,
+        // and at-or-after in whole seconds before it. pre-fork `Header::new` drops the
+        // milliseconds, so clamping to the latest parent itself reproduces the seconds rule.
+        let millis_active = subsecond_timestamp_active(current_epoch);
+        let min_created_at = parents
+            .iter()
+            .map(|c| c.header().created_at_ms())
+            .max()
+            .map(|latest| if millis_active { latest.saturating_add_millis(1) } else { latest });
+
+        // a certified parent can sit ahead of this node's clock by up to the voters' drift
+        // tolerance, so this is expected rather than a fault: wait out exactly the gap
+        if let Some(min_created_at) = min_created_at {
+            let current_time = now_ms();
+            if current_time < min_created_at {
+                let drift_ms = min_created_at.as_millis() - current_time.as_millis();
+                debug!(
+                    target: "primary::proposer",
+                    %current_time,
+                    %min_created_at,
+                    drift_ms,
+                    "latest parent not yet in the past - sleeping until it is",
+                );
+                sleep(Duration::from_millis(drift_ms)).await;
+            }
         }
 
         // Sign the seed message for exactly this `(epoch, round)`. It is signed here, immediately
@@ -309,6 +320,10 @@ impl<DB: Database> Proposer<DB> {
             Default::default()
         };
 
+        // clamped instead of trusting the sleep alone: the sleep runs on tokio's monotonic clock
+        // while `now_ms` reads the wall clock, and the two can disagree (e.g. after a clock step)
+        let created_at = now_ms().max(min_created_at.unwrap_or_default());
+
         let header = Header::new(
             author,
             current_round,
@@ -317,6 +332,7 @@ impl<DB: Database> Proposer<DB> {
             parents.iter().map(|x| x.header().digest()).collect(),
             consensus_bus.app().latest_execution_block_num_hash(),
             seed_signature,
+            created_at,
         );
 
         // Metric: header_proposed - tracks header proposals

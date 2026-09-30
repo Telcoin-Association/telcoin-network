@@ -92,6 +92,9 @@ lane_clippy() {
 }
 
 lane_test_default() {
+    # Keep this library-only: workspace tests unify dev-dependency features and can
+    # hide missing dependency features in tn-types/test-utils.
+    run cargo check --locked -p tn-types --features test-utils --lib
     run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 

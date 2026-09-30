@@ -186,6 +186,7 @@ fn prepare_worker_networks<Events: Clone>(
     );
 
     let mut addresses = HashSet::with_capacity(configured);
+    let mut rpc_endpoints = HashSet::with_capacity(configured);
     workers
         .iter()
         .zip(event_streams)
@@ -211,6 +212,16 @@ fn prepare_worker_networks<Events: Clone>(
                     "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in node config"
                 )
             })?;
+            if configured > 1 && p2p.rpc.is_none() {
+                warn!(target: "epoch-manager", worker_id,
+                    "worker advertises no JSON-RPC endpoint: observers cannot forward transactions to this node on this worker's lane; configure it with `keytool set-rpc --worker-id {worker_id} --http URL`");
+            }
+            p2p.rpc.iter().for_each(|rpc| {
+                if !rpc_endpoints.insert(&rpc.http) {
+                    warn!(target: "epoch-manager", worker_id, http = %rpc.http,
+                        "workers advertise the same JSON-RPC endpoint; ensure the gateway routes transactions to the correct worker");
+                }
+            });
             Ok(PreparedWorkerNetwork {
                 worker_id,
                 p2p: p2p.clone(),
@@ -245,9 +256,10 @@ pub(crate) struct EpochManager<P, DB> {
     node_shutdown: ShutdownNotifier,
     /// The timestamp to close the current epoch.
     ///
-    /// The manager monitors leader timestamps for the epoch boundary.
-    /// If the timestamp of the leader is >= the epoch_boundary then the
-    /// manager closes the epoch after the engine executes all data.
+    /// The manager monitors commit timestamps for the epoch boundary through
+    /// `ConsensusOutput::reaches_epoch_boundary` (whole seconds; the sub-second
+    /// part of a commit never affects the decision). Once an output reaches the
+    /// boundary the manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
@@ -793,12 +805,14 @@ where
     /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip`, before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], restore execution state with
-    /// [`try_restore_state`](Self::try_restore_state), and spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), register bootstrap peers, bind all
+    /// [`try_restore_state`](Self::try_restore_state), pin the epoch-start committee, seed fees
+    /// for epochs after epoch 0, publish the locally known node mode, and bind worker 0's RPC.
+    /// Spawn the long-running p2p networks ([`spawn_node_networks`](Self::spawn_node_networks)),
+    /// register bootstrap peers, bind all
     /// p2p listeners, schedule process-lifetime bootstrap dials, spawn the vote collector, and
-    /// re-vote durable records. Read the epoch-start-pinned committee, seed the in-memory epoch-0
+    /// re-vote durable records. Reuse the startup-pinned committee, seed the in-memory epoch-0
     /// anchor if needed, then poll for peers and sync epoch records within `STARTUP_SYNC_TIMEOUT`.
-    /// Seed the node-mode watch using both committee views before spawning the background record
+    /// Refresh the node-mode watch using both committee views before spawning the background record
     /// collector and the engine-update task. It then launches the epoch pack fetch workers before
     /// requesting any missing epoch pack files, followed by the recent-consensus fetch task.
     ///
@@ -920,6 +934,46 @@ where
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
         self.try_restore_state(&engine).await?;
 
+        // Pin startup membership and fees to the epoch's closing block before exposing RPC.
+        // Catchup restores gas usage, while epoch entry normally supplies these fees later.
+        // Epoch 0 keeps the protocol-minimum defaults because it has no preceding close.
+        let (committee, _, _, epoch_start_header) =
+            self.get_committee_with_epoch_start_info(&engine).await?;
+        if committee.epoch() > 0 {
+            read_base_fees_for_entered_epoch(
+                &engine.get_reth_env().await,
+                committee.epoch(),
+                &epoch_start_header,
+            )
+            .await?
+            .apply(&gas_accumulator);
+        }
+
+        let public_key = self.key_config.primary_public_key();
+        let is_committee_member = committee.authority_by_key(&public_key).is_some();
+        let initial_mode =
+            if is_committee_member { NodeMode::CvvActive } else { NodeMode::Observer };
+        // Publish before tn_nodeMode is reachable; the post-sync seed re-applies the record veto.
+        seed_node_mode_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.node_mode(),
+            &public_key,
+            committee.epoch(),
+            initial_mode,
+        )
+        .await;
+
+        // Bind worker 0's RPC before either startup synchronization or epoch peer waits. Its
+        // network shim reports syncing until the first epoch publishes the node's mode.
+        engine
+            .initialize_worker_components(
+                DEFAULT_WORKER_ID,
+                self.engine_to_primary_rpc(&engine).await?,
+                gas_accumulator.base_fee(DEFAULT_WORKER_ID),
+                gas_accumulator.worker_base_fee(DEFAULT_WORKER_ID),
+            )
+            .await?;
+
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
         // #765). Genesis is the single source of truth; this one value is read by the
@@ -1040,11 +1094,9 @@ where
         // seed the dummy, sync records, seed the mode, then start background collection. The
         // re-vote hook must never see the uncertifiable dummy, and the two record
         // collectors must not race.
-        // This pinned read uses committee.yaml at genesis and the epoch-start state afterward;
-        // a mid-epoch governance burn must not change the startup membership decision.
-        let (committee, ..) = self.get_committee_with_epoch_start_info(&engine).await?;
-        let public_key = self.key_config.primary_public_key();
-        let initial_mode = if committee.authority_by_key(&public_key).is_some() {
+        // Reuse the committee pinned before RPC startup, so a mid-epoch governance burn cannot
+        // change the startup membership decision.
+        if is_committee_member {
             // Committee dials run concurrently with bounded epoch-record synchronization.
             committee
                 .bls_keys()
@@ -1058,10 +1110,7 @@ where
                         node_task_spawner.clone(),
                     );
                 });
-            NodeMode::CvvActive
-        } else {
-            NodeMode::Observer
-        };
+        }
         if !self.consensus_chain.epochs().contains_epoch(0).await {
             eyre::ensure!(
                 committee.epoch() == 0,
@@ -1851,6 +1900,24 @@ mod tests {
             },
         )?;
         Ok(())
+    }
+
+    /// Private worker lanes and shared RPC gateways are supported configurations, even though
+    /// startup warns about their effect on observer forwarding.
+    #[test]
+    fn prepare_worker_networks_accepts_private_workers_and_shared_gateways() -> eyre::Result<()> {
+        let keys = worker_key_config();
+        let first = worker_p2p(&keys, 0)?;
+        [None, first.rpc.clone()].into_iter().try_for_each(|rpc| -> eyre::Result<()> {
+            let second = P2pNode { rpc, ..worker_p2p(&keys, 1)? };
+            let workers = [first.clone(), second];
+            let prepared = prepare_worker_networks(&workers, &[(), ()], &keys, Epoch::MAX, 2)?;
+            assert_eq!(prepared.len(), 2);
+            prepared.iter().zip(workers).for_each(|(prepared, configured)| {
+                assert_eq!(prepared.p2p, configured);
+            });
+            Ok(())
+        })
     }
 
     /// Both missing and surplus event streams are rejected instead of silently truncating `zip`.
