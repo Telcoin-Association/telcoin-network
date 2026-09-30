@@ -4932,7 +4932,7 @@ pub(crate) mod test {
         leader_1.update_header_author_for_test(authority_1);
         for batch in &batches_1 {
             let mut builder = HeaderBuilder::from_header(leader_1.header());
-            builder = builder.with_payload_batch(&batch, 0_u16);
+            builder = builder.with_payload_batch(batch, 0_u16);
             leader_1.update_header_for_test(builder.build());
         }
         let sub_dag_index_1 = 1;
@@ -5245,7 +5245,7 @@ pub(crate) mod test {
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
-            parent = consensus_output.digest().into();
+            parent = consensus_output.digest();
             outputs.push(consensus_output.clone());
             pack.save_consensus_output(consensus_output).await.unwrap();
         }
@@ -5253,8 +5253,8 @@ pub(crate) mod test {
             let output_db = pack
                 .get_consensus_output(i as u64 + 1)
                 .await
-                .expect(&format!("consensus output for {}", i + 1));
-            let output = outputs.get(i as usize).unwrap();
+                .unwrap_or_else(|_| panic!("consensus output for {}", i + 1));
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
 
@@ -5273,7 +5273,7 @@ pub(crate) mod test {
                 (i + num_outputs) as u64 + 1,
                 parent,
             );
-            parent = consensus_output.digest().into();
+            parent = consensus_output.digest();
             outputs.push(consensus_output.clone());
             pack.save_consensus_output(consensus_output).await.unwrap();
         }
@@ -5282,7 +5282,7 @@ pub(crate) mod test {
                 .get_consensus_output(i as u64 + 1)
                 .await
                 .unwrap_or_else(|e| panic!("failed output on {i}: {e}"));
-            let output = outputs.get(i as usize).unwrap();
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
         pack.persist().await.expect("persist");
@@ -5292,7 +5292,7 @@ pub(crate) mod test {
         let pack = ConsensusPack::open_static(temp_dir.path(), 0).unwrap();
         for i in 0..(num_outputs * 2) {
             let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
-            let output = outputs.get(i as usize).unwrap();
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
         assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
@@ -5330,13 +5330,13 @@ pub(crate) mod test {
             .await;
             for i in 0..num_outputs {
                 let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
-                let output = outputs.get(i as usize).unwrap();
+                let output = outputs.get(i).unwrap();
                 compare_outputs(&output_db, output);
             }
             for i in 0..num_outputs {
                 let output_db =
                     pack.get_consensus_output((i + num_outputs) as u64 + 1).await.unwrap();
-                let output = outputs.get(i as usize + num_outputs).unwrap();
+                let output = outputs.get(i + num_outputs).unwrap();
                 compare_outputs(&output_db, output);
             }
             assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
@@ -5371,8 +5371,8 @@ pub(crate) mod test {
             let output_db = pack
                 .get_consensus_output(i as u64 + 1)
                 .await
-                .expect(&format!("failed to get output (damage 1) {i}"));
-            let output = outputs.get(i as usize).unwrap();
+                .unwrap_or_else(|_| panic!("failed to get output (damage 1) {i}"));
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
         assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_err());
@@ -5383,13 +5383,13 @@ pub(crate) mod test {
             let output_db = pack
                 .get_consensus_output(i as u64 + 1)
                 .await
-                .expect(&format!("failed to get output (damage 1) {i}"));
-            let output = outputs.get(i as usize).unwrap();
+                .unwrap_or_else(|_| panic!("failed to get output (damage 1) {i}"));
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
 
         let output_db = pack.get_consensus_output(num_outputs as u64 * 2).await.unwrap();
-        let output = outputs.get((num_outputs as usize * 2) - 1).unwrap();
+        let output = outputs.get((num_outputs * 2) - 1).unwrap();
         compare_outputs(&output_db, output);
         pack.persist().await.unwrap();
         drop(pack);
@@ -5415,8 +5415,8 @@ pub(crate) mod test {
             let output_db = pack
                 .get_consensus_output(i as u64 + 1)
                 .await
-                .expect(&format!("failed to get output (damage 1) {i}"));
-            let output = outputs.get(i as usize).unwrap();
+                .unwrap_or_else(|_| panic!("failed to get output (damage 1) {i}"));
+            let output = outputs.get(i).unwrap();
             compare_outputs(&output_db, output);
         }
         drop(pack);
@@ -5453,7 +5453,7 @@ pub(crate) mod test {
             1,
             ConsensusHeader::default().digest(),
         );
-        let output_2 = make_test_output(&committee, 2, chain.clone(), 2, output_1.digest().into());
+        let output_2 = make_test_output(&committee, 2, chain.clone(), 2, output_1.digest());
         pack.save_consensus_output(output_1.clone()).await.unwrap();
         pack.save_consensus_output(output_2.clone()).await.unwrap();
 
@@ -6160,7 +6160,7 @@ pub(crate) mod test {
             1,
             ConsensusHeader::default().digest(),
         );
-        let out2 = make_test_output(&committee, 2, chain.clone(), 2, out1.digest().into());
+        let out2 = make_test_output(&committee, 2, chain.clone(), 2, out1.digest());
         pack.save_consensus_output(out1.clone()).await.unwrap();
         pack.save_consensus_output(out2.clone()).await.unwrap();
         pack.persist().await.expect("persist");
@@ -6311,7 +6311,7 @@ pub(crate) mod test {
         let mut parent = ConsensusHeader::default().digest();
         for i in 0..3 {
             let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
-            parent = output.digest().into();
+            parent = output.digest();
             pack.save_consensus_output(output).await.unwrap();
         }
         // start_consensus_number is 1 for epoch 0; 0 is below range.
@@ -6341,7 +6341,7 @@ pub(crate) mod test {
             for i in 0..5 {
                 let output =
                     make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
-                parent = output.digest().into();
+                parent = output.digest();
                 pack.save_consensus_output(output).await.unwrap();
             }
             pack.persist().await.expect("persist");
@@ -9089,7 +9089,7 @@ pub(crate) mod test {
         let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let output = make_test_output(&committee, i % 4, chain.clone(), i as u64 + 1, parent);
-            parent = output.digest().into();
+            parent = output.digest();
             outputs.push(output.clone());
             pack.save_consensus_output(output).await.unwrap();
         }
@@ -9112,7 +9112,7 @@ pub(crate) mod test {
             0,
             chain.clone(),
             num_outputs as u64 + 1,
-            outputs[num_outputs - 1].digest().into(),
+            outputs[num_outputs - 1].digest(),
         );
         pack.save_consensus_output(extra).await.unwrap();
         pack.persist().await.expect("persist extra");
@@ -9148,9 +9148,9 @@ pub(crate) mod test {
             "last stream-imported output to be readable",
         )
         .await;
-        for i in 0..num_outputs {
+        for (i, expected) in outputs.iter().enumerate().take(num_outputs) {
             let got = imported.get_consensus_output(i as u64 + 1).await.unwrap();
-            compare_outputs(&got, &outputs[i]);
+            compare_outputs(&got, expected);
         }
         // The output appended after the snapshot must NOT be in the bounded copy.
         assert!(
@@ -10628,12 +10628,10 @@ pub(crate) mod test {
     #[cfg(feature = "adiri")]
     fn legacy_pack_outputs(committee: &Committee, previous: &EpochRecord) -> Vec<ConsensusOutput> {
         let mut parent = previous.final_consensus.hash;
-        let mut number = previous.final_consensus.number + 1;
         let mut outputs = Vec::new();
-        for tag in [1_u8, 2] {
+        for (number, tag) in (previous.final_consensus.number + 1..).zip([1_u8, 2]) {
             let output = legacy_pack_output(committee, number, parent, tag);
             parent = output.digest();
-            number += 1;
             outputs.push(output);
         }
         outputs

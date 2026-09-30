@@ -2764,7 +2764,7 @@ mod test {
             let by_epoch = db
                 .record_by_epoch(record.epoch)
                 .await
-                .expect(&format!("damaged reopen: epoch {}", record.epoch));
+                .unwrap_or_else(|| panic!("damaged reopen: epoch {}", record.epoch));
             assert_eq!(by_epoch.digest(), record.digest());
         }
         // The damaged final record should be gone.
@@ -2798,7 +2798,7 @@ mod test {
             let by_epoch = db
                 .record_by_epoch(record.epoch)
                 .await
-                .expect(&format!("extended reopen: epoch {}", record.epoch));
+                .unwrap_or_else(|| panic!("extended reopen: epoch {}", record.epoch));
             assert_eq!(by_epoch.digest(), record.digest());
         }
         drop(db);
@@ -2957,8 +2957,7 @@ mod test {
 
         // The rebuild must fail closed, not silently drop the sealed log's acked records.
         let err = EpochRecordDb::open(temp_dir.path())
-            .err()
-            .expect("open must fail closed on sealed-log corruption");
+            .expect_err("open must fail closed on sealed-log corruption");
         assert!(matches!(err, EpochDbError::CorruptLog(_)), "expected CorruptLog, got {err:?}");
     }
 

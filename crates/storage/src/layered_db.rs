@@ -1266,7 +1266,7 @@ mod test {
         use tn_types::DbTxMut as _;
         let temp_dir = tempdir().expect("failed to create temp dir");
         let raw = MdbxDatabase::open(
-            &temp_dir.path().join("mdbx_commit_fail"),
+            temp_dir.path().join("mdbx_commit_fail"),
             4,
             16 * MEGABYTE,
             8 * MEGABYTE,
@@ -1311,7 +1311,7 @@ mod test {
         use tn_types::DbTxMut as _;
         let temp_dir = tempdir().expect("failed to create temp dir");
         let raw =
-            MdbxDatabase::open(&temp_dir.path().join("mdbx_latch"), 4, 16 * MEGABYTE, 8 * MEGABYTE)
+            MdbxDatabase::open(temp_dir.path().join("mdbx_latch"), 4, 16 * MEGABYTE, 8 * MEGABYTE)
                 .expect("Cannot open database");
         raw.open_table::<TestTable>().expect("failed to open table!");
         // full_memory=true mirrors the epoch DB, where the recast reads the authoritative mem
@@ -1354,7 +1354,7 @@ mod test {
         // and this test fails.
         let temp_dir = tempdir().expect("failed to create temp dir");
         let raw = MdbxDatabase::open(
-            &temp_dir.path().join("mdbx_bare_insert_latch"),
+            temp_dir.path().join("mdbx_bare_insert_latch"),
             4,
             16 * MEGABYTE,
             8 * MEGABYTE,
@@ -1393,7 +1393,7 @@ mod test {
         use tn_types::DbTxMut as _;
         let temp_dir = tempdir().expect("failed to create temp dir");
         let raw = MdbxDatabase::open(
-            &temp_dir.path().join("mdbx_cache_retain_fail"),
+            temp_dir.path().join("mdbx_cache_retain_fail"),
             4,
             16 * MEGABYTE,
             8 * MEGABYTE,

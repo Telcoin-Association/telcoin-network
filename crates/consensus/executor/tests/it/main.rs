@@ -36,7 +36,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_output_to_header").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
             .await
             .unwrap();
@@ -63,7 +63,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
 
     // yield for subscriber to spawn
@@ -83,7 +83,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -163,7 +163,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -185,7 +185,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -202,7 +202,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -273,7 +273,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -295,7 +295,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -312,7 +312,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -416,7 +416,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_duplicate_batch_digest").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -439,7 +439,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -510,7 +510,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -623,7 +623,7 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 

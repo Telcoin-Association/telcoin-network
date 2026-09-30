@@ -307,7 +307,7 @@ async fn propose_headers_one_bad() {
             // Break the signature, a lot of errors will be filtered before they get to what we are
             // testing...
             vote.signature =
-                primary.consensus_config().key_config().request_signature_direct(&vec![0_u8, 0_u8]);
+                primary.consensus_config().key_config().request_signature_direct(&[0_u8, 0_u8]);
         }
         peer_votes.insert(name, vote);
     }

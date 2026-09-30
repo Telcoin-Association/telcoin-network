@@ -111,7 +111,7 @@ async fn test_epoch_boundary_inner(
         debug!(target: "epoch-test", "pending tx: {pending:?}");
         // Txns may land right at an epoch boundary, get orphaned, and be re-injected into
         // the next epoch. Allow two full epoch durations + startup buffer for confirmation.
-        timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
+        timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
     }
 
     // cross-check the `tn` namespace ConsensusRegistry endpoints against direct eth_call reads
@@ -336,7 +336,7 @@ async fn test_epoch_sync_inner(
     committee: &[(&str, Address)],
     temp_path: &Path,
     test: &str,
-    endpoints: &mut Vec<NodeEndpoints>,
+    endpoints: &mut [NodeEndpoints],
 ) -> eyre::Result<Range<Epoch>> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
@@ -419,10 +419,12 @@ async fn test_epoch_sync_inner(
                     .map_err(|e| eyre::eyre!("validator {val_name}: {e}"))?;
             // Make sure we have executed the final block from the epoch record.
             // This should prove we have the consensus output as well (i.e. verify the pack data).
-            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).expect(&format!(
-                "final block for {epoch} for {val_name} missing {}",
-                epoch_rec.final_state.number
-            ));
+            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).unwrap_or_else(|_| {
+                panic!(
+                    "final block for {epoch} for {val_name} missing {}",
+                    epoch_rec.final_state.number
+                )
+            });
             if i == kill_idx {
                 killed_epoch_records.insert(epoch, epoch_rec);
             }

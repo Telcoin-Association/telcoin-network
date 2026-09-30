@@ -520,7 +520,7 @@ mod tests {
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 i * 100,
                 "failed on iteration {i}"
             );
@@ -537,7 +537,7 @@ mod tests {
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 i * 100,
                 "failed on iteration {i}"
             );
@@ -583,7 +583,7 @@ mod tests {
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 (i, i * 100),
                 "failed on iteration {i}"
             );
@@ -596,7 +596,7 @@ mod tests {
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 (i, i * 100),
                 "failed on iteration {i}"
             );

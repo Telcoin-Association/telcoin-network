@@ -67,7 +67,7 @@
 
 use crate::common::{
     acquire_test_permit, config_committee, start_nodes, wait_for_epoch_at_least, wait_for_rpc,
-    ProcessGuard, NODE_PASSWORD,
+    GenesisConfig, ProcessGuard, NODE_PASSWORD,
 };
 use alloy::providers::{Provider, ProviderBuilder};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, GOVERNANCE_SAFE_ADDRESS};
@@ -259,7 +259,7 @@ fn assert_pre_fork_alloc(genesis: &Genesis) -> eyre::Result<()> {
             .alloc
             .get(&address)
             .and_then(|account| account.code.as_ref())
-            .map(|code| keccak256(code))
+            .map(keccak256)
             .unwrap_or(B256::ZERO)
     };
 
@@ -451,14 +451,16 @@ async fn test_governance_safe_fork_boundary() -> eyre::Result<()> {
     let genesis = config_committee(
         temp_path,
         &shared_genesis_dir,
-        Some(NODE_PASSWORD.to_string()),
-        // registry owner is never used by this test; a distinct address keeps it from
-        // entangling with the governance Safe whose state the fork rewrites
-        Address::from_slice(&[0xAA; 20]),
-        vec![],
-        &committee,
-        EPOCH_DURATION,
-        Some(ADIRI_CHAIN_ID),
+        GenesisConfig {
+            passphrase: Some(NODE_PASSWORD.to_string()),
+            // registry owner is never used by this test; a distinct address keeps it from
+            // entangling with the governance Safe whose state the fork rewrites
+            consensus_registry_owner: Address::from_slice(&[0xAA; 20]),
+            accounts: vec![],
+            validators: &committee,
+            epoch_duration: EPOCH_DURATION,
+            chain_id: Some(ADIRI_CHAIN_ID),
+        },
     )?;
 
     // rewrite the shared genesis, then redistribute it: copying one rewritten file is what makes
