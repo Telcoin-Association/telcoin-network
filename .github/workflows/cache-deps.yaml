@@ -7,13 +7,18 @@
 # on main. A lane's cold dependency build is paid once here, off the critical path,
 # instead of on every queue entry.
 #
-# Two jobs, two entries, one per toolchain pr.yaml uses:
+# Two warm jobs, two entries, one per toolchain pr.yaml uses:
 #
 #   clippy-cache  both clippy passes (default and --all-features) under the nightly pin;
 #                 read by pr.yaml's `clippy` job
 #   test-cache    dependencies for both test lanes (default and adiri features) under
 #                 the stable pin; read by `test` and `adiri-test`. Workspace test binaries
 #                 are rebuilt per run because rust-cache does not save workspace crates.
+#
+# A third job, prune-caches, runs after both warms on main and deletes the superseded
+# generations of these two entries and of durable-e2e.yaml's, which would otherwise stay
+# until they went 7 days unread. The comment above the job has the rule and what it never
+# touches.
 #
 # rust-cache builds the key as follows (checked against v2.9.2; a later release can
 # change it, and the paragraph on such releases below says how one that does can move):
@@ -39,22 +44,19 @@
 #
 # Entries are immutable and an exact key hit skips the save. A change to WHAT a job here
 # builds (a lane added, a feature set changed) is therefore never written while the key
-# stays the same: bump `prefix-key` in both workflows, here first and in pr.yaml once main
-# has written the new entries, or in both at once, a choice the next paragraph weighs (or
+# stays the same: bump `prefix-key` here and in pr.yaml in the same pull request (or
 # delete the entries under Settings > Actions > Caches).
 #
 # A rust-cache release that changes how the key is computed is a change of key too, and
-# the choice is the same. Moved here and in pr.yaml together, it is one pull request and
-# one attestation, but the merge queue restores keys nothing has written yet and builds
-# every dependency cold, from that pull request's own queue run until the warm its merge
-# triggers here has finished. Moved here first, and in pr.yaml once main has written the
-# new entries, it keeps the queue warm, but is two pull requests and two attestations,
-# and while the gap is open this workflow no longer refreshes the entries pr.yaml
-# restores. What decides it is whether a cold lane fits its timeout-minutes and how busy
-# the queue is; .github/ACTIONS.md ("Caches") has the one cold timing measured. To tell
-# whether a release is one of these, read the release notes of every release between the
-# old pin and the new one for anything about the key or hashing, or compare the
-# "Cache Key" a warm prints before and after the bump.
+# moves the same way, here and in pr.yaml together. The merge queue then restores keys
+# nothing has written yet and builds every dependency cold, from that pull request's own
+# queue run until the warm its merge triggers here has finished; .github/ACTIONS.md
+# ("Caches") has the one cold timing measured. Moving this file first no longer keeps the
+# queue warm: prune-caches counts the old key's entries as a superseded generation and
+# deletes them at the end of the first warm that saves the new ones, so pr.yaml would
+# restore nothing until it moved too. To tell whether a release is one of these, read the
+# release notes of every release between the old pin and the new one for anything about
+# the key or hashing, or compare the "Cache Key" a warm prints before and after the bump.
 #
 # No `cache-on-failure`: a warm job that died mid-build would freeze a partial target dir
 # under the exact key, permanently. A failed warm saves nothing; fix it and re-dispatch.
@@ -82,7 +84,8 @@ on:
   schedule:
     - cron: "23 5 * * 1,4"
 
-# Only reads the repository; cache writes go through the cache service, not the token.
+# The warm jobs only read the repository; their cache writes go through the cache
+# service, not the token. prune-caches sets its own permissions.
 permissions:
   contents: read
 
@@ -166,3 +169,53 @@ jobs:
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+
+  # Deletes the superseded cache generations, through .github/scripts/prune_caches.sh,
+  # whose header has the rule in full. A family is every entry on refs/heads/main whose
+  # key starts v<N>-rust-clippy-cache-, v<N>-rust-test-cache- or
+  # v<N>-rust-durable-e2e-cache-, whatever its prefix-key version, architecture and
+  # hashes. The live entries of a family are those created since this run began, else
+  # those accessed since, else the single most recently accessed one; the rest are
+  # deleted, so a family is never left empty. Nothing outside the three families is ever
+  # touched: not CodeQL's entries, not another ref's, not another workflow's shared key.
+  # Without this job each Cargo.lock change on main leaves the previous generation behind
+  # until it goes 7 days unread, or until GitHub evicts the least recently used entries
+  # past the quota, which can take a live one with it.
+  #
+  # It sits after the warms because they have just restored or saved the live clippy and
+  # test entries, which is what marks them as touched since the run began. "Began" is the
+  # first attempt's start: the run's own run_started_at is the latest attempt's, and
+  # re-running this job alone would move it past the warms and leave the live entries
+  # unmarked. Only on main: a warm dispatched on another branch writes that branch's own
+  # scope and must not prune main's. With no status function in `if`, the job also runs
+  # only when both warms succeeded.
+  #
+  # This is the first job in these workflows to use the token for more than reading.
+  # `actions: write` is what deleting a cache entry needs. For this repository, and until
+  # the job ends, it would also let the token cancel, re-run, approve or delete workflow
+  # runs, delete logs and artifacts, and enable, disable or dispatch workflows. What runs
+  # with it is the pinned checkout and the script as it stands in this commit on main.
+  prune-caches:
+    needs: [warm-clippy-cache, warm-test-cache]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # There is no run start in the `github` context; the REST API has it.
+      - name: Delete superseded cache generations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          this_run="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          started=$(gh api "${this_run}/attempts/1" --jq .run_started_at)
+          RUN_STARTED_AT="${started:?no start time for this run}" \
+            .github/scripts/prune_caches.sh

@@ -32,12 +32,9 @@
 # read either; the upload would only add minutes to the critical path and consume quota
 # that evicts the entries the queue does read. Those are written on main by
 # .github/workflows/cache-deps.yaml, and the cache steps here must stay in lockstep with
-# it: same env block, same steps before the cache step, same rust-cache release. A
-# release that changes the key is the one thing that may move out of step, and only for
-# a while: it can reach cache-deps.yaml first, and this file once main has written
-# entries with it, at the cost of a second pull request and attestation; or it can
-# reach both at once, and the queue builds cold until main has re-warmed.
-# cache-deps.yaml's header weighs the two.
+# it: same env block, same steps before the cache step, same rust-cache release. A release
+# that changes the key moves in both files in one pull request, and the queue builds cold
+# until main has re-warmed; cache-deps.yaml's header says why it cannot move there first.
 #
 # The fmt, clippy and test lanes below do not spell out their own commands. They call
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue

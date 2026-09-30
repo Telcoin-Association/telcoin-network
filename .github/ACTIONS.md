@@ -174,43 +174,41 @@ They were checked against v2.9.2, and a later release can change them; the third
   group between the two workflows first.
 - Entries are immutable, and an exact key hit skips the save. So changing *what* a warm job
   builds (a lane added, a feature set changed) writes nothing until the key changes: bump
-  `prefix-key` in both workflows, `cache-deps.yaml` first, then `pr.yaml` once `main` has
-  written the new entries, or both at once; the next bullet weighs the two. (Or delete
-  the entries under Settings -> Actions -> Caches and re-run the warm.) Both workflows
-  now use `prefix-key: v1-rust`. Older entries that nothing restores any more can be
-  deleted there, and until they are, or expire after 7 days without a restore, the list
-  shows them beside the current ones:
-  `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust`, and
-  `v1-rust-clippy-cache-Linux-<hash>`, `v1-rust-test-cache-Linux-<hash>` and
-  `v0-rust-durable-e2e-cache-Linux-<hash>` from rust-cache v2.7.7, whose keys have no
-  `x64` after `Linux-`.
+  `prefix-key` in both workflows, in the same pull request; the next bullet says why not
+  `cache-deps.yaml` first. (Or delete the entries under Settings -> Actions -> Caches and
+  re-run the warm.) Both workflows now use `prefix-key: v1-rust`. Entries under an older
+  key, `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust` and
+  rust-cache v2.7.7's with no `x64` after `Linux-`, are superseded generations, which the
+  `prune-caches` job (below) deletes.
 - How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
   changes it is a change of key like any other. Whoever reviews a rust-cache bump reads
   the release notes of every release it covers for anything about the key, hashing or
   cached paths; comparing the "Cache Key" a warm prints before and after the bump shows
-  whether a release changes the key. Such a release can move in one of two ways, and
-  each has a cost. Moving every cache step together is one pull request and one
-  attestation, but the queue then builds every dependency cold, from that pull request's
-  own queue run until the warm its merge triggers has finished on `main`. Moving the
-  writer first, `cache-deps.yaml` (and `durable-e2e.yaml`, which reads only the entry it
-  writes itself), then `pr.yaml` once `main` has written the new entries, keeps the queue
-  warm, but is two pull requests and two attestations, and while the gap is open the
-  warm no longer refreshes the entries `pr.yaml` restores. Dependabot may open that
-  second pull request by itself, since `pr.yaml` is then the only file behind the new
-  release; it still waits for the warm. What decides between them is whether a cold lane
-  fits its `timeout-minutes` (the one cold figure measured is below, with the warm
-  timings) and how busy the queue is. The bump from v2.7.7 to v2.9.2 changed the key and
-  moved all six steps together. Dependabot sends rust-cache bumps as a pull request of
-  their own (`.github/dependabot.yaml`) so that this choice can be made, and the bump
-  split if wanted, without the other actions riding along.
+  whether a release changes the key. Such a release moves every cache step together, in
+  one pull request and one attestation, and the queue then builds every dependency cold,
+  from that pull request's own queue run until the warm its merge triggers has finished
+  on `main`; whether a cold lane fits its `timeout-minutes` is the thing to check (the
+  one cold figure measured is below, with the warm timings). Moving the writer,
+  `cache-deps.yaml`, first no longer keeps the queue warm: the `prune-caches` job deletes
+  the old key's entries at the end of the first warm that saves the new ones, so
+  `pr.yaml` would have nothing to restore until it moved too. The bump from v2.7.7 to
+  v2.9.2 changed the key and moved all six steps together. Dependabot sends rust-cache
+  bumps as a pull request of their own (`.github/dependabot.yaml`), so that such a
+  release is reviewed on its own, without the other actions riding along.
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
 One cold figure has been measured: the warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
 A cold test lane then still has to run the tests, which no GitHub runner has timed from cold.
-Check the total under Settings -> Actions -> Caches now and then: three current entries should be there (`clippy-cache`, `test-cache`, `durable-e2e-cache`), about 4.6 GB in September 2026 against the 10 GB quota.
-Each `Cargo.lock` change on `main` leaves the previous generation behind until it goes 7 days without a restore, and GitHub evicts the least recently used entries once the total passes the quota; superseded entries can be deleted there by hand once a warm has replaced them.
+Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
+The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.
+A family is every entry on `main` whose key starts `v<N>-rust-clippy-cache-`, `v<N>-rust-test-cache-` or `v<N>-rust-durable-e2e-cache-`, whatever its prefix-key version, architecture and hashes.
+In each family the job keeps the entries created since the warm began, failing those the ones accessed since, and failing both the single most recently accessed one, and deletes the rest, so a family is never left empty.
+It never touches an entry outside the three families: not CodeQL's, not another ref's, not another workflow's.
+To run it by hand, from the repository root, `DRY_RUN=1 GH_REPO=Telcoin-Association/telcoin-network .github/scripts/prune_caches.sh` prints what it would delete and deletes nothing; the same without `DRY_RUN=1` deletes.
+Run by hand, it counts "since the warm began" from the latest successful warm on `main`, and deleting needs a `gh` login that can delete caches, which takes write access to the repository.
+Two things are still worth a look under Settings -> Actions -> Caches now and then: entries on other refs, because a warm dispatched on a branch writes gigabytes into that branch's scope and nothing prunes it, and the total against the quota (10 GB in September 2026).
 
 One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 1.94.x point release changes the rustc version, which is in the key, and every entry misses with no fallback until the next warm (the schedule within 3-4 days, or a manual dispatch).
 Pinning `1.94.x` would make the rotation explicit and deliberate.
