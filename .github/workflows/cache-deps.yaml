@@ -51,7 +51,7 @@
 # moves the same way, here and in pr.yaml together. The merge queue then restores keys
 # nothing has written yet and builds every dependency cold, from that pull request's own
 # queue run until the warm its merge triggers here has finished; .github/ACTIONS.md
-# ("Caches") has the one cold timing measured. Moving this file first no longer keeps the
+# ("Caches") has the cold timings measured. Moving this file first no longer keeps the
 # queue warm: prune-caches counts the old key's entries as a superseded generation and
 # deletes them at the end of the first warm that saves the new ones, so pr.yaml would
 # restore nothing until it moved too. To tell whether a release is one of these, read the

@@ -188,7 +188,7 @@ They were checked against v2.9.2, and a later release can change them; the third
   one pull request and one attestation, and the queue then builds every dependency cold,
   from that pull request's own queue run until the warm its merge triggers has finished
   on `main`; whether a cold lane fits its `timeout-minutes` is the thing to check (the
-  one cold figure measured is below, with the warm timings). Moving the writer,
+  cold timings measured are below, with the warm ones). Moving the writer,
   `cache-deps.yaml`, first no longer keeps the queue warm: the `prune-caches` job deletes
   the old key's entries at the end of the first warm that saves the new ones, so
   `pr.yaml` would have nothing to restore until it moved too. The bump from v2.7.7 to
@@ -199,8 +199,8 @@ They were checked against v2.9.2, and a later release can change them; the third
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
-One cold figure has been measured: the warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
-A cold test lane then still has to run the tests, which no GitHub runner has timed from cold.
+The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
+The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
 Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
 The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.
 A family is every entry on `main` whose key starts `v<N>-rust-clippy-cache-`, `v<N>-rust-test-cache-` or `v<N>-rust-durable-e2e-cache-`, whatever its prefix-key version, architecture and hashes.
