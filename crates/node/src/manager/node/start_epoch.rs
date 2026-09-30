@@ -1152,6 +1152,36 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
+    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
+    /// there: the on-disk state an `EpochManager` is built from.
+    fn reth_config_and_db<P>(
+        config: &tn_config::Config,
+        committee: &tn_types::Committee,
+        datadir: &P,
+    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
+    where
+        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
+    {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+
+        tn_reth::init_reth_defaults();
+        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            datadir,
+            true,
+            std::sync::Arc::new(config.chain_spec()),
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
+        Ok((node_config, reth_db))
+    }
+
     /// Epoch entry reuses worker 0's early RPC, refreshes sync state, and stops and reactivates
     /// removed workers over their retained pools.
     #[cfg(not(feature = "adiri"))]
@@ -1163,12 +1193,11 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+        use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
         use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
 
-        tn_reth::init_reth_defaults();
         let temp = tempfile::TempDir::new()?;
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
@@ -1189,20 +1218,7 @@ mod tests {
             .committee()
             .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
-        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
-        let chain = Arc::new(config.chain_spec());
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            &datadir,
-            true,
-            chain,
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
         let reth_env =
@@ -1451,6 +1467,75 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
+        );
+        Ok(())
+    }
+
+    /// Every epoch after 0 floors its first commit on the timestamp of the previous epoch's
+    /// closing block, and `configure_consensus` is where that timestamp enters the consensus
+    /// config. Epoch 0's entry read is pinned to genesis, which closes no epoch, so its config
+    /// carries no close even though the pinned header has a timestamp.
+    #[tokio::test]
+    async fn configure_consensus_carries_prior_epoch_close_after_epoch_zero() -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{BlsKeypair, TimestampSec};
+
+        // both epochs get the same pinned-header timestamp, so only the committee's epoch decides
+        // whether it becomes the close
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let config = Config::default_for_test();
+        let genesis = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+
+        let epoch_zero = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_zero.prior_epoch_close(),
+            None,
+            "epoch 0 follows genesis rather than a closed epoch, so there is no close to floor on"
+        );
+
+        let committee =
+            CommitteeFixture::builder(MemDatabase::default).epoch(1).build().committee();
+        let epoch_one = manager
+            .configure_consensus(
+                &network_config,
+                committee,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_one.prior_epoch_close(),
+            Some(EPOCH_START),
+            "epoch 1 must floor its first commit on the timestamp of epoch 0's closing block"
         );
         Ok(())
     }
