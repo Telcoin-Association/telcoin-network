@@ -14,8 +14,10 @@ use tn_network_libp2p::types::{
 };
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
-use tn_types::{encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, TnSender};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tn_types::{
+    encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, TnSender, VotingPower,
+};
+use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
 // ===== Certifier test harness =====
 
@@ -298,6 +300,7 @@ impl MockNetwork {
                     "{context}: waiting for vote request {ordinal} of {count}"
                 ))
                 .await;
+            let at = Instant::now();
             assert!(
                 self.node != Some(peer),
                 "{context}: vote request {ordinal} of {count} asks the proposer for its own vote"
@@ -309,6 +312,7 @@ impl MockNetwork {
                 peer,
                 header: header.digest(),
                 parents: parents.iter().map(|parent| parent.header().digest()).collect(),
+                at,
             });
             let result = match reply_for(&peer, &request) {
                 Reply::Vote(vote) => Ok(PrimaryResponse::Vote(vote)),
@@ -370,6 +374,8 @@ struct LoggedRequest {
     header: HeaderDigest,
     /// The digests of the parent certificates the request carries, in request order.
     parents: Vec<HeaderDigest>,
+    /// When the request arrived, on the test's clock (virtual time under a paused clock).
+    at: Instant,
 }
 
 /// Run `certifier.propose_header(header)` as its own task, so the test can answer the vote
@@ -552,6 +558,54 @@ async fn transient_network_error_retries() {
         same_outcome(&result, &expected),
         "expected {expected:?} over the proposer's, the flaky peer's and the voter's votes, got \
          {result:?}"
+    );
+}
+
+/// A peer that keeps failing with a retryable error is asked again after exactly the delays of
+/// the retry schedule: at once, then after 100 ms, 500 ms, 1 s, 2 s and 5 s, and every 10 s from
+/// then on.
+///
+/// The delay after a failed request is picked by the number of that attempt, so the gap between
+/// the peer's requests `k` and `k + 1` is the delay for attempt `k`. The paused clock jumps
+/// straight to the next timer, so each gap is exactly the certifier's sleep. The other peers'
+/// requests are held, so the proposal never reaches quorum and the failing peer is asked for as
+/// long as the test keeps answering.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn vote_retry_backoff_schedule() {
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let header = cx.proposer_header();
+    let flaky = *cx.peers().next().expect("committee has peers").authority().protocol_key();
+    let held = cx.peers().count() - 1;
+    // the ceiling appears three times, so it is shown to repeat
+    let expected =
+        [0, 100, 500, 1_000, 2_000, 5_000, 10_000, 10_000, 10_000].map(Duration::from_millis);
+
+    let _proposal = start_proposal(&certifier, header);
+    let responses = cx
+        .network
+        .respond(
+            expected.len() + 1 + held,
+            "the flaky peer fails every request, the other peers' requests are held",
+            |peer, _| {
+                if *peer == flaky {
+                    Reply::Fail(NetworkError::Timeout)
+                } else {
+                    Reply::Hold
+                }
+            },
+        )
+        .await;
+
+    let asked_at: Vec<_> = responses
+        .requests
+        .iter()
+        .filter(|request| request.peer == flaky)
+        .map(|request| request.at)
+        .collect();
+    let gaps: Vec<_> = asked_at.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert_eq!(
+        gaps, expected,
+        "gaps between the flaky peer's successive vote requests must follow the retry schedule"
     );
 }
 
@@ -1148,49 +1202,63 @@ async fn startup_republish_highest_cert() {
     );
 }
 
-/// Exactly `committee.quorum_threshold()` voting-weight worth of peers vote. The remaining peers
-/// are silent (never reply). A certificate must form — this validates the threshold boundary
-/// without hardcoding a number. See Issue #646: always use committee.quorum_threshold(), never
-/// hardcode.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn minimum_quorum_exactly_threshold() {
-    // 4-node committee: quorum is 3 out of 4 (f=1, 2f+1=3).
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let votes = cx.peer_votes(&header);
-    let committee = cx.fixture.committee();
-    let mut cert_rx = cx.subscribe_new_certificates();
+/// `VotesAggregator::append` forms a certificate exactly when the voting weight reaches
+/// `committee.quorum_threshold()`: at one vote's weight short of it there is none, and the vote
+/// that brings the weight to the threshold forms the certificate over exactly the votes appended.
+///
+/// Every authority has equal voting power, so each committee size puts the threshold at a
+/// different number of votes. The threshold is always read from the committee, never hardcoded
+/// (issue #646). The test lists every committee size that failed.
+#[test]
+fn certificate_forms_exactly_at_quorum_threshold() {
+    let sizes = [4, 7, 10];
+    let mut failures = Vec::new();
+    for size in sizes {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(size).expect("committee size must be non-zero"))
+            .randomize_ports(true)
+            .build();
+        let committee = fixture.committee();
+        let header =
+            fixture.authorities().last().expect("committee has authorities").header(&committee);
+        let quorum = committee.quorum_threshold();
+        let voters: Vec<_> = fixture.authorities().take(quorum as usize).collect();
+        let weight_of = |voters: &[&AuthorityFixture<MemDatabase>]| {
+            voters
+                .iter()
+                .map(|voter| committee.voting_power_by_id(&voter.id()))
+                .sum::<VotingPower>()
+        };
+        let below = &voters[..voters.len() - 1];
+        assert_eq!(
+            (weight_of(below), weight_of(&voters)),
+            (quorum - 1, quorum),
+            "{size} authorities: precondition: equal stake puts the last vote exactly at quorum"
+        );
 
-    // The proposer already self-voted (weight 1) in propose_header.
-    // Accumulate peer votes until the committee quorum threshold is reached.
-    let quorum = committee.quorum_threshold();
-    let mut accumulated_weight = committee.voting_power_by_id(&cx.proposer().id());
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    // a peer whose vote would push the weight past quorum stays silent, and so does every peer once
-    // quorum is reached; their requests are held unanswered until the test ends
-    let _silent = cx
-        .network
-        .respond(votes.len(), "quorum drain", |peer, _| {
-            let vote = votes[peer].clone();
-            let peer_weight = committee.voting_power_by_id(vote.author());
-            if accumulated_weight + peer_weight > quorum {
-                return Reply::Hold;
+        // no certificate for every vote below quorum, then the certificate over all of them
+        let certificate = certificate_over(&committee, &header, voters.iter().copied());
+        let outcomes = below.iter().map(|_| Ok(None)).chain([Ok(Some(certificate))]);
+        let mut aggregator = VotesAggregator::new();
+        let mut weight = 0;
+        for (count, (voter, expected)) in (1..).zip(voters.iter().zip(outcomes)) {
+            weight += committee.voting_power_by_id(&voter.id());
+            let result = aggregator.append(voter.vote(&header), &committee, &header);
+            if !same_outcome(&result, &expected) {
+                failures.push(format!(
+                    "{size} authorities: vote {count} brings the weight to {weight} of quorum \
+                     {quorum}: expected {expected:?}, got {result:?}"
+                ));
+                break;
             }
-            accumulated_weight += peer_weight;
-            Reply::Vote(vote)
-        })
-        .await;
-
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .expect("cert formed at exact quorum threshold")
-        .expect("cert_rx channel open");
-    assert_eq!(cert.header().digest(), header.digest());
+        }
+    }
     assert!(
-        accumulated_weight >= quorum,
-        "sanity: at least quorum weight ({quorum}) voted, got {accumulated_weight}"
+        failures.is_empty(),
+        "{} of {} committee sizes failed the quorum boundary:\n{}",
+        failures.len(),
+        sizes.len(),
+        failures.join("\n")
     );
 }
 
@@ -1273,6 +1341,39 @@ async fn propose_header_to_form_certificate() {
     cx.network.assert_quiet("late votes after the certificate is gossiped").await;
 }
 
+/// A header whose certificate is already in `ProposedCertificates` is not proposed again:
+/// `spawn_header_proposal` gossips exactly the stored certificate, returns `Ok`, and asks no peer
+/// for a vote.
+///
+/// The stored certificate carries every authority's vote, so it is not one a fresh round of votes
+/// would form. Proposing the header again could aggregate a different quorum into a second
+/// certificate for the same header.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn already_certified_header_is_republished() {
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let stored = certificate_over(&committee, &header, cx.fixture.authorities());
+    cx.proposer()
+        .consensus_config()
+        .node_storage()
+        .insert::<ProposedCertificates>(&header.digest(), &stored)
+        .expect("record the header's certificate before it is proposed");
+
+    let proposal = tokio::spawn(certifier.clone().spawn_header_proposal(header));
+    let gossip = cx.network.next_publish("already-certified header: first network command").await;
+    assert!(
+        gossip == certificate_gossip(stored).await,
+        "an already-certified header must republish exactly its stored certificate"
+    );
+    match tokio::time::timeout(STEP_TIMEOUT, proposal).await {
+        Ok(Ok(result)) => assert!(result.is_ok(), "expected Ok(()), got {result:?}"),
+        Ok(Err(error)) => panic!("already-certified header: proposal task failed: {error}"),
+        Err(_) => panic!("spawn_header_proposal did not return within {STEP_TIMEOUT:?}"),
+    }
+    cx.network.assert_quiet("already-certified header: no vote request may follow").await;
+}
+
 /// `propose_header` returns exactly `CouldNotFormCertificate` for the header when every peer fails
 /// its vote request with the fatal `NetworkError::RPCError`, and asks each peer exactly once.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1295,6 +1396,66 @@ async fn propose_header_failure() {
     assert!(same_outcome(&result, &expected), "expected {expected:?}, got {result:?}");
     assert_eq!(responses.requests_per_peer(), peers, "each peer is asked exactly once");
     cx.network.assert_quiet("a fatal error is not retried").await;
+}
+
+/// One peer failing its vote request with the fatal `NetworkError::RPCError` does not derail the
+/// round: the other peers' votes still form exactly the certificate they and the proposer support.
+///
+/// In a 4-authority committee the proposer and the two other peers are exactly a quorum, so the
+/// certificate needs both of their votes. Their requests are held until the fatal failure has
+/// reached `propose_header`: on the paused clock a sleep ends only once every task is idle, so
+/// after it the failed vote has been taken off the vote channel while the proposal is still short
+/// of quorum. Only then are the voters answered.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fatal_peer_does_not_derail_round() {
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+    assert_eq!(
+        committee.quorum_threshold(),
+        3,
+        "precondition: the proposer and the two voters are exactly a quorum"
+    );
+    let (expected, fatal) = {
+        let fatal = cx.peers().next().expect("committee has peers");
+        let voters = cx.fixture.authorities().filter(|authority| authority.id() != fatal.id());
+        (Ok(certificate_over(&committee, &header, voters)), *fatal.authority().protocol_key())
+    };
+    let peers: HashMap<_, _> = votes.keys().map(|peer| (*peer, 1)).collect();
+
+    let proposal = start_proposal(&certifier, header);
+    let responses = cx
+        .network
+        .respond(votes.len(), "one peer fails fatally, the voters' requests are held", |peer, _| {
+            if *peer == fatal {
+                Reply::Fail(NetworkError::RPCError("mock fatal peer error".to_string()))
+            } else {
+                Reply::Hold
+            }
+        })
+        .await;
+    // the failed vote reaches propose_header before any vote does
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let asked = responses.requests_per_peer();
+    // the held requests, in arrival order, are those of the peers that did not fail
+    let voters =
+        responses.requests.iter().map(|request| request.peer).filter(|peer| *peer != fatal);
+    for (reply, peer) in responses.held.into_iter().zip(voters) {
+        let vote = PrimaryResponse::Vote(votes[&peer].clone());
+        assert!(
+            reply.send(Ok(NetworkResponseMessage { peer, result: vote })).is_ok(),
+            "a voter's held request stopped waiting before its vote"
+        );
+    }
+    let result = proposal_result(proposal, "one peer fails fatally").await;
+
+    assert!(
+        same_outcome(&result, &expected),
+        "expected {expected:?} over the proposer's and both voters' votes, got {result:?}"
+    );
+    assert_eq!(asked, peers, "each peer is asked exactly once; the fatal error is not retried");
 }
 
 /// `propose_header` returns exactly the certificate the valid votes support when some peers sign
@@ -1438,21 +1599,24 @@ async fn run_bad_signature_row(row: BadSignatureRow) {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn test_shutdown_core() {
-    let cx = CertifierContext::new();
-    let config = cx.proposer().consensus_config().clone();
+/// Once shutdown is signalled, the running certifier stops: its task ends, and a header sent
+/// afterwards is never proposed.
+///
+/// The header is sent only once every task has gone idle after the signal, so the certifier has
+/// had every chance to act on it. The certifier task holds the only handle to the mock network, so
+/// the network channel closes when the task ends. A certifier still running would keep the channel
+/// open, and would propose the header, so its vote requests would reach the network.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn certifier_stops_on_shutdown() {
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
 
-    // send request to spawn voting sub-tasks
-    cx.consensus_bus.headers().send(Header::default()).await.expect("send header for proposal");
-
-    // on the paused clock this sleep ends only once every task is idle, so the certifier has
-    // subscribed before the core is shut down
+    cx.proposer().consensus_config().shutdown().notify();
+    // on the paused clock this sleep ends only once every task is idle
     tokio::time::sleep(Duration::from_millis(100)).await;
-    config.shutdown().notify();
-    let mut task_manager = cx.task_manager;
-    let _ =
-        tokio::time::timeout(Duration::from_secs(3), task_manager.join(config.shutdown().clone()))
-            .await
-            .expect("timeout");
+
+    cx.consensus_bus.headers().send(header).await.expect("send a header after shutdown");
+    cx.network
+        .assert_closed("after shutdown: the certifier task must end without proposing the header")
+        .await;
 }
