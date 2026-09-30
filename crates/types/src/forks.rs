@@ -271,9 +271,13 @@ const fn build_fork_active(epoch: Epoch) -> bool {
 /// would silently reach only the in-process tests, and the multi-node tests that actually
 /// exercise epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`. A node-scoped build (`cargo build -p
+/// telcoin-network`, as release builds are made) leaves that feature off, so its binary keeps the
+/// compile-time constant whatever its environment holds. A workspace-root build without `-p`
+/// does not: `e2e-tests` enables `tn-types/test-utils`, feature unification carries it into the
+/// node binary, and that binary honours this variable. The e2e binary relies on this. An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -400,10 +404,10 @@ const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
 /// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
 /// with the harness, so a process-global setter would silently reach only in-process tests.
-/// Compiled out entirely without `test-utils`, so a production binary keeps the
-/// compile-time constant and cannot be repointed at runtime by its environment. An
-/// unparseable value is ignored rather than defaulted, leaving the build's own fork point
-/// in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -537,9 +541,10 @@ const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
 /// silently reach only the in-process tests, and the multi-node tests that actually exercise
 /// epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -697,9 +702,10 @@ const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
 /// node processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static
 /// would silently reach only the in-process tests.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -710,13 +716,179 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose consensus timestamps carry millisecond precision.
+///
+/// Every rule below reads a combined millisecond timestamp, `seconds * 1000 + millis`, where
+/// `seconds` is the existing seconds-granularity field and `millis` its sub-second remainder. At
+/// this boundary:
+/// - `Header` gains a ninth bcs field, `created_at_millis`, written after `seed_signature` (the
+///   eighth field, gated by [`seed_signature_active`]), and `CommittedSubDag` gains
+///   `commit_timestamp_millis`. bcs is not self-describing, so both are layout changes: every epoch
+///   below the fork keeps the eight-field `Header` and the pre-fork `CommittedSubDag` layout byte
+///   for byte.
+/// - The voter's parent-timestamp rule becomes strict on the combined value: a header's combined
+///   timestamp must be strictly later than each of its parents'.
+/// - The commit clamp becomes strict on the combined value: each committed sub-DAG's combined
+///   timestamp is raised to at least 1 ms after the previous commit's.
+/// - Execution clamps block timestamps to be non-decreasing, since several commits can now land
+///   inside one second.
+///
+/// The EVM block `timestamp` does not change: it stays whole seconds, `floor(combined / 1000)`.
+///
+/// Every encode, decode, and rule this fork touches MUST gate ([`subsecond_timestamp_active`]) on
+/// the epoch carried inside the value itself (the header's own epoch, the committed leader's
+/// epoch), never on `Committee::epoch()` or other node-local state, so mixed-epoch containers
+/// (certificate vectors, sub-DAGs, pack records) decode correctly at any nesting depth and
+/// historical digests are preserved end to end.
+///
+/// # Arming constraints
+///
+/// - **At or above [`SEED_SIGNATURE_FORK_EPOCH`]** (compile-time asserted below). Header layouts
+///   form one chain: seven legacy fields, then eight (seed signature), then nine (milliseconds).
+///   [`subsecond_timestamp_active`] conjoins [`seed_signature_active`] fail-closed, so a lower
+///   value would silently stay dormant until the seed fork fires rather than write a header that
+///   carries the millisecond field without the seed signature.
+/// - **At least 8 epochs above the live adiri epoch** when the epoch-setting PR merges, so every
+///   node runs the armed build before the boundary. Nothing machine-checks this margin: re-verify
+///   it against the live chain at merge time. If the chosen epoch has already begun, raise it in
+///   the same PR: headers already committed at or past the fork epoch in the eight-field layout do
+///   not decode under the armed build.
+///
+/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
+/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
+/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
+/// constant that differs between binaries has no other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// (safe indefinitely while dormant, since it keeps the seconds-only layout and rules for every
+/// epoch below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
+/// begins. A straggler still on an old build past the boundary has no ninth header field to read
+/// and keeps applying the seconds-only rules, so the fleet must be fully upgraded before the
+/// epoch is armed.
+///
+/// Non-adiri builds (mainnet) have no dormant period: millisecond timestamps are active from
+/// genesis and this constant does not exist there.
+pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Compile-time enforcement of the first arming constraint documented on
+/// [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]: a rollout PR that sets this fork below the seed fork
+/// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
+/// fires (the [`subsecond_timestamp_active`] conjunct).
+#[cfg(feature = "adiri")]
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "always true only while SUBSECOND_TIMESTAMP_FORK_EPOCH is the `u32::MAX` \
+              placeholder; once the rollout PR lowers the constant the comparison becomes \
+              live and this expectation flags itself for removal"
+)]
+const _: () = assert!(
+    SUBSECOND_TIMESTAMP_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH,
+    "SUBSECOND_TIMESTAMP_FORK_EPOCH must be at or above SEED_SIGNATURE_FORK_EPOCH: the \
+     millisecond header field follows the seed signature"
+);
+
+/// Whether values of `epoch` carry millisecond consensus timestamps: the `Header`
+/// `created_at_millis` and `CommittedSubDag` `commit_timestamp_millis` fields on the wire, the
+/// strict millisecond parent-timestamp and commit rules, and the non-decreasing execution clamp
+/// documented on [`SUBSECOND_TIMESTAMP_FORK_EPOCH`].
+///
+/// Gates both directions of serialization plus every rule that reads the combined millisecond
+/// timestamp. Callers MUST pass the epoch carried inside the value being encoded, decoded, or
+/// validated (e.g. `HeaderInner::epoch`, `leader.epoch()`), never `Committee::epoch()` or other
+/// node-local state, so that historical values keep their historical layout and rules at any
+/// nesting depth.
+///
+/// Requires [`seed_signature_active`] as a fail-closed conjunct because `created_at_millis` is
+/// the ninth `Header` field, written after the eighth (`seed_signature`): the layouts form one
+/// chain, seven fields then eight then nine, and no epoch may carry the millisecond field
+/// without the seed signature. If an override or a future fork schedule orders the two forks the
+/// other way, the gate stays on the seconds-only layout and rules until the seed fork fires
+/// instead of producing a header outside that chain.
+///
+/// Adiri builds activate at [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]; all other builds are active
+/// from genesis (mainnet never carries the seconds-only layout). Under `test-utils`, an explicit
+/// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` override takes precedence over the build's fork point
+/// (see [`subsecond_timestamp_fork_epoch_override`]), so a test states the fork point it means
+/// rather than inheriting whichever one its feature set happens to select.
+#[inline]
+pub fn subsecond_timestamp_active(epoch: Epoch) -> bool {
+    seed_signature_active(epoch) && subsecond_timestamp_fork_point_active(epoch)
+}
+
+/// This build's effective sub-second-timestamp fork point (any `test-utils` override applied),
+/// without the [`seed_signature_active`] conjunct [`subsecond_timestamp_active`] enforces.
+///
+/// The only gate decision that honors [`subsecond_timestamp_fork_epoch_override`]: code that
+/// decides from [`subsecond_timestamp_build_fork_active`] or [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]
+/// directly silently ignores a test pin, so every decision routes through
+/// [`subsecond_timestamp_active`].
+#[inline]
+fn subsecond_timestamp_fork_point_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        subsecond_timestamp_fork_epoch_override()
+            .map_or_else(|| subsecond_timestamp_build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        subsecond_timestamp_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time sub-second-timestamp fork point, with no test override applied.
+///
+/// Same contract as [`build_fork_active`]: adiri (testnet, which carries seconds-only headers in
+/// its history) is dormant before [`SUBSECOND_TIMESTAMP_FORK_EPOCH`] and active from it; every
+/// other build is active from genesis.
+#[inline]
+const fn subsecond_timestamp_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "SUBSECOND_TIMESTAMP_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) \
+                  is the gate the future epoch-setting PR relies on, and this expectation flags \
+                  itself for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= SUBSECOND_TIMESTAMP_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective sub-second-timestamp fork epoch, read once from
+/// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// genesis", both subject to the [`seed_signature_active`] conjunct).
+///
+/// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
+/// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
+/// with the harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
+#[cfg(feature = "test-utils")]
+pub fn subsecond_timestamp_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 /// Every `test-utils` fork-epoch override actually in force in this process, for the startup
 /// fork-schedule log (#1086).
 ///
 /// Callable from any build so the CLI logs the effective schedule without having to know whether
 /// `tn-types`' `test-utils` was unified into the binary it is compiled into. Always empty in a
-/// production binary, where the overrides are compiled out and no environment variable can
-/// repoint a fork; empty in a `test-utils` build too when nothing is exported. Without this the
+/// binary built without that feature (a node-scoped release build), where the overrides are
+/// compiled out and no environment variable can repoint a fork; empty in a `test-utils` build too
+/// when nothing is exported. Without this the
 /// startup line reports the compiled constants only, and a `test-utils` binary whose forks its
 /// harness pinned elsewhere (the e2e harness holds all but the leader-seeded fork dormant) logs
 /// "active from genesis" while executing the legacy derivations — the shape of a `mix_hash`
@@ -746,6 +918,7 @@ pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
             ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
+            ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_timestamp_fork_epoch_override()),
         ]
         .into_iter()
         .chain(governance_safe)
@@ -1000,10 +1173,11 @@ pub fn governance_safe_fork_epoch() -> Epoch {
 ///
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]: e2e
 /// tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory with the
-/// harness, so a process-global setter would silently reach only in-process tests. Compiled
-/// out entirely without `test-utils`, so a production binary keeps the compile-time constant
-/// and cannot be repointed at runtime by its environment. An unparseable value is ignored
-/// rather than defaulted, leaving the build's own fork point in force.
+/// harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn governance_safe_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -1491,6 +1665,7 @@ mod tests {
                     "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
                     leader_seeded_ordering_fork_epoch_override(),
                 ),
+                ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_timestamp_fork_epoch_override()),
             ]
             .into_iter()
             .chain(governance_safe)
@@ -1770,6 +1945,193 @@ mod tests {
                  though the leader-seeded fork point is active from 0",
             );
         });
+    }
+
+    /// Pin the sub-second-timestamp gate to the rollout contract this build actually implements.
+    ///
+    /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
+    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// `adiri`. Every other build, including the default one that produces both the shipped node
+    /// binary and the e2e binary, is active from genesis, so epoch 0 already uses the millisecond
+    /// layout and rules there.
+    ///
+    /// Asserts against [`subsecond_timestamp_build_fork_active`], the override-free decision, so
+    /// the result does not depend on whether `test-utils` was unified into this build. The grid is
+    /// derived from the constant, so arming the fork does not require editing this test.
+    #[test]
+    fn subsecond_timestamp_build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                subsecond_timestamp_build_fork_active(epoch),
+                "non-adiri builds carry no seconds-only history and are active from genesis; \
+                 epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2, SUBSECOND_TIMESTAMP_FORK_EPOCH.saturating_sub(1)]
+                .into_iter()
+                .filter(|epoch| *epoch < SUBSECOND_TIMESTAMP_FORK_EPOCH)
+                .for_each(|epoch| {
+                    assert!(
+                        !subsecond_timestamp_build_fork_active(epoch),
+                        "adiri stays dormant before SUBSECOND_TIMESTAMP_FORK_EPOCH; epoch \
+                         {epoch} must be pre-fork",
+                    );
+                });
+            [SUBSECOND_TIMESTAMP_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    subsecond_timestamp_build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
+        }
+    }
+
+    /// With no `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn subsecond_timestamp_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            subsecond_timestamp_fork_epoch_override().is_none(),
+            "this test requires a process without TN_SUBSECOND_TIMESTAMP_FORK_EPOCH set; the \
+             override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            // The fork point is the half that carries the override; the public gate wraps it
+            // in the `seed_signature_active` conjunct, which is orthogonal to the override.
+            assert_eq!(
+                subsecond_timestamp_fork_point_active(epoch),
+                subsecond_timestamp_build_fork_active(epoch),
+                "an unset override must not shift the fork point at epoch {epoch}",
+            );
+            assert_eq!(
+                subsecond_timestamp_active(epoch),
+                seed_signature_active(epoch) && subsecond_timestamp_build_fork_active(epoch),
+                "the public gate must be exactly the fail-closed conjunction at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Sentinel selecting the child dispatch of
+    /// [`subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later`]: a dedicated variable
+    /// rather than the fork overrides themselves, so lane-exported fork variables cannot be
+    /// mistaken for a child spawn.
+    #[cfg(feature = "test-utils")]
+    const TN_TEST_SUBSECOND_CONJUNCT_CHILD: &str = "TN_TEST_SUBSECOND_TIMESTAMP_CONJUNCT_CHILD";
+
+    /// The `seed_signature_active` conjunct in [`subsecond_timestamp_active`] blocks the gate
+    /// when the seed fork is scheduled later than the sub-second fork point, so no epoch carries
+    /// the millisecond header field without the seed signature.
+    ///
+    /// This is the only configuration where the conjunct is observable: on adiri the
+    /// compile-time assert `SUBSECOND_TIMESTAMP_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH` makes
+    /// the fork point imply the conjunct, and every other build has both forks active from
+    /// genesis, so with the overrides unset the in-process conjunction assert above cannot catch
+    /// deletion of the `seed_signature_active &&` term. Spawns THIS test binary with the seed
+    /// fork pinned dormant (`4294967295`) and the sub-second fork point pinned to `0`: both
+    /// overrides latch in process-wide `OnceLock`s, so the crossed schedule needs its own
+    /// process. The child's harness output must report exactly one passed test: a drifted name
+    /// would match nothing and still exit 0, so exit status alone would be a vacuous pass.
+    ///
+    /// The child is also the one process where this suite pins
+    /// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` itself, so it asserts that [`fork_epoch_overrides`]
+    /// reports the row: [`fork_epoch_overrides_lists_only_the_pins_in_force`] sees the row only
+    /// in a process that happens to export the variable.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let fn_name = "child_subsecond_timestamp_conjunct_blocks";
+        let name = module_path!()
+            .split_once("::")
+            .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"));
+        let mut command = std::process::Command::new(exe);
+        command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+        command.env(TN_TEST_SUBSECOND_CONJUNCT_CHILD, "1");
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        command.env("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", "0");
+        let output = command.output().expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// Child of [`subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later`], spawned with the
+    /// seed fork dormant and the sub-second fork point active from genesis: the fork point says
+    /// yes at every probed epoch, so any `false` from the public gate is attributable to the
+    /// `seed_signature_active` conjunct alone.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    #[ignore = "spawned by subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later with a \
+                controlled env"]
+    fn child_subsecond_timestamp_conjunct_blocks() {
+        assert!(
+            std::env::var_os(TN_TEST_SUBSECOND_CONJUNCT_CHILD).is_some(),
+            "this child runs only under \
+             subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later, which pins both \
+             fork overrides in the spawn env",
+        );
+        // Both overrides latch in process-wide `OnceLock`s, so a child launched without them
+        // in its env cannot observe the crossed schedule. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(u32::MAX),
+            "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
+             spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        assert_eq!(
+            subsecond_timestamp_fork_epoch_override(),
+            Some(0),
+            "this child requires TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=0 latched from its spawn \
+             env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        // 383 is adiri's SEED_SIGNATURE_FORK_EPOCH, written as a literal because the
+        // constant does not exist on non-adiri builds and this child is not adiri-gated.
+        [0, 1, 383, u32::MAX - 1].into_iter().for_each(|epoch| {
+            assert!(
+                subsecond_timestamp_fork_point_active(epoch),
+                "the fork point is pinned to 0, so it must be active at epoch {epoch}; \
+                 otherwise the gate assertion below would not isolate the conjunct",
+            );
+            assert!(
+                !seed_signature_active(epoch),
+                "the seed fork must be dormant at epoch {epoch} under the never-fires pin",
+            );
+            assert!(
+                !subsecond_timestamp_active(epoch),
+                "the dormant seed fork must block the public gate at epoch {epoch} even \
+                 though the sub-second fork point is active from 0",
+            );
+        });
+        // the seed gate is `>=`, so the pin fires it at `u32::MAX` itself. With both conjuncts
+        // true there the gate must open, which rules out a gate that never opens at all.
+        assert!(
+            seed_signature_active(u32::MAX) && subsecond_timestamp_active(u32::MAX),
+            "with the seed fork and the sub-second fork point both active at u32::MAX, the \
+             public gate must open",
+        );
+        assert_eq!(
+            fork_epoch_overrides()
+                .into_iter()
+                .find(|(var, _)| *var == "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH")
+                .map(|(_, fork_epoch)| fork_epoch),
+            Some(0),
+            "fork_epoch_overrides must report the pinned TN_SUBSECOND_TIMESTAMP_FORK_EPOCH row at \
+             its pinned value",
+        );
     }
 
     /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in

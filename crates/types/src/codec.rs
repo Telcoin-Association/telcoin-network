@@ -10,6 +10,17 @@
 
 pub use bcs::Error as BcsError;
 use bincode::Options;
+
+/// Extracts the next element of a hand-written positional (bcs) field sequence, converting an
+/// early end of input into a field-labeled `missing_field` error (bcs would otherwise surface
+/// only a distal `Eof`). Shared by the epoch-gated `Header` and `CommittedSubDag` visitors.
+pub(crate) fn next_seq_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: serde::Deserialize<'de>,
+{
+    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
+}
 use serde::{Deserialize, Serialize};
 
 /// Decode bytes to a type for a DB key.

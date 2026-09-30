@@ -231,6 +231,10 @@ impl TNBlockExecutionCtx {
     ///
     /// This is used during execution to write the consensus header hash
     /// to `BEACON_ROOTS` contract (eip4788).
+    ///
+    /// The gate makes that write once per consensus output rather than once per EVM block. It does
+    /// not make the write unique per `timestamp`: see `apply_consensus_root_contract_call` for how
+    /// outputs committed within the same second share one ring-buffer entry.
     fn first_batch(&self) -> bool {
         self.difficulty < U256::from(65536)
     }
@@ -1708,6 +1712,22 @@ where
     }
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
+    ///
+    /// The contract is a ring buffer of 8191 entries keyed by `timestamp % 8191`. Each write stores
+    /// the block's `timestamp` alongside the root, and a lookup by timestamp succeeds only while
+    /// the entry still holds that exact timestamp.
+    ///
+    /// The EVM `timestamp` has one-second granularity and every block of a consensus output
+    /// carries the same value. This call runs only for the output's first batch, so each output
+    /// writes once, but several outputs committed within the same second all write the same entry
+    /// and the latest write wins. Once the chain has moved past that second, a lookup for it
+    /// returns the root written by the last output committed in it. Before then, a contract
+    /// executing in an earlier output of that second that queries its own block's `timestamp` sees
+    /// its own output's root, because the later outputs have not written yet.
+    ///
+    /// This is accepted behavior, not a bug. `ConsensusHeader`s are hash-linked, so the roots of
+    /// the earlier outputs in that second remain recoverable by walking the consensus chain back
+    /// from the root that survived.
     fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
         if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp().saturating_to()) {
             return Ok(());
@@ -1844,6 +1864,9 @@ where
         // pre-block system calls; each commit retains only the target contract's state
         if self.ctx.first_batch() {
             // EIP-4788: write the consensus header digest only once per output (first batch)
+            //
+            // outputs committed within the same second share a `timestamp`, so they overwrite
+            // one ring-buffer entry and the latest root wins (see the callee's docs)
             self.apply_consensus_root_contract_call()?;
         }
 

@@ -239,6 +239,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidRound(_)
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
+        | HeaderError::InvalidTimestampMillis(_)
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore (local/transient, not the peer's fault)
