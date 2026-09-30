@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import runpy
 from pathlib import Path
 import subprocess
 import tarfile
@@ -85,6 +86,8 @@ def main():
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--audit", required=True)
     parser.add_argument("--deny", required=True)
+    parser.add_argument("--sources", required=True, type=Path,
+                        help="completed source evidence from sources.py for the current node lockfile")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -145,10 +148,25 @@ def main():
         if result.returncode not in (0, 1):
             raise RuntimeError("workspace audit failed before producing a usable advisory result")
         findings = report["vulnerabilities"]["list"]
+        source_summary = json.loads((args.sources / "summary.json").read_text())
+        if source_summary["status"] != "passed":
+            raise RuntimeError("source evidence must pass before advisory qualification")
+        closure = runpy.run_path(str(ROOT / "etc/transport-patches/sources.py"))["transport_closure"]
+        identities = set()
+        summary["transport_closure_counts"] = {}
+        for mode in ("default", "adiri"):
+            if source_summary["node"][mode]["lockfile_sha256"] != sha256(ROOT / "Cargo.lock"):
+                raise RuntimeError("source evidence does not identify the current node lockfile")
+            raw = args.sources / f"node-{mode}-metadata.stdout"
+            source_receipt = json.loads((args.sources / f"node-{mode}-metadata.json").read_text())
+            if source_receipt["stdout_sha256"] != sha256(raw):
+                raise RuntimeError("resolved source evidence changed after capture")
+            packages = closure(json.loads(raw.read_text()))
+            identities.update((package["name"], package["version"]) for package in packages)
+            summary["transport_closure_counts"][mode] = len(packages)
         summary["carried_scan"] = {**receipt, "workspace_finding_count": len(findings),
             "transport_findings": [finding for finding in findings
-                                   if finding["package"]["name"] in stack
-                                   or finding["package"]["name"] in {"rustls-webpki", "aws-lc-rs", "aws-lc-sys", "ring"}]}
+                                   if (finding["package"]["name"], finding["package"]["version"]) in identities]}
         if summary["carried_scan"]["transport_findings"]:
             raise RuntimeError("carried transport has advisory findings requiring review")
         summary["status"] = "passed"

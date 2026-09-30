@@ -17,6 +17,23 @@ NAMES = {"libp2p-quic", "libp2p-tls", "libp2p-core", "libp2p-identity", "quinn",
          "quinn-proto", "rustls", "rustls-webpki", "aws-lc-rs", "aws-lc-sys", "ring"}
 
 
+def transport_closure(metadata):
+    """Follow resolved normal/build edges from the shipped QUIC/TLS packages, keeping versions."""
+    packages = {package["id"]: package for package in metadata["packages"]}
+    nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+    pending = [package["id"] for package in packages.values()
+               if package["name"] in {"libp2p-quic", "libp2p-tls", "quinn", "quinn-proto", "rustls"}]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(dependency["pkg"] for dependency in nodes[current]["deps"]
+                       if any(kind["kind"] != "dev" for kind in dependency["dep_kinds"]))
+    return [packages[identity] for identity in sorted(visited)]
+
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -53,6 +70,10 @@ def node(root, output, label):
         elif not (active["source"] or "").startswith("registry+"):
             raise RuntimeError("comparison does not select the registry QUIC source")
         nodes = {item["id"]: item for item in metadata["resolve"]["nodes"]}
+        closure = transport_closure(metadata)
+        if any(package["name"] != "libp2p-quic"
+               and not (package["source"] or "").startswith("registry+") for package in closure):
+            raise RuntimeError("a transitive transport dependency is overridden; extend its source record and controls")
         packages = [{"name": package["name"], "version": package["version"], "source": package["source"],
                      "id": package["id"].replace(str(root), "$NODE"),
                      "dependencies": sorted(dependency["pkg"].replace(str(root), "$NODE")
@@ -68,6 +89,8 @@ def node(root, output, label):
         selected = sorted(set(line.replace(str(root), "$NODE") for line in tree.splitlines()
                               if line.split(" ", 1)[0] in NAMES and " (*)" not in line))
         result[mode] = {"packages": packages, "release_feature_tree": selected,
+                        "transport_closure": [{"name": package["name"], "version": package["version"],
+                                               "source": package["source"]} for package in closure],
                         "lockfile_sha256": sha256(root / "Cargo.lock")}
     return result
 

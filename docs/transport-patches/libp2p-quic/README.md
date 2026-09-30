@@ -104,8 +104,15 @@ The fresh scan also identified [GHSA-2mjx-qc3c-rqvc](https://github.com/advisori
 RUSTSEC-2026-0285, affecting the old rustls 0.23.37 pin. This PR updates rustls
 to the fixed 0.23.45, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
 The scoped updated transport scan has no findings. The workspace scan exits
-1 with seven findings outside this transport scope; this record does not
+1 with seven findings outside the complete QUIC/TLS dependency closure; this record does not
 claim the entire workspace is advisory-free.
+
+Advisory qualification reuses the hashed default and Adiri source metadata and
+requires it to identify the current lockfile. It follows every normal and build
+dependency from the resolved QUIC/TLS stack, matching findings by package name
+and exact version. A transitive certificate or crypto dependency therefore
+cannot escape the gate through a crate-name shortlist. Additional non-registry
+dependencies in that closure require an extended source record and controls.
 
 Dependabot was checked separately on 2026-09-30:
 
@@ -211,7 +218,8 @@ python3 -I etc/transport-patches/sources.py --output /tmp/transport-sources
 python3 -I etc/transport-patches/mutations.py --peers /tmp/transport-peers
 git clone https://github.com/RustSec/advisory-db.git /tmp/transport-db
 python3 -I etc/transport-patches/advisories.py --output /tmp/transport-advisories \
-  --database /tmp/transport-db --audit /path/to/cargo-audit --deny /path/to/cargo-deny
+  --database /tmp/transport-db --audit /path/to/cargo-audit --deny /path/to/cargo-deny \
+  --sources /tmp/transport-sources
 python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
 ```
 
