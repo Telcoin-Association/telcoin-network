@@ -353,6 +353,7 @@ Complete tree after the node has run:
 <datadir>/
   node-info.yaml                  # node public identity
   parameters.yaml                 # consensus parameters
+  network-config                  # network settings (YAML), written with defaults on first start
   node-keys/                      # private key material
     bls.key  or  bls.kw           #   BLS keypair (plain or encrypted)
     primary.seed                  #   primary network key seed
@@ -481,7 +482,7 @@ These are application port requirements, not a complete production perimeter. Th
 
 ## Consensus parameters
 
-The `parameters.yaml` file controls consensus timing and behavior. The node reads it at startup and refuses to start when the file is missing or fails to parse. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
+The `parameters.yaml` file controls consensus timing and behavior. The node reads it at startup and refuses to start when the file is missing or fails to parse, or when a value fails one of the [checks that stop the node](#checks-that-stop-the-node). Duration values accept human-readable strings (e.g. `3s`, `500ms`).
 
 | Field                                   | Default  | Description                                         |
 | --------------------------------------- | -------- | --------------------------------------------------- |
@@ -489,7 +490,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
-| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + `max_header_time_drift_tolerance` (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -514,14 +515,14 @@ on the network must hold the same value. A parameters file that omits the key fa
 the node refuses to start rather than falling back in silence. The `genesis` commands write the
 key for you, and the `mainnet` and `adiri` chain presets carry their own value.
 
-Example (testnet configuration):
+Example, the testnet preset (`chain-configs/testnet/parameters.yaml`). It leaves `vote_timeout` at the 5 s default:
 
 ```yaml
+---
 header_num_of_batches_threshold: 5
 max_header_num_of_batches: 10
 max_header_delay: 3s
 min_header_delay: 1s
-vote_timeout: 5s
 gc_depth: 50
 sync_retry_delay: 5s
 sync_retry_nodes: 3
@@ -535,6 +536,92 @@ parallel_fetch_request_delay_interval:
   secs: 5
   nanos: 0
 ```
+
+### Checks that stop the node
+
+Beyond parsing `parameters.yaml`, the node checks the values below each time it sets up consensus for an epoch: as it starts, at every epoch boundary, and when it re-enters the current epoch after its role changes.
+Validators and observers run the same checks.
+When one fails, the node logs `epoch returned error` and then `Error running node:` with a message that names the field, and exits.
+Fix the file and restart.
+
+The node reads `parameters.yaml` and `network-config` only at startup, so a bad value stops the node while it starts, as it enters its first epoch.
+The only input to these checks that changes between epochs is whether the sub-second timestamp fork is active, and that only loosens the `vote_timeout` bound, so a value the node accepts at startup it accepts at every later epoch boundary.
+
+| Requirement                                                              | Why                                                                                                                                                                                                  |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gc_depth` above 10                                                      | The node's activity window is `gc_depth` minus 10 rounds; at 10 or less the window is empty and the node cannot stay active                                                                         |
+| `gc_depth` at most 50                                                    | The consensus-pack reader is sized for this bound, so a deeper setting could commit output that no node can reconstruct later                                                                        |
+| `max_header_num_of_batches` from 1 to 10                                 | At 0 the proposer puts no batches in a header and drains no transactions; above 10, as with `gc_depth`, output could exceed what the reader reconstructs                                              |
+| `header_num_of_batches_threshold` from 1 to `max_header_num_of_batches`  | At 0 the proposer seals empty headers; above the maximum the two limits contradict each other                                                                                                        |
+| `min_header_delay` at most `max_header_delay`                            | The minimum is an early-proposal point inside the maximum's window; inverted, the maximum always expires first and the minimum never takes effect                                                   |
+| `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
+| `vote_timeout` below 10 s                                                | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires                                                        |
+
+With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
+Neither preset sets `vote_timeout`, so it is 5 s.
+The testnet preset's `max_header_delay` is 3 s, which leaves room for a tolerance of up to 2 s; the mainnet preset's is 1 s, which leaves room for up to 4 s.
+The default `250ms` and a legacy `1` pass with both.
+
+One condition only logs a warning: `max_header_delay` below 1 s while the sub-second timestamp fork is not active for the epoch.
+Header timestamps are then still whole seconds, so rounds can stall at second boundaries.
+
+A `network-config` that fails to parse, including a `max_header_time_drift_tolerance` in a form the node does not accept, stops the node earlier in startup, when it reads that file.
+
+### `max_header_time_drift_tolerance` (network-config)
+
+How far a header's creation time may run ahead of this node's clock before the node stops waiting it out.
+It is not in `parameters.yaml`.
+It lives in the network config, the file `network-config` in the data directory (YAML, no file extension), under `sync_config`:
+
+```yaml
+sync_config:
+  max_header_time_drift_tolerance: 250ms
+```
+
+The default is `250ms`.
+Write the value as a humantime string such as `250ms`, `1s` or `1s 500ms`.
+A bare whole number is read as seconds (`1` is one second); that is the format older binaries wrote, and the node logs a warning each time it reads one.
+Anything else fails to parse and the node does not start: a negative number, a fraction such as `1.5`, text humantime cannot read, or the `secs:` / `nanos:` form other durations in the file use.
+The node also logs a warning at startup when the value is above 1 s, because a vote can wait that long.
+
+When a validator gets a vote request, it measures how far the header's creation time is ahead of its own clock:
+
+- Within the tolerance, it waits out the difference, then decides whether to vote.
+- Beyond the tolerance but within the tolerance plus `vote_timeout` (5.25 s at the defaults), it does not vote yet. It answers with a retryable response, the proposer is not penalized, and the proposer retries the request; by then the difference may be back within the tolerance. The validator counts these deferrals in `tn_primary_votes_deferred_future_header_total` and logs a warning once per proposer and round.
+- Further ahead, it rejects the header and gives the proposer a severe peer penalty.
+
+Before the sub-second timestamp fork is active for an epoch, header timestamps are whole seconds and the first check compares whole seconds against the tolerance rounded up.
+The 250 ms default then waits out a difference of up to 1 s, the same as `1`; the rejection point is still the tolerance plus `vote_timeout`, measured in milliseconds.
+
+The tolerance is local.
+Validators with different values agree on every block; the value only changes when this validator votes and when it penalizes a proposer.
+`vote_timeout` has to cover `max_header_delay` plus the longest of these waits, or the node stops (see [Checks that stop the node](#checks-that-stop-the-node)).
+
+#### Datadirs from older binaries keep one second
+
+The node writes `network-config` only when the file is missing, and never rewrites an existing one.
+A datadir first started by a binary from before sub-second timestamps, such as `v0.15.0-adiri`, holds the whole number that binary wrote, `max_header_time_drift_tolerance: 1`, and a newer binary keeps reading it as one second.
+The 250 ms default reaches only datadirs a newer binary creates.
+
+To see the value:
+
+```bash
+grep -n max_header_time_drift_tolerance <datadir>/network-config
+```
+
+To use the default, delete that line: a missing key takes the default.
+To choose a value, write it as a humantime string, for example `max_header_time_drift_tolerance: 250ms`.
+The node reads the file once, at startup, so restart it after an edit.
+
+#### Rolling back to an older binary
+
+Binaries from before sub-second timestamps, such as `v0.15.0-adiri`, read this field as a whole number of seconds and reject a string.
+A `network-config` holding a humantime value (every datadir a newer binary created, and any file edited to a value such as `250ms`) fails to parse on an older binary, and that binary does not start.
+Before rolling back, do one of these:
+
+- Set the line to a whole number of seconds, for example `max_header_time_drift_tolerance: 1`.
+- Delete the line. Each binary then runs its own default: one second on the older binary, 250 ms on a newer one. The file then works with both binaries.
+- Remove the file. The older binary writes a new one with its defaults, which also resets every other network setting in it.
 
 ## Monitoring
 
