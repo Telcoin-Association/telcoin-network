@@ -139,20 +139,24 @@
       "cargo-audit": "cargo-audit 0.22.2",
       "cargo-deny": "cargo-deny 0.20.2"
     },
-    "status": "passed"
+    "status": "passed",
+    "transport_closure_counts": {
+      "adiri": 221,
+      "default": 221
+    }
   },
   "artifact": {
-    "digest": "sha256:345bd2f4e9e702f8eaf9797b399e1c2d32782edb29339245d96b8352e9d89b93",
+    "digest": "sha256:fdc57c961abf9e79bb92381a6460c1ea84b9eda44be0fdb0559554dd7e09bbdf",
     "expired": false,
-    "id": 11120465331,
-    "name": "transport-evidence-d35a35926fd0b4c6f5e315a0f69074d2eac84251"
+    "id": 11121816829,
+    "name": "transport-evidence-e3cb9a16eac59072f12159f3b6ac2d341f7e3bf6"
   },
   "existing_attestation_gate": "tested commit is not attested; full workspace validation and attestation remain required for merge",
   "full_report_hashes": {
-    "transport-advisories/summary.json": "84d4eaa027565a42571612144d3f431da48fcb75fc2c4b02daa9355171ca5fc1",
+    "transport-advisories/summary.json": "6a09e12d647d92b90589111804300f5c923b359abf84be782c0441a32f1c6234",
     "transport-peers/mutations.json": "6b6644abf2ebdbc622bc42856e2852865ac4f73e5f8c6c70934fe441886fdb26",
     "transport-peers/summary.json": "92b38d23d8eb8106b6f27222f3f6d550497f98a2bfd064a21a1d7a860f8808b5",
-    "transport-sources/summary.json": "5ff75121495033faa8210a32066fb680833b7bda813e9aff131f16ffd82b73d6"
+    "transport-sources/summary.json": "d6abb4ff539dc4bf27b4dd072d58a3ff554e0009bd7b92e5ef5b7047186c701d"
   },
   "mutations": {
     "mutations": {
@@ -681,9 +685,15 @@
   },
   "prior_failure_evidence": "ci-shutdown-failure.json",
   "provider_comparison": "exact baseline group and cipher order preserved in all three independently built peers",
+  "recipe_hashes": {
+    "etc/transport-patches/advisories.py": "16d2525fdf830b80b6aed2bb039598c646206b7431a0c3a713a08d3627873bb1",
+    "etc/transport-patches/mutations.py": "718690d01a24746dd204cf572af93be77ea5f89b453212e2d14152cbfa6732f9",
+    "etc/transport-patches/qualify.py": "e20ea9f975365c0ce560cb13ab0a65c4ce75b033aae204da1e27e51c0af4b811",
+    "etc/transport-patches/sources.py": "2fcba773ba1494a2324959b8c98fdc8f49b50d0fc96874776b23f5fe1e58c111"
+  },
   "recorded_at": "2026-09-30",
   "release_feature_comparison": "default and Adiri transport/crypto features preserved across the registry crypto update",
-  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36763760398",
+  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36767437360",
   "shutdown_synchronization": "dialer held alive until listener ECHO after final stream close, then explicitly released through stdin",
   "sources": {
     "node": {
@@ -702,7 +712,8 @@
           "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
           "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
           "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
-        ]
+        ],
+        "transport_closure_count": 221
       },
       "default": {
         "lockfile_sha256": "0e877cdbc8ece40539e16d85b4c3918e44af2d9b6f30a350cb4ce5d1bcd4983c",
@@ -719,7 +730,8 @@
           "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
           "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
           "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
-        ]
+        ],
+        "transport_closure_count": 221
       }
     },
     "provenance": {
@@ -745,7 +757,7 @@
     },
     "status": "passed"
   },
-  "tested_commit": "17164dbb188ac4efd77f4ea0b98e9ec6d0a6b327",
+  "tested_commit": "d3d0c056f6937918b40933c6391c40356020f6dc",
   "transport_job_conclusion": "success",
-  "transport_job_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36763760398/job/110052610751"
+  "transport_job_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36767437360/job/110065036388"
 }

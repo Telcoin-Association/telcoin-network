@@ -198,12 +198,15 @@ the job succeeds after its scope check. A skipped, failed or cancelled job
 cannot pass aggregation. The existing lint, tests, archive and attestation
 requirements are retained.
 
-The [Linux qualification run](https://github.com/Telcoin-Association/telcoin-network/actions/runs/36763760398/job/110052610751)
-passed on commit `17164dbb188ac4efd77f4ea0b98e9ec6d0a6b327`, including the
-endpoint lifetime synchronization fix. It includes the
+The [Linux qualification run](https://github.com/Telcoin-Association/telcoin-network/actions/runs/36767437360/job/110065036388)
+passed on commit `d3d0c056f6937918b40933c6391c40356020f6dc`, including the
+endpoint lifetime synchronization and complete dependency closure gates. It includes the
 source/default/Adiri checks, both scanner source-form controls, eight peer rows,
 identity rejection, provider comparison, key logging control, CI aggregation
-tests and killed traffic/identity mutations. Both scanner database revisions
+tests and killed traffic/identity mutations. Both default and Adiri advisory
+closures contain 221 packages. The transitive closure regression test was
+also verified by removing traversal from a temporary copy and observing its failure.
+Both scanner database revisions
 were `9b3a3b73a7f42606494c943e95f8196e9994df46`.
 [ci-linux.json](evidence/ci-linux.json) retains the actual package IDs/features,
 binary and report hashes, outcomes, immutable artifact ID and archive digest.
