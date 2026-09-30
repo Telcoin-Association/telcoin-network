@@ -42,16 +42,19 @@ impl TestBinary {
     /// multi-workers and PREVRANDAO pins are `u32::MAX`, holding those forks dormant:
     /// wire-identical to pre-fork mainnet for the seed signature, the legacy single-worker layout
     /// for the committee worker list, the legacy `output_digest ^ batch_digest` mix hash for
-    /// PREVRANDAO. The leader-seeded-ordering pin defaults to `0` instead: its gate
-    /// (`tn_types::forks::leader_seeded_ordering_active`) conjoins the seed-signature fork
-    /// fail-closed, so with the seed fork dormant the seeded ordering stays off regardless of this
-    /// pin, and `0` means "the fork point itself never blocks; the seed fork governs", which is
-    /// what a non-adiri production build does. A harness-level value is forwarded verbatim so a
-    /// lane can export `TN_SEED_SIGNATURE_FORK_EPOCH=0`, `TN_MULTI_WORKERS_FORK_EPOCH=1`,
-    /// `TN_PREVRANDAO_FORK_EPOCH=0` or `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=1`, and a single test
-    /// can still override a pin with its own later `env()` call. Only binaries built with
-    /// `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see `make build-e2e-bin`)
-    /// consult these variables; production binaries ignore them.
+    /// PREVRANDAO. The leader-seeded-ordering and sub-second-timestamp pins default to `0`
+    /// instead: their gates (`tn_types::forks::leader_seeded_ordering_active` and
+    /// `tn_types::forks::subsecond_timestamp_active`) conjoin the seed-signature fork
+    /// fail-closed, so with the seed fork dormant the seeded ordering and the millisecond
+    /// timestamps stay off regardless of these pins, and `0` means "the fork point itself never
+    /// blocks; the seed fork governs", which is what a non-adiri production build does. A
+    /// harness-level value is forwarded verbatim so a lane can export
+    /// `TN_SEED_SIGNATURE_FORK_EPOCH=0`, `TN_MULTI_WORKERS_FORK_EPOCH=1`,
+    /// `TN_PREVRANDAO_FORK_EPOCH=0`, `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=1` or
+    /// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=1`, and a single test can still override a pin with
+    /// its own later `env()` call. Only binaries built with `tn-types/test-utils` (pulled in via
+    /// `tn-storage/test-utils`, see `make build-e2e-bin`) consult these variables; production
+    /// binaries ignore them.
     ///
     /// The governance-Safe pin is the odd one out: its whole mechanism is `adiri`-gated, so a
     /// default e2e binary neither honors the forwarded value nor reports it (its
@@ -67,16 +70,17 @@ impl TestBinary {
         };
         // one loop rather than a block per variable so the forks cannot drift apart in mechanism;
         // they arm independently, so each is read and forwarded on its own, and each carries its
-        // own default. The two conjoined forks are why the defaults are not uniform: reaching the
+        // own default. The conjoined forks are why the defaults are not uniform: reaching the
         // seeded PREVRANDAO derivation needs the seed fork armed too (`prevrandao_seed_active`),
         // so pinning PREVRANDAO dormant here keeps a seed-armed lane from silently arming it on a
-        // non-adiri build, while the leader-seeded fork is governed by that same seed conjunct and
-        // so defaults to the always-armed 0 rather than dormant
+        // non-adiri build, while the leader-seeded and sub-second-timestamp forks are governed by
+        // that same seed conjunct and so default to the always-armed 0 rather than dormant
         [
             ("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX),
             ("TN_MULTI_WORKERS_FORK_EPOCH", u32::MAX),
             ("TN_PREVRANDAO_FORK_EPOCH", u32::MAX),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", 0),
+            ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", 0),
             ("TN_GOVERNANCE_SAFE_FORK_EPOCH", u32::MAX),
         ]
         .into_iter()
