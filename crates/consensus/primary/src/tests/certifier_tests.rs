@@ -18,20 +18,24 @@ use tn_types::{
     encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, SignatureVerificationState,
     TnSender,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 // ===== Certifier test harness =====
 
-/// A `Certifier` task running on the last authority of a committee, on a [`MockNetwork`].
+/// The `Certifier` of the last authority of a committee, on a [`MockNetwork`].
 ///
-/// Tests send headers through the consensus bus, answer the certifier's vote requests through
-/// [`Self::network`], and read the certificates it forms from the bus.
+/// In the spawned mode ([`Self::from_fixture`]) the certifier runs as its own task, as in
+/// production: tests send headers through the consensus bus, answer the certifier's vote requests
+/// through [`Self::network`], and read the certificates it forms from the bus. In the unspawned
+/// mode ([`Self::unspawned_from_fixture`]) the test gets the `Certifier` itself and calls its
+/// methods directly, so it can match the exact result of one proposal.
 struct CertifierContext<DB> {
     /// All authorities and their configs.
     fixture: CommitteeFixture<DB>,
     /// Per-epoch consensus bus: send headers, read certificates.
     consensus_bus: ConsensusBus,
-    /// Keeps the spawned `Certifier` task alive for the test duration.
+    /// Owns the certifier's tasks for the test duration: the certifier task itself (spawned mode
+    /// only), the state synchronizer, and the vote tasks of every proposal.
     task_manager: TaskManager,
     /// The network the certifier sends through. It knows the proposer's key, so
     /// [`MockNetwork::respond`] fails a test in which the proposer is asked for its own vote.
@@ -45,13 +49,13 @@ impl CertifierContext<MemDatabase> {
         Self::from_fixture(fixture)
     }
 
-    /// `n`-authority context; `Certifier` spawned on the last authority.
-    fn with_size(n: usize) -> Self {
+    /// `n`-authority context and the last authority's `Certifier`, built but not spawned.
+    fn unspawned(n: usize) -> (Self, Certifier<MemDatabase>) {
         let fixture = CommitteeFixture::builder(MemDatabase::default)
             .committee_size(NonZeroUsize::new(n).expect("committee size must be non-zero"))
             .randomize_ports(true)
             .build();
-        Self::from_fixture(fixture)
+        Self::unspawned_from_fixture(fixture)
     }
 }
 
@@ -59,30 +63,65 @@ impl<DB: Database> CertifierContext<DB> {
     /// Spawn the `Certifier` on the last authority of an already-built fixture (useful for custom
     /// committee params or a store filled before the certifier starts).
     fn from_fixture(fixture: CommitteeFixture<DB>) -> Self {
+        let (cx, handle, state_sync) = Self::assemble(fixture);
+        Certifier::spawn(
+            cx.proposer().consensus_config(),
+            cx.consensus_bus.clone(),
+            state_sync,
+            handle,
+            &cx.task_manager,
+        );
+        cx
+    }
+
+    /// Build, without spawning, the `Certifier` of the last authority of an already-built fixture,
+    /// with the fields `Certifier::spawn` gives it.
+    ///
+    /// Nothing runs until the test calls a method on the returned certifier, so the startup
+    /// republish of `Certifier::spawn` never happens. Vote tasks are spawned on
+    /// [`Self::task_manager`], and every proposal on the returned certifier or its clones shares
+    /// one `new_proposal` notifier and one proposal lock, as the proposals of a running certifier
+    /// do.
+    fn unspawned_from_fixture(fixture: CommitteeFixture<DB>) -> (Self, Certifier<DB>) {
+        let (cx, network, state_sync) = Self::assemble(fixture);
+        let config = cx.proposer().consensus_config();
+        let certifier = Certifier {
+            authority_id: config.authority_id().expect("the proposer is a committee member"),
+            committee: config.committee().clone(),
+            certificate_store: config.node_storage().clone(),
+            state_sync,
+            signature_service: config.key_config().clone(),
+            network,
+            task_spawner: cx.task_manager.get_spawner(),
+            new_proposal: Notifier::new(),
+            proposal_lock: Arc::new(Mutex::new(())),
+            metrics: cx.consensus_bus.app().metrics().clone(),
+            config,
+        };
+        (cx, certifier)
+    }
+
+    /// The context both modes share, and the network handle and running state synchronizer the
+    /// certifier is built with.
+    fn assemble(
+        fixture: CommitteeFixture<DB>,
+    ) -> (Self, PrimaryNetworkHandle, StateSynchronizer<DB>) {
         let consensus_bus = ConsensusBus::new();
         let task_manager = TaskManager::default();
 
         let primary = fixture.authorities().last().expect("committee has authorities");
         let (network, handle) = MockNetwork::for_node(*primary.authority().protocol_key());
-        let synchronizer = StateSynchronizer::new(
+        let state_sync = StateSynchronizer::new(
             primary.consensus_config(),
             consensus_bus.clone(),
             task_manager.get_spawner(),
         );
-        synchronizer.spawn(&task_manager);
+        state_sync.spawn(&task_manager);
 
-        Certifier::spawn(
-            primary.consensus_config(),
-            consensus_bus.clone(),
-            synchronizer,
-            handle,
-            &task_manager,
-        );
-
-        Self { fixture, consensus_bus, task_manager, network }
+        (Self { fixture, consensus_bus, task_manager, network }, handle, state_sync)
     }
 
-    /// The authority whose `Certifier` is running (last in the fixture).
+    /// The authority whose `Certifier` is under test (last in the fixture).
     fn proposer(&self) -> &AuthorityFixture<DB> {
         self.fixture.authorities().last().expect("committee has authorities")
     }
@@ -224,17 +263,18 @@ impl MockNetwork {
     ///
     /// `reply_for` receives the peer the request is addressed to and the request. A request
     /// answered with [`Reply::Hold`] is not answered at all: its reply channel is handed back in
-    /// [`Responses::held`]. Gossip publishes in between are acknowledged and skipped (see
-    /// [`Self::next_vote_request`]). Panics, naming `context`, if a vote request does not arrive
-    /// within [`STEP_TIMEOUT`], if any other command arrives instead, if a request is addressed to
-    /// this network's own node, or if the requester is gone before its reply is delivered.
+    /// [`Responses::held`]. Every request is logged in [`Responses::requests`]. Gossip publishes in
+    /// between are acknowledged and skipped (see [`Self::next_vote_request`]). Panics, naming
+    /// `context`, if a vote request does not arrive within [`STEP_TIMEOUT`], if any other command
+    /// arrives instead, if a request is addressed to this network's own node, or if the requester
+    /// is gone before its reply is delivered.
     async fn respond(
         &mut self,
         count: usize,
         context: &str,
         mut reply_for: impl FnMut(&BlsPublicKey, &PrimaryRequest) -> Reply,
     ) -> Responses {
-        let mut responses = Responses { held: Vec::new() };
+        let mut responses = Responses { held: Vec::new(), requests: Vec::new() };
         for ordinal in 1..=count {
             let (peer, request, reply) = self
                 .next_vote_request(&format!(
@@ -245,6 +285,14 @@ impl MockNetwork {
                 self.node != Some(peer),
                 "{context}: vote request {ordinal} of {count} asks the proposer for its own vote"
             );
+            let PrimaryRequest::Vote { header, parents } = &request else {
+                unreachable!("next_vote_request returns only vote requests");
+            };
+            responses.requests.push(LoggedRequest {
+                peer,
+                header: header.digest(),
+                parents: parents.iter().map(|parent| parent.header().digest()).collect(),
+            });
             let result = match reply_for(&peer, &request) {
                 Reply::Vote(vote) => Ok(PrimaryResponse::Vote(vote)),
                 Reply::Response(response) => Ok(response),
@@ -282,140 +330,262 @@ struct Responses {
     /// The requester waits on each until the test answers it or drops it; a channel whose
     /// requester stopped waiting reports `is_closed()`.
     held: Vec<NetworkResponseSender<PrimaryResponse>>,
+    /// Every vote request seen, in arrival order, however it was answered.
+    requests: Vec<LoggedRequest>,
+}
+
+impl Responses {
+    /// How many of the logged requests were addressed to each peer.
+    fn requests_per_peer(&self) -> HashMap<BlsPublicKey, usize> {
+        let mut counts = HashMap::new();
+        for request in &self.requests {
+            *counts.entry(request.peer).or_default() += 1;
+        }
+        counts
+    }
+}
+
+/// One vote request seen by [`MockNetwork::respond`].
+struct LoggedRequest {
+    /// The peer the request is addressed to.
+    peer: BlsPublicKey,
+    /// The digest of the header the request asks a vote for.
+    header: HeaderDigest,
+    /// The digests of the parent certificates the request carries, in request order.
+    parents: Vec<HeaderDigest>,
+}
+
+/// Run `certifier.propose_header(header)` as its own task, so the test can answer the vote
+/// requests it sends. Collect the result with [`proposal_result`].
+fn start_proposal<DB: Database>(
+    certifier: &Certifier<DB>,
+    header: Header,
+) -> JoinHandle<DagResult<Certificate>> {
+    let certifier = certifier.clone();
+    tokio::spawn(async move { certifier.propose_header(header).await })
+}
+
+/// The result of a proposal started with [`start_proposal`].
+///
+/// Panics, naming `context`, if the proposal does not return within [`STEP_TIMEOUT`] (it is still
+/// waiting on a vote no peer will send) or if its task panicked.
+async fn proposal_result(
+    proposal: JoinHandle<DagResult<Certificate>>,
+    context: &str,
+) -> DagResult<Certificate> {
+    match tokio::time::timeout(STEP_TIMEOUT, proposal).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => panic!("{context}: proposal task failed: {error}"),
+        Err(_) => panic!("{context}: propose_header did not return within {STEP_TIMEOUT:?}"),
+    }
+}
+
+/// The verified certificate for `header` over exactly the votes of `voters`: what
+/// `VotesAggregator` forms when those votes, and no others, reach quorum.
+fn certificate_over<'a, DB: Database>(
+    committee: &Committee,
+    header: &Header,
+    voters: impl IntoIterator<Item = &'a AuthorityFixture<DB>>,
+) -> Certificate {
+    let votes =
+        voters.into_iter().map(|voter| (voter.id(), *voter.vote(header).signature())).collect();
+    let mut certificate = Certificate::new_unverified(committee, header.clone(), votes)
+        .expect("the voters reach quorum");
+    certificate.verify_cert(&committee.bls_keys()).expect("expected certificate verifies");
+    certificate
 }
 
 // ===== end harness =====
 
-/// A single peer initially responds with MissingParents for one of the header's genesis parent
-/// certs. The certifier fetches the cert from the store and retries; on the retry the peer returns
-/// a valid vote. A certificate still forms.
+/// A peer that answers `MissingParents` is asked again with exactly the parent certificate it
+/// named, and its vote on the retry counts toward the certificate.
+///
+/// The header is a round-2 header whose parents are the round-1 certificates of every authority,
+/// stored where the proposer reads the parents a peer asks for. One other peer's request is held
+/// unanswered, so quorum needs the retried vote.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn missing_parents_happy_path() {
-    let mut cx = CertifierContext::new();
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
     let committee = cx.fixture.committee();
 
-    // pre-populate the cert store with genesis certs so the MissingParents retry can be satisfied
-    // (the certifier reads them on the next loop iteration)
-    let genesis_certs = Certificate::genesis(&committee);
-    for cert in &genesis_certs {
-        cx.proposer()
-            .consensus_config()
-            .node_storage()
-            .write(cert.clone())
-            .expect("write genesis cert to store");
+    let round1: Vec<Certificate> = cx
+        .fixture
+        .authorities()
+        .map(|authority| {
+            cx.fixture.certificate(&authority.header_builder_at_round(&committee, 1).build())
+        })
+        .collect();
+    let store = cx.proposer().consensus_config().node_storage().clone();
+    for certificate in &round1 {
+        store.write(certificate.clone()).expect("write round-1 certificate");
     }
+    let header = cx
+        .proposer()
+        .header_builder_at_round(&committee, 2)
+        .parents(round1.iter().map(|certificate| certificate.header().digest()).collect())
+        .build();
+    // the proposer's own round-1 certificate, which the slow peer has not seen
+    let missing = round1.last().expect("committee has authorities").header().digest();
 
-    let header = cx.proposer_header(); // round 1; parents == genesis cert digests
     let votes = cx.peer_votes(&header);
-    let mut cert_rx = cx.subscribe_new_certificates();
+    let (slow, held, voter) = {
+        let mut peers = cx.peers();
+        let mut peer = || peers.next().expect("committee has three peers");
+        (peer(), peer(), peer())
+    };
+    let expected = Ok(certificate_over(&committee, &header, [cx.proposer(), slow, voter]));
+    let (slow, held) = (*slow.authority().protocol_key(), *held.authority().protocol_key());
 
-    // one non-proposer peer returns MissingParents first, then votes
-    let slow_peer =
-        *cx.peers().next().expect("committee has non-proposer peer").authority().protocol_key();
-
-    // use the first genesis cert digest as the "missing" parent the peer asks for
-    let missing_digest = genesis_certs[0].header().digest();
-    assert!(
-        header.parents().contains(&missing_digest),
-        "precondition: genesis digest is in header parents"
-    );
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    // every peer votes; the slow peer's first request gets MissingParents, so its vote comes on the
-    // retry: one request more than there are peers
+    let proposal = start_proposal(&certifier, header);
+    // the slow peer's vote comes on its second request: one request more than there are peers
     let mut asked_for_parents = false;
-    cx.network
-        .respond(votes.len() + 1, "MissingParents then retry", |peer, _| {
-            if *peer == slow_peer && !asked_for_parents {
+    let responses = cx
+        .network
+        .respond(votes.len() + 1, "the slow peer names a missing parent", |peer, _| {
+            if *peer == held {
+                Reply::Hold
+            } else if *peer == slow && !asked_for_parents {
                 asked_for_parents = true;
-                Reply::Response(PrimaryResponse::MissingParents(vec![missing_digest]))
+                Reply::Response(PrimaryResponse::MissingParents(vec![missing]))
             } else {
                 Reply::Vote(votes[peer].clone())
             }
         })
         .await;
+    let result = proposal_result(proposal, "the slow peer names a missing parent").await;
 
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .expect("cert formed within timeout")
-        .expect("cert_rx channel open");
-    assert_eq!(cert.header().digest(), header.digest());
+    let slow_requests: Vec<&[HeaderDigest]> = responses
+        .requests
+        .iter()
+        .filter(|request| request.peer == slow)
+        .map(|request| request.parents.as_slice())
+        .collect();
+    assert_eq!(
+        slow_requests,
+        [&[][..], &[missing][..]],
+        "the slow peer's first request must carry no parents, and its retry exactly the parent it \
+         named"
+    );
+    assert!(
+        same_outcome(&result, &expected),
+        "expected {expected:?} over the proposer's, the slow peer's and the voter's votes, got \
+         {result:?}"
+    );
 }
 
-/// One peer returns a transient (non-RPC) network error on first contact, then a valid vote on the
-/// retry. A certificate still forms — transient errors do not permanently disqualify a peer.
+/// A peer whose first request fails with a retryable network error is asked again, and its vote
+/// on the retry counts toward the certificate.
+///
+/// One other peer's request is held unanswered, so quorum needs the retried vote.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn transient_network_error_retries() {
-    let mut cx = CertifierContext::new();
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let committee = cx.fixture.committee();
     let header = cx.proposer_header();
     let votes = cx.peer_votes(&header);
-    let mut cert_rx = cx.subscribe_new_certificates();
 
-    let flaky_peer = *cx.peers().next().expect("non-proposer peer").authority().protocol_key();
+    let (flaky, held, voter) = {
+        let mut peers = cx.peers();
+        let mut peer = || peers.next().expect("committee has three peers");
+        (peer(), peer(), peer())
+    };
+    let expected = Ok(certificate_over(&committee, &header, [cx.proposer(), flaky, voter]));
+    let [flaky, held, voter] = [flaky, held, voter].map(|peer| *peer.authority().protocol_key());
 
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    // every peer votes; the flaky peer's first request fails with a transient error, so its vote
-    // comes on the retry: one request more than there are peers
+    let proposal = start_proposal(&certifier, header);
+    // the flaky peer's vote comes on its second request: one request more than there are peers
     let mut failed_once = false;
-    cx.network
-        .respond(votes.len() + 1, "transient error then retry", |peer, _| {
-            if *peer == flaky_peer && !failed_once {
-                // transient error: the certifier will retry (no immediate task failure)
-                failed_once = true;
-                Reply::Fail(NetworkError::Timeout)
-            } else {
-                Reply::Vote(votes[peer].clone())
-            }
-        })
+    let responses = cx
+        .network
+        .respond(
+            votes.len() + 1,
+            "the flaky peer's first request fails, so it must be asked again",
+            |peer, _| {
+                if *peer == held {
+                    Reply::Hold
+                } else if *peer == flaky && !failed_once {
+                    failed_once = true;
+                    Reply::Fail(NetworkError::Timeout)
+                } else {
+                    Reply::Vote(votes[peer].clone())
+                }
+            },
+        )
         .await;
+    let result = proposal_result(proposal, "the flaky peer fails once").await;
 
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .expect("cert formed after transient error + retry")
-        .expect("cert_rx channel open");
-    assert_eq!(cert.header().digest(), header.digest());
+    assert_eq!(
+        responses.requests_per_peer(),
+        HashMap::from([(flaky, 2), (held, 1), (voter, 1)]),
+        "the flaky peer must be asked exactly twice, every other peer once"
+    );
+    assert!(
+        same_outcome(&result, &expected),
+        "expected {expected:?} over the proposer's, the flaky peer's and the voter's votes, got \
+         {result:?}"
+    );
 }
 
-/// When a second header arrives while the first is being certified, the certifier cancels all
-/// outstanding vote tasks for header 1 and starts fresh for header 2. Only a certificate for header
-/// 2 is produced.
+/// A new header cancels the proposal in flight: every vote request for the old header is dropped,
+/// the new header is certified, and the old one never is.
+///
+/// Header 1's requests are held unanswered, so its vote tasks stay parked on the network until
+/// something cancels them. Receiving header 2 fires `new_proposal`, which ends header 1's proposal
+/// (releasing `proposal_lock`, so header 2's proposal can start) and each of header 1's vote tasks
+/// (dropping its pending request, which closes the reply channel the test holds). Holding rather
+/// than dropping the requests matters: a dropped request fails with a retryable error, so a vote
+/// task that is never cancelled would retry forever instead of leaving its channel open.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn new_header_cancels_inflight() {
     let mut cx = CertifierContext::new();
 
     let committee = cx.fixture.committee();
-    // use distinct created_at timestamps so the two headers have different digests
+    // distinct creation times give the two headers distinct digests
     let header1 = cx.proposer().header_builder(&committee).created_at(1000).build();
     let header2 = cx.proposer().header_builder(&committee).created_at(1001).build();
-    assert_ne!(header1.digest(), header2.digest(), "two distinct headers required");
-
     let h2_digest = header2.digest();
+    assert_ne!(header1.digest(), h2_digest, "precondition: two distinct headers");
     let votes = cx.peer_votes(&header2);
     let mut cert_rx = cx.subscribe_new_certificates();
 
-    // phase 1: send header1 and hold every vote request it sends. this proves header1's vote tasks
-    // are running and have subscribed to `cancel_proposal`. the requests stay held until the test
-    // ends: a dropped request fails, and its vote task may retry before it sees the cancellation
-    // (`select!` polls its branches in random order), slipping a header1 request into phase 3
-    cx.consensus_bus.headers().send(header1.clone()).await.unwrap();
-    let _header1_requests =
-        cx.network.respond(votes.len(), "phase 1: header1", |_, _| Reply::Hold).await;
+    cx.consensus_bus.headers().send(header1).await.unwrap();
+    let mut header1_requests =
+        cx.network.respond(votes.len(), "header 1: every request held", |_, _| Reply::Hold).await;
 
-    // phase 2: send header2 — `new_proposal.notify()` fires, cancelling the header1 vote tasks
-    cx.consensus_bus.headers().send(header2.clone()).await.unwrap();
+    cx.consensus_bus.headers().send(header2).await.unwrap();
+    let all_cancelled = async {
+        for reply in &mut header1_requests.held {
+            reply.closed().await;
+        }
+    };
+    if tokio::time::timeout(STEP_TIMEOUT, all_cancelled).await.is_err() {
+        let open = header1_requests.held.iter().filter(|reply| !reply.is_closed()).count();
+        panic!(
+            "header 2 did not cancel header 1's vote tasks: {open} of {} header-1 requests still \
+             pending after {STEP_TIMEOUT:?}",
+            header1_requests.held.len()
+        );
+    }
 
-    // phase 3: every peer votes for header2
-    cx.network
-        .respond(votes.len(), "phase 3: header2", |peer, _| Reply::Vote(votes[peer].clone()))
+    let header2_requests = cx
+        .network
+        .respond(votes.len(), "header 2: every peer votes", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
         .await;
+    assert!(
+        header2_requests.requests.iter().all(|request| request.header == h2_digest),
+        "every vote request after header 2 must be for header 2"
+    );
 
-    let cert = tokio::time::timeout(Duration::from_secs(5), cert_rx.recv())
+    let cert = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
         .await
-        .expect("cert for header2 formed")
+        .expect("header 2 certified")
         .expect("cert_rx channel open");
-    assert_eq!(cert.header().digest(), h2_digest, "cert should be for header2");
+    assert_eq!(cert.header().digest(), h2_digest, "the certificate must be for header 2");
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
+        panic!("expected no certificate after header 2's, got {result:?}");
+    }
 }
 
 /// A header whose epoch does not match the committee's current epoch is rejected by
@@ -1028,62 +1198,145 @@ async fn propose_header_failure() {
     );
 }
 
+/// `propose_header` returns exactly the certificate the valid votes support when some peers sign
+/// their votes badly.
+///
+/// Every row calls `Certifier::propose_header` directly, on a committee of the row's size, and
+/// every peer answers. The bad signers are the first peers asked, so their votes reach the
+/// aggregator before any valid one. Each row sits at the quorum boundary. Where the proposer and
+/// the valid voters are exactly a quorum, the result must be the certificate over exactly their
+/// votes: it needs every valid vote and carries no bad one. Where they are one short, the call must
+/// return `CouldNotFormCertificate` once every vote is in. Each row runs as its own task and the
+/// test lists every row that failed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn propose_header_scenario_with_bad_sigs() {
-    // expect cert if less than 2 byzantines, otherwise no cert
-    run_vote_aggregator_with_param(6, 0, true).await;
-    run_vote_aggregator_with_param(6, 1, true).await;
-    run_vote_aggregator_with_param(6, 2, false).await;
+async fn propose_header_bad_signature_outcomes() {
+    let row = |name, committee_size, bad_signers, forgery, certifies| BadSignatureRow {
+        name,
+        committee_size,
+        bad_signers,
+        forgery,
+        certifies,
+    };
+    let rows = [
+        row("4 authorities, 1 foreign-key signature", 4, 1, Forgery::ForeignKey, true),
+        row("4 authorities, 2 foreign-key signatures", 4, 2, Forgery::ForeignKey, false),
+        row("6 authorities, 1 foreign-key signature", 6, 1, Forgery::ForeignKey, true),
+        row("6 authorities, 2 foreign-key signatures", 6, 2, Forgery::ForeignKey, false),
+        row("10 authorities, 3 wrong-message signatures", 10, 3, Forgery::WrongMessage, true),
+        row("10 authorities, 4 wrong-message signatures", 10, 4, Forgery::WrongMessage, false),
+    ];
 
-    // expect cert if less than 2 byzantines, otherwise no cert
-    run_vote_aggregator_with_param(4, 0, true).await;
-    run_vote_aggregator_with_param(4, 1, true).await;
-    run_vote_aggregator_with_param(4, 2, false).await;
+    let row_count = rows.len();
+    let mut failures = Vec::new();
+    for row in rows {
+        let name = row.name;
+        if let Err(error) = tokio::spawn(run_bad_signature_row(row)).await {
+            failures.push(row_failure(name, error));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {row_count} bad-signature rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
-async fn run_vote_aggregator_with_param(
+/// One committee in [`propose_header_bad_signature_outcomes`] and the proposal it must certify or
+/// fail.
+struct BadSignatureRow {
+    /// Names the row in every failure message.
+    name: &'static str,
+    /// Number of authorities, the proposer among them.
     committee_size: usize,
-    num_byzantine: usize,
-    expect_cert: bool,
-) {
-    let mut cx = CertifierContext::with_size(committee_size);
-    let header = cx.proposer_header();
-    let proposed_digest = header.digest();
-    let mut cert_rx = cx.subscribe_new_certificates();
+    /// Number of peers whose vote carries a bad signature.
+    bad_signers: usize,
+    /// How the bad signatures are made.
+    forgery: Forgery,
+    /// Whether the proposer and the valid voters are exactly a quorum (else one short of it).
+    certifies: bool,
+}
 
-    // Byzantine peers sign with an unrelated key; honest peers sign correctly.
-    let bad_key = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
-    let peer_votes: HashMap<_, _> = cx
+/// How a bad signer's vote signature is made. The vote is otherwise the signer's honest vote.
+enum Forgery {
+    /// The vote for the header, signed with a key that belongs to no member.
+    ForeignKey,
+    /// The signer's own key, over a message other than the header digest.
+    WrongMessage,
+}
+
+/// Run one row on its own unspawned certifier, panicking with the row's name on any mismatch.
+async fn run_bad_signature_row(row: BadSignatureRow) {
+    let BadSignatureRow { name, committee_size, bad_signers, forgery, certifies } = row;
+    let (mut cx, certifier) = CertifierContext::unspawned(committee_size);
+    let committee = cx.fixture.committee();
+    let quorum = committee.quorum_threshold();
+    let valid_voters = (committee_size - bad_signers) as u64;
+    assert_eq!(
+        valid_voters,
+        if certifies { quorum } else { quorum - 1 },
+        "{name}: precondition: the row must sit at the quorum boundary"
+    );
+
+    let header = cx.proposer_header();
+    let honest = cx.peer_votes(&header);
+    let foreign_key = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
+    let forged: HashMap<BlsPublicKey, Vote> = cx
         .peers()
-        .enumerate()
-        .map(|(i, peer)| {
-            let vote = if i < num_byzantine {
-                Vote::new_with_signer(&header, peer.id(), &bad_key)
-            } else {
-                peer.vote(&header)
+        .map(|peer| {
+            let vote = match forgery {
+                Forgery::ForeignKey => Vote::new_with_signer(&header, peer.id(), &foreign_key),
+                Forgery::WrongMessage => Vote {
+                    signature: peer
+                        .consensus_config()
+                        .key_config()
+                        .request_signature_direct(&[0_u8, 0_u8]),
+                    ..peer.vote(&header)
+                },
             };
             (*peer.authority().protocol_key(), vote)
         })
         .collect();
 
-    cx.consensus_bus.headers().send(header).await.unwrap();
+    let proposal = start_proposal(&certifier, header.clone());
+    let mut bad = Vec::new();
     cx.network
-        .respond(
-            peer_votes.len(),
-            &format!("bad-sig votes ({committee_size} authorities, {num_byzantine} byzantine)"),
-            |peer, _| Reply::Vote(peer_votes[peer].clone()),
-        )
+        .respond(honest.len(), name, |peer, _| {
+            if bad.len() < bad_signers {
+                bad.push(*peer);
+                Reply::Vote(forged[peer].clone())
+            } else {
+                Reply::Vote(honest[peer].clone())
+            }
+        })
         .await;
+    let result = proposal_result(proposal, name).await;
 
-    if expect_cert {
-        // A cert is expected; check that the header digest matches.
-        let cert =
-            tokio::time::timeout(Duration::from_secs(5), cert_rx.recv()).await.unwrap().unwrap();
-        assert_eq!(cert.header().digest(), proposed_digest);
+    let expected = if certifies {
+        // the proposer and every peer that signed validly
+        let valid = cx
+            .fixture
+            .authorities()
+            .filter(|authority| !bad.contains(authority.authority().protocol_key()));
+        Ok(certificate_over(&committee, &header, valid))
     } else {
-        // A cert is not expected; verify it times out without forming.
-        assert!(tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err());
-    }
+        Err(DagError::CouldNotFormCertificate(header.digest()))
+    };
+    let signers = |outcome: &DagResult<Certificate>| {
+        outcome
+            .as_ref()
+            .map(|certificate| certificate.signed_authorities_with_committee(&committee))
+            .unwrap_or_default()
+    };
+    let got = signers(&result);
+    assert!(
+        same_outcome(&result, &expected),
+        "{name}: expected {expected:?} with {} signers, none bad; got {result:?} with {} signers, \
+         {} of them bad",
+        signers(&expected).len(),
+        got.len(),
+        got.iter().filter(|signer| bad.contains(signer)).count()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1103,45 +1356,4 @@ async fn test_shutdown_core() {
         tokio::time::timeout(Duration::from_secs(3), task_manager.join(config.shutdown().clone()))
             .await
             .expect("timeout");
-}
-
-/// One vote request will produce an error, make sure the certificate is still formed with the good
-/// votes. I.E. the vote error does not derail the entire process leaving a broken DAG.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn propose_headers_one_bad() {
-    let mut cx = CertifierContext::with_size(10);
-    let header = cx.proposer_header();
-    let proposed_digest = header.digest();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    // 3 peers have a broken signature; the remaining 6 sign correctly.
-    // VotesAggregator should tolerate the bad sigs and still form a cert.
-    let broken_signature =
-        cx.proposer().consensus_config().key_config().request_signature_direct(&[0_u8, 0_u8]);
-    let peer_votes: HashMap<_, _> = cx
-        .peers()
-        .enumerate()
-        .map(|(i, peer)| {
-            let mut vote = peer.vote(&header);
-            if i < 3 {
-                vote.signature = broken_signature;
-            }
-            (*peer.authority().protocol_key(), vote)
-        })
-        .collect();
-
-    cx.consensus_bus.headers().send(header).await.unwrap();
-    cx.network
-        .respond(peer_votes.len(), "three bad-sig votes", |peer, _| {
-            Reply::Vote(peer_votes[peer].clone())
-        })
-        .await;
-
-    let cert =
-        tokio::time::timeout(Duration::from_secs(10), cert_rx.recv()).await.unwrap().unwrap();
-    assert_eq!(cert.header().digest(), proposed_digest);
-    assert!(matches!(
-        cert.signature_verification_state(),
-        SignatureVerificationState::VerifiedDirectly(_)
-    ));
 }
