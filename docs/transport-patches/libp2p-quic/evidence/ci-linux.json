@@ -142,30 +142,30 @@
     "status": "passed"
   },
   "artifact": {
-    "digest": "sha256:4f3379247c3dbb551b64b45e81a49ba6816a441ee49f5bafa1833eebf9d9d645",
+    "digest": "sha256:345bd2f4e9e702f8eaf9797b399e1c2d32782edb29339245d96b8352e9d89b93",
     "expired": false,
-    "id": 11117869448,
-    "name": "transport-evidence-3f0c769d45e3a3d9170a32a84fa0ac7347da9cd8"
+    "id": 11120465331,
+    "name": "transport-evidence-d35a35926fd0b4c6f5e315a0f69074d2eac84251"
   },
-  "existing_attestation_gate": "failed: tested commit is not attested; maintainer must run make attest and request review to rerun check",
+  "existing_attestation_gate": "tested commit is not attested; full workspace validation and attestation remain required for merge",
   "full_report_hashes": {
     "transport-advisories/summary.json": "84d4eaa027565a42571612144d3f431da48fcb75fc2c4b02daa9355171ca5fc1",
-    "transport-peers/mutations.json": "e5cefff9b97c38113cbfe2c9c1105ae726a706626952b1fffd9916a1a67d8f19",
-    "transport-peers/summary.json": "340d6070364c9e9afec2b8aa9d65d6c1b8c8062e38144e94673396abbd270e85",
+    "transport-peers/mutations.json": "6b6644abf2ebdbc622bc42856e2852865ac4f73e5f8c6c70934fe441886fdb26",
+    "transport-peers/summary.json": "92b38d23d8eb8106b6f27222f3f6d550497f98a2bfd064a21a1d7a860f8808b5",
     "transport-sources/summary.json": "5ff75121495033faa8210a32066fb680833b7bda813e9aff131f16ffd82b73d6"
   },
   "mutations": {
     "mutations": {
       "identity": {
-        "binary_sha256": "c592034a7e105f909170c66ce4119f81889f260ba261e1adee639c7413914db6",
+        "binary_sha256": "417d4e533e1f4ae9f55d53a7bd1976e953be1fac7463a42b4cba9605e3b7616c",
         "failure": "wrong expected identity was not rejected",
-        "source_sha256": "33fc182a23fc1b1f6a1524a5aa7a82345d6a4715d8334f720e7b6774eb2a545a",
+        "source_sha256": "89296908210872927313765abe7840232d2d46f603b5c147e06b328c32eadb11",
         "status": "killed"
       },
       "traffic": {
-        "binary_sha256": "3bee8e2a74912f334ceeaae4b24703e9e01baf3157b8445d030308cc74370877",
+        "binary_sha256": "c9f7dc5b8aca420a36fcdd3f9b13abcce87b7959b1493d13c90881f0b21d26f5",
         "failure": "peer-mutant <- peer-stock-current, /ip4/127.0.0.1/udp/0/quic-v1, exchange 1: Error: Invalid(\"application echo differs\")\n",
-        "source_sha256": "f829347debdcc18bd9a029da46f36318f3f90f7b18b72f7a997eea3166f741ff",
+        "source_sha256": "4ae30f246c0773ccce052b65798e4e961c476d01dea9ee5edba9eae966a4a5e2",
         "status": "killed"
       }
     },
@@ -358,10 +358,10 @@
         "reconnect": "passed"
       }
     ],
-    "peer_source_sha256": "d41d2f4d8ab9846260050ef58ba0c013b0043938abb75234b1aed21720a5c95f",
+    "peer_source_sha256": "a59db14f033b9dca41ddfefaa0cc3799f54872ff8b083456bdc236b96fc9ed1a",
     "peers": {
       "carried": {
-        "binary_sha256": "f3072621ab816f46d932a8ce1e8f90103b87e26bb4067f17369ace6e6db4d403",
+        "binary_sha256": "db22355e27fca426260c019a865113e435346c95a60a121b882542eb194874f7",
         "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         "lockfile_sha256": "ff3273d2534a769b838ba4586eeaa020b1aaf23d2fc09b7297fcd953af4cf059",
         "resolved": [
@@ -465,7 +465,7 @@
         ]
       },
       "stock-current": {
-        "binary_sha256": "6bc5c9c488ccc8ff996b77ec4b375be4cfaf4cb3ce6ad5535eedc71ba39561bc",
+        "binary_sha256": "0f8b252b7840fadfd0f01bd22107084aad2df2494c0742ff8cc61e4c4e9417ec",
         "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         "lockfile_sha256": "69c6c767e4634d128b8118dc90ac92f7698c95628fbd822b523b0f2463066c72",
         "resolved": [
@@ -569,7 +569,7 @@
         ]
       },
       "stock-previous": {
-        "binary_sha256": "7e7dac77b887f7348274395b87b9a866f420b811e5dd44630d3cf196ce6a640d",
+        "binary_sha256": "efd7154755a73cb61d8560c6b26b316b3b4a471ce952eddfb33ae52f610c924d",
         "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         "lockfile_sha256": "de7cb8e98e4786014758f70575f479e6a0453ff33af4f49811702f2867aac17b",
         "resolved": [
@@ -679,9 +679,12 @@
     "status": "passed",
     "toolchain": "1.94"
   },
+  "prior_failure_evidence": "ci-shutdown-failure.json",
   "provider_comparison": "exact baseline group and cipher order preserved in all three independently built peers",
   "recorded_at": "2026-09-30",
-  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36759742506",
+  "release_feature_comparison": "default and Adiri transport/crypto features preserved across the registry crypto update",
+  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36763760398",
+  "shutdown_synchronization": "dialer held alive until listener ECHO after final stream close, then explicitly released through stdin",
   "sources": {
     "node": {
       "adiri": {
@@ -742,7 +745,7 @@
     },
     "status": "passed"
   },
-  "tested_commit": "f6a36fb7b5bf1a96e2d82c4722515b9fcc5ec2fe",
+  "tested_commit": "17164dbb188ac4efd77f4ea0b98e9ec6d0a6b327",
   "transport_job_conclusion": "success",
-  "transport_job_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36759742506/job/110038954563"
+  "transport_job_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36763760398/job/110052610751"
 }
