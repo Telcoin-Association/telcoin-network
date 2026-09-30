@@ -139,6 +139,12 @@ async fn dial(address: Multiaddr, expected: PeerId) -> Result<(), Error> {
     outbound.write_all(b"DONE").await?;
     outbound.close().await?;
     println!("VERIFIED {peer}");
+    // Keep the endpoint's Tokio workers alive until the listener's final FIN is acknowledged.
+    let mut release = String::new();
+    io::stdin().read_line(&mut release)?;
+    if release != "EXIT\n" {
+        Err(Error::Invalid("missing listener completion signal".into()))?;
+    }
     Ok(())
 }
 

@@ -141,6 +141,14 @@ A wrong expected PeerId must fail at the authenticated transport output
 before application bytes are sent. This asserts the application identity
 boundary, not a promise that a bare transport dial enforces a `/p2p` suffix.
 
+The dialer remains alive after verifying the echo until the listener confirms
+its stream close with `ECHO`. The harness then releases it through stdin.
+This event-driven lifetime prevents endpoint shutdown before the final FIN
+is acknowledged, while retaining both stream close checks. A later evidence
+rerun exposed the race in the original harness; its immutable failed run and
+diagnostic are retained in [ci-shutdown-failure.json](evidence/ci-shutdown-failure.json).
+Successful rows are saved as they finish, including when a later row fails.
+
 The unchanged source baseline passed all eight rows and the identity control
 locally on macOS. An initial run timed out; failed receipts were retained,
 and bounded subprocess deadlines and two Tokio workers were used for the

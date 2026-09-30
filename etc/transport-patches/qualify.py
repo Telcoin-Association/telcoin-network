@@ -127,19 +127,28 @@ async def exercise(server, client, address, env):
     try:
         for exchange in range(2):
             dialer = await asyncio.create_subprocess_exec(client, "dial", bound, peer, env=env,
+                                                          stdin=asyncio.subprocess.PIPE,
                                                           stdout=asyncio.subprocess.PIPE,
                                                           stderr=asyncio.subprocess.PIPE)
             try:
-                stdout, stderr = await asyncio.wait_for(dialer.communicate(), 45)
+                verified = await asyncio.wait_for(dialer.stdout.readline(), 45)
+                if verified.decode().strip() != f"VERIFIED {peer}":
+                    _, stderr = await asyncio.wait_for(dialer.communicate(), 45)
+                    raise RuntimeError(f"{Path(server).name} <- {Path(client).name}, {address}, exchange {exchange + 1}: {stderr.decode()}")
+                echoed = await asyncio.wait_for(process.stdout.readline(), 45)
+                if not echoed.startswith(b"ECHO "):
+                    _, listener_error = await asyncio.wait_for(process.communicate(), 45)
+                    raise RuntimeError(f"listener did not confirm delivery and close: {echoed.decode()} {listener_error.decode()}")
+                stdout, stderr = await asyncio.wait_for(dialer.communicate(b"EXIT\n"), 45)
             finally:
                 if dialer.returncode is None:
                     await stop(dialer)
-            if dialer.returncode or stdout.decode().strip() != f"VERIFIED {peer}":
+            if dialer.returncode or stdout.strip():
                 raise RuntimeError(f"{Path(server).name} <- {Path(client).name}, {address}, exchange {exchange + 1}: {stderr.decode()}")
             exchanges.append({"exit_code": dialer.returncode, "authenticated": True,
                               "echo_bytes": 32})
         stdout, stderr = await asyncio.wait_for(process.communicate(), 45)
-        if process.returncode or stdout.decode().count("ECHO ") != 2:
+        if process.returncode or stdout.strip():
             raise RuntimeError(f"listener failed: {stderr.decode()}")
         return {"listener": server, "dialer": client, "address": address,
                 "listener_exit_code": process.returncode, "exchanges": exchanges,
@@ -158,10 +167,11 @@ async def identity_rejection(server, client, env):
         second, _, wrong = await listener(server, "/ip4/127.0.0.1/udp/0/quic-v1", env)
         processes.append(second)
         dialer = await asyncio.create_subprocess_exec(client, "dial", bound, wrong, env=env,
+                                                      stdin=asyncio.subprocess.PIPE,
                                                       stdout=asyncio.subprocess.PIPE,
                                                       stderr=asyncio.subprocess.PIPE)
         processes.append(dialer)
-        _, stderr = await asyncio.wait_for(dialer.communicate(), 45)
+        _, stderr = await asyncio.wait_for(dialer.communicate(b"EXIT\n"), 45)
         if dialer.returncode == 0 or b"authenticated peer identity differs" not in stderr:
             raise RuntimeError("wrong expected identity was not rejected")
         return {"dialer_exit_code": dialer.returncode, "wrong_expected_identity": "rejected",
@@ -182,6 +192,8 @@ async def runtime(binaries, env, output):
                 result = await exercise(binaries[server], binaries[client], address, env)
                 result.update({"listener_source": server, "dialer_source": client})
                 results.append(result)
+                (output / f"matrix-row-{len(results)}-{time.time_ns()}.json").write_text(
+                    json.dumps(result, indent=2) + "\n")
     keylog = output / "temporary-keylog-control"
     keylog.unlink(missing_ok=True)
     logged_env = {**env, "SSLKEYLOGFILE": str(keylog)}
