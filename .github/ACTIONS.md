@@ -234,7 +234,7 @@ Three positions made this worth doing:
 - `taiki-e/install-action` runs in `cache-deps.yaml`'s `warm-test-cache` job, which writes
   the `main`-scope cache entry that every PR and queue run restores.
 - `foundry-rs/foundry-toolchain` supplies the `cast` binary whose answer decides
-  `verify-on-chain`.
+  `verify-on-chain`; that binary is pinned too, by release and digest (below).
 - `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
 
 The pinned actions and the runtime each one uses (each pin's SHA, and the release it stands for in the `# vX.Y.Z` comment beside it, are in the workflows, and only there):
@@ -287,8 +287,34 @@ For a lightweight tag it prints one line, and that is the commit.
 ### What a pin does not cover
 
 A pin fixes the action's own code, not what that code downloads when it runs.
-`foundry-rs/foundry-toolchain` installs the current `stable` Foundry release on every run (its `version` input defaults to `stable`), so the `cast` behind `verify-on-chain` still changes whenever Foundry releases.
+For `foundry-rs/foundry-toolchain` the download is pinned separately, in the `attest` job in `pr.yaml`: the install step's `version` input names a Foundry release, and the step after it fails the job unless the `cast` on `PATH` has the SHA-256 digest in `CAST_SHA256`.
+A release asset swapped under the same tag therefore fails `verify-on-chain` instead of deciding it.
+The digest is that of the `linux_amd64` build, because `ubuntu-latest` is x64; a runner of another architecture needs a new one.
+The action takes no digest itself, and Dependabot moves an action's SHA but never its inputs, so the release and the digest stay where they are until someone moves them, together and by hand:
+
+1. Download the new release's `linux_amd64` tarball, check it against the release's own
+   `.sha256` file, and hash the `cast` inside it. The commands are for Linux; on macOS,
+   `shasum -a 256` stands in for `sha256sum`.
+
+   ```sh
+   v=vX.Y.Z   # the release to move to
+   base="https://github.com/foundry-rs/foundry/releases/download/$v"
+   curl -fsSLO "$base/foundry_${v}_linux_amd64.tar.gz"
+   curl -fsSL "$base/foundry_${v}_linux_amd64.sha256" | sha256sum --check -
+   tar -xzf "foundry_${v}_linux_amd64.tar.gz" cast
+   sha256sum cast
+   ```
+
+   The binary is hashed, never run.
+2. In `pr.yaml`, set `version` to the release and `CAST_SHA256` to the digest the last
+   command printed, in the same pull request.
+3. That pull request's own `verify-on-chain` run is the test that `foundryup` installs the
+   tarball's `cast` unchanged on the runner. If it does not, the check step fails there,
+   before anything lands.
+
+What is still not pinned: `foundryup`, the program the action downloads to perform the install, which runs in the job before the check and so is trusted by it.
 The runner image (`ubuntu-latest`) is not pinned either, and with it everything preinstalled on it.
+The local `make attest` run uses whatever `cast` the maintainer has installed, which this pin does not reach.
 
 One thing a pin does newly fix: `taiki-e/install-action` resolves a tool requested without a version (`tool: cargo-nextest`) from the manifest in the pinned commit, with a checksum, so the cargo-nextest version stays the same until the pin moves.
 

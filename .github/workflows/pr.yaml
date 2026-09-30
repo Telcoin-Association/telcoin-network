@@ -180,11 +180,31 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      # cast, for the read-only registry call. The pin fixes this action's code, not the
-      # Foundry it installs: `version` defaults to `stable`, so each run fetches whatever
-      # Foundry release is current when the job starts.
+      # cast, for the read-only registry call. The SHA pins this action's code and
+      # `version` the Foundry release it installs; the next step pins the `cast` binary
+      # itself by its SHA-256 digest, since the action takes no digest. A release asset
+      # swapped under the same tag therefore fails there instead of answering the registry
+      # call. The digest is that of the linux_amd64 build, because ubuntu-latest is x64,
+      # so moving this job to another runner architecture needs a new digest.
+      # Dependabot moves the SHA but never an action's inputs: `version` and CAST_SHA256
+      # move together, by hand, as .github/ACTIONS.md ("What a pin does not cover")
+      # describes. Both are part of this job definition, which the PR supplies, so they
+      # guard against a change upstream and not against a PR that edits them; the comment
+      # above the checkout says what stops that.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.8.3
+
+      # `command -v`, so the digest covers whichever `cast` the next step will resolve on
+      # PATH, wherever the install put it. sha256sum by its full path, so nothing the
+      # install put first on PATH can stand in for it.
+      - name: Check the cast binary
+        env:
+          CAST_SHA256: 1412cb2374f68032ce2c73a3fcb04e0e02a8d2b1744c160456ce513bdb2416da
+        run: |
+          set -euo pipefail
+          echo "${CAST_SHA256}  $(command -v cast)" | /usr/bin/sha256sum --check --strict -
 
       - name: Verify attestation on adiri
         env:
