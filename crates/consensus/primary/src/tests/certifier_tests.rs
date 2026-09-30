@@ -130,6 +130,29 @@ fn build_peer_response(
     }
 }
 
+/// Upper bound on every wait for the certifier's next network command.
+///
+/// It must exceed the certifier's 10s vote-retry backoff ceiling; otherwise a wait could tie with a
+/// backoff tick and fail a test that is only waiting for a retry.
+const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Receive the certifier's next network command, panicking if none arrives within
+/// [`STEP_TIMEOUT`].
+///
+/// The certifier task holds the channel's sender for the whole test, so a bare `recv()` never
+/// returns `None`: a certifier that sends fewer commands than a test expects would hang the test
+/// instead of failing it. `context` names what the caller was waiting for.
+async fn next_command(
+    network_rx: &mut mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    context: &str,
+) -> NetworkCommand<PrimaryRequest, PrimaryResponse> {
+    match tokio::time::timeout(STEP_TIMEOUT, network_rx.recv()).await {
+        Ok(Some(command)) => command,
+        Ok(None) => panic!("{context}: certifier network channel closed"),
+        Err(_) => panic!("{context}: certifier sent no network command within {STEP_TIMEOUT:?}"),
+    }
+}
+
 /// Drain outgoing vote requests from the certifier, replying with configured responses.
 ///
 /// For any peer not in `peer_configs`, [`VoteResponseConfig::ValidVote`] is used.
@@ -143,7 +166,12 @@ async fn drive_vote_requests(
 ) {
     let num_peers = fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = network_rx.recv().await {
+    loop {
+        let req = next_command(
+            network_rx,
+            &format!("drive_vote_requests: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -221,7 +249,15 @@ async fn missing_parents_happy_path() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     let mut slow_peer_first_done = false;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!(
+                "MissingParents then retry: got {handled} of {num_peers} votes \
+                 (MissingParents sent: {slow_peer_first_done})"
+            ),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -289,7 +325,12 @@ async fn missing_parents_fake_digests() {
     // The certifier will fail each vote task (count mismatch after filtering).
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("fake-digest MissingParents: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -343,7 +384,12 @@ async fn missing_parents_store_miss() {
 
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("store-miss MissingParents: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -396,7 +442,15 @@ async fn transient_network_error_retries() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     let mut flaky_first_done = false;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!(
+                "transient error then retry: got {handled} of {num_peers} votes \
+                 (transient error sent: {flaky_first_done})"
+            ),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -460,10 +514,7 @@ async fn new_header_cancels_inflight() {
     cx.consensus_bus.headers().send(header1.clone()).await.unwrap();
 
     let stale_req = loop {
-        let req = tokio::time::timeout(Duration::from_secs(5), cx.network_rx.recv())
-            .await
-            .expect("h1 vote request within 5s")
-            .expect("channel open");
+        let req = next_command(&mut cx.network_rx, "phase 1: first header1 vote request").await;
         if let NetworkCommand::SendRequest {
             request: PrimaryRequest::Vote { ref header, .. },
             ..
@@ -486,9 +537,12 @@ async fn new_header_cancels_inflight() {
     // all h2 requests get valid votes.
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut h2_handled = 0;
-    while let Ok(Some(req)) =
-        tokio::time::timeout(Duration::from_secs(10), cx.network_rx.recv()).await
-    {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("phase 3: got {h2_handled} of {num_peers} header2 vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest {
             peer,
             request: PrimaryRequest::Vote { ref header, .. },
@@ -643,7 +697,12 @@ async fn vote_wrong_author() {
     let mut handled = 0;
     // Collect all non-proposer ids so we can pick a "wrong" one for each peer.
     let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("wrong-author votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -692,7 +751,12 @@ async fn vote_wrong_header_digest() {
 
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("wrong-header-digest votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -740,7 +804,12 @@ async fn vote_wrong_origin() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("wrong-origin votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -788,7 +857,12 @@ async fn vote_epoch_mismatch() {
 
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("wrong-epoch votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -835,7 +909,12 @@ async fn vote_round_mismatch() {
 
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("wrong-round votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -885,7 +964,12 @@ async fn vote_unknown_authority() {
 
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("unknown-author votes: got {handled} of {num_peers} vote requests"),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -981,10 +1065,7 @@ async fn startup_republish_highest_cert() {
 
     // The very first network command should be a Publish (gossip broadcast of the
     // highest known certificate for this authority).
-    let cmd = tokio::time::timeout(Duration::from_secs(5), cx.network_rx.recv())
-        .await
-        .expect("network command received within timeout")
-        .expect("network_rx channel open");
+    let cmd = next_command(&mut cx.network_rx, "startup republish: first network command").await;
 
     assert!(
         matches!(cmd, NetworkCommand::Publish { .. }),
@@ -1015,9 +1096,12 @@ async fn minimum_quorum_exactly_threshold() {
 
     cx.consensus_bus.headers().send(header.clone()).await.unwrap();
 
-    while let Ok(Some(req)) =
-        tokio::time::timeout(Duration::from_secs(5), cx.network_rx.recv()).await
-    {
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!("quorum drain: voting weight {accumulated_weight} of quorum {quorum}"),
+        )
+        .await;
         if accumulated_weight >= quorum {
             // Quorum reached — stop replying, let remaining tasks stay silent.
             break;
@@ -1170,7 +1254,17 @@ async fn run_vote_aggregator_with_param(
     }
 
     cx.consensus_bus.headers().send(header).await.unwrap();
-    while let Some(req) = cx.network_rx.recv().await {
+    let num_peers = peer_votes.len();
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!(
+                "bad-sig votes ({committee_size} authorities, {num_byzantine} byzantine): \
+                 got {} of {num_peers} vote requests",
+                num_peers - peer_votes.len()
+            ),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
@@ -1241,7 +1335,16 @@ async fn propose_headers_one_bad() {
     }
 
     cx.consensus_bus.headers().send(header).await.unwrap();
-    while let Some(req) = cx.network_rx.recv().await {
+    let num_peers = peer_votes.len();
+    loop {
+        let req = next_command(
+            &mut cx.network_rx,
+            &format!(
+                "three bad-sig votes: got {} of {num_peers} vote requests",
+                num_peers - peer_votes.len()
+            ),
+        )
+        .await;
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
