@@ -33,10 +33,10 @@ use crate::{
     archive::{
         data_file::create_dir_synced,
         digest_index::HdxIndex,
-        error::{fetch::FetchError, open::OpenError},
+        error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
         position_index::index::PositionIndex,
     },
     consensus_pack::fetch_error_is_absent,
@@ -496,24 +496,62 @@ impl EpochRecordDb {
         if !dir.join(Inner::RECORDS_NAME).exists() {
             return Ok(Some("no epoch-record logs yet; they would be created".to_string()));
         }
-        let records = Pack::<EpochRecord>::open(
+        let records = match Pack::<EpochRecord>::open(
             dir.join(Inner::RECORDS_NAME),
             Inner::PACK_EPOCH,
             true,
             PackCompression::ZStd,
             EPOCH_PACK_VERSION,
-        )?;
+        ) {
+            Ok(records) => records,
+            // A log a writable open initialises (empty, or sized but never written) holds nothing
+            // to assess and nothing to lose.
+            Err(e) if open_would_initialise(&e) => {
+                return Ok(Some("the records log is empty; it would be initialised".to_string()))
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut heals = Vec::new();
-        Inner::assess_log(&records, &dir.join(Inner::RECORD_HASH_NAME), "records", &mut heals)?;
-        if dir.join(Inner::CERTS_NAME).exists() {
-            let certs = Pack::<EpochCertificate>::open(
+        Inner::assess_log(
+            &records,
+            &dir.join(Inner::RECORD_HASH_NAME),
+            Some(&dir.join(Inner::EPOCH_POS_NAME)),
+            "records",
+            &mut heals,
+        )?;
+        let certs = if dir.join(Inner::CERTS_NAME).exists() {
+            match Pack::<EpochCertificate>::open(
                 dir.join(Inner::CERTS_NAME),
                 Inner::CERT_PACK_EPOCH,
                 true,
                 PackCompression::ZStd,
                 EPOCH_PACK_VERSION,
-            )?;
-            Inner::assess_log(&certs, &dir.join(Inner::CERT_HASH_NAME), "certs", &mut heals)?;
+            ) {
+                Ok(certs) => {
+                    Inner::assess_log(
+                        &certs,
+                        &dir.join(Inner::CERT_HASH_NAME),
+                        None,
+                        "certs",
+                        &mut heals,
+                    )?;
+                    Some(certs)
+                }
+                Err(e) if open_would_initialise(&e) => {
+                    heals.push("the certs log is empty; it would be initialised".to_string());
+                    None
+                }
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+        // The open also rebuilds indexes that were not cleanly sealed or whose tracked length
+        // disagrees with their log, even when the logs themselves are sealed.
+        if heals.is_empty() {
+            if let Some(what) = Inner::assess_indexes(dir, &records, certs.as_ref()) {
+                heals.push(what);
+            }
         }
         Ok((!heals.is_empty()).then(|| heals.join("; ")))
     }
@@ -1234,6 +1272,16 @@ fn absent_to_none<T>(res: Result<T, FetchError>) -> Result<Option<T>, FetchError
     res.map(Some).or_else(|e| fetch_error_is_absent(&e).then_some(None).ok_or(e))
 }
 
+/// What one log's on-disk indexes attest about it, read before any index is touched: the digest
+/// index's durably synced data length (the acked end; `0` when that index cannot be opened, which
+/// attests nothing), and the position index's recorded record offsets (empty when the log has no
+/// position index or it cannot be opened).
+#[derive(Debug, Default)]
+struct AttestedLog {
+    end: u64,
+    offsets: Vec<u64>,
+}
+
 #[derive(Debug)]
 struct Inner {
     /// Log file for [`EpochRecord`] entries.
@@ -1258,11 +1306,30 @@ struct Inner {
     /// failed-quorum recovery or state-sync backfill) parks it until a later scan observes the
     /// backfill.
     certified_watermark: Epoch,
+    /// The logs' lengths at the last successful [`Self::persist`] (`records`, `certs`). The
+    /// digest indexes' data-length markers advance on every save, ahead of the commit, and a
+    /// digest index makes its marker durable when it closes. So when a commit fails the markers
+    /// are rolled back to these, or the close would attest records that never reached disk and
+    /// the next open would refuse to truncate that unacked tail.
+    committed_lens: (u64, u64),
     /// Test-only: when set, the next record index-save fails right after the data append, so tests
     /// can exercise the atomic rollback (mirrors ConsensusPack's `fail_save_after_append`).
     /// Consumed once.
     #[cfg(test)]
     fail_index_save_after_append: bool,
+}
+
+/// Would a writable open of a log that failed to open read-only with `error` simply initialise it?
+/// True for an empty (0-length) file, whose read-only open fails writing the fresh header, and
+/// for a sized-but-unwritten one ([`LoadHeaderError::Unwritten`]).
+fn open_would_initialise(error: &OpenError) -> bool {
+    match error {
+        OpenError::DataFileOpen(LoadHeaderError::Unwritten) => true,
+        OpenError::DataFileOpen(LoadHeaderError::IO(e)) => {
+            e.kind() == io::ErrorKind::ReadOnlyFilesystem
+        }
+        _ => false,
+    }
 }
 
 impl Inner {
@@ -1282,33 +1349,28 @@ impl Inner {
         epoch_idx: &mut PositionIndex<u64>,
         record_digests: &HdxIndex,
     ) -> Result<(), EpochDbError> {
+        // Reached only on a clean open: the log is sealed and its indexes agree with its length, so
+        // anything short of "the last indexed record decodes" is at-rest corruption of committed
+        // data, refused rather than trimmed (INV4). Only the zero padding below is ever rolled
+        // back.
         let records_len = records.file_len();
         let digest_final = record_digests.data_file_length();
         if records_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            records.rewind_to(digest_final);
+            return Err(EpochDbError::CorruptLog(format!(
+                "sealed records log is {records_len} bytes but its digest index attests only \
+                 {digest_final}; at-rest corruption, re-sync required"
+            )));
         }
-        let records_len = records.file_len();
         if !epoch_idx.is_empty() {
-            let mut new_len = records_len;
-            let start_idx = epoch_idx.len() as u64 - 1;
-            let mut idx = start_idx;
-            loop {
-                if let Ok(last_record) = epoch_idx.load(idx) {
-                    let size_res = records.record_size(last_record);
-                    if size_res.is_ok() {
-                        epoch_idx.truncate_to_index(idx)?;
-                        new_len = last_record.saturating_add(size_res.unwrap_or_default() as u64);
-                        break;
-                    }
-                }
-                if idx == 0 {
-                    epoch_idx.truncate_all()?;
-                    break;
-                }
-                idx -= 1;
-            }
-            if new_len != records_len {
-                records.rewind_to(new_len);
+            let last = epoch_idx.len() as u64 - 1;
+            let decodes =
+                epoch_idx.load(last).is_ok_and(|position| records.record_size(position).is_ok());
+            if !decodes {
+                return Err(EpochDbError::CorruptLog(
+                    "sealed records log: its last indexed record does not decode; at-rest \
+                     corruption, re-sync required"
+                        .to_string(),
+                ));
             }
         }
         // A header-only log left at mmap capacity by an unclean close: nothing was ever appended,
@@ -1334,10 +1396,15 @@ impl Inner {
         certs: &mut Pack<EpochCertificate>,
         cert_digests: &HdxIndex,
     ) -> Result<(), EpochDbError> {
+        // Clean open, as for the records log: a sealed log longer than its index attests is
+        // corruption, not a tail to trim.
         let certs_len = certs.file_len();
         let digest_final = cert_digests.data_file_length();
         if certs_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
-            certs.rewind_to(digest_final);
+            return Err(EpochDbError::CorruptLog(format!(
+                "sealed certs log is {certs_len} bytes but its digest index attests only \
+                 {digest_final}; at-rest corruption, re-sync required"
+            )));
         } else if certs_len > DATA_HEADER_BYTES as u64
             && !certs.any_content_after(DATA_HEADER_BYTES as u64)
         {
@@ -1535,12 +1602,65 @@ impl Inner {
         Ok(())
     }
 
+    /// The index-side part of [`EpochRecordDb::assess`]: `Some(why)` when [`Self::open_append`]
+    /// would discard and rebuild the indexes of otherwise clean logs (one that will not open,
+    /// was not cleanly sealed, or whose tracked data length disagrees with its log).
+    fn assess_indexes(
+        base_dir: &Path,
+        records: &Pack<EpochRecord>,
+        certs: Option<&Pack<EpochCertificate>>,
+    ) -> Option<String> {
+        let unclean_or_lagging = |name: &str, index: Result<HdxIndex, _>, log_len: u64| match index
+        {
+            Ok(index) if !index.opened_unclean() && index.data_file_length() == log_len => None,
+            Ok(_) => Some(format!("{name} index was not cleanly sealed or lags its log")),
+            Err(e) => Some(format!("{name} index will not open ({e})")),
+        };
+        let epoch_idx = PositionIndex::<u64>::open_pdx_file(
+            base_dir.join(Self::EPOCH_POS_NAME),
+            records.header(),
+            "index.pdx",
+            true,
+        );
+        let position = match epoch_idx {
+            Ok(index) if !index.opened_unclean() => None,
+            Ok(_) => Some("position index was not cleanly sealed".to_string()),
+            Err(e) => Some(format!("position index will not open ({e})")),
+        };
+        let open_hdx = |dir: PathBuf, header: &DataHeader| {
+            HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+                dir,
+                header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true,
+            )
+        };
+        let record_digests = unclean_or_lagging(
+            "record-digest",
+            open_hdx(base_dir.join(Self::RECORD_HASH_NAME), records.header()),
+            records.file_len(),
+        );
+        let cert_digests = certs.and_then(|certs| {
+            unclean_or_lagging(
+                "cert-digest",
+                open_hdx(base_dir.join(Self::CERT_HASH_NAME), certs.header()),
+                certs.file_len(),
+            )
+        });
+        let why: Vec<String> =
+            [position, record_digests, cert_digests].into_iter().flatten().collect();
+        (!why.is_empty())
+            .then(|| format!("indexes would be rebuilt from the logs: {}", why.join(", ")))
+    }
+
     /// One log's part of [`EpochRecordDb::assess`]: decode it read-only and classify it the way
     /// [`Self::open_append`] would. `digest_dir` is its digest index, whose on-disk data length
-    /// attests the acked end. A heal is described into `heals`; a refusal is returned.
+    /// attests the acked end, and `position_dir` its position index if it has one. A heal is
+    /// described into `heals`; a refusal is returned.
     fn assess_log<V>(
         log: &Pack<V>,
         digest_dir: &Path,
+        position_dir: Option<&Path>,
         name: &str,
         heals: &mut Vec<String>,
     ) -> Result<(), EpochDbError>
@@ -1567,14 +1687,7 @@ impl Inner {
                 log.file_len()
             )));
         }
-        if let Ok(index) = HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
-            digest_dir,
-            log.header(),
-            BuildHasherDefault::<FxHasher>::default(),
-            true,
-        ) {
-            Self::refuse_dropping_acked(log, index.data_file_length(), name)?;
-        }
+        Self::refuse_dropping_acked(log, &Self::attested_log(log, digest_dir, position_dir), name)?;
         heals.push(format!(
             "{name} log was not cleanly closed: {} byte(s) past offset {consistent_end} would be \
              truncated and its indexes rebuilt",
@@ -1583,62 +1696,107 @@ impl Inner {
         Ok(())
     }
 
-    /// Does `log` hold a record that still decodes AFTER its first undecodable one and ends within
-    /// `attested_end`, the durably synced (acked) data length? Such a record was acked after the
-    /// damaged one, so the damage is at-rest corruption of acked data, not an unacked torn tail.
-    /// (Mirrors `ConsensusPack`'s `output_after_tear`.) Records past `attested_end` were never
-    /// acked (a crash can persist unacked records out of order) and do not count, and a
-    /// physically truncated tail has nothing after it, so both still heal (INV1). CRC-failed
-    /// frames are skipped while the walk makes forward progress.
-    fn acked_record_after_tear<V>(log: &Pack<V>, attested_end: u64) -> bool
+    /// What one log's on-disk indexes attest, read with read-only opens before any index is
+    /// opened for writing or discarded (see [`Self::attested_log`]).
+    fn attested_log<V>(log: &Pack<V>, digest_dir: &Path, position_dir: Option<&Path>) -> AttestedLog
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let end = HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            digest_dir,
+            log.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .map(|index| index.data_file_length())
+        .unwrap_or(0);
+        // Read straight from the index file: a read-only open refuses an unsealed (crashed)
+        // index, and a writable one would heal it, while this must attest the same offsets
+        // whether the caller is the writable open or the read-only assessment.
+        let offsets = position_dir
+            .map(|dir| PositionIndex::<u64>::raw_entries(&dir.join("index.pdx")))
+            .unwrap_or_default();
+        AttestedLog { end, offsets }
+    }
+
+    /// Does `log` hold an acked record that a rebuild would drop? The rebuild truncates the log at
+    /// its first undecodable record, so this asks whether a record AFTER that tear was acked:
+    /// one that decodes and ends within `attested.end`, the digest index's durably synced data
+    /// length. Such a record was acked after the damaged one, so the damage is at-rest
+    /// corruption of acked data, not an unacked torn tail (mirrors `ConsensusPack`'s
+    /// `output_after_tear`). Records past `attested.end` were never acked (a crash can persist
+    /// unacked records out of order) and do not count, and a physically truncated tail has
+    /// nothing after it, so both still heal (INV1).
+    ///
+    /// Two ways to find such a record. The walk continues past the tear frame by frame, skipping
+    /// undecodable frames while it makes forward progress. A damaged size prefix desyncs that
+    /// walk, so the position index's recorded offsets are tried too: an attested record that
+    /// still decodes at its recorded offset past the tear (mirrors `ConsensusPack`'s
+    /// `attested_record_survives`).
+    fn acked_damage_after_tear<V>(log: &Pack<V>, attested: &AttestedLog) -> bool
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
         let Ok(mut iter) = log.raw_iter() else { return false };
-        let mut torn = false;
+        let mut tear: Option<u64> = None;
         let mut last_pos = iter.logical_position();
         loop {
             match iter.next() {
-                None => return false,
+                None => break,
                 Some(Ok(_)) => {
                     let end = iter.logical_position();
-                    if torn && end <= attested_end {
+                    if tear.is_some() && end <= attested.end {
                         return true;
                     }
                     last_pos = end;
                 }
                 Some(Err(_)) => {
-                    torn = true;
+                    tear.get_or_insert(last_pos);
                     let pos = iter.logical_position();
                     if pos <= last_pos {
-                        return false; // no forward progress: nothing readable after
+                        break; // no forward progress: the walk cannot see past here
                     }
                     last_pos = pos;
                 }
             }
         }
+        let Some(tear) = tear else { return false };
+        attested
+            .offsets
+            .iter()
+            .any(|&offset| offset > tear && Self::record_decodes_within(log, offset, attested.end))
     }
 
-    /// Before an unclean log's indexes are discarded and rebuilt, refuse (`CorruptLog`, nothing
-    /// changed) if the rebuild would drop an ACKED record: one that still decodes after a tear
-    /// and ends within `attested_end`, the old digest index's on-disk `data_file_length`. That
-    /// marker reaches disk only through an ordered sync after the data it covers. Checking
-    /// BEFORE the indexes are reset keeps the refusal repeatable: a retry still sees the same
-    /// attested end. A `0` (invalidated) or header-only marker attests nothing.
+    /// Does the record at `offset` of `log` decode, ending within `attested_end`?
+    fn record_decodes_within<V>(log: &Pack<V>, offset: u64, attested_end: u64) -> bool
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let Ok(mut iter) = log.raw_iter() else { return false };
+        if iter.set_position(offset).is_err() {
+            return false;
+        }
+        matches!(iter.next(), Some(Ok(_))) && iter.logical_position() <= attested_end
+    }
+
+    /// Before a log's indexes are discarded and rebuilt, refuse (`CorruptLog`, nothing changed)
+    /// if the rebuild would drop an ACKED record (see [`Self::acked_damage_after_tear`]).
+    /// `attested` must have been read before any index was reset, so the refusal is repeatable:
+    /// a retry still sees the same attested end. A `0` (invalidated, or unreadable index) or
+    /// header-only marker attests nothing.
     fn refuse_dropping_acked<V>(
         log: &Pack<V>,
-        attested_end: u64,
+        attested: &AttestedLog,
         name: &str,
     ) -> Result<(), EpochDbError>
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
-        if attested_end > DATA_HEADER_BYTES as u64
-            && Self::acked_record_after_tear(log, attested_end)
-        {
+        if attested.end > DATA_HEADER_BYTES as u64 && Self::acked_damage_after_tear(log, attested) {
             return Err(EpochDbError::CorruptLog(format!(
                 "{name} log has an undecodable record followed by acked records (durably synced \
-                 through offset {attested_end}); at-rest corruption of acked data, re-sync required"
+                 through offset {}); at-rest corruption of acked data, re-sync required",
+                attested.end
             )));
         }
         Ok(())
@@ -1664,9 +1822,22 @@ impl Inner {
             EPOCH_PACK_VERSION,
         )?;
 
+        // What the indexes attest about the logs, read before any index is opened for writing or
+        // discarded: a rebuild below must refuse to drop an acked record, and once an index is
+        // reset its attestation is gone. Read read-only and per index, so one unreadable index
+        // (which the rebuild replaces anyway) never blinds the check for the others.
+        let attested_records = Self::attested_log(
+            &records,
+            &base_dir.join(Self::RECORD_HASH_NAME),
+            Some(&base_dir.join(Self::EPOCH_POS_NAME)),
+        );
+        let attested_certs = Self::attested_log(&certs, &base_dir.join(Self::CERT_HASH_NAME), None);
+
         // Open the position + digest indexes; if any is unreadable, fall back to a fresh set and
         // force a rebuild from the data logs below rather than failing the open. A corrupt sidecar
-        // index must not brick the node -- the data logs are authoritative.
+        // index must not brick the node -- the data logs are authoritative. Validate before
+        // mutating: the rebuild must not drop acked records, and the refusal must come before the
+        // reset so a retry finds the same on-disk state.
         let (mut epoch_idx, mut record_digests, mut cert_digests, index_open_failed) =
             match Self::try_open_indexes(base_dir, &records, &certs) {
                 Ok((epoch_idx, record_digests, cert_digests)) => {
@@ -1678,6 +1849,8 @@ impl Inner {
                         "epoch-records index failed to open ({e}); discarding and rebuilding all \
                          indexes from the data logs"
                     );
+                    Self::refuse_dropping_acked(&records, &attested_records, "records")?;
+                    Self::refuse_dropping_acked(&certs, &attested_certs, "certs")?;
                     let (epoch_idx, record_digests, cert_digests) =
                         Self::reset_indexes(base_dir, &records, &certs)?;
                     (epoch_idx, record_digests, cert_digests, true)
@@ -1706,15 +1879,11 @@ impl Inner {
             || record_digests.data_file_length() != records.file_len()
             || cert_digests.data_file_length() != certs.file_len();
         if must_rebuild {
-            // Validate before mutating: a recovery that fails must leave the state a retry needs,
-            // so check the replay against the attested ends while the old indexes still exist.
+            // Validate before mutating: a recovery that fails must leave the state a retry needs.
+            // (Already checked above when an index failed to open.)
             if !index_open_failed {
-                Self::refuse_dropping_acked(
-                    &records,
-                    record_digests.data_file_length(),
-                    "records",
-                )?;
-                Self::refuse_dropping_acked(&certs, cert_digests.data_file_length(), "certs")?;
+                Self::refuse_dropping_acked(&records, &attested_records, "records")?;
+                Self::refuse_dropping_acked(&certs, &attested_certs, "certs")?;
             }
             let (idx, rdig, cdig) = Self::reset_indexes(base_dir, &records, &certs)?;
             epoch_idx = idx;
@@ -1751,6 +1920,8 @@ impl Inner {
             start_epoch
         };
 
+        // Recovery (or a clean open) has just proven everything in the logs durable.
+        let (records_len, certs_len) = (records.file_len(), certs.file_len());
         let mut inner = Self {
             records,
             certs,
@@ -1760,6 +1931,7 @@ impl Inner {
             start_epoch,
             dummy_epoch0: None,
             certified_watermark: 0,
+            committed_lens: (records_len, certs_len),
             #[cfg(test)]
             fail_index_save_after_append: false,
         };
@@ -2054,13 +2226,21 @@ impl Inner {
     }
 
     fn persist(&mut self) -> Result<(), EpochDbError> {
-        if !self.records.read_only() {
-            self.records.commit().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
-            self.certs.commit().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
-            self.epoch_idx.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
-            self.record_digests.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
-            self.cert_digests.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
+        if self.records.read_only() {
+            return Ok(());
         }
+        let committed = self.records.commit().and_then(|()| self.certs.commit());
+        if let Err(e) = committed {
+            // The data past the last successful commit is of unknown durability: pull the digest
+            // markers back to it so a close cannot attest that tail (see `committed_lens`).
+            self.record_digests.set_data_file_length(self.committed_lens.0);
+            self.cert_digests.set_data_file_length(self.committed_lens.1);
+            return Err(EpochDbError::PersistError(e.to_string()));
+        }
+        self.committed_lens = (self.records.file_len(), self.certs.file_len());
+        self.epoch_idx.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
+        self.record_digests.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
+        self.cert_digests.sync().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
         Ok(())
     }
 }
@@ -3064,6 +3244,128 @@ mod test {
             bytes,
             "a refused recovery must leave the log untouched"
         );
+    }
+
+    /// Eight records saved and persisted, then a crash: durable logs, no clean-close sentinel.
+    /// Returns the directory and the records log's offset of epoch 2.
+    fn crashed_db_with_eight_records() -> (TempDir, u64) {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_crashed_db").expect("temp dir");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        let mut parent = EpochDigest::default();
+        for epoch in 0..8u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            inner.save(record, cert).expect("save");
+        }
+        inner.persist().expect("persist");
+        let pos = inner.epoch_idx.load(2).expect("epoch 2 offset");
+        std::mem::forget(inner);
+        (dir, pos)
+    }
+
+    /// The acked-record guard must hold even when one index will not open: the rebuild replaces
+    /// that index anyway, and the other indexes' attestations are read before anything is reset.
+    /// Here the cert-digest index header is torn beside the damaged records log; the open must
+    /// still refuse, not discard every index and truncate the acked records.
+    #[test]
+    fn test_unclean_rebuild_refuses_acked_damage_even_with_a_torn_index() {
+        let (dir, damaged_at) = crashed_db_with_eight_records();
+        let path = dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        bytes[damaged_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write records log");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(Inner::CERT_HASH_NAME).join("index.hdx"))
+            .expect("open cert hdx")
+            .set_len(16)
+            .expect("tear the cert digest index header");
+
+        assert!(
+            matches!(EpochRecordDb::assess(dir.path()), Err(EpochDbError::CorruptLog(_))),
+            "the read-only assessment must predict the refusal"
+        );
+        for attempt in 1..=2 {
+            let err = EpochRecordDb::open(dir.path())
+                .err()
+                .unwrap_or_else(|| panic!("open {attempt} must refuse to drop acked records"));
+            assert!(matches!(err, EpochDbError::CorruptLog(_)), "open {attempt}: {err:?}");
+        }
+        assert_eq!(std::fs::read(&path).expect("read records log"), bytes, "log rewritten");
+    }
+
+    /// A damaged size prefix desyncs the frame-by-frame walk, so it cannot see the acked records
+    /// behind the damage. The position index's recorded offsets re-frame them: a record that
+    /// still decodes at its recorded offset past the tear is acked data the rebuild would drop.
+    #[test]
+    fn test_unclean_rebuild_refuses_acked_damage_behind_a_bad_size_prefix() {
+        let (dir, damaged_at) = crashed_db_with_eight_records();
+        let path = dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        // Size prefix of epoch 2's record: far past any valid size, so the walk stops dead.
+        bytes[damaged_at as usize..damaged_at as usize + 4].copy_from_slice(&[0xFF; 4]);
+        std::fs::write(&path, &bytes).expect("write records log");
+
+        assert!(
+            matches!(EpochRecordDb::assess(dir.path()), Err(EpochDbError::CorruptLog(_))),
+            "the read-only assessment must predict the refusal"
+        );
+        let err = EpochRecordDb::open(dir.path()).expect_err("open must refuse");
+        assert!(matches!(err, EpochDbError::CorruptLog(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&path).expect("read records log"), bytes, "log rewritten");
+    }
+
+    /// A cleanly sealed log is complete by construction. When its last indexed record is damaged
+    /// at rest, the clean open must refuse (as the dry run does), never trim the record and
+    /// re-seal the shortened log.
+    #[test]
+    fn test_clean_open_refuses_a_sealed_log_with_a_damaged_last_record() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_sealed_last_damaged").expect("temp dir");
+        let last_at = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            for epoch in 0..4u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                inner.save(record, cert).expect("save");
+            }
+            inner.persist().expect("persist");
+            let pos = inner.epoch_idx.load(3).expect("epoch 3 offset");
+            drop(inner); // clean close: sealed logs and indexes
+            pos
+        };
+        let path = dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        bytes[last_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write records log");
+
+        assert!(
+            matches!(EpochRecordDb::assess(dir.path()), Err(EpochDbError::CorruptLog(_))),
+            "the read-only assessment must predict the refusal"
+        );
+        let err = EpochRecordDb::open(dir.path()).expect_err("a sealed log is never trimmed");
+        assert!(matches!(err, EpochDbError::CorruptLog(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&path).expect("read records log"), bytes, "log rewritten");
+    }
+
+    /// A log a writable open would simply initialise (here an empty file, as a crash right after
+    /// its creation leaves) assesses as a heal, not as a refusal, and the open then succeeds.
+    #[test]
+    fn test_assess_reports_an_empty_log_as_initialisable() {
+        let dir = TempDir::with_prefix("epoch_assess_empty").expect("temp dir");
+        std::fs::write(dir.path().join(RECORDS_NAME), b"").expect("create empty records log");
+        assert!(
+            matches!(EpochRecordDb::assess(dir.path()), Ok(Some(_))),
+            "an empty log must assess as one the open initialises"
+        );
+        let db = EpochRecordDb::open(dir.path()).expect("the open initialises the empty log");
+        drop(db);
     }
 
     /// An index-save failure after the data append must roll the append back (no orphan), and a

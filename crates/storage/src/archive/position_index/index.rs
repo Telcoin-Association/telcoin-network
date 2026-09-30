@@ -199,6 +199,29 @@ impl<T: PosIndexValue> PositionIndex<T> {
         Ok(index)
     }
 
+    /// Every entry of the pdx file at `path`, in order, read straight from its bytes without
+    /// opening the index: empty if the file is absent, shorter than its header, or not a pdx
+    /// (type tag / header CRC). Entries that fail to decode are skipped.
+    ///
+    /// For attesting record offsets from an index that a read-only open would refuse — an
+    /// unsealed file whose mmap capacity padding leaves its tail unaligned — while a writable
+    /// open (which would heal that tail) is not wanted. Zero-filled padding past an unsealed
+    /// index's logical end decodes as zero entries; a caller treating entries as record offsets
+    /// must ignore those (a real offset lies past the data file's header).
+    pub fn raw_entries(path: &Path) -> Vec<T> {
+        let Ok(bytes) = fs::read(path) else { return Vec::new() };
+        if bytes.len() < PDX_HEADER_SIZE
+            || &bytes[0..8] != b"telcoinx"
+            || !check_crc(&bytes[..PDX_HEADER_SIZE])
+        {
+            return Vec::new();
+        }
+        bytes[PDX_HEADER_SIZE..]
+            .chunks_exact(T::buffer_len())
+            .filter_map(|chunk| T::decode(chunk).ok())
+            .collect()
+    }
+
     /// Return the number of values in this index.
     pub fn len(&self) -> usize {
         let len = self.pdx_file.len() as usize;

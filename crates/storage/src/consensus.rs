@@ -397,10 +397,12 @@ pub struct ConsensusChain {
     /// the same legacy or damaged epoch never build its heal twice, without holding
     /// `pack_install` (which gates epoch handoff) for the length of a rebuild.
     heal_locks: Arc<Mutex<HashMap<Epoch, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Epochs whose read-side heal failed recently: when, and why. A failed heal is not retried
-    /// until [`Self::HEAL_RETRY_BACKOFF`] has passed, so a corrupt epoch that peers keep asking
-    /// for does not re-run a full-epoch scan or copy per request.
-    heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, String)>>>,
+    /// Epochs whose read-side heal failed recently: when, and with what. A failed heal is not
+    /// retried until [`Self::HEAL_RETRY_BACKOFF`] has passed, so a corrupt epoch that peers keep
+    /// asking for does not re-run a full-epoch scan or copy per request. Environmental failures
+    /// (a full disk, descriptor exhaustion) are not remembered: they say nothing about the epoch
+    /// and clear on their own.
+    heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
 }
 
 impl ConsensusChain {
@@ -551,10 +553,11 @@ impl ConsensusChain {
         // handle cached before this handoff (e.g. a meta-only epoch read on restart before
         // `new_epoch` reached it) would keep serving that stale view once the epoch is sealed and
         // read back through `get_static`. The old epoch is re-sealed below and reopened fresh.
-        let evicted = self.take_cached(&[epoch, old_pack.epoch()]);
-        // The live pack just changed; invalidate any `get_static` open racing this handoff.
+        // The live pack just changed; invalidate any `get_static` open racing this handoff, then
+        // evict (a reader that inserts between the two would otherwise cache its stale handle
+        // under the old generation).
         self.install_generation.fetch_add(1, Ordering::Release);
-        for stale in evicted {
+        for stale in self.take_cached(&[epoch, old_pack.epoch()]) {
             stale.close().await;
         }
         if let Some(staging_epoch) = self.staging_epoch() {
@@ -727,9 +730,8 @@ impl ConsensusChain {
                 // cache the stale handle — see the generation guard
                 // in `get_static`). Harmless when the rename failed and the old inode was restored
                 // (same inode; the re-open below just re-reads it).
-                let evicted = self.take_cached(&[epoch]);
                 self.install_generation.fetch_add(1, Ordering::Release);
-                for p in evicted {
+                for p in self.take_cached(&[epoch]) {
                     p.close().await;
                 }
                 // Surface a genuine install failure only AFTER invalidating the cache above.
@@ -1051,8 +1053,15 @@ impl ConsensusChain {
             error!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
             Err(ConsensusChainError::CantSaveAndNotAvailable(number))
         } else {
-            // The static (imported) pack already holds this output: replay over an imported
-            // epoch only needs to advance latest_consensus, nothing is rewritten.
+            // The static (imported) pack already holds this number: replay over an imported epoch
+            // only needs to advance latest_consensus, nothing is rewritten. But only for the SAME
+            // output (as the writable save checks): a different one must not be reported as
+            // persisted, and then executed, while the pack keeps the other.
+            let stored = pack.consensus_header_by_number(number).await?.digest();
+            let got = consensus.consensus_header_hash();
+            if stored != got {
+                return Err(PackError::ConflictingOutput { number, stored, got }.into());
+            }
             self.latest_consensus.update(epoch, number).await;
             Ok(0)
         }
@@ -1081,18 +1090,18 @@ impl ConsensusChain {
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
-        let pack = &self.current_pack();
-        if epoch == pack.epoch() {
+        if let Some(pack) = self.current_pack_for(epoch) {
             let direct = pack.consensus_header_by_digest(digest).await;
-            if direct.is_some() {
+            return if direct.is_some() {
                 Ok(direct)
             } else if let Some(staging) = self.staging() {
                 // Fallback check on staging before settling on a legitimate `None`.
                 Ok(staging.pack.consensus_header_by_digest(digest).await)
             } else {
                 Ok(None)
-            }
-        } else if let Some(pack) = self.get_static_if_present(epoch).await? {
+            };
+        }
+        if let Some(pack) = self.get_static_if_present(epoch).await? {
             // A sealed epoch whose pack is present but unreadable propagated as `Err` from
             // `get_static_if_present` just above; only a genuinely absent epoch (files never on
             // disk) reaches the staging fallback / `Ok(None)` arms below. (The current-epoch
@@ -1117,8 +1126,7 @@ impl ConsensusChain {
         number: u64,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let epoch = self.epochs.number_to_epoch(number);
-        let pack = &self.current_pack();
-        if epoch == pack.epoch() {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return match pack.consensus_header_by_number(number).await {
                 Ok(r) => Ok(Some(r)),
                 Err(e) => {
@@ -1159,8 +1167,7 @@ impl ConsensusChain {
         number: u64,
     ) -> Result<Option<ConsensusOutput>, ConsensusChainError> {
         let epoch = self.epochs.number_to_epoch(number);
-        let pack = &self.current_pack();
-        if epoch == pack.epoch() {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return match pack.get_consensus_output(number).await {
                 Ok(r) => Ok(Some(r)),
                 Err(e) => {
@@ -1280,8 +1287,7 @@ impl ConsensusChain {
         number: u64,
     ) -> Result<Option<Vec<u8>>, ConsensusChainError> {
         let epoch = self.epochs.number_to_epoch(number);
-        let pack = &self.current_pack();
-        if epoch == pack.epoch() {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return match pack.get_consensus_output_bytes(number).await {
                 Ok(r) => Ok(Some(r)),
                 Err(e) => {
@@ -1521,8 +1527,7 @@ impl ConsensusChain {
         &self,
         epoch: Epoch,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
-        let pack = &self.current_pack();
-        if pack.epoch() == epoch {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return Ok(pack.latest_consensus_header().await?);
         }
         self.get_static(epoch).await?.latest_consensus_header().await.map_err(Into::into)
@@ -1539,8 +1544,7 @@ impl ConsensusChain {
         &self,
         epoch: Epoch,
     ) -> Result<HashMap<AuthorityIdentifier, Round>, ConsensusChainError> {
-        let pack = &self.current_pack();
-        if pack.epoch() == epoch {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return Ok(pack.read_last_committed().await?);
         }
         self.get_static(epoch).await?.read_last_committed().await.map_err(Into::into)
@@ -1551,8 +1555,7 @@ impl ConsensusChain {
         &self,
         epoch: Epoch,
     ) -> Result<Option<CommittedSubDag>, ConsensusChainError> {
-        let pack = &self.current_pack();
-        if pack.epoch() == epoch {
+        if let Some(pack) = self.current_pack_for(epoch) {
             return Ok(pack.read_latest_commit_with_final_reputation_scores().await?);
         }
         if let Ok(pack) = self.get_static(epoch).await {
@@ -1615,6 +1618,14 @@ impl ConsensusChain {
     /// Return a clone of the current pack.
     fn current_pack(&self) -> ConsensusPack {
         self.current_pack.lock().clone()
+    }
+
+    /// A clone of the current pack if it is `epoch`'s, else `None`. Readers that fall through to
+    /// `get_static` for another epoch use this so the live pack's clone is gone before they
+    /// await: an epoch handoff waits (briefly) for every clone of the pack it seals.
+    fn current_pack_for(&self, epoch: Epoch) -> Option<ConsensusPack> {
+        let current = self.current_pack.lock();
+        (current.epoch() == epoch).then(|| current.clone())
     }
 
     /// Return a clone of the staging pack.
@@ -1689,32 +1700,33 @@ impl ConsensusChain {
         let gen_before = self.install_generation.load(Ordering::Acquire);
         let pack = match ConsensusPack::open_static(&self.base_path, epoch) {
             Ok(pack) => pack,
-            // Genuinely absent and no install in flight (an install moves the live dir aside to
-            // `epoch-N.replaced` first): a plain miss, answered without waiting on `pack_install`.
-            Err(e)
-                if e.is_missing_static_files()
-                    && !self.epoch_data_present(epoch)
-                    && !self.base_path.join(format!("epoch-{epoch}.replaced")).exists() =>
-            {
-                return Err(e)
-            }
+            // Genuinely absent and no install in flight: a plain miss, answered without waiting
+            // on `pack_install`. Checked in this order: an install moves the live dir aside to
+            // `epoch-N.replaced` before the new one appears, so a reader that saw no data log
+            // mid-install still sees the aside.
+            Err(e) if e.is_missing_static_files() && self.epoch_absent(epoch) => return Err(e),
             Err(_) => {
-                drop(self.pack_install.lock().await);
-                // After waiting out the in-flight handoff/import, the epoch we want may now BE the
-                // live current pack — e.g. a `get_static(N+1)` that raced `new_epoch(N+1)`. Serve
-                // the live pack directly instead of `open_static`-ing the active
-                // writer (which fails the clean-close sentinel gate and would
-                // misreport a healthy epoch as CorruptPack).
-                let live = self.current_pack();
-                if live.epoch() == epoch {
-                    return Ok(live);
-                }
-                match ConsensusPack::open_static(&self.base_path, epoch) {
+                // Wait out the in-flight handoff/import, then decide and retry while still
+                // holding the lock (a sync open; nothing awaits under it), so a following install
+                // cannot slip between the wait and the retry. The epoch we want may now BE the
+                // live current pack — e.g. a `get_static(N+1)` that raced `new_epoch(N+1)`:
+                // serve it directly instead of `open_static`-ing the active writer (which fails
+                // the clean-close sentinel gate and would misreport a healthy epoch as
+                // CorruptPack).
+                let retried = {
+                    let _install = self.pack_install.lock().await;
+                    let live = self.current_pack();
+                    if live.epoch() == epoch {
+                        return Ok(live);
+                    }
+                    ConsensusPack::open_static(&self.base_path, epoch)
+                };
+                match retried {
                     Ok(pack) => pack,
                     // Genuinely absent: no data log. (A missing INDEX beside a present data log
                     // is damage to heal, not absence: e.g. a crash between discarding and
                     // recreating the index directories.)
-                    Err(e) if e.is_missing_static_files() && !self.epoch_data_present(epoch) => {
+                    Err(e) if e.is_missing_static_files() && self.epoch_absent(epoch) => {
                         return Err(e)
                     }
                     Err(e) => return self.heal_and_reopen(epoch, Some(e)).await,
@@ -1772,23 +1784,30 @@ impl ConsensusChain {
     /// Heal sealed past epoch `epoch` read-side (see [`Self::heal_static`]) and open the result.
     ///
     /// `cause` is the open error that led here, and is what the caller sees if the heal fails (the
-    /// heal's own error is logged and remembered by `heal_static`). Without one (a legacy pack that
-    /// opened but must be migrated first) the heal's error surfaces instead.
+    /// heal's own error is logged and remembered by `heal_static`) — unless it is a missing-files
+    /// error: the read was routed here because the data log IS present (only an index is
+    /// missing), and returning that error would let `get_static_if_present` report a damaged
+    /// epoch as one this node does not hold. Then, as without a cause (a legacy pack that opened
+    /// but must be migrated first), the heal's own error surfaces.
     ///
-    /// The epoch can become the live writer while the heal runs, and the heal then stands down:
-    /// serve the live pack rather than `open_static` the active writer, whose unsealed files fail
-    /// the clean-close sentinel gate. The reopened handle is returned uncached; the next
-    /// `get_static` caches a fresh open.
+    /// The epoch can become the live writer while the heal runs (the heal then stands down, or
+    /// fails on the writer's now-unsealed log): serve the live pack rather than `open_static`
+    /// the active writer, whose unsealed files fail the clean-close sentinel gate. The reopened
+    /// handle is returned uncached; the next `get_static` caches a fresh open.
     async fn heal_and_reopen(
         &self,
         epoch: Epoch,
         cause: Option<PackError>,
     ) -> Result<ConsensusPack, PackError> {
-        self.heal_static(epoch).await.map_err(|e| cause.unwrap_or(e))?;
+        let healed = self.heal_static(epoch).await;
         let live = self.current_pack();
         if live.epoch() == epoch {
             return Ok(live);
         }
+        healed.map_err(|e| match cause {
+            Some(cause) if !cause.is_missing_static_files() => cause,
+            _ => e,
+        })?;
         let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
         if pack.is_legacy() {
             pack.close().await;
@@ -1802,6 +1821,14 @@ impl ConsensusChain {
     /// True if the data log of `epoch` exists on disk.
     fn epoch_data_present(&self, epoch: Epoch) -> bool {
         self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME).is_file()
+    }
+
+    /// True if this node holds nothing of `epoch`: no data log, and no `epoch-N.replaced` copy
+    /// that an in-flight install moved aside (checked first, since an install removes the live
+    /// directory before the replacement appears).
+    fn epoch_absent(&self, epoch: Epoch) -> bool {
+        !self.base_path.join(format!("epoch-{epoch}.replaced")).exists()
+            && !self.epoch_data_present(epoch)
     }
 
     /// How long a failed read-side heal of an epoch is remembered before it is attempted again.
@@ -1819,15 +1846,18 @@ impl ConsensusChain {
     /// failure is remembered for [`Self::HEAL_RETRY_BACKOFF`], so repeated reads of a corrupt
     /// epoch fail fast.
     async fn heal_static(&self, epoch: Epoch) -> Result<(), PackError> {
-        if let Some((failed_at, why)) = self.heal_failures.lock().get(&epoch).cloned() {
-            if failed_at.elapsed() < Self::HEAL_RETRY_BACKOFF {
-                return Err(PackError::CorruptPack(why));
-            }
+        if let Some(recent) = self.recent_heal_failure(epoch) {
+            return Err(recent);
         }
         let epoch_lock = self.heal_locks.lock().entry(epoch).or_default().clone();
         let result = {
             let _serial = epoch_lock.lock().await;
-            self.build_and_install_heal(epoch).await
+            // Readers queued behind a build that just failed find its failure here rather than
+            // each re-running the build.
+            match self.recent_heal_failure(epoch) {
+                Some(recent) => Err(recent),
+                None => self.build_and_install_heal(epoch).await,
+            }
         };
         {
             let mut locks = self.heal_locks.lock();
@@ -1843,10 +1873,26 @@ impl ConsensusChain {
             }
             Err(e) => {
                 warn!(target: "consensus::store", epoch, %e, "read-side heal of a past epoch failed");
-                self.heal_failures.lock().insert(epoch, (std::time::Instant::now(), e.to_string()));
+                // Not remembered: an environmental failure, or a failure on the epoch that became
+                // the live writer meanwhile (its now-unsealed log fails the heal, which is not a
+                // verdict on the epoch).
+                let environmental =
+                    e.is_environmental_index_error() || matches!(e, PackError::IO(_));
+                if !environmental && self.current_pack().epoch() != epoch {
+                    self.heal_failures.lock().insert(epoch, (std::time::Instant::now(), e.clone()));
+                }
             }
         }
         result
+    }
+
+    /// The failure a heal of `epoch` hit within [`Self::HEAL_RETRY_BACKOFF`], if any.
+    fn recent_heal_failure(&self, epoch: Epoch) -> Option<PackError> {
+        self.heal_failures
+            .lock()
+            .get(&epoch)
+            .filter(|(failed_at, _)| failed_at.elapsed() < Self::HEAL_RETRY_BACKOFF)
+            .map(|(_, e)| e.clone())
     }
 
     /// Body of [`Self::heal_static`], run while holding the epoch's heal lock.
@@ -2950,6 +2996,96 @@ mod test {
             .expect("a missing index must heal, not error")
             .expect("a present epoch with a missing index must not read as absent");
         assert_eq!(header.number, 3);
+    }
+
+    /// A past epoch whose index directory is missing but whose data log is present and damaged
+    /// (here unsealed, so the heal refuses) is unreadable, not absent: the read must surface an
+    /// error, never `Ok(None)`, or a restart would prime consensus number 0 from "not held".
+    #[tokio::test]
+    async fn test_missing_index_with_a_damaged_log_is_not_reported_absent() {
+        use crate::consensus_pack::DATA_NAME;
+
+        let temp_dir = TempDir::with_prefix("test_missing_index_damaged").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, last) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+        consensus_chain.epochs().save_record(record0).await.unwrap();
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::remove_dir_all(epoch_dir.join("hash")).expect("remove the digest index dir");
+        // Strip the clean-close sentinel: an unsealed v2 log is refused by the read-side heal.
+        let data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(epoch_dir.join(DATA_NAME))
+            .expect("open data log");
+        let len = data.metadata().expect("meta").len();
+        data.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        drop(data);
+
+        let result = consensus_chain.consensus_header_by_digest(0, last).await;
+        assert!(
+            result.is_err(),
+            "a present but unhealable epoch must surface an error, not absence: {result:?}"
+        );
+    }
+
+    /// Replaying consensus over an imported (static) epoch advances the latest pointer without
+    /// rewriting anything — but only for the output the pack holds. A different output under a
+    /// stored number must be refused, as the writable save refuses it, never reported persisted.
+    #[tokio::test]
+    async fn test_static_replay_refuses_a_different_output_under_a_stored_number() {
+        use crate::consensus_pack::{ConsensusPack, PackError};
+
+        let temp_dir = TempDir::with_prefix("test_static_replay_conflict").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+
+        // Make the sealed epoch-0 pack the current one, as an imported epoch is, and rewind the
+        // latest pointer so a replay of number 2 is admitted.
+        let imported = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        assert!(imported.is_static());
+        let replaced = std::mem::replace(&mut *consensus_chain.current_pack.lock(), imported);
+        replaced.close().await;
+        consensus_chain.latest_consensus.update(0, 1).await;
+
+        let stored = consensus_chain
+            .get_consensus_output_current(2)
+            .await
+            .expect("output 2 is in the imported pack");
+        let other =
+            make_test_output(&committee, 3, chain.clone(), 2, ConsensusHeaderDigest::default());
+        assert_ne!(other.digest(), stored.digest(), "precondition: a different output");
+        let err = consensus_chain
+            .save_consensus_output(other)
+            .await
+            .expect_err("a different output under a stored number must be refused");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::PackError(PackError::ConflictingOutput { number: 2, .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(consensus_chain.latest_consensus.number(), 1, "nothing advanced");
+
+        // The pack's own output replays as a no-op that advances the pointer.
+        consensus_chain.save_consensus_output(stored).await.expect("the same output replays");
+        assert_eq!(consensus_chain.latest_consensus.number(), 2);
     }
 
     /// A read-side heal can finish after its epoch became the live writer (the heal then stands

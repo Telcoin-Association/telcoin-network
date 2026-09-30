@@ -35,8 +35,8 @@ use tn_storage::{
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
     pack_validate::{
-        classify_physical_corruption, incomplete_trailing_output, validate_pack_file,
-        validate_pack_file_bounded, Verdict,
+        classify_physical_corruption, incomplete_trailing_output, recovery_refusal,
+        validate_pack_file, validate_pack_file_bounded, Verdict,
     },
 };
 use tn_types::{
@@ -159,6 +159,15 @@ impl DbValidateArgs {
             // otherwise report that output's unwritten batches as false "absent" and
             // flip the verdict INVALID right after "SAFE".
             let mut prefix_invalid = false;
+            // "Truncatable" is only what recovery would do: a tear past which an acked output
+            // still lies is refused by a node restart and `db repair --force` alike, and a legacy
+            // pack's tail is judged by the migration. Say so instead of promising a self-heal.
+            if corruption.kind.is_truncatable() {
+                if let Some(why) = recovery_refusal(&data_file, epoch) {
+                    println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
+                    bail!("pack {} is corrupt (see report above)", data_file.display());
+                }
+            }
             if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
                 let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
                 eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
@@ -187,6 +196,14 @@ impl DbValidateArgs {
         // last record happens to end the file: an unacked in-flight write that recovery truncates,
         // not corruption. Report it as such and validate the complete prefix before it.
         if let Some(end) = incomplete_trailing_output(&data_file, epoch) {
+            if let Some(why) = recovery_refusal(&data_file, epoch) {
+                println!(
+                    "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
+                     incomplete (bytes past offset {end}), but recovery would refuse to truncate \
+                     it: {why}"
+                );
+                bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
             println!(
                 "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
                  (bytes past offset {end}); this unacked in-flight write is truncated by a node \

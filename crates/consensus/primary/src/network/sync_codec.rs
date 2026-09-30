@@ -357,7 +357,21 @@ where
     .await
     .map_err(|_elapsed| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reading epoch pack sync frame")
-    })??;
+    })?
+    // A substream that closes without an `End` frame reads as EOF inside a frame. Left as
+    // `UnexpectedEof`, the pack decoder on top of this reader would take an EOF that lands on a
+    // record boundary for a clean end of the pack, and the importer would then charge the peer
+    // for a short pack. It is a transport failure: report it as one.
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "epoch pack sync stream closed before its End frame",
+            )
+        } else {
+            e
+        }
+    })?;
 
     match frame {
         SyncFrame::Data(bytes) => Ok(Some(bytes)),
@@ -779,6 +793,26 @@ mod tests {
         .await
         .expect("write err");
         assert!(read_back(framed).await.is_err(), "an Err frame must surface as a read error");
+    }
+
+    /// A stream that ends without an `End` frame is a transport failure, never a clean end of
+    /// the pack: the reader must surface an error (and not `UnexpectedEof`, which the pack decoder
+    /// above it treats as a clean end on a record boundary).
+    #[tokio::test]
+    async fn sync_pack_reader_rejects_eof_without_end_frame() {
+        let mut framed = Vec::new();
+        let (mut enc, mut comp) = (Vec::new(), Vec::new());
+        write_frame(
+            &mut framed,
+            &SyncFrame::<PrimarySyncRequest>::Data(vec![1, 2, 3]),
+            &mut enc,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("write data");
+        let err = read_back(framed).await.expect_err("EOF without End must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted, "got {err:?}");
     }
 
     /// An out-of-place control frame (e.g. a second `Ack`) is a protocol

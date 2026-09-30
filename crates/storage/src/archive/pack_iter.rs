@@ -21,6 +21,11 @@ use crate::archive::{
 /// an upper bound on memory allocations for a record.
 pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
+/// A zstd failure on a CRC-valid record is a fault in the record's bytes, not in reading them.
+fn zstd_decode_error(e: io::Error) -> FetchError {
+    FetchError::DeserializeValue(format!("zstd: {e}"))
+}
+
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
@@ -165,12 +170,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
+                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
+                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
+                // importer treats `IO` as a transport failure that says nothing about the bytes).
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
+                decoder.window_log_max(24).map_err(zstd_decode_error)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
+                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
@@ -325,12 +334,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
+                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
+                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
+                // importer treats `IO` as a transport failure that says nothing about the bytes).
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
+                decoder.window_log_max(24).map_err(zstd_decode_error)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
+                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }

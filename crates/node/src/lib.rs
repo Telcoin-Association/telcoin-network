@@ -51,9 +51,10 @@ where
     // then exit.
     tokio::spawn(async move {
         // Refuse to run a second writer against this datadir. Take the PID lockfile before
-        // touching anything in the datadir (including opening the consensus DB, whose open is
-        // fail-fast and would otherwise panic on a datadir another node holds before this clear
-        // error is reached) and hold the guard for the node's whole lifetime: it is released on
+        // consensus storage is touched (its open is fail-fast and would otherwise panic on a
+        // datadir another node holds before this clear error is reached; the execution
+        // engine's database, opened by the CLI before this point, is guarded by its own lock)
+        // and hold the guard for the node's whole lifetime: it is released on
         // the clean-shutdown path below, and on any early error or panic via the guard's
         // `Drop`. A crashed holder never blocks a restart: the kernel releases its `flock` when
         // the process exits. This is TN-owned and does not depend on the execution engine's own

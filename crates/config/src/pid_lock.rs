@@ -78,9 +78,12 @@ impl PidLock {
             let _ = file.read_to_string(&mut buf);
             let holder = buf.trim();
             let who = if holder.is_empty() { String::new() } else { format!(" (pid {holder})") };
+            // Never suggest deleting the lockfile: a refused lock means a live holder (the kernel
+            // releases a dead one), and a deleted lockfile lets two processes lock two files at
+            // the same path.
             bail!(
-                "another telcoin process{who} is using this data directory; stop it first, or \
-                 delete {} if you are certain it is stale",
+                "another telcoin process{who} holds the lock on this data directory ({}); stop \
+                 it first",
                 path.display()
             );
         }
