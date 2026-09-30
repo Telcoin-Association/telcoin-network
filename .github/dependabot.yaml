@@ -37,9 +37,11 @@ updates:
       actions:
         patterns:
           - "*"
-        # A rust-cache release can change how the cache key is computed, and then
-        # cache-deps.yaml (the writer) has to move before pr.yaml (the reader). So that
-        # bump must not ride along with the others: excluded here, it arrives as a pull
-        # request of its own. See "Caches" in .github/ACTIONS.md.
+        # A rust-cache release can change how the cache key is computed. Moving
+        # cache-deps.yaml (the writer) and pr.yaml (the reader) together leaves the
+        # queue cold until main has re-warmed; moving the writer first keeps it warm but
+        # takes a second pull request. Excluded here, the bump arrives as a pull request
+        # of its own, so that choice can be made, and the bump split if wanted, without
+        # the other actions riding along. See "Caches" in .github/ACTIONS.md.
         exclude-patterns:
           - "Swatinem/rust-cache"

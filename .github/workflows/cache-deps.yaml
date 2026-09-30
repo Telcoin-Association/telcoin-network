@@ -16,7 +16,7 @@
 #                 are rebuilt per run because rust-cache does not save workspace crates.
 #
 # rust-cache builds the key as follows (checked against v2.9.2; a later release can
-# change it, and one that does moves as the paragraph on such releases below says):
+# change it, and the paragraph on such releases below says how one that does can move):
 #
 #   <prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests,
 #   lockfiles and toolchain/config files>
@@ -40,15 +40,21 @@
 # Entries are immutable and an exact key hit skips the save. A change to WHAT a job here
 # builds (a lane added, a feature set changed) is therefore never written while the key
 # stays the same: bump `prefix-key` in both workflows, here first and in pr.yaml once main
-# has written the new entries (or delete the entries under Settings > Actions > Caches).
+# has written the new entries, or in both at once, a choice the next paragraph weighs (or
+# delete the entries under Settings > Actions > Caches).
 #
 # A rust-cache release that changes how the key is computed is a change of key too, and
-# moves the same way: here first, in pr.yaml once main has written the new entries. If
-# both moved together, the merge queue would restore keys nothing had written yet and
-# build every dependency cold on each queue entry until main had warmed. To tell whether
-# a release is one of these, read the release notes of every release between the old pin
-# and the new one for anything about the key or hashing, or compare the "Cache Key" a
-# warm prints before and after the bump.
+# the choice is the same. Moved here and in pr.yaml together, it is one pull request and
+# one attestation, but the merge queue restores keys nothing has written yet and builds
+# every dependency cold, from that pull request's own queue run until the warm its merge
+# triggers here has finished. Moved here first, and in pr.yaml once main has written the
+# new entries, it keeps the queue warm, but is two pull requests and two attestations,
+# and while the gap is open this workflow no longer refreshes the entries pr.yaml
+# restores. What decides it is whether a cold lane fits its timeout-minutes and how busy
+# the queue is; .github/ACTIONS.md ("Caches") has the one cold timing measured. To tell
+# whether a release is one of these, read the release notes of every release between the
+# old pin and the new one for anything about the key or hashing, or compare the
+# "Cache Key" a warm prints before and after the bump.
 #
 # No `cache-on-failure`: a warm job that died mid-build would freeze a partial target dir
 # under the exact key, permanently. A failed warm saves nothing; fix it and re-dispatch.
@@ -66,7 +72,8 @@ on:
       - ".cargo/config.toml"
       - "etc/ci-lanes.sh"
       - ".github/workflows/cache-deps.yaml"
-  # Re-warm by hand: after deleting entries, or when a warm failed.
+  # Re-warm by hand: after deleting entries, when a warm failed, or when the runner
+  # image's stable Rust changed and every key with it.
   workflow_dispatch:
   # GitHub deletes an entry not accessed for 7 days, so a quiet week would leave the queue
   # cold. Twice a week keeps the entries alive; on an exact hit the run restores, rebuilds

@@ -155,7 +155,7 @@ When the entry already matches, the run restores it, rebuilds only the workspace
 
 All six cache steps (two in `cache-deps.yaml`, three in `pr.yaml`, one in `durable-e2e.yaml`) pin the same `Swatinem/rust-cache` release.
 Three of its properties shape all of this.
-They were checked against v2.9.2, and a later release can change them; the third says how a release that changes the key moves:
+They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 
 - The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo
   manifests, lockfiles and toolchain/config files>`, so the two entries start with
@@ -175,29 +175,40 @@ They were checked against v2.9.2, and a later release can change them; the third
 - Entries are immutable, and an exact key hit skips the save. So changing *what* a warm job
   builds (a lane added, a feature set changed) writes nothing until the key changes: bump
   `prefix-key` in both workflows, `cache-deps.yaml` first, then `pr.yaml` once `main` has
-  written the new entries. (Or delete the entries under Settings -> Actions -> Caches and
-  re-run the warm.) Both workflows now use `prefix-key: v1-rust`. Older entries that
-  nothing restores any more can be deleted there, and until they are, or expire after 7
-  days without a restore, the list shows them beside the current ones:
+  written the new entries, or both at once; the next bullet weighs the two. (Or delete
+  the entries under Settings -> Actions -> Caches and re-run the warm.) Both workflows
+  now use `prefix-key: v1-rust`. Older entries that nothing restores any more can be
+  deleted there, and until they are, or expire after 7 days without a restore, the list
+  shows them beside the current ones:
   `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust`, and
   `v1-rust-clippy-cache-Linux-<hash>`, `v1-rust-test-cache-Linux-<hash>` and
   `v0-rust-durable-e2e-cache-Linux-<hash>` from rust-cache v2.7.7, whose keys have no
   `x64` after `Linux-`.
 - How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
-  changes it is a change of key like any other: `cache-deps.yaml` first, `pr.yaml` once
-  `main` has written the new entries. Dependabot sends rust-cache bumps as a pull request
-  of their own for exactly this reason (`.github/dependabot.yaml`). Whoever reviews one
-  reads the release notes of every release it covers for anything about the key,
-  hashing or cached paths, and if there is any, splits the bump into two pull requests:
-  the first moves `cache-deps.yaml` (and `durable-e2e.yaml`, which reads only the entry
-  it writes itself), the second moves `pr.yaml` after the warm on `main` has succeeded.
-  Dependabot may open that second one by itself, since `pr.yaml` is then the only file
-  behind the new release; it still waits for the warm. Comparing the "Cache Key" a warm
-  prints before and after the bump shows whether a release changes the key.
+  changes it is a change of key like any other. Whoever reviews a rust-cache bump reads
+  the release notes of every release it covers for anything about the key, hashing or
+  cached paths; comparing the "Cache Key" a warm prints before and after the bump shows
+  whether a release changes the key. Such a release can move in one of two ways, and
+  each has a cost. Moving every cache step together is one pull request and one
+  attestation, but the queue then builds every dependency cold, from that pull request's
+  own queue run until the warm its merge triggers has finished on `main`. Moving the
+  writer first, `cache-deps.yaml` (and `durable-e2e.yaml`, which reads only the entry it
+  writes itself), then `pr.yaml` once `main` has written the new entries, keeps the queue
+  warm, but is two pull requests and two attestations, and while the gap is open the
+  warm no longer refreshes the entries `pr.yaml` restores. Dependabot may open that
+  second pull request by itself, since `pr.yaml` is then the only file behind the new
+  release; it still waits for the warm. What decides between them is whether a cold lane
+  fits its `timeout-minutes` (the one cold figure measured is below, with the warm
+  timings) and how busy the queue is. The bump from v2.7.7 to v2.9.2 changed the key and
+  moved all six steps together. Dependabot sends rust-cache bumps as a pull request of
+  their own (`.github/dependabot.yaml`) so that this choice can be made, and the bump
+  split if wanted, without the other actions riding along.
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
+One cold figure has been measured: the warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
+A cold test lane then still has to run the tests, which no GitHub runner has timed from cold.
 Check the total under Settings -> Actions -> Caches now and then: three current entries should be there (`clippy-cache`, `test-cache`, `durable-e2e-cache`), about 4.6 GB in September 2026 against the 10 GB quota.
 Each `Cargo.lock` change on `main` leaves the previous generation behind until it goes 7 days without a restore, and GitHub evicts the least recently used entries once the total passes the quota; superseded entries can be deleted there by hand once a warm has replaced them.
 
@@ -208,10 +219,9 @@ That is a decision to make, not one made here.
 A second exposure, new with v2.9.2: the stable Rust preinstalled on the `ubuntu-latest` image is one of the toolchains hashed into every key, and this repository does not control it.
 When GitHub updates the image to a new Rust release (roughly every six weeks, plus point releases, rolled out to the runners over several days), every entry misses with no fallback until the next warm, and while the rollout is in progress a writer and a reader can land on different images and compute different keys.
 A missed restore whose "Rust Versions:" list shows a new stable is the sign.
-There are two ways out.
-One is to dispatch a warm by hand when it happens.
-The other is to make the installed set deterministic by removing the image's own toolchain before the cache step, in both workflows and in lockstep; that is untested on a runner.
-That too is a decision to make, not one made here.
+When it happens, dispatch a warm by hand (*Warm dependency cache* -> *Run workflow*); until that warm has finished, the lanes build cold.
+While the rollout lasts, the warm can itself land on an old image, which its own "Rust Versions:" list shows, and then it has to be dispatched again.
+The alternative, making the installed set deterministic by removing the image's own toolchain before each of the six cache steps, in lockstep, was considered and not adopted; it is untested on a runner.
 
 ## Action pins
 
@@ -245,7 +255,7 @@ The runtime column matters because GitHub removed Node 20 from the hosted runner
 Dependabot (`.github/dependabot.yaml`) checks the actions weekly and opens one grouped pull request for all of them except `Swatinem/rust-cache`, with each SHA and its version comment rewritten together.
 It proposes a release only once the release is 7 days old, so one that is pulled or found to be compromised in its first days never reaches one of its pull requests; a pin set by hand skips that wait.
 The grouping is for the attestation: a pull request cannot enter the queue until a maintainer has run the full local suite on its head and attested it, and `taiki-e/install-action` alone was released about five times a week in September 2026.
-`Swatinem/rust-cache` arrives as a pull request of its own, because a release that changes how the cache key is computed has to reach `cache-deps.yaml` before `pr.yaml`.
+`Swatinem/rust-cache` arrives as a pull request of its own, so that a release that changes how the cache key is computed can be moved as "Caches" above describes, without the other actions riding along.
 
 Whoever reviews such a pull request:
 
