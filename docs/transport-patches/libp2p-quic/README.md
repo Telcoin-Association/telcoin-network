@@ -144,8 +144,8 @@ boundary, not a promise that a bare transport dial enforces a `/p2p` suffix.
 The unchanged source baseline passed all eight rows and the identity control
 locally on macOS. An initial run timed out; failed receipts were retained,
 and bounded subprocess deadlines and two Tokio workers were used for the
-successful repeat. The final updated stack and node configuration are
-qualified in the required Linux CI lane before merging this PR.
+successful repeat. The final updated stack and node configuration passed all
+eight rows and sixteen exchanges in the required Linux CI lane on 2026-09-30.
 
 The actual default and Adiri graphs retain the same feature selection when
 compared with the registry-source control. `libp2p-tls` 0.7.0 explicitly uses
@@ -157,8 +157,9 @@ libp2p TLS 1.3 protocol selection.
 
 The baseline provider groups are `X25519MLKEM768`, `X25519`, `secp256r1` and
 `secp384r1`. The complete ordered baseline provider cipher suite list is
-retained beside the evidence. Compare the updated provider dump before merge;
-any change requires explicit review. Independent peers use the node's exact
+retained beside the evidence. The required lane compares the updated provider
+dump against that baseline and passed for all three peers. Any change requires
+explicit review. Independent peers use the node's exact
 rustls, AWS-LC and webpki pins and provider features rather than claiming
 equivalence from crate versions alone.
 
@@ -168,7 +169,9 @@ variable can enable secret logging even without a Telcoin logging option.
 The matrix runs with that variable removed. A separate positive control
 enables it for ephemeral test identities, requires TLS traffic-secret labels,
 then deletes the secret file and retains only labels. Secret files are never
-uploaded as CI artifacts. This PR does not enable production key logging.
+uploaded as CI artifacts. The Linux positive control recorded handshake and
+application traffic-secret labels and confirmed deletion of the file. This PR
+does not enable production key logging.
 
 ## Required gate and evidence
 
@@ -180,11 +183,23 @@ the job succeeds after its scope check. A skipped, failed or cancelled job
 cannot pass aggregation. The existing lint, tests, archive and attestation
 requirements are retained.
 
+The [Linux qualification run](https://github.com/Telcoin-Association/telcoin-network/actions/runs/36759742506/job/110038954563)
+passed on commit `f6a36fb7b5bf1a96e2d82c4722515b9fcc5ec2fe`. It includes the
+source/default/Adiri checks, both scanner source-form controls, eight peer rows,
+identity rejection, provider comparison, key logging control, CI aggregation
+tests and killed traffic/identity mutations. Both scanner database revisions
+were `9b3a3b73a7f42606494c943e95f8196e9994df46`.
+[ci-linux.json](evidence/ci-linux.json) retains the actual package IDs/features,
+binary and report hashes, outcomes, immutable artifact ID and archive digest.
+The existing on-chain attestation gate failed because this commit has no
+attestation; full workspace validation and attestation remain required for merge.
+
 Run from the repository root:
 
 ```sh
 python3 -I etc/transport-patches/qualify.py --output /tmp/transport-peers
 python3 -I etc/transport-patches/sources.py --output /tmp/transport-sources
+python3 -I etc/transport-patches/mutations.py --peers /tmp/transport-peers
 git clone https://github.com/RustSec/advisory-db.git /tmp/transport-db
 python3 -I etc/transport-patches/advisories.py --output /tmp/transport-advisories \
   --database /tmp/transport-db --audit /path/to/cargo-audit --deny /path/to/cargo-deny
