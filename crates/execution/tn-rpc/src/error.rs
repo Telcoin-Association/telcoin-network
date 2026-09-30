@@ -34,8 +34,9 @@ pub enum TNRpcError {
     /// Internal failure serving the request. Detail logged server-side only.
     ///
     /// Deliberately says nothing about which endpoint or stage failed: it is returned for registry
-    /// reads and for the blocking-dispatch failures behind `proofOfPossessionMessage` alike, and
-    /// the cause is only ever logged server-side.
+    /// reads, for the header and consensus-pack lookups behind `getBlockTimestampMillis`, and for
+    /// the blocking-dispatch failures behind `proofOfPossessionMessage` alike, and the cause is
+    /// only ever logged server-side.
     #[error("internal error")]
     Internal,
     /// Caller supplied an invalid parameter (e.g. a malformed BLS public key).

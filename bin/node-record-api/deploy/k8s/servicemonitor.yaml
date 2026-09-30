@@ -1,0 +1,21 @@
+# Prometheus Operator ServiceMonitor: tells Prometheus to scrape the daemon's
+# /metrics endpoint via the Service above.
+#
+# Requires the Prometheus Operator CRDs (monitoring.coreos.com) to be installed
+# in the cluster; without them, applying this manifest will fail.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-record-api
+  labels:
+    app: node-record-api
+    app.kubernetes.io/name: node-record-api
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  selector:
+    matchLabels:
+      app: node-record-api
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

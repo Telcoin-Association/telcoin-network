@@ -28,12 +28,15 @@ use serde::{Deserialize, Serialize};
 /// constant and is never derived from node-local epoch state, for the same reason.
 ///
 /// NOTE: the resulting digest is build-dependent and is frozen per build flavor by the
-/// `test_consensus_header_default_digest_pinned` pin: the embedded [`Header`](crate::Header)
-/// default (epoch 0) carries `seed_signature` on the wire only where the seed-signature fork
-/// ([`seed_signature_active`](crate::forks::seed_signature_active)) is active for epoch 0
-/// (always on non-adiri builds, never on adiri builds), so the two flavors anchor different
-/// digests. Both flavors also differ from the pre-#1032 anchor, which built this sub-dag
-/// through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
+/// `test_consensus_header_default_digest_pinned` pin. The embedded [`Header`](crate::Header)
+/// default is at epoch 0, and three fields reach the wire, and so the digest, only where their
+/// fork is active for epoch 0: the header's `seed_signature`
+/// ([`seed_signature_active`](crate::forks::seed_signature_active)), and the header's
+/// `created_at_millis` and the sub-dag's `commit_timestamp_millis`
+/// ([`subsecond_timestamp_active`](crate::forks::subsecond_timestamp_active)). Non-adiri builds
+/// activate both forks from genesis and adiri builds neither at epoch 0, so the two flavors
+/// anchor different digests. Both flavors also differ from the pre-#1032 anchor, which built this
+/// sub-dag through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
 /// default certificate's aggregate signature, where this derived default anchors the pinned
 /// placeholder itself (not a fold over it).
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
@@ -216,12 +219,13 @@ mod test {
 
     /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] without
     /// `adiri`: every epoch is fork-active, so the embedded [`crate::Header::default`]
-    /// carries `seed_signature` on the wire and the anchor deliberately differs from the
-    /// adiri build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as
-    /// the adiri pin.
+    /// carries `seed_signature` and `created_at_millis` on the wire, the sub-dag digest
+    /// covers `commit_timestamp_millis`, and the anchor deliberately differs from the adiri
+    /// build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as the adiri
+    /// pin.
     #[cfg(not(feature = "adiri"))]
     const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
-        "bcc5222c2dfb715151c596051f5421efa5bf6387d4e9700e91a70f9f51d21e50";
+        "f9a4365f984c09d97b9d17ba33bf9bf362dd6e13147d1cc8906934b4931a060f";
 
     /// PIN: the pre-genesis anchor digest [`crate::ConsensusHeader::default`], per build
     /// flavor (the wire layout of the embedded default header is build-dependent).

@@ -10,14 +10,16 @@ The `telcoin-network` binary has three subcommands:
 
 ## Prerequisites
 
-Hardware (recommended minimums for Adiri testnet):
+Hardware: [Hardware requirements](../../docs/src/getting-started/hardware-requirements.md) has the sizing model, the benchmark results and the observer profiles.
+The validator figures below are the minimum and recommended tiers from that page, set from the 2026-09 benchmark; the page says which figures are measured and which are modelled.
+CPU and memory are twice the measured single-worker figures, a margin for the multi-worker rollout.
 
-| Resource | Minimum    | Recommended   |
-| -------- | ---------- | ------------- |
-| CPU      | 8 cores    | 16+ cores     |
-| RAM      | 16 GB      | 64 GB        |
-| Disk     | 500 TB TLC NVMe SSD | 1 TB TLC NVMe SSD |
-| Network  | 100 Mbps   | 1 Gbps        |
+| Resource | Minimum | Recommended |
+| -------- | ------- | ----------- |
+| CPU      | 8 physical cores | 16 physical cores, PassMark single-thread 3,500+ |
+| RAM      | 32 GB ECC, no swap | 64 GB ECC, no swap |
+| Disk     | 2 TB TLC NVMe SSD, 10,000+ sustained write IOPS, 300+ MB/s, rated 2+ DWPD | 4 TB TLC NVMe SSD, 20,000+ sustained IOPS, 500+ MB/s, rated 1+ DWPD |
+| Network  | 200 Mbps symmetric | 1 Gbps |
 
 Software:
 
@@ -192,7 +194,7 @@ telcoin-network genesis \
     --consensus-registry-owner 0xGOVERNANCE_MULTISIG \
     --basefee-address 0xBASEFEE_RECIPIENT \
     --initial-stake-per-validator 1000000 \
-    --epoch-duration-in-secs 28800
+    --epoch-duration-in-secs 21600  # 6 hours, as on mainnet and testnet
 ```
 
 ### genesis flags
@@ -205,7 +207,7 @@ telcoin-network genesis \
 | `--initial-stake-per-validator`, `--stake`           | `1000000`      | TEL staked per validator at genesis (input in whole TEL, stored as wei)                   |
 | `--min-withdraw-amount`, `--min_withdraw`            | `1000`         | Minimum TEL withdrawal amount                                                             |
 | `--epoch-block-rewards`, `--block_rewards_per_epoch` | `25806`        | Total block rewards per epoch in TEL                                                      |
-| `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours)                                              |
+| `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours; mainnet and testnet use `21600`, 6 hours)    |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
 | `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
@@ -489,6 +491,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + `max_header_time_drift_tolerance` (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -520,6 +523,7 @@ header_num_of_batches_threshold: 5
 max_header_num_of_batches: 10
 max_header_delay: 3s
 min_header_delay: 1s
+vote_timeout: 5s
 gc_depth: 50
 sync_retry_delay: 5s
 sync_retry_nodes: 3

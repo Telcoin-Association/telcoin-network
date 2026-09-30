@@ -211,7 +211,8 @@ impl ExecutionNode {
 
     /// Initialize the worker's transaction pool and public RPC.
     ///
-    /// This method should be called on node startup.
+    /// This method can run before startup synchronization. Call
+    /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -221,7 +222,6 @@ impl ExecutionNode {
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
-        network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
         worker_base_fee: WorkerBaseFee,
@@ -231,13 +231,7 @@ impl ExecutionNode {
     {
         let mut guard = self.internal.write().await;
         guard
-            .initialize_worker_components(
-                worker_id,
-                network_handle,
-                engine_to_primary,
-                base_fee,
-                worker_base_fee,
-            )
+            .initialize_worker_components(worker_id, engine_to_primary, base_fee, worker_base_fee)
             .await
     }
 
@@ -256,7 +250,7 @@ impl ExecutionNode {
 
     /// Respawn one worker's network tasks with its own handle for the new epoch.
     ///
-    /// This method should be called on epoch rollover.
+    /// Call once at every epoch entry, including for a worker whose RPC bound during startup.
     pub async fn respawn_worker_network_tasks(
         &self,
         worker_id: WorkerId,
@@ -282,10 +276,10 @@ impl ExecutionNode {
 
     /// Returns true if the worker identified by `worker_id` has been initialized.
     ///
-    /// A worker's components (RPC server + transaction pool) are created once on
-    /// the node's first epoch and are not torn down across epoch transitions, so
-    /// this reflects "this worker is up and accepting transactions" rather than
-    /// any per-epoch state. Backs the `/health/workers` readiness endpoint.
+    /// A worker's components (RPC server + transaction pool) are created once and never torn
+    /// down across epoch transitions. Worker 0 is created during process startup, before
+    /// startup epoch-record sync; other workers on the first epoch entry where their id is
+    /// active. Backs the `/health/workers` readiness endpoint.
     pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
         self.internal.read().await.workers.get(worker_id as usize).is_some()
     }
