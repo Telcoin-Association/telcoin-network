@@ -11,7 +11,10 @@ use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
-use tn_types::{error::DagError, BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
+use tn_types::{
+    encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, SignatureVerificationState,
+    TnSender,
+};
 use tokio::sync::mpsc;
 
 // ===== Certifier test harness =====
@@ -208,6 +211,78 @@ async fn drive_vote_requests(
     }
 }
 
+/// Stands in for the libp2p network under the code being tested.
+///
+/// Owns the receiving end of the network command channel. Every receive is bounded by
+/// [`STEP_TIMEOUT`] and panics with the caller's context string, so a test that expects a request
+/// the code never sends fails instead of hanging.
+struct MockNetwork {
+    /// Receiver of the `NetworkCommand`s sent through the handle returned by [`Self::new`].
+    rx: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+}
+
+impl MockNetwork {
+    /// A mock network and the primary network handle whose commands it receives.
+    fn new() -> (Self, PrimaryNetworkHandle) {
+        let (sender, rx) = mpsc::channel(100);
+        let handle: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+        (Self { rx }, handle.into())
+    }
+
+    /// Receive the next network command. See the free [`next_command`].
+    async fn next_command(
+        &mut self,
+        context: &str,
+    ) -> NetworkCommand<PrimaryRequest, PrimaryResponse> {
+        next_command(&mut self.rx, context).await
+    }
+
+    /// Answer the next `count` vote requests, each with the reply `reply_for` picks for it.
+    ///
+    /// `reply_for` receives the peer the request is addressed to and the request. Panics, naming
+    /// `context`, if a vote request does not arrive within [`STEP_TIMEOUT`], if any other command
+    /// arrives instead, or if the requester is gone before its reply is delivered.
+    async fn respond(
+        &mut self,
+        count: usize,
+        context: &str,
+        mut reply_for: impl FnMut(&BlsPublicKey, &PrimaryRequest) -> Reply,
+    ) {
+        for ordinal in 1..=count {
+            let command = self
+                .next_command(&format!("{context}: waiting for vote request {ordinal} of {count}"))
+                .await;
+            let (peer, request, reply) = match command {
+                NetworkCommand::SendRequest {
+                    peer,
+                    request: request @ PrimaryRequest::Vote { .. },
+                    reply,
+                } => (peer, request, reply),
+                other => {
+                    panic!("{context}: expected vote request {ordinal} of {count}, got {other:?}")
+                }
+            };
+            let result = match reply_for(&peer, &request) {
+                Reply::Vote(vote) => PrimaryResponse::Vote(vote),
+                Reply::Response(response) => response,
+            };
+            assert!(
+                reply.send(Ok(NetworkResponseMessage { peer, result })).is_ok(),
+                "{context}: requester dropped vote request {ordinal} of {count} before its reply"
+            );
+        }
+    }
+}
+
+/// How a [`MockNetwork`] peer answers one vote request.
+#[derive(Clone)]
+enum Reply {
+    /// Answer with this vote.
+    Vote(Vote),
+    /// Answer with this raw response, such as [`PrimaryResponse::MissingParents`].
+    Response(PrimaryResponse),
+}
+
 // ===== end harness =====
 
 // ---------------------------------------------------------------------------
@@ -309,125 +384,6 @@ async fn missing_parents_happy_path() {
         .expect("cert formed within timeout")
         .expect("cert_rx channel open");
     assert_eq!(cert.header().digest(), header.digest());
-}
-
-// ---------------------------------------------------------------------------
-// T2: missing_parents_fake_digests
-// A peer returns MissingParents with digests not present in the header's parent
-// set. The certifier filters them out (count mismatch) and fails that vote task.
-// When ALL peers return fake-digest MissingParents, no certificate forms.
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn missing_parents_fake_digests() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    // A digest that is NOT one of the header's parents.
-    let fake_digest = HeaderDigest::default();
-    assert!(!header.parents().contains(&fake_digest), "precondition: fake_digest not a parent");
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    // Every non-proposer peer responds with a fake-digest MissingParents.
-    // The certifier will fail each vote task (count mismatch after filtering).
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("fake-digest MissingParents: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        reply
-            .send(Ok(NetworkResponseMessage {
-                peer,
-                result: PrimaryResponse::MissingParents(vec![fake_digest]),
-            }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    // No certificate should form.
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all peers return fake-digest MissingParents"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T3: missing_parents_store_miss
-// A peer returns MissingParents for valid parent digests (actually in the header's
-// parent set), but the cert store is empty so the certifier cannot satisfy the
-// request (count mismatch). The vote task fails and no certificate forms.
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn missing_parents_store_miss() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    // Grab the first actual parent digest from the header.
-    let real_parent = *header.parents().iter().next().unwrap();
-    // Confirm it IS a real parent (would pass the filter) — but cert store is empty.
-    assert!(header.parents().contains(&real_parent));
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("store-miss MissingParents: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        // Valid parent digest, but cert store is empty → count mismatch → error.
-        reply
-            .send(Ok(NetworkResponseMessage {
-                peer,
-                result: PrimaryResponse::MissingParents(vec![real_parent]),
-            }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when cert store cannot satisfy MissingParents"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -686,327 +642,221 @@ async fn non_cvv_node_skips_certifier() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// T8: vote_wrong_author
-// A peer returns a vote whose `author` field names a different committee member.
-// The certifier rejects the vote (DagError::UnexpectedVote) and the vote task
-// for that peer fails. With all remaining peers also tampered, no cert forms.
-// ---------------------------------------------------------------------------
+/// `request_vote` returns exactly the result each peer reply calls for.
+///
+/// Every row calls `Certifier::request_vote` directly, so neither a later check (the aggregator's
+/// digest and signature checks) nor a quorum that never forms can stand in for the check a row
+/// targets. Each row runs as its own task and the test lists every row that failed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_wrong_author() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
+async fn request_vote_outcomes() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+    let epoch = committee.epoch();
+    let proposer = fixture.authorities().last().expect("committee has authorities");
+    let mut others = fixture.authorities().filter(|a| a.id() != proposer.id());
+    let peer = others.next().expect("committee has a non-proposer peer");
+    let bystander = others.next().expect("committee has a second non-proposer peer");
+    let peer_keys = peer.consensus_config().key_config().clone();
 
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let header = proposer.header(&committee);
+    let honest_vote = Vote::new(&header, peer.id(), &peer_keys);
 
-    // All non-proposer peers return a vote with a wrong author.
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    // Collect all non-proposer ids so we can pick a "wrong" one for each peer.
-    let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("wrong-author votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        // Manufacture a vote signed by `authority` but claiming authorship of a different peer.
-        let wrong_author = all_ids.iter().find(|id| **id != authority.id()).unwrap().clone();
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.author = wrong_author;
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
+    // same author, round and epoch as `header`: a vote for it differs from the honest vote only in
+    // its header digest
+    let sibling = proposer.header_builder(&committee).created_at(1_000).build();
+    assert_ne!(sibling.digest(), header.digest(), "precondition: sibling header is distinct");
 
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes have wrong author"
-    );
-}
+    // a header one epoch ahead of the committee, so the two epoch checks can be told apart
+    let next_epoch_header = HeaderBuilder::from_header(&header).epoch(epoch + 1).build();
 
-// ---------------------------------------------------------------------------
-// T9: vote_wrong_header_digest
-// A peer returns a vote whose `header_digest` field doesn't match the proposed
-// header. The certifier rejects the vote (DagError::UnexpectedVote).
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_wrong_header_digest() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("wrong-header-digest votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.header_digest = HeaderDigest::default(); // wrong digest
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes have wrong header_digest"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T10: vote_wrong_origin
-// A peer returns a vote whose `origin` field doesn't match the header's author.
-// The certifier rejects the vote (DagError::UnexpectedVote).
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_wrong_origin() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("wrong-origin votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let wrong_origin = all_ids.iter().find(|id| **id != authority.id()).unwrap().clone();
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.origin = wrong_origin;
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes have wrong origin"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T11: vote_epoch_mismatch
-// A peer returns a vote whose `epoch` field doesn't match the header's epoch.
-// The certifier rejects the vote (DagError::InvalidEpoch).
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_epoch_mismatch() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("wrong-epoch votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.epoch = header.epoch().wrapping_add(1); // wrong epoch
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes have wrong epoch"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T12: vote_round_mismatch
-// A peer returns a vote whose `round` field doesn't match the header's round.
-// The certifier rejects the vote (DagError::InvalidRound).
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_round_mismatch() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("wrong-round votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.round = header.round().wrapping_add(1); // wrong round
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
-        }
-    }
-
-    assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes have wrong round"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T13: vote_unknown_authority
-// A peer returns a vote whose `author` is a key not in the committee at all.
-// The certifier rejects the vote (DagError::UnknownAuthority).
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_unknown_authority() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    // A completely synthetic id that doesn't belong to any committee member.
+    // a node outside the committee
     let ghost_id = AuthorityIdentifier::dummy_for_test(0xAB);
+    let ghost_key = BlsKeypair::generate(&mut StdRng::from_seed([7; 32]));
+    assert_eq!(committee.voting_power_by_id(&ghost_id), 0, "precondition: ghost is not a member");
 
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    // a stored certificate that is not a parent of `header`, and a parent that is not stored
+    let non_parent = fixture.certificate(&peer.header(&committee));
+    let non_parent_digest = non_parent.header().digest();
+    assert!(!header.parents().contains(&non_parent_digest), "precondition: not a parent");
+    let store_with_non_parent = MemDatabase::default();
+    store_with_non_parent.write(non_parent).expect("write non-parent certificate");
+    let absent_parent = *header.parents().iter().next().expect("header has parents");
 
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    loop {
-        let req = next_command(
-            &mut cx.network_rx,
-            &format!("unknown-author votes: got {handled} of {num_peers} vote requests"),
-        )
-        .await;
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let mut vote =
-            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        vote.author = ghost_id.clone(); // not in committee
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
-            .unwrap();
-        handled += 1;
-        if handled >= num_peers {
-            break;
+    // a request to `peer` for its vote on `header`, against an empty certificate store
+    let row = |name: &'static str, reply: Reply, expected: DagResult<Vote>| VoteRequestRow {
+        name,
+        authority: peer.id(),
+        peer_id: *peer.authority().protocol_key(),
+        header: header.clone(),
+        store: MemDatabase::default(),
+        reply,
+        expected,
+    };
+
+    let rows = vec![
+        row("valid vote", Reply::Vote(honest_vote.clone()), Ok(honest_vote.clone())),
+        row(
+            "wrong header digest",
+            Reply::Vote(Vote::new(&sibling, peer.id(), &peer_keys)),
+            Err(DagError::UnexpectedVote(sibling.digest())),
+        ),
+        row(
+            "wrong origin",
+            Reply::Vote(Vote { origin: bystander.id(), ..honest_vote.clone() }),
+            Err(DagError::UnexpectedVote(header.digest())),
+        ),
+        row(
+            "wrong author",
+            Reply::Vote(Vote::new(
+                &header,
+                bystander.id(),
+                bystander.consensus_config().key_config(),
+            )),
+            Err(DagError::UnexpectedVote(header.digest())),
+        ),
+        // a non-member author trips the author clause before the voting-power check can run
+        row(
+            "ghost author",
+            Reply::Vote(Vote { author: ghost_id.clone(), ..honest_vote.clone() }),
+            Err(DagError::UnexpectedVote(header.digest())),
+        ),
+        // the only way to reach the voting-power check is to request the vote from a non-member
+        VoteRequestRow {
+            authority: ghost_id.clone(),
+            peer_id: *ghost_key.public(),
+            ..row(
+                "unknown authority",
+                Reply::Vote(Vote::new_with_signer(&header, ghost_id.clone(), &ghost_key)),
+                Err(DagError::UnknownAuthority(ghost_id.to_string())),
+            )
+        },
+        // the vote matches the committee epoch, so only the header-vs-vote check can reject it
+        VoteRequestRow {
+            header: next_epoch_header.clone(),
+            ..row(
+                "header epoch != vote epoch",
+                Reply::Vote(Vote { epoch, ..Vote::new(&next_epoch_header, peer.id(), &peer_keys) }),
+                Err(DagError::InvalidEpoch { expected: epoch + 1, received: epoch }),
+            )
+        },
+        // the vote matches the header epoch, so only the committee check can reject it
+        VoteRequestRow {
+            header: next_epoch_header.clone(),
+            ..row(
+                "vote epoch != committee epoch",
+                Reply::Vote(Vote::new(&next_epoch_header, peer.id(), &peer_keys)),
+                Err(DagError::InvalidEpoch { expected: epoch, received: epoch + 1 }),
+            )
+        },
+        row(
+            "round mismatch",
+            Reply::Vote(Vote { round: header.round() + 1, ..honest_vote.clone() }),
+            Err(DagError::InvalidRound { expected: header.round(), received: header.round() + 1 }),
+        ),
+        // the store could serve the certificate, but it is not a parent of the header
+        VoteRequestRow {
+            store: store_with_non_parent,
+            ..row(
+                "missing parents: stored non-parent",
+                Reply::Response(PrimaryResponse::MissingParents(vec![non_parent_digest])),
+                Err(DagError::ProposedHeaderMissingCertificates),
+            )
+        },
+        // a real parent the store cannot serve
+        row(
+            "missing parents: absent parent",
+            Reply::Response(PrimaryResponse::MissingParents(vec![absent_parent])),
+            Err(DagError::ProposedHeaderMissingCertificates),
+        ),
+    ];
+
+    let row_count = rows.len();
+    let mut failures = Vec::new();
+    for row in rows {
+        let name = row.name;
+        if let Err(error) = tokio::spawn(run_vote_request_row(row, committee.clone())).await {
+            failures.push(row_failure(name, error));
         }
     }
-
     assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate when all votes claim an unknown author"
+        failures.is_empty(),
+        "{} of {row_count} request_vote rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
+}
+
+/// One `request_vote` call in [`request_vote_outcomes`] and the exact result it must return.
+struct VoteRequestRow {
+    /// Names the row in every failure message.
+    name: &'static str,
+    /// The authority whose vote is requested.
+    authority: AuthorityIdentifier,
+    /// The network key the request is addressed to.
+    peer_id: BlsPublicKey,
+    /// The header the vote is requested for.
+    header: Header,
+    /// The certificate store `request_vote` reads missing parents from.
+    store: MemDatabase,
+    /// The peer's reply to the one vote request the row answers.
+    reply: Reply,
+    /// What `request_vote` must return.
+    expected: DagResult<Vote>,
+}
+
+/// Run one row against its own mock network, panicking with the row's name on any mismatch.
+async fn run_vote_request_row(row: VoteRequestRow, committee: Committee) {
+    let VoteRequestRow { name, authority, peer_id, header, store, reply, expected } = row;
+    let (mut network, handle) = MockNetwork::new();
+    let cancel_proposal = Notifier::new();
+    let call = Certifier::request_vote(
+        authority,
+        header,
+        peer_id,
+        store,
+        handle,
+        committee,
+        cancel_proposal.subscribe(),
+    );
+    let (result, ()) = tokio::join!(
+        async {
+            // the row answers exactly one vote request, so a request_vote that sends a second one
+            // waits here until the timeout
+            tokio::time::timeout(STEP_TIMEOUT, call).await.unwrap_or_else(|_| {
+                panic!(
+                    "{name}: request_vote did not return within {STEP_TIMEOUT:?} (a vote request \
+                     after the row's one reply goes unanswered)"
+                )
+            })
+        },
+        network.respond(1, name, |_, _| reply.clone()),
+    );
+    assert!(same_outcome(&result, &expected), "{name}: expected {expected:?}, got {result:?}");
+}
+
+/// Whether two `request_vote` results are the same outcome.
+///
+/// `DagError` has no `PartialEq`. Its derived `Debug` prints the variant and every field, so equal
+/// `Debug` text means the same variant carrying the same values. `Vote`'s `PartialEq` and `Debug`
+/// both leave out fields (the signature among them), so votes are compared by their encoded bytes.
+fn same_outcome(got: &DagResult<Vote>, want: &DagResult<Vote>) -> bool {
+    match (got, want) {
+        (Ok(got), Ok(want)) => encode(got) == encode(want),
+        (Err(got), Err(want)) => format!("{got:?}") == format!("{want:?}"),
+        _ => false,
+    }
+}
+
+/// The failure message of a table row whose task panicked.
+fn row_failure(name: &str, error: tokio::task::JoinError) -> String {
+    let Ok(payload) = error.try_into_panic() else {
+        return format!("{name}: row task was cancelled");
+    };
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|message| message.to_string()))
+        .unwrap_or_else(|| format!("{name}: row panicked with a non-string payload"))
 }
 
 // ---------------------------------------------------------------------------
