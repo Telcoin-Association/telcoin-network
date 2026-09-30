@@ -26,9 +26,10 @@ proptest! {
     #[test]
     fn prop_pipeline_mint_timelock_claim(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let supply_before = env.get_total_supply();
         let mint_tx = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
@@ -134,9 +135,10 @@ proptest! {
     #[test]
     fn prop_pipeline_double_claim_fails(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
 
         // Block 1: mint
         let tx1 = env.governance_mint_tx(U256::from(amount));
@@ -164,9 +166,10 @@ proptest! {
     fn prop_pipeline_mint_overwrite_latest_only(
         first in 1u128..500_000u128,
         second in 500_001u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let supply_before = env.get_total_supply();
 
         // Block 1: mint first
@@ -200,9 +203,10 @@ proptest! {
     #[test]
     fn prop_pipeline_claim_at_exact_timelock_boundary(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
 
         let tx1 = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
@@ -224,9 +228,10 @@ proptest! {
     #[test]
     fn prop_pipeline_permissioned_claim(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let gov_balance_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
 
         // Block 1: governance mints
@@ -274,9 +279,10 @@ proptest! {
     fn prop_pipeline_supply_invariant(
         mint_amount in 1u128..1_000_000u128,
         burn_amount in 1u64..500u64,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let supply_initial = env.get_total_supply();
 
         // Block 1: mint
@@ -320,7 +326,7 @@ proptest! {
     #[test]
     fn prop_pipeline_claim_balance_overflow(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
         let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
@@ -337,6 +343,7 @@ proptest! {
             large_balance,
             large_balance,
         );
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let supply_before = env.get_total_supply();
 
         // Block 1: mint
@@ -389,7 +396,7 @@ proptest! {
     #[test]
     fn prop_pipeline_claim_total_supply_overflow(
         amount in 1u128..1_000_000u128,
-        mint_ts in 1_000u64..100_000_000u64,
+        mint_offset in 1_000u64..100_000_000u64,
     ) {
         let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
         let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
@@ -405,6 +412,7 @@ proptest! {
             large_balance,
             large_balance,
         );
+        let mint_ts = env.genesis_timestamp() + mint_offset;
         let supply_before = env.get_total_supply();
 
         // Block 1: mint

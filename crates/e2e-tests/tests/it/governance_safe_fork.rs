@@ -13,7 +13,9 @@
 //! ```
 //!
 //! which builds the `adiri` e2e binary (`make build-e2e-bin-adiri`), points `TN_BIN_PATH` at it,
-//! arms `TN_GOVERNANCE_SAFE_FORK_EPOCH`, and exports the [`ADIRI_BIN_MARKER`] marker.
+//! and exports the [`ADIRI_BIN_MARKER`] marker. It also sets `TN_GOVERNANCE_SAFE_FORK_EPOCH` from
+//! `TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH` (default 2), which moves the fork from the binary's compiled
+//! fork point, epoch 554, down to one this test can wait for.
 //!
 //! # How the lane is told apart from every other one
 //!
@@ -25,10 +27,16 @@
 //!
 //! | marker | `TN_GOVERNANCE_SAFE_FORK_EPOCH` | outcome |
 //! |---|---|---|
-//! | unset | dormant (`u32::MAX`) | skip, with a `warn!` naming the lane |
-//! | unset | armed | **fail**: the variable is inert on a non-adiri binary |
-//! | set | dormant | **fail**: the lane claims adiri but armed nothing |
-//! | set | armed | run, and assert every pre- and post-fork fact hard |
+//! | unset | unset or `u32::MAX` | skip, with a `warn!` naming the lane |
+//! | unset | any other epoch | **fail**: the variable is inert on a non-adiri binary |
+//! | set | unset or `u32::MAX` | **fail**: the lane claims adiri but the fork cannot fire in time |
+//! | set | 1 to [`MAX_LANE_FORK_EPOCH`] | run, and assert every pre- and post-fork fact hard |
+//! | set | 0, or above [`MAX_LANE_FORK_EPOCH`] | **fail**: 0 can never fire and a later epoch would not fire in time |
+//!
+//! An unset (or unparseable) variable shares a row with `u32::MAX`, although a node treats the two
+//! differently: `u32::MAX` never fires, while an unset variable leaves an adiri node on its
+//! compiled fork point, epoch 554. Neither reaches the boundary within [`MAX_LANE_FORK_EPOCH`], so
+//! the lane counts both as not armed.
 //!
 //! The middle two rows are what keeps a false green out: the only silent path is "nobody claimed
 //! anything and nothing was armed". In particular, arming the variable on a default lane — the
@@ -136,11 +144,12 @@ fn canonical_address(name: &str) -> eyre::Result<Address> {
 ///
 /// `Ok(None)` means "not this lane, skip"; `Err` means the environment claims something it
 /// cannot deliver. See the module docs for the full truth table — the short version is that the
-/// only quiet outcome is an unmarked lane with the fork left dormant.
+/// only quiet outcome is an unmarked lane that leaves the variable unset or at `u32::MAX`.
 fn lane_fork_epoch() -> eyre::Result<Option<Epoch>> {
     let marker = std::env::var(ADIRI_BIN_MARKER).ok().filter(|value| !value.is_empty());
-    // the raw value, not the latched override: an unparseable or absent variable means "this
-    // build's own fork point", which for the adiri binary is the dormant u32::MAX placeholder
+    // the override alone, not the effective fork epoch: an unparseable or absent variable falls
+    // back to the binary's compiled fork point (epoch 554 on adiri, far past this lane's budget)
+    // and `u32::MAX` never fires, so neither counts as armed
     let armed = governance_safe_fork_epoch_override().filter(|epoch| *epoch != Epoch::MAX);
 
     match (marker, armed) {
@@ -165,9 +174,10 @@ fn lane_fork_epoch() -> eyre::Result<Option<Epoch>> {
              would have executed. Run `make test-e2e-governance-safe` instead."
         )),
         (Some(_), None) => Err(eyre::eyre!(
-            "{ADIRI_BIN_MARKER} is set but {GOVERNANCE_SAFE_FORK_ENV} is dormant or unset, so \
-             the boundary would never fire and this lane would assert nothing. The lane must \
-             export both."
+            "{ADIRI_BIN_MARKER} is set but {GOVERNANCE_SAFE_FORK_ENV} is unset or u32::MAX, so \
+             the boundary would not fire within this lane's budget (unset leaves the adiri \
+             binary on its compiled fork point, epoch 554) and this lane would assert nothing. \
+             The lane must export both."
         )),
         (Some(marker), Some(fork_epoch)) => {
             eyre::ensure!(

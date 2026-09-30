@@ -44,9 +44,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Path prefix the site is served under. At the docs.telcoin.network DNS
-  # cutover, flip this to "" (and site-url in docs/book.toml to "/").
-  SITE_ROOT: /telcoin-network
+  # Path prefix the site is served under: empty, because docs.telcoin.network
+  # (the Pages custom domain) serves the site at its root. If the site ever
+  # moves under a prefix again, set "/<prefix>" (no trailing slash) here and
+  # match site-url in docs/book.toml.
+  SITE_ROOT: ""
 
 jobs:
   # Build latest + every tagged version with the pinned mdBook and hand the

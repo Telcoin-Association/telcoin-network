@@ -271,9 +271,13 @@ const fn build_fork_active(epoch: Epoch) -> bool {
 /// would silently reach only the in-process tests, and the multi-node tests that actually
 /// exercise epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`. A node-scoped build (`cargo build -p
+/// telcoin-network`, as release builds are made) leaves that feature off, so its binary keeps the
+/// compile-time constant whatever its environment holds. A workspace-root build without `-p`
+/// does not: `e2e-tests` enables `tn-types/test-utils`, feature unification carries it into the
+/// node binary, and that binary honours this variable. The e2e binary relies on this. An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -297,14 +301,30 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// always has; it does not make `PREVRANDAO` unbiasable. See
 /// [`EpochSeedChainValue`](crate::EpochSeedChainValue) on accepted last-actor bias.
 ///
-/// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
-/// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
-/// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting
-/// PR fleet-wide before the fork epoch begins. The rollout PR MUST set a value at or above
-/// the live adiri epoch plus deployment margin, and at or above
-/// [`SEED_SIGNATURE_FORK_EPOCH`]: [`prevrandao_seed_active`] additionally requires
-/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork
-/// fires instead of hashing the forkable legacy leader-aggregate seed (#1032).
+/// Armed for adiri (chain 2017) at epoch 574: every block executed for a commit whose leader
+/// carries epoch 574 or later derives `PREVRANDAO` from the seed chain. Measured boundary: Wed
+/// 2026-09-30 08:33 UTC (03:33 CDT). Derived by binary-searching first-block timestamps over
+/// epochs 536→544 on the live chain (mean epoch length 21,602 s, σ 58 s, so about 6.001 h per
+/// epoch), snapshotted at epoch 544 / block 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 574 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so blocks the fleet already executed with the XOR derivation at or past the
+/// constant would replay with a different `mix_hash` on this build and diverge from canonical
+/// history.
+///
+/// Arming constraint (compile-time asserted below): the epoch must be at or above
+/// [`SEED_SIGNATURE_FORK_EPOCH`]. [`prevrandao_seed_active`] additionally requires
+/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork fires
+/// instead of hashing the forkable legacy leader-aggregate seed (#1032).
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary keeps the XOR derivation, computes a different `mix_hash` for
+/// every block from the fork epoch on, and forks away from the upgraded fleet at its first
+/// post-fork block.
 ///
 /// Pre-fork epochs keep the XOR derivation byte-identical so replaying already-executed
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
@@ -320,19 +340,12 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// commit. This fork promotes that bias into an opcode contracts can read; contracts that
 /// need unbiasable randomness must not use `PREVRANDAO` alone.
 #[cfg(feature = "adiri")]
-pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
+pub const PREVRANDAO_FORK_EPOCH: Epoch = 574;
 
-/// Compile-time enforcement of the rollout-order contract documented on
-/// [`PREVRANDAO_FORK_EPOCH`]: a rollout PR that sets the PREVRANDAO fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires.
+/// Compile-time enforcement of the arming constraint documented on [`PREVRANDAO_FORK_EPOCH`]:
+/// a retarget that sets the PREVRANDAO fork below the seed fork fails to compile instead of
+/// shipping a gate that silently stays dormant until the seed fork fires.
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while PREVRANDAO_FORK_EPOCH is the `Epoch::MAX` placeholder; \
-              once the rollout PR lowers the constant the comparison becomes live and this \
-              expectation flags itself for removal"
-)]
 const _: () = assert!(PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Whether executed blocks of `epoch` derive `PREVRANDAO` from the epoch seed chain (#1247).
@@ -374,12 +387,6 @@ fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
 #[inline]
 const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "PREVRANDAO_FORK_EPOCH is an `Epoch::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= PREVRANDAO_FORK_EPOCH
     }
@@ -397,10 +404,10 @@ const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
 /// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
 /// with the harness, so a process-global setter would silently reach only in-process tests.
-/// Compiled out entirely without `test-utils`, so a production binary keeps the
-/// compile-time constant and cannot be repointed at runtime by its environment. An
-/// unparseable value is ignored rather than defaulted, leaving the build's own fork point
-/// in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -411,7 +418,7 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 
 #[cfg(feature = "adiri")]
 /// First epoch whose [`Committee`](crate::Committee) is bcs-encoded in the multi-worker layout
-/// (#554).
+/// (issue #554).
 ///
 /// Two fields move at this boundary, both inside the `Committee` value itself:
 /// - each `BootstrapServer` writes `workers`, a length-prefixed sequence of `P2pNode`, where the
@@ -423,38 +430,58 @@ pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
 /// worker's first byte as a sequence length. `Committee` is embedded in `EpochMeta`, the first
 /// record of every consensus pack, so an un-gated layout change bricks decode of every pack
 /// already on disk: an adiri node restarting on the new build cannot read its own history. Below
-/// this epoch the encoder writes the legacy single-worker shape byte-identically to the pre-#554
-/// binary, so packs stay readable in both directions across a mixed fleet.
+/// this epoch the encoder writes the legacy single-worker shape byte-identically to the
+/// pre-multi-worker (#554) binary, so packs stay readable in both directions across a mixed fleet.
 ///
 /// The gate ([`multi_workers_fork_active`]) always reads the epoch carried inside the value being
 /// encoded or decoded — never node-local committee state — so mixed-epoch containers (pack
 /// records, epoch records, state-sync payloads) decode correctly at any nesting depth and
 /// historical digests are preserved end to end.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 570: every committee of epoch 570 or later is encoded in
+/// the multi-worker layout. Measured boundary: Tue 2026-09-29 08:32 UTC (03:32 CDT). Derived by
+/// binary-searching first-block timestamps over epochs 536→544 on the live chain (mean epoch
+/// length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block 408941
+/// on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup so
+/// operators can diff it across the fleet; a compile-time constant that differs between binaries
+/// has no other in-protocol detection.
 ///
-/// Arming constraint: the concrete epoch must be at least [`CONSENSUS_REGISTRY_FORK_EPOCH`]
-/// (407). Committees below 407 are structurally single-worker — the deployed pre-fork registry
-/// exposes no governance path that raises the worker count — so the legacy layout is lossless
-/// for every epoch this gate leaves dormant. From 407 onward that guarantee becomes operational
-/// rather than structural: the worker count must stay at one until this fork epoch has begun, or
-/// a multi-worker committee gets written in a layout that cannot represent it.
+/// Re-verify at merge and at tag time. If epoch 570 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so committees at or past the constant that the fleet already wrote in the
+/// legacy layout would not decode under this build.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since it writes and reads the legacy layout for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch begins. A
-/// straggler still on an old build past the boundary fails to decode post-fork committees loudly
-/// and drops out rather than silently diverging.
+/// Arming constraint (compile-time asserted below): the epoch must be at least
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] (407). Committees below 407 are structurally single-worker —
+/// the deployed pre-fork registry exposes no governance path that raises the worker count — so the
+/// legacy layout is lossless for every epoch this gate leaves dormant. From 407 onward that
+/// guarantee becomes operational rather than structural: the on-chain worker count must stay at
+/// one until epoch 570 begins, or a multi-worker committee gets written in a layout that cannot
+/// represent it.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build is not cut off at this boundary: with a single worker it keeps running past it on
+/// its own legacy-layout packs and never decodes a peer's committee. It fails only when it must
+/// fetch an epoch pack for an epoch at or past the constant from an upgraded peer, or serve one
+/// to it, because the post-fork `EpochMeta` record does not decode on the old binary and the
+/// legacy record does not decode on the new one.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the multi-worker layout is active from
 /// genesis and this constant does not exist there.
-pub const MULTI_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
+pub const MULTI_WORKERS_FORK_EPOCH: Epoch = 570;
+
+/// Compile-time enforcement of the arming constraint documented on
+/// [`MULTI_WORKERS_FORK_EPOCH`]: a retarget that sets this fork below
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] fails to compile instead of leaving the ordering to a
+/// reader's arithmetic.
+#[cfg(feature = "adiri")]
+const _: () = assert!(MULTI_WORKERS_FORK_EPOCH >= CONSENSUS_REGISTRY_FORK_EPOCH);
 
 /// Whether the [`Committee`](crate::Committee) of `epoch` is bcs-encoded in the multi-worker
-/// layout (#554).
+/// layout (issue #554).
 ///
 /// Gates both directions of serialization. Callers MUST pass the epoch carried inside the value
 /// being encoded or decoded (the committee's own epoch, the epoch of the pack record being read),
@@ -486,20 +513,15 @@ pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
 /// because the two forks arm independently and must never be tied to one constant.
 ///
 /// Unchanged from [`MULTI_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
-/// carries pre-#554 packs on disk) stays dormant until the constant is lowered, and every other
-/// build is active from genesis. The genesis default rests on an assumption worth stating: no
-/// non-adiri network holds packs written by a pre-#554 binary, so no such build ever has to read
-/// the legacy single-worker layout. A non-adiri deployment that predates #554 would need its own
-/// dormant period here instead.
+/// carries pre-multi-worker (#554) packs on disk) stays dormant before
+/// [`MULTI_WORKERS_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other build is
+/// active from genesis. The genesis default rests on an assumption worth stating: no non-adiri
+/// network holds packs written by a pre-multi-worker (#554) binary, so no such build ever has to
+/// read the legacy single-worker layout. A non-adiri deployment that predates the multi-worker
+/// layout (#554) would need its own dormant period here instead.
 #[inline]
 const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "MULTI_WORKERS_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
-                  the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= MULTI_WORKERS_FORK_EPOCH
     }
@@ -519,9 +541,10 @@ const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
 /// silently reach only the in-process tests, and the multi-node tests that actually exercise
 /// epoch close would keep inheriting the build default.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -564,38 +587,41 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
 ///   two headers is credited to whichever header comes first in sequence and dropped from the
 ///   second (`subscriber.rs`, mirrored in `consensus_pack.rs`). This fork permutes exactly that
 ///   sequence, so arming it at or below the cutoff would change replayed attribution on adiri, a
-///   resync divergence rather than just a reordering. The epoch-setting PR is the place this bites,
-///   and that PR will not be looking at the dup-batch interaction; the assert makes it look.
+///   resync divergence rather than just a reordering. A retarget of the constant is the place this
+///   bites, and a retarget will not be looking at the dup-batch interaction; the assert makes it
+///   look.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 567: every commit whose leader carries epoch 567 or later
+/// takes the seeded intra-round order. Measured boundary: Mon 2026-09-28 14:32 UTC (09:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel. The full fork schedule is logged at startup
+/// so operators can diff it across the fleet; a compile-time constant that differs between
+/// binaries has no other in-protocol detection.
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
-/// (safe indefinitely while dormant, since the legacy order stays in force for every epoch
-/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
-/// begins. A straggler still on an old build past the boundary orders the same certificates
-/// differently, executes them in a different sequence, and forks away from the upgraded fleet
-/// at its next commit. That divergence is loud (its executed state stops matching the fleet's)
-/// but it is a fork, not a decode error, so the fleet must be fully upgraded before the epoch
-/// is armed.
+/// Re-verify at merge and at tag time. If epoch 567 has begun, raise the constant in the same PR:
+/// the gate is `>=`, so commits the fleet already executed in the legacy order at or past the
+/// constant would replay in the seeded order on this build and diverge from canonical history.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553, the
+/// deadline the same release's one-shot [`GOVERNANCE_SAFE_FORK_EPOCH`] sets. A straggler still on
+/// an old build past this boundary orders the same certificates differently, executes them in a
+/// different sequence, and forks away from the upgraded fleet at its next commit. That divergence
+/// is loud (its executed state stops matching the fleet's) but it is a fork, not a decode error,
+/// so the fleet must be fully upgraded before the fork epoch begins.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the seeded order is active from genesis
 /// and this constant does not exist there.
-pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
+pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = 567;
 
 /// Compile-time enforcement of the first arming constraint documented on
-/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a rollout PR that sets this fork below the seed
-/// fork fails to compile instead of shipping a gate that silently stays dormant until the
-/// seed fork fires (the [`leader_seeded_ordering_active`] conjunct).
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: a retarget that sets this fork below the seed fork
+/// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
+/// fires (the [`leader_seeded_ordering_active`] conjunct).
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while LEADER_SEEDED_ORDERING_FORK_EPOCH is the `u32::MAX` \
-              placeholder; once the rollout PR lowers the constant the comparison becomes \
-              live and this expectation flags itself for removal"
-)]
 const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
 
 /// Compile-time enforcement of the second arming constraint documented on
@@ -652,17 +678,12 @@ fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
 /// independently and must never be tied to one constant.
 ///
 /// Unchanged from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]'s documented contract: adiri (testnet,
-/// which carries legacy-ordered commits in its history) stays dormant until the constant is
-/// lowered, and every other build is active from genesis.
+/// which carries legacy-ordered commits in its history) stays dormant before
+/// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`] and is active from it (`>=`, not `==`), and every other
+/// build is active from genesis.
 #[inline]
 const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "LEADER_SEEDED_ORDERING_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not \
-                  `==`) is the gate the future epoch-setting PR relies on, and this expectation \
-                  flags itself for removal once that PR lowers the constant"
-    )]
     {
         epoch >= LEADER_SEEDED_ORDERING_FORK_EPOCH
     }
@@ -681,9 +702,10 @@ const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
 /// node processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static
 /// would silently reach only the in-process tests.
 ///
-/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
-/// constant and cannot be repointed at runtime by its environment. An unparseable value is
-/// ignored rather than defaulted, leaving the build's own fork point in force.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -694,13 +716,179 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose consensus timestamps carry millisecond precision.
+///
+/// Every rule below reads a combined millisecond timestamp, `seconds * 1000 + millis`, where
+/// `seconds` is the existing seconds-granularity field and `millis` its sub-second remainder. At
+/// this boundary:
+/// - `Header` gains a ninth bcs field, `created_at_millis`, written after `seed_signature` (the
+///   eighth field, gated by [`seed_signature_active`]), and `CommittedSubDag` gains
+///   `commit_timestamp_millis`. bcs is not self-describing, so both are layout changes: every epoch
+///   below the fork keeps the eight-field `Header` and the pre-fork `CommittedSubDag` layout byte
+///   for byte.
+/// - The voter's parent-timestamp rule becomes strict on the combined value: a header's combined
+///   timestamp must be strictly later than each of its parents'.
+/// - The commit clamp becomes strict on the combined value: each committed sub-DAG's combined
+///   timestamp is raised to at least 1 ms after the previous commit's.
+/// - Execution clamps block timestamps to be non-decreasing, since several commits can now land
+///   inside one second.
+///
+/// The EVM block `timestamp` does not change: it stays whole seconds, `floor(combined / 1000)`.
+///
+/// Every encode, decode, and rule this fork touches MUST gate ([`subsecond_timestamp_active`]) on
+/// the epoch carried inside the value itself (the header's own epoch, the committed leader's
+/// epoch), never on `Committee::epoch()` or other node-local state, so mixed-epoch containers
+/// (certificate vectors, sub-DAGs, pack records) decode correctly at any nesting depth and
+/// historical digests are preserved end to end.
+///
+/// # Arming constraints
+///
+/// - **At or above [`SEED_SIGNATURE_FORK_EPOCH`]** (compile-time asserted below). Header layouts
+///   form one chain: seven legacy fields, then eight (seed signature), then nine (milliseconds).
+///   [`subsecond_timestamp_active`] conjoins [`seed_signature_active`] fail-closed, so a lower
+///   value would silently stay dormant until the seed fork fires rather than write a header that
+///   carries the millisecond field without the seed signature.
+/// - **At least 8 epochs above the live adiri epoch** when the epoch-setting PR merges, so every
+///   node runs the armed build before the boundary. Nothing machine-checks this margin: re-verify
+///   it against the live chain at merge time. If the chosen epoch has already begun, raise it in
+///   the same PR: headers already committed at or past the fork epoch in the eight-field layout do
+///   not decode under the armed build.
+///
+/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
+/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
+/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
+/// constant that differs between binaries has no other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// (safe indefinitely while dormant, since it keeps the seconds-only layout and rules for every
+/// epoch below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
+/// begins. A straggler still on an old build past the boundary has no ninth header field to read
+/// and keeps applying the seconds-only rules, so the fleet must be fully upgraded before the
+/// epoch is armed.
+///
+/// Non-adiri builds (mainnet) have no dormant period: millisecond timestamps are active from
+/// genesis and this constant does not exist there.
+pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Compile-time enforcement of the first arming constraint documented on
+/// [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]: a rollout PR that sets this fork below the seed fork
+/// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
+/// fires (the [`subsecond_timestamp_active`] conjunct).
+#[cfg(feature = "adiri")]
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "always true only while SUBSECOND_TIMESTAMP_FORK_EPOCH is the `u32::MAX` \
+              placeholder; once the rollout PR lowers the constant the comparison becomes \
+              live and this expectation flags itself for removal"
+)]
+const _: () = assert!(
+    SUBSECOND_TIMESTAMP_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH,
+    "SUBSECOND_TIMESTAMP_FORK_EPOCH must be at or above SEED_SIGNATURE_FORK_EPOCH: the \
+     millisecond header field follows the seed signature"
+);
+
+/// Whether values of `epoch` carry millisecond consensus timestamps: the `Header`
+/// `created_at_millis` and `CommittedSubDag` `commit_timestamp_millis` fields on the wire, the
+/// strict millisecond parent-timestamp and commit rules, and the non-decreasing execution clamp
+/// documented on [`SUBSECOND_TIMESTAMP_FORK_EPOCH`].
+///
+/// Gates both directions of serialization plus every rule that reads the combined millisecond
+/// timestamp. Callers MUST pass the epoch carried inside the value being encoded, decoded, or
+/// validated (e.g. `HeaderInner::epoch`, `leader.epoch()`), never `Committee::epoch()` or other
+/// node-local state, so that historical values keep their historical layout and rules at any
+/// nesting depth.
+///
+/// Requires [`seed_signature_active`] as a fail-closed conjunct because `created_at_millis` is
+/// the ninth `Header` field, written after the eighth (`seed_signature`): the layouts form one
+/// chain, seven fields then eight then nine, and no epoch may carry the millisecond field
+/// without the seed signature. If an override or a future fork schedule orders the two forks the
+/// other way, the gate stays on the seconds-only layout and rules until the seed fork fires
+/// instead of producing a header outside that chain.
+///
+/// Adiri builds activate at [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]; all other builds are active
+/// from genesis (mainnet never carries the seconds-only layout). Under `test-utils`, an explicit
+/// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` override takes precedence over the build's fork point
+/// (see [`subsecond_timestamp_fork_epoch_override`]), so a test states the fork point it means
+/// rather than inheriting whichever one its feature set happens to select.
+#[inline]
+pub fn subsecond_timestamp_active(epoch: Epoch) -> bool {
+    seed_signature_active(epoch) && subsecond_timestamp_fork_point_active(epoch)
+}
+
+/// This build's effective sub-second-timestamp fork point (any `test-utils` override applied),
+/// without the [`seed_signature_active`] conjunct [`subsecond_timestamp_active`] enforces.
+///
+/// The only gate decision that honors [`subsecond_timestamp_fork_epoch_override`]: code that
+/// decides from [`subsecond_timestamp_build_fork_active`] or [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]
+/// directly silently ignores a test pin, so every decision routes through
+/// [`subsecond_timestamp_active`].
+#[inline]
+fn subsecond_timestamp_fork_point_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        subsecond_timestamp_fork_epoch_override()
+            .map_or_else(|| subsecond_timestamp_build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        subsecond_timestamp_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time sub-second-timestamp fork point, with no test override applied.
+///
+/// Same contract as [`build_fork_active`]: adiri (testnet, which carries seconds-only headers in
+/// its history) is dormant before [`SUBSECOND_TIMESTAMP_FORK_EPOCH`] and active from it; every
+/// other build is active from genesis.
+#[inline]
+const fn subsecond_timestamp_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "SUBSECOND_TIMESTAMP_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) \
+                  is the gate the future epoch-setting PR relies on, and this expectation flags \
+                  itself for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= SUBSECOND_TIMESTAMP_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective sub-second-timestamp fork epoch, read once from
+/// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// genesis", both subject to the [`seed_signature_active`] conjunct).
+///
+/// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
+/// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
+/// with the harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
+#[cfg(feature = "test-utils")]
+pub fn subsecond_timestamp_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 /// Every `test-utils` fork-epoch override actually in force in this process, for the startup
 /// fork-schedule log (#1086).
 ///
 /// Callable from any build so the CLI logs the effective schedule without having to know whether
 /// `tn-types`' `test-utils` was unified into the binary it is compiled into. Always empty in a
-/// production binary, where the overrides are compiled out and no environment variable can
-/// repoint a fork; empty in a `test-utils` build too when nothing is exported. Without this the
+/// binary built without that feature (a node-scoped release build), where the overrides are
+/// compiled out and no environment variable can repoint a fork; empty in a `test-utils` build too
+/// when nothing is exported. Without this the
 /// startup line reports the compiled constants only, and a `test-utils` binary whose forks its
 /// harness pinned elsewhere (the e2e harness holds all but the leader-seeded fork dormant) logs
 /// "active from genesis" while executing the legacy derivations — the shape of a `mix_hash`
@@ -730,6 +918,7 @@ pub fn fork_epoch_overrides() -> Vec<(&'static str, Epoch)> {
             ("TN_PREVRANDAO_FORK_EPOCH", prevrandao_fork_epoch_override()),
             ("TN_MULTI_WORKERS_FORK_EPOCH", multi_workers_fork_epoch_override()),
             ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", leader_seeded_ordering_fork_epoch_override()),
+            ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_timestamp_fork_epoch_override()),
         ]
         .into_iter()
         .chain(governance_safe)
@@ -915,14 +1104,36 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// full canonical suite with governance on SafeL2, so non-adiri builds exclude the mechanism
 /// entirely.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Arming (standard hard-fork rule): deploy
-/// the gate-capable build fleet-wide first — safe indefinitely while dormant — then land a
-/// dedicated epoch-setting PR fleet-wide before the fork epoch begins, re-verifying against the
-/// live chain that (a) the chosen epoch is still in the future (the one-shot trigger cannot
-/// fire retroactively; if the boundary has passed, raise the constant in the same PR), and
-/// (b) the three pre-fork pins still match the live deployments (a mismatch means adiri's Safe
-/// state moved since 2026-08-28 — reassess before arming, do not update pins to make gates
-/// pass). Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
+/// Armed for adiri (chain 2017) at epoch 554, so the migration executes one boundary earlier, in
+/// the epoch-closing block of 553. Measured boundary: Fri 2026-09-25 08:32 UTC (03:32 CDT).
+/// Derived by binary-searching first-block timestamps over epochs 536→544 on the live chain (mean
+/// epoch length 21,602 s, σ 58 s, so about 6.001 h per epoch), snapshotted at epoch 544 / block
+/// 408941 on 2026-09-22 22:08 UTC via rpc.adiri.tel.
+///
+/// Re-verify at merge and at tag time. If epoch 554 has begun, raise the constant in the same PR:
+/// the trigger (`concluding_epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH`) cannot fire retroactively,
+/// so the live fleet would skip the migration for good while a node replaying that boundary on
+/// this build applies it and diverges from canonical history. The const assert below rejects only
+/// a value at or below [`CONSENSUS_REGISTRY_FORK_EPOCH`]; a stale epoch above that floor still
+/// compiles, so this re-verification is the guard.
+///
+/// Live pre-fork state, re-read on 2026-09-22 (first sampled 2026-08-28): the three pre-fork pins
+/// ([`GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH`], [`SAFE_SINGLETON_PRE_FORK_CODE_HASH`],
+/// [`SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH`]) match the live deployments; the governance proxy's
+/// slot 0 holds the L1 `Safe` singleton and its fallback-handler slot is unset; the Safe nonce
+/// is 2; the Safe Singleton Factory deployer's nonce is 0; all eleven etch targets are empty;
+/// and the registry carries the post-fork code (the epoch-407 fork ran). A mismatch at
+/// re-verification means adiri's Safe state moved: reassess before tagging, and do not update
+/// pins to make gates pass.
+///
+/// Rollout sequence: the standard two-step rule (gate-capable build fleet-wide first, arming later)
+/// is compressed into one release here because the fleet's current build, 5f1c0b49
+/// (v0.14.0-adiri), predates every one of the fork gates that release arms. Every validator,
+/// observer and RPC node must run that release before the closing block of epoch 553 executes; a
+/// node still on 5f1c0b49 closes that epoch without the migration and diverges from the canonical
+/// chain.
+///
+/// Under `test-utils`, `TN_GOVERNANCE_SAFE_FORK_EPOCH` overrides the constant (see
 /// [`governance_safe_fork_epoch_override`]). Honoring it also takes `adiri`: every piece of this
 /// fork is behind that feature and `make build-e2e-bin` omits it, so the variable is inert on the
 /// default e2e lanes. `make test-e2e-governance-safe` is the one invocation that arms it on
@@ -930,7 +1141,15 @@ pub fn governance_safe_fork_canonical_address(name: &str) -> Option<Address> {
 /// `crates/e2e-tests/tests/it/governance_safe_fork.rs`, which rewrites its genesis into the live
 /// adiri pre-fork Safe state and asserts the transition over RPC. Arming the variable on any other
 /// lane is a named test failure there rather than a silent no-op.
-pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = u32::MAX;
+pub const GOVERNANCE_SAFE_FORK_EPOCH: Epoch = 554;
+
+/// Compile-time floor for [`GOVERNANCE_SAFE_FORK_EPOCH`]: adiri has already crossed
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`], so a value at or below it would be a retroactive
+/// arming, and a one-shot `==` trigger can never fire for a boundary that has already closed.
+/// Only this floor is machine-checked; whether the armed epoch is still in the future is the
+/// manual re-verification documented on the constant.
+#[cfg(feature = "adiri")]
+const _: () = assert!(GOVERNANCE_SAFE_FORK_EPOCH > CONSENSUS_REGISTRY_FORK_EPOCH);
 
 /// This build's effective governance-Safe fork epoch: the `TN_GOVERNANCE_SAFE_FORK_EPOCH`
 /// override when compiled with `test-utils` and set, otherwise
@@ -954,10 +1173,11 @@ pub fn governance_safe_fork_epoch() -> Epoch {
 ///
 /// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]: e2e
 /// tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory with the
-/// harness, so a process-global setter would silently reach only in-process tests. Compiled
-/// out entirely without `test-utils`, so a production binary keeps the compile-time constant
-/// and cannot be repointed at runtime by its environment. An unparseable value is ignored
-/// rather than defaulted, leaving the build's own fork point in force.
+/// harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so node-scoped release builds lack it, but any
+/// workspace-root build without `-p` has it (see [`seed_signature_fork_epoch_override`]). An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point in
+/// force.
 #[cfg(feature = "test-utils")]
 pub fn governance_safe_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
@@ -1157,17 +1377,21 @@ mod tests {
 
     /// The governance-Safe fork trigger is one-shot: with the concluding epoch `e`, the
     /// boundary fires iff `e + 1 == GOVERNANCE_SAFE_FORK_EPOCH` — exactly once, never
-    /// retroactively, and (unlike the `>=` layout gates) never for any later epoch. With the
-    /// `u32::MAX` placeholder the `checked_add` overflow also keeps a concluding epoch of
-    /// `u32::MAX` itself from firing, so the dormant constant can never trigger twice.
+    /// retroactively, and (unlike the `>=` layout gates) never for any later epoch. On adiri the
+    /// fork fires only in the epoch-closing block that concludes epoch 553, the boundary that opens
+    /// [`GOVERNANCE_SAFE_FORK_EPOCH`]; the boundary before it, the one after it, and every later
+    /// one stay silent. The closure mirrors the trigger in `tn-reth::evm::block`, `checked_add`
+    /// included: a concluding epoch of `u32::MAX` has no successor, so it neither fires nor
+    /// overflows.
     #[cfg(feature = "adiri")]
     #[test]
     fn governance_safe_fork_boundary_is_one_shot() {
         let fires =
             |concluding: Epoch| concluding.checked_add(1) == Some(GOVERNANCE_SAFE_FORK_EPOCH);
 
-        // dormant placeholder: only the (unreachable) u32::MAX - 1 boundary fires
-        for concluding in [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH] {
+        for concluding in
+            [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH, u32::MAX]
+        {
             assert!(!fires(concluding), "concluding epoch {concluding} must not fire the fork");
         }
         assert!(
@@ -1441,6 +1665,7 @@ mod tests {
                     "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH",
                     leader_seeded_ordering_fork_epoch_override(),
                 ),
+                ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_timestamp_fork_epoch_override()),
             ]
             .into_iter()
             .chain(governance_safe)
@@ -1501,14 +1726,14 @@ mod tests {
     /// Pin the multi-workers gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
-    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// for the seed-signature gate: "dormant before `MULTI_WORKERS_FORK_EPOCH`" holds only under
     /// `adiri`. Every other build — including the default one that produces both the shipped node
     /// binary and the e2e binary — is active from genesis, so epoch 1 already uses the
     /// multi-worker layout there.
     ///
     /// Asserts against [`multi_workers_build_fork_active`], the override-free decision, so the
     /// result does not depend on whether `test-utils` was unified into this build. The grid is
-    /// derived from the constant, so arming the fork does not require editing this test.
+    /// derived from the constant, so retargeting the fork does not require editing this test.
     #[test]
     fn multi_workers_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
@@ -1564,14 +1789,14 @@ mod tests {
     /// implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`]
-    /// states for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds
-    /// only under `adiri`. Every other build, including the default one that produces both the
-    /// shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
+    /// states for the seed-signature gate: "dormant before `LEADER_SEEDED_ORDERING_FORK_EPOCH`"
+    /// holds only under `adiri`. Every other build, including the default one that produces both
+    /// the shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
     /// orders sub-DAGs with the leader-seeded tie-break there.
     ///
     /// Asserts against [`leader_seeded_ordering_build_fork_active`], the override-free
     /// decision, so the result does not depend on whether `test-utils` was unified into this
-    /// build. The grid is derived from the constant, so arming the fork does not require
+    /// build. The grid is derived from the constant, so retargeting the fork does not require
     /// editing this test.
     #[test]
     fn leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract() {
@@ -1720,6 +1945,193 @@ mod tests {
                  though the leader-seeded fork point is active from 0",
             );
         });
+    }
+
+    /// Pin the sub-second-timestamp gate to the rollout contract this build actually implements.
+    ///
+    /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
+    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// `adiri`. Every other build, including the default one that produces both the shipped node
+    /// binary and the e2e binary, is active from genesis, so epoch 0 already uses the millisecond
+    /// layout and rules there.
+    ///
+    /// Asserts against [`subsecond_timestamp_build_fork_active`], the override-free decision, so
+    /// the result does not depend on whether `test-utils` was unified into this build. The grid is
+    /// derived from the constant, so arming the fork does not require editing this test.
+    #[test]
+    fn subsecond_timestamp_build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                subsecond_timestamp_build_fork_active(epoch),
+                "non-adiri builds carry no seconds-only history and are active from genesis; \
+                 epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2, SUBSECOND_TIMESTAMP_FORK_EPOCH.saturating_sub(1)]
+                .into_iter()
+                .filter(|epoch| *epoch < SUBSECOND_TIMESTAMP_FORK_EPOCH)
+                .for_each(|epoch| {
+                    assert!(
+                        !subsecond_timestamp_build_fork_active(epoch),
+                        "adiri stays dormant before SUBSECOND_TIMESTAMP_FORK_EPOCH; epoch \
+                         {epoch} must be pre-fork",
+                    );
+                });
+            [SUBSECOND_TIMESTAMP_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    subsecond_timestamp_build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
+        }
+    }
+
+    /// With no `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn subsecond_timestamp_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            subsecond_timestamp_fork_epoch_override().is_none(),
+            "this test requires a process without TN_SUBSECOND_TIMESTAMP_FORK_EPOCH set; the \
+             override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            // The fork point is the half that carries the override; the public gate wraps it
+            // in the `seed_signature_active` conjunct, which is orthogonal to the override.
+            assert_eq!(
+                subsecond_timestamp_fork_point_active(epoch),
+                subsecond_timestamp_build_fork_active(epoch),
+                "an unset override must not shift the fork point at epoch {epoch}",
+            );
+            assert_eq!(
+                subsecond_timestamp_active(epoch),
+                seed_signature_active(epoch) && subsecond_timestamp_build_fork_active(epoch),
+                "the public gate must be exactly the fail-closed conjunction at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Sentinel selecting the child dispatch of
+    /// [`subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later`]: a dedicated variable
+    /// rather than the fork overrides themselves, so lane-exported fork variables cannot be
+    /// mistaken for a child spawn.
+    #[cfg(feature = "test-utils")]
+    const TN_TEST_SUBSECOND_CONJUNCT_CHILD: &str = "TN_TEST_SUBSECOND_TIMESTAMP_CONJUNCT_CHILD";
+
+    /// The `seed_signature_active` conjunct in [`subsecond_timestamp_active`] blocks the gate
+    /// when the seed fork is scheduled later than the sub-second fork point, so no epoch carries
+    /// the millisecond header field without the seed signature.
+    ///
+    /// This is the only configuration where the conjunct is observable: on adiri the
+    /// compile-time assert `SUBSECOND_TIMESTAMP_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH` makes
+    /// the fork point imply the conjunct, and every other build has both forks active from
+    /// genesis, so with the overrides unset the in-process conjunction assert above cannot catch
+    /// deletion of the `seed_signature_active &&` term. Spawns THIS test binary with the seed
+    /// fork pinned dormant (`4294967295`) and the sub-second fork point pinned to `0`: both
+    /// overrides latch in process-wide `OnceLock`s, so the crossed schedule needs its own
+    /// process. The child's harness output must report exactly one passed test: a drifted name
+    /// would match nothing and still exit 0, so exit status alone would be a vacuous pass.
+    ///
+    /// The child is also the one process where this suite pins
+    /// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH` itself, so it asserts that [`fork_epoch_overrides`]
+    /// reports the row: [`fork_epoch_overrides_lists_only_the_pins_in_force`] sees the row only
+    /// in a process that happens to export the variable.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let fn_name = "child_subsecond_timestamp_conjunct_blocks";
+        let name = module_path!()
+            .split_once("::")
+            .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"));
+        let mut command = std::process::Command::new(exe);
+        command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+        command.env(TN_TEST_SUBSECOND_CONJUNCT_CHILD, "1");
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        command.env("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", "0");
+        let output = command.output().expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// Child of [`subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later`], spawned with the
+    /// seed fork dormant and the sub-second fork point active from genesis: the fork point says
+    /// yes at every probed epoch, so any `false` from the public gate is attributable to the
+    /// `seed_signature_active` conjunct alone.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    #[ignore = "spawned by subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later with a \
+                controlled env"]
+    fn child_subsecond_timestamp_conjunct_blocks() {
+        assert!(
+            std::env::var_os(TN_TEST_SUBSECOND_CONJUNCT_CHILD).is_some(),
+            "this child runs only under \
+             subsecond_timestamp_conjunct_blocks_when_seed_fork_is_later, which pins both \
+             fork overrides in the spawn env",
+        );
+        // Both overrides latch in process-wide `OnceLock`s, so a child launched without them
+        // in its env cannot observe the crossed schedule. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(u32::MAX),
+            "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
+             spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        assert_eq!(
+            subsecond_timestamp_fork_epoch_override(),
+            Some(0),
+            "this child requires TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=0 latched from its spawn \
+             env; the override is OnceLock-latched, so it cannot be set after startup",
+        );
+        // 383 is adiri's SEED_SIGNATURE_FORK_EPOCH, written as a literal because the
+        // constant does not exist on non-adiri builds and this child is not adiri-gated.
+        [0, 1, 383, u32::MAX - 1].into_iter().for_each(|epoch| {
+            assert!(
+                subsecond_timestamp_fork_point_active(epoch),
+                "the fork point is pinned to 0, so it must be active at epoch {epoch}; \
+                 otherwise the gate assertion below would not isolate the conjunct",
+            );
+            assert!(
+                !seed_signature_active(epoch),
+                "the seed fork must be dormant at epoch {epoch} under the never-fires pin",
+            );
+            assert!(
+                !subsecond_timestamp_active(epoch),
+                "the dormant seed fork must block the public gate at epoch {epoch} even \
+                 though the sub-second fork point is active from 0",
+            );
+        });
+        // the seed gate is `>=`, so the pin fires it at `u32::MAX` itself. With both conjuncts
+        // true there the gate must open, which rules out a gate that never opens at all.
+        assert!(
+            seed_signature_active(u32::MAX) && subsecond_timestamp_active(u32::MAX),
+            "with the seed fork and the sub-second fork point both active at u32::MAX, the \
+             public gate must open",
+        );
+        assert_eq!(
+            fork_epoch_overrides()
+                .into_iter()
+                .find(|(var, _)| *var == "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH")
+                .map(|(_, fork_epoch)| fork_epoch),
+            Some(0),
+            "fork_epoch_overrides must report the pinned TN_SUBSECOND_TIMESTAMP_FORK_EPOCH row at \
+             its pinned value",
+        );
     }
 
     /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in

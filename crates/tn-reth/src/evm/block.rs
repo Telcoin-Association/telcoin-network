@@ -30,7 +30,16 @@
 //!    sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
 //!    `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
 //!    block.
-//! 2. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
+//! 2. (`adiri` builds only) `apply_governance_safe_fork` — fires only when the concluding epoch,
+//!    plus one (checked), equals `governance_safe_fork_epoch()` (`GOVERNANCE_SAFE_FORK_EPOCH`, 554
+//!    on adiri, so it runs once, in the block that closes epoch 553; a `test-utils` build can move
+//!    it through `TN_GOVERNANCE_SAFE_FORK_EPOCH`). It etches the canonical Safe v1.4.1 suite, swaps
+//!    the `Safe` singleton and `SafeProxyFactory` code, and moves the governance Safe proxy onto
+//!    `SafeL2`, failing closed unless the singleton, factory and proxy code hashes and the proxy's
+//!    slot 0 match their pre-fork pins. Nothing in the close reads Safe state, so its position
+//!    after the registry pair and before the boundary calls is the fork-leads convention, not a
+//!    data dependency.
+//! 3. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
 //!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`, then
 //!    `setWorkerConfigsData(uint16[],uint184[])`. The reward infos carry the leader counts from
 //!    `ctx.gas_accumulator`'s rewards counter; committee membership is drawn by the
@@ -222,6 +231,10 @@ impl TNBlockExecutionCtx {
     ///
     /// This is used during execution to write the consensus header hash
     /// to `BEACON_ROOTS` contract (eip4788).
+    ///
+    /// The gate makes that write once per consensus output rather than once per EVM block. It does
+    /// not make the write unique per `timestamp`: see `apply_consensus_root_contract_call` for how
+    /// outputs committed within the same second share one ring-buffer entry.
     fn first_batch(&self) -> bool {
         self.difficulty < U256::from(65536)
     }
@@ -1377,14 +1390,15 @@ where
         // - **already canonical** — the write is a no-op and drops straight out of the changeset
         //   via the `is_changed` filter, so the `state_root` is unaffected.
         // - **a third-party handler** — reachable at any time: `setFallbackHandler` is `authorized`
-        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot between the
-        //   arming PR and the boundary. The fork overwrites it anyway. Aborting would stall the
-        //   entire fleet on the epoch-closing block over a slot the migration defines, and the
-        //   canonical handler is the value the post-fork SafeL2 stack expects; getting the intended
-        //   storage and bytecode in place is what the boundary is for. The overwrite is loud rather
-        //   than silent — the `warn!` below records the displaced address alongside its
-        //   replacement, so the prior value stays recoverable from the node record and the owners
-        //   can re-install it afterwards with an ordinary `execTransaction`.
+        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot at any point
+        //   before the boundary (on adiri, the block that closes epoch 553; the fork epoch is 554).
+        //   The fork overwrites it anyway. Aborting would stall the entire fleet on the
+        //   epoch-closing block over a slot the migration defines, and the canonical handler is the
+        //   value the post-fork SafeL2 stack expects; getting the intended storage and bytecode in
+        //   place is what the boundary is for. The overwrite is loud rather than silent — the
+        //   `warn!` below records the displaced address alongside its replacement, so the prior
+        //   value stays recoverable from the node record and the owners can re-install it
+        //   afterwards with an ordinary `execTransaction`.
         let handler_slot = U256::from_be_bytes(
             alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
         );
@@ -1698,6 +1712,22 @@ where
     }
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
+    ///
+    /// The contract is a ring buffer of 8191 entries keyed by `timestamp % 8191`. Each write stores
+    /// the block's `timestamp` alongside the root, and a lookup by timestamp succeeds only while
+    /// the entry still holds that exact timestamp.
+    ///
+    /// The EVM `timestamp` has one-second granularity and every block of a consensus output
+    /// carries the same value. This call runs only for the output's first batch, so each output
+    /// writes once, but several outputs committed within the same second all write the same entry
+    /// and the latest write wins. Once the chain has moved past that second, a lookup for it
+    /// returns the root written by the last output committed in it. Before then, a contract
+    /// executing in an earlier output of that second that queries its own block's `timestamp` sees
+    /// its own output's root, because the later outputs have not written yet.
+    ///
+    /// This is accepted behavior, not a bug. `ConsensusHeader`s are hash-linked, so the roots of
+    /// the earlier outputs in that second remain recoverable by walking the consensus chain back
+    /// from the root that survived.
     fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
         if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp().saturating_to()) {
             return Ok(());
@@ -1834,6 +1864,9 @@ where
         // pre-block system calls; each commit retains only the target contract's state
         if self.ctx.first_batch() {
             // EIP-4788: write the consensus header digest only once per output (first batch)
+            //
+            // outputs committed within the same second share a `timestamp`, so they overwrite
+            // one ring-buffer entry and the latest root wins (see the callee's docs)
             self.apply_consensus_root_contract_call()?;
         }
 
@@ -2584,10 +2617,11 @@ mod tests {
     /// fail closed, while the fallback-handler slot is one the migration defines and therefore
     /// writes through every reachable pre-state.
     ///
-    /// The slot is genuinely owner-mutable between the arming PR and the boundary —
-    /// `FallbackManager.setFallbackHandler` is `authorized` (`msg.sender == address(this)`),
-    /// so a quorum of the live 3-of-7 Safe can point it anywhere, including at an address with
-    /// no code. `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
+    /// The slot is genuinely owner-mutable right up to the boundary (on adiri, the block that
+    /// closes epoch 553; the fork epoch is 554) — `FallbackManager.setFallbackHandler` is
+    /// `authorized` (`msg.sender == address(this)`), so a quorum of the live 3-of-7 Safe can
+    /// point it anywhere, including at an address with no code.
+    /// `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
     /// unset -> canonical transition that the committed genesis fixture exhibits; nothing else
     /// in the tree seeds a non-zero pre-state, so without this test the overwrite branch is
     /// unexercised.
