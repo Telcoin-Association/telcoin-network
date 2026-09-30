@@ -84,41 +84,33 @@ pub struct WorkerNetwork {
 
 /// Sync flags backing the shim's `eth_syncing` answers.
 ///
-/// `syncing` mirrors whether the node is catching up on consensus output; the node manager
+/// `syncing` starts true while startup synchronization is pending, then the node manager
 /// drives it from the consensus node-mode watch. `completed_initial_sync` latches on the
 /// first caught-up report so `is_initially_syncing` distinguishes the first catch-up of
 /// this process from a later mid-epoch fall-behind.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SyncFlags {
-    /// True while the node is catching up on consensus output.
+    /// True during startup synchronization or while catching up on consensus output.
     syncing: bool,
     /// True once the node has reported caught-up at least once.
     completed_initial_sync: bool,
 }
 
+impl Default for SyncFlags {
+    fn default() -> Self {
+        Self { syncing: true, completed_initial_sync: false }
+    }
+}
+
 impl WorkerNetwork {
-    /// Create a new instance of self.
-    pub fn new(
-        chain_spec: ChainSpec,
-        worker_network: WorkerNetworkHandle,
-        version: &'static str,
-        reth_env: RethEnv,
-    ) -> Self {
-        let peer_count = Arc::new(RwLock::new(0));
-        let peer_count_clone = peer_count.clone();
-        let spawner = worker_network.get_task_spawner().clone();
-        spawner.spawn_task("Worker Network Peers", async move {
-            loop {
-                if let Ok(peers) = worker_network.connected_peers_count().await {
-                    let mut guard = peer_count_clone.write();
-                    *guard = peers;
-                }
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        });
+    /// Create an RPC network shim that reports syncing until the node publishes its mode.
+    ///
+    /// Peer tracking starts separately through [`Self::respawn_peer_count`] when the worker's
+    /// epoch tasks are ready, so RPC can bind before startup waits for peers.
+    pub fn new(chain_spec: ChainSpec, version: &'static str, reth_env: RethEnv) -> Self {
         Self {
             chain_spec: chain_spec.reth_chain_spec(),
-            peer_count,
+            peer_count: Arc::new(RwLock::new(0)),
             version,
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
             reth_env: Some(reth_env),
@@ -145,10 +137,9 @@ impl WorkerNetwork {
     /// The node manager drives this from the consensus node-mode watch; the stock reth
     /// `eth_syncing` handler reads it back through [`NetworkInfo::is_syncing`]. The first
     /// caught-up report latches `completed_initial_sync`, so a later mid-epoch fall-behind
-    /// reports as syncing but no longer as initially syncing. The node boots
-    /// optimistic-current, so the driver's first not-syncing report usually latches the
-    /// initial sync as already complete; `is_initially_syncing` is true only when a
-    /// demotion lands before that first report. Nothing in TN's RPC surface consumes the
+    /// reports as syncing but no longer as initially syncing. Both flags report syncing
+    /// before the first node-mode update, including while startup epoch records are fetched.
+    /// Nothing in TN's RPC surface consumes the
     /// initial-sync distinction today: `eth_syncing` reads only `is_syncing`.
     pub fn set_syncing(&self, syncing: bool) {
         let mut flags = self.sync_flags.write();
@@ -157,7 +148,8 @@ impl WorkerNetwork {
     }
 
     /// Spawn a new task to keep up with peer counts.
-    /// Use this when the epoch rolls over and the worker_network gets a new task manager.
+    /// Call once when the worker enters an epoch, including its first epoch. The previous
+    /// epoch's task manager must stop its task before this is called again.
     pub fn respawn_peer_count(&self, worker_network: WorkerNetworkHandle) {
         let peer_count = self.peer_count.clone();
         let spawner = worker_network.get_task_spawner().clone();
@@ -346,8 +338,8 @@ mod tests {
     #[test]
     fn test_sync_flags_follow_recorded_state() {
         let network = test_network();
-        assert!(!network.is_syncing());
-        assert!(!network.is_initially_syncing());
+        assert!(network.is_syncing());
+        assert!(network.is_initially_syncing());
 
         // A node that starts behind is initially syncing.
         network.set_syncing(true);

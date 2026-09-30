@@ -31,19 +31,16 @@ async fn test_multi_worker_execution_isolation() -> eyre::Result<()> {
         temp_dir.path(),
         Some(accumulator.clone()),
     )?;
-    let task_manager = TaskManager::default();
 
     futures::stream::iter(0..3)
         .then(|worker_id| {
             let execution_node = &execution_node;
             let accumulator = &accumulator;
-            let task_manager = &task_manager;
             async move {
                 accumulator.base_fee(worker_id).set_base_fee(worker_fee(worker_id));
                 execution_node
                     .initialize_worker_components(
                         worker_id,
-                        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
                         NoopEngineToPrimary,
                         accumulator.base_fee(worker_id),
                         accumulator.worker_base_fee(worker_id),
