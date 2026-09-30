@@ -35,12 +35,18 @@ def check_locks():
     """Fail if the current fixture drifts from the node's resolved transport stack."""
     releases = {
         release: versions(ROOT / "testing/quic-interop/releases" / release / "Cargo.lock")
-        for release in ("0.13.1", "0.14.0")
+        for release in ("0.13.1", "0.14.0", "candidate")
     }
     for release, resolved in releases.items():
-        require(resolved["libp2p-quic"] == [release], f"wrong QUIC resolution: {resolved}")
+        expected = "0.14.0" if release == "candidate" else release
+        require(resolved["libp2p-quic"] == [expected], f"wrong QUIC resolution: {resolved}")
     require(releases["0.14.0"] == versions(ROOT / "Cargo.lock"),
-            "current fixture transport versions differ from the node; refresh its lockfile")
+             "current fixture transport versions differ from the node; refresh its lockfile")
+    require(releases["candidate"] == versions(ROOT / "Cargo.lock"),
+            "candidate transport versions differ from the node; refresh its lockfile")
+    packages = tomllib.loads((ROOT / "testing/quic-interop/releases/candidate/Cargo.lock").read_text())["package"]
+    patched = [p for p in packages if p["name"] == "libp2p-quic"]
+    require(len(patched) == 1 and "source" not in patched[0], "candidate must use the carried patch")
     return releases
 
 
@@ -67,16 +73,59 @@ def environment():
     }
 
 
+class LossRelay(asyncio.DatagramProtocol):
+    """Reverse the first two client datagrams and drop one server reply."""
+
+    def __init__(self, server):
+        self.server = server
+        self.client = None
+        self.held = None
+        self.dropped = 0
+        self.reordered = 0
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, address):
+        if address == self.server:
+            if self.dropped == 0:
+                self.dropped += 1
+            elif self.client is not None:
+                self.transport.sendto(data, self.client)
+        else:
+            self.client = address
+            if self.reordered:
+                self.transport.sendto(data, self.server)
+            elif self.held is None:
+                self.held = data
+            else:
+                self.transport.sendto(data, self.server)
+                self.transport.sendto(self.held, self.server)
+                self.held = None
+                self.reordered += 1
+
+
 class Fixture:
     """A process with a continuously drained JSON event stream and retained stderr."""
 
-    def __init__(self, binary, role, settings, output, address=None):
+    def __init__(self, binary, role, settings, output, address=None, impair=False):
         self.command = [str(binary), role, str(settings)] + ([address] if address else [])
         self.output = output
         self.events = []
         self.queue = asyncio.Queue()
+        self.impair = impair
+        self.relay = None
+        self.impairments = None
 
     async def __aenter__(self):
+        if self.impair:
+            parts = self.command[-1].split("/")
+            port = parts.index("udp") + 1
+            self.impairments = LossRelay((parts[2], int(parts[port])))
+            self.relay, _protocol = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: self.impairments, local_addr=("127.0.0.1", 0))
+            parts[port] = str(self.relay.get_extra_info("sockname")[1])
+            self.command[-1] = "/".join(parts)
         self.stderr = self.output.with_suffix(".stderr").open("wb")
         self.process = await asyncio.create_subprocess_exec(
             *self.command, stdin=asyncio.subprocess.PIPE,
@@ -121,6 +170,8 @@ class Fixture:
                 await self.process.wait()
         await self.reader
         self.stderr.close()
+        if self.relay is not None:
+            self.relay.close()
 
 
 def select(events, name):
@@ -132,15 +183,19 @@ def configuration(event, release):
     """Verify the role's release and that every configured field reached the transport."""
     require(event["release"] == release, f"wrong binary: {event}")
     require(event["settings"] == event["applied"], "production configuration mapping drifted")
+    require(event["node_incoming_policy"]["applied"] == (release == "candidate"),
+            "candidate incoming policy was omitted or a stock build claimed to apply it")
     return event
 
 
-async def honest(args, settings):
+async def honest(args, settings, impair=False):
     """Verify identity, fresh connections, payloads and clean reconnects in both roles."""
-    async with Fixture(args.listener, "listen", settings, args.output / "honest-listener") as listener:
+    prefix = "loss-reorder" if impair else "honest"
+    async with Fixture(args.listener, "listen", settings, args.output / f"{prefix}-listener") as listener:
         server = configuration(await listener.event("configuration"), args.listener_release)
         address = (await listener.event("listening"))["address"]
-        async with Fixture(args.dialer, "dial", settings, args.output / "honest-dialer", address) as dialer:
+        async with Fixture(args.dialer, "dial", settings, args.output / f"{prefix}-dialer", address,
+                           impair=impair) as dialer:
             client = configuration(await dialer.event("configuration"), args.dialer_release)
             await dialer.event("complete", 90)
             await listener.event("closed")
@@ -153,6 +208,14 @@ async def honest(args, settings):
             accepted = select(listener.events, "accepted")
             require([event["round"] for event in connected] == [0, 1, 2], "missing fresh connections")
             require(len(accepted) == 3, "listener did not establish three connections")
+            if args.listener_release == "candidate":
+                outcomes = select(listener.events, "outcomes")
+                require(outcomes and outcomes[-1]["retried"] >= 1,
+                        "candidate did not challenge the first unvalidated dial")
+                require(outcomes[-1]["accepted"] == 3, "candidate acceptance count drifted")
+            if impair:
+                require(dialer.impairments.dropped == 1 and dialer.impairments.reordered == 1,
+                        "the loss/reordering experiment was not actually exercised")
             require(all(event["peer"] == server["peer"] for event in connected), "wrong listener identity")
             require(all(event["peer"] == client["peer"] for event in accepted), "dialer identity changed")
             verified = select(dialer.events, "verified")
@@ -239,6 +302,7 @@ async def run(args):
         result["binaries"] = {role: hashlib.sha256(path.read_bytes()).hexdigest()
                               for role, path in (("listener", args.listener), ("dialer", args.dialer))}
         result["honest"] = await honest(args, settings)
+        result["loss_reordering"] = await honest(args, settings, impair=True)
         result["deadlines"] = await deadlines(args, settings)
         result["status"] = "passed"
     except Exception as error:
@@ -254,8 +318,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--listener", type=Path, required=True)
     parser.add_argument("--dialer", type=Path, required=True)
-    parser.add_argument("--listener-release", choices=("0.13.1", "0.14.0"), required=True)
-    parser.add_argument("--dialer-release", choices=("0.13.1", "0.14.0"), required=True)
+    parser.add_argument("--listener-release", choices=("0.13.1", "0.14.0", "candidate"), required=True)
+    parser.add_argument("--dialer-release", choices=("0.13.1", "0.14.0", "candidate"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     asyncio.run(run(parser.parse_args()))
 

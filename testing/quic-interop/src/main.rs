@@ -21,6 +21,33 @@ use std::{
     pin::Pin,
     time::Instant,
 };
+#[cfg(feature = "candidate")]
+use tn_quic_candidate::Observer;
+
+/// Stock releases cannot install the carried incoming-policy additions.
+#[cfg(not(feature = "candidate"))]
+struct Observer {
+    /// Requested policy, explicitly recorded as unapplied on a stock build.
+    policy: Value,
+}
+
+#[cfg(not(feature = "candidate"))]
+impl Observer {
+    /// Record the unsupported node policy instead of silently claiming to apply it.
+    fn new(_config: &mut quic::Config, retry: bool, _peers: usize, _connections: u32) -> Self {
+        Self { policy: json!({"applied": false, "retry_unvalidated_incoming": retry}) }
+    }
+
+    /// Report the effective incoming-policy status.
+    fn configuration(&self) -> Value {
+        self.policy.clone()
+    }
+
+    /// Stock releases have no carried aggregate outcome counters.
+    fn record(&mut self) -> Option<Value> {
+        None
+    }
+}
 
 // Compile the production defaults and mapping against each independently locked release.
 #[path = "../../../crates/config/src/network/quic.rs"]
@@ -119,19 +146,34 @@ async fn serve(connection: quic::Connection) -> Result<(), Error> {
 }
 
 /// Poll the listener between connections and report failed handshakes as evidence.
-async fn listen(mut transport: quic::tokio::Transport, key: Keypair) -> Result<(), Error> {
+async fn listen(
+    mut transport: quic::tokio::Transport,
+    key: Keypair,
+    observer: Observer,
+) -> Result<(), Error> {
+    let ip = std::env::var("TN_QUIC_LISTEN_IP").unwrap_or_else(|_| "127.0.0.1".into());
+    let ip: std::net::Ipv4Addr = ip.parse().map_err(|error| Error::Setup(format!("{error}")))?;
     transport
         .listen_on(
             ListenerId::next(),
-            "/ip4/127.0.0.1/udp/0/quic-v1"
+            format!("/ip4/{ip}/udp/0/quic-v1")
                 .parse()
                 .map_err(|error| Error::Setup(format!("{error}")))?,
         )
         .map_err(|error| Error::Setup(format!("{error}")))?;
     let peer = key.public().to_peer_id();
     stream::repeat_with(|| Ok::<_, Error>(()))
-        .try_fold(transport, |mut transport, ()| async move {
-            match poll_fn(|cx| Pin::new(&mut transport).poll(cx)).await {
+        .try_fold((transport, observer), |(mut transport, mut observer), ()| async move {
+            match poll_fn(|cx| {
+                let next = Pin::new(&mut transport).poll(cx);
+                observer
+                    .record()
+                    .map(report)
+                    .transpose()
+                    .map_or_else(|error| std::task::Poll::Ready(Err(error)), |_| next.map(Ok))
+            })
+            .await?
+            {
                 TransportEvent::NewAddress { listen_addr, .. } => {
                     let address = listen_addr.with(libp2p::multiaddr::Protocol::P2p(peer));
                     report(json!({"event": "listening", "address": address.to_string()}))
@@ -159,10 +201,10 @@ async fn listen(mut transport: quic::tokio::Transport, key: Keypair) -> Result<(
                 }
                 TransportEvent::ListenerError { error, .. } => Err(Error::Quic(error)),
             }?;
-            Ok(transport)
+            Ok((transport, observer))
         })
         .await
-        .map(|_transport| ())
+        .map(|_state| ())
 }
 
 /// Establish fresh connections to one authenticated peer and check every echoed byte.
@@ -244,8 +286,21 @@ async fn main() -> Result<(), Error> {
         serde_json::from_reader(File::open(config_path).map_err(Error::Io)?)
             .map_err(Error::Json)?;
     let key = Keypair::generate_ed25519();
-    let config = settings.apply_to(quic::Config::new(&key));
-    report(json!({"event": "configuration", "release": env!("CARGO_PKG_VERSION"),
+    let mut config = settings.apply_to(quic::Config::new(&key));
+    let peers = std::env::var("TN_QUIC_PRIORITY_PEERS")
+        .ok()
+        .map(|value| value.parse::<usize>().map_err(|error| Error::Setup(format!("{error}"))))
+        .transpose()?
+        .unwrap_or(45);
+    let connections = std::env::var("TN_QUIC_CONNECTIONS_PER_PEER")
+        .ok()
+        .map(|value| value.parse::<u32>().map_err(|error| Error::Setup(format!("{error}"))))
+        .transpose()?
+        .unwrap_or(8);
+    let observer =
+        Observer::new(&mut config, settings.retry_unvalidated_incoming, peers, connections);
+    let release = if cfg!(feature = "candidate") { "candidate" } else { env!("CARGO_PKG_VERSION") };
+    report(json!({"event": "configuration", "release": release,
         "peer": key.public().to_peer_id().to_string(),
         "settings": {"handshake_timeout": settings.handshake_timeout,
             "max_idle_timeout": settings.max_idle_timeout,
@@ -253,8 +308,7 @@ async fn main() -> Result<(), Error> {
             "max_concurrent_stream_limit": settings.max_concurrent_stream_limit,
             "max_stream_data": settings.max_stream_data,
             "max_connection_data": settings.max_connection_data},
-        "node_incoming_policy": {"applied": false,
-            "retry_unvalidated_incoming": settings.retry_unvalidated_incoming},
+        "node_incoming_policy": observer.configuration(),
         "applied": {"handshake_timeout": config.handshake_timeout,
             "max_idle_timeout": config.max_idle_timeout,
             "keep_alive_interval": config.keep_alive_interval,
@@ -263,7 +317,7 @@ async fn main() -> Result<(), Error> {
             "max_connection_data": config.max_connection_data}}))?;
     let transport = quic::tokio::Transport::new(config);
     match role.as_str() {
-        "listen" => listen(transport, key).await,
+        "listen" => listen(transport, key, observer).await,
         "dial" => {
             let address =
                 args.next().ok_or_else(|| Error::Setup("expected dial address".into()))?;

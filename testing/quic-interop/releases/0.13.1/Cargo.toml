@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 # Independent resolution is essential: this must not join the node's workspace.
 [workspace]
 
+[features]
+candidate = []
+
 [[bin]]
 name = "quic-interop"
 path = "../../src/main.rs"
