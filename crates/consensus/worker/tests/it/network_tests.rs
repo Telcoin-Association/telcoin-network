@@ -159,6 +159,90 @@ async fn test_batch_gossip_topics() {
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
 }
 
+/// Three workers on the same validator accept only their own batch gossip namespace.
+#[tokio::test]
+async fn test_multi_worker_batch_gossip_isolation() -> eyre::Result<()> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    use std::num::NonZeroUsize;
+
+    let chain_id = 2017;
+    let mut network_config = tn_config::NetworkConfig::default();
+    network_config.set_chain_id(chain_id);
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .number_of_workers(NonZeroUsize::new(3).ok_or_else(|| eyre::eyre!("worker count"))?)
+        .with_network_config(network_config)
+        .build();
+    committee.authorities().try_for_each(|authority| {
+        let config = authority.consensus_config();
+        let addresses = (0..3)
+            .map(|worker_id| config.worker_address(worker_id))
+            .collect::<Option<BTreeSet<_>>>()
+            .ok_or_else(|| eyre::eyre!("fixture is missing a worker address"))?;
+        assert_eq!(addresses.len(), 3, "fixture workers need distinct listen addresses");
+        assert!(config.worker_address(3).is_none());
+        eyre::Ok(())
+    })?;
+    let config = committee.first_authority().consensus_config();
+    let task_manager = TaskManager::default();
+    let batch = Batch::default();
+    let digest = batch.digest();
+    config.node_storage().insert::<NodeBatchesCache>(&digest, &batch)?;
+
+    futures::stream::iter(0..3)
+        .then(|worker_id| {
+            let config = config.clone();
+            let task_manager = &task_manager;
+            async move {
+                let (tx, _rx) = mpsc::channel(10);
+                let handle = WorkerNetworkHandle::new(
+                    NetworkHandle::new(tx),
+                    task_manager.get_spawner(),
+                    worker_id,
+                    config.epoch(),
+                    chain_id,
+                );
+                let handler = RequestHandler::new(
+                    worker_id,
+                    Arc::new(NoopBatchValidator),
+                    config.clone(),
+                    handle,
+                );
+                futures::stream::iter(0..3)
+                    .then(|topic_worker| {
+                        let handler = &handler;
+                        let config = &config;
+                        async move {
+                            let message = GossipMessage {
+                                source: None,
+                                data: tn_types::encode(&WorkerGossip::Batch(
+                                    config.epoch(),
+                                    digest,
+                                )),
+                                sequence_number: None,
+                                topic: TopicHash::from_raw(
+                                    tn_config::LibP2pConfig::worker_batch_topic(
+                                        chain_id,
+                                        topic_worker,
+                                    ),
+                                ),
+                            };
+                            let result = handler.pub_process_gossip_for_test(&message).await;
+                            if worker_id == topic_worker {
+                                assert!(result.is_ok(), "worker {worker_id}: {result:?}");
+                            } else {
+                                assert_matches!(result, Err(WorkerNetworkError::InvalidTopic));
+                            }
+                        }
+                    })
+                    .collect::<()>()
+                    .await;
+                eyre::Ok(())
+            }
+        })
+        .try_collect::<()>()
+        .await
+}
+
 /// The handler validates gossip topics against the chain id from its config, not a
 /// hardcoded value: with a non-zero chain id, a message on the chain-0 namespace (what
 /// an un-stamped node would publish) is rejected as an invalid topic. This is the

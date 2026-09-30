@@ -53,7 +53,7 @@ Two shorthands used throughout:
    and the `close_epoch_for_last_batch(i)` boundary (`primary/output.rs:240-244`) are both indexed
    off the digest deque while the transactions are indexed off the batch vectors, so unequal lengths
    mean the epoch-close system calls fire on the wrong block or on none. Under `adiri` the check is
-   relaxed for epochs `<= ADIRI_DUP_BATCH_EPOCH` (160, `tn-types` `forks.rs:46`) so testnet can
+   relaxed for epochs `<= ADIRI_DUP_BATCH_EPOCH` (160, `tn-types` `forks.rs`) so testnet can
    replay a historical duplicate-batch bug.
 2. **Digest index bounds** (`:188-190`), `TnEngineError::NextBlockDigestMissing`. Fires when the
    deque is *shorter* than the flattened batches. The count check above rejects that condition
@@ -76,10 +76,19 @@ in its blocking task instead of returning a `TnEngineError`; the dropped oneshot
 
 ### Digest ↔ batch positional alignment is emergent, not asserted here
 
-The engine pairs the *i*-th flattened batch with the *i*-th digest in the deque: the digest becomes
-the block's `ommers_hash` and `mix_hash = output_digest ^ batch_digest`. **This crate never verifies
-that pairing** — it does not re-derive `batch.digest()` at all, only compares counts. The property
-comes from two walks over the same source in `Subscriber::fetch_batches`:
+The engine pairs the *i*-th flattened batch with the *i*-th digest in the deque.
+The digest becomes the block's `ommers_hash`, and the index and digest together go to `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs:310`, called from `crates/engine/src/payload_builder.rs:238`), which returns the block's `mix_hash` (EVM `PREVRANDAO`).
+That function has two arms, chosen by `prevrandao_seed_active` (`tn-types` `forks.rs`) on the committing leader's epoch, which also requires the seed-signature fork:
+
+- the legacy arm, `output_digest ^ batch_digest`, runs on `adiri` epochs below `PREVRANDAO_FORK_EPOCH` (574).
+  It is kept byte-identical so replayed testnet history reproduces the same headers.
+  The empty epoch-closing block passes a zero batch digest (`:161`), so its `mix_hash` is the bare output digest.
+- the seed-chain fold, `seeded_prev_randao` (`primary/output.rs:324`), runs on `adiri` from epoch 574 and on every non-`adiri` build, mainnet included, from genesis.
+  It computes `keccak256("TN_PREVRANDAO_V1" || seed chain value || consensus block number || batch index)`, integers as little-endian `u64`, where the seed chain value is `committee_shuffle_seed()` as of this commit.
+  The batch digest is not an input, so after the fork a mispaired digest corrupts only `ommers_hash`.
+
+**This crate never verifies that pairing**: it does not re-derive `batch.digest()` at all, only compares counts.
+The property comes from two walks over the same source in `Subscriber::fetch_batches`:
 
 - `crates/consensus/executor/src/subscriber.rs:447-452` pushes every `header.payload()` key, in
   order, across `sub_dag.headers()`, into the `batch_digests` deque.
@@ -125,18 +134,23 @@ positional check those turn up is the pack reader above.
   hand-written `Serialize` impl writes (`primary/output.rs:84-92`), and the matching `Deserialize`
   hardcodes `close_epoch: false` (`:102`). **A deserialized `ConsensusOutput` always reports
   `false`**, as that type documents in place (`output.rs:79-83`).
-- every producer derives it locally as `output.committed_at() >= self.epoch_boundary`
-  (`crates/node/src/manager/node/run_epoch.rs:622` and `:681-690`; also `close_epoch.rs:196`,
-  `:225`, and `start_epoch.rs:100`). `committed_at()` is certified; `epoch_boundary` is the epoch
-  start plus `epoch_info.epochDuration`, read from the `ConsensusRegistry` at epoch entry
-  (`run_epoch.rs:150`).
+- every producer derives it locally as `output.reaches_epoch_boundary(self.epoch_boundary)`
+  (`crates/node/src/manager/node/run_epoch.rs:567` and `:626`; also `close_epoch.rs:240`,
+  `:269`, and `start_epoch.rs:100`). That delegates to `CommittedSubDag::reaches_epoch_boundary`
+  (`tn-types` `primary/output.rs:846`), the single boundary predicate. The boundary stays in
+  whole seconds while commits carry milliseconds: the predicate compares the commit's whole
+  seconds (`commit_timestamp()`, the floor of `commit_timestamp_ms()`) against the boundary with
+  `>=`, which holds exactly when the commit time is at least `1000 * epoch_boundary` ms, so the
+  sub-second part never moves the decision. The commit timestamp is certified; `epoch_boundary` is
+  the epoch start plus `epoch_info.epochDuration`, read from the `ConsensusRegistry` at epoch entry
+  (`run_epoch.rs:143`).
 
 So an unauthenticated boolean, computed from one certified value and one chain read, gates the
 epoch-close system calls. Both inputs are chain-consistent, so honest nodes agree: this is a
 **reproducibility** guarantee, not an authentication one. It is load-bearing in both directions —
 one of those system calls records every worker's next-epoch base fee, and the following epoch's
 entry read consumes exactly that write and halts the node when it is unreadable
-(`read_base_fees_for_entered_epoch`, `run_epoch.rs:213`). A wrong `close_epoch` does not
+(`read_base_fees_for_entered_epoch`, defined in `node.rs:594`, called from `run_epoch.rs:206`). A wrong `close_epoch` does not
 produce a bad block; it strands the next epoch.
 
 Determinism rules for block production live in `crates/tn-reth/README.md` ("Determinism rules"). The

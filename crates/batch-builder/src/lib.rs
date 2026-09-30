@@ -23,8 +23,8 @@ use futures_util::{future::OptionFuture, StreamExt};
 use std::time::{Duration, Instant};
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
-    TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedHeader,
+    TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -127,8 +127,8 @@ pub struct BatchBuilder {
     /// This channel will receive a header on canonical update.  We use it to wakeup the future and
     /// save the canonical update.
     state_changed: CanonStateNotificationStream,
-    /// The last canonical update, saved when state_changed sends a new update.
-    last_canonical_update: SealedBlock,
+    /// The last canonical tip header, saved when state_changed sends a new update.
+    last_canonical_update: SealedHeader,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
     /// Worker id this batch builder belongs too.
@@ -160,7 +160,7 @@ impl BatchBuilder {
     ) -> BatchBuilderResult<Self> {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
-        let last_canonical_update = Self::latest_canon_block(reth_env)?;
+        let last_canonical_update = Self::latest_canon_header(reth_env)?;
         let metrics = BatchBuilderMetrics::new_for_worker(worker_id);
         // constant per epoch
         metrics.base_fee.set(base_fee as f64);
@@ -320,13 +320,13 @@ impl BatchBuilder {
         done
     }
 
-    fn latest_canon_block(reth_env: &RethEnv) -> BatchBuilderResult<SealedBlock> {
-        let num = reth_env.last_block_number()?;
-        match reth_env.sealed_block_by_number(num)? {
-            Some(block) => Ok(block),
-            // the empty-chain window: genesis lives in the chain spec before any block persists
-            None => Ok(reth_env.chainspec().sealed_genesis_block()),
-        }
+    /// Load the latest persisted tip header, falling back to genesis before a block persists.
+    fn latest_canon_header(reth_env: &RethEnv) -> BatchBuilderResult<SealedHeader> {
+        reth_env
+            .last_block_number()
+            .and_then(|num| reth_env.sealed_header_by_number(num))
+            .map(|header| header.unwrap_or_else(|| reth_env.chainspec().sealed_genesis_header()))
+            .map_err(Into::into)
     }
 }
 
@@ -451,7 +451,7 @@ impl BatchBuilder {
                 Some(latest) = self.state_changed.next() => {
                     // NOTE: separate background task applies these changes to the pool
                     // regardless of pending_task
-                    self.last_canonical_update = latest.tip().sealed_block().clone()
+                    self.last_canonical_update = latest.tip().clone_sealed_header()
                 }
 
                 // poll receiver that returns mined transactions once the batch reaches quorum
