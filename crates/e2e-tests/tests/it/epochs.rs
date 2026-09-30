@@ -101,7 +101,11 @@ const SUBSECOND_TARGET_EPOCH: Epoch = 5;
 /// Prometheus series of the engine counter `tn_engine.evm_timestamp_clamped_total`.
 ///
 /// The engine bumps it whenever it raises an EVM `timestamp` to its parent's. Consensus is meant
-/// to produce non-decreasing commit times on its own, so any non-zero reading is a consensus bug.
+/// to produce non-decreasing commit times on its own, so a non-zero reading in
+/// [`test_epoch_subsecond_timestamps_across_fork`] is a consensus bug. On a real network the first
+/// commits of epoch 0 can also be raised, when the validators' clocks lag the genesis timestamp,
+/// but not in that test: it keeps epoch 0 pre-fork ([`SUBSECOND_FORK_EPOCH`]), where the engine
+/// never clamps, and it stamps genesis from the host clock the nodes share, before they start.
 const EVM_TIMESTAMP_CLAMPED_SERIES: &str = "tn_engine_evm_timestamp_clamped_total";
 
 /// Pause between rounds of [`drive_light_tx_load`].
@@ -1291,8 +1295,9 @@ async fn test_epoch_subsecond_timestamps_across_fork() -> eyre::Result<()> {
         eyre::ensure!(
             clamped == 0.0,
             "{url} clamped {clamped} EVM timestamps up to their parent's: consensus let commit \
-             time go backwards (node logs under test_logs/{test}/ carry the \"evm timestamp \
-             clamped to parent\" warnings)"
+             time go backwards in a post-fork epoch (epoch 0 is pre-fork here, so validator clocks \
+             lagging the genesis timestamp cannot explain it; node logs under test_logs/{test}/ \
+             carry the \"evm timestamp clamped to parent\" warnings)"
         );
     }
 

@@ -66,7 +66,16 @@ pub struct BlockTimestampMillis {
     /// exception is a block without a consensus header (genesis), which reports
     /// `timestamp * 1000`.
     ///
-    /// Non-decreasing within an epoch; blocks executed from one consensus output share a value.
+    /// Normally `timestamp == floor(timestamp_millis / 1000)`. It does not hold when execution
+    /// raised the block's `timestamp` to its parent's, which the engine counts in
+    /// `evm_timestamp_clamped_total`: this value then stays the consensus commit time and is below
+    /// `timestamp * 1000`. Execution raises a block's `timestamp` only from the sub-second
+    /// timestamp fork on, and then only after a consensus regression or for an epoch-0 commit made
+    /// while the validators' clocks lag the genesis timestamp (epoch 0 has no commit floor).
+    ///
+    /// Non-decreasing within an epoch, except from genesis to block 1 if the validators' clocks
+    /// lagged the genesis timestamp at launch: genesis reports `timestamp * 1000` and block 1
+    /// reports its earlier commit time. Blocks executed from one consensus output share a value.
     /// Across an epoch boundary only `timestamp` is guaranteed not to decrease: the blocks of an
     /// epoch's first commit can report up to 998 ms less than the previous epoch's last block,
     /// within the same whole second.
@@ -1503,9 +1512,16 @@ mod tests {
     /// Execution block `number` executed from `consensus`, with its commit's whole second as the
     /// EVM `timestamp` and its leader's nonce, as the payload builder stamps them.
     fn executed_block(number: u64, consensus: &ConsensusHeader) -> SealedHeader {
+        executed_block_at(number, consensus, consensus.sub_dag.commit_timestamp())
+    }
+
+    /// Execution block `number` executed from `consensus`, with EVM `timestamp` in place of the
+    /// commit's whole second. The payload builder stamps a later second when it raises a block to
+    /// its parent's `timestamp`.
+    fn executed_block_at(number: u64, consensus: &ConsensusHeader, timestamp: u64) -> SealedHeader {
         SealedHeader::seal_slow(ExecHeader {
             number,
-            timestamp: consensus.sub_dag.commit_timestamp(),
+            timestamp,
             nonce: consensus.sub_dag.leader().nonce().into(),
             parent_beacon_block_root: Some(consensus.digest().into()),
             ..Default::default()
@@ -1840,6 +1856,48 @@ mod tests {
         assert_eq!(pre.consensus_number, Some(U64::from(5)));
         assert!(post.sub_second, "a post-fork leader commits in milliseconds");
         assert_eq!(post.timestamp_millis, U64::from(COMMIT_FLOOR_MS + 1));
+    }
+
+    /// A block whose EVM `timestamp` execution raised to its parent's reports its consensus
+    /// header's commit time unchanged, which is then below `timestamp * 1000`: the one case where
+    /// `timestamp == floor(timestampMillis / 1000)` does not hold. The block here carries the
+    /// commit's whole second plus one, as a block raised to a parent one second later does.
+    ///
+    /// Reporting the larger of the commit time and `timestamp * 1000` instead fails the
+    /// `timestampMillis` assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raised_evm_timestamp_reports_the_commit_time_unchanged() {
+        pin_forks();
+        let latest = consensus_header(7, SUBSECOND_FORK_EPOCH);
+        let rpc = TestRpc::new("raised-timestamp", FakePrimary::new(latest.clone(), Vec::new()));
+        let commit_ms = latest.sub_dag.commit_timestamp_ms().as_millis();
+        let raised = latest.sub_dag.commit_timestamp() + 1;
+        let block = executed_block_at(3, &latest, raised);
+
+        let response =
+            rpc.ext.block_timestamp_millis(&block).await.expect("the latest header resolves");
+
+        assert_eq!(
+            response.timestamp_millis,
+            U64::from(commit_ms),
+            "timestampMillis is the consensus commit time, whatever execution stamped as timestamp"
+        );
+        assert!(
+            response.timestamp_millis < U64::from(raised * 1000),
+            "a raised block reports a commit time below its timestamp in milliseconds"
+        );
+        assert_eq!(
+            response,
+            BlockTimestampMillis {
+                block_number: U64::from(3),
+                block_hash: block.hash(),
+                timestamp: U64::from(raised),
+                timestamp_millis: U64::from(commit_ms),
+                sub_second: true,
+                consensus_number: Some(U64::from(7)),
+                consensus_digest: Some(latest.digest().into()),
+            }
+        );
     }
 
     /// Genesis has no consensus header. Every id that selects it reports the genesis timestamp in
