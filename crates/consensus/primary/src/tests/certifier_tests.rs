@@ -8,14 +8,20 @@ use crate::{
 };
 use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use tn_network_libp2p::types::{
     MessageId, NetworkCommand, NetworkHandle, NetworkResponseMessage, NetworkResponseSender,
 };
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, TnSender, VotingPower,
+    encode, error::DagError, BlsKeypair, BlsSigner, DBIter, HeaderBuilder, Table, TnSender,
+    VotingPower,
 };
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
@@ -1372,6 +1378,201 @@ async fn already_certified_header_is_republished() {
         Err(_) => panic!("spawn_header_proposal did not return within {STEP_TIMEOUT:?}"),
     }
     cx.network.assert_quiet("already-certified header: no vote request may follow").await;
+}
+
+/// A certificate whose `ProposedCertificates` record the durable barrier fails to make durable is
+/// never externalized: `spawn_header_proposal` fails with exactly the barrier's error, and the
+/// certificate is neither delivered to the node nor gossiped.
+///
+/// Every peer votes, so the certificate forms, and exactly one `ProposedCertificates` barrier is
+/// awaited: the refusal is the barrier's, not an earlier failure. The network is checked first
+/// because a certifier that ignored the failure would wait on its gossip publish until it is
+/// acknowledged. A control round over a barrier that succeeds delivers and gossips its
+/// certificate, so the quiet channels of the refused round are not vacuous.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn certificate_withheld_when_durable_barrier_fails() {
+    let (mut cx, mut cert_rx, proposal) = barrier_round(true, "failed barrier").await;
+    cx.network.assert_quiet("failed barrier: the certificate must not be gossiped").await;
+    let error = header_proposal_result(proposal, "failed barrier")
+        .await
+        .expect_err("failed barrier: spawn_header_proposal must refuse the certificate");
+    assert_eq!(
+        error.to_string(),
+        INJECTED_BARRIER_FAILURE,
+        "failed barrier: the proposal must fail with the barrier's error"
+    );
+    assert_eq!(
+        cx.proposer().consensus_config().node_storage().proposed_barriers(),
+        1,
+        "failed barrier: the certificate must reach exactly one ProposedCertificates barrier"
+    );
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
+        panic!("failed barrier: expected no certificate delivered, got {result:?}");
+    }
+    // deliberately not checked: whether the refused record is still in `ProposedCertificates`
+
+    let (mut cx, mut cert_rx, proposal) = barrier_round(false, "healthy barrier").await;
+    let gossip = cx.network.next_publish("healthy barrier: gossip of the certificate").await;
+    header_proposal_result(proposal, "healthy barrier")
+        .await
+        .expect("healthy barrier: spawn_header_proposal succeeds");
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("healthy barrier: the certificate is delivered")
+        .expect("certificate channel open");
+    assert!(
+        gossip == certificate_gossip(certificate).await,
+        "healthy barrier: the gossip must carry exactly the delivered certificate"
+    );
+    assert_eq!(
+        cx.proposer().consensus_config().node_storage().proposed_barriers(),
+        1,
+        "healthy barrier: the certificate must reach exactly one ProposedCertificates barrier"
+    );
+}
+
+/// What a failing [`FaultDb`] barrier resolves to.
+const INJECTED_BARRIER_FAILURE: &str = "injected durable barrier failure";
+
+/// A [`MemDatabase`] whose durable barrier for `ProposedCertificates` can fail, as a failed
+/// physical commit (disk full, `EIO`, a checksum error) makes it fail on a disk-backed store.
+///
+/// Every other operation, including `persist` for every other table, is the inner database's.
+/// Clones share one count of the `ProposedCertificates` barriers awaited, so the count read from
+/// the proposer's store includes the certifier's.
+#[derive(Clone, Debug)]
+struct FaultDb {
+    /// The database every operation but the faulted barrier is delegated to.
+    inner: MemDatabase,
+    /// Whether `persist::<ProposedCertificates>` resolves to [`INJECTED_BARRIER_FAILURE`].
+    fail: bool,
+    /// How many times `persist::<ProposedCertificates>` has been awaited, across every clone.
+    proposed_barriers: Arc<AtomicUsize>,
+}
+
+impl FaultDb {
+    /// An empty store whose `ProposedCertificates` barrier fails if `fail` and succeeds otherwise.
+    fn new(fail: bool) -> Self {
+        Self { inner: MemDatabase::default(), fail, proposed_barriers: Arc::default() }
+    }
+
+    /// How many times `persist::<ProposedCertificates>` has been awaited on this store or a clone.
+    fn proposed_barriers(&self) -> usize {
+        self.proposed_barriers.load(Ordering::SeqCst)
+    }
+}
+
+impl Database for FaultDb {
+    type TX<'txn>
+        = <MemDatabase as Database>::TX<'txn>
+    where
+        Self: 'txn;
+
+    type TXMut<'txn>
+        = <MemDatabase as Database>::TXMut<'txn>
+    where
+        Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        self.inner.open_table::<T>()
+    }
+
+    fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
+        self.inner.read_txn()
+    }
+
+    fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+        self.inner.write_txn()
+    }
+
+    fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+        self.inner.contains_key::<T>(key)
+    }
+
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        self.inner.get::<T>(key)
+    }
+
+    fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        self.inner.insert::<T>(key, value)
+    }
+
+    fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
+        self.inner.remove::<T>(key)
+    }
+
+    fn clear_table<T: Table>(&self) -> eyre::Result<()> {
+        self.inner.clear_table::<T>()
+    }
+
+    fn is_empty<T: Table>(&self) -> bool {
+        self.inner.is_empty::<T>()
+    }
+
+    fn iter<T: Table>(&self) -> DBIter<'_, T> {
+        self.inner.iter::<T>()
+    }
+
+    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+        self.inner.skip_to::<T>(key)
+    }
+
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+        self.inner.reverse_iter::<T>()
+    }
+
+    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
+        self.inner.record_prior_to::<T>(key)
+    }
+
+    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
+        self.inner.last_record::<T>()
+    }
+
+    async fn persist<T: Table>(&self) -> eyre::Result<()> {
+        if TypeId::of::<T>() == TypeId::of::<ProposedCertificates>() {
+            self.proposed_barriers.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(eyre::Report::msg(INJECTED_BARRIER_FAILURE));
+            }
+        }
+        self.inner.persist::<T>().await
+    }
+}
+
+/// Start `spawn_header_proposal` for a proposer header on an unspawned certifier over a committee
+/// whose stores are [`FaultDb`]s that fail the `ProposedCertificates` barrier if `fail`, and answer
+/// every peer's vote request with its honest vote.
+///
+/// Returns the context, a new-certificates subscription taken before the proposal started, and
+/// the proposal task. `context` names the round in panic messages.
+async fn barrier_round(
+    fail: bool,
+    context: &str,
+) -> (CertifierContext<FaultDb>, impl TnReceiver<Certificate>, JoinHandle<TaskResult>) {
+    let fixture = CommitteeFixture::builder(|| FaultDb::new(fail)).randomize_ports(true).build();
+    let (mut cx, certifier) = CertifierContext::unspawned_from_fixture(fixture);
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+    let cert_rx = cx.subscribe_new_certificates();
+    let proposal = tokio::spawn(certifier.spawn_header_proposal(header));
+    cx.network
+        .respond(votes.len(), &format!("{context}: every peer votes"), |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    (cx, cert_rx, proposal)
+}
+
+/// The result of a `spawn_header_proposal` task.
+///
+/// Panics, naming `context`, if the task does not return within [`STEP_TIMEOUT`] or panicked.
+async fn header_proposal_result(proposal: JoinHandle<TaskResult>, context: &str) -> TaskResult {
+    match tokio::time::timeout(STEP_TIMEOUT, proposal).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => panic!("{context}: proposal task failed: {error}"),
+        Err(_) => panic!("{context}: spawn_header_proposal did not return within {STEP_TIMEOUT:?}"),
+    }
 }
 
 /// `propose_header` returns exactly `CouldNotFormCertificate` for the header when every peer fails
