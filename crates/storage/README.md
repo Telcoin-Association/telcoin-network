@@ -129,7 +129,9 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
 `pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail`
 (an unacked torn tail — truncated and repaired) or as needing a re-sync: `TornMetaEmpty` (a torn
 epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption`, `CorruptSealedRecord`
-(data loss).
+(data loss). Only a `TornTrailingTail` exits `db validate` with success. Its read-only recovery checks
+(shared with `db repair`'s dry run) read the position index's entries straight from the file, so an
+index a crash left unsealed attests the same output boundaries it does to the writable open.
 
 ### 6. `consensus.rs` — `ConsensusChain` (full consensus store)
 
@@ -139,12 +141,16 @@ read-only via `open_static` (behind a small `recent_packs` cache; a legacy or in
 is healed read-side first — built off the async runtime and outside `pack_install` into a side directory,
 data log opened read-only, then swapped in by rename), imports a full epoch from peers with
 `stream_import` (into an `import-{N}/` dir, then an install-locked rename to `epoch-{N}/`; a read-only
-partial-prefix pack instead stages under `staging-{N}/` and is never renamed), and drives epoch handoff.
+partial-prefix pack instead stages under `staging-{N}/` and is never renamed; either import stops with
+a local `StorageFull` error, not charged to the peer, before free space drops below a floor, since the
+peer's bytes are authenticated only at the final header), and drives epoch handoff.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
 `epoch_records` (`EpochRecordDb`) is the singleton chain of `EpochRecord`s (`epochs.pack`) and their
-`EpochCertificate`s (`epoch_certs.pack`), auto-healed on open. `certificate_pack` and
+`EpochCertificate`s (`epoch_certs.pack`), auto-healed on open under the same rules: `persist()` stamps
+each log's tail commit marker, a rebuild refuses to truncate below it (or below the digest index's
+synced length), and an empty position index beside a populated digest index is rebuilt, not trusted. `certificate_pack` and
 `exec_state_pack` are per-epoch / per-snapshot packs for certificate bundles and EVM state exports.
 
 ### 7. Key/value stores (the other family)
@@ -243,9 +249,11 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     from the authoritative log is the *point* (`db repair`/`open_append_exists`, gated by the
     node-stopped contract above). `ConsensusChain::get_static` additionally heals a sealed past epoch
     whose data log is clean but whose index will not open (e.g. after an index-format change), and
-    migrates a legacy (pre-v2) epoch whose indexes use the old key placement. The heal is built on a
-    blocking thread into a side directory (the data log opened read-only), serialized per epoch and
-    backed off after a failure; only the final renames run under `pack_install`. It never writes the
+    migrates a legacy (pre-v2) epoch whose indexes use the old key placement. The heal runs as its own
+    task (a reader that stops waiting does not abandon it), is built on a blocking thread into a side
+    directory (the data log opened read-only) that it removes if it is not installed, and is
+    serialized per epoch and backed off after a failure; only the final renames run under
+    `pack_install`. It never writes the
     data log of a v2 pack — a torn/unclean data log stays terminal (→ `db repair`). Not an "unsafe
     destructive operation".
 11. **Fail-fast `expect`/`panic` in DB-open startup paths** (e.g. `open_db`). A datadir that cannot be

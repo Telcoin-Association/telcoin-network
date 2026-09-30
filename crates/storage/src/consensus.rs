@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
     thread::JoinHandle,
     time::Duration,
@@ -398,10 +398,10 @@ pub struct ConsensusChain {
     /// `pack_install` (which gates epoch handoff) for the length of a rebuild.
     heal_locks: Arc<Mutex<HashMap<Epoch, Arc<tokio::sync::Mutex<()>>>>>,
     /// Epochs whose read-side heal failed recently: when, and with what. A failed heal is not
-    /// retried until [`Self::HEAL_RETRY_BACKOFF`] has passed, so a corrupt epoch that peers keep
-    /// asking for does not re-run a full-epoch scan or copy per request. Environmental failures
-    /// (a full disk, descriptor exhaustion) are not remembered: they say nothing about the epoch
-    /// and clear on their own.
+    /// retried until [`ReadSideHeal::RETRY_BACKOFF`] has passed, so a corrupt epoch that peers
+    /// keep asking for does not re-run a full-epoch scan or copy per request. Environmental
+    /// failures (a full disk, descriptor exhaustion) are not remembered: they say nothing
+    /// about the epoch and clear on their own.
     heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
 }
 
@@ -1831,9 +1831,6 @@ impl ConsensusChain {
             && !self.epoch_data_present(epoch)
     }
 
-    /// How long a failed read-side heal of an epoch is remembered before it is attempted again.
-    const HEAL_RETRY_BACKOFF: Duration = Duration::from_secs(60);
-
     /// Heal sealed past epoch `epoch` read-side so [`ConsensusPack::open_static`] can serve it:
     /// migrate a legacy (pre-v2) pack, or rebuild a clean v2 pack's derived indexes. See
     /// [`ConsensusPack::build_static_heal`] for what is (and is never) healed.
@@ -1843,79 +1840,30 @@ impl ConsensusChain {
     /// epoch are serialized, and a second reader finds the work done. Only the install (a few
     /// renames) takes `pack_install`. It is abandoned if the epoch became the live writer
     /// meanwhile, and the pack layer discards it if the epoch's data log was replaced. A
-    /// failure is remembered for [`Self::HEAL_RETRY_BACKOFF`], so repeated reads of a corrupt
+    /// failure is remembered for [`ReadSideHeal::RETRY_BACKOFF`], so repeated reads of a corrupt
     /// epoch fail fast.
+    ///
+    /// The heal runs as its own task and this only waits for it. A reader whose future is dropped
+    /// (an epoch-scoped task aborted at the epoch boundary, a request that timed out) stops
+    /// waiting without abandoning the heal: the task keeps the epoch's heal lock until its build
+    /// is installed or discarded, so the next reader waits for it instead of starting a second
+    /// build, no staging copy is left behind, and a heal that outlasts any one reader still
+    /// completes.
     async fn heal_static(&self, epoch: Epoch) -> Result<(), PackError> {
-        if let Some(recent) = self.recent_heal_failure(epoch) {
+        let heal = ReadSideHeal {
+            base_path: self.base_path.clone(),
+            current_pack: Arc::downgrade(&self.current_pack),
+            pack_install: self.pack_install.clone(),
+            install_generation: self.install_generation.clone(),
+            heal_locks: self.heal_locks.clone(),
+            heal_failures: self.heal_failures.clone(),
+        };
+        if let Some(recent) = heal.recent_failure(epoch) {
             return Err(recent);
         }
-        let epoch_lock = self.heal_locks.lock().entry(epoch).or_default().clone();
-        let result = {
-            let _serial = epoch_lock.lock().await;
-            // Readers queued behind a build that just failed find its failure here rather than
-            // each re-running the build.
-            match self.recent_heal_failure(epoch) {
-                Some(recent) => Err(recent),
-                None => self.build_and_install_heal(epoch).await,
-            }
-        };
-        {
-            let mut locks = self.heal_locks.lock();
-            // Drop the map entry once no other reader is waiting on it (the map and this call hold
-            // the only references).
-            if Arc::strong_count(&epoch_lock) <= 2 {
-                locks.remove(&epoch);
-            }
-        }
-        match &result {
-            Ok(()) => {
-                self.heal_failures.lock().remove(&epoch);
-            }
-            Err(e) => {
-                warn!(target: "consensus::store", epoch, %e, "read-side heal of a past epoch failed");
-                // Not remembered: an environmental failure, or a failure on the epoch that became
-                // the live writer meanwhile (its now-unsealed log fails the heal, which is not a
-                // verdict on the epoch).
-                let environmental =
-                    e.is_environmental_index_error() || matches!(e, PackError::IO(_));
-                if !environmental && self.current_pack().epoch() != epoch {
-                    self.heal_failures.lock().insert(epoch, (std::time::Instant::now(), e.clone()));
-                }
-            }
-        }
-        result
-    }
-
-    /// The failure a heal of `epoch` hit within [`Self::HEAL_RETRY_BACKOFF`], if any.
-    fn recent_heal_failure(&self, epoch: Epoch) -> Option<PackError> {
-        self.heal_failures
-            .lock()
-            .get(&epoch)
-            .filter(|(failed_at, _)| failed_at.elapsed() < Self::HEAL_RETRY_BACKOFF)
-            .map(|(_, e)| e.clone())
-    }
-
-    /// Body of [`Self::heal_static`], run while holding the epoch's heal lock.
-    async fn build_and_install_heal(&self, epoch: Epoch) -> Result<(), PackError> {
-        let base_path = self.base_path.clone();
-        let heal = tokio::task::spawn_blocking(move || {
-            ConsensusPack::build_static_heal(&base_path, epoch)
-        })
-        .await
-        .map_err(|e| PackError::PersistError(format!("epoch {epoch} heal task failed: {e}")))??;
-        // `None`: nothing to do (another reader healed it, or it opens fine).
-        let Some(heal) = heal else { return Ok(()) };
-        let _install = self.pack_install.lock().await;
-        if self.current_pack().epoch() == epoch {
-            // It became the live writer while we built: never swap files under the writer.
-            ConsensusPack::discard_static_heal(heal);
-            return Ok(());
-        }
-        ConsensusPack::install_static_heal(&self.base_path, epoch, heal)?;
-        // The epoch's files changed: a `get_static` that opened them across the swap must not
-        // cache its handle.
-        self.install_generation.fetch_add(1, Ordering::Release);
-        Ok(())
+        tokio::spawn(heal.run(epoch))
+            .await
+            .map_err(|e| PackError::PersistError(format!("epoch {epoch} heal task failed: {e}")))?
     }
 
     /// Open the sealed static pack for `epoch` if its files exist on disk.
@@ -1933,6 +1881,107 @@ impl ConsensusChain {
             .map(Some)
             .or_else(|error| error.is_missing_static_files().then_some(None).ok_or(error))
             .map_err(Into::into)
+    }
+}
+
+/// What a read-side heal of a past epoch works with (see `ConsensusChain::heal_static`), owned so
+/// the heal can run as its own task. The live pack is held only weakly, so a heal still running at
+/// shutdown never keeps the chain from reaching sole ownership
+/// ([`ConsensusChain::wait_until_sole_owner`]).
+struct ReadSideHeal {
+    base_path: PathBuf,
+    current_pack: Weak<Mutex<ConsensusPack>>,
+    pack_install: Arc<tokio::sync::Mutex<()>>,
+    install_generation: Arc<AtomicU64>,
+    heal_locks: Arc<Mutex<HashMap<Epoch, Arc<tokio::sync::Mutex<()>>>>>,
+    heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
+}
+
+impl ReadSideHeal {
+    /// How long a failed read-side heal of an epoch is remembered before it is attempted again.
+    const RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+    /// Heal `epoch` under its heal lock (see `ConsensusChain::heal_static`).
+    async fn run(self, epoch: Epoch) -> Result<(), PackError> {
+        let epoch_lock = self.heal_locks.lock().entry(epoch).or_default().clone();
+        let result = {
+            let _serial = epoch_lock.lock().await;
+            // Readers queued behind a build that just failed find its failure here rather than
+            // each re-running the build.
+            match self.recent_failure(epoch) {
+                Some(recent) => Err(recent),
+                None => {
+                    let result = self.build_and_install(epoch).await;
+                    // Before the lock is released, so a queued reader sees the outcome.
+                    self.record(epoch, &result);
+                    result
+                }
+            }
+        };
+        let mut locks = self.heal_locks.lock();
+        // Drop the map entry once no other reader is waiting on it (the map and this heal hold the
+        // only references).
+        if Arc::strong_count(&epoch_lock) <= 2 {
+            locks.remove(&epoch);
+        }
+        result
+    }
+
+    /// The failure a heal of `epoch` hit within [`Self::RETRY_BACKOFF`], if any.
+    fn recent_failure(&self, epoch: Epoch) -> Option<PackError> {
+        self.heal_failures
+            .lock()
+            .get(&epoch)
+            .filter(|(failed_at, _)| failed_at.elapsed() < Self::RETRY_BACKOFF)
+            .map(|(_, e)| e.clone())
+    }
+
+    /// Remember a failed heal of `epoch` for [`Self::RETRY_BACKOFF`], or forget one that succeeded.
+    fn record(&self, epoch: Epoch, result: &Result<(), PackError>) {
+        match result {
+            Ok(()) => {
+                self.heal_failures.lock().remove(&epoch);
+            }
+            Err(e) => {
+                warn!(target: "consensus::store", epoch, %e, "read-side heal of a past epoch failed");
+                // Not remembered: an environmental failure, or a failure on the epoch that became
+                // the live writer meanwhile (its now-unsealed log fails the heal, which is not a
+                // verdict on the epoch).
+                let environmental =
+                    e.is_environmental_index_error() || matches!(e, PackError::IO(_));
+                if !environmental && self.live_epoch() != Some(epoch) {
+                    self.heal_failures.lock().insert(epoch, (std::time::Instant::now(), e.clone()));
+                }
+            }
+        }
+    }
+
+    /// The epoch of the chain's live (writable) pack, or `None` once the chain is gone.
+    fn live_epoch(&self) -> Option<Epoch> {
+        self.current_pack.upgrade().map(|pack| pack.lock().epoch())
+    }
+
+    /// Build the heal on a blocking thread, then install it under `pack_install`.
+    async fn build_and_install(&self, epoch: Epoch) -> Result<(), PackError> {
+        let base_path = self.base_path.clone();
+        let heal = tokio::task::spawn_blocking(move || {
+            ConsensusPack::build_static_heal(&base_path, epoch)
+        })
+        .await
+        .map_err(|e| PackError::PersistError(format!("epoch {epoch} heal task failed: {e}")))??;
+        // `None`: nothing to do (another reader healed it, or it opens fine).
+        let Some(heal) = heal else { return Ok(()) };
+        let _install = self.pack_install.lock().await;
+        if self.live_epoch() == Some(epoch) {
+            // It became the live writer while we built: never swap files under the writer. The
+            // dropped heal removes its staging.
+            return Ok(());
+        }
+        ConsensusPack::install_static_heal(&self.base_path, epoch, heal)?;
+        // The epoch's files changed: a `get_static` that opened them across the swap must not
+        // cache its handle.
+        self.install_generation.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -2996,6 +3045,41 @@ mod test {
             .expect("a missing index must heal, not error")
             .expect("a present epoch with a missing index must not read as absent");
         assert_eq!(header.number, 3);
+    }
+
+    /// A reader that stops waiting on a read-side heal (an aborted task, a timed-out request) must
+    /// not abandon the heal: the build still installs, the next reader waits for it instead of
+    /// starting a second one, and no staging copy is left behind.
+    #[tokio::test]
+    async fn test_a_cancelled_heal_still_completes_without_leftovers() {
+        let temp_dir = TempDir::with_prefix("test_cancelled_heal").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, last) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::remove_dir_all(epoch_dir.join("hash")).expect("remove the digest index dir");
+
+        // Poll the read once (it starts the heal) and drop it.
+        let cancelled =
+            tokio::time::timeout(Duration::ZERO, consensus_chain.get_static(0)).await.is_err();
+        let pack = consensus_chain.get_static(0).await.expect("the next read gets the healed pack");
+        assert!(pack.contains_consensus_header(last).await, "the heal was installed");
+        // Room for a build the cancelled read orphaned to finish, so a leak would show.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leftovers: Vec<_> = std::fs::read_dir(&epoch_dir)
+            .expect("read epoch dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".reindex"))
+            .collect();
+        assert!(leftovers.is_empty(), "cancelled={cancelled}: staging left behind: {leftovers:?}");
     }
 
     /// A past epoch whose index directory is missing but whose data log is present and damaged

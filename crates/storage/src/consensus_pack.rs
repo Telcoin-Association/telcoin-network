@@ -321,12 +321,26 @@ pub enum EpochMigrate {
 
 /// A read-side heal of a sealed past epoch, built beside the live files and not yet visible. See
 /// [`ConsensusPack::build_static_heal`] and [`ConsensusPack::install_static_heal`].
+///
+/// Owns its staging directory: a heal dropped without being installed (abandoned because the epoch
+/// went live, or dropped on any other path) removes it, so a built copy is never left on disk.
 #[derive(Debug)]
 pub(crate) struct StaticHeal {
-    kind: StaticHealKind,
+    /// `None` once [`ConsensusPack::install_static_heal`] has taken it.
+    kind: Option<StaticHealKind>,
     /// Identity of the epoch's data log when the heal was built, so an install can tell the epoch
     /// was replaced (or appended to and re-sealed) in the meantime.
     data_identity: FileIdentity,
+}
+
+impl Drop for StaticHeal {
+    fn drop(&mut self) {
+        if let Some(StaticHealKind::Indexes(dir) | StaticHealKind::Migration(dir)) =
+            self.kind.take()
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -525,37 +539,33 @@ impl ConsensusPack {
             }
             _ => return Err(Inner::corrupt_pack(&base_dir)),
         };
-        Ok(Some(StaticHeal { kind, data_identity }))
+        Ok(Some(StaticHeal { kind: Some(kind), data_identity }))
     }
 
     /// Make a built [`StaticHeal`] visible: a few renames plus a directory fsync. The caller must
     /// hold `ConsensusChain::pack_install` and must not be installing over the live epoch.
     ///
     /// If the epoch's data log was replaced after the heal was built (an import or migration
-    /// installed a new `epoch-N`), the build describes files that are gone: it is discarded and
-    /// nothing changes. The caller's next open sees whatever is there now.
+    /// installed a new `epoch-N`), the build describes files that are gone: it is discarded (its
+    /// staging removed as it drops) and nothing changes. The caller's next open sees whatever is
+    /// there now.
     pub(crate) fn install_static_heal(
         path: &Path,
         epoch: Epoch,
-        heal: StaticHeal,
+        mut heal: StaticHeal,
     ) -> Result<(), PackError> {
         let base_dir = path.join(format!("epoch-{epoch}"));
         if file_identity(&base_dir.join(Inner::DATA_NAME)).ok() != Some(heal.data_identity) {
-            Self::discard_static_heal(heal);
             return Ok(());
         }
-        match heal.kind {
-            StaticHealKind::Indexes(side) => Inner::install_static_indexes(&base_dir, &side),
-            StaticHealKind::Migration(migrate_dir) => {
+        // Taken, so the install owns the staging from here (its own failure handling applies).
+        match heal.kind.take() {
+            Some(StaticHealKind::Indexes(side)) => Inner::install_static_indexes(&base_dir, &side),
+            Some(StaticHealKind::Migration(migrate_dir)) => {
                 Inner::install_migrated_dir(path, epoch, &migrate_dir)
             }
+            None => Ok(()),
         }
-    }
-
-    /// Throw away a built [`StaticHeal`] that will not be installed.
-    pub(crate) fn discard_static_heal(heal: StaticHeal) {
-        let (StaticHealKind::Indexes(dir) | StaticHealKind::Migration(dir)) = heal.kind;
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Remove any read-side heal staging left inside `epoch_dir` by a crash mid-rebuild or
@@ -886,6 +896,7 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus_number,
             timeout,
+            IMPORT_MIN_FREE_BYTES,
         )
         .await?;
         let version = inner.version();
@@ -1286,17 +1297,24 @@ pub(crate) fn attested_output_survives_past(data_path: &Path, epoch: Epoch, from
     let Some(epoch_dir) = data_path.parent() else {
         return false;
     };
-    let offsets: Vec<u64> =
-        match Inner::open_pdx_file::<_, IndexPositions>(epoch_dir, data.header(), true) {
-            Ok(mut idx) => (0..idx.len() as u64)
-                .filter_map(|i| idx.load(i).ok().map(|p| p.consensus_header))
-                .collect(),
-            Err(_) => return false,
-        };
-    offsets
-        .iter()
-        .filter(|&&pos| pos > from)
-        .any(|&pos| matches!(data.fetch(pos), Ok(PackRecord::Consensus(_))))
+    let offsets = attested_header_offsets(epoch_dir, data.header());
+    Inner::attested_record_survives(&mut data, &offsets, from)
+}
+
+/// The output-header offsets the position index of the pack in `epoch_dir` records, read straight
+/// from the index file (see [`PositionIndex::raw_entries`]) so the read-only checks attest what
+/// [`Inner::recover_pack`] attests from its writable open. A read-only index open would refuse an
+/// index a crash left unsealed (still capacity-padded, so not a whole number of entries), and the
+/// checks would then attest nothing where recovery refuses. Empty when there is no readable index
+/// for this data file.
+fn attested_header_offsets(epoch_dir: &Path, data_header: &DataHeader) -> Vec<u64> {
+    PositionIndex::<IndexPositions>::raw_entries(
+        &epoch_dir.join(Inner::CONSENSUS_POS_NAME).join(Inner::CONSENSUS_POS_FILE),
+        data_header,
+    )
+    .into_iter()
+    .map(|position| position.consensus_header)
+    .collect()
 }
 
 /// The offsets one position-index entry records for an output: `(consensus_header, output_start,
@@ -1438,6 +1456,8 @@ struct Inner {
 impl Inner {
     const DATA_NAME: &str = "data";
     const CONSENSUS_POS_NAME: &str = "idx";
+    /// The position index file inside [`Self::CONSENSUS_POS_NAME`].
+    const CONSENSUS_POS_FILE: &str = "index_pos.pdx";
     const CONSENSUS_HASH_NAME: &str = "hash";
     const BATCH_HASH_NAME: &str = "bhash";
 
@@ -1821,11 +1841,7 @@ impl Inner {
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
-        let attested_headers: Vec<u64> = read_position_entries(data_file, data.header())
-            .ok()
-            .flatten()
-            .map(|entries| entries.into_iter().filter_map(|e| e.ok().map(|(h, _, _)| h)).collect())
-            .unwrap_or_default();
+        let attested_headers = attested_header_offsets(epoch_dir, data.header());
         let consistent_end = Self::replay_wal(&data, epoch_dir, None)?;
         if data.committed_end().is_some_and(|committed| consistent_end < committed)
             || Self::attested_record_survives(&mut data, &attested_headers, consistent_end)
@@ -2384,13 +2400,12 @@ impl Inner {
 
     /// Prefix of the directory, inside an epoch dir, where a read-side index rebuild is staged
     /// before it replaces the live index directories. Each build stages in its own directory
-    /// ([`Self::heal_staging_name`]), so a build whose awaiting task was cancelled and that is
-    /// still running can never touch the directory of a later build of the same epoch.
+    /// ([`Self::heal_staging_name`]), so no build can touch (or remove) another build's staging.
     const REINDEX_DIR: &str = ".reindex";
 
     /// A staging directory name unique to one heal build: `{prefix}-{n}` from a process-wide
-    /// counter (with `suffix` appended). Staging is swept at startup by prefix/suffix, so an
-    /// orphaned build's directory is removed on the next start.
+    /// counter (with `suffix` appended). Staging is swept at startup by prefix/suffix, so what a
+    /// crash left mid-build or mid-install is removed on the next start.
     fn heal_staging_name(prefix: &str, suffix: &str) -> String {
         static HEAL_BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = HEAL_BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2508,9 +2523,13 @@ impl Inner {
         read_only: bool,
     ) -> Result<PositionIndex<T>, PackError> {
         let base_dir = dir.as_ref().join(Self::CONSENSUS_POS_NAME);
-        let consensus_pos_idx =
-            PositionIndex::open_pdx_file(&base_dir, data_header, "index_pos.pdx", read_only)
-                .map_err(OpenError::IndexFileOpen)?;
+        let consensus_pos_idx = PositionIndex::open_pdx_file(
+            &base_dir,
+            data_header,
+            Self::CONSENSUS_POS_FILE,
+            read_only,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
         Ok(consensus_pos_idx)
     }
 
@@ -2974,6 +2993,9 @@ impl Inner {
     /// single record rather than by the (committee-scaled, multi-GB) theoretical maximum output
     /// size. Reading stops at `final_consensus_number`: anything a peer streams past it cannot
     /// belong to this epoch's certified chain.
+    /// Import a full epoch (or a verifiable prefix) from a peer `stream` into a fresh pack under
+    /// `path`, stopping before the filesystem's free space drops below `min_free` (see
+    /// [`IMPORT_MIN_FREE_BYTES`]).
     async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
@@ -2981,9 +3003,12 @@ impl Inner {
         previous_epoch: &EpochRecord,
         final_consensus_number: u64,
         timeout: Duration,
+        min_free: u64,
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         create_dir_synced(&base_dir)?;
+        let mut floor = DiskFloor { dir: base_dir.clone(), min_free, checked_at: None };
+        floor.check(0)?;
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
         // A header that does not read (transport) or is from a newer build is no fault of the
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
@@ -3054,6 +3079,7 @@ impl Inner {
                         timeout,
                         parent_digest_expectation,
                         final_consensus_number,
+                        &mut floor,
                     )
                     .await
                 } else {
@@ -3062,6 +3088,7 @@ impl Inner {
                         timeout,
                         parent_digest_expectation,
                         final_consensus_number,
+                        &mut floor,
                     )
                     .await
                 };
@@ -3106,12 +3133,14 @@ impl Inner {
     /// therefore one record, however large a batch fan-out the (not yet authenticated) header
     /// declares. Returns the output's digest and number, or `None` at a clean end of stream.
     /// Any error leaves a partial output behind; the caller discards the whole import pack.
+    /// `floor` is checked as the pack grows.
     async fn import_streamed_output<R: AsyncRead + Unpin>(
         &mut self,
         stream_iter: &mut AsyncPackIter<PackRecord, R>,
         timeout: Duration,
         expectation: HeaderExpectation,
         final_consensus_number: u64,
+        floor: &mut DiskFloor,
     ) -> Result<Option<(ConsensusHeaderDigest, u64)>, PackError> {
         let header = match next_output_record(stream_iter, timeout).await? {
             None => return Ok(None),
@@ -3129,6 +3158,7 @@ impl Inner {
         let (consensus_idx, declared) =
             self.check_import_header(&header, final_consensus_number)?;
         let (header_pos, digest, number) = self.append_imported_header(header)?;
+        floor.check(self.data.file_len())?;
         let max_bytes = max_batch_size(self.epoch_meta.committee.epoch());
         for expected in declared {
             let batch = match next_output_record(stream_iter, timeout).await? {
@@ -3157,6 +3187,7 @@ impl Inner {
                 return Err(PackError::BatchTooLarge { size: batch_bytes, max: max_bytes });
             }
             self.append_imported_batch(got, batch)?;
+            floor.check(self.data.file_len())?;
         }
         self.finish_imported_output(consensus_idx, header_pos)?;
         Ok(Some((digest, number)))
@@ -3176,6 +3207,7 @@ impl Inner {
         timeout: Duration,
         expectation: HeaderExpectation,
         final_consensus_number: u64,
+        floor: &mut DiskFloor,
     ) -> Result<Option<(ConsensusHeaderDigest, u64)>, PackError> {
         let budget =
             output_buffer_budget(&self.epoch_meta.committee).min(LEGACY_IMPORT_OUTPUT_BUDGET);
@@ -3195,11 +3227,13 @@ impl Inner {
         let (consensus_idx, declared) =
             self.check_import_header(&header, final_consensus_number)?;
         let (header_pos, digest, number) = self.append_imported_header(header)?;
+        floor.check(self.data.file_len())?;
         // `read_legacy_output` already proved the buffered set is exactly the declared set (no
         // missing, no extra batches).
         for expected in declared {
             let batch = batches.remove(&expected).ok_or(PackError::MissingBatch)?;
             self.append_imported_batch(expected, batch)?;
+            floor.check(self.data.file_len())?;
         }
         self.finish_imported_output(consensus_idx, header_pos)?;
         Ok(Some((digest, number)))
@@ -3835,6 +3869,75 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
         }
     }
     batches
+}
+
+/// Free space a stream import leaves on the filesystem it writes to. An import appends up to a
+/// whole epoch of peer-supplied bytes before its only authentication (the final header against the
+/// certified epoch record), and it shares that filesystem with the live pack and the node's other
+/// stores, so it stops here rather than filling the disk under them.
+const IMPORT_MIN_FREE_BYTES: u64 = 2 << 30;
+
+/// How far an import's data log may grow between free-space checks.
+const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
+
+/// Stops a stream import before free space on `dir`'s filesystem drops below `min_free`. Falling
+/// short is a local condition, not the sending peer's fault (an honest epoch on a nearly full disk
+/// looks the same), so it is an [`io::ErrorKind::StorageFull`] I/O error that charges no penalty.
+struct DiskFloor {
+    dir: PathBuf,
+    min_free: u64,
+    /// The data length at the last check, `None` before the first.
+    checked_at: Option<u64>,
+}
+
+impl DiskFloor {
+    /// Check the free space once the import's data log has grown by [`IMPORT_FREE_CHECK_EVERY`]
+    /// since the last check (and on the first call). An unknown free space does not stop the
+    /// import: a real shortage still surfaces as a write error.
+    fn check(&mut self, data_len: u64) -> Result<(), PackError> {
+        if self.checked_at.is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY)) {
+            return Ok(());
+        }
+        self.checked_at = Some(data_len);
+        match available_space(&self.dir) {
+            Ok(free) if free < self.min_free => Err(PackError::IO(Arc::new(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "stream import into {} stopped: {free} bytes free, below the {} bytes an \
+                     import must leave",
+                    self.dir.display(),
+                    self.min_free
+                ),
+            )))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding `path`.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // the `statvfs` field widths differ by platform
+fn available_space(path: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `path` is a NUL-terminated string that outlives the call, and `stat` is writable
+    // memory of the type `statvfs` fills in; it is read only after the call reported success (0),
+    // which means every field was written.
+    let stat = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        stat.assume_init()
+    };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// No portable free-space query on this target: never stops an import.
+#[cfg(not(unix))]
+fn available_space(_path: &Path) -> io::Result<u64> {
+    Ok(u64::MAX)
 }
 
 /// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
@@ -7566,6 +7669,35 @@ pub(crate) mod test {
         ConsensusPack::open_static(temp_dir.path(), 0).expect("still consistent after the sweep");
     }
 
+    /// A built heal that is never installed (its caller stopped waiting, or the epoch went live)
+    /// removes its staging directory when dropped, rather than leaving a rebuilt index copy on disk
+    /// until the next startup sweep.
+    #[tokio::test]
+    async fn test_uninstalled_static_heal_removes_its_staging() {
+        let temp_dir = TempDir::with_prefix("test_heal_drop").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::remove_dir_all(base_dir.join(Inner::CONSENSUS_HASH_NAME)).expect("remove index");
+        let staging = || {
+            std::fs::read_dir(&base_dir)
+                .expect("read epoch dir")
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(Inner::REINDEX_DIR))
+                .count()
+        };
+
+        let heal = ConsensusPack::build_static_heal(temp_dir.path(), 0)
+            .expect("build")
+            .expect("a missing index needs a heal");
+        assert_eq!(staging(), 1, "the build stages its rebuilt indexes");
+        drop(heal);
+        assert_eq!(staging(), 0, "an uninstalled heal removes its staging");
+    }
+
     /// A read-only `open_static` of a sealed epoch whose position index is damaged at rest must
     /// surface the actionable `corrupt_static_index` remediation (a real error, not a clean miss) —
     /// the read-only door cannot rebuild the index, but the operator must not see the bare
@@ -8644,6 +8776,69 @@ pub(crate) mod test {
         );
     }
 
+    /// The read-only checks behind `db validate` and `db repair`'s dry run must attest the same
+    /// output boundaries as the writable open, including from a position index that was not
+    /// cleanly closed. Such an index is still capacity-padded, so its tail is not a whole number
+    /// of entries and a read-only index open refuses it; the checks read its entries straight
+    /// from the file instead. Here a corrupted size prefix hides an intact later output from the
+    /// WAL walk and no commit marker survives, so only the position index shows that the damage
+    /// lies below acked data: every verdict must be the writable open's refusal.
+    #[tokio::test]
+    async fn test_dry_run_matches_apply_on_unsealed_padded_position_index() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::{
+            consensus_pack::{check_recoverable, PackError},
+            pack_validate::{classify_physical_corruption, recovery_refusal, CorruptionKind},
+        };
+        let temp_dir = TempDir::with_prefix("test_unsealed_pdx_parity").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary)).expect("seek to size prefix");
+            f.write_all(&7u32.to_le_bytes()).expect("corrupt size prefix");
+        }
+        strip_sentinel(&data_path);
+        // The position index as a crash leaves it: no sentinel, zero-padded to its capacity.
+        let pdx_path = epoch_dir.join(Inner::CONSENSUS_POS_NAME).join("index_pos.pdx");
+        strip_sentinel(&pdx_path);
+        OpenOptions::new()
+            .write(true)
+            .open(&pdx_path)
+            .expect("open pdx")
+            .set_len(1 << 20)
+            .expect("pad pdx");
+
+        assert!(
+            check_recoverable(&data_path, 0).is_err(),
+            "the read-only recovery check must refuse what the writable open refuses"
+        );
+        assert!(recovery_refusal(&data_path, 0).is_some(), "validate must not call it truncatable");
+        let corruption = classify_physical_corruption(&data_path, 0)
+            .expect("classify")
+            .expect("corruption detected");
+        assert_eq!(corruption.kind, CorruptionKind::MidLogCorruption);
+        let dry = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("dry run");
+        assert!(matches!(dry, EpochRepair::Unrepairable(_)), "dry run: {dry:?}");
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("apply");
+        assert!(matches!(applied, EpochRepair::Unrepairable(_)), "apply: {applied:?}");
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(matches!(res, Err(PackError::CorruptPack(_))), "writable open: {res:?}");
+    }
+
     /// R1 regression: a *failed* recovery must be idempotent and non-destructive. Recovery
     /// validates the data-log WAL (index-free) BEFORE it touches any index or truncates the
     /// log, so a detected corruption returns without mutating on-disk state and a retry (a
@@ -9009,7 +9204,8 @@ pub(crate) mod test {
         assert!(c.decodable_after);
     }
 
-    /// A torn epoch-meta with no outputs behind it is a truncatable, effectively-empty pack.
+    /// A torn epoch-meta with no outputs behind it holds no committed data, but it is not a
+    /// truncatable tail: both open doors refuse it, so `db validate` must not report it as one.
     #[tokio::test]
     async fn test_classify_physical_corruption_torn_meta_empty() {
         use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
@@ -9027,7 +9223,7 @@ pub(crate) mod test {
         }
         let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
         assert_eq!(c.kind, CorruptionKind::TornMetaEmpty);
-        assert!(c.kind.is_truncatable(), "an empty torn-meta pack is truncatable");
+        assert!(!c.kind.is_truncatable(), "a torn epoch-meta is refused, not truncated");
     }
 
     /// An unreadable epoch-meta with outputs behind it is data loss (the outputs are unreachable).
@@ -10119,6 +10315,40 @@ pub(crate) mod test {
         .await
         .expect_err("an empty sub-dag must be rejected, not imported");
         assert!(matches!(err, PackError::EmptySubDag), "got {err:?}");
+    }
+
+    /// A stream import stops before it drives the filesystem below its free-space floor, with a
+    /// local `StorageFull` I/O error (never charged to the peer), and checks again each time the
+    /// data log has grown by the check interval.
+    #[tokio::test]
+    async fn test_stream_import_stops_at_the_free_space_floor() {
+        use std::io;
+
+        use crate::consensus_pack::{DiskFloor, PackError, IMPORT_FREE_CHECK_EVERY};
+        let temp_dir = TempDir::with_prefix("test_import_floor").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let previous_epoch = test_previous_epoch(&fixture.committee());
+        let is_storage_full = |e: &PackError| matches!(e, PackError::IO(io_err) if io_err.kind() == io::ErrorKind::StorageFull);
+
+        let err = Inner::stream_import(
+            temp_dir.path(),
+            &[][..],
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+            u64::MAX,
+        )
+        .await
+        .err()
+        .expect("an import with no room must stop");
+        assert!(is_storage_full(&err), "got {err:?}");
+
+        let mut floor =
+            DiskFloor { dir: temp_dir.path().to_owned(), min_free: u64::MAX, checked_at: Some(0) };
+        assert!(floor.check(IMPORT_FREE_CHECK_EVERY - 1).is_ok(), "no check within the interval");
+        let err = floor.check(IMPORT_FREE_CHECK_EVERY).expect_err("checked after the interval");
+        assert!(is_storage_full(&err), "got {err:?}");
     }
 
     /// A streamed import builds a fresh pack strictly in order, so a header whose number does not

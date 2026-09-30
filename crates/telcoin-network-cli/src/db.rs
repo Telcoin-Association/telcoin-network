@@ -1515,6 +1515,35 @@ mod tests {
         };
     }
 
+    /// A pack whose epoch meta is torn with nothing behind it holds no committed data, but both
+    /// open doors refuse it and `db repair` reports it unrepairable, so `db validate` must fail
+    /// (exit non-zero) rather than report a self-healing shape.
+    #[test]
+    fn db_validate_fails_on_a_torn_epoch_meta() {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+            consensus_pack::{PackRecord, PACK_VERSION},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let epoch_dir = dir.path().join("epoch-0");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data_file = epoch_dir.join(super::DATA_NAME);
+        // A header-only pack, then an unclean tail: a meta size prefix claiming more bytes than
+        // follow it.
+        drop(
+            Pack::<PackRecord>::open(&data_file, 0, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("create pack"),
+        );
+        let mut bytes = fs::read(&data_file).unwrap();
+        bytes.truncate(DATA_HEADER_BYTES);
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data_file, &bytes).unwrap();
+
+        let args = super::DbValidateArgs { path: epoch_dir, epoch: None };
+        assert!(args.execute().is_err(), "a torn epoch meta must fail validation");
+    }
+
     #[test]
     fn parse_db_load_state_subcommand() {
         let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "load-state", "/tmp/epoch-3"])

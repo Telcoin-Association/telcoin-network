@@ -48,11 +48,16 @@ impl PdxHeader {
     fn load_header(hdx_file: &mut MmapDataFile) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
+        hdx_file.read_exact(&mut buffer[..])?;
+        Self::decode(&buffer)
+    }
+
+    /// Decode and CRC-check a header from its on-disk bytes.
+    fn decode(buffer: &[u8; PDX_HEADER_SIZE]) -> Result<Self, LoadHeaderError> {
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
-        hdx_file.read_exact(&mut buffer[..])?;
         if !check_crc(&buffer[..]) {
             return Err(LoadHeaderError::CrcFailed);
         }
@@ -200,20 +205,27 @@ impl<T: PosIndexValue> PositionIndex<T> {
     }
 
     /// Every entry of the pdx file at `path`, in order, read straight from its bytes without
-    /// opening the index: empty if the file is absent, shorter than its header, or not a pdx
-    /// (type tag / header CRC). Entries that fail to decode are skipped.
+    /// opening the index: empty if the file is absent, shorter than its header, not a pdx (type
+    /// tag / header CRC), or not the index of the data file whose header is `data_header` (the
+    /// version/appnum/uid identity [`Self::open_pdx_file`] checks). Entries that fail to decode
+    /// are skipped.
     ///
     /// For attesting record offsets from an index that a read-only open would refuse — an
     /// unsealed file whose mmap capacity padding leaves its tail unaligned — while a writable
-    /// open (which would heal that tail) is not wanted. Zero-filled padding past an unsealed
-    /// index's logical end decodes as zero entries; a caller treating entries as record offsets
-    /// must ignore those (a real offset lies past the data file's header).
-    pub fn raw_entries(path: &Path) -> Vec<T> {
+    /// open (which would heal that tail) is not wanted: it yields the entries a writable open
+    /// would keep, and none where that open would discard the file. Zero-filled padding past an
+    /// unsealed index's logical end decodes as zero entries; a caller treating entries as record
+    /// offsets must ignore those (a real offset lies past the data file's header).
+    pub fn raw_entries(path: &Path, data_header: &DataHeader) -> Vec<T> {
         let Ok(bytes) = fs::read(path) else { return Vec::new() };
-        if bytes.len() < PDX_HEADER_SIZE
-            || &bytes[0..8] != b"telcoinx"
-            || !check_crc(&bytes[..PDX_HEADER_SIZE])
-        {
+        let header = bytes
+            .first_chunk::<PDX_HEADER_SIZE>()
+            .and_then(|header| PdxHeader::decode(header).ok());
+        if !header.is_some_and(|header| {
+            header.version() == data_header.version()
+                && header.uid() == data_header.uid()
+                && header.appnum() == data_header.appnum()
+        }) {
             return Vec::new();
         }
         bytes[PDX_HEADER_SIZE..]

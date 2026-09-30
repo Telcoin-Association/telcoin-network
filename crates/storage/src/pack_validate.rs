@@ -180,9 +180,10 @@ impl Display for Verdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorruptionKind {
     /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
-    /// no outputs. No committed data is at risk, but both open doors REFUSE a torn meta (they
-    /// cannot read the committee), so it is not auto-healed: remove this `epoch-N` directory to
-    /// rebuild.
+    /// no outputs. No committed data is at risk, but it is not healed by truncation: both open
+    /// doors REFUSE torn meta bytes (they cannot read the committee), and only a header followed
+    /// by nothing but zeros is re-initialized, by the open that creates the epoch. Remove this
+    /// `epoch-N` directory to rebuild.
     TornMetaEmpty,
     /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
     /// unreachable without the meta. Data loss for this epoch.
@@ -204,9 +205,11 @@ pub enum CorruptionKind {
 }
 
 impl CorruptionKind {
-    /// True when recovery can safely drop the damage by truncation, losing no committed data.
+    /// True when recovery heals the damage itself by truncating it, losing no committed data. A
+    /// torn epoch meta is not: nothing is truncated, and the open doors refuse it (see
+    /// [`CorruptionKind::TornMetaEmpty`]).
     pub fn is_truncatable(&self) -> bool {
-        matches!(self, CorruptionKind::TornMetaEmpty | CorruptionKind::TornTrailingTail)
+        matches!(self, CorruptionKind::TornTrailingTail)
     }
 }
 
@@ -254,9 +257,10 @@ impl Display for PhysicalCorruption {
         match self.kind {
             CorruptionKind::TornMetaEmpty => writeln!(
                 f,
-                "no committed data at risk, but ACTION NEEDED — both open doors refuse a torn \
-                 epoch-meta, so `open_append` will NOT reinitialize it: remove this `epoch-N` \
-                 directory to rebuild (re-sync the epoch from peers if it is not the current one)."
+                "no committed data at risk, but ACTION NEEDED — both open doors refuse torn \
+                 epoch-meta bytes (only a header followed by nothing but zeros is re-initialized, \
+                 and only when the node creates the epoch): remove this `epoch-N` directory to \
+                 rebuild (re-sync the epoch from peers if it is not the current one)."
             ),
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
