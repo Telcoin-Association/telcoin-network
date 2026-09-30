@@ -22,6 +22,7 @@ pub mod error;
 pub mod kad;
 mod metrics;
 mod peers;
+mod quic_incoming;
 pub mod stream;
 mod sync;
 pub mod types;
@@ -49,3 +50,6 @@ pub(crate) mod common;
 #[cfg(test)]
 #[path = "tests/fixture_tests.rs"]
 mod fixture_tests;
+#[cfg(test)]
+#[path = "tests/quic_retry.rs"]
+mod quic_retry;

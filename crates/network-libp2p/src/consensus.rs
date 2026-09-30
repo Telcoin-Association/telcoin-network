@@ -6,14 +6,15 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::{node_record_key, KadStore},
-    metrics::{PeerManagerMetrics, SwarmMetrics},
+    metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
-        RecordDomain, ResponseChannel, RpcInfo,
+        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
+        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -55,6 +56,57 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[path = "tests/network_tests.rs"]
 mod network_tests;
 
+#[cfg(test)]
+#[path = "tests/admission_contention.rs"]
+mod admission_contention;
+
+#[cfg(test)]
+#[path = "tests/loop_budget_tests.rs"]
+mod loop_budget_tests;
+
+/// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
+/// [`next_loop_event`].
+#[derive(Debug)]
+enum LoopEvent<E, C> {
+    /// The record-refresh interval ticked.
+    Refresh,
+    /// The swarm produced an event.
+    Swarm(E),
+    /// The command channel produced a command.
+    Command(C),
+    /// Every command sender is gone, so the network loop must shut down.
+    CommandsClosed,
+}
+
+/// Wait for the next unit of work of the network loop: a record-refresh tick, a swarm event or a
+/// command.
+///
+/// [`ConsensusNetwork::run`] calls this once per loop iteration. `events` is generic so tests can
+/// drive this exact function with a synthetic, always-ready event source.
+///
+/// Every call first spends one unit of the tokio cooperative budget. The swarm stream spends no
+/// budget (libp2p events, QUIC accepts and futures channels are not budget-aware). Without this
+/// charge, a flood of ready swarm events never makes the loop return `Pending`, so the task never
+/// yields: other tasks on the same worker thread do not run and, on a `current_thread` runtime,
+/// the time driver does not turn, so no interval fires. With the charge, the loop serves at most
+/// one budget of iterations per scheduler poll, then yields and wakes itself. The charge comes
+/// before the `select!`, so a yield never drops a swarm event or a command.
+async fn next_loop_event<S, C>(
+    record_refresh: &mut tokio::time::Interval,
+    events: &mut S,
+    commands: &mut Receiver<C>,
+) -> LoopEvent<S::Item, C>
+where
+    S: futures::Stream + futures::stream::FusedStream + Unpin,
+{
+    tokio::task::coop::consume_budget().await;
+    tokio::select! {
+        _ = record_refresh.tick() => LoopEvent::Refresh,
+        event = events.select_next_some() => LoopEvent::Swarm(event),
+        command = commands.recv() => command.map_or(LoopEvent::CommandsClosed, LoopEvent::Command),
+    }
+}
+
 /// Hard cap on the number of distinct peers retained in
 /// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
 /// already pushed our [`NodeRecord`] to.
@@ -78,20 +130,7 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// records reach the store, whose larger value limit is not the effective wire bound.
 const MAX_KAD_PACKET_SIZE: usize = 16 * 1024;
 
-/// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
-///
-/// A legitimate node advertises exactly one address per record (see `get_peer_record`). A record
-/// exceeding the cap is rejected at validation, bounding the attacker-chosen address data admitted
-/// per record before it can accumulate on the peer entry (GHSA-29v6-gvv5-45gx). The cap is tied to
-/// the per-peer set cap `MAX_MULTIADDRS_PER_PEER`, so validation and storage agree on how many
-/// addresses one peer may present: a single validated record contributes at most as many addresses
-/// as the store keeps for a peer, and the set cap is what bounds accumulation across repeated
-/// records. Folding a record into an entry that already holds a connection form replaces that
-/// form; that only trims the peer-exchange payload built from the entry.
-///
-/// The same cap bounds the address list of a kad provider record before it is written to the
-/// consensus database (`KadStore::add_provider`, issue #1185).
-pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
+pub(crate) use tn_node_record::MAX_ADVERTISED_MULTIADDRS;
 
 /// Freshness of a validated incoming record relative to the locally stored value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,17 +162,91 @@ enum RecordFreshness {
 /// of connections instead of an unbounded fan-out.
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
-/// Build the [`connection_limits::Behaviour`] that caps concurrent established connections per peer
-/// at [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`].
+/// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
+/// established) for one swarm.
 ///
-/// Only the per-peer bound is set; the other `connection_limits` dimensions (pending / established
-/// totals and per-direction caps) are intentionally left unbounded so this change adds exactly the
-/// missing per-peer ceiling and nothing else. Shared by [`TNBehavior::new`] and its regression test
-/// so both exercise the identical limit.
-fn connection_limits_behaviour() -> connection_limits::Behaviour {
+/// This is a last-resort memory bound, not an admission policy. With QUIC Retry enabled (the
+/// default), the listener validates the source address before accepting a handshake, so occupying
+/// a slot requires a validated round trip. If `retry_unvalidated_incoming` is disabled as an
+/// operator rollback, a forged QUIC Initial datagram can hold a slot for the transport timeout
+/// (about 10 seconds, see [`connection_limits_behaviour`]). A full budget refuses every new inbound
+/// handshake, committee peers included, so the value is sized to bound memory only.
+///
+/// The value does not depend on [`PeerConfig`]. The peer manager has no inbound admission ceiling
+/// for this budget to mirror: it admits every connection that is not banned and disconnects excess
+/// peers that are not important only after establishment, and validators and allowlisted peers have
+/// no count ceiling. A dial that this budget refuses is retried only by `dial_peer_bls` (committee
+/// dials at epoch start, with a bounded backoff that gives up once other peers are connected).
+///
+/// Established connections do not count against this budget, so connected peers are not affected
+/// when it is full, and neither are this node's own outbound dials.
+const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 1024;
+
+/// Minimum time between two operator warnings about inbound connections that a
+/// `connection_limits` bound refuses (see [`InboundDenialWarning`]).
+const INBOUND_DENIAL_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the operator warning about inbound connections that a `connection_limits` bound
+/// refuses.
+///
+/// Every refusal is counted in the `tn_network.inbound_connections_denied_total` metric and logged
+/// at `debug`. The warning fires only when refusals persist: the first refusal opens a window, and
+/// the first refusal at least [`INBOUND_DENIAL_WARN_INTERVAL`] after the window opened fires the
+/// warning with the number of refusals in the window and closes the window.
+#[derive(Debug, Default)]
+struct InboundDenialWarning {
+    /// When the current window opened, or `None` if no refusal was counted since the last warning.
+    window_start: Option<tokio::time::Instant>,
+    /// The number of refusals counted in the current window.
+    denied: u64,
+}
+
+impl InboundDenialWarning {
+    /// Count one refusal at `now`. Return the number of refusals in the window when the warning is
+    /// due, and `None` otherwise.
+    fn record(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        let window_start = *self.window_start.get_or_insert(now);
+        self.denied = self.denied.saturating_add(1);
+        (now.saturating_duration_since(window_start) >= INBOUND_DENIAL_WARN_INTERVAL)
+            .then(|| std::mem::take(self).denied)
+    }
+}
+
+/// Build the [`connection_limits::Behaviour`] for one swarm.
+///
+/// It sets two bounds:
+/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
+///   (issue #1010);
+/// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
+///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
+/// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
+///   the count is below the budget. Otherwise it denies the connection with
+///   [`connection_limits::Exceeded`] and takes no slot. A refusal by an earlier sub-behaviour (for
+///   example the banned-IP check in `peer_manager`) happens before this point, so it takes no slot
+///   either.
+/// - release: `handle_established_inbound_connection` frees the slot before the per-peer check, and
+///   `FromSwarm::ListenFailure` frees it on every other outcome. The swarm emits `ListenFailure`
+///   when a pending hook refuses the connection, when an established hook refuses it, and when the
+///   pending upgrade fails, times out or is aborted. The slots are a set of `ConnectionId`s, so a
+///   second release of the same id and a release of an id that holds no slot free nothing.
+///
+/// Hold time: the libp2p `SwarmBuilder` wraps the transport in a `TransportTimeout` with a 10
+/// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
+/// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
+///
+/// The budget applies to each swarm separately. Each primary and worker network builds its own
+/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+///
+/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
+/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
+/// exercise the identical limits.
+fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER)),
+            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
 
@@ -159,12 +272,13 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer connection ceiling (issue #1010).
+    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
+    /// inbound connections (see [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
-    /// peer is rejected before it is counted here), and before the remaining behaviors so an
-    /// over-cap connection is denied before `req_res` / `gossipsub` / `kademlia` register any
-    /// per-peer state for it.
+    /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
+    /// remaining behaviors so an over-cap connection is denied before `req_res` / `gossipsub` /
+    /// `kademlia` register any per-peer state for it.
     pub(crate) connection_limits: connection_limits::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
@@ -202,7 +316,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour();
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -343,6 +457,12 @@ where
     published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// Rate limit for the warning about inbound connections that a `connection_limits` bound
+    /// refuses.
+    inbound_denial_warning: InboundDenialWarning,
+    /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
+    /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
+    quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -559,6 +679,14 @@ where
 
         let network_pubkey = keypair.public().into();
 
+        // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
+        let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
+        let quic_limits = QuicIncomingLimits::new(
+            network_config.peer_config().max_priority_peers(),
+            MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+        );
+        let quic_stats = std::sync::Arc::clone(&quic_incoming);
+
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -570,6 +698,11 @@ where
                     network_config.quic_config().max_concurrent_stream_limit;
                 config.max_stream_data = network_config.quic_config().max_stream_data;
                 config.max_connection_data = network_config.quic_config().max_connection_data;
+                quic_limits.apply(
+                    &mut config,
+                    network_config.quic_config().retry_unvalidated_incoming,
+                    quic_stats,
+                );
                 config
             })
             .with_behaviour(|_| behavior)
@@ -616,6 +749,8 @@ where
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
+            inbound_denial_warning: InboundDenialWarning::default(),
+            quic_incoming,
         })
     }
 
@@ -770,28 +905,31 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            tokio::select! {
-                _ = record_refresh.tick() => self.refresh_own_record(),
-                event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
-                    error!(target: "network", ?e, "network event error");
-                    if let NetworkError::AllListenersClosed = e {
-                        // In this case go ahead and kill the node.
-                        return Err(e);
+            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+                LoopEvent::Refresh => self.refresh_own_record(),
+                LoopEvent::Swarm(event) => {
+                    if let Err(e) = self.process_event(event).await {
+                        error!(target: "network", ?e, "network event error");
+                        if let NetworkError::AllListenersClosed = e {
+                            // In this case go ahead and kill the node.
+                            return Err(e);
+                        }
                     }
-                },
-                command = self.commands.recv() => match command {
-                    Some(c) => if let Err(e) = self.process_command(c) {
+                }
+                LoopEvent::Command(c) => {
+                    if let Err(e) = self.process_command(c) {
                         error!(target: "network", ?e, "network command error")
-                    },
-                    None => {
-                        info!(target: "network", "network shutting down...");
-                        return Ok(())
                     }
-                },
+                }
+                LoopEvent::CommandsClosed => {
+                    info!(target: "network", "network shutting down...");
+                    return Ok(());
+                }
             }
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
 
@@ -849,6 +987,43 @@ where
                     error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
                     return Err(NetworkError::AllListenersClosed);
                 }
+            }
+            // an inbound connection refused by a `connection_limits` bound (the pending inbound
+            // ceiling or the per-peer established ceiling); count it, and log only the configured
+            // limit and the fixed limit description, never peer-supplied data
+            SwarmEvent::IncomingConnectionError {
+                error: libp2p::swarm::ListenError::Denied { cause },
+                peer_id,
+                ..
+            } => {
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        // the pending hook runs before the remote is authenticated, so only a
+                        // refusal at establishment (the per-peer ceiling) carries a peer id
+                        let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
+                            InboundDenial::EstablishedPerPeerLimit
+                        });
+                        self.metrics.record_inbound_denied(&denial);
+                        debug!(
+                            target: "network",
+                            ?denial,
+                            limit = exceeded.limit(),
+                            %exceeded,
+                            "inbound connection refused by connection limit"
+                        );
+                        self.inbound_denial_warning
+                            .record(tokio::time::Instant::now())
+                            .into_iter()
+                            .for_each(|denied| {
+                                warn!(
+                                    target: "network",
+                                    denied,
+                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                    "inbound connections keep being refused by connection limits"
+                                );
+                            });
+                    },
+                );
             }
             // other events handled by peer manager and other behaviors
             _ => {}
