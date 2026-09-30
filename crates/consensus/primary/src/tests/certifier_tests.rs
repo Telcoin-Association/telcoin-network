@@ -14,10 +14,7 @@ use tn_network_libp2p::types::{
 };
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
-use tn_types::{
-    encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, SignatureVerificationState,
-    TnSender,
-};
+use tn_types::{encode, error::DagError, BlsKeypair, BlsSigner, HeaderBuilder, TnSender};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 // ===== Certifier test harness =====
@@ -236,15 +233,35 @@ impl MockNetwork {
         }
     }
 
-    /// Receive the next network command, which must be a gossip publish, and acknowledge it.
-    async fn next_publish(&mut self, context: &str) {
+    /// Receive the next network command, which must be a gossip publish, acknowledge it, and
+    /// return the bytes it publishes.
+    async fn next_publish(&mut self, context: &str) -> Vec<u8> {
         match self.next_command(context).await {
-            NetworkCommand::Publish { reply, .. } => {
+            NetworkCommand::Publish { msg, reply, .. } => {
                 // the certifier only logs a failed publish, so a publisher that stopped waiting
                 // changes nothing
                 let _ = reply.send(Ok(MessageId::new(&[])));
+                msg
             }
             other => panic!("{context}: expected a gossip publish, got {other:?}"),
+        }
+    }
+
+    /// Panic, naming `context`, unless the network channel is closed and nothing was sent on it.
+    ///
+    /// The channel closes once every handle to this network has been dropped. Unlike
+    /// [`Self::assert_quiet`], an open channel fails the check even if nothing is sent on it: it
+    /// means something, such as a running certifier task, still holds a handle.
+    async fn assert_closed(&mut self, context: &str) {
+        match tokio::time::timeout(STEP_TIMEOUT, self.rx.recv()).await {
+            Ok(None) => {}
+            Ok(Some(command)) => {
+                panic!("{context}: expected a closed network channel, got {command:?}")
+            }
+            Err(_) => panic!(
+                "{context}: network channel still open after {STEP_TIMEOUT:?}; something holds a \
+                 handle to it"
+            ),
         }
     }
 
@@ -393,6 +410,18 @@ fn certificate_over<'a, DB: Database>(
         .expect("the voters reach quorum");
     certificate.verify_cert(&committee.bls_keys()).expect("expected certificate verifies");
     certificate
+}
+
+/// The bytes a certifier gossips for `certificate`: what
+/// `PrimaryNetworkHandle::publish_certificate` publishes, captured on a scratch [`MockNetwork`].
+async fn certificate_gossip(certificate: Certificate) -> Vec<u8> {
+    let (mut network, handle) = MockNetwork::new();
+    let (published, msg) = tokio::join!(
+        handle.publish_certificate(certificate),
+        network.next_publish("gossip of the expected certificate")
+    );
+    published.expect("the scratch network acknowledges the publish");
+    msg
 }
 
 // ===== end harness =====
@@ -588,43 +617,71 @@ async fn new_header_cancels_inflight() {
     }
 }
 
-/// A header whose epoch does not match the committee's current epoch is rejected by
-/// propose_header with DagError::InvalidEpoch. No certificate forms.
+/// `propose_header` rejects a header from another epoch with exactly `InvalidEpoch`, naming the
+/// committee's epoch and the header's, before it sends anything on the network.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn wrong_epoch_header_rejected() {
-    let mut cx = CertifierContext::new();
-    let committee = cx.fixture.committee();
-    let mut cert_rx = cx.subscribe_new_certificates();
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let epoch = cx.fixture.committee().epoch();
+    let wrong_epoch = epoch + 1;
+    let header = HeaderBuilder::from_header(&cx.proposer_header()).epoch(wrong_epoch).build();
 
-    // Build a header with a wrong epoch.
-    let current_epoch = committee.epoch();
-    let wrong_epoch = current_epoch.wrapping_add(1);
-    let base = cx.proposer().header(&committee);
-    // Override the epoch field. Header fields are pub in test-utils context via super::*.
-    // We build a new header directly using HeaderBuilder.
-    let wrong_epoch_header = tn_types::HeaderBuilder::default()
-        .author(base.author().clone())
-        .payload(base.payload().clone())
-        .round(base.round())
-        .epoch(wrong_epoch)
-        .parents(base.parents().clone())
-        .created_at(*base.created_at())
-        .build();
-
-    cx.consensus_bus.headers().send(wrong_epoch_header).await.unwrap();
-
-    // No vote requests should arrive (certifier rejects before sending requests).
-    cx.network.assert_quiet("certifier should not send vote requests for wrong-epoch header").await;
-
-    // No certificate should form.
+    let proposal = start_proposal(&certifier, header);
+    cx.network.assert_quiet("wrong-epoch header: propose_header must send nothing").await;
+    let result = proposal_result(proposal, "wrong-epoch header").await;
+    let expected = Err(DagError::InvalidEpoch { expected: epoch, received: wrong_epoch });
     assert!(
-        tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await.is_err(),
-        "expected no certificate for wrong-epoch header"
+        same_outcome(&result, &expected),
+        "wrong-epoch header: expected {expected:?}, got {result:?}"
     );
 }
 
-/// When Certifier::spawn is called with a ConsensusConfig whose key is not in the committee
-/// (authority_id() == None), it returns early. Sending a header produces no vote requests.
+/// A rejected wrong-epoch header does not stall the running certifier: the next valid header is
+/// certified, and no certificate ever forms for the rejected one.
+///
+/// The valid header is sent only once the certifier has gone idle after the wrong-epoch one, so
+/// the certifier has already processed and rejected it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn wrong_epoch_header_does_not_stall_certifier() {
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
+    let wrong_epoch = cx.fixture.committee().epoch() + 1;
+    let wrong_epoch_header = HeaderBuilder::from_header(&header).epoch(wrong_epoch).build();
+    let digest = header.digest();
+    let votes = cx.peer_votes(&header);
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(wrong_epoch_header).await.unwrap();
+    cx.network.assert_quiet("wrong-epoch header: the certifier must send nothing").await;
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    let responses = cx
+        .network
+        .respond(votes.len(), "valid header after the wrong-epoch one", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    assert!(
+        responses.requests.iter().all(|request| request.header == digest),
+        "every vote request must be for the valid header"
+    );
+
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the valid header after a wrong-epoch one is certified")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), digest, "the certificate is for the valid header");
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
+        panic!("expected no certificate after the valid header's, got {result:?}");
+    }
+}
+
+/// `Certifier::spawn` on a node whose key is not in the committee (`authority_id()` is `None`)
+/// returns without spawning a certifier task.
+///
+/// `spawn` owns the network handle it is given, so when it returns early it drops the handle and
+/// the network channel closes. A certifier task, even an idle one, would keep the handle and the
+/// channel open.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn non_cvv_node_skips_certifier() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -655,15 +712,9 @@ async fn non_cvv_node_skips_certifier() {
         StateSynchronizer::new(non_cvv_config.clone(), cb.clone(), task_manager.get_spawner());
     sync.spawn(&task_manager);
 
-    // Spawn returns immediately without starting the certifier task.
-    Certifier::spawn(non_cvv_config, cb.clone(), sync, handle, &task_manager);
+    Certifier::spawn(non_cvv_config, cb, sync, handle, &task_manager);
 
-    // Send a header — the certifier task is not running, so no vote requests arrive.
-    let header = any_auth.header(&fixture.committee());
-    cb.headers().send(header).await.unwrap();
-
-    // a closed channel (the early return dropped the handle) is as quiet as an idle one
-    network.assert_quiet("non-CVV node must not send any vote requests").await;
+    network.assert_closed("non-CVV node: Certifier::spawn must not spawn a certifier task").await;
 }
 
 /// `request_vote` returns exactly the result each peer reply calls for.
@@ -1068,30 +1119,33 @@ struct AppendRow {
     steps: Vec<(Vote, DagResult<Option<Certificate>>)>,
 }
 
-/// If the cert store already contains a certificate for this authority when the Certifier starts,
-/// it publishes that cert to the gossip network on startup (NetworkCommand::Publish) before
-/// processing any new headers.
+/// A certifier that starts with its own certificates in the store first gossips exactly the
+/// highest-round one, before it does anything else.
+///
+/// The store holds the proposer's round-1 and round-2 certificates, written highest round first,
+/// so neither the lowest-round nor the last-written certificate is the right one.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn startup_republish_highest_cert() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let proposer = fixture.authorities().last().expect("committee has authorities");
     let committee = fixture.committee();
+    let proposer = fixture.authorities().last().expect("committee has authorities");
+    let [round1, round2] = [1, 2].map(|round| {
+        fixture.certificate(&proposer.header_builder_at_round(&committee, round).build())
+    });
+    let store = proposer.consensus_config().node_storage().clone();
+    for certificate in [&round2, &round1] {
+        store.write(certificate.clone()).expect("write an own certificate before startup");
+    }
 
-    // Build and store a certificate in the proposer's cert store BEFORE spawning.
-    let header = proposer.header(&committee);
-    let existing_cert = fixture.certificate(&header);
-    proposer
-        .consensus_config()
-        .node_storage()
-        .write(existing_cert)
-        .expect("write pre-existing cert");
-
-    // Now spawn the certifier via from_fixture — startup should trigger a Publish.
     let mut cx = CertifierContext::from_fixture(fixture);
 
-    // The very first network command should be a Publish (gossip broadcast of the
-    // highest known certificate for this authority).
-    cx.network.next_publish("startup republish: first network command").await;
+    let published = cx.network.next_publish("startup republish: first network command").await;
+    assert!(
+        published == certificate_gossip(round2).await,
+        "startup must republish the proposer's round-2 certificate, its highest; published the \
+         round-1 one instead: {}",
+        published == certificate_gossip(round1).await
+    );
 }
 
 /// Exactly `committee.quorum_threshold()` voting-weight worth of peers vote. The remaining peers
@@ -1140,62 +1194,107 @@ async fn minimum_quorum_exactly_threshold() {
     );
 }
 
+/// The running certifier turns a header into exactly the certificate its quorum's votes support,
+/// records it in `ProposedCertificates` under the header digest, and gossips it.
+///
+/// Every vote request is answered. The first peers asked, in fixture order, vote until they and
+/// the proposer are a quorum; the other requests are held until the certificate is gossiped and
+/// then answered with late votes, which must change nothing. Gossip is the next network command
+/// after the vote requests, so a request the proposer sends to itself fails the test wherever it
+/// arrives.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_to_form_certificate() {
     let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
     let header = cx.proposer_header();
-    let proposed_digest = header.digest();
+    let digest = header.digest();
     let votes = cx.peer_votes(&header);
+    let quorum = committee.quorum_threshold();
+    // every authority has one vote, so the proposer's own vote needs `quorum - 1` peers' votes
+    let (expected, voters) = {
+        let voters: Vec<_> = cx.peers().take(quorum as usize - 1).collect();
+        let expected =
+            certificate_over(&committee, &header, voters.iter().copied().chain([cx.proposer()]));
+        let voters: Vec<_> = voters.iter().map(|voter| *voter.authority().protocol_key()).collect();
+        (expected, voters)
+    };
+    let store = cx.proposer().consensus_config().node_storage().clone();
     let mut cert_rx = cx.subscribe_new_certificates();
 
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-    cx.network
-        .respond(votes.len(), "every peer votes", |peer, _| Reply::Vote(votes[peer].clone()))
-        .await;
-
-    let cert =
-        tokio::time::timeout(Duration::from_secs(10), cert_rx.recv()).await.unwrap().unwrap();
-    assert_eq!(cert.header().digest(), proposed_digest);
-    assert!(matches!(
-        cert.signature_verification_state(),
-        SignatureVerificationState::VerifiedDirectly(_)
-    ));
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn propose_header_failure() {
-    let mut cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposed_digest = header.digest();
-    let num_peers = cx.peers().count();
-    let mut cert_rx = cx.subscribe_new_certificates();
-
-    // Propose header and verify we get no certificate back.
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
-    // every peer fails its request with a fatal `NetworkError::RPCError`: no retry
-    cx.network
-        .respond(num_peers, "every peer fails fatally", |_, _| {
-            Reply::Fail(NetworkError::RPCError("mock fatal peer error".to_string()))
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    let responses = cx
+        .network
+        .respond(votes.len(), "every peer is asked", |peer, _| {
+            if voters.contains(peer) {
+                Reply::Vote(votes[peer].clone())
+            } else {
+                Reply::Hold
+            }
         })
         .await;
 
-    // Fatal peer errors should cause proposal failure without publishing a cert.
-    // The paused clock only reaches the end of the quiet window once every task is idle,
-    // so the certifier has processed all vote task results before this can pass.
-    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
-        panic!("expected no certificate to form; got {result:?}");
-    }
-
-    let stored = cx
-        .proposer()
-        .consensus_config()
-        .node_storage()
-        .get::<ProposedCertificates>(&proposed_digest)
-        .expect("reading proposed certificates should succeed");
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("a certificate forms from a quorum of votes")
+        .expect("certificate channel open");
     assert!(
-        stored.is_none(),
-        "failed proposal should not persist a proposed certificate for {proposed_digest:?}"
+        encode(&certificate) == encode(&expected),
+        "expected the certificate over the proposer's and its voters' votes {expected:?}, got \
+         {certificate:?}"
     );
+    certificate.clone().verify_cert(&committee.bls_keys()).expect("the certificate verifies");
+    assert_eq!(certificate.signed_authorities().len(), quorum, "a quorum signs the certificate");
+
+    let proposed = store
+        .get::<ProposedCertificates>(&digest)
+        .expect("read ProposedCertificates")
+        .expect("ProposedCertificates holds the certificate under the header digest");
+    assert!(
+        encode(&proposed) == encode(&expected),
+        "ProposedCertificates holds {proposed:?} for the header, not its certificate"
+    );
+
+    let gossip = cx.network.next_publish("gossip of the new certificate").await;
+    assert!(
+        gossip == certificate_gossip(expected).await,
+        "the gossip after certification must carry exactly the new certificate"
+    );
+
+    // the held requests, in arrival order, are those of the peers that did not vote
+    let late_voters =
+        responses.requests.iter().map(|request| request.peer).filter(|peer| !voters.contains(peer));
+    for (reply, peer) in responses.held.into_iter().zip(late_voters) {
+        let vote = PrimaryResponse::Vote(votes[&peer].clone());
+        assert!(
+            reply.send(Ok(NetworkResponseMessage { peer, result: vote })).is_ok(),
+            "a held vote request stopped waiting before its late vote"
+        );
+    }
+    cx.network.assert_quiet("late votes after the certificate is gossiped").await;
+}
+
+/// `propose_header` returns exactly `CouldNotFormCertificate` for the header when every peer fails
+/// its vote request with the fatal `NetworkError::RPCError`, and asks each peer exactly once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn propose_header_failure() {
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let header = cx.proposer_header();
+    let peers: HashMap<_, _> =
+        cx.peers().map(|peer| (*peer.authority().protocol_key(), 1)).collect();
+
+    let proposal = start_proposal(&certifier, header.clone());
+    let responses = cx
+        .network
+        .respond(peers.len(), "every peer fails fatally", |_, _| {
+            Reply::Fail(NetworkError::RPCError("mock fatal peer error".to_string()))
+        })
+        .await;
+    let result = proposal_result(proposal, "every peer fails fatally").await;
+
+    let expected = Err(DagError::CouldNotFormCertificate(header.digest()));
+    assert!(same_outcome(&result, &expected), "expected {expected:?}, got {result:?}");
+    assert_eq!(responses.requests_per_peer(), peers, "each peer is asked exactly once");
+    cx.network.assert_quiet("a fatal error is not retried").await;
 }
 
 /// `propose_header` returns exactly the certificate the valid votes support when some peers sign
