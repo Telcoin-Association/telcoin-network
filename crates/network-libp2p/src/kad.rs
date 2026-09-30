@@ -1547,6 +1547,8 @@ mod test {
     /// negotiating with each other (issue #765).
     #[test]
     fn test_network_type_protocol_names() -> crate::types::NetworkResult<()> {
+        use crate::types::NetworkTypeExt as _;
+
         assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.2");
         assert_eq!(NetworkType::Primary.kad_protocol(2017)?.as_ref(), "/tn-primary-kad-2017/0.0.1");
         assert_eq!(

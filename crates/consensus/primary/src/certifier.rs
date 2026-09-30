@@ -17,11 +17,18 @@ use tn_types::{
     Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, enabled, error, info, instrument};
+use tracing::{debug, enabled, error, info, instrument, warn};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
 mod certifier_tests;
+
+/// The vote-request attempt from which the retry delay in [`Certifier::request_vote`] stays at
+/// its 10 s ceiling.
+///
+/// A request still failing at this attempt has used up the fast retries and is logged once at
+/// warn; the requests after it keep retrying at the ceiling until the proposal is superseded.
+const VOTE_RETRY_CEILING_ATTEMPT: u32 = 7;
 
 /// This component is responisble for proposing headers to peers, collecting votes on headers,
 /// and certifying headers into certificates.
@@ -188,8 +195,27 @@ impl<DB: Database> Certifier<DB> {
                                 return Err(DagError::NetworkError(format!(
                                     "irrecoverable error requesting vote for {header}: {error}"
                                 )));
-                            } else {
-                                error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+                            }
+                            // retries are unbounded until the proposal is superseded, so a peer
+                            // that keeps failing must not produce a line per attempt
+                            if attempt == VOTE_RETRY_CEILING_ATTEMPT {
+                                warn!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    ?error,
+                                    header = %header.digest(),
+                                    attempt,
+                                    "vote request still failing after the fast retries; retrying every 10s until the proposal is superseded"
+                                );
+                            } else if attempt.is_power_of_two() {
+                                debug!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    ?error,
+                                    header = %header.digest(),
+                                    attempt,
+                                    "retryable error requesting vote"
+                                );
                             }
 
                             missing_parents = None;
@@ -213,6 +239,7 @@ impl<DB: Database> Certifier<DB> {
                 4 => 1_000,
                 5 => 2_000,
                 6 => 5_000,
+                // from VOTE_RETRY_CEILING_ATTEMPT on
                 _ => 10_000,
             }))
             .await;

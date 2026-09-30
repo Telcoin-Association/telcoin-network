@@ -37,11 +37,11 @@ use tracing::{error, warn};
 ///
 /// The discovery path reuses this value as the per-entry ceiling in `eligible_for_discovery`:
 /// a PeerExchange entry with more addresses than this set can hold cannot come from an honest
-/// peer's store, so it is rejected before it reaches `discovery_peers` (issue #1183). The record
-/// validation cap `MAX_ADVERTISED_MULTIADDRS` is tied to this value, so validation and storage
+/// peer's store, so it is rejected before it reaches `discovery_peers` (issue #1183). This is
+/// defined as the record validation cap `MAX_ADVERTISED_MULTIADDRS`, so validation and storage
 /// agree on how many addresses one peer may present: a record can never carry more addresses than
 /// the store keeps for a peer.
-pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = 1;
+pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = tn_node_record::MAX_ADVERTISED_MULTIADDRS;
 
 /// Maximum number of distinct observed connection IPs retained for a single peer.
 ///
