@@ -1,0 +1,91 @@
+name: Carried transport evidence
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select transport changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          changed=$(git diff --name-only "${BASE_SHA}" HEAD -- Cargo.toml Cargo.lock patches crates/network-libp2p crates/config/src/network.rs docs/transport-patches etc/transport-patches .github/workflows/transport-patches.yaml .github/workflows/pr.yaml)
+          if [[ -n "$changed" ]]; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install pinned toolchain and scanners
+        if: steps.scope.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94 --profile minimal
+          mkdir -p "$RUNNER_TEMP/transport-tools"
+          gh release download cargo-audit/v0.22.2 --repo rustsec/rustsec --pattern 'cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz' --dir "$RUNNER_TEMP/transport-tools"
+          gh release download 0.20.2 --repo EmbarkStudios/cargo-deny --pattern 'cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz*' --dir "$RUNNER_TEMP/transport-tools"
+          cd "$RUNNER_TEMP/transport-tools"
+          deny_sha=$(cat cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz.sha256)
+          printf '%s  %s\n' "$deny_sha" cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | sha256sum --check
+          tar -xzf cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          tar -xzf cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+      - name: Independently built release peers
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -I etc/transport-patches/qualify.py --output "$RUNNER_TEMP/transport-peers"
+      - name: Actual source and release features
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -I etc/transport-patches/sources.py --output "$RUNNER_TEMP/transport-sources"
+      - name: Traffic and identity mutation witnesses
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -I etc/transport-patches/mutations.py --peers "$RUNNER_TEMP/transport-peers"
+      - name: Registry and path advisory controls
+        if: steps.scope.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/transport-db"
+          python3 -I etc/transport-patches/advisories.py \
+            --output "$RUNNER_TEMP/transport-advisories" --database "$RUNNER_TEMP/transport-db" \
+            --audit "$RUNNER_TEMP/transport-tools/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit" \
+            --deny "$RUNNER_TEMP/transport-tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny"
+      - name: CI gate regressions
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
+      - name: Preserve successful and failed evidence
+        if: always() && steps.scope.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transport-evidence-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/transport-peers/*.json
+            ${{ runner.temp }}/transport-peers/*.stdout
+            ${{ runner.temp }}/transport-peers/*.stderr
+            ${{ runner.temp }}/transport-peers/*/Cargo.toml
+            ${{ runner.temp }}/transport-peers/*/Cargo.lock
+            ${{ runner.temp }}/transport-sources/*.json
+            ${{ runner.temp }}/transport-sources/*.stdout
+            ${{ runner.temp }}/transport-sources/*.stderr
+            ${{ runner.temp }}/transport-advisories/*.json
+            ${{ runner.temp }}/transport-advisories/*.stdout
+            ${{ runner.temp }}/transport-advisories/*.stderr
+            ${{ runner.temp }}/transport-advisories/deny.toml
+            ${{ runner.temp }}/transport-advisories/*/Cargo.toml
+            ${{ runner.temp }}/transport-advisories/*/Cargo.lock

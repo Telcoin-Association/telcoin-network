@@ -314,13 +314,18 @@ jobs:
       - name: Assert no pruning entry point in the node
         run: ./etc/archive-mode-guard.sh
 
+  # Transport evidence also runs for maintainer and draft PRs. Scope is evaluated inside
+  # the workflow, so unrelated changes succeed without compiling the peer fixtures.
+  transport-evidence:
+    uses: ./.github/workflows/transport-patches.yaml
+
   # The one required status check, for branch protection and for the merge queue.
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, transport-evidence]
     steps:
       - name: Check all jobs passed
         env:
@@ -347,7 +352,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt test"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -373,6 +378,11 @@ jobs:
               merge_group:attest:skipped) echo "  skipped  ${job} (verified at queue entry)" ;;
               *:attest:*)
                 echo "::error::attest: ${result} on ${EVENT_NAME}"
+                failed=1
+                ;;
+              *:transport-evidence:success) echo "  ok       ${job}" ;;
+              *:transport-evidence:*)
+                echo "::error::transport-evidence: ${result}"
                 failed=1
                 ;;
               *:*:success) echo "  ok       ${job}" ;;
