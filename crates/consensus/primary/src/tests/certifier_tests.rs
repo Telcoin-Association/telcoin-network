@@ -7,8 +7,11 @@ use crate::{
     ConsensusBus,
 };
 use rand::{rngs::StdRng, SeedableRng};
+use serde::Serialize;
 use std::{collections::HashMap, num::NonZeroUsize};
-use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
+use tn_network_libp2p::types::{
+    NetworkCommand, NetworkHandle, NetworkResponseMessage, NetworkResponseSender,
+};
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
@@ -239,15 +242,18 @@ impl MockNetwork {
 
     /// Answer the next `count` vote requests, each with the reply `reply_for` picks for it.
     ///
-    /// `reply_for` receives the peer the request is addressed to and the request. Panics, naming
-    /// `context`, if a vote request does not arrive within [`STEP_TIMEOUT`], if any other command
-    /// arrives instead, or if the requester is gone before its reply is delivered.
+    /// `reply_for` receives the peer the request is addressed to and the request. A request
+    /// answered with [`Reply::Hold`] is not answered at all: its reply channel is handed back in
+    /// [`Responses::held`]. Panics, naming `context`, if a vote request does not arrive within
+    /// [`STEP_TIMEOUT`], if any other command arrives instead, or if the requester is gone before
+    /// its reply is delivered.
     async fn respond(
         &mut self,
         count: usize,
         context: &str,
         mut reply_for: impl FnMut(&BlsPublicKey, &PrimaryRequest) -> Reply,
-    ) {
+    ) -> Responses {
+        let mut responses = Responses { held: Vec::new() };
         for ordinal in 1..=count {
             let command = self
                 .next_command(&format!("{context}: waiting for vote request {ordinal} of {count}"))
@@ -263,24 +269,42 @@ impl MockNetwork {
                 }
             };
             let result = match reply_for(&peer, &request) {
-                Reply::Vote(vote) => PrimaryResponse::Vote(vote),
-                Reply::Response(response) => response,
+                Reply::Vote(vote) => Ok(PrimaryResponse::Vote(vote)),
+                Reply::Response(response) => Ok(response),
+                Reply::Fail(error) => Err(error),
+                Reply::Hold => {
+                    responses.held.push(reply);
+                    continue;
+                }
             };
             assert!(
-                reply.send(Ok(NetworkResponseMessage { peer, result })).is_ok(),
+                reply.send(result.map(|result| NetworkResponseMessage { peer, result })).is_ok(),
                 "{context}: requester dropped vote request {ordinal} of {count} before its reply"
             );
         }
+        responses
     }
 }
 
 /// How a [`MockNetwork`] peer answers one vote request.
-#[derive(Clone)]
 enum Reply {
     /// Answer with this vote.
     Vote(Vote),
     /// Answer with this raw response, such as [`PrimaryResponse::MissingParents`].
     Response(PrimaryResponse),
+    /// Fail the request with this network error, as if the exchange with the peer failed.
+    Fail(NetworkError),
+    /// Leave the request unanswered and hand its reply channel back to the test.
+    Hold,
+}
+
+/// What [`MockNetwork::respond`] hands back once it has seen all of its requests.
+struct Responses {
+    /// The reply channels of the requests answered with [`Reply::Hold`], in arrival order.
+    ///
+    /// The requester waits on each until the test answers it or drops it; a channel whose
+    /// requester stopped waiting reports `is_closed()`.
+    held: Vec<NetworkResponseSender<PrimaryResponse>>,
 }
 
 // ===== end harness =====
@@ -682,42 +706,44 @@ async fn request_vote_outcomes() {
     store_with_non_parent.write(non_parent).expect("write non-parent certificate");
     let absent_parent = *header.parents().iter().next().expect("header has parents");
 
-    // a request to `peer` for its vote on `header`, against an empty certificate store
-    let row = |name: &'static str, reply: Reply, expected: DagResult<Vote>| VoteRequestRow {
+    // a request to `peer` for its vote on `header`, against an empty certificate store; the row
+    // expects one vote request per reply
+    let row = |name: &'static str, replies: Vec<Reply>, expected: DagResult<Vote>| VoteRequestRow {
         name,
         authority: peer.id(),
         peer_id: *peer.authority().protocol_key(),
         header: header.clone(),
         store: MemDatabase::default(),
-        reply,
+        replies,
+        cancel_after_replies: false,
         expected,
     };
 
-    let rows = vec![
-        row("valid vote", Reply::Vote(honest_vote.clone()), Ok(honest_vote.clone())),
+    let mut rows = vec![
+        row("valid vote", vec![Reply::Vote(honest_vote.clone())], Ok(honest_vote.clone())),
         row(
             "wrong header digest",
-            Reply::Vote(Vote::new(&sibling, peer.id(), &peer_keys)),
+            vec![Reply::Vote(Vote::new(&sibling, peer.id(), &peer_keys))],
             Err(DagError::UnexpectedVote(sibling.digest())),
         ),
         row(
             "wrong origin",
-            Reply::Vote(Vote { origin: bystander.id(), ..honest_vote.clone() }),
+            vec![Reply::Vote(Vote { origin: bystander.id(), ..honest_vote.clone() })],
             Err(DagError::UnexpectedVote(header.digest())),
         ),
         row(
             "wrong author",
-            Reply::Vote(Vote::new(
+            vec![Reply::Vote(Vote::new(
                 &header,
                 bystander.id(),
                 bystander.consensus_config().key_config(),
-            )),
+            ))],
             Err(DagError::UnexpectedVote(header.digest())),
         ),
         // a non-member author trips the author clause before the voting-power check can run
         row(
             "ghost author",
-            Reply::Vote(Vote { author: ghost_id.clone(), ..honest_vote.clone() }),
+            vec![Reply::Vote(Vote { author: ghost_id.clone(), ..honest_vote.clone() })],
             Err(DagError::UnexpectedVote(header.digest())),
         ),
         // the only way to reach the voting-power check is to request the vote from a non-member
@@ -726,7 +752,7 @@ async fn request_vote_outcomes() {
             peer_id: *ghost_key.public(),
             ..row(
                 "unknown authority",
-                Reply::Vote(Vote::new_with_signer(&header, ghost_id.clone(), &ghost_key)),
+                vec![Reply::Vote(Vote::new_with_signer(&header, ghost_id.clone(), &ghost_key))],
                 Err(DagError::UnknownAuthority(ghost_id.to_string())),
             )
         },
@@ -735,7 +761,10 @@ async fn request_vote_outcomes() {
             header: next_epoch_header.clone(),
             ..row(
                 "header epoch != vote epoch",
-                Reply::Vote(Vote { epoch, ..Vote::new(&next_epoch_header, peer.id(), &peer_keys) }),
+                vec![Reply::Vote(Vote {
+                    epoch,
+                    ..Vote::new(&next_epoch_header, peer.id(), &peer_keys)
+                })],
                 Err(DagError::InvalidEpoch { expected: epoch + 1, received: epoch }),
             )
         },
@@ -744,13 +773,13 @@ async fn request_vote_outcomes() {
             header: next_epoch_header.clone(),
             ..row(
                 "vote epoch != committee epoch",
-                Reply::Vote(Vote::new(&next_epoch_header, peer.id(), &peer_keys)),
+                vec![Reply::Vote(Vote::new(&next_epoch_header, peer.id(), &peer_keys))],
                 Err(DagError::InvalidEpoch { expected: epoch, received: epoch + 1 }),
             )
         },
         row(
             "round mismatch",
-            Reply::Vote(Vote { round: header.round() + 1, ..honest_vote.clone() }),
+            vec![Reply::Vote(Vote { round: header.round() + 1, ..honest_vote.clone() })],
             Err(DagError::InvalidRound { expected: header.round(), received: header.round() + 1 }),
         ),
         // the store could serve the certificate, but it is not a parent of the header
@@ -758,17 +787,54 @@ async fn request_vote_outcomes() {
             store: store_with_non_parent,
             ..row(
                 "missing parents: stored non-parent",
-                Reply::Response(PrimaryResponse::MissingParents(vec![non_parent_digest])),
+                vec![Reply::Response(PrimaryResponse::MissingParents(vec![non_parent_digest]))],
                 Err(DagError::ProposedHeaderMissingCertificates),
             )
         },
         // a real parent the store cannot serve
         row(
             "missing parents: absent parent",
-            Reply::Response(PrimaryResponse::MissingParents(vec![absent_parent])),
+            vec![Reply::Response(PrimaryResponse::MissingParents(vec![absent_parent]))],
             Err(DagError::ProposedHeaderMissingCertificates),
         ),
+        // the peer rejected the request on its merits, so asking again is pointless
+        row(
+            "RPCError is fatal",
+            vec![Reply::Fail(NetworkError::RPCError("mock permanent rejection".to_string()))],
+            Err(DagError::NetworkError(format!(
+                "irrecoverable error requesting vote for {header}: mock permanent rejection"
+            ))),
+        ),
+        // the header is superseded while the peer has not answered: the call gives up on it
+        VoteRequestRow {
+            cancel_after_replies: true,
+            ..row("canceled while held", vec![Reply::Hold], Err(DagError::Canceled))
+        },
     ];
+    // every other network error is transient: the request is sent again and the peer's second
+    // answer decides the result
+    rows.extend(
+        [
+            ("Timeout retries", NetworkError::Timeout),
+            (
+                "AckChannelClosed retries",
+                NetworkError::AckChannelClosed("mock reply channel closed".to_string()),
+            ),
+            (
+                "RPCRetryable retries",
+                NetworkError::RPCRetryable("mock transient rejection".to_string()),
+            ),
+            ("PeerUnresolved retries", NetworkError::PeerUnresolved),
+        ]
+        .into_iter()
+        .map(|(name, error)| {
+            row(
+                name,
+                vec![Reply::Fail(error), Reply::Vote(honest_vote.clone())],
+                Ok(honest_vote.clone()),
+            )
+        }),
+    );
 
     let row_count = rows.len();
     let mut failures = Vec::new();
@@ -798,15 +864,32 @@ struct VoteRequestRow {
     header: Header,
     /// The certificate store `request_vote` reads missing parents from.
     store: MemDatabase,
-    /// The peer's reply to the one vote request the row answers.
-    reply: Reply,
+    /// The peer's replies, in order, one per vote request the row expects.
+    replies: Vec<Reply>,
+    /// Fire the proposal's cancel notifier once every request has been seen.
+    cancel_after_replies: bool,
     /// What `request_vote` must return.
     expected: DagResult<Vote>,
 }
 
 /// Run one row against its own mock network, panicking with the row's name on any mismatch.
+///
+/// The row expects exactly one vote request per reply. A `request_vote` that sends fewer drops its
+/// network handle on return, so the mock sees its channel close while waiting for the next
+/// request; one that sends more waits on a request nobody answers until [`STEP_TIMEOUT`].
 async fn run_vote_request_row(row: VoteRequestRow, committee: Committee) {
-    let VoteRequestRow { name, authority, peer_id, header, store, reply, expected } = row;
+    let VoteRequestRow {
+        name,
+        authority,
+        peer_id,
+        header,
+        store,
+        replies,
+        cancel_after_replies,
+        expected,
+    } = row;
+    let request_count = replies.len();
+    let mut replies = replies.into_iter();
     let (mut network, handle) = MockNetwork::new();
     let cancel_proposal = Notifier::new();
     let call = Certifier::request_vote(
@@ -818,28 +901,41 @@ async fn run_vote_request_row(row: VoteRequestRow, committee: Committee) {
         committee,
         cancel_proposal.subscribe(),
     );
-    let (result, ()) = tokio::join!(
+    let (result, responses) = tokio::join!(
         async {
-            // the row answers exactly one vote request, so a request_vote that sends a second one
-            // waits here until the timeout
             tokio::time::timeout(STEP_TIMEOUT, call).await.unwrap_or_else(|_| {
                 panic!(
-                    "{name}: request_vote did not return within {STEP_TIMEOUT:?} (a vote request \
-                     after the row's one reply goes unanswered)"
+                    "{name}: request_vote did not return within {STEP_TIMEOUT:?} (a held request, \
+                     or a request after the row's last reply, goes unanswered)"
                 )
             })
         },
-        network.respond(1, name, |_, _| reply.clone()),
+        async {
+            let responses = network
+                .respond(request_count, name, |_, _| {
+                    replies.next().expect("respond asks for one reply per request")
+                })
+                .await;
+            if cancel_after_replies {
+                cancel_proposal.notify();
+            }
+            responses
+        },
     );
     assert!(same_outcome(&result, &expected), "{name}: expected {expected:?}, got {result:?}");
+    assert!(
+        responses.held.iter().all(NetworkResponseSender::is_closed),
+        "{name}: request_vote returned but still holds the reply channel of a held request"
+    );
 }
 
-/// Whether two `request_vote` results are the same outcome.
+/// Whether two results are the same outcome.
 ///
 /// `DagError` has no `PartialEq`. Its derived `Debug` prints the variant and every field, so equal
-/// `Debug` text means the same variant carrying the same values. `Vote`'s `PartialEq` and `Debug`
-/// both leave out fields (the signature among them), so votes are compared by their encoded bytes.
-fn same_outcome(got: &DagResult<Vote>, want: &DagResult<Vote>) -> bool {
+/// `Debug` text means the same variant carrying the same values. `Ok` values are compared by their
+/// encoded bytes: `Vote`'s `PartialEq` and `Debug` both leave out fields (the signature among
+/// them), and the bytes of a `Certificate` cover its signers and aggregated signature.
+fn same_outcome<T: Serialize>(got: &DagResult<T>, want: &DagResult<T>) -> bool {
     match (got, want) {
         (Ok(got), Ok(want)) => encode(got) == encode(want),
         (Err(got), Err(want)) => format!("{got:?}") == format!("{want:?}"),
@@ -859,43 +955,117 @@ fn row_failure(name: &str, error: tokio::task::JoinError) -> String {
         .unwrap_or_else(|| format!("{name}: row panicked with a non-string payload"))
 }
 
-// ---------------------------------------------------------------------------
-// T14: duplicate_vote_same_peer
-// The same peer sends two identical votes for the same header. The second vote
-// must be rejected with `DagError::AuthorityReuse`, while unique votes from the
-// remaining peers can still form a certificate.
-// ---------------------------------------------------------------------------
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn duplicate_vote_rejected_quorum_still_forms() {
-    let cx = CertifierContext::new();
-    let header = cx.proposer_header();
-    let proposer_id = cx.proposer().id();
-    let committee = cx.fixture.committee();
-    let mut agg = VotesAggregator::new();
+/// `VotesAggregator::append` returns exactly the result each vote calls for.
+///
+/// Every row appends its votes, in order, to a fresh aggregator and checks each result, so the
+/// aggregator's own checks are pinned without a certifier or a network in the way. A row stops at
+/// its first mismatch, since later results depend on the aggregator's state; the test lists every
+/// row that failed.
+#[test]
+fn votes_aggregator_append_outcomes() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+    let proposer = fixture.authorities().last().expect("committee has authorities");
+    let header = proposer.header(&committee);
+    let mut members = fixture.authorities();
+    let mut member = || members.next().expect("committee has three members");
+    let (a, b, c) = (member(), member(), member());
+    assert_eq!(committee.quorum_threshold(), 3, "precondition: three votes reach quorum");
 
-    let mut peers = cx.fixture.authorities().filter(|a| a.id() != proposer_id);
-    let dup = peers.next().expect("at least one non-proposer peer");
+    let vote = |voter: &AuthorityFixture<MemDatabase>| {
+        Vote::new(&header, voter.id(), voter.consensus_config().key_config())
+    };
+    // the verified certificate over exactly these voters' votes
+    let certificate = |voters: &[&AuthorityFixture<MemDatabase>]| {
+        let votes = voters.iter().map(|voter| (voter.id(), *vote(voter).signature())).collect();
+        let mut certificate = Certificate::new_unverified(&committee, header.clone(), votes)
+            .expect("the voters reach quorum");
+        certificate.verify_cert(&committee.bls_keys()).expect("expected certificate verifies");
+        certificate
+    };
 
-    // First vote from `dup` is accepted.
-    let v1 = Vote::new(&header, dup.id(), dup.consensus_config().key_config());
-    assert!(matches!(agg.append(v1, &committee, &header), Ok(None)));
+    // same author, round and epoch as `header`, but a different digest
+    let sibling = proposer.header_builder(&committee).created_at(1_000).build();
+    assert_ne!(sibling.digest(), header.digest(), "precondition: sibling header is distinct");
 
-    // Second vote from the same author is rejected.
-    let v2 = Vote::new(&header, dup.id(), dup.consensus_config().key_config());
-    assert!(matches!(agg.append(v2, &committee, &header), Err(DagError::AuthorityReuse(_))));
+    // a node outside the committee
+    let ghost_id = AuthorityIdentifier::dummy_for_test(0xAB);
+    let ghost_key = BlsKeypair::generate(&mut StdRng::from_seed([7; 32]));
+    assert_eq!(committee.voting_power_by_id(&ghost_id), 0, "precondition: ghost is not a member");
 
-    // Unique votes from other peers still allow quorum to form.
-    let mut cert = None;
-    for peer in peers {
-        let vote = Vote::new(&header, peer.id(), peer.consensus_config().key_config());
-        cert = agg.append(vote, &committee, &header).expect("unique peer vote should be accepted");
-        if cert.is_some() {
-            break;
+    // a key that belongs to no member
+    let wrong_key = BlsKeypair::generate(&mut StdRng::from_seed([8; 32]));
+
+    let rows = vec![
+        AppendRow {
+            name: "votes below quorum, then the vote that reaches it",
+            steps: vec![
+                (vote(a), Ok(None)),
+                (vote(b), Ok(None)),
+                (vote(c), Ok(Some(certificate(&[a, b, c])))),
+            ],
+        },
+        AppendRow {
+            name: "duplicate vote",
+            steps: vec![
+                (vote(a), Ok(None)),
+                (vote(a), Err(DagError::AuthorityReuse(a.id().to_string()))),
+                // the duplicate added no weight: two distinct voters are still short of quorum
+                (vote(b), Ok(None)),
+                // and the certificate is the one over the three distinct votes
+                (vote(c), Ok(Some(certificate(&[a, b, c])))),
+            ],
+        },
+        AppendRow {
+            name: "vote for another header",
+            steps: vec![(
+                Vote::new(&sibling, a.id(), a.consensus_config().key_config()),
+                Err(DagError::InvalidHeaderDigest),
+            )],
+        },
+        AppendRow {
+            name: "vote from a non-member",
+            steps: vec![(
+                Vote::new_with_signer(&header, ghost_id.clone(), &ghost_key),
+                Err(DagError::UnknownAuthority(ghost_id.to_string())),
+            )],
+        },
+        AppendRow {
+            name: "invalid signature",
+            steps: vec![(
+                Vote::new_with_signer(&header, a.id(), &wrong_key),
+                Err(DagError::InvalidSignature),
+            )],
+        },
+    ];
+
+    let row_count = rows.len();
+    let mut failures = Vec::new();
+    for AppendRow { name, steps } in rows {
+        let mut aggregator = VotesAggregator::new();
+        for (ordinal, (vote, expected)) in (1..).zip(steps) {
+            let result = aggregator.append(vote, &committee, &header);
+            if !same_outcome(&result, &expected) {
+                failures
+                    .push(format!("{name}: vote {ordinal}: expected {expected:?}, got {result:?}"));
+                break;
+            }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} of {row_count} VotesAggregator::append rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
 
-    let cert = cert.expect("certificate should form from unique non-duplicate votes");
-    assert_eq!(cert.header().digest(), header.digest());
+/// One aggregator in [`votes_aggregator_append_outcomes`] and the votes appended to it.
+struct AppendRow {
+    /// Names the row in every failure message.
+    name: &'static str,
+    /// Each vote, in append order, with the exact result `append` must return for it.
+    steps: Vec<(Vote, DagResult<Option<Certificate>>)>,
 }
 
 // ---------------------------------------------------------------------------
