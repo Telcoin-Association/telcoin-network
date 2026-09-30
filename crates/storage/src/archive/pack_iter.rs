@@ -132,22 +132,32 @@ where
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
         }
+        // On-disk frame: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors the
+        // offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above plus
+        // real mmap file-size limits already make an overflow impossible, so this only formalizes
+        // it.
+        let frame_end = pos.checked_add(4 + val_size as u64 + 4).ok_or_else(|| {
+            FetchError::IO(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack record position overflow",
+            ))
+        })?;
+        // The whole frame must end within the logical data. A frame that straddles `end` would
+        // read its tail from bytes past the data (capacity padding, or bytes appended after the
+        // iterator was opened), so it is a torn frame here, not a record.
+        if frame_end > end {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "record frame extends past the logical data end",
+            )));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
-        // On-disk frame consumed: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors
-        // the offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above
-        // plus real mmap file-size limits already make an overflow impossible, so this only
-        // formalizes it.
-        *pos = pos.checked_add(4 + val_size as u64 + 4).ok_or_else(|| {
-            FetchError::IO(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pack record position overflow",
-            ))
-        })?;
+        *pos = frame_end;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);

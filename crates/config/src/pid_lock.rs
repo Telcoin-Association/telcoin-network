@@ -8,11 +8,12 @@
 //! and refuses it, without reaching into any storage-engine-internal lock.
 //!
 //! Mechanism:
-//! - The real mutual exclusion is an **advisory file lock** (`flock(LOCK_EX)` on unix) taken on an
-//!   open handle that the guard holds for its whole lifetime. Acquisition is atomic — two racing
-//!   starts cannot both win — and the kernel releases the lock automatically when the holding
-//!   process exits or crashes, so a crash never leaves a lock that blocks restart. This closes the
-//!   read-then-write TOCTOU window a plain PID file would have.
+//! - The real mutual exclusion is an **exclusive OS file lock** ([`File::try_lock`]: `flock` on
+//!   unix, `LockFileEx` on Windows) taken on an open handle that the guard holds for its whole
+//!   lifetime. Acquisition is atomic — two racing starts cannot both win — and the kernel releases
+//!   the lock automatically when the holding process exits or crashes, so a crash never leaves a
+//!   lock that blocks restart. This closes the read-then-write TOCTOU window a plain PID file would
+//!   have.
 //! - The file *contents* (our PID) are **advisory only**: they exist so an operator (and our own
 //!   error message) can see which process holds the directory. Whoever wins the lock overwrites any
 //!   stale content.
@@ -29,7 +30,7 @@
 use crate::TelcoinDirs;
 use eyre::{bail, eyre};
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::PathBuf,
 };
@@ -41,8 +42,8 @@ use tracing::warn;
 #[must_use = "the lock is released as soon as the guard is dropped"]
 pub struct PidLock {
     path: PathBuf,
-    /// The locked handle, held for the guard's lifetime. Dropping it closes the fd, which releases
-    /// the advisory `flock`.
+    /// The locked handle, held for the guard's lifetime. Dropping it closes the handle, which
+    /// releases the lock.
     file: File,
 }
 
@@ -121,33 +122,18 @@ fn write_pid(file: &mut File, pid: u32) -> std::io::Result<()> {
     file.flush()
 }
 
-/// Try to take an exclusive advisory lock on `file` without blocking.
+/// Try to take an exclusive lock on `file` without blocking.
 ///
 /// Returns `Ok(true)` if the lock is now held by this handle, `Ok(false)` if another handle holds
-/// it, or `Err` on an unexpected OS error.
-#[cfg(unix)]
+/// it, or `Err` on an unexpected OS error. The lock is tied to this open handle (on unix, its open
+/// file description) and released when the handle closes or the process exits.
 fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    // LOCK_EX | LOCK_NB: take the exclusive lock or fail immediately if another open file
-    // description holds it. The lock is tied to this fd and released on close/exit.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        // Held by someone else: not an error, just "no".
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(err)) => Err(err),
     }
-    let err = std::io::Error::last_os_error();
-    // EWOULDBLOCK (== EAGAIN) means the lock is held by someone else — not an error, just "no".
-    match err.raw_os_error() {
-        Some(libc::EWOULDBLOCK) => Ok(false),
-        _ => Err(err),
-    }
-}
-
-/// Non-unix fallback: no advisory-lock primitive is wired up (Telcoin nodes run on unix). Keep the
-/// crate buildable elsewhere by conservatively treating a non-empty pre-existing file as a live
-/// holder, so we never allow a second concurrent writer.
-#[cfg(not(unix))]
-fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
-    Ok(file.metadata()?.len() == 0)
 }
 
 #[cfg(test)]

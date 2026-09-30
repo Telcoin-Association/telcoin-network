@@ -561,11 +561,8 @@ impl ConsensusPack {
     }
 
     /// Read-only check: does epoch `epoch`'s on-disk consensus pack predate the v2 (sentinel-era)
-    /// format? A pre-v2 pack's digest indexes were written under the old key-placement scheme, so
-    /// its by-digest lookups would silently miss present records until it is migrated. `false` if
-    /// the pack is missing/unopenable (that case is handled by the normal open path). Used by
-    /// `get_static` to migrate a legacy sealed epoch on read (encapsulates `SENTINEL_MIN_VERSION`
-    /// and the data-file name so `consensus.rs` need not know either).
+    /// format (see [`Self::is_legacy`])? `false` if the pack is missing/unopenable.
+    #[cfg(test)]
     pub(crate) fn epoch_is_legacy<P: AsRef<Path>>(path: P, epoch: Epoch) -> bool {
         let data_file = path.as_ref().join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
         matches!(pack_unsealed_version(&data_file, epoch), Some((v, _)) if v < SENTINEL_MIN_VERSION)
@@ -902,6 +899,13 @@ impl ConsensusPack {
     /// Is this packfile static- i.e. complete and read only.
     pub fn is_static(&self) -> bool {
         self.is_static
+    }
+
+    /// Does this pack predate the v2 (sentinel-era) format? A pre-v2 pack reads correctly by
+    /// number, but its digest indexes were written under the old key-placement scheme, so its
+    /// by-digest lookups would silently miss present records until it is migrated.
+    pub fn is_legacy(&self) -> bool {
+        self.version < SENTINEL_MIN_VERSION
     }
 
     /// Return the epoch for this pack file.
@@ -1877,9 +1881,7 @@ impl Inner {
     /// Returns `true` (corruption) iff a later output header decodes before EOF; stray batches, a
     /// stray meta, and CRC-failed frames are skipped. The `position` no-forward-progress guard
     /// (mirrors `pack_validate::probe_decodable_after`) stops a size-prefix-past-EOF from spinning.
-    fn output_after_tear(
-        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
-    ) -> bool {
+    fn output_after_tear(iter: &mut crate::archive::pack::RawIter<PackRecord>) -> bool {
         // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
         // position — it advances by each frame's on-disk size, including a CRC-failed
         // zero-padding frame, so it gives the same monotonic forward-progress signal as the
@@ -2213,7 +2215,7 @@ impl Inner {
     /// the exact number of `Batch` records its sub-dag names). Records at/after `end` are the
     /// discarded unacked tail.
     fn migrate_copy_v1(
-        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
+        iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         end: u64,
         epoch: Epoch,
@@ -2279,7 +2281,7 @@ impl Inner {
     /// appended. Any decode failure or a batch count that disagrees with the header is
     /// corruption.
     fn migrate_copy_v0(
-        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
+        iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         epoch: Epoch,
     ) -> Result<u64, MigrateAbort> {
@@ -4009,7 +4011,8 @@ pub(crate) async fn serve_output_bytes(
                 &mut value_buffer,
                 &mut compress_buffer,
                 PackCompression::ZStd,
-            )?;
+            )
+            .map_err(|e| PackError::Append(e.to_string()))?;
             for (_, batch) in batches.into_iter() {
                 write_value(
                     &PackRecord::Batch(batch),
@@ -4017,7 +4020,8 @@ pub(crate) async fn serve_output_bytes(
                     &mut value_buffer,
                     &mut compress_buffer,
                     PackCompression::ZStd,
-                )?;
+                )
+                .map_err(|e| PackError::Append(e.to_string()))?;
             }
             Ok(bytes)
         }

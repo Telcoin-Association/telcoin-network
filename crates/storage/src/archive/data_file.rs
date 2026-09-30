@@ -353,12 +353,27 @@ impl MmapDataFile {
             None
         };
 
+        // A writable reopen of a sealed file retires its clean-close sentinel on disk, durably,
+        // before anything is written. The sentinel only vouches for the bytes as they were sealed;
+        // once this handle writes (in place for `WriteMode::Random` files, which never overwrite
+        // the sentinel themselves), a crash must reopen as unclean so recovery runs. Zeroing it
+        // only in the mapping would leave that to page writeback, and a power loss before the
+        // sentinel's page reached disk would present torn writes as sealed. The zeros land in the
+        // capacity padding past `logical_end`, so a crash right after this leaves exactly the
+        // zero padding every unclean-recovery path already expects. One 8-byte write and a data
+        // sync per writable reopen of a sealed file (an open, never the persist hot path).
+        if !read_only && !opened_unclean && logical_end < orig_len {
+            file.write_all_at(&[0_u8; SENTINEL_LEN as usize], logical_end)?;
+            file.sync_data()?;
+        }
+
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
         // until the first write, so a crash before any data keeps it 0-length (and it reopens as
-        // empty). Existing content (including a clean file's trailing sentinel, which sits in the
-        // `[end, capacity)` padding region and is overwritten by the next append) is mapped as-is;
-        // any trailing padding a crashed writer left is handled by the pack's heal path.
-        let (mut backing, capacity) = if orig_len == 0 {
+        // empty). Existing content is mapped as-is, including a clean file's 8 trailing bytes in
+        // the `[end, capacity)` padding region (the sentinel on a read-only open; zeros on a
+        // writable one, retired above); any trailing padding a crashed writer left is handled by
+        // the pack's heal path.
+        let (backing, capacity) = if orig_len == 0 {
             (Backing::Empty, 0)
         } else if read_only {
             // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
@@ -380,20 +395,6 @@ impl MmapDataFile {
             let map = unsafe { MmapMut::map_mut(&file)? };
             (Backing::Rw(map), orig_len)
         };
-
-        // On a clean writable reopen the mapping spans the 8-byte clean-close sentinel, which now
-        // sits in the capacity padding at `[logical_end, capacity)` (the logical end was stripped
-        // back past it above). Zero it so the "capacity padding reads as zero" invariant
-        // holds from open: otherwise a later `ensure_len` that grows `end` into that gap
-        // would expose the stale sentinel bytes rather than zeros. Cheap and one-time (8
-        // bytes); the page is padding past `end` — never force-synced, and truncated away
-        // by the clean-close `Drop`. Unclean and fresh opens have no such gap (`capacity ==
-        // logical_end`, or no mapping), so this is a no-op there.
-        if !read_only {
-            if let Backing::Rw(map) = &mut backing {
-                map[logical_end as usize..capacity as usize].fill(0);
-            }
-        }
 
         let df = Self {
             file,
@@ -900,7 +901,10 @@ impl MmapDataFile {
     /// via [`raw_iter`](crate::archive::pack::Pack::raw_iter) does). An external byte consumer that
     /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must bound its
     /// own read to `end`; the physical padding is only ever removed on a clean close (`Drop`).
-    pub fn try_clone(&self) -> io::Result<(File, u64)> {
+    ///
+    /// The clone is a [`DataFileReader`] with a cursor of its own, so any number of clones can be
+    /// read at once without disturbing each other.
+    pub fn try_clone(&self) -> io::Result<(DataFileReader, u64)> {
         // A prior write/sync/remap failure means the mapped tail is of unknown durability; refuse
         // to hand out a clone (an iterator/export reader) that would read
         // possibly-non-durable bytes.
@@ -920,7 +924,7 @@ impl MmapDataFile {
                 self.flushed_end.store(self.end, Ordering::Relaxed);
             }
         }
-        Ok((self.file.try_clone()?, self.end))
+        Ok((DataFileReader { file: self.file.try_clone()?, pos: 0 }, self.end))
     }
 
     /// `msync` the dirty region to the backing store. For [`WriteMode::Append`] this is only the
@@ -1165,10 +1169,9 @@ impl Write for MmapDataFile {
         }
         // Fail closed after any earlier write/sync/remap failure: the durability of what is already
         // written is unknown, so admitting more data would only pile unsyncable bytes on a failing
-        // mapping and hide the fault. `ErrorKind::Other` (not `InvalidInput`) so
-        // `PackInner::append` moves the pack to its failed state (see `pack.rs`), which the
-        // consensus actor treats as fatal and reopens, where recovery replays the WAL and
-        // truncates the unacked tail.
+        // mapping and hide the fault. Like every write error, `PackInner::append` moves the pack
+        // to its failed state on it (see `pack.rs`), which the consensus actor treats as fatal and
+        // reopens, where recovery replays the WAL and truncates the unacked tail.
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "data file poisoned by an earlier write/sync failure; refusing further writes",
@@ -1295,6 +1298,40 @@ impl Drop for MmapDataFile {
                 tracing::error!("MmapDataFile: failed to fsync on drop: {e}");
             }
         }
+    }
+}
+
+/// A read handle on a data file, from [`MmapDataFile::try_clone`], that keeps its own cursor and
+/// reads with positional reads (`pread`). A cloned `File` descriptor shares one file offset with
+/// every other clone of it, so two readers over the same file would move each other's position; a
+/// `DataFileReader` never can.
+#[derive(Debug)]
+pub struct DataFileReader {
+    file: File,
+    pos: u64,
+}
+
+impl Read for DataFileReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read_at(buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for DataFileReader {
+    /// `SeekFrom::End` is relative to the physical file length (which includes any mmap capacity
+    /// padding; readers bound themselves by the logical end `try_clone` returned).
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let (base, offset) = match pos {
+            SeekFrom::Start(p) => (p, 0),
+            SeekFrom::End(p) => (self.file.metadata()?.len(), p),
+            SeekFrom::Current(p) => (self.pos, p),
+        };
+        self.pos = base.checked_add_signed(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range")
+        })?;
+        Ok(self.pos)
     }
 }
 
@@ -1734,6 +1771,42 @@ mod tests {
             gap.iter().all(|&b| b == 0),
             "the stale clean-close sentinel must be zeroed at open, got {gap:?}"
         );
+    }
+
+    /// A writable reopen retires the clean-close sentinel on disk before anything is written. A
+    /// random-mode file updated in place (which never overwrites its own sentinel) and then
+    /// abandoned without a clean close must reopen as unclean, never as sealed over its in-place
+    /// writes.
+    #[test]
+    fn writable_reopen_then_crash_reopens_unclean() {
+        let tmp = TempDir::with_prefix("mmap_df_reopen_crash").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(100);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, random_opts()).expect("open");
+            df.write_all(&data).expect("write"); // clean close on drop seals the file
+        }
+        assert!(
+            !MmapDataFile::open_with(&path, true, random_opts()).expect("ro open").opened_unclean(),
+            "precondition: the file is sealed"
+        );
+
+        let mut df = MmapDataFile::open_with(&path, false, random_opts()).expect("reopen rw");
+        assert!(!df.opened_unclean(), "a sealed file reopens clean");
+        let on_disk = std::fs::read(&path).expect("read file");
+        assert_eq!(
+            &on_disk[data.len()..],
+            &[0_u8; SENTINEL_LEN as usize],
+            "the sentinel is retired on disk at open"
+        );
+        df.seek(SeekFrom::Start(10)).expect("seek");
+        df.write_all(&[0xAB; 5]).expect("in-place write");
+        // Crash: the handle never runs its clean-close seal.
+        std::mem::forget(df);
+
+        let reopened =
+            MmapDataFile::open_with(&path, true, random_opts()).expect("reopen after crash");
+        assert!(reopened.opened_unclean(), "an unsealed in-place write must reopen unclean");
     }
 
     #[test]

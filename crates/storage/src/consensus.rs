@@ -1673,20 +1673,6 @@ impl ConsensusChain {
         if let Some(old) = evicted {
             old.close().await;
         }
-        // A legacy (pre-v2) sealed epoch was indexed under the old digest-key placement, so a
-        // by-digest lookup would silently miss present records (the by-number position index is
-        // placement-independent). Migrate it — which rebuilds its indexes and re-seals it as v2 —
-        // before serving it. One-time per epoch. The live current epoch was returned early
-        // above, so this only ever touches a sealed past epoch. A failed migration (a corrupt
-        // legacy log) surfaces rather than serving a stale-index handle.
-        if ConsensusPack::epoch_is_legacy(&self.base_path, epoch) {
-            self.heal_static(epoch).await?;
-            if ConsensusPack::epoch_is_legacy(&self.base_path, epoch) {
-                return Err(PackError::CorruptPack(format!(
-                    "epoch {epoch}: legacy (pre-v2) pack is not yet migrated; retry the read"
-                )));
-            }
-        }
         // `new_epoch` swaps `current_pack` and only THEN seals the previous writer
         // (`seal_previous_pack` stamps the clean-close sentinels and truncates the mmap
         // padding, always before releasing `pack_install`); an import or migration install
@@ -1731,13 +1717,20 @@ impl ConsensusChain {
                     Err(e) if e.is_missing_static_files() && !self.epoch_data_present(epoch) => {
                         return Err(e)
                     }
-                    Err(e) => {
-                        self.heal_static(epoch).await.map_err(|_| e)?;
-                        ConsensusPack::open_static(&self.base_path, epoch)?
-                    }
+                    Err(e) => return self.heal_and_reopen(epoch, Some(e)).await,
                 }
             }
         };
+        // A legacy (pre-v2) sealed epoch opens, but it was indexed under the old digest-key
+        // placement, so a by-digest lookup would silently miss present records (the by-number
+        // position index is placement-independent). Migrate it — which rebuilds its indexes and
+        // re-seals it as v2 — before serving it. One-time per epoch. The live current epoch was
+        // returned early above, so this only ever touches a sealed past epoch. A failed migration
+        // (a corrupt legacy log) surfaces rather than serving a stale-index handle.
+        if pack.is_legacy() {
+            pack.close().await;
+            return self.heal_and_reopen(epoch, None).await;
+        }
         // Final check after grabbing the lock again that another task did not also create the pack.
         // Decide under the brief lock, then release it BEFORE any `.await` — a `parking_lot` guard
         // must not be held across `close()` (same rule as the eviction block above), and the
@@ -1774,6 +1767,36 @@ impl ConsensusChain {
         } else {
             Ok(pack)
         }
+    }
+
+    /// Heal sealed past epoch `epoch` read-side (see [`Self::heal_static`]) and open the result.
+    ///
+    /// `cause` is the open error that led here, and is what the caller sees if the heal fails (the
+    /// heal's own error is logged and remembered by `heal_static`). Without one (a legacy pack that
+    /// opened but must be migrated first) the heal's error surfaces instead.
+    ///
+    /// The epoch can become the live writer while the heal runs, and the heal then stands down:
+    /// serve the live pack rather than `open_static` the active writer, whose unsealed files fail
+    /// the clean-close sentinel gate. The reopened handle is returned uncached; the next
+    /// `get_static` caches a fresh open.
+    async fn heal_and_reopen(
+        &self,
+        epoch: Epoch,
+        cause: Option<PackError>,
+    ) -> Result<ConsensusPack, PackError> {
+        self.heal_static(epoch).await.map_err(|e| cause.unwrap_or(e))?;
+        let live = self.current_pack();
+        if live.epoch() == epoch {
+            return Ok(live);
+        }
+        let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
+        if pack.is_legacy() {
+            pack.close().await;
+            return Err(PackError::CorruptPack(format!(
+                "epoch {epoch}: legacy (pre-v2) pack is not yet migrated; retry the read"
+            )));
+        }
+        Ok(pack)
     }
 
     /// True if the data log of `epoch` exists on disk.
@@ -2927,6 +2950,53 @@ mod test {
             .expect("a missing index must heal, not error")
             .expect("a present epoch with a missing index must not read as absent");
         assert_eq!(header.number, 3);
+    }
+
+    /// A read-side heal can finish after its epoch became the live writer (the heal then stands
+    /// down). The caller must get the live pack, not a static open of the active writer's epoch.
+    #[tokio::test]
+    async fn test_heal_and_reopen_serves_the_live_pack() {
+        let temp_dir = TempDir::with_prefix("test_heal_live").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+
+        // Epoch 0 is now a healthy sealed past epoch, so its heal has nothing to do. Make an
+        // epoch-0 writer the live pack, as if the epoch went live while the heal ran. It
+        // lives outside the chain's directory, so the sealed files the heal inspects stay
+        // untouched.
+        let live_dir = TempDir::with_prefix("test_heal_live_writer").expect("temp dir");
+        let epoch0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let live0 = crate::consensus_pack::ConsensusPack::open_append(
+            live_dir.path(),
+            epoch0,
+            committee.clone(),
+        )
+        .expect("open an epoch-0 writer");
+        let replaced = std::mem::replace(&mut *consensus_chain.current_pack.lock(), live0);
+        replaced.close().await;
+
+        let pack = consensus_chain
+            .heal_and_reopen(0, None)
+            .await
+            .expect("the heal of a healthy sealed epoch succeeds");
+        assert_eq!(pack.epoch(), 0);
+        assert!(
+            !pack.is_static(),
+            "the live writer must be served, not a static open of its epoch"
+        );
     }
 
     /// Build a chain whose current epoch 0 holds outputs 1..=3, and the record that closes it.

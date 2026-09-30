@@ -30,7 +30,6 @@
 use std::{
     collections::{BTreeSet, HashSet},
     fmt::{self, Display},
-    fs::File,
     path::Path,
 };
 
@@ -44,8 +43,7 @@ use crate::{
         error::fetch::FetchError,
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{DataHeader, Pack, PackCompression},
-        pack_iter::PackIter,
+        pack::{DataHeader, Pack, PackCompression, RawIter},
     },
     consensus_pack::{
         attested_output_survives_past, pack_unsealed_version, read_position_entries,
@@ -853,7 +851,7 @@ pub fn classify_physical_corruption(
 /// short/torn record leaves the reader at EOF. Guards against a record whose claimed extent runs
 /// past EOF (the iterator's logical position does not advance on that read): if a repeated error
 /// makes no forward progress, stop rather than spin.
-fn probe_decodable_after(iter: &mut PackIter<PackRecord, File>) -> bool {
+fn probe_decodable_after(iter: &mut RawIter<PackRecord>) -> bool {
     // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
     // forward-progress signal — advanced by each frame's on-disk size, no per-frame `lseek`.
     let mut last_pos = iter.logical_position();
