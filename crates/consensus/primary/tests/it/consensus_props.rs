@@ -7,11 +7,39 @@
 //! - Committee membership invariants
 
 use proptest::prelude::*;
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
+};
 use tn_primary::consensus::{LeaderSchedule, LeaderSwapTable};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{AuthorityIdentifier, ReputationScores};
+use tn_types::{AuthorityIdentifier, Committee, ReputationScores};
+
+/// Committees memoized by committee size.
+///
+/// Building a [CommitteeFixture] generates fresh BLS keypairs for every authority, which
+/// dominates the runtime of these property tests. The properties under test depend only on
+/// the committee for a given size, so each size is built once per test process.
+static COMMITTEE_CACHE: LazyLock<Mutex<HashMap<usize, (Committee, Vec<AuthorityIdentifier>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return the memoized [Committee] and authority ids for a committee of `size`.
+fn committee_for_size(size: usize) -> (Committee, Vec<AuthorityIdentifier>) {
+    COMMITTEE_CACHE
+        .lock()
+        .unwrap()
+        .entry(size)
+        .or_insert_with(|| {
+            let fixture = CommitteeFixture::builder(MemDatabase::default)
+                .committee_size(std::num::NonZeroUsize::new(size).unwrap())
+                .build();
+            let authority_ids: Vec<AuthorityIdentifier> =
+                fixture.authorities().map(|a| a.id()).collect();
+            (fixture.committee(), authority_ids)
+        })
+        .clone()
+}
 
 proptest! {
     /// Leader selection must be deterministic: same round always produces same leader.
@@ -20,10 +48,7 @@ proptest! {
         committee_size in 4usize..15,
         round in (1u32..100).prop_map(|r| r * 2) // Even rounds only
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
+        let (committee, _) = committee_for_size(committee_size);
 
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
@@ -47,10 +72,7 @@ proptest! {
     fn prop_round_robin_covers_all(
         committee_size in 4usize..15
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
+        let (committee, _) = committee_for_size(committee_size);
 
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
@@ -77,10 +99,7 @@ proptest! {
         committee_size in 4usize..15,
         start_round in 1u32..50
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
+        let (committee, _) = committee_for_size(committee_size);
 
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
@@ -104,10 +123,7 @@ proptest! {
         committee_size in 4usize..15,
         round in (1u32..100).prop_map(|r| r * 2)
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
+        let (committee, _) = committee_for_size(committee_size);
 
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
         let leader = schedule.leader(round);
@@ -124,12 +140,7 @@ proptest! {
         committee_size in 4usize..15,
         round in (1u32..100).prop_map(|r| r * 2)
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
-        let authority_ids: Vec<AuthorityIdentifier> =
-            fixture.authorities().map(|a| a.id()).collect();
+        let (committee, authority_ids) = committee_for_size(committee_size);
 
         // Create scores where authority 0 is bad
         let mut scores = ReputationScores::new(&committee);
@@ -161,10 +172,7 @@ proptest! {
         committee_size in 4usize..15,
         num_cycles in 2usize..5
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(std::num::NonZeroUsize::new(committee_size).unwrap())
-            .build();
-        let committee = fixture.committee();
+        let (committee, _) = committee_for_size(committee_size);
 
         let schedule = LeaderSchedule::new(committee, LeaderSwapTable::default());
 
@@ -194,11 +202,7 @@ proptest! {
 /// Test that bad nodes with low scores get swapped.
 #[test]
 fn test_bad_node_gets_swapped() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default)
-        .committee_size(std::num::NonZeroUsize::new(7).unwrap())
-        .build();
-    let committee = fixture.committee();
-    let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    let (committee, authority_ids) = committee_for_size(7);
 
     // No swap schedule
     let no_swap_schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());

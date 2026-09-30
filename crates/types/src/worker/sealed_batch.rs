@@ -4,7 +4,8 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, Address, BlockHash, Epoch, ExecHeader, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    crypto, encode, Address, BlockHash, BlsPublicKey, Epoch, ExecHeader, RpcInfo, TimestampSec,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -67,12 +68,17 @@ pub struct Batch {
     /// The 160-bit address to which all fees collected from the successful mining of this batch
     /// be transferred; formally Hc.
     pub beneficiary: Address,
-    /// A scalar representing EIP1559 base fee which can move up or down each batch according
-    /// to a formula which is a function of gas used in parent batch and gas target
-    /// (batch gas limit divided by elasticity multiplier) of parent batch.
-    /// The algorithm results in the base fee per gas increasing when batchs are
-    /// above the gas target, and decreasing when batchs are below the gas target. The base fee per
-    /// gas is sent to governance address.
+    /// The EIP-1559 base fee in effect for this batch.
+    ///
+    /// Unlike Ethereum, this does not move from batch to batch. The value is keyed by `worker_id`
+    /// and is constant for the whole epoch, so every validator's worker N carries the same base
+    /// fee until the epoch closes; a batch carrying any other value is rejected as
+    /// `InvalidBaseFee`.
+    ///
+    /// It is recomputed only at the epoch boundary, from that worker's gas accumulated over the
+    /// epoch against its target: either by the EIP-1559 formula (floored at
+    /// `MIN_PROTOCOL_BASE_FEE`) or pinned to a fixed value, according to the worker's on-chain fee
+    /// strategy. Collected base fees go to the configured base fee recipient.
     pub base_fee_per_gas: u64,
     /// The worker id for the worker that orginated this batch.
     /// Worker ids will be consistent accross validators (i.e. worker 0 talks to othere worker 0s,
@@ -192,10 +198,36 @@ pub fn max_batch_gas(_epoch: Epoch) -> u64 {
     30_000_000
 }
 
-/// Max batch size in effect at a timestamp.  Measured in bytes.
-/// Currently allways 1,000,000 but can change in the future at a fork.
+/// Max batch size in effect at an epoch, measured in bytes.
+/// Currently always 1,000,000 but can change in the future at a fork.
+///
+/// Fork changes that lower this limit must also lower [`min_batch_size`] and extend
+/// `min_batch_size_bounds_every_epoch` with the fork boundary and its adjacent epochs.
+/// The transaction pool checks its admission byte limit against that floor only once
+/// at node startup: the pool and its validator persist across epoch changes.
 pub fn max_batch_size(_epoch: Epoch) -> usize {
     1_000_000
+}
+
+/// Smallest batch byte limit across every epoch this build can serve.
+///
+/// Used by startup guards whose consumers cannot update their limits at epoch boundaries.
+/// Keep this floor in sync with every fork that lowers [`max_batch_size`].
+pub fn min_batch_size() -> usize {
+    max_batch_size(0)
+}
+
+/// Startup admission must fit every supported batch-size schedule segment.
+#[cfg(test)]
+#[test]
+fn min_batch_size_bounds_every_epoch() {
+    // Add each batch-size fork boundary and its adjacent epochs when the schedule changes.
+    [0, 1, Epoch::MAX].into_iter().for_each(|epoch| {
+        assert!(
+            min_batch_size() <= max_batch_size(epoch),
+            "batch byte floor exceeds epoch {epoch}"
+        );
+    });
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
@@ -209,6 +241,59 @@ pub trait BatchValidation: Send + Sync + Debug {
     /// Submit a transaction (as bytes) for inclusion in a batch.
     /// Will only submit if the txn hash fits the provided committee slot.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64);
+}
+
+/// Forwards accepted transactions to committee validators over their advertised JSON-RPC
+/// endpoints.
+///
+/// A non-committee ("observer") worker cannot include the transactions it accepts in a batch
+/// itself, so it forwards them to the committee. Instead of pushing over the libp2p worker
+/// protocol, the observer forwards each transaction to the JSON-RPC endpoint the owning
+/// validator advertised on its worker record (issue #804), so the submitter gets the same RPC
+/// experience they would get talking to a validator directly.
+///
+/// Implementations are best-effort and must not block: forwarding runs on a background task so
+/// batch production is never stalled by a slow or unreachable validator.
+pub trait TxnForwarder: Send + Sync + Debug {
+    /// Forward `transactions` to the validators that own them.
+    ///
+    /// `committee_slots` holds the committee's BLS public keys in slot order (index = committee
+    /// slot); a transaction is routed to the validator whose slot owns the sender, matching
+    /// [`BatchValidation::submit_txn_if_mine`] so all transactions from one account converge on a
+    /// single validator and nonce ordering is preserved. `validator_rpcs` is the set of
+    /// currently-known advertised endpoints; a validator that has not advertised an endpoint is
+    /// skipped in favor of one that has.
+    ///
+    /// Returns `true` if the batch was admitted to a forward task. `false` means it was dropped
+    /// at the door and the caller still owns these transactions: they must stay in the caller's
+    /// pool for a future batch. Admission is not delivery — delivery stays best-effort on the
+    /// background task.
+    fn forward_txns(
+        &self,
+        transactions: Vec<Vec<u8>>,
+        committee_slots: Vec<BlsPublicKey>,
+        validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> bool;
+}
+
+/// A [`TxnForwarder`] that admits nothing.
+///
+/// Committee voting validators never forward (they include transactions directly), so they can
+/// be constructed with this; it is also convenient in tests that do not exercise forwarding.
+/// Refusing admission keeps the honest contract: a caller that relies on forwarding sees the
+/// batch refused and keeps its transactions, instead of believing they were handed off.
+#[derive(Clone, Debug, Default)]
+pub struct NoopTxnForwarder;
+
+impl TxnForwarder for NoopTxnForwarder {
+    fn forward_txns(
+        &self,
+        _transactions: Vec<Vec<u8>>,
+        _committee_slots: Vec<BlsPublicKey>,
+        _validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Block validation error types
@@ -254,6 +339,15 @@ pub enum BatchValidationError {
     /// The batch contains blob transactions EIP-4844.
     #[error("Proposed batch contains blob transaction. Tx hash: {0}")]
     InvalidTx4844(BlockHash),
+    /// The batch contains a transaction whose EIP-2718 type byte is outside the
+    /// executable allowlist (legacy, EIP-2930, EIP-1559).
+    #[error("Proposed batch contains unsupported transaction type {tx_type}. Tx hash: {hash}")]
+    UnsupportedTxType {
+        /// The EIP-2718 type byte of the offending transaction.
+        tx_type: u8,
+        /// Hash of the offending transaction.
+        hash: BlockHash,
+    },
     /// The total allowable gas in the batch exceeds `u64::MAX`.
     #[error("Overflow calculating max possible gas.")]
     GasOverflow,

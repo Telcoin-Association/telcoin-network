@@ -10,7 +10,7 @@ pub use stores::*;
 // Always build redb, we use it as the default for persistant consensus data.
 pub use redb::database::ReDB;
 use tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
+    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
@@ -20,11 +20,20 @@ pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+/// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
+#[cfg(test)]
+mod db_bench;
 pub mod epoch_records;
+pub(crate) mod error_latch;
+pub mod exec_state_pack;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
+/// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
+#[cfg(test)]
+mod pack_bench;
+pub mod pack_validate;
 pub mod redb;
 
 pub use tn_types::error::StoreError;
@@ -54,12 +63,16 @@ const PROPOSED_CERTIFICATES_CF: &str = "proposed_certificates";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
-const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
+const CONSENSUS_OUTPUT_CACHE_CF: &str = "consensus_output_cache";
 
-const KAD_RECORD_CF: &str = "kad_record";
-const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
-const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
-const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
+/// Discovery records with role and worker id in their row hashes.
+const KAD_RECORD_CF: &str = "kad_record_v2";
+/// Provider rows with a separately decodable ownership key.
+const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record_v2";
+/// Worker discovery records isolated by worker id.
+const KAD_WORKER_RECORD_CF: &str = "kad_worker_record_v2";
+/// Worker provider rows isolated by worker id and ownership key.
+const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record_v2";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;$hint:expr;<$K:ty, $V:ty>),*) => {
@@ -80,7 +93,7 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusHeader, Header, HeaderDigest,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusOutput, Header, HeaderDigest,
         Round, TableHint, VoteInfo, WorkerId,
     };
 
@@ -96,8 +109,9 @@ pub mod tables {
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // Cache batches we produce until they are accepted (they will move to NodeBatchesCache once accepted).
         OurNodeBatchesCache;crate::OUR_NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
-        // This is a cache to store ConsensusHeaders during some sync operations, remove once in confirmed consensus output.
-        ConsensusHeaderCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
+        // Cache of verified ConsensusOutputs (header + batches) pulled during sync, keyed by number;
+        // entries are removed once written to confirmed consensus output.
+        ConsensusCache;crate::CONSENSUS_OUTPUT_CACHE_CF;TableHint::Cache;<u64, ConsensusOutput>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
@@ -177,7 +191,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
     db
 }
 
@@ -207,7 +221,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
     db
 }
 
@@ -248,6 +262,15 @@ mod test {
             startc.elapsed().as_secs_f64(),
             start.elapsed().as_secs_f64()
         );
+
+        // `commit()` on a non-full-memory layered DB only queues the commit to the
+        // background writer, so wait for that write path to drain before iterating.
+        // Without this barrier the chained disk+mem iterator below can briefly observe
+        // a key in both layers and fail the ordering assertions.  A single barrier
+        // covers all the reads below since no writes occur until the clear_table.
+        // Deliberately untimed: the commit number above measures the (async) commit
+        // call itself, not durability.
+        db.sync_persist();
 
         let start = std::time::Instant::now();
         let mut i = 0;
@@ -405,6 +428,7 @@ mod test {
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_some());
 
         db.remove::<TestTable>(&123456789).expect("Failed to remove");
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_none());
     }
 

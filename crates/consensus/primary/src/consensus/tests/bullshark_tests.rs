@@ -10,14 +10,15 @@ use crate::{
     },
     ConsensusBus,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, BlockHash, BlockNumHash, EpochRecord, ExecHeader, Notifier, SealedHeader,
-    TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
+    ExecHeader, Header, HeaderDigest, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver,
+    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -54,7 +55,9 @@ async fn order_leaders() {
     let (_, leader) = schedule.leader_certificate(6, &state.dag);
 
     // WHEN
-    let mut ordered_leaders = bullshark.order_leaders(leader.unwrap(), &state);
+    let mut ordered_leaders = bullshark
+        .order_leaders(leader.unwrap(), &state)
+        .expect("order_leaders succeeds for a valid even-round leader");
 
     // THEN
     // we expect all the leaders to be returned in round ascending order
@@ -65,6 +68,54 @@ async fn order_leaders() {
 
     // we expect to have ordered all the 3 leaders
     assert!(expected_leader_rounds.is_empty());
+}
+
+#[tokio::test]
+async fn order_leaders_rejects_odd_round_leader() {
+    // GIVEN a populated DAG (rounds 1..=7) and a Bullshark instance.
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _next_parents) =
+        make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(gc_depth);
+    certificates.iter().for_each(|certificate| {
+        state.try_insert(certificate).unwrap();
+    });
+
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let bullshark = Bullshark::new(
+        committee,
+        NUM_SUB_DAGS_PER_SCHEDULE,
+        schedule,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    // AND an odd-round certificate standing in as a malformed leader. Leaders are only ever
+    // elected on even rounds, so round 5 violates the `order_leaders` construction invariant.
+    let odd_round_leader = state
+        .dag
+        .get(&5)
+        .and_then(|authorities| authorities.values().next())
+        .map(|(_digest, certificate)| certificate.clone())
+        .expect("round 5 certificate exists in the populated DAG");
+    assert_eq!(odd_round_leader.round() % 2, 1);
+
+    // WHEN / THEN the former `assert_eq!(leader.round() % 2, 0)` panic is now a diagnosable
+    // typed error, so the consensus task shuts down cleanly instead of aborting on a backtrace.
+    let err = bullshark.order_leaders(&odd_round_leader, &state).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ConsensusError::Invariant(ConsensusInvariant::LeaderRoundNotEven(round))
+                if *round == odd_round_leader.round()
+        ),
+        "expected LeaderRoundNotEven typed error, got: {err}",
+    );
 }
 
 #[tokio::test]
@@ -348,8 +399,8 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
                 // Two schedule changes have happened during this commit
-                assert!(committed_dag_6.reputation_score.final_of_schedule);
-                assert!(committed_dag_14.reputation_score.final_of_schedule);
+                assert!(committed_dag_6.reputation_scores().final_of_schedule);
+                assert!(committed_dag_14.reputation_scores().final_of_schedule);
 
                 //
                 // We are still using a swap table with no bad list...
@@ -431,10 +482,14 @@ async fn commit_one() {
             .unwrap();
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
@@ -445,8 +500,8 @@ async fn commit_one() {
 
     // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
     // committed leader); then the leader's certificate should be committed.
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.headers.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=4 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -455,8 +510,8 @@ async fn commit_one() {
     assert_eq!(output.round(), 2);
 
     // AND the reputation scores have not been updated
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 }
 
 /// Run for 11 dag rounds with one dead node (that is not a leader). We should commit the
@@ -494,11 +549,11 @@ async fn dead_node() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     let cb_clone = cb.clone();
     // Feed all certificates to the consensus.
@@ -510,10 +565,10 @@ async fn dead_node() {
 
     // We should commit 3 leaders (rounds 2, 4 and 6).
     let mut committed = Vec::new();
-    let mut committed_sub_dags: Vec<Arc<CommittedSubDag>> = Vec::new();
+    let mut committed_sub_dags: Vec<CommittedSubDag> = Vec::new();
     for _commit_rounds in 1..=4 {
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        let headers = committed_sub_dag.headers.clone();
+        let headers: Vec<Header> = committed_sub_dag.headers().iter().cloned().collect();
         committed.extend(headers);
         committed_sub_dags.push(committed_sub_dag);
     }
@@ -529,17 +584,17 @@ async fn dead_node() {
 
     // AND check that the consensus scores are the expected ones
     for (index, sub_dag) in committed_sub_dags.iter().enumerate() {
-        assert_eq!(sub_dag.reputation_score.total_authorities(), 4);
+        assert_eq!(sub_dag.reputation_scores().total_authorities(), 4);
 
         // For the first commit we expect to have any only zero scores
         if index == 0 {
-            sub_dag.reputation_score.scores_per_authority.iter().for_each(|(_key, score)| {
+            sub_dag.reputation_scores().scores_per_authority.iter().for_each(|(_key, score)| {
                 assert_eq!(*score, 0_u64);
             });
         } else {
             // For any other commit we expect to always have a +1 score for each authority, as
             // everyone always votes for the leader
-            for (key, score) in &sub_dag.reputation_score.scores_per_authority {
+            for (key, score) in &sub_dag.reputation_scores().scores_per_authority {
                 if key == &dead_node {
                     assert_eq!(*score as usize, 0);
                 } else {
@@ -629,11 +684,11 @@ async fn not_enough_support() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -642,8 +697,8 @@ async fn not_enough_support() {
     }
 
     // We should commit 2 leaders (rounds 2 and 4).
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.headers.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -652,11 +707,11 @@ async fn not_enough_support() {
     assert_eq!(output.round(), 2);
 
     // AND all scores are zero for leader 2 , as this is the first commit
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.headers.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 2);
@@ -671,10 +726,10 @@ async fn not_enough_support() {
     // AND scores should be updated with everyone that has voted for leader of round 2.
     // Only node 0 has voted for the leader of this round, so only their score should exist
     // with value 1, and everything else should be zero.
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
 
     let node_0_name: AuthorityIdentifier = ids.first().unwrap().clone();
-    committed_sub_dag.reputation_score.scores_per_authority.iter().for_each(|(key, score)| {
+    committed_sub_dag.reputation_scores().scores_per_authority.iter().for_each(|(key, score)| {
         if *key == node_0_name {
             assert_eq!(*score, 1_u64);
         } else {
@@ -729,11 +784,11 @@ async fn missing_leader() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.
@@ -742,8 +797,8 @@ async fn missing_leader() {
     }
 
     // Ensure the commit sequence is as expected.
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.headers.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -760,7 +815,7 @@ async fn missing_leader() {
     assert_eq!(output.round(), 4);
 
     // AND all scores are zero since this is the first commit that has happened
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 }
 
 /// Run for 11 dag rounds in ideal conditions (all nodes reference all other nodes).
@@ -777,10 +832,11 @@ async fn committed_round_after_restart() {
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=11, epoch, &genesis, &ids);
 
-    let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
+    let fixture_config = fixture.authorities().next().unwrap().consensus_config();
+    let store = fixture_config.node_storage().clone();
     let temp_dir = TempDir::new().unwrap();
-    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+    let consensus_chain =
+        ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
     let previous_epoch = EpochRecord {
         epoch: committee.epoch().saturating_sub(1),
         committee: committee.bls_keys().iter().copied().collect(),
@@ -791,6 +847,17 @@ async fn committed_round_after_restart() {
 
     let mut consensus_number = 0u64;
     for input_round in (1..=11usize).step_by(2) {
+        // Build a fresh config for each restart so its one-shot shutdown cannot
+        // leak across iterations; node storage is shared so committed state
+        // survives the restart (same pattern as `restart_with_new_committee`).
+        let config = ConsensusConfig::new_with_committee_for_test(
+            fixture_config.config().clone(),
+            fixture_config.node_storage().clone(),
+            fixture_config.key_config().clone(),
+            committee.clone(),
+            NetworkConfig::default(),
+        )
+        .unwrap();
         let bullshark = Bullshark::new(
             committee.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
@@ -801,20 +868,14 @@ async fn committed_round_after_restart() {
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
         let mut rx_primary = cb.subscribe_committed_own_headers();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(
-            config.clone(),
-            &cb,
-            bullshark,
-            &task_manager,
-            consensus_chain.clone(),
-            None,
-        )
-        .await;
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+            .await
+            .unwrap();
 
         // When `input_round` is 2 * r + 1, r > 1, the previous commit round would be 2 * (r - 1),
         // and the expected commit round after sending in certificates up to `input_round` would
@@ -856,8 +917,8 @@ async fn committed_round_after_restart() {
         info!("Committed round adanced to {}", input_round.saturating_sub(1));
 
         // Shutdown consensus and wait for it to stop.
-        fixture.notify_shutdown();
-        let _ = task_manager.join(Notifier::default()).await;
+        config.shutdown().notify();
+        let _ = task_manager.join(ShutdownNotifier::default()).await;
     }
 }
 
@@ -993,12 +1054,12 @@ async fn reset_consensus_scores_on_every_schedule_change() {
             // On every 5th commit we reset the scores and count from the beginning with
             // scores updated to 1, as we expect now every node to have voted for the previous
             // leader.
-            for score in sub_dag.reputation_score.scores_per_authority.values() {
+            for score in sub_dag.reputation_scores().scores_per_authority.values() {
                 assert_eq!(*score as usize, 1);
             }
             current_score = 2;
         } else {
-            for score in sub_dag.reputation_score.scores_per_authority.values() {
+            for score in sub_dag.reputation_scores().scores_per_authority.values() {
                 assert_eq!(*score, current_score);
             }
 
@@ -1009,9 +1070,9 @@ async fn reset_consensus_scores_on_every_schedule_change() {
             if ((sub_dag.leader().round() / 2) + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
                 // if this is going to be the last score update for the current schedule, then
                 // make sure that the `final_of_schedule` will be true
-                assert!(sub_dag.reputation_score.final_of_schedule);
+                assert!(sub_dag.reputation_scores().final_of_schedule);
             } else {
-                assert!(!sub_dag.reputation_score.final_of_schedule);
+                assert!(!sub_dag.reputation_scores().final_of_schedule);
             }
         }
     }
@@ -1025,8 +1086,9 @@ async fn restart_with_new_committee() {
     let mut committee: Committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
-    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
-    let mut prev_epoch_digest = BlockHash::default();
+    let consensus_chain =
+        ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+    let mut prev_epoch_digest = EpochDigest::default();
 
     // Run for a few epochs.
     for epoch in 0..5 {
@@ -1055,9 +1117,9 @@ async fn restart_with_new_committee() {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: prev_epoch_digest,
-            final_consensus: BlockNumHash {
+            final_consensus: ConsensusNumHash {
                 number: last.map(|l| l.number).unwrap_or_default(),
-                hash: BlockHash::default(),
+                hash: ConsensusHeaderDigest::default(),
             },
             ..Default::default()
         };
@@ -1065,19 +1127,13 @@ async fn restart_with_new_committee() {
         consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(
-            config.clone(),
-            &cb,
-            bullshark,
-            &task_manager,
-            consensus_chain.clone(),
-            None,
-        )
-        .await;
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+            .await
+            .unwrap();
 
         // Make certificates for rounds 1 and 2.
         let genesis =
@@ -1112,7 +1168,7 @@ async fn restart_with_new_committee() {
         // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
         // committed leader); then the leader's certificate should be committed.
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        let mut sequence = committed_sub_dag.headers.iter();
+        let mut sequence = committed_sub_dag.headers().iter();
         for _ in 1..=4 {
             let output = sequence.next().unwrap();
             assert_eq!(output.epoch(), epoch);
@@ -1128,7 +1184,7 @@ async fn restart_with_new_committee() {
         config.shutdown().notify();
 
         // Ensure consensus stopped.
-        let _ = task_manager.join(Notifier::default()).await;
+        let _ = task_manager.join(ShutdownNotifier::default()).await;
     }
 }
 
@@ -1177,7 +1233,7 @@ async fn garbage_collection_basic() {
         sub_dags.iter().for_each(|sub_dag| {
             // ensure nothing has been committed for authority 4
             assert!(
-                !sub_dag.headers.iter().any(|c| c.author() == &slow_node),
+                !sub_dag.headers().iter().any(|c| c.author() == &slow_node),
                 "Slow authority shouldn't be amongst the committed ones"
             );
 
@@ -1298,7 +1354,7 @@ async fn slow_node() {
 
                 let sub_dag = sub_dags.first().unwrap();
 
-                for committed in &sub_dag.headers {
+                for committed in sub_dag.headers() {
                     assert!(
                         committed.round() >= 2,
                         "We don't expect to see any certificate below round 2 because of gc"
@@ -1306,7 +1362,7 @@ async fn slow_node() {
                 }
 
                 let slow_node_total =
-                    sub_dag.headers.iter().filter(|c| c.author() == &slow_node).count();
+                    sub_dag.headers().iter().filter(|c| c.author() == &slow_node).count();
 
                 assert_eq!(slow_node_total, 4);
 
@@ -1446,8 +1502,8 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
                     assert_eq!(sub_dags[0].leader().round(), 2);
                     assert_eq!(sub_dags[1].leader().round(), 6);
 
-                    assert_eq!(sub_dags[0].headers.len(), 4);
-                    assert_eq!(sub_dags[1].headers.len(), 10);
+                    assert_eq!(sub_dags[0].headers().len(), 4);
+                    assert_eq!(sub_dags[1].headers().len(), 10);
 
                     // And GC has collected everything up to round 5.
                     assert_eq!(state.dag.len(), 5);
@@ -1472,4 +1528,392 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     }
 
     assert!(committed);
+}
+
+/// Builds an optimal DAG for rounds 1..=6 over the default four-authority committee and returns
+/// the populated consensus state.
+///
+/// The fixture headers carry the deterministic per-author BLS seed signatures stamped by
+/// `mock_certificate_with_epoch`, so the seeded arm of `order_dag_inner` folds a distinct seed
+/// for each candidate leader. Certificate digests are random per process run (mock payloads
+/// embed random transactions), so the tests below assert structural and statistical properties
+/// rather than exact sequences.
+fn seeded_ordering_state() -> ConsensusState {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _next_parents) =
+        make_optimal_certificates(&committee, 1..=6, &genesis, &ids);
+
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(gc_depth);
+    certificates.iter().for_each(|certificate| {
+        state.try_insert(certificate).unwrap();
+    });
+    state
+}
+
+/// Returns two distinct round-6 certificates that stand in as alternative leaders over the same
+/// sub-DAG: an optimal DAG makes every certificate of rounds 1..=5 reachable from either one.
+///
+/// The pair is deterministic (the two smallest round-6 digests): the dag's inner map iterates
+/// in per-process random order, so picking whatever `values()` yields first would make a
+/// failing run irreproducible.
+fn two_round_6_leaders(state: &ConsensusState) -> (Certificate, Certificate) {
+    let mut candidates = state
+        .dag
+        .get(&6)
+        .expect("round 6 exists in the populated DAG")
+        .values()
+        .map(|(_digest, certificate)| (certificate.digest(), certificate.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_values();
+    let first = candidates.next().expect("at least one round 6 certificate");
+    let second = candidates.next().expect("at least two round 6 certificates");
+    assert_ne!(first.digest(), second.digest(), "leaders must be distinct");
+    (first, second)
+}
+
+/// Groups a commit sequence into per-round digest sequences, preserving the emitted order.
+fn digests_by_round(ordered: &[Certificate]) -> HashMap<Round, Vec<HeaderDigest>> {
+    ordered.iter().fold(HashMap::new(), |mut acc, certificate| {
+        acc.entry(certificate.round()).or_default().push(certificate.digest());
+        acc
+    })
+}
+
+/// Asserts that the seeded arm of `order_dag_inner` is observable for this leader: its header
+/// must carry a seed signature.
+///
+/// On an adiri-unified test build the epoch-0 fixtures sit below `SEED_SIGNATURE_FORK_EPOCH`,
+/// `Header::seed_signature()` returns `None`, and `order_dag_inner(.., true)` folds no
+/// per-leader seed, so the seeded arm silently degrades to the legacy sort: the seeded-arm
+/// tests below would pass vacuously and the arms-disagree test would fail confusingly. Fail
+/// loudly rather than assert a property this build cannot exhibit; a silent skip here would
+/// read as a pass.
+fn assert_seeded_arm_observable(leader: &Certificate) {
+    assert!(
+        leader.header().seed_signature().is_some(),
+        "this build gates seed signatures off at the fixture epoch (adiri feature unified): \
+         the seeded-arm tests would silently exercise the legacy path; pin the fixture epoch \
+         above SEED_SIGNATURE_FORK_EPOCH or run without adiri",
+    );
+}
+
+/// Post-fork `order_dag` invariants (#1260): rounds never decrease, the leader is the final
+/// certificate, and the seed-chain tie-break only permutes certificates within their round,
+/// so per-round membership is exactly what the legacy round-only sort would emit.
+#[test]
+fn order_dag_seeded_sort_preserves_rounds_and_membership() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let ordered = utils::order_dag_inner(&leader, &state, true);
+
+    // THEN the leader sorts last and rounds are non-decreasing
+    assert_eq!(ordered.last().expect("commit is non-empty").digest(), leader.digest());
+    ordered.iter().zip(ordered.iter().skip(1)).for_each(|(previous, next)| {
+        assert!(previous.round() <= next.round(), "rounds must be non-decreasing");
+    });
+
+    // AND per-round membership equals the sub-DAG: every certificate of rounds 1..=5
+    // exactly once, plus the leader alone at round 6. The seeded sort may only permute
+    // within a round.
+    let by_round = digests_by_round(&ordered);
+    let committee_size = state.dag.get(&1).expect("round 1 exists").len();
+    (1..=5).for_each(|round| {
+        let expected = state
+            .dag
+            .get(&round)
+            .expect("round exists in the DAG")
+            .values()
+            .map(|(digest, _certificate)| *digest)
+            .collect::<BTreeSet<_>>();
+        let committed = by_round.get(&round).expect("round appears in the commit");
+        let actual = committed.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "round {round} membership must match the DAG");
+        assert_eq!(committed.len(), expected.len(), "round {round} has no duplicates");
+    });
+    assert_eq!(by_round.get(&6).expect("leader round appears"), &vec![leader.digest()]);
+    assert_eq!(ordered.len(), 5 * committee_size + 1, "five full rounds plus the leader");
+}
+
+/// The seeded order is a pure function of the committed leader, the DAG, and the epoch seed
+/// chain value: two calls with the same inputs emit the identical sequence, so every honest
+/// node derives the same commit.
+#[test]
+fn order_dag_seeded_sort_is_deterministic() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let first: Vec<_> =
+        utils::order_dag_inner(&leader, &state, true).iter().map(|x| x.digest()).collect();
+    let second: Vec<_> =
+        utils::order_dag_inner(&leader, &state, true).iter().map(|x| x.digest()).collect();
+
+    // THEN
+    assert_eq!(first, second, "repeated calls must agree digest for digest");
+}
+
+/// The intra-round order is keyed on the epoch seed chain (#1260): the tie-break key is
+/// `blake3(domain || seed || certificate_digest)` where `seed` folds the leader's round and
+/// its deterministic BLS seed signature into the chain value the commit is about to fold into
+/// `CommittedSubDag::randomness`. Two distinct round-6 leaders over the same optimal sub-DAG
+/// commit the same certificates for rounds 1..=5 but disagree on at least one round's
+/// permutation, because their per-author deterministic seed signatures differ, so the folded
+/// seeds differ. This is the anti-grinding property: a proposer cannot steer its position
+/// without knowing the future leader's seed contribution, which is unpublished while it builds
+/// its header.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, two independent seeds
+/// induce independent orders on each four-certificate round, so all five rounds coincide with
+/// probability at most (1 / 24)^5, under 2e-7 per run.
+#[test]
+fn order_dag_seeded_sort_depends_on_the_leader() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader_a, leader_b) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader_a);
+    assert_seeded_arm_observable(&leader_b);
+
+    // WHEN ordering the shared rounds 1..=5 under each leader (round 6 holds only the
+    // leader itself, so it is excluded from the comparison)
+    let below_leader = |leader: &Certificate| {
+        utils::order_dag_inner(leader, &state, true)
+            .iter()
+            .filter(|x| x.round() <= 5)
+            .map(|x| x.digest())
+            .collect::<Vec<_>>()
+    };
+    let order_a = below_leader(&leader_a);
+    let order_b = below_leader(&leader_b);
+
+    // THEN both commits carry the same certificates
+    assert_eq!(
+        order_a.iter().copied().collect::<BTreeSet<_>>(),
+        order_b.iter().copied().collect::<BTreeSet<_>>(),
+        "both leaders must commit the same sub-DAG"
+    );
+    // AND the leader's seed signature reseeds the intra-round permutation
+    assert_ne!(order_a, order_b, "distinct leaders must produce distinct intra-round orders");
+}
+
+/// The seeded order does not reduce to ascending certificate-digest order: a certificate's
+/// position is not a monotone function of its own digest, so grinding toward a small or large
+/// digest buys no particular slot (#1260).
+///
+/// Statistical, not absolute: the seeded permutation matches digest-ascending order on all five
+/// four-certificate rounds with probability at most (1 / 24)^5, under 2e-7 per run, modelling
+/// blake3 as a random oracle over this run's random fixture digests.
+#[test]
+fn order_dag_seeded_sort_is_not_digest_ascending() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let by_round = digests_by_round(&utils::order_dag_inner(&leader, &state, true));
+
+    // THEN at least one round's seeded order differs from its digest-ascending order
+    let any_round_differs = (1..=5).any(|round| {
+        let seeded = by_round.get(&round).expect("round appears in the commit");
+        let ascending =
+            seeded.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        *seeded != ascending
+    });
+    assert!(any_round_differs, "seeded order must not equal ascending digest order");
+}
+
+/// Recomputes the legacy commit sequence independently of `order_dag_inner`: a pre-order DFS
+/// popped from a stack seeded with the leader, resolving each certificate's parent digests in
+/// the previous round of `state.dag`, skipping digests already seen and certificates at or
+/// below their authority's `last_committed` round, then a stable sort by round (which keeps
+/// the DFS discovery order within each round).
+fn legacy_replay_sequence(leader: &Certificate, state: &ConsensusState) -> Vec<HeaderDigest> {
+    let mut stack = vec![leader.clone()];
+    let mut seen: HashSet<HeaderDigest> = HashSet::new();
+    let mut discovered = std::iter::from_fn(|| {
+        stack.pop().map(|certificate| {
+            certificate.header().parents().iter().for_each(|parent| {
+                state
+                    .dag
+                    .get(&(certificate.round() - 1))
+                    .and_then(|entries| entries.values().find(|(digest, _)| digest == parent))
+                    .into_iter()
+                    .for_each(|(digest, parent_certificate)| {
+                        let committed = state
+                            .last_committed
+                            .get(parent_certificate.origin())
+                            .map_or_else(|| false, |r| &parent_certificate.round() <= r);
+                        if !seen.contains(digest) && !committed {
+                            seen.insert(*digest);
+                            stack.push(parent_certificate.clone());
+                        }
+                    });
+            });
+            certificate
+        })
+    })
+    .collect::<Vec<_>>();
+    discovered.sort_by_key(|certificate| certificate.round());
+    discovered.iter().map(|certificate| certificate.digest()).collect()
+}
+
+/// Legacy-arm pin (#1260): for a fixed state and leader, `order_dag_inner(.., false)` must
+/// equal the stable round-sort of the DFS discovery order, recomputed here by
+/// [`legacy_replay_sequence`], an independent reimplementation of the traversal.
+///
+/// This order must never change: historical pre-fork commits (the adiri chain included)
+/// replay through the legacy arm, and any drift would re-execute them in a different order.
+#[test]
+fn order_dag_legacy_arm_matches_independent_replay() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+
+    // WHEN
+    let legacy: Vec<_> =
+        utils::order_dag_inner(&leader, &state, false).iter().map(|x| x.digest()).collect();
+
+    // THEN
+    assert_eq!(
+        legacy,
+        legacy_replay_sequence(&leader, &state),
+        "the legacy arm must reproduce the stable round-sorted DFS discovery order"
+    );
+}
+
+/// The two arms of `order_dag_inner` agree on per-round membership for the same state and
+/// leader but disagree on at least one round's permutation: the seed-chain tie-break reorders
+/// certificates within rounds and does nothing else.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, the seeded permutation
+/// reproduces the legacy DFS order on all five four-certificate rounds with probability at
+/// most (1 / 24)^5, under 2e-7 per run.
+#[test]
+fn order_dag_arms_share_membership_and_disagree_on_order() {
+    // GIVEN
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    // WHEN
+    let seeded = digests_by_round(&utils::order_dag_inner(&leader, &state, true));
+    let legacy = digests_by_round(&utils::order_dag_inner(&leader, &state, false));
+
+    // THEN per-round membership is identical
+    (1..=6).for_each(|round| {
+        let seeded_round = seeded.get(&round).expect("round appears in the seeded commit");
+        let legacy_round = legacy.get(&round).expect("round appears in the legacy commit");
+        assert_eq!(
+            seeded_round.iter().copied().collect::<BTreeSet<_>>(),
+            legacy_round.iter().copied().collect::<BTreeSet<_>>(),
+            "round {round} membership must agree across the arms"
+        );
+    });
+    // AND at least one round's permutation differs
+    let any_round_differs = (1..=5).any(|round| seeded.get(&round) != legacy.get(&round));
+    assert!(any_round_differs, "the seeded arm must permute at least one round");
+}
+
+/// Sentinel selecting the child dispatch of [`order_dag_wrapper_consults_the_fork_gate`]: a
+/// dedicated variable rather than the fork override itself, so a lane-exported
+/// `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` cannot be mistaken for a child spawn.
+const TN_TEST_ORDER_DAG_WRAPPER_CHILD: &str = "TN_TEST_ORDER_DAG_WRAPPER_CHILD";
+
+/// Names a sibling `#[ignore]` child test as the libtest filter string for THIS binary: the
+/// module path minus its crate segment, joined to the bare function name.
+fn child_test_name(fn_name: &str) -> String {
+    module_path!()
+        .split_once("::")
+        .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"))
+}
+
+/// Production-wrapper gate pin (#1260): `order_dag` must consult
+/// `forks::leader_seeded_ordering_active(leader.epoch())`, test override included, rather
+/// than hardcoding an arm.
+///
+/// Every other test reaches the arms through the `order_dag_inner` seam with a literal bool,
+/// and on default builds the gate is constant-true, so a wrapper regression (hardcoding
+/// `true`, or reading node-local state that happens to agree) is unobservable in-process.
+/// This parent spawns THIS test binary with `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295`
+/// (dormant) in the child's env: the override latches in a process-wide `OnceLock`, so the
+/// dormant configuration needs its own process. The child's harness output must report
+/// exactly one passed test: a drifted name would match nothing and still exit 0, so exit
+/// status alone would be a vacuous pass.
+///
+/// What this does and does not discriminate: it proves the wrapper consults the fork gate
+/// (override included) instead of hardcoding an arm; it cannot distinguish `leader.epoch()`
+/// from node-local epoch state in-process, because every fixture certificate shares one
+/// epoch.
+#[test]
+fn order_dag_wrapper_consults_the_fork_gate() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let name = child_test_name("child_order_dag_wrapper_observes_dormant_gate");
+    let mut command = std::process::Command::new(exe);
+    command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
+    command.env(TN_TEST_ORDER_DAG_WRAPPER_CHILD, "1");
+    command.env("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", u32::MAX.to_string());
+    let output = command.output().expect("spawn child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child test {name} did not pass exactly once; status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+/// Child of [`order_dag_wrapper_consults_the_fork_gate`], spawned with the leader-seeded
+/// ordering fork pinned dormant: the wrapper must observe the dormant gate and emit exactly
+/// the legacy sequence, while the seeded arm, forced through the seam, still differs.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, the forced seeded
+/// permutation reproduces the legacy order on all five four-certificate rounds with
+/// probability at most (1 / 24)^5, under 2e-7 per run.
+#[test]
+#[ignore = "spawned by order_dag_wrapper_consults_the_fork_gate with a controlled env"]
+fn child_order_dag_wrapper_observes_dormant_gate() {
+    assert!(
+        std::env::var_os(TN_TEST_ORDER_DAG_WRAPPER_CHILD).is_some(),
+        "this child runs only under order_dag_wrapper_consults_the_fork_gate, which pins the \
+         fork override in the spawn env; running it directly proves nothing about the wrapper",
+    );
+    // The override latches in a process-wide `OnceLock`, so a child launched WITHOUT the
+    // variable in its env cannot observe the dormant gate. Fail loudly rather than assert a
+    // property this process cannot hold; a silent skip here would read as a pass.
+    assert_eq!(
+        tn_types::forks::leader_seeded_ordering_fork_epoch_override(),
+        Some(u32::MAX),
+        "this child requires TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=4294967295 latched from its \
+         spawn env; the override is OnceLock-latched, so it cannot be set after startup",
+    );
+
+    let state = seeded_ordering_state();
+    let (leader, _other) = two_round_6_leaders(&state);
+    assert_seeded_arm_observable(&leader);
+
+    let digests = |ordered: &[Certificate]| ordered.iter().map(|x| x.digest()).collect::<Vec<_>>();
+    let wrapper = digests(&utils::order_dag(&leader, &state));
+    let legacy = digests(&utils::order_dag_inner(&leader, &state, false));
+    let seeded = digests(&utils::order_dag_inner(&leader, &state, true));
+
+    assert_eq!(
+        wrapper, legacy,
+        "order_dag must observe the dormant fork gate and take the legacy arm digest for digest",
+    );
+    assert_ne!(
+        wrapper, seeded,
+        "the arms must disagree here, or the equality above is vacuous and this child cannot \
+         tell which arm the wrapper took",
+    );
 }

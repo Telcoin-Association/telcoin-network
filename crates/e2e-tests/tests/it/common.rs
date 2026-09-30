@@ -2,8 +2,13 @@
 //!
 //! Process management, cleanup guards, and helpers used across all test modules.
 
-use e2e_tests::setup_log_dir;
-use escargot::CargoRun;
+use alloy::{
+    primitives::{utils::parse_ether, Bytes},
+    providers::{Provider, ProviderBuilder},
+    sol_types::SolCall as _,
+};
+use clap::Parser as _;
+use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -18,17 +23,35 @@ use nix::{
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt::Debug,
+    io::{Read, Write},
+    net::TcpStream,
+    ops::RangeInclusive,
     path::Path,
-    process::Child,
-    sync::{Condvar, Mutex},
+    process::{Child, ExitStatus},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
-use tn_types::{
-    address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address,
+use telcoin_network_cli::genesis::GenesisArgs;
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
+use tn_reth::{
+    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    test_utils::TransactionFactory,
+    RethChainSpec,
 };
-use tokio::runtime::Builder;
+use tn_test_utils::{wait_until, wait_until_blocking};
+use tn_types::{
+    address, get_available_tcp_port, keccak256,
+    test_utils::{init_test_tracing, CommandParser},
+    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo,
+    DEFAULT_WORKER_ID, U256,
+};
+use tokio::{
+    runtime::Builder,
+    time::{timeout, Instant},
+};
 use tracing::{error, info};
 
 /// Max number of e2e tests that can run concurrently.
@@ -136,17 +159,94 @@ impl ProcessGuard {
 
     /// Send SIGTERM to all, wait for each to exit (SIGKILL if needed), then clear all slots.
     /// Safe to call multiple times.
+    ///
+    /// The exit wait polls EVERY child against one shared 6s deadline (the same shape as
+    /// [`Self::wait_for_natural_exits`]) instead of giving each child its own [`wait_or_kill`]
+    /// window: a 10ms poll reaps the common case (all children already dying from the parallel
+    /// SIGTERM) as soon as the last one exits, instead of rounding each child up to its next
+    /// 1.2s poll slot in sequence.
     pub(crate) fn kill_all(&mut self) {
         // Phase 1: SIGTERM all in parallel for fast graceful shutdown
         self.send_term_all();
 
-        // Phase 2: wait for each to exit, escalate to SIGKILL if needed
-        for slot in self.children.iter_mut() {
-            if let Some(ref mut child) = slot {
-                wait_or_kill(child);
-            }
-            *slot = None;
+        // Phase 2: one shared deadline for every child to exit, polled at 10ms.
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let all_exited =
+            std::iter::repeat(()).take_while(|()| std::time::Instant::now() < deadline).any(|()| {
+                std::thread::sleep(Duration::from_millis(10));
+                self.children
+                    .iter_mut()
+                    .flatten()
+                    .all(|child| child.try_wait().ok().flatten().is_some())
+            });
+
+        // Phase 3: escalate whatever is still running, then clear every slot. `try_wait` on an
+        // already-reaped child returns its stored status, so exited children are never signaled.
+        if !all_exited {
+            self.children.iter_mut().flatten().for_each(|child| {
+                if child.try_wait().ok().flatten().is_none() {
+                    force_kill_and_reap(child);
+                }
+            });
         }
+        self.children.iter_mut().for_each(|slot| *slot = None);
+    }
+
+    /// Wait (bounded) for every child at `indices` to exit on its own, without signaling any of
+    /// them. All not-yet-exited children are polled together each round against ONE shared
+    /// `timeout`, so the whole wait is bounded by `timeout` — not `timeout * indices.len()`, as a
+    /// sequence of per-child waits would be.
+    ///
+    /// On success every named child has been reaped, so its slot is cleared: `kill_all`/`Drop`
+    /// signal raw pids, and the OS may reuse a reaped child's pid, so the guard must never signal
+    /// it again. The returned `(index, status)` pairs are ordered by index. On timeout the
+    /// still-running children stay guarded so `Drop` still cleans them up, and a named-timeout
+    /// error (naming the pending children) is returned.
+    pub(crate) fn wait_for_natural_exits(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        timeout: Duration,
+    ) -> eyre::Result<Vec<(usize, ExitStatus)>> {
+        let want: Vec<usize> = indices.into_iter().collect();
+        for &idx in &want {
+            if self.children.get(idx).and_then(|slot| slot.as_ref()).is_none() {
+                return Err(eyre::eyre!("no child process at index {idx}"));
+            }
+        }
+
+        // `wait_until_blocking` takes an `Fn` closure, but `try_wait` needs `&mut Child`, so thread
+        // the children and the collected exit statuses through `RefCell`s (the poll loop is
+        // single-threaded). Polling every not-yet-exited child on each round lets one shared
+        // deadline cover them all.
+        let children = RefCell::new(&mut self.children);
+        let exits: RefCell<HashMap<usize, ExitStatus>> = RefCell::new(HashMap::new());
+        let description = format!("children {want:?} to exit on their own");
+        wait_until_blocking(timeout, &description, || {
+            let mut children = children.borrow_mut();
+            let mut exits = exits.borrow_mut();
+            for &idx in &want {
+                if exits.contains_key(&idx) {
+                    continue;
+                }
+                if let Some(child) = children[idx].as_mut() {
+                    if let Some(status) = child.try_wait()? {
+                        exits.insert(idx, status);
+                    }
+                }
+            }
+            Ok(exits.len() == want.len())
+        })?;
+
+        // Every requested child is reaped; clear its slot so `kill_all`/`Drop` never signal a
+        // possibly-reused pid. The `children` borrow of `self.children` has already ended here —
+        // its last use was inside the poll closure above — so the Vec can be mutated directly.
+        let exits = exits.into_inner();
+        for &idx in exits.keys() {
+            self.children[idx] = None;
+        }
+        let mut statuses: Vec<(usize, ExitStatus)> = exits.into_iter().collect();
+        statuses.sort_by_key(|&(idx, _)| idx);
+        Ok(statuses)
     }
 }
 
@@ -188,12 +288,20 @@ fn wait_or_kill(child: &mut Child) {
         }
         std::thread::sleep(Duration::from_millis(1200));
     }
-    if let Err(e) = child.kill() {
-        error!(target: "e2e-test", ?e, "error sending SIGKILL");
-    }
-    if let Err(e) = child.wait() {
-        error!(target: "e2e-test", ?e, "error waiting for child after SIGKILL");
-    }
+    force_kill_and_reap(child);
+}
+
+/// SIGKILL a child that did not exit within its SIGTERM grace, then reap it.
+///
+/// The shared tail of every kill path ([`wait_or_kill`], [`ProcessGuard::kill_all`], and
+/// `basefee.rs`'s boundary-kill helper). Failures are logged, not propagated: teardown has no
+/// recovery path, and signaling a child that already exited is harmless (`kill` on a reaped
+/// child returns `InvalidInput` without touching any pid).
+pub(crate) fn force_kill_and_reap(child: &mut Child) {
+    child.kill().unwrap_or_else(|e| error!(target: "e2e-test", ?e, "error sending SIGKILL"));
+    child.wait().map(drop).unwrap_or_else(
+        |e| error!(target: "e2e-test", ?e, "error waiting for child after SIGKILL"),
+    );
 }
 
 /// Get the block for block_number or latest block if None for node.
@@ -244,7 +352,9 @@ where
     let mut resp = client.request(command, params.clone()).await;
     let mut i = 0;
     while i < retries && resp.is_err() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Short backoff: these retries mask brief RPC unavailability (e.g. a node
+        // mid-restart), so poll ~4x/sec instead of once a second.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let client = HttpClientBuilder::default()
             .request_timeout(Duration::from_secs(10))
             .build(node)
@@ -295,34 +405,32 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     // exist or an epoch closes, so we cannot rely on block_number advancing
     // during idle periods. Actual block production is verified later by
     // send_and_confirm().
-    let mut i = 0;
-    loop {
-        let mut all_responsive = true;
-        for url in client_urls {
-            if get_block_number(url).is_err() {
-                all_responsive = false;
-                break;
-            }
-        }
-        if all_responsive {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        i += 1;
-        if i > 45 {
-            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
-        }
-    }
+    wait_until_blocking(Duration::from_secs(45), "all nodes advancing", || {
+        Ok(client_urls.iter().all(|url| get_block_number(url).is_ok()))
+    })
 }
 
 /// Start a process running a validator node.
 pub(crate) fn start_validator(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
     run: u32,
+) -> Child {
+    start_validator_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start a validator node process with additional CLI arguments (e.g. `--metrics`).
+pub(crate) fn start_validator_with_args(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
@@ -346,15 +454,44 @@ pub(crate) fn start_validator(
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
+    command.args(extra_args);
+
     setup_log_dir(&mut command, instance, test, run);
 
     command.spawn().expect("failed to execute")
 }
 
+/// Advertise a validator's JSON-RPC endpoint on its worker record.
+///
+/// The genesis ceremony leaves `p2p_info.workers[0].rpc` unset, and a non-committee node
+/// forwards accepted transactions to whatever endpoints committee validators advertise
+/// (issue #804); with none advertised, each seal is refused with
+/// `BlockSealError::NotValidator` and the transactions stay pending in the node's own
+/// pool, retried roughly once per `max_batch_delay` until an endpoint is discoverable.
+/// Call this between the config ceremony and `start_validator`, passing the same
+/// `rpc_port` the validator will serve `--http` on; the node re-signs the record from
+/// its `node-info.yaml` at startup, so editing the file is sufficient.
+pub(crate) fn advertise_worker_rpc(
+    base_dir: &Path,
+    instance: usize,
+    rpc_port: u16,
+) -> eyre::Result<()> {
+    let path = base_dir.join(format!("validator-{}", instance + 1)).join("node-info.yaml");
+    let mut node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
+    let rpc = Some(RpcInfo { http: format!("http://127.0.0.1:{rpc_port}").parse()?, ws: None });
+    node_info
+        .p2p_info
+        .worker_mut(DEFAULT_WORKER_ID)
+        .map(|worker| worker.rpc = rpc)
+        .ok_or_else(|| eyre::eyre!("validator-{} node info has no worker 0", instance + 1))?;
+    Config::write_to_path(&path, &node_info, ConfigFmt::YAML)?;
+    Ok(())
+}
+
 /// Start a process running an observer node.
 pub(crate) fn start_observer(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -430,6 +567,25 @@ pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> 
     call_rpc(node, "tn_info", rpc_params![], 10, "tn_info")
 }
 
+/// Retrieve a node's current consensus participation mode ([`NodeMode`]) over RPC.
+///
+/// Reads the live mode via `tn_nodeMode`. A node whose RPC is not yet up returns an error
+/// immediately, leaving retry timing to the caller's bounded wait. A current-mode query cannot
+/// establish whether a transient mode occurred between calls.
+pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
+    call_rpc(node, "tn_nodeMode", rpc_params![], 0, "tn_nodeMode")
+}
+
+/// Scrape the metrics endpoint with a raw HTTP GET (no client dependencies).
+pub(crate) fn scrape_metrics(addr: &str) -> eyre::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
 /// Query a node's highest consensus chain block height.
 /// NOTE: consensus chain is required to grow to detect byzantine validators.
 pub(crate) fn get_latest_consensus_header_number(node: &str) -> eyre::Result<u64> {
@@ -483,8 +639,6 @@ pub(crate) fn send_and_confirm(
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
 
-    // sleep
-    std::thread::sleep(Duration::from_millis(1000));
     info!(target: "restart-test", "calling get_positive_balance_with_retry...");
 
     // get positive bal and kill child2 if error
@@ -543,6 +697,8 @@ pub(crate) fn get_balance_above_with_retry(
 }
 
 /// Create, sign and submit a TXN to transfer TEL from key's account to to_account.
+/// Returns the submitted transaction's hash as reported by `eth_sendRawTransaction`, so callers
+/// can attribute the tx to its exact block via the receipt.
 pub(crate) fn send_tel(
     node: &str,
     key: &str,
@@ -551,13 +707,13 @@ pub(crate) fn send_tel(
     gas_price: u128,
     gas: u128,
     nonce: u128,
-) -> eyre::Result<()> {
+) -> eyre::Result<String> {
     let mut to_addr = [0_u8; 20];
     //const_hex::decode_to_slice(to_account, &mut to_addr[..])?;
     to_addr.copy_from_slice(to_account.as_slice());
     let (from_account, _, _) = decode_key(key)?;
     let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
+        chain: 0xde7e1,
         nonce,
         to: Some(to_addr),
         value: amount,
@@ -579,6 +735,697 @@ pub(crate) fn send_tel(
         transaction_bytes,
     )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
+    Ok(res_str)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Epoch-test scaffolding shared by epochs.rs, basefee.rs, and eject.rs
+// ---------------------------------------------------------------------------------------------
+
+/// Name of the extra (non-genesis-committee) validator node used by epoch and ejection tests.
+pub(crate) const NEW_VALIDATOR: &str = "new-validator";
+/// BLS passphrase shared by all nodes started via [`start_nodes`].
+pub(crate) const NODE_PASSWORD: &str = "sup3rsecuur";
+/// Initial stake per validator written into genesis and used by `stake` transactions.
+pub(crate) const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
+/// Epoch duration (seconds) for epoch-boundary style tests.
+///
+/// Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
+/// ConsensusPack::open_append). With test-utils, these are ~1.3MB each (vs ~130MB in prod).
+/// 10s provides margin for parallel test execution and CI load variance.
+pub(crate) const EPOCH_DURATION: u64 = 10;
+
+/// Create genesis for epoch/ejection tests.
+///
+/// Funds `extra_node` (a validator that joins after genesis) and the governance wallet to issue
+/// NFTs. This method also configures the initial committee to start the network.
+pub(crate) fn create_genesis_for_test(
+    temp_path: &Path,
+    extra_node: (&str, Address),
+    governance_wallet: Address,
+    committee: &Vec<(&str, Address)>,
+    epoch_duration: u64,
+) -> eyre::Result<Genesis> {
+    let (extra_name, extra_address) = extra_node;
+    // use same passphrase for all nodes
+    let passphrase = Some(NODE_PASSWORD.to_string());
+
+    // create validator info for the extra validator to join later
+    let extra_node_path = temp_path.join(extra_name);
+    create_validator_info(&extra_node_path, &extra_address.to_string(), passphrase.clone())?;
+
+    // fund governance to issue NFT and the extra validator to stake
+    let accounts = vec![
+        (
+            governance_wallet,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), /* 50mil TEL */
+        ),
+        (
+            extra_address,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
+        ),
+    ];
+
+    let shared_genesis_dir = temp_path.join("shared-genesis");
+
+    // create the initial committee of validators and create genesis
+    let genesis = config_committee(
+        temp_path,
+        &shared_genesis_dir,
+        passphrase,
+        governance_wallet,
+        accounts,
+        committee,
+        epoch_duration,
+        None,
+    )?;
+
+    // copy genesis for the extra validator
+    std::fs::create_dir_all(extra_node_path.join("genesis"))?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/committee.yaml"),
+        extra_node_path.join("genesis/committee.yaml"),
+    )?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/genesis.yaml"),
+        extra_node_path.join("genesis/genesis.yaml"),
+    )?;
+    std::fs::copy(
+        shared_genesis_dir.join("parameters.yaml"),
+        extra_node_path.join("parameters.yaml"),
+    )?;
+
+    Ok(genesis)
+}
+
+/// Configure the initial committee and fund accounts for network genesis.
+///
+/// All data is written to file.
+///
+/// `chain_id` overrides the genesis ceremony's default chain id (`911329`). Only the
+/// governance-Safe fork lane needs it: an `adiri` binary refuses to boot any chain whose id is
+/// not `2017` (`telcoin-network-cli::node`), and the default binary refuses one whose id IS
+/// `2017`, so the two e2e binaries need different ids and neither can be left implicit on the
+/// adiri lane. Pass `None` everywhere else to keep the ceremony default.
+pub(crate) fn config_committee(
+    temp_path: &Path,
+    shared_genesis_dir: &Path,
+    passphrase: Option<String>,
+    consensus_registry_owner: Address,
+    accounts: Vec<(Address, GenesisAccount)>,
+    validators: &Vec<(&str, Address)>,
+    epoch_duration: u64,
+    chain_id: Option<u64>,
+) -> eyre::Result<Genesis> {
+    // create shared genesis dir
+    let copy_path = shared_genesis_dir.join("genesis/validators");
+    std::fs::create_dir_all(&copy_path)?;
+    // create validator info and copy to shared genesis dir
+    for (v, addr) in validators.iter() {
+        let dir = temp_path.join(v);
+        // init genesis ceremony to create committee files
+        create_validator_info(&dir, &addr.to_string(), passphrase.clone())?;
+
+        // copy to shared genesis dir
+        std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
+    }
+
+    // configuration for ConesnsusRegistry to pass through CLI
+    let min_withdrawal = "1_000";
+    let epoch_rewards = "1000";
+
+    info!(target: "epoch-test", "creating committee!");
+
+    // create committee from shared genesis dir
+    let mut genesis_args: Vec<String> = vec![
+        "tn".into(),
+        "--basefee-address".into(),
+        "0x9999999999999999999999999999999999999999".into(),
+        "--consensus-registry-owner".into(),
+        consensus_registry_owner.to_string(),
+        "--initial-stake-per-validator".into(),
+        INITIAL_STAKE_AMOUNT.into(),
+        "--min-withdraw-amount".into(),
+        min_withdrawal.into(),
+        "--epoch-block-rewards".into(),
+        epoch_rewards.into(),
+        "--epoch-duration-in-secs".into(),
+        epoch_duration.to_string(),
+        "--dev-funded-account".into(),
+        "test-source".into(),
+        "--max-header-delay-ms".into(),
+        "500".into(),
+        "--min-header-delay-ms".into(),
+        "250".into(),
+        "--max-batch-delay-ms".into(),
+        "250".into(),
+    ];
+    if let Some(chain_id) = chain_id {
+        genesis_args.push("--chain-id".into());
+        genesis_args.push(chain_id.to_string());
+    }
+    let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
+    create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
+
+    // update genesis with funded accounts
+    let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
+    let genesis: Genesis = Config::load_from_path(&data_dir, ConfigFmt::YAML)?;
+    let genesis = genesis.extend_accounts(accounts);
+    Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
+
+    // distribute updated genesis to all validators
+    for (v, _addr) in validators.iter() {
+        let dir = temp_path.join(v);
+        std::fs::create_dir_all(dir.join("genesis"))?;
+        // copy genesis files back to validator dirs
+        std::fs::copy(
+            shared_genesis_dir.join("genesis/committee.yaml"),
+            dir.join("genesis/committee.yaml"),
+        )?;
+        std::fs::copy(
+            shared_genesis_dir.join("genesis/genesis.yaml"),
+            dir.join("genesis/genesis.yaml"),
+        )?;
+        std::fs::copy(shared_genesis_dir.join("parameters.yaml"), dir.join("parameters.yaml"))?;
+    }
+
+    Ok(genesis)
+}
+
+/// Start the network using the node cli command.
+pub(crate) fn start_nodes(
+    temp_path: &Path,
+    validators: &[(&str, Address)],
+    test: &str,
+    run: u32,
+) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
+    let bin = e2e_tests::get_telcoin_network_binary();
+
+    let mut children = Vec::new();
+    let mut endpoints = Vec::new();
+    for (v, _) in validators.iter() {
+        let dir = temp_path.join(v);
+
+        if *v == NEW_VALIDATOR {
+            info!(target: "epoch-test", ?v, "starting new validator");
+        }
+
+        // Get dynamic ports for RPC - OS assigns ports, no instance compensation needed
+        let rpc_port = get_available_tcp_port("127.0.0.1").expect("available tcp port");
+        let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+
+        // IPC - unique path under temp dir to avoid cross-test conflicts
+        let ipc_path = temp_path.join(format!("{v}.ipc"));
+
+        let mut command = bin.command();
+        command
+            .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
+            .arg("--bls-passphrase-source")
+            .arg("env")
+            .arg("node")
+            .arg("--datadir")
+            .arg(&*dir.to_string_lossy())
+            .arg("--http")
+            .arg("--http.port")
+            .arg(rpc_port.to_string())
+            .arg("--ws")
+            .arg("--ws.port")
+            .arg(ws_port.to_string())
+            .arg("--ipcpath")
+            .arg(ipc_path.to_string_lossy().as_ref());
+
+        setup_log_dir(&mut command, v, test, run);
+
+        children.push(command.spawn().expect("failed to execute"));
+        endpoints.push(NodeEndpoints {
+            http_url: format!("http://127.0.0.1:{rpc_port}"),
+            ws_url: format!("ws://127.0.0.1:{ws_port}"),
+            ipc_path: ipc_path.to_string_lossy().to_string(),
+        });
+    }
+
+    Ok((children, endpoints))
+}
+
+/// Watch `iterations` epoch boundaries pass on `rpc_url`, asserting each one closes (the epoch
+/// info changes and the block height grows). Returns the epoch id after the final boundary.
+///
+/// `epoch_duration` is the network's configured epoch duration (seconds); callers pass their own
+/// value (e.g. epochs.rs runs a shorter cadence than the ejection tests) so the boundary-wait
+/// deadline scales with it and the on-chain duration assertion matches the genesis config.
+pub(crate) async fn loop_epochs(
+    start: u32,
+    iterations: u32,
+    rpc_url: &str,
+    epoch_duration: u64,
+) -> eyre::Result<u32> {
+    // create rpc client for node1 default rpc address
+    let rpc_url = rpc_url.to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    // retrieve current committee
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+
+    let mut last_epoch_block_height = current_epoch_info.blockHeight;
+    for i in start..start + iterations {
+        // Poll until the epoch changes, with a generous timeout for parallel test load. Capture
+        // the changed `EpochInfo` from inside the poll (via `RefCell`, since `wait_until` takes
+        // an `Fn` closure) so the boundary is read exactly once instead of fetched again after.
+        let observed: RefCell<Option<ConsensusRegistry::EpochInfo>> = RefCell::new(None);
+        wait_until(
+            Duration::from_secs(epoch_duration * 4),
+            &format!("epoch to change on iteration {i}"),
+            || async {
+                let info = consensus_registry.getCurrentEpochInfo().call().await?;
+                let changed = info != current_epoch_info;
+                if changed {
+                    *observed.borrow_mut() = Some(info);
+                }
+                Ok(changed)
+            },
+        )
+        .await?;
+        let new_epoch_info =
+            observed.into_inner().expect("wait_until returned Ok, so a changed epoch was observed");
+
+        assert!(new_epoch_info.blockHeight > last_epoch_block_height);
+        assert_eq!(new_epoch_info.epochDuration as u64, epoch_duration);
+
+        // store the last seen epoch info that is expected to change every epoch
+        last_epoch_block_height = new_epoch_info.blockHeight;
+        current_epoch_info = new_epoch_info;
+    }
+    Ok(current_epoch_info.epochId)
+}
+
+/// Generate all the transactions needed for a new validator to be shuffled into the committee.
+///
+/// The validator's node info is read from `temp_path/new-validator` (see [`NEW_VALIDATOR`]).
+pub(crate) fn generate_new_validator_txs(
+    temp_path: &Path,
+    chain: Arc<RethChainSpec>,
+    new_validator: &mut TransactionFactory,
+    governance_wallet: &mut TransactionFactory,
+) -> eyre::Result<Vec<Vec<u8>>> {
+    // read bls public key from fs for new validator
+    let new_validator_path = temp_path.join(NEW_VALIDATOR);
+    let new_validator_info = Config::load_from_path_or_default::<NodeInfo>(
+        new_validator_path.join("node-info.yaml").as_path(),
+        ConfigFmt::YAML,
+    )?;
+
+    // governance issue nft to new validator tx
+    let calldata = ConsensusRegistry::mintCall { validatorAddress: new_validator.address() }
+        .abi_encode()
+        .into();
+    let mint_nft = governance_wallet.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    // stake tx
+    let proof = ConsensusRegistry::ProofOfPossession {
+        signature: new_validator_info.proof_of_possession.to_bytes().into(),
+    };
+    let calldata = ConsensusRegistry::stakeCall {
+        blsPubkey: new_validator_info.bls_public_key.compress().into(),
+        proofOfPossession: proof,
+    }
+    .abi_encode()
+    .into();
+    let stake_tx = new_validator.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        parse_ether(INITIAL_STAKE_AMOUNT)?,
+        calldata,
+    );
+
+    // activation tx
+    let calldata = ConsensusRegistry::activateCall {}.abi_encode().into();
+    let activate_tx = new_validator.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    Ok(vec![mint_nft, stake_tx, activate_tx])
+}
+
+/// Submit a transaction from the consensus-registry owner (governance) wallet to the
+/// `ConsensusRegistry` and wait for it to confirm. Returns the tx hash and the block number the
+/// transaction landed in (from its receipt) so callers can anchor assertions to an exact epoch.
+pub(crate) async fn send_owner_tx(
+    rpc_url: &str,
+    owner_wallet: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    calldata: Bytes,
+) -> eyre::Result<(String, u64)> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let tx = owner_wallet.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&tx).await?;
+    // txs may land right at an epoch boundary, get orphaned, and be re-injected into the next
+    // epoch; allow two full epoch durations + startup buffer for confirmation
+    let hash =
+        timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??.to_string();
+    let block = get_tx_receipt_block(rpc_url, &hash)?;
+    Ok((hash, block))
+}
+
+/// Minimal snapshot of an epoch's identity, its first EL block, and its duration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EpochSnapshot {
+    pub(crate) epoch_id: u32,
+    /// First EL block of the epoch (the block at which the committee became active). Under
+    /// skip-empty-execution this block may not exist yet; the block BEFORE it is the previous
+    /// epoch's closing block, produced exactly at the boundary.
+    pub(crate) block_height: u64,
+    /// The epoch's configured duration in seconds.
+    pub(crate) epoch_duration: u64,
+}
+
+/// Poll a provider until its RPC answers `eth_chainId`.
+pub(crate) async fn wait_for_rpc<P: Provider>(provider: &P) -> eyre::Result<()> {
+    wait_until(Duration::from_secs(30), "provider RPC answers eth_chainId", || async {
+        Ok(provider.get_chain_id().await.is_ok())
+    })
+    .await
+}
+
+/// Read the current epoch snapshot from the `ConsensusRegistry`.
+pub(crate) async fn current_epoch<P: Provider>(provider: &P) -> eyre::Result<EpochSnapshot> {
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+    let info = registry.getCurrentEpochInfo().call().await?;
+    Ok(EpochSnapshot {
+        epoch_id: info.epochId,
+        block_height: info.blockHeight,
+        epoch_duration: u64::from(info.epochDuration),
+    })
+}
+
+/// Poll the `ConsensusRegistry` until the current epoch id is at least `target`, returning the
+/// snapshot of that epoch.
+pub(crate) async fn wait_for_epoch_at_least<P: Provider>(
+    provider: &P,
+    target: u32,
+) -> eyre::Result<EpochSnapshot> {
+    // A boundary every `EPOCH_DURATION`s; allow generous slack for CI load.
+    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4 * (target as u64 + 1));
+    loop {
+        let snap = current_epoch(provider).await?;
+        if snap.epoch_id >= target {
+            return Ok(snap);
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "epoch did not reach {target} within timeout (stuck at {})",
+                snap.epoch_id
+            ));
+        }
+        // Poll ~4x/sec: with 5s epochs a 1s cadence adds up to ~1s of slop per boundary.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll `node` until its latest execution block number is at least `min_height`.
+pub(crate) async fn wait_for_head_at_least(
+    node: &str,
+    min_height: u64,
+    timeout_secs: u64,
+) -> eyre::Result<()> {
+    wait_until(
+        Duration::from_secs(timeout_secs),
+        &format!("{node} head to reach block {min_height}"),
+        || async { Ok(get_block_number(node)? >= min_height) },
+    )
+    .await
+}
+
+/// Wait (bounded) for `epoch` to be reached on `http_url`, failing with a message that names the
+/// calling phase instead of hanging until the harness slow-timeout kills the test.
+pub(crate) async fn assert_epoch_reached(
+    http_url: &str,
+    epoch: u32,
+    phase: &str,
+) -> eyre::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(http_url.parse()?);
+    let bound = EPOCH_DURATION * 6;
+    match timeout(Duration::from_secs(bound), wait_for_epoch_at_least(&provider, epoch)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            Err(eyre::eyre!("{phase}: node {http_url} failed reaching epoch {epoch}: {e}"))
+        }
+        Err(_) => {
+            Err(eyre::eyre!("{phase}: node {http_url} did not reach epoch {epoch} within {bound}s"))
+        }
+    }
+}
+
+/// Wait until the host clock sits inside a measured mid-epoch window and return that epoch's
+/// snapshot.
+///
+/// `EpochInfo` exposes no epoch-start timestamp, but the previous epoch's closing block
+/// (`block_height - 1`) is produced exactly at the boundary, so its timestamp measures when the
+/// current epoch started (the registry records `block.number + 1` at `concludeEpoch`). All
+/// testnet nodes run on this host, which makes host-clock vs block-timestamp comparison sound.
+/// Re-checks on a bounded 250ms cadence, rather than a blind sleep followed by a hard assert,
+/// until the measured phase is at least `MIN_PHASE` seconds into the epoch and at least
+/// `END_MARGIN` seconds before the next boundary.
+pub(crate) async fn wait_for_mid_epoch<P: Provider>(
+    provider: &P,
+    node: &str,
+) -> eyre::Result<EpochSnapshot> {
+    /// Seconds past the boundary before the mid-epoch window opens.
+    const MIN_PHASE: u64 = 1;
+    /// Seconds of margin demanded before the next boundary. With a 5s epoch this leaves a
+    /// `[MIN_PHASE, epoch_duration - END_MARGIN] = [1s, 3s]` landing window that keeps the tx (and
+    /// the restart kill) clear of both boundaries; at the previous 10s epoch the window was the
+    /// wider `[2s, 6s]`. Expressed as small absolute seconds so the window stays non-empty at the
+    /// 5s consensus minimum (`MIN_PHASE + END_MARGIN <= epoch_duration`).
+    const END_MARGIN: u64 = 2;
+
+    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
+    loop {
+        let snap = current_epoch(provider).await?;
+        let boundary_block = snap.block_height.saturating_sub(1);
+        let epoch_start = read_block_timestamp(node, boundary_block)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host clock is after the unix epoch")
+            .as_secs();
+        let phase = now.saturating_sub(epoch_start);
+        if phase >= MIN_PHASE && phase + END_MARGIN <= snap.epoch_duration {
+            info!(
+                target: "e2e-test",
+                epoch = snap.epoch_id, phase, duration = snap.epoch_duration,
+                "measured mid-epoch phase"
+            );
+            return Ok(snap);
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "no mid-epoch window observed within {}s: epoch {} at phase {phase}s of {}s",
+                EPOCH_DURATION * 4,
+                snap.epoch_id,
+                snap.epoch_duration
+            ));
+        }
+        // Poll ~4x/sec so the mid-epoch window (as narrow as ~2s at a 5s epoch) is caught promptly.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Seconds of runway left before `snap`'s epoch closes, measured from the host clock against the
+/// epoch's start.
+///
+/// Mirrors the phase arithmetic [`wait_for_mid_epoch`] performs: the block before the epoch's
+/// first block (`block_height - 1`) is the previous epoch's closing block, produced exactly at the
+/// boundary, so its timestamp is when this epoch started; every testnet node runs on this host, so
+/// the host-clock vs block-timestamp comparison is sound. Saturates to 0 once the boundary is due.
+/// `as_secs()` floors the host clock while the block timestamp is already whole seconds, so the
+/// result can over-report the true remaining budget by strictly under a second; a caller must keep
+/// a margin over its worst-case sequence rather than treat the value as exact.
+pub(crate) fn epoch_seconds_remaining(node: &str, snap: &EpochSnapshot) -> eyre::Result<u64> {
+    let boundary_block = snap.block_height.saturating_sub(1);
+    let epoch_start = read_block_timestamp(node, boundary_block)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host clock is after the unix epoch")
+        .as_secs();
+    let phase = now.saturating_sub(epoch_start);
+    Ok(snap.epoch_duration.saturating_sub(phase))
+}
+
+/// Fetch the receipt for `tx_hash` from `node` via `eth_getTransactionReceipt` and return the
+/// `blockNumber` it landed in.
+///
+/// Retries briefly: the balance-based landing signal and receipt indexing can race by a moment.
+pub(crate) fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let receipt: Option<HashMap<String, Value>> =
+            call_rpc(node, "eth_getTransactionReceipt", rpc_params!(tx_hash), 3, tx_hash)?;
+        if let Some(receipt) = receipt {
+            let raw = receipt.get("blockNumber").ok_or_else(|| {
+                eyre::eyre!("receipt for tx {tx_hash} on {node} has no blockNumber field")
+            })?;
+            return parse_hex_u64(raw).ok_or_else(|| {
+                eyre::eyre!(
+                    "receipt for tx {tx_hash} on {node} blockNumber is not a hex u64: {raw:?}"
+                )
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(eyre::eyre!("no receipt for confirmed tx {tx_hash} on {node} within 10s"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
+///
+/// These testnets run a single worker (worker 0), so every block's base fee is worker 0's fee.
+///
+/// Do **not** assume a block's fee is the fee of the epoch containing it. Only a
+/// **transaction-bearing** block reliably carries its epoch's fee: it takes
+/// `batch.base_fee_per_gas` (`crates/engine/src/payload_builder.rs:190`), which is the fee the
+/// worker built the batch at. An empty epoch-closing block instead copies its parent's
+/// `base_fee_per_gas` verbatim (`:124`), so in a run of idle epochs every block carries the last
+/// transaction-bearing block's fee, however many boundaries back that was — including the idle
+/// epoch's own single closing block.
+///
+/// Anchor a fee assertion to something read out of chain state — see
+/// `state_export_import::recorded_entry_fee`, which reads the `WorkerConfigs` word a node actually
+/// enters on — rather than inferring the expected value from another block's header, and read it
+/// off a block that carried transactions.
+pub(crate) fn read_base_fee(node: &str, block_number: u64) -> eyre::Result<u64> {
+    let block = get_block(node, Some(block_number))?;
+    let raw = block
+        .get("baseFeePerGas")
+        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no baseFeePerGas field"))?;
+    parse_hex_u64(raw).ok_or_else(|| {
+        eyre::eyre!("block {block_number} on {node} baseFeePerGas is not a hex u64: {raw:?}")
+    })
+}
+
+/// Read the `timestamp` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
+pub(crate) fn read_block_timestamp(node: &str, block_number: u64) -> eyre::Result<u64> {
+    let block = get_block(node, Some(block_number))?;
+    let raw = block
+        .get("timestamp")
+        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no timestamp field"))?;
+    parse_hex_u64(raw).ok_or_else(|| {
+        eyre::eyre!("block {block_number} on {node} timestamp is not a hex u64: {raw:?}")
+    })
+}
+
+/// Parse a JSON value that is expected to be a `0x`-prefixed hex string into a `u64`.
+pub(crate) fn parse_hex_u64(value: &Value) -> Option<u64> {
+    let s = value.as_str()?;
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Poll `http_url` for the certified epoch record of `epoch`, verify the certificate against the
+/// record's own committee, and return the record.
+///
+/// Certificates are produced asynchronously after epoch boundaries via quorum voting, so this
+/// polls until `timeout_secs` elapses before failing.
+pub(crate) async fn fetch_verified_epoch_record(
+    http_url: &str,
+    epoch: u32,
+    timeout_secs: u64,
+) -> eyre::Result<EpochRecord> {
+    let provider = ProviderBuilder::new().connect_http(http_url.parse()?);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let (epoch_rec, cert) = loop {
+        match provider
+            .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (epoch,))
+            .await
+        {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < deadline => {
+                // Poll ~4x/sec so the record is picked up promptly once quorum voting completes.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                return Err(eyre::eyre!(
+                    "epoch record not available for epoch {epoch} on {http_url}: {e}"
+                ));
+            }
+        }
+    };
+    eyre::ensure!(
+        epoch_rec.verify_with_cert(&cert),
+        "invalid epoch record: {} {}/{} {}!",
+        http_url,
+        epoch_rec.epoch,
+        epoch_rec.digest(),
+        cert.epoch_hash
+    );
+    Ok(epoch_rec)
+}
+
+/// Assert every node in `endpoints` serves a certified, verifying epoch record for every epoch in
+/// `epochs`, and that each node has executed the final block named by each record with the exact
+/// hash the record commits to.
+///
+/// Hash equality is the cross-node divergence detector: two nodes can both HAVE a block at the
+/// recorded height while disagreeing on its contents (e.g. a different withdrawals_root ⇒ a
+/// different hash), so existence alone cannot catch divergence.
+pub(crate) async fn assert_epoch_records_verify(
+    endpoints: &[NodeEndpoints],
+    epochs: RangeInclusive<u32>,
+    per_record_timeout_secs: u64,
+) -> eyre::Result<()> {
+    for ep in endpoints {
+        for epoch in epochs.clone() {
+            let epoch_rec =
+                fetch_verified_epoch_record(&ep.http_url, epoch, per_record_timeout_secs).await?;
+            // Make sure the node has executed the final block from the epoch record.
+            // This should prove it has the consensus output as well (i.e. verify the pack data).
+            let block =
+                get_block(&ep.http_url, Some(epoch_rec.final_state.number)).map_err(|e| {
+                    eyre::eyre!(
+                        "final block {} for epoch {epoch} missing on {}: {e}",
+                        epoch_rec.final_state.number,
+                        ep.http_url
+                    )
+                })?;
+            // The block must be the SAME block the record commits to, not merely one at the
+            // same height (the RPC serves hex strings; the record stores a typed hash).
+            let block_hash = block.get("hash").and_then(Value::as_str).ok_or_else(|| {
+                eyre::eyre!(
+                    "final block {} for epoch {epoch} on {} has no hash field",
+                    epoch_rec.final_state.number,
+                    ep.http_url
+                )
+            })?;
+            let expected_hash = epoch_rec.final_state.hash.to_string();
+            eyre::ensure!(
+                block_hash.eq_ignore_ascii_case(&expected_hash),
+                "final block {} for epoch {epoch} on {} hash mismatch: node has {block_hash}, \
+                 record commits to {expected_hash}",
+                epoch_rec.final_state.number,
+                ep.http_url
+            );
+        }
+    }
     Ok(())
 }
 
@@ -612,4 +1459,188 @@ pub(crate) fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
         }
         Err(err) => Err(Report::msg(err.to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Commit-time, metrics and consensus-chain readers
+// ---------------------------------------------------------------------------------------------
+
+/// One `tn_getBlockTimestampMillis` response, parsed out of its hex-encoded JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockCommitTime {
+    /// The execution block's number.
+    pub(crate) block_number: u64,
+    /// The execution block's hash.
+    pub(crate) block_hash: tn_types::B256,
+    /// The execution block's whole-second EVM `timestamp`.
+    pub(crate) timestamp: u64,
+    /// The commit time of the block's consensus header, in milliseconds since the Unix epoch.
+    pub(crate) timestamp_millis: u64,
+    /// Whether the consensus header's leader epoch commits with millisecond resolution.
+    pub(crate) sub_second: bool,
+    /// The number of the consensus header the block was executed from; `None` for genesis.
+    pub(crate) consensus_number: Option<u64>,
+    /// The digest of that consensus header, which is the block's `parentBeaconBlockRoot`; `None`
+    /// for genesis.
+    pub(crate) consensus_digest: Option<tn_types::B256>,
+}
+
+/// Fetch and parse `tn_getBlockTimestampMillis` for execution block `block_number`.
+///
+/// The node answers `null` for a block it does not know, so callers should only ask for heights
+/// at or below the node's head. A `null` answer, a missing required field, or a malformed one is an
+/// error naming the field. The two consensus fields are optional in the response (genesis has
+/// neither), so only a present-but-malformed value fails for them.
+pub(crate) async fn get_block_commit_time<P: Provider>(
+    provider: &P,
+    block_number: u64,
+) -> eyre::Result<BlockCommitTime> {
+    let response: Option<Value> = provider
+        .raw_request("tn_getBlockTimestampMillis".into(), (format!("0x{block_number:x}"),))
+        .await?;
+    let response = response.ok_or_else(|| {
+        eyre::eyre!("tn_getBlockTimestampMillis returned null for block {block_number}")
+    })?;
+    let malformed = |field: &str| {
+        eyre::eyre!("block {block_number}: `{field}` missing or malformed: {response}")
+    };
+    let quantity = |field: &str| response.get(field).and_then(parse_hex_u64);
+    let hash = |field: &str| {
+        response
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<tn_types::B256>().ok())
+    };
+    // genesis omits both consensus fields, so only a present-but-unparseable one fails
+    let optional = |field: &str, parsed: bool| -> eyre::Result<()> {
+        if response.get(field).is_some() && !parsed {
+            return Err(malformed(field));
+        }
+        Ok(())
+    };
+
+    let consensus_number = quantity("consensusNumber");
+    optional("consensusNumber", consensus_number.is_some())?;
+    let consensus_digest = hash("consensusDigest");
+    optional("consensusDigest", consensus_digest.is_some())?;
+    Ok(BlockCommitTime {
+        block_number: quantity("blockNumber").ok_or_else(|| malformed("blockNumber"))?,
+        block_hash: hash("blockHash").ok_or_else(|| malformed("blockHash"))?,
+        timestamp: quantity("timestamp").ok_or_else(|| malformed("timestamp"))?,
+        timestamp_millis: quantity("timestampMillis")
+            .ok_or_else(|| malformed("timestampMillis"))?,
+        sub_second: response
+            .get("subSecond")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| malformed("subSecond"))?,
+        consensus_number,
+        consensus_digest,
+    })
+}
+
+/// Read the value of the prometheus series `name` from the metrics endpoint at `addr` (the
+/// address a node was started with `--metrics` on), summed over every label set.
+///
+/// A series that is absent from the scrape is an error, not zero: counters are the usual subject
+/// of a "this never happened" assertion, and reading an unregistered or renamed series as zero
+/// would pass that assertion without measuring anything. Retries for up to 30s, so a transient
+/// scrape failure or a series that registers on first use late in startup does not fail the read.
+pub(crate) fn scrape_metric_value(addr: &str, name: &str) -> eyre::Result<f64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let last = match scrape_metrics(addr) {
+            Ok(body) => match sum_metric_samples(&body, name)? {
+                Some(value) => return Ok(value),
+                None => body,
+            },
+            Err(e) => format!("scrape failed: {e}"),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "metrics endpoint {addr} never served series `{name}`; last response:\n{}",
+                &last[..last.len().min(2000)]
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Sum every sample of the prometheus series `name` in a text-format scrape `body`, or `None`
+/// when the body holds no sample of it.
+///
+/// A sample line is `name value` or `name{labels} value`; comment lines and every other series
+/// (including ones `name` is a prefix of) are skipped. A sample whose value does not parse is an
+/// error rather than a skipped line, so a format change cannot hide the series.
+fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
+    let mut total = None;
+    for line in body.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        // the label set can hold spaces inside quoted values, so step past its closing brace
+        // before taking the value token
+        let after_labels = match rest.strip_prefix('{') {
+            Some(labels) => match labels.rfind('}') {
+                Some(end) => &labels[end + 1..],
+                None => continue,
+            },
+            None if rest.starts_with(char::is_whitespace) => rest,
+            // a longer series name that merely starts with `name`
+            None => continue,
+        };
+        let raw = after_labels.split_whitespace().next().unwrap_or_default();
+        let value: f64 =
+            raw.parse().map_err(|e| eyre::eyre!("sample of `{name}` has value {raw:?}: {e}"))?;
+        total = Some(total.unwrap_or(0.0) + value);
+    }
+    Ok(total)
+}
+
+/// Read every consensus header a stopped node committed, in consensus-number order.
+///
+/// Opens the node's consensus chain under `datadir` directly, so the node must not be running
+/// and must not be restarted on this datadir afterwards without care: opening heals the open
+/// epoch's pack in place and clears leftover staging directories, which would race a live node.
+/// The walk ends at the last header the open epoch's pack holds (read from the pack itself rather
+/// than the "latest" slot hint, which can run one ahead of a pack cut short by a hard kill) and
+/// starts at number 1, since the genesis header (number 0) is never stored. Any number in between
+/// that the chain cannot serve is an error, so a gap fails the read instead of shortening the
+/// walk.
+pub(crate) async fn read_consensus_headers(
+    datadir: &Path,
+) -> eyre::Result<Vec<tn_types::ConsensusHeader>> {
+    // the node's `TelcoinDirs::epochs_db_path`
+    let base = datadir.join("consensus-db").join("epochs");
+    // opening a missing directory would quietly start a brand-new, empty chain there
+    eyre::ensure!(base.is_dir(), "no consensus chain at {}", base.display());
+    // the committee only seeds a chain that has never committed anything; an existing chain
+    // reads every epoch's committee from its own packs
+    let chain =
+        tn_storage::consensus::ConsensusChain::new(base.clone(), tn_types::Committee::default())
+            .map_err(|e| eyre::eyre!("opening consensus chain at {}: {e}", base.display()))?;
+    let last = chain
+        .consensus_header_latest()
+        .await
+        .map_err(|e| eyre::eyre!("reading latest consensus header at {}: {e}", base.display()))?
+        .ok_or_else(|| eyre::eyre!("consensus chain at {} holds no headers", base.display()))?
+        .number;
+
+    let mut headers = Vec::new();
+    for number in 1..=last {
+        let header = chain
+            .consensus_header_by_number(number)
+            .await
+            .map_err(|e| {
+                eyre::eyre!("reading consensus header {number} at {}: {e}", base.display())
+            })?
+            .ok_or_else(|| {
+                eyre::eyre!("consensus header {number} of 1..={last} missing at {}", base.display())
+            })?;
+        eyre::ensure!(
+            header.number == number,
+            "consensus header lookup for {number} at {} returned header {}",
+            base.display(),
+            header.number
+        );
+        headers.push(header);
+    }
+    Ok(headers)
 }

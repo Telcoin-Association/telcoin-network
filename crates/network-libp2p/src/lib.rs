@@ -20,8 +20,11 @@ mod codec;
 mod consensus;
 pub mod error;
 pub mod kad;
+mod metrics;
 mod peers;
+mod quic_incoming;
 pub mod stream;
+mod sync;
 pub mod types;
 
 // export types
@@ -29,14 +32,24 @@ pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
 pub use stream::StreamError;
+pub use sync::{
+    read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
+    WorkerSyncRequest,
+};
+pub use types::ResponseChannel;
 
 // re-export specific libp2p types
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
     Multiaddr, Stream,
 };
 #[cfg(test)]
 #[path = "./tests/common.rs"]
 pub(crate) mod common;
+#[cfg(test)]
+#[path = "tests/fixture_tests.rs"]
+mod fixture_tests;
+#[cfg(test)]
+#[path = "tests/quic_retry.rs"]
+mod quic_retry;

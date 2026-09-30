@@ -25,6 +25,11 @@ pub(crate) enum ProposerError {
     /// Error writing to the proposer store.
     #[error("Failed to write new header to proposer store: {0}")]
     StoreError(String),
+    /// The epoch DB's durable-persistence barrier reported a failed commit, so the last-proposed
+    /// header is not on disk. Fatal: broadcasting the header anyway would risk self-inflicted
+    /// equivocation on restart (issue #975).
+    #[error("Durable persistence barrier failed; epoch DB commit did not succeed: {0}")]
+    DurableBarrierFailed(String),
 }
 
 impl From<watch::error::RecvError> for ProposerError {

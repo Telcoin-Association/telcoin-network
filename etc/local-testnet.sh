@@ -71,9 +71,9 @@ LENGTH="${#VALIDATORS[@]}"
 
 # Use RELEASE="debug" below and remove the --release to use a debug build
 RELEASE="release"
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 # Example of using redb for the consensus DB
-#cargo build --bin telcoin-network --features redb --release
+#cargo build -p telcoin-network --bin telcoin-network --features redb --release
 
 if [ -d "${ROOTDIR}" ]; then
     echo "The directory ${ROOTDIR} already exists -- skipping configuration"
@@ -180,8 +180,8 @@ if [ "$START" = true ]; then
     DATADIR="${ROOTDIR}/observer"
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
+    # This node's key is outside the committee, so its role is derived as observer.
     target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-       --observer \
        --instance 5 \
        --metrics "${CONSENSUS_METRICS}" \
        --log.stdout.format log-fmt \

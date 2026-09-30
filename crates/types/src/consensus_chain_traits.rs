@@ -17,13 +17,14 @@
 //! Error handling follows the [`Database`] trait convention of `eyre::Result`,
 //! so these interfaces compose cleanly with the rest of the workspace.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
 use crate::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, EpochRecord, Round, B256,
+    Committee, ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch,
+    EpochRecord, Round,
 };
 
 /// Marker trait for an async readable+seekable stream over an epoch's pack
@@ -48,7 +49,7 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
-        digest: B256,
+        digest: ConsensusHeaderDigest,
     ) -> impl Future<Output = eyre::Result<Option<ConsensusHeader>>> + Send;
 
     /// Retrieve a consensus header by global number.
@@ -56,6 +57,18 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
         &self,
         number: u64,
     ) -> impl Future<Output = eyre::Result<Option<ConsensusHeader>>> + Send;
+
+    /// Retrieve the raw consensus output bytes by global number.
+    fn consensus_output_bytes_by_number(
+        &self,
+        number: u64,
+    ) -> impl Future<Output = eyre::Result<Option<Vec<u8>>>> + Send;
+
+    /// Retrieve a full consensus output (with batches) by global number.
+    fn consensus_output_by_number(
+        &self,
+        number: u64,
+    ) -> impl Future<Output = eyre::Result<Option<ConsensusOutput>>> + Send;
 
     /// Retrieve the most recent consensus header that was executed.
     fn consensus_header_latest(
@@ -80,14 +93,14 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     fn read_last_committed(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = HashMap<AuthorityIdentifier, Round>> + Send;
+    ) -> impl Future<Output = eyre::Result<HashMap<AuthorityIdentifier, Round>>> + Send;
 
     /// Read the final committed sub dag of `epoch` together with its
     /// finalised reputation scores.
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = Option<Arc<CommittedSubDag>>> + Send;
+    ) -> impl Future<Output = eyre::Result<Option<CommittedSubDag>>> + Send;
 
     /// Load a consensus output from the current epoch by number.
     fn get_consensus_output_current(
@@ -138,7 +151,7 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
-    ) -> impl Future<Output = eyre::Result<()>> + Send;
+    ) -> impl Future<Output = eyre::Result<u64>> + Send;
 
     /// Rotate the current pack file to a new epoch.  The previous pack is
     /// persisted and moved into the recent-packs cache before the new pack

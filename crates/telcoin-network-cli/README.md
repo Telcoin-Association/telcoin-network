@@ -10,14 +10,16 @@ The `telcoin-network` binary has three subcommands:
 
 ## Prerequisites
 
-Hardware (recommended minimums for Adiri testnet):
+Hardware: [Hardware requirements](../../docs/src/getting-started/hardware-requirements.md) has the sizing model, the benchmark results and the observer profiles.
+The validator figures below are the minimum and recommended tiers from that page, set from the 2026-09 benchmark; the page says which figures are measured and which are modelled.
+CPU and memory are twice the measured single-worker figures, a margin for the multi-worker rollout.
 
-| Resource | Minimum    | Recommended   |
-| -------- | ---------- | ------------- |
-| CPU      | 8 cores    | 16+ cores     |
-| RAM      | 16 GB      | 64 GB        |
-| Disk     | 500 TB TLC NVMe SSD | 1 TB TLC NVMe SSD |
-| Network  | 100 Mbps   | 1 Gbps        |
+| Resource | Minimum | Recommended |
+| -------- | ------- | ----------- |
+| CPU      | 8 physical cores | 16 physical cores, PassMark single-thread 3,500+ |
+| RAM      | 32 GB ECC, no swap | 64 GB ECC, no swap |
+| Disk     | 2 TB TLC NVMe SSD, 10,000+ sustained write IOPS, 300+ MB/s, rated 2+ DWPD | 4 TB TLC NVMe SSD, 20,000+ sustained IOPS, 500+ MB/s, rated 1+ DWPD |
+| Network  | 200 Mbps symmetric | 1 Gbps |
 
 Software:
 
@@ -29,7 +31,7 @@ Software:
 Build from source:
 
 ```bash
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 ```
 
 The binary lands at `target/release/telcoin-network`.
@@ -59,6 +61,7 @@ telcoin-network keytool generate observer \
 | `--address`, `--execution-address` | required                   | EVM address for fee recipient. Pass `0` for the zero address. Env: `EXECUTION_ADDRESS`                                |
 | `--workers`                        | `1`                        | Number of workers for the primary (range: 1-4, must be 1 currently)                                                   |
 | `--force`, `--overwrite`           | `false`                    | Overwrite existing keys. Existing keys are lost permanently                                                           |
+| `--name`                           | auto-derived               | Human-readable node name written to `node-info.yaml` (logging/RPC only). Defaults to `node-<bs58 of BLS key>`         |
 | `--external-primary-addr`          | localhost with random port | External multiaddr for the primary P2P network. Format: `/ip4/HOST/udp/PORT/quic-v1`. Env: `TN_EXTERNAL_PRIMARY_ADDR` |
 | `--external-worker-addrs`          | localhost with random port | Comma-separated multiaddrs for worker P2P networks. Env: `TN_EXTERNAL_WORKER_ADDRS`                                   |
 
@@ -74,6 +77,8 @@ The `--bls-passphrase-source` global flag controls how the BLS private key is en
 | `no-passphrase` | Store the key unencrypted. Testing only; never use in production                                                                              |
 
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
+
+The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
 
 ### Generated files
 
@@ -117,6 +122,50 @@ execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
 proof_of_possession: "kFa9r..."
 ```
 
+### Rotating the execution address
+
+To stake or earn rewards under a different execution address, the proof of possession has to be re-signed. The PoP commits to the execution address, so the original signature fails on-chain `stake()` verification once the address changes (the symptom is a "proof of possession is incorrect" revert).
+
+`keytool generate pop` re-signs the proof of possession for a new address using the node's *existing* keys. It never generates or overwrites keys — the BLS key, network identity keys, p2p peer IDs, and node name stay byte-for-byte identical. Only `execution_address` and `proof_of_possession` in `node-info.yaml` change.
+
+```bash
+telcoin-network keytool generate pop \
+    --datadir /var/lib/telcoin \
+    --address 0xNEW_EXECUTION_ADDRESS
+```
+
+The command requires existing keys and a `node-info.yaml` under `--datadir`; it errors if either is missing (run `keytool generate validator|observer` first). When the new address differs from the current one it logs a warning, re-signs, and prints the new proof of possession. The `proof-of-possession` alias and the `EXECUTION_ADDRESS` env var both work, mirroring `generate validator|observer`.
+
+After rotating, re-export the staking arguments for the new address (see [Staking registration](#staking-registration)):
+
+```bash
+telcoin-network keytool export-staking-args \
+    --node-info /var/lib/telcoin/node-info.yaml
+```
+
+### Advertising a JSON-RPC endpoint
+
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.worker.rpc` and advertised by the worker network when the node runs.
+
+`keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
+
+```bash
+telcoin-network keytool set-rpc \
+    --datadir /var/lib/telcoin \
+    --http https://validator.example.com:8545/ \
+    --ws wss://validator.example.com:8546/
+```
+
+`--http` is the required HTTP/HTTPS endpoint; `--ws` is the optional WebSocket endpoint. Both are validated with the same check node startup applies — `--http` must use the `http` or `https` scheme and `--ws` must use `ws` or `wss` — so a bad scheme fails immediately instead of being advertised and rejected by peers.
+
+Remove a previously-advertised endpoint with `--clear`:
+
+```bash
+telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
+```
+
+`--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
+
 ## Genesis ceremony
 
 The genesis ceremony runs once per network. One coordinator collects all validators' `node-info.yaml` files, runs the `genesis` command, and distributes the output to every participant.
@@ -145,22 +194,23 @@ telcoin-network genesis \
     --consensus-registry-owner 0xGOVERNANCE_MULTISIG \
     --basefee-address 0xBASEFEE_RECIPIENT \
     --initial-stake-per-validator 1000000 \
-    --epoch-duration-in-secs 86400
+    --epoch-duration-in-secs 21600  # 6 hours, as on mainnet and testnet
 ```
 
 ### genesis flags
 
 | Flag                                                 | Default        | Description                                                                               |
 | ---------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------- |
-| `--chain-id`                                         | `2017` (0x7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                    |
+| `--chain-id`                                         | `911329` (0xde7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                |
 | `--consensus-registry-owner`                         | `0x...07a0`    | Owner address for the ConsensusRegistry contract. Use a governance multisig in production |
 | `--basefee-address`                                  | `0x...07a0`    | Address that receives all transaction base fees                                           |
 | `--initial-stake-per-validator`, `--stake`           | `1000000`      | TEL staked per validator at genesis (input in whole TEL, stored as wei)                   |
 | `--min-withdraw-amount`, `--min_withdraw`            | `1000`         | Minimum TEL withdrawal amount                                                             |
 | `--epoch-block-rewards`, `--block_rewards_per_epoch` | `25806`        | Total block rewards per epoch in TEL                                                      |
-| `--epoch-duration-in-secs`, `--epoch_length`         | `86400`        | Epoch duration in seconds (default: 24 hours)                                             |
+| `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours; mainnet and testnet use `21600`, 6 hours)    |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
+| `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
 | `--dev-funded-account`                               | none           | Fund a deterministic test account. Never use in production                                |
 | `--accounts`                                         | none           | Path to a YAML file mapping addresses to genesis accounts                                 |
 
@@ -218,6 +268,27 @@ Available named chains: `adiri` (alias: `testnet`), `mainnet`.
 
 The `--chain` flag overrides local genesis files with the embedded config for that network.
 
+#### Run an observer against testnet
+
+Build a release version of the node software with the `adiri` feature (required to join the
+adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
+`cargo build -p telcoin-network --bin telcoin-network --release --features adiri`
+
+Generate a config and keys for your observer node:
+`target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
+
+This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
+
+Start your observer node:
+`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+
+Make sure DATADIR matches the config command above and use the same password for reading the key.
+
+Node role is derived from committee membership: a key outside the current committee runs as an
+observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
+chain.
+
+
 ### Using local config
 
 When running a private network or local testnet, omit `--chain` and point `--datadir` at a directory containing the genesis files:
@@ -234,8 +305,8 @@ telcoin-network node \
 | Flag                  | Default        | Description                                                                                    |
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
 | `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
-| `--instance`          | none           | Instance number (0-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
-| `--observer`          | `false`        | Run as an observer (no consensus participation)                                                |
+| `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
+| `--observer`          | `false`        | Deprecated, hidden no-op. Node role follows committee membership.                              |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
@@ -325,19 +396,29 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.max-connections`                  | `500`         | Max concurrent RPC connections           |
 | `--rpc.max-tracing-requests`             | CPU-dependent | Max concurrent tracing requests          |
 | `--rpc.gascap`                           | Reth default  | Max gas for `eth_call`                   |
-| `--rpc.txfeecap`                         | `1.0` (ETH)   | Max transaction fee via RPC (0 = no cap) |
+| `--rpc.txfeecap`                         | `0` (no cap)  | Max transaction fee via RPC (0 = no cap) |
 
 ### available RPC modules
 
 `eth`, `net`, `web3`, `debug`, `trace`, `rpc`
 
-The `admin` and `txpool` modules are not available at this time.
+`--http.api all` (and `--ws.api all`) enables `eth`, `net`, `web3`, `rpc`. The `debug` and
+`trace` modules are expensive to serve on an archive node and are never part of `all`: name
+them explicitly (for example `--http.api eth,debug,trace`) to enable them, which logs a
+warning at startup. A selection whose first entry is `all` (for example `all,debug`) parses
+as plain `all` and the rest of the list is ignored, so list every module by name instead.
+
+The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the same module set as
+`all`.
+
+The `admin` and `txpool` modules are not available at this time; they are dropped from any
+selection with a warning.
 
 ### Transaction pool
 
 | Flag                         | Default | Description                                                                                |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------ |
-| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender (Reth default is 16; Telcoin Network overrides to 256) |
+| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender. Telcoin Network raises Reth's default of 16 to 256; any explicit value is honored, including 16 |
 
 ## Networking
 
@@ -398,9 +479,11 @@ Inbound (must be open):
 
 Outbound: Unrestricted UDP for QUIC connections to peers.
 
+These are application port requirements, not a complete production perimeter. The node does not configure host firewall rules. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#firewall-configuration) for the recommended validator, sentry, observer, and management separation. Never create firewall rules from DHT or peer exchange data.
+
 ## Consensus parameters
 
-The `parameters.yaml` file controls consensus timing and behavior. If the file is absent, defaults are used. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
+The `parameters.yaml` file controls consensus timing and behavior. The node reads it at startup and refuses to start when the file is missing or fails to parse. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
 
 | Field                                   | Default  | Description                                         |
 | --------------------------------------- | -------- | --------------------------------------------------- |
@@ -408,14 +491,30 @@ The `parameters.yaml` file controls consensus timing and behavior. If the file i
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + `max_header_time_drift_tolerance` (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
 | `max_batch_delay`                       | `1s`     | Worker timeout before sealing a batch               |
 | `max_concurrent_requests`               | `500000` | Max concurrent requests from untrusted entities     |
 | `batch_vote_timeout`                    | `10s`    | Timeout for batch voting requests                   |
-| `basefee_address`                       | none     | Address that receives transaction base fees         |
+| `basefee_address`                       | required | Base-fee recipient; must match every peer           |
 | `parallel_fetch_request_delay_interval` | `5s`     | Delay between parallel certificate fetch requests   |
+| `allow_private_forward_targets`         | `false`  | Let observer forwarding dial non-public RPC hosts   |
+
+### `allow_private_forward_targets`
+
+An observer forwards each transaction it accepts to the JSON-RPC endpoint the owning validator advertised on its node record, so the dial target is chosen by a committee member rather than by this node. Left at the default `false`, an advertised endpoint on a loopback, private (RFC 1918), link-local, unique-local, shared-address-space or unspecified address is refused and logged once at `warn` with the advertising validator's BLS key, so a committee member cannot direct this node's outbound HTTP at hosts inside its own perimeter.
+
+The check reads the host as written and never resolves DNS. It refuses IP literals in every spelling (dotted-quad, decimal, octal, hex, IPv4-mapped and NAT64/6to4 IPv6) and the names reserved to resolve locally (`localhost`, `*.localhost`, `*.local`), but a hostname that merely resolves to a private address is still dialed. Treat this as a guard against an advertised internal address, not as complete egress filtering. Operators who need the stronger property should restrict outbound traffic from observer nodes at the network layer.
+
+Set it to `true` only when every committee member is under the same operator as this node - single-host and docker-compose deployments, where validators legitimately advertise `127.0.0.1`. On a public network it re-enables dialing arbitrary internal addresses.
+
+`basefee_address` is the one field here without a default. It is consensus-critical: the
+EVM credits this account on every transaction, so its balance enters the state root and every node
+on the network must hold the same value. A parameters file that omits the key fails to parse, so
+the node refuses to start rather than falling back in silence. The `genesis` commands write the
+key for you, and the `mainnet` and `adiri` chain presets carry their own value.
 
 Example (testnet configuration):
 
@@ -424,6 +523,7 @@ header_num_of_batches_threshold: 5
 max_header_num_of_batches: 10
 max_header_delay: 3s
 min_header_delay: 1s
+vote_timeout: 5s
 gc_depth: 50
 sync_retry_delay: 5s
 sync_retry_nodes: 3
@@ -448,7 +548,27 @@ Enable with `--metrics <ADDR:PORT>`:
 telcoin-network node --metrics 127.0.0.1:9101
 ```
 
-Scrape the endpoint with Prometheus or any compatible collector.
+The endpoint serves the Prometheus text format (`Content-Type: text/plain; version=0.0.4`)
+and exposes two namespaces:
+
+- `tn_*` — telcoin-network instrumentation: consensus (`tn_primary_*`), batches
+  (`tn_worker_*`, `tn_batch_builder_*`), execution (`tn_engine_*`, `tn_executor_*`),
+  networking (`tn_network_*`, labeled `network={primary,worker}`), epoch lifecycle
+  (`tn_epoch_*`), and node health (`tn_node_*`, including `tn_node_mode` and
+  `tn_node_consensus_sync_distance`).
+- `reth_*` — reth's built-in instrumentation (database, transaction pool, provider) plus
+  process metrics (`reth_process_*`), named identically to a stock reth node so upstream
+  dashboards work unchanged.
+
+A Grafana dashboard covering both namespaces ships at
+`etc/grafana/telcoin-node-metrics.json`.
+
+If the address cannot be bound, node startup fails — the flag is an explicit request for
+the endpoint, not best-effort.
+
+Warning: like the health check, the endpoint answers any connection without limits or
+authentication. Bind to loopback and relay with a local collector (Prometheus, Grafana
+Alloy), or place the port behind a firewall.
 
 ### OpenTelemetry tracing
 
@@ -490,7 +610,10 @@ RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
 
 ## Multi-instance setup
 
-The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 0 to 200. This configuration is only recommended for spawning local networks and should not be used in production environments.
+The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 1 to 200; the CLI rejects 0 before the node starts (earlier releases accepted 0 and derived conflicting ports from it). This configuration is only recommended for spawning local networks and should not be used in production environments.
+
+Note: `--instance` does NOT offset `--metrics` (or `--healthcheck`) — pass a distinct
+address per instance, as in the example below.
 
 ### Port offset formula
 
@@ -498,7 +621,7 @@ The `--instance` flag adjusts port numbers so multiple nodes can run on the same
 | ------------- | -------------------- | --------------- | --------------- | --------------- |
 | HTTP RPC      | `8545 - N + 1`       | 8545            | 8544            | 8543            |
 | WebSocket RPC | `8546 + (N * 2 - 2)` | 8546            | 8548            | 8550            |
-| IPC path      | `/tmp/tn-{N}.ipc`    | `/tmp/tn-1.ipc` | `/tmp/tn-2.ipc` | `/tmp/tn-3.ipc` |
+| IPC path      | `/tmp/tn.ipc-{N}`    | `/tmp/tn.ipc-1` | `/tmp/tn.ipc-2` | `/tmp/tn.ipc-3` |
 
 Example starting four validators on one machine:
 
@@ -575,8 +698,7 @@ JSON (`--json`):
 ```json
 {
 	"blsPubkey": "0x...",
-	"uncompressedPubkey": "0x...",
-	"uncompressedSignature": "0x..."
+	"signature": "0x..."
 }
 ```
 
@@ -593,21 +715,20 @@ function stake(
 ) public
 
 struct ProofOfPossession {
-    bytes uncompressedPubkey;    // 192 bytes
-    bytes uncompressedSignature; // 96 bytes
+    bytes signature; // 48 bytes (compressed G1)
 }
 ```
 
-The compressed BLS public key is 96 bytes. The proof of possession binds the BLS key to the validator's execution address.
+The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
 
 ## Observer mode
 
-Run a node that follows consensus and executes blocks without participating in voting or block production:
+With a key outside the current committee, a node follows consensus and executes blocks without
+participating in voting or block production. Role is derived from committee membership:
 
 ```bash
 telcoin-network node \
     --datadir /var/lib/telcoin \
-    --observer \
     --http
 ```
 
@@ -625,7 +746,11 @@ telcoin-network node \
 
 Observers still require key generation (`keytool generate observer`) and the genesis files. They need the same genesis config and parameters as validators.
 
-An observer generates its own network identity keys for P2P connectivity but never participates in the consensus committee, regardless of whether it is registered on-chain.
+An observer generates its own network identity keys for P2P connectivity. If its key joins the
+committee, the node takes the validator role and participates once caught up. `--observer` remains
+accepted for compatibility, but is hidden from CLI help and only logs a deprecation warning
+([#1355](https://github.com/Telcoin-Association/telcoin-network/issues/1355)). It cannot keep a seated
+validator out of consensus; exit the validator on chain to do that.
 
 ## Security considerations
 

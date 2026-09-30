@@ -1,10 +1,12 @@
 //! Error type to wrap various Reth errors.
 
+use alloy::primitives::Bytes;
 use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
+use tn_types::WorkerId;
 
-/// Result alias for [`TNRethError`].
+/// Result alias for [`TnRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -16,9 +18,6 @@ pub enum TnRethError {
     /// Error recovering transaction from bytes.
     #[error(transparent)]
     RecoverTransactionBytes(#[from] EthApiError),
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The executed block failed.
     #[error("Block execution failed: {0}")]
     BlockExecution(#[from] BlockExecutionError),
@@ -37,9 +36,94 @@ pub enum TnRethError {
     /// Error forwarding engine update to consensus.
     #[error("Failed to forward engine update to consensus.")]
     EngineUpdateChannelClosed,
-    /// Executed output must always contain at least one block.
-    #[error("Empty execution output from engine.")]
-    EmptyExecutionOutput,
+    /// Receipts are missing for a block that exists (DB inconsistency).
+    ///
+    /// Surfaced during ExEx replay: returning an empty receipt set would make a
+    /// non-empty block look empty to a stateful indexer (silent corruption), so
+    /// it is treated as an error instead.
+    #[error("receipts not found for existing block {0} during replay")]
+    ReplayReceiptsMissing(u64),
+    /// Failed to recover a transaction's signer from its signature.
+    #[error(transparent)]
+    SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
+    /// The persisted finalized marker points past the persisted canonical tip.
+    ///
+    /// The marker only ever trails or equals the tip (it commits atomically with the
+    /// blocks; pre-fix versions committed the blocks first), so a marker ahead of the
+    /// tip means the execution database lost blocks this node already attested as
+    /// final. Surfaced by the startup heal (`RethEnv::heal_finalized_to_persisted_tip`)
+    /// to refuse startup instead of silently re-executing past attested state.
+    #[error(
+        "finalized marker {finalized} is ahead of the persisted canonical tip {tip}: \
+         execution db is behind a marker this node already attested; refusing to start"
+    )]
+    FinalizedMarkerAheadOfTip {
+        /// The persisted finalized-block marker.
+        finalized: u64,
+        /// The persisted canonical tip.
+        tip: u64,
+    },
+    /// Failure exporting or restoring an EVM state snapshot.
+    #[error("snapshot: {0}")]
+    Snapshot(String),
+    /// The shuffled committee is smaller than the on-chain target size.
+    ///
+    /// `shuffle_new_committee` trims the shuffled pool to `next_committee_size` with
+    /// [`Vec::truncate`], which is a silent no-op when the eligible pool is already smaller than
+    /// the target. The registry invariant `nextCommitteeSize <= eligibleValidatorCount` makes this
+    /// unreachable in practice, and the on-chain `concludeEpoch` guard rejects a wrong-length
+    /// committee, but assembling an undersized committee client-side is still a protocol fault:
+    /// fail here with the exact counts instead of forwarding calldata that can only revert
+    /// on-chain.
+    #[error("shuffled committee is undersized: expected {expected} validators, assembled {got}")]
+    UndersizedCommittee {
+        /// The target committee size read from the consensus registry (`next_committee_size`).
+        expected: usize,
+        /// The number of validators actually assembled after the shuffle and truncate.
+        got: usize,
+    },
+    /// Deriving a worker's RPC listener port left the valid port range.
+    ///
+    /// Worker `worker_id`'s band offset applied to the operator's configured port went
+    /// below 1 or above `u16::MAX`. Failing startup loudly here replaces the pre-#1287
+    /// behavior, where every worker bound the one shared endpoint config: the second
+    /// worker unlinked worker 0's IPC socket silently and a fixed http/ws port failed
+    /// later with `AddrInUse`.
+    #[error(
+        "worker {worker_id} {transport} rpc port derivation left the valid port range: \
+         base port {base}, worker offset {offset}"
+    )]
+    WorkerRpcPort {
+        /// The worker whose endpoint was being derived.
+        worker_id: WorkerId,
+        /// The transport whose port left the range (`"http"` or `"ws"`).
+        transport: &'static str,
+        /// The operator-configured port the offset applies to.
+        base: u16,
+        /// The band offset for this worker (stride times worker id).
+        offset: u32,
+    },
+    /// Multi-worker RPC derivation needs the ws base port at or above the http base.
+    ///
+    /// http bands stride down and ws bands stride up from the operator's bases, so
+    /// `ws_port >= http_port` (reth's own default layout; equality is the shared
+    /// http+ws server) is what keeps every derived endpoint distinct across workers.
+    /// Worker 0 binds the operator's ports as configured, so single-worker nodes
+    /// never see this error; the first derived worker refuses startup loudly instead
+    /// of colliding with another worker's endpoint at bind time.
+    #[error(
+        "worker {worker_id} rpc port derivation needs ws_port ({ws}) at or above http_port \
+         ({http}): http bands stride down and ws bands stride up, so inverted bases collide \
+         across workers"
+    )]
+    WorkerRpcPortOrder {
+        /// The first derived worker that hit the inverted bases.
+        worker_id: WorkerId,
+        /// The operator-configured http base port.
+        http: u16,
+        /// The operator-configured ws base port.
+        ws: u16,
+    },
 }
 
 impl From<TnRethError> for EthApiError {
@@ -55,5 +139,86 @@ impl From<TnRethError> for EthApiError {
 impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
     fn from(_: std::sync::mpsc::SendError<T>) -> Self {
         Self::TreeChannelClosed
+    }
+}
+
+/// Failure executing a read-only on-chain EVM call.
+///
+/// Distinguishes a user-triggerable on-chain revert (revert bytes surfaced to RPC
+/// clients eth_call-style) from internal node failures (never leaked to clients).
+#[derive(Debug, thiserror::Error)]
+pub enum EvmReadError {
+    /// The EVM call reverted on-chain.
+    #[error("execution reverted{}", .reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Revert {
+        /// Raw ABI-encoded revert bytes.
+        output: Bytes,
+        /// Decoded human-readable reason, if available.
+        reason: Option<String>,
+    },
+    /// Non-revert failure: state provider/DB, EVM construction, Halt, ABI decode.
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Result of a read-only on-chain EVM call.
+///
+/// The error is always an [`EvmReadError`], so consumers (e.g. the RPC layer) can match
+/// revert-vs-internal directly instead of recovering it via a runtime downcast. Every non-revert
+/// failure — state provider/EVM setup, `Halt`, ABI decode — is an [`EvmReadError::Internal`].
+pub type EvmReadResult<T> = Result<T, EvmReadError>;
+
+/// Failure reading system-contract state at a pinned block, classified by whether the failure is
+/// deterministic across the committee.
+///
+/// [`Provider`](Self::Provider) is a node-local storage/provider fault: the pinned header not
+/// resolving in this node's database, state-provider construction failing, or a database error
+/// surfaced while the EVM lazily reads accounts/storage during the call. Another committee member
+/// issuing the same read at the same block may succeed, so consensus-critical callers must NOT
+/// assume peers share the failure — proceeding on stale values there can diverge from the
+/// committee (retry or halt instead).
+///
+/// [`ChainGlobal`](Self::ChainGlobal) is a deterministic product of the pinned chain state and the
+/// node's own code: contract absent at the block, on-chain revert or halt, ABI decode failure,
+/// arity mismatch, or EVM environment construction. Every node reading the same block observes the
+/// identical failure, so a keep-current fail-open policy stays committee-consistent.
+#[derive(Debug, thiserror::Error)]
+pub enum StateReadError {
+    /// Node-local storage/provider fault; NOT committee-deterministic.
+    #[error("provider fault reading pinned chain state: {0}")]
+    Provider(String),
+    /// Deterministic product of the pinned chain state; identical on every node.
+    #[error("{0}")]
+    ChainGlobal(String),
+}
+
+/// Result of a committee-determinism-classified state read (see [`StateReadError`]).
+pub type StateReadResult<T> = Result<T, StateReadError>;
+
+/// Refusal of a pinned state read below a restored datadir's state floor.
+///
+/// Raised by `RethEnv::read_only_state_db` (the shared state constructor for every pinned,
+/// non-committing read) when the pinned block number is below the restored-state floor (the
+/// snapshot's final block `B`, the only block whose state the restore imports). Below `B` the
+/// datadir holds headers but no state, and reth's checkpoint-less history walk would answer the
+/// read with every account "never written" instead of an error. Carried through
+/// [`reth_errors::ProviderError::other`], so every caller observes it as a node-local provider
+/// fault.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "pinned read at block {pinned} is below this datadir's restored-state floor (block {floor}, \
+     the snapshot's final block): the snapshot shipped no state below it"
+)]
+pub struct RestoredStateFloorError {
+    /// The refused pin's block number.
+    pinned: u64,
+    /// The datadir's restored-state floor: the snapshot's final block `B`.
+    floor: u64,
+}
+
+impl RestoredStateFloorError {
+    /// Bundle the refused pin's block number with the floor it fell below.
+    pub(crate) fn new(pinned: u64, floor: u64) -> Self {
+        Self { pinned, floor }
     }
 }

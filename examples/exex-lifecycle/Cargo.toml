@@ -1,0 +1,17 @@
+[package]
+name = "exex-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Example ExEx that tracks transactions through the full lifecycle."
+
+[dependencies]
+tn-exex = { path = "../../crates/exex" }
+tn-types = { path = "../../crates/types" }
+eyre = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -44,8 +44,9 @@ where
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression)? })
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
     }
 
     /// Length of the Pack file.
@@ -56,6 +57,11 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
         self.inner.fetch(pos)
+    }
+
+    /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
+    pub fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+        self.inner.read_bytes(start_pos, end_pos)
     }
 
     /// Read the record size (with crc32) at position.
@@ -77,11 +83,21 @@ where
     ///   - key data
     ///   - value data
     ///
-    /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
-    /// failed state and become read only.  These errors all indicate serious underlying issues that
-    /// can not be trivially fixed, a reopen/repair might help.
+    /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
+    /// and each commit returns a copy of the error that caused the failed state.  This error
+    /// indicates a serious underlying issue that can not be trivially fixed, a reopen/repair
+    /// might help.
     pub fn append(&mut self, value: &V) -> Result<u64, AppendError> {
         self.inner.append(value)
+    }
+
+    /// Test-only failure injector: make the next append fail with
+    /// [`AppendError::WriteDataError`], the same classification a real io write failure gets.
+    /// The append path then marks the pack failed, which is the poisoned state the queued-save
+    /// regression tests start from.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_for_test(&mut self) {
+        self.inner.fail_next_append = true;
     }
 
     /// Return the DB version.
@@ -102,6 +118,8 @@ where
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     /// Note this is an expensive call (syncing to disk is not cheap).
+    /// On a pack in the failed state this returns [`CommitError::Failed`] with a copy of the
+    /// error that caused the failed state.
     pub fn commit(&mut self) -> Result<(), CommitError> {
         self.inner.commit()
     }
@@ -156,9 +174,15 @@ where
     value_buffer: Vec<u8>,
     /// Used as a second buffer for compress and decompress operations on records.
     compression_buffer: Vec<u8>,
-    failed: bool,
+    /// Root cause of the failed state: a copy of the io error from the append that failed
+    /// the pack. While this is `Some`, each append and each commit returns a copy of this
+    /// error so callers see the root cause and not a generic guard error.
+    failed: Option<io::Error>,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
+    /// Test-only: when set, the next append fails as if the data write hit an io error.
+    #[cfg(test)]
+    fail_next_append: bool,
     _value: PhantomData<V>,
 }
 
@@ -183,17 +207,21 @@ where
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<Self, OpenError> {
-        let (data_file, header) = Self::open_data_file(path, uid_idx, read_only, compression)
-            .map_err(OpenError::DataFileOpen)?;
+        let (data_file, header) =
+            Self::open_data_file(path, uid_idx, read_only, compression, version)
+                .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
             data_file,
             value_buffer: Vec::new(),
             compression_buffer: Vec::new(),
-            failed: false,
+            failed: None,
             read_only,
             uid_idx,
+            #[cfg(test)]
+            fail_next_append: false,
             _value: PhantomData,
         })
     }
@@ -208,36 +236,53 @@ where
         self.read_record(pos)
     }
 
+    /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
+    fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+        // Validate the range against the file length before allocating so a corrupt or
+        // oversized bound (the position index has no per-record CRC) errors instead of
+        // triggering a huge up-front allocation that would only fail at read_exact.
+        if start_pos > end_pos || end_pos > self.data_file.len() {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_bytes range out of bounds",
+            )));
+        }
+        let mut bytes = vec![0; (end_pos - start_pos) as usize];
+        self.data_file.seek(SeekFrom::Start(start_pos))?;
+        self.data_file.read_exact(&mut bytes[..])?;
+        Ok(bytes)
+    }
+
+    /// Test-only injection point: fail the append the way a real io write failure fails.
+    /// Armed by [`Pack::fail_next_append_for_test`]; disarms after one use. The injected
+    /// error carries the StorageFull kind, a sentinel that is not the Other default, so
+    /// tests can assert that a replayed copy keeps the kind.
+    #[cfg(test)]
+    fn injected_append_failure(&mut self) -> Result<(), AppendError> {
+        std::mem::take(&mut self.fail_next_append)
+            .then(|| {
+                AppendError::WriteDataError(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected write failure",
+                ))
+            })
+            .map_or(Ok(()), Err)
+    }
+
     /// Do the actual insert so the public function can rollback easily on an error.
     fn append_inner(&mut self, value: &V) -> Result<u64, AppendError> {
         let record_pos = self.data_file.len();
-        self.value_buffer.clear();
-        encode_into_buffer(&mut self.value_buffer, value)
-            .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
-        let buffer = match self.header.compression {
-            PackCompression::None => &self.value_buffer,
-            PackCompression::ZStd => {
-                self.compression_buffer.clear();
-                let mut compressor =
-                    zstd::stream::write::Encoder::new(&mut self.compression_buffer, 0)?;
-                compressor.write_all(&self.value_buffer)?;
-                compressor.finish()?;
-                &self.compression_buffer
-            }
-        };
 
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        // Once we have written to write_buffer, it needs to be rolled back before returning an
-        // error. Space for the value length.
-        let value_size = (buffer.len() as u32).to_le_bytes();
-        self.data_file.write_all(&value_size)?;
-        crc32_hasher.update(&value_size);
+        #[cfg(test)]
+        self.injected_append_failure()?;
 
-        self.data_file.write_all(buffer)?;
-        crc32_hasher.update(buffer);
-        let crc32 = crc32_hasher.finalize();
-        self.data_file.write_all(&crc32.to_le_bytes())?;
-
+        write_value(
+            value,
+            &mut self.data_file,
+            &mut self.value_buffer,
+            &mut self.compression_buffer,
+            self.header.compression,
+        )?;
         Ok(record_pos)
     }
 
@@ -249,18 +294,22 @@ where
     ///   - key data
     ///   - value data
     ///
-    /// For the errors IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to
-    /// a failed state and become read only.  These errors all indicate serious underlying
-    /// issues that can not be trivially fixed, a reopen/repair might help.
+    /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
+    /// and each commit returns a copy of the error that caused the failed state.  This error
+    /// indicates a serious underlying issue that can not be trivially fixed, a reopen/repair
+    /// might help.
     fn append(&mut self, value: &V) -> Result<u64, AppendError> {
-        if self.read_only || self.failed {
+        if self.read_only {
             return Err(AppendError::ReadOnly);
         }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
         let result = self.append_inner(value);
         if let Err(err) = &result {
             match err {
                 // These errors all indicate a failed DB that can no longer be inserted too.
-                AppendError::WriteDataError(_io_err) => self.failed = true,
+                AppendError::WriteDataError(io_err) => {
+                    self.failed = Some(Self::copy_io_error(io_err))
+                }
                 // These errors do not indicate a failed DB.
                 AppendError::SerializeValue(_)
                 | AppendError::ReadOnly
@@ -269,6 +318,19 @@ where
             }
         }
         result
+    }
+
+    /// Copy an io error: io::Error is not Clone, so the copy keeps the error kind and the
+    /// message of the original.
+    fn copy_io_error(cause: &io::Error) -> io::Error {
+        io::Error::new(cause.kind(), cause.to_string())
+    }
+
+    /// When the pack is in the failed state, return a copy of the io error that caused it.
+    /// The copy keeps the error kind and the message of the first failure, so every later
+    /// append or commit reports the root cause of the failed state.
+    fn failed_cause(&self) -> Result<(), io::Error> {
+        self.failed.as_ref().map_or(Ok(()), |cause| Err(Self::copy_io_error(cause)))
     }
 
     /// Return the DB version.
@@ -290,9 +352,10 @@ where
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
     fn commit(&mut self) -> Result<(), CommitError> {
-        if self.read_only || self.failed {
+        if self.read_only {
             return Err(CommitError::ReadOnly);
         }
+        self.failed_cause().map_err(CommitError::Failed)?;
         self.flush().map_err(CommitError::Flush)?;
         self.data_file.sync_all().map_err(CommitError::DataFileSync)?;
         Ok(())
@@ -310,17 +373,19 @@ where
         uid_idx: u64,
         ro: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
         let mut data_file = DataFile::open(path, ro)?;
         let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
-            let header = DataHeader::new(uid_idx, compression);
+            let header = DataHeader::new(uid_idx, compression, version);
             header.write_header(&mut data_file)?;
             header
         } else {
             let header = DataHeader::load_header(&mut data_file, uid_idx)?;
-            if header.version() != 0 {
+            if header.version() > version {
+                // Do not allow a newer version than we request but allow an older.
                 return Err(LoadHeaderError::InvalidVersion);
             }
             if header.appnum() != 1 {
@@ -427,6 +492,48 @@ where
     }
 }
 
+/// Do the actual insert so the public function can rollback easily on an error.
+pub fn write_value<V, W>(
+    value: &V,
+    writer: &mut W,
+    value_buffer: &mut Vec<u8>,
+    mut compression_buffer: &mut Vec<u8>,
+    compression: PackCompression,
+) -> Result<(), std::io::Error>
+where
+    V: Debug + Serialize,
+    W: ?Sized + std::io::Write,
+{
+    value_buffer.clear();
+    encode_into_buffer(value_buffer, value).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let buffer = match compression {
+        PackCompression::None => value_buffer,
+        PackCompression::ZStd => {
+            compression_buffer.clear();
+            {
+                let mut compressor = zstd::stream::write::Encoder::new(&mut compression_buffer, 0)?;
+                compressor.write_all(value_buffer)?;
+                compressor.finish()?;
+            }
+            compression_buffer
+        }
+    };
+
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    // Once we have written to write_buffer, it needs to be rolled back before returning an
+    // error. Space for the value length.
+    let value_size = (buffer.len() as u32).to_le_bytes();
+    writer.write_all(&value_size)?;
+    crc32_hasher.update(&value_size);
+
+    writer.write_all(buffer)?;
+    crc32_hasher.update(buffer);
+    let crc32 = crc32_hasher.finalize();
+    writer.write_all(&crc32.to_le_bytes())?;
+
+    Ok(())
+}
+
 /// Size of the data file header.
 pub const DATA_HEADER_BYTES: usize = 28;
 
@@ -449,9 +556,9 @@ pub struct DataHeader {
 }
 
 impl DataHeader {
-    pub(crate) fn new(uid_idx: u64, compression: PackCompression) -> Self {
+    pub(crate) fn new(uid_idx: u64, compression: PackCompression, version: u16) -> Self {
         let uid = Self::gen_uid(uid_idx);
-        Self { type_id: *b"telnet", version: 0, uid, appnum: 1, compression }
+        Self { type_id: *b"telnet", version, uid, appnum: 1, compression }
     }
 
     /// Load a DataHeader from source.
@@ -615,10 +722,89 @@ mod tests {
     }
     type TestPack = Pack<TestRec>;
 
+    /// Regression test for the failed-state guard: a failed pack replays the error that
+    /// caused the failed state, on both the append and the commit path, instead of the
+    /// read-only guard error it returned before. The replayed copy keeps the error kind
+    /// and the message of the root cause.
+    #[test]
+    fn failed_pack_replays_the_root_cause() {
+        let tmp_path = TempDir::with_prefix("test_failed_pack_replay").expect("temp dir");
+        let mut db: TestPack = Pack::open(
+            tmp_path.path().join("pack_failed_replay"),
+            0,
+            false,
+            PackCompression::None,
+            0,
+        )
+        .expect("open pack");
+
+        // Arm the injector: the next append fails the way a real io write failure fails and
+        // moves the pack to the failed state.
+        db.fail_next_append_for_test();
+        let root_cause = db
+            .append(&TestRec { idx: 1, name: "Value One".to_string() })
+            .expect_err("armed append must fail");
+        assert!(
+            root_cause.to_string().contains("injected write failure"),
+            "unexpected root cause: {root_cause}"
+        );
+        // Positive control for the negative assertions below: the root cause does not
+        // render as the guard error.
+        assert!(!root_cause.to_string().contains("read only"), "got: {root_cause}");
+        // Positive control for the kind assertions below: the injected root cause really
+        // carries the StorageFull sentinel kind, not the Other default a degenerate copy
+        // would produce.
+        assert!(
+            matches!(&root_cause, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "unexpected root cause shape: {root_cause}"
+        );
+
+        // Each later append replays a copy of the root cause, not the read-only guard error.
+        let replayed = db
+            .append(&TestRec { idx: 2, name: "Value Two".to_string() })
+            .expect_err("a failed pack rejects appends");
+        assert_eq!(
+            replayed.to_string(),
+            root_cause.to_string(),
+            "append must replay the root cause"
+        );
+        assert!(
+            matches!(&replayed, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "the append replay must keep the error kind, got: {replayed}"
+        );
+
+        // Commit reports the failed state with its own discriminant and the same root cause.
+        let commit_err = db.commit().expect_err("a failed pack rejects commits");
+        assert!(
+            matches!(&commit_err, CommitError::Failed(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "commit must report the failed state and keep the error kind, got: {commit_err:?}"
+        );
+        assert!(
+            commit_err.to_string().contains("injected write failure"),
+            "commit must carry the root cause, got: {commit_err}"
+        );
+
+        // A genuinely read-only pack still reports the read-only guard error. The injected
+        // failure fired before any record write, so the file reopens cleanly.
+        drop(db);
+        let mut ro: TestPack = Pack::open(
+            tmp_path.path().join("pack_failed_replay"),
+            0,
+            true,
+            PackCompression::None,
+            0,
+        )
+        .expect("reopen read only");
+        let ro_err = ro
+            .append(&TestRec { idx: 3, name: "Value Three".to_string() })
+            .expect_err("a read-only pack rejects appends");
+        assert_eq!(ro_err.to_string(), "read only");
+    }
+
     fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression, 0)
                 .expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
@@ -666,7 +852,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression, 0)
                 .expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
@@ -687,7 +873,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
                 .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
@@ -733,8 +919,9 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
 
-        let db: TestPack = Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
-            .expect("open pack");
+        let db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
+                .expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
@@ -787,7 +974,7 @@ mod tests {
         let path = tmp_path.path().join("pack_bomb");
         {
             let _pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
         }
         let pos = fs::metadata(&path).expect("metadata").len();
 
@@ -827,7 +1014,7 @@ mod tests {
         let path = tmp_path.path().join("pack_corrupt");
         let pos = {
             let mut pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
             pack.append(&TestRec { idx: 1, name: "f4 fixture".to_string() }).expect("append")
         };
 
@@ -875,7 +1062,7 @@ mod tests {
         let (tmp_dir, pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let mut pack: TestPack =
-            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+            Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -924,7 +1111,7 @@ mod tests {
         let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let mut pack: TestPack =
-            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+            Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -955,5 +1142,23 @@ mod tests {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_read_bytes_rejects_out_of_range() {
+        let tmp_path = TempDir::with_prefix("test_read_bytes_oob").expect("temp dir");
+        let path = tmp_path.path().join("pack_oob");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
+        pack.append(&TestRec { idx: 1, name: "x".to_string() }).expect("append");
+        pack.commit().expect("commit");
+
+        // An end far past EOF must error without attempting a giant allocation.
+        assert!(pack.read_bytes(0, u64::MAX).is_err());
+        // An inverted range must error.
+        assert!(pack.read_bytes(100, 10).is_err());
+        // A valid in-range request still works.
+        let len = pack.file_len();
+        assert!(pack.read_bytes(0, len).is_ok());
     }
 }

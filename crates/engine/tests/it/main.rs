@@ -5,6 +5,7 @@
 #![allow(unused_crate_dependencies)]
 
 use assert_matches::assert_matches;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
@@ -13,24 +14,35 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::{ExecutorEngine, TnEngineError};
+use tn_engine::{
+    execute_consensus_output, ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS,
+    PERSIST_OUTPUT_ATTEMPTS,
+};
 use tn_reth::{
-    calculate_gas_penalty, recover_signed_transaction,
+    calculate_gas_penalty,
+    error::TnRethError,
+    payload::BuildArguments,
+    recover_signed_transaction,
     system_calls::EpochState,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
-        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
-        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
+        TransactionFactory, BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
-    FixedBytes, RethChainSpec, RethEnv,
+    FixedBytes, ProviderError, RethChainSpec, RethEnv,
 };
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier, ReputationScores,
-    SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    forks::{
+        seed_signature_fork_epoch_override, subsecond_timestamp_active,
+        subsecond_timestamp_fork_epoch_override,
+    },
+    gas_accumulator::GasAccumulator,
+    keccak256, max_batch_gas, now, test_chain_spec_arc, test_genesis, Address, Batch, BlockHash,
+    Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest,
+    ConsensusOutput, Encodable2718, Epoch, GenesisAccount, Notifier, ReputationScores, SealedBlock,
+    SealedHeader, TaskManager, TimestampMs, TimestampSec, TransactionTrait as _, B256,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -52,6 +64,16 @@ const TOTAL_GAS_PER_TX: u64 = 21_000;
 const MAX_PRIORITY_FEE_PER_GAS: u64 = 100;
 /// Arbitrary value used for priority fee calcs in tests.
 const MAX_FEE_PER_GAS: u64 = 100;
+/// Engine counter of blocks whose EVM `timestamp` was raised above the output's `committed_at`.
+const EVM_TIMESTAMP_CLAMPED_TOTAL: &str = "tn_engine.evm_timestamp_clamped_total";
+/// Engine counter of executed blocks. Clamp tests read it as a positive control: a non-zero count
+/// proves the test's recorder captured the engine's metrics, so a zero clamp count is a
+/// measurement rather than a recorder that saw nothing.
+const BLOCKS_EXECUTED_TOTAL: &str = "tn_engine.blocks_executed_total";
+/// The epoch the cross-epoch clamp tests close.
+const CLOSING_EPOCH: Epoch = 0;
+/// The epoch whose first output the cross-epoch clamp tests execute with a regressed commit time.
+const OPENING_EPOCH: Epoch = CLOSING_EPOCH + 1;
 
 /// Helper function to calculate expected priority fees for batch producer.
 fn calc_priority_fees(basefee: u64) -> u64 {
@@ -64,7 +86,7 @@ fn calc_priority_fees(basefee: u64) -> u64 {
 fn assert_eip4788(
     reth_env: &RethEnv,
     block: &SealedBlock,
-    consensus_hash: B256,
+    consensus_hash: ConsensusHeaderDigest,
 ) -> eyre::Result<()> {
     // for EIP-4788, the storage slot is derived from the timestamp:
     //  - timestamp_slot = to_uint256_be(evm.timestamp) % HISTORY_BUFFER_LENGTH
@@ -83,7 +105,8 @@ fn assert_eip4788(
 
     // assert the block hash was correctly written to the contract
     let root_storage_slot = timestamp_storage_slot + U256::from(HISTORY_BUFFER_LENGTH);
-    let expected_blockhash = U256::from_be_bytes(consensus_hash.0);
+    let expected_blockhash: B256 = consensus_hash.into();
+    let expected_blockhash = U256::from_be_bytes(expected_blockhash.0);
     let stored_value =
         state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
     assert_eq!(
@@ -123,7 +146,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -144,15 +167,16 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let sub_dag: CommittedSubDag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
-    let consensus_output = ConsensusOutput::new_with_subdag(sub_dag, BlockHash::default(), 0);
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output =
+        ConsensusOutput::new_with_subdag(sub_dag, ConsensusHeaderDigest::default(), 0);
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -169,6 +193,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -186,7 +211,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -214,10 +239,11 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     Ok(())
 }
 
-/// This tests that a single empty block IS executed when consensus output contains
-/// no batches but close_epoch is true.
+/// The engine must stop draining the consensus stream once its execution backlog reaches
+/// [`MAX_QUEUED_OUTPUTS`], then drain to completion (executing every output exactly once, in
+/// order) as completed executions re-open the gate.
 #[tokio::test]
-async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
+async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
@@ -227,7 +253,119 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // build a chain of empty outputs. Pre-fill one more than the bound: the loop immediately
+    // pops one output into the in-flight execution slot, so MAX_QUEUED_OUTPUTS + 1 leaves the
+    // queue exactly at the bound (gate closed) when the stream is first polled.
+    const STREAMED: usize = 2;
+    let prefill = MAX_QUEUED_OUTPUTS + 1;
+    let total = prefill + STREAMED;
+    let timestamp = now();
+    let mut outputs = Vec::with_capacity(total);
+    let mut parent_hash = ConsensusHeaderDigest::default();
+    let mut previous_sub_dag: Option<CommittedSubDag> = None;
+    for i in 0..total {
+        let round = i as u32 + 1;
+        let mut leader = Certificate::default();
+        leader.update_header_round_for_test(round);
+        leader.update_header_created_at_for_test(timestamp);
+        leader.update_header_author_for_test(leader_id.clone());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            round as u64,
+            ReputationScores::default(),
+            previous_sub_dag.clone(),
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let output = ConsensusOutput::new_with_subdag(sub_dag.clone(), parent_hash, i as u64 + 1);
+        parent_hash = output.consensus_header_hash();
+        previous_sub_dag = Some(sub_dag);
+        outputs.push(output);
+    }
+
+    //=== Execution
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(STREAMED);
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(total + 1);
+    let mut engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    // pre-fill the queue past the bound and fill the channel behind it
+    let mut outputs_iter = outputs.iter();
+    for output in outputs_iter.by_ref().take(prefill) {
+        engine.push_back_queued_for_test(output.clone());
+    }
+    for output in outputs_iter {
+        to_engine.send(output.clone()).await?;
+    }
+    assert_eq!(to_engine.capacity(), 0, "test setup: channel must start full");
+
+    // first poll: the queue is at the bound, so the engine must leave the stream untouched
+    // (an unbounded engine drains the whole channel on this poll)
+    let mut engine_fut = Box::pin(engine.run());
+    assert!(futures::poll!(&mut engine_fut).is_pending());
+    assert_eq!(
+        to_engine.capacity(),
+        0,
+        "engine drained the consensus stream past MAX_QUEUED_OUTPUTS"
+    );
+
+    // as executions complete the gate re-opens: everything drains and the engine shuts
+    // down once the (dropped) stream is exhausted
+    drop(to_engine);
+    let res = timeout(Duration::from_secs(30), engine_fut).await?;
+    assert_matches!(res, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // every output was executed exactly once, in order
+    for (i, output) in outputs.iter().enumerate() {
+        let (leader_round, consensus_num_hash, _tip) =
+            engine_update_rx.try_recv().unwrap_or_else(|e| {
+                panic!("missing engine update for output {}: {e}", i + 1);
+            });
+        assert_eq!(leader_round, i as u32 + 1, "output executed out of order");
+        assert_eq!(consensus_num_hash, output.num_hash());
+    }
+    assert!(engine_update_rx.try_recv().is_err(), "extra engine update: output executed twice");
+
+    Ok(())
+}
+
+/// This tests that a single empty block IS executed when consensus output contains
+/// no batches but close_epoch is true.
+#[tokio::test]
+async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -250,15 +388,22 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, true, VecDeque::new(), vec![]);
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -276,6 +421,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -293,7 +439,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -354,10 +500,9 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     // timestamp
     assert_eq!(expected_block.timestamp, consensus_output.committed_at());
     // parent beacon block root is output digest
-    assert_eq!(
-        expected_block.parent_beacon_block_root,
-        Some(consensus_output.consensus_header_hash())
-    );
+    let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+        expected_block.parent_beacon_block_root.map(|d| d.into());
+    assert_eq!(parent_beacon_block_root, Some(consensus_output.consensus_header_hash()));
     // first block's parent is expected to be genesis
     assert_eq!(expected_block.parent_hash, chain.genesis_hash());
     // expect state roots are different after writing parent hash to BEACON_ROOT_CONTRACT
@@ -365,10 +510,10 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     // expect header number genesis + 1
     assert_eq!(expected_block.number, expected_block_height);
 
-    // mix hash is xor bitwise with worker sealed block's hash and consensus output
-    // just use consensus output hash if no batches in the round
-    let consensus_output_hash = B256::from(consensus_output.digest());
-    assert_eq!(expected_block.mix_hash, consensus_output_hash);
+    // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+    // the empty epoch-close block uses batch index 0 and a zero batch digest
+    let expected_mix_hash = consensus_output.prev_randao(0, B256::ZERO);
+    assert_eq!(expected_block.mix_hash, expected_mix_hash);
     // bloom expected to be the same bc all proposed transactions should be good
     // ie) no duplicates, etc.
     assert_eq!(expected_block.logs_bloom, genesis_header.logs_bloom);
@@ -390,6 +535,241 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     Ok(())
 }
 
+/// This pins the fail-stop for an empty epoch-closing output whose leader is not a member of
+/// the committee installed on the rewards counter: the engine must terminate with
+/// [`TnEngineError::UnknownAuthority`], build no block, and send no tip update.
+///
+/// The lookup miss is unreachable for valid output (see the invariant comment at the
+/// `get_authority_address` call in `payload_builder.rs`), so this constructs the impossible
+/// state directly and asserts the engine refuses to paper over it with a default beneficiary.
+/// A "graceful default" regression here is chain-consistent (every node computes the same
+/// wrong beneficiary), so no downstream validation would ever catch it; only this test does.
+#[tokio::test]
+async fn test_empty_close_epoch_unknown_leader_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // install a real committee so the miss comes from the leader, not an unset committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a non-member:
+    // keep the `Certificate::default()` author instead of overwriting it with a committee
+    // member's id (the delta from the happy-path test above)
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    // the default author is not a committee member; capture it for the error assertion
+    let outside_leader = leader.header().author().clone();
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == outside_leader
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
+/// This pins the fail-stop for an empty epoch-closing output executed before any committee is
+/// installed on the rewards counter: even a leader that would be a valid committee member must
+/// terminate the engine with [`TnEngineError::UnknownAuthority`], build no block, and send no
+/// tip update.
+///
+/// Companion to [`test_empty_close_epoch_unknown_leader_fail_stops`]: together they pin both
+/// ways the beneficiary lookup can miss (non-member author, committee never set), so replacing
+/// the fail-stop with a silent default beneficiary turns at least one of them red.
+#[tokio::test]
+async fn test_empty_close_epoch_without_committee_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // build the committee to obtain a legitimate member id, but never call `set_committee`:
+    // the rewards counter's committee stays `None` (the delta from the happy-path test above)
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a valid member
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    leader.update_header_author_for_test(leader_id.clone());
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == leader_id
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
 /// This tests that leader count is incremented even when execution is skipped
 /// for empty non-epoch-closing output.
 #[tokio::test]
@@ -403,7 +783,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -425,15 +805,22 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, false, VecDeque::new(), vec![]);
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        VecDeque::new(),
+        vec![],
+    );
 
     // verify leader counts start at zero
     let address_counts = gas_accumulator.rewards_counter().get_address_counts();
@@ -454,6 +841,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -468,7 +856,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -527,7 +915,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -577,7 +965,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -700,24 +1088,30 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update cert
     leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
+    leader_1.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![Certificate::default(), leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -731,6 +1125,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
@@ -740,6 +1135,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     )
     .into();
     let consensus_output_2 = ConsensusOutput::new(
@@ -778,6 +1174,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -804,7 +1201,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -881,8 +1278,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
     // basefee intentionally increased with loop
     let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
-    let output_digest_1: B256 = consensus_output_1.digest().into();
-    let output_digest_2: B256 = consensus_output_2.digest().into();
 
     // assert blocks are executed as expected
     for (idx, txs) in txs_by_block.iter().enumerate() {
@@ -899,7 +1294,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
         let mut expected_subdag_index = &sub_dag_index_1;
-        let mut output_digest = output_digest_1;
         let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
         let mut expected_batch_index = idx;
 
@@ -908,7 +1302,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
             expected_subdag_index = &sub_dag_index_2;
-            output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
             // takeaway 4 to compensate for independent loops for executing batches
             expected_batch_index = idx - 4;
@@ -929,7 +1322,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -944,8 +1339,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = output_digest ^ all_batches[idx].digest();
+        // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+        let expected_mix_hash =
+            expected_output.prev_randao(expected_batch_index, all_batches[idx].digest());
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -957,7 +1353,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -1003,7 +1399,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -1064,7 +1460,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1209,8 +1605,13 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
+    leader_1.update_header_created_at_for_test(timestamp);
     leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1: u64 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
@@ -1219,16 +1620,17 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let mut cert_1 = Certificate::default();
     cert_1.update_header_round_for_test(1);
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -1239,6 +1641,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update timestamp
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
@@ -1247,14 +1650,14 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let mut cert_2 = Certificate::default();
     cert_2.update_header_round_for_test(2);
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let subdag_2 = CommittedSubDag::new(
         vec![leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2.clone(),
         consensus_output_1.consensus_header_hash(),
@@ -1292,6 +1695,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -1312,7 +1716,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1407,8 +1811,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
     // basefee intentionally increased with loop
     let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
-    let output_digest_1: B256 = consensus_output_1.digest().into();
-    let output_digest_2: B256 = consensus_output_2.digest().into();
 
     // assert blocks are execute as expected
     for (idx, txs) in txs_by_block.iter().enumerate() {
@@ -1439,7 +1841,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
         let mut expected_subdag_index = &sub_dag_index_1;
-        let mut output_digest = output_digest_1;
         // We just set this to default in the test...
         let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
         let mut expected_batch_index = idx;
@@ -1450,7 +1851,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
             expected_subdag_index = &sub_dag_index_2;
-            output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
             // takeaway 4 to compensate for independent loops for executing batches
             expected_batch_index = idx - 4;
@@ -1472,7 +1872,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -1487,8 +1889,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
+        // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+        let expected_mix_hash =
+            expected_output.prev_randao(expected_batch_index, all_batches[idx].digest());
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -1500,7 +1903,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -1593,23 +1996,29 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    //
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
+    leader_1.update_header_created_at_for_test(timestamp);
     let sub_dag_index_1 = 1;
     leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1,
@@ -1620,19 +2029,20 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // create second output
     let mut leader_2 = Certificate::default();
     // update timestamp
+    leader_2.update_header_created_at_for_test(timestamp + 1);
     let sub_dag_index_2 = 2;
     leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let subdag_2 = CommittedSubDag::new(
         vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
         consensus_output_1.consensus_header_hash(),
@@ -1661,6 +2071,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         GasAccumulator::default(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -1678,7 +2089,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1765,7 +2176,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1832,20 +2243,23 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),
@@ -1873,6 +2287,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -1896,7 +2311,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1990,7 +2405,9 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         // timestamp
         assert_eq!(block.timestamp, consensus_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(consensus_output_hash));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(consensus_output_hash));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -2005,8 +2422,42 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = consensus_output_hash ^ batch_digest;
+        // Independent oracle for the mix hash: recompose the exact bytes by hand for whichever
+        // derivation this build's fork schedule selects, rather than trusting
+        // `ConsensusOutput::prev_randao` to check itself. Gated on the same predicate the engine
+        // dispatches on, so the oracle stays correct under `--features adiri` (epoch 0 is below
+        // the epoch 574 PREVRANDAO fork: legacy XOR) and default features (seeded from genesis).
+        //
+        // That shared dispatch is also the oracle's limit: it is independent on byte layout only,
+        // so a regression in the predicate itself moves both sides together. Default builds have
+        // no pre-fork window, so pin their arm outright rather than leaving it to the dispatch.
+        #[cfg(not(feature = "adiri"))]
+        assert!(
+            tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()),
+            "default builds are seeded from genesis; epoch {} must be post-fork. is \
+             TN_PREVRANDAO_FORK_EPOCH or TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?",
+            consensus_output.leader().epoch(),
+        );
+        let expected_mix_hash =
+            if tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()) {
+                keccak256(
+                    [
+                        b"TN_PREVRANDAO_V1".as_slice(),
+                        consensus_output.committee_shuffle_seed().as_slice(),
+                        consensus_output.number().to_le_bytes().as_slice(),
+                        0u64.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                )
+            } else {
+                let output_digest: B256 = consensus_output_hash.into();
+                output_digest ^ batch_digest
+            };
+        assert_eq!(
+            expected_mix_hash,
+            consensus_output.prev_randao(0, batch_digest),
+            "engine derivation must match the hand-composed oracle",
+        );
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -2018,7 +2469,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         assert_eq!(block.difficulty, U256::from(0 << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(consensus_output.keccak_leader_sigs().0)
+            Bytes::from(consensus_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -2038,6 +2489,215 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         };
         assert_eq!(block.withdrawals_root, Some(expected_withdrawals));
     }
+
+    Ok(())
+}
+
+/// Regression for #1222: a batch's priority fees are credited to the batch producer's own
+/// beneficiary (`Batch::beneficiary`), never to the sub-DAG header author's committee execution
+/// address (`CertifiedBatch::address`).
+///
+/// `Batch::beneficiary` is covered by the batch digest (only `received_at` is `#[serde(skip)]`), so
+/// it is identical no matter which header references the digest. The pre-fix code resolved the
+/// block beneficiary from `cert_batch.address`, so a byzantine validator that copied another
+/// validator's already-gossiped batch digest into its own certified header, and won the sub-DAG
+/// ordering race, redirected that batch's priority fees to itself. This test models exactly that
+/// theft: the honest producer's beneficiary (VICTIM) differs from the header author's address
+/// (ATTACKER, `cert_batch.address`), and it asserts both the sealed block's beneficiary and the
+/// priority-fee credit land on the VICTIM. Reverting `payload_builder` to credit
+/// `cert_batch.address` flips the block beneficiary and the balance credit to the ATTACKER, failing
+/// every assertion here.
+#[tokio::test]
+async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const TX_GAS_LIMIT: u64 = 15_000_000;
+    const PRIORITY_FEE: u64 = 10;
+
+    // The honest producer's own beneficiary, carried INSIDE the batch digest. A fixed
+    // non-committee address with zero genesis balance, so its post-execution balance equals
+    // exactly the priority fees it is credited.
+    let victim_beneficiary = Address::from([0x11u8; 20]);
+
+    // create simple batch with different tx types (mirrors `test_simple_basefee_penalty`)
+    let genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let encoded_eip1559_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(PRIORITY_FEE as u128),    // priority at 10
+            Some(MAX_FEE_PER_GAS as u128), // max fee at 100 (100 > 17)
+            Some(TX_GAS_LIMIT),            // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+            None,
+        )
+        .encoded_2718();
+    let encoded_legacy_tx = tx_factory
+        .create_explicit_legacy_tx(
+            Some(genesis.config.chain_id),
+            None,
+            Some(MIN_PROTOCOL_BASE_FEE as u128), // gas price (no priority fee)
+            Some(TX_GAS_LIMIT),                  // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+        )
+        .encoded_2718();
+
+    let mut batch = Batch {
+        transactions: vec![encoded_eip1559_tx, encoded_legacy_tx],
+        epoch: 0,
+        beneficiary: victim_beneficiary, // the producer's own beneficiary (inside the digest)
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    // clones only seed genesis and recover signers; beneficiary value is irrelevant to seeding
+    let all_batches = vec![batch.clone()];
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // create committee from genesis state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    // The byzantine header author's committee execution address, i.e. `CertifiedBatch::address`,
+    // the value the pre-fix code credited. Committee execution addresses are unfunded in genesis,
+    // so this account starts at a zero balance (same premise `test_simple_basefee_penalty` relies
+    // on when it asserts the producer balance equals only the priority fees).
+    let attacker_header_author =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    assert_ne!(
+        victim_beneficiary, attacker_header_author,
+        "the #1222 attack requires the producer beneficiary and the header author to differ",
+    );
+
+    // finalize the batch (state root, header) after the beneficiary is set
+    execute_test_batch(&mut batch);
+
+    // only the eip1559 tx pays a priority fee; the legacy tx's gas price equals the base fee, so it
+    // contributes zero. This mirrors `test_simple_basefee_penalty`'s `eip1559_priority_fees`.
+    let expected_priority_fees = U256::from(TOTAL_GAS_PER_TX * PRIORITY_FEE);
+    assert!(expected_priority_fees > U256::ZERO, "test must produce a nonzero priority fee");
+
+    //=== Consensus: an ATTACKER-authored sub-DAG header referencing the VICTIM's batch digest
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        // the header author's `address` here is the pre-fix beneficiary; the fix must ignore it in
+        // favour of `batch.beneficiary` above.
+        vec![CertifiedBatch { address: attacker_header_author, batches: vec![batch] }],
+    );
+    let consensus_output_hash = consensus_output.consensus_header_hash();
+
+    //=== Execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    // drop sending channel so the engine stops after the queued output
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    let final_block = reth_env.finalized_block_num_hash()?.expect("finalized block");
+    assert_eq!(reth_env.last_block_number()?, 1, "exactly one block executed");
+    let last_output = execution_node.last_executed_output().await?;
+    assert_eq!(last_output, consensus_output_hash);
+    let _ = final_block;
+
+    // (1) the sealed block's beneficiary is the VICTIM (batch producer), NOT the ATTACKER. The
+    // pre-fix code wrote `cert_batch.address` (the attacker) here, so this assertion kills a
+    // revert.
+    let executed_blocks = reth_env.block_with_senders_range(1..=1)?;
+    assert_eq!(executed_blocks.len(), 1);
+    assert_eq!(
+        executed_blocks[0].beneficiary, victim_beneficiary,
+        "block beneficiary must be the batch producer (batch.beneficiary), not the header author",
+    );
+
+    // (2) the VICTIM received exactly the priority fees (its account starts at a zero balance).
+    let victim_balance = reth_env
+        .retrieve_account(&victim_beneficiary)?
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+    assert_eq!(
+        victim_balance, expected_priority_fees,
+        "priority fees must be credited to the batch producer's beneficiary",
+    );
+
+    // (3) the ATTACKER (header author / cert_batch.address) received NOTHING. Under the pre-fix
+    // code this account would instead hold `expected_priority_fees`.
+    let attacker_balance = reth_env
+        .retrieve_account(&attacker_header_author)?
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+    assert_eq!(
+        attacker_balance,
+        U256::ZERO,
+        "the header author must not receive the batch producer's priority fees (#1222 theft)",
+    );
 
     Ok(())
 }
@@ -2116,7 +2776,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee
@@ -2137,20 +2797,23 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
     leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),
@@ -2176,6 +2839,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
 
@@ -2185,7 +2849,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     let (tx, rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -2234,6 +2898,1707 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     assert_eq!(
         expected_governance_revenue, actual_governance_revenue,
         "governance revenue mismatch — penalty may be using post-refund gas instead of pre-refund gas"
+    );
+
+    Ok(())
+}
+
+/// Regression test for issue #989: a later-block build failure inside a single consensus output
+/// must not leave the earlier blocks' eager in-memory canonical advance un-rolled-back (a transient
+/// "phantom" canonical head visible to RPC until the node restarts).
+///
+/// Drives `execute_consensus_output` with a two-batch output where the first block executes and
+/// advances the in-memory state, and the second block carries a single transaction whose gas limit
+/// exceeds the block gas limit. That is a fatal, non-`InvalidTx` build error, so the output fails
+/// after the first block already advanced. The test asserts the in-memory canonical state is
+/// reverted to the pre-output (genesis) tip, nothing was committed durably, and no canon-state
+/// notification or engine update was emitted for the failed output.
+///
+/// Confirm-by-mutation: with the `rollback_in_memory_output` compensation removed from
+/// `execute_consensus_output`, the first block's advance survives and the
+/// `canonical_chain().count() == 0` and `canonical_tip == genesis` assertions below fail — so this
+/// test genuinely pins the post-error in-memory contract rather than passing vacuously.
+#[tokio::test]
+async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 2);
+
+    // Craft the poison transaction for the second block: a gas limit strictly greater than the
+    // block gas limit (`max_batch_gas`). The block-gas check fires before any balance/nonce
+    // validation, so the sender does not need to be funded; the transaction only needs to be
+    // decodable and signer-recoverable.
+    let genesis = test_genesis_with_consensus_registry(4);
+    let mut tx_factory = TransactionFactory::new_random();
+    let poison_gas_limit = max_batch_gas(0) + 1;
+    let poison_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None, // nonce
+            None, // max_priority_fee_per_gas
+            Some(MAX_FEE_PER_GAS as u128),
+            Some(poison_gas_limit), // gas_limit > block gas limit -> fatal build error
+            Some(Address::random()), // to
+            None,                   // value
+            None,                   // input
+            None,                   // access_list
+        )
+        .encoded_2718();
+
+    // Replace the second block's transactions with only the poison transaction.
+    if let Some(second) = batches.get_mut(1) {
+        let txs = second.transactions_mut();
+        txs.clear();
+        txs.push(poison_tx);
+    }
+
+    // Seed genesis from the first block's transactions only, so the first block executes and
+    // advances the in-memory state before the second block fails.
+    let batch_1 = batches.first().cloned().expect("two batches");
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, std::iter::once(&batch_1));
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    // the output fails: the second block's oversized-gas transaction is a fatal build error
+    assert_matches!(result, Err(_), "output with an oversized-gas block must fail to build");
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the first block's in-memory advance must be rolled back after the later block failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Regression test for issue #1090 defect (a): a pre-commit failure of the durable persist
+/// (`RethEnv::persist_executed_output`) after every block of the output built successfully must
+/// not leave the eager in-memory canonical advance standing (a "phantom" canonical head that RPC
+/// `latest`/`pending` reads would observe until the node restarts).
+///
+/// Drives `execute_consensus_output` with a two-batch output where both blocks build and advance
+/// the in-memory state, then fails every persist attempt via the injected provider fault
+/// (`PERSIST_OUTPUT_ATTEMPTS` armed faults, so the bounded retry exhausts too). Asserts the
+/// output errors with the provider fault, the in-memory canonical state is back at the
+/// pre-output (genesis) tip, nothing was committed durably, and no canon-state notification or
+/// engine update was emitted.
+///
+/// Confirm-by-mutation: with the `rollback_in_memory_output` compensation removed from the
+/// persist error path in `execute_consensus_output`, the two blocks' advance survives and the
+/// `canonical_chain().count() == 0` / `canonical_tip == genesis` assertions below fail.
+#[tokio::test]
+async fn test_persist_output_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // arm the injector: every persist attempt (first try + retries) hits a provider fault, so
+    // the bounded retry exhausts and the failure escalates
+    reth_env.inject_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    // the persist fault escalates as a provider error once the retry budget is exhausted
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(_))),
+        "an exhausted persist retry must escalate the provider fault"
+    );
+
+    // the whole budget was spent: a fault raised before `save_blocks` leaves nothing behind for
+    // the next attempt to trip over, so this is the one ordering a retry can actually work on
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        PERSIST_OUTPUT_ATTEMPTS,
+        "an early-seam fault must be retried until the budget is exhausted"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the persist failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090, late-stage variant of the persist rollback: a provider fault raised AFTER
+/// `save_blocks` has advanced the process-wide static-file writers still compensates the
+/// speculative in-memory advance, so the phantom canonical head cannot survive a late-stage
+/// persist failure.
+///
+/// Mirrors `test_persist_output_failure_rolls_back_in_memory_state` exactly, changing only the
+/// fault seam: `inject_late_persist_provider_faults` fires after `save_blocks` and the
+/// finalized/safe marker writes, immediately before `provider_rw.commit()`, rather than at the
+/// top of `RethEnv::persist_executed_output`. The database transaction is still uncommitted on
+/// that path, so the post-conditions are identical: the in-memory chain segment is empty, the
+/// canonical head is back at the anchor, nothing is durable, and no canon-state or engine-update
+/// notification fired.
+///
+/// Unlike the early-seam case this ordering CANNOT exhaust the retry budget: attempt 1 leaves the
+/// static-file writers advanced, so attempt 2 fails terminally on the mismatch before it reaches
+/// the seam at all. The attempt-count assertion pins that, so the test cannot quietly start
+/// passing for a different reason than the one documented here.
+#[tokio::test]
+async fn test_late_persist_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // arm the LATE injector with the full budget: only the first fault is ever consumed, because
+    // attempt 2 trips over attempt 1's static-file progress before it reaches the seam
+    reth_env.inject_late_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    // the persist fault escalates as a provider error
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(_))),
+        "a failed persist must escalate the provider fault"
+    );
+
+    // this ordering cannot exhaust the budget: attempt 1 leaves the static-file writers advanced,
+    // so attempt 2 fails terminally on the mismatch before it ever reaches the seam
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        2,
+        "a late-seam fault must stop at the terminal repeat attempt, not spend the whole budget"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the late persist failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090: once an attempt of `RethEnv::persist_executed_output` has failed AFTER
+/// `save_blocks` fsynced its static-file progress, re-running the call in-process can never
+/// succeed, so the bounded retry must abandon the budget rather than burn it.
+///
+/// Arms exactly ONE late fault: attempt 1 dies immediately before `provider_rw.commit()` with
+/// the static-file writers already advanced past this output's blocks, so attempt 2 re-runs
+/// `save_blocks` for real and trips over that progress. Empirically (three identical runs)
+/// attempt 2 fails with `ProviderError::UnexpectedStaticFileBlockNumber(Headers, 1, 3)`, reth's
+/// "trying to append data to Headers as block #1 but expected block #3", which
+/// `retryable_persist_fault` classifies terminal.
+///
+/// Pins three things: the terminal class is what escalates, the engine stops at attempt 2 of
+/// `PERSIST_OUTPUT_ATTEMPTS` instead of burning the third (asserted on the attempt counter, never
+/// on elapsed time), and the speculative in-memory advance is still compensated on the way out
+/// even though a durable side effect (the static-file writers) survives for reth's startup
+/// consistency check to reconcile.
+#[tokio::test]
+async fn test_repeat_persist_after_static_file_progress_is_terminal() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // exactly ONE late fault: attempt 1 dies after `save_blocks`, attempt 2 re-runs it for real
+    reth_env.inject_late_persist_provider_faults(1);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    // attempt 2 trips over attempt 1's fsynced static-file progress, and that class is terminal
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(
+            ProviderError::UnexpectedStaticFileBlockNumber(..)
+        ))),
+        "a repeat persist over the failed attempt's fsynced static-file progress must surface \
+         the static-file mismatch, not a retryable fault"
+    );
+
+    // the terminal class abandons the budget at attempt 2 instead of burning the third attempt
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        2,
+        "the static-file mismatch is terminal, so the retry must stop at attempt 2 of \
+         {PERSIST_OUTPUT_ATTEMPTS}"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the terminal persist failure"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: both attempts left the database transaction uncommitted
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090 defect (b): a transient node-local provider fault on the durable persist is
+/// retried within the bounded budget instead of halting the engine.
+///
+/// Arms `PERSIST_OUTPUT_ATTEMPTS - 1` injected faults, so every attempt in the retry window
+/// fails and the final attempt succeeds. Asserts the output executes to completion exactly as on
+/// the fault-free path: both blocks durably committed with the finalized marker advanced, the
+/// in-memory head naming the committed tip, and the engine update and canon-state notification
+/// emitted.
+#[tokio::test]
+async fn test_persist_provider_fault_retry_recovers() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // arm the injector: the whole retry window faults, then the final attempt succeeds
+    reth_env.inject_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS - 1);
+
+    // subscribe before execution to observe the success-path notification
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    // the transient faults are absorbed by the bounded retry
+    let executed_tip = result?;
+    assert_eq!(executed_tip.number, 2, "both blocks executed");
+
+    // the injector really fired: without this the test passes just as well when the seam fails to
+    // arm and the very first attempt succeeds, leaving the retry window itself untested
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        PERSIST_OUTPUT_ATTEMPTS,
+        "every attempt in the retry window must run before the final one succeeds"
+    );
+
+    // the output is durably committed and announced exactly as on the fault-free path
+    assert_eq!(reth_env.last_block_number()?, 2, "both blocks committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 2, "finalized marker advanced");
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        executed_tip.hash(),
+        "the in-memory head names the committed tip"
+    );
+    assert!(
+        canon_rx.try_recv().is_ok(),
+        "a committed output broadcasts a canon-state notification"
+    );
+    let (_, _, header) =
+        engine_update_rx.try_recv().expect("a committed output sends an engine update");
+    assert_eq!(
+        header.map(|h| h.hash()),
+        Some(executed_tip.hash()),
+        "the engine update names the committed tip"
+    );
+
+    Ok(())
+}
+
+/// Issue #1090 mirror case: a failure AFTER the durable commit (a closed engine-update channel
+/// yields `TnRethError::EngineUpdateChannelClosed` from `RethEnv::announce_executed_output`) must
+/// NOT roll back the in-memory advance. The blocks are canonical for real, and reverting durably
+/// committed blocks would be a worse defect than the phantom head this issue fixes; this pins the
+/// compensator's pre-commit-only scope.
+///
+/// Confirm-by-mutation: with the rollback widened to fire on the announce failure too, the
+/// canonical-head assertions below fail.
+#[tokio::test]
+async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // subscribe before execution: the announce fails at the engine-update send, BEFORE the
+    // canon-state broadcast, so no notification may be observed either
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // close the engine-update channel BEFORE execution: the POST-commit blocking_send fails
+    let (engine_update_tx, engine_update_rx) = tokio::sync::mpsc::channel(64);
+    drop(engine_update_rx);
+
+    // run the output on a blocking task, mirroring the production execution task
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::EngineUpdateChannelClosed)),
+        "a closed engine-update channel fails the output post-commit"
+    );
+
+    // the blocks are durably canonical: committed tip and markers advanced
+    assert_eq!(
+        reth_env.last_block_number()?,
+        2,
+        "both blocks committed durably before the failure"
+    );
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        2,
+        "finalized marker advanced with the blocks"
+    );
+
+    // and the in-memory head still names the committed tip: NO rollback fired
+    assert_eq!(
+        reth_env.canonical_tip().number,
+        2,
+        "the in-memory canonical head must keep naming the committed tip"
+    );
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        2,
+        "the committed blocks stay in the in-memory chain (finalize_block never ran)"
+    );
+
+    // ordering: the announce failed before the canon-state broadcast
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "the canon-state broadcast happens after the engine-update send, which failed"
+    );
+
+    Ok(())
+}
+
+/// Drive `execute_consensus_output` with an output whose `batch_digests` deque is one entry longer
+/// than its flattened batch count, and return the result alongside the reth env.
+///
+/// The shape mirrors what the adiri duplicate-batch bug produces: the subscriber pushes a digest
+/// for every header payload key but skips the batch when the digest is a duplicate
+/// (`crates/consensus/executor/src/subscriber.rs`), so the deque ends up longer than the batches.
+/// Here one batch is paired with that batch's digest listed twice.
+///
+/// The leader's epoch is 0, i.e. at or below `ADIRI_DUP_BATCH_EPOCH`, so the `adiri` build takes
+/// the tolerated fall-through arm and the default build takes the `Err` arm. Genesis is seeded from
+/// the batch so the fall-through arm can actually execute rather than failing for an unrelated
+/// reason.
+async fn execute_uneven_output(
+    tmp_dir: &std::path::Path,
+) -> eyre::Result<(Result<SealedHeader, TnEngineError>, RethEnv)> {
+    let chain = test_chain_spec_arc();
+    let batch = tn_reth::test_utils::batches(chain, 1).remove(0);
+
+    // seed genesis with the batch's senders so the block is executable
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, std::iter::once(&batch));
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir,
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one batch, but its digest listed twice
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let batch_digest = batch.digest();
+    let batch_digests: VecDeque<BlockHash> = VecDeque::from([batch_digest, batch_digest]);
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
+
+    // the premise of both arms: the two lengths disagree, and the epoch is inside the adiri window
+    assert_eq!(consensus_output.flatten_batches().len(), 1, "one flattened batch");
+    assert_eq!(consensus_output.batch_digests().len(), 2, "two batch digests");
+    assert_eq!(consensus_output.leader().epoch(), 0, "epoch must be <= ADIRI_DUP_BATCH_EPOCH");
+
+    //=== drive execution on a blocking task, mirroring the production execution task
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    // hold the receiver so `finish_executing_output` can deliver the tip update on the Ok arm
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header);
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await?;
+
+    Ok((result, reth_env))
+}
+
+/// Arm 1 of the batch/digest count check: on a default build an uneven output is rejected with
+/// [`TnEngineError::ConsensusOutputUnevenBatches`] before anything executes.
+///
+/// This arm was unreachable until the un-`cfg`-gated `debug_assert_eq!` above the check was
+/// removed: every profile a test can run under (`test`, and `[profile.e2e]`, which sets
+/// `debug-assertions = true`) panicked on the assert first.
+#[cfg(not(feature = "adiri"))]
+#[tokio::test]
+async fn test_uneven_batches_and_digests_rejected() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    let (result, reth_env) = execute_uneven_output(tmp_dir.path()).await?;
+
+    assert_matches!(
+        result,
+        Err(TnEngineError::ConsensusOutputUnevenBatches(1, 2)),
+        "uneven batches and digests must be rejected fail-closed"
+    );
+
+    // the check fires before any block is built
+    assert_eq!(
+        reth_env.canonical_in_memory_state().canonical_chain().count(),
+        0,
+        "no block may be built for a rejected output"
+    );
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+
+    Ok(())
+}
+
+/// Arm 2 of the batch/digest count check: on an `adiri` build at an epoch at or below
+/// `ADIRI_DUP_BATCH_EPOCH` the same uneven output is *tolerated* and executes.
+///
+/// That tolerance is why the duplicate-batch history of adiri testnet can be resynced. It is also
+/// why the removed `debug_assert_eq!` was a bug rather than a harmless duplicate: it panicked on
+/// exactly these epochs in any debug-assertions build.
+///
+/// Not covered by CI's test job, which runs `--workspace --exclude tn-faucet` with no
+/// `--all-features` (`.github/workflows/pr.yaml`). Run with
+/// `cargo nextest run -p tn-engine --features adiri`.
+#[cfg(feature = "adiri")]
+#[tokio::test]
+async fn test_uneven_batches_and_digests_tolerated_on_early_adiri_epoch() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // the fixture's epoch is 0, which is inside the tolerated window for any value of the constant
+    let (result, reth_env) = execute_uneven_output(tmp_dir.path()).await?;
+
+    let canonical_header = result.expect("uneven output must be tolerated on an early adiri epoch");
+    assert_eq!(canonical_header.number, 1, "the one flattened batch produced one block");
+    assert_eq!(reth_env.last_block_number()?, 1, "the block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 1, "the block was finalized");
+
+    Ok(())
+}
+
+/// Issue #1259: a validator that re-packs another validator's gossiped transactions into its own
+/// batch must be visible to the repack monitor when the output executes.
+///
+/// One output carries two certified batches from two different producer addresses; the second
+/// batch contains one transaction copied from the first. Execution succeeds (the duplicate copy
+/// is skipped by the EVM's transaction-level validation, `tn_reth.invalid_txs_skipped_total`),
+/// and the monitor attributes exactly one cross-producer duplicate to the first-ordered
+/// producer. Note the honest-duplicate caveat: the monitor is telemetry, so the assertion here
+/// is on observation, never on execution outcome.
+#[tokio::test]
+async fn test_cross_producer_repack_flagged_during_execution() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two batches from two different producers.
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+
+    // The second producer poaches the first transaction of the first producer's batch.
+    let poached_tx =
+        batches.first().expect("two batches").transactions.first().expect("batch has txs").clone();
+    if let Some(second) = batches.get_mut(1) {
+        second.transactions_mut().push(poached_tx);
+    }
+
+    // Seed genesis from both batches so every original transaction executes.
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let victim_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    let poacher_producer = Address::random();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output, two certified batches from two producers
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(1);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let mut batches_iter = batches.into_iter();
+    let victim_batch = batches_iter.next().expect("two batches");
+    let poacher_batch = batches_iter.next().expect("two batches");
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![
+            CertifiedBatch { address: victim_producer, batches: vec![victim_batch] },
+            CertifiedBatch { address: poacher_producer, batches: vec![poacher_batch] },
+        ],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let repack_monitor = tn_types::repack_monitor::RepackMonitor::enabled();
+    let task_monitor = repack_monitor.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, task_monitor, engine_update_tx)
+    })
+    .await?;
+
+    // The poached duplicate never fails the build: it is skipped at transaction-level
+    // validation, so the output executes both blocks.
+    let final_header = result.expect("output with a poached duplicate still executes");
+    assert_eq!(final_header.number, 2, "both producers' blocks must build");
+    assert!(engine_update_rx.try_recv().is_ok(), "successful output sends an engine update");
+
+    // The monitor flags exactly the one cross-producer duplicate.
+    assert_eq!(
+        repack_monitor.total_repacked(),
+        1,
+        "the poached transaction must be flagged once against the first-ordered producer"
+    );
+
+    Ok(())
+}
+
+/// Issue #1259: the engine must wire its repack monitor into every consensus-output execution,
+/// so a cross-producer duplicate that spans two outputs is flagged by the engine-owned monitor.
+///
+/// Two outputs flow through the engine's consensus-output channel: the first carries the victim
+/// producer's batches, the second carries the poacher's batches with one transaction copied from
+/// the victim's first batch. Both outputs execute to canonical blocks (the duplicate copy is
+/// skipped by transaction-level validation), and the monitor clone held by the test observes
+/// exactly one cross-producer duplicate because clones share one window across outputs.
+#[tokio::test]
+async fn test_engine_repack_monitor_flags_cross_producer_repack_through_engine() -> eyre::Result<()>
+{
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two rounds of batches from two different producers.
+    let chain = test_chain_spec_arc();
+    let batches_1 = tn_reth::test_utils::batches(chain.clone(), 2);
+    let mut batches_2 = tn_reth::test_utils::batches(chain, 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+
+    // The second producer poaches the first transaction of the first producer's first batch.
+    let poached_tx = batches_1
+        .first()
+        .expect("two batches in round one")
+        .transactions
+        .first()
+        .expect("batch has txs")
+        .clone();
+    batches_2
+        .iter_mut()
+        .take(1)
+        .for_each(|batch| batch.transactions_mut().push(poached_tx.clone()));
+
+    // Seed genesis from both rounds so every original transaction executes.
+    let all_batches = [batches_1.clone(), batches_2.clone()].concat();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // create committee from genesis state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let authority_2 =
+        committee.authorities().last().expect("last in 4 auth committee for tests").id();
+    let victim_producer =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    let poacher_producer = Address::random();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: two outputs, the second producer re-packs the first producer's transaction
+    // genesis is stamped with `now()` on creation, so the leaders never predate the parent block;
+    // the second leader is one second later so consecutive outputs strictly increase
+    let timestamp = now();
+    let mut leader_1 = Certificate::default();
+    leader_1.update_header_author_for_test(authority_1);
+    leader_1.update_header_round_for_test(1);
+    leader_1.update_header_created_at_for_test(timestamp);
+    let sub_dag_index_1: u64 = 1;
+    let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
+        leader_1,
+        sub_dag_index_1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests_1,
+        vec![CertifiedBatch { address: victim_producer, batches: batches_1 }],
+    );
+
+    // create second output
+    let mut leader_2 = Certificate::default();
+    leader_2.update_header_author_for_test(authority_2);
+    leader_2.update_header_round_for_test(2);
+    leader_2.update_header_created_at_for_test(timestamp + 1);
+    let sub_dag_index_2: u64 = 2;
+    let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
+    let subdag_2 = CommittedSubDag::new(
+        vec![leader_2.clone()],
+        leader_2,
+        sub_dag_index_2,
+        ReputationScores::default(),
+        Some(subdag_1),
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        true,
+        batch_digests_2,
+        vec![CertifiedBatch { address: poacher_producer, batches: batches_2 }],
+    );
+    let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
+
+    //=== Execution
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let repack_monitor = tn_types::repack_monitor::RepackMonitor::enabled();
+    let mut engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        repack_monitor.clone(),
+        engine_update_tx,
+    );
+
+    // queue the first output - simulate already received from channel
+    engine.push_back_queued_for_test(consensus_output_1.clone());
+
+    // send second output
+    let broadcast_result = to_engine.send(consensus_output_2.clone()).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel before receiver has a chance to process message
+    drop(to_engine);
+
+    // channels for engine shutting down
+    let (tx, rx) = oneshot::channel();
+
+    // spawn engine task
+    //
+    // one output already queued up, one output waiting in broadcast stream
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus output stream closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // prove BOTH outputs executed: one block per batch, tip finalized at the second output
+    let last_block_num = reth_env.last_block_number()?;
+    let expected_block_height = 4;
+    assert_eq!(last_block_num, expected_block_height, "both outputs' batches must build blocks");
+    let canonical_tip = reth_env.canonical_tip();
+    let final_block = reth_env.finalized_block_num_hash()?.expect("finalized block");
+    assert_eq!(canonical_tip.hash(), final_block.hash);
+    let last_output = execution_node.last_executed_output().await?;
+    assert_eq!(last_output, consensus_output_2_hash);
+
+    // the engine-owned monitor flags exactly the one cross-producer duplicate
+    assert!(repack_monitor.is_enabled());
+    assert_eq!(
+        repack_monitor.total_repacked(),
+        1,
+        "the poached transaction must be flagged once by the engine's monitor"
+    );
+
+    Ok(())
+}
+
+/// Pins this test process's sub-second timestamp fork active (or dormant) from genesis, with the
+/// seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building a consensus output. nextest runs each test
+/// in its own process, which keeps one test's pin from reaching another; a single-process `cargo
+/// test` run shares one latch across the whole test binary instead. Reading the overrides back
+/// turns a value that latched before the pin into a named failure. Because both forks are pinned,
+/// a test that calls this behaves the same in the default and `adiri` builds.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+}
+
+/// Installs a [`DebuggingRecorder`] as this process's global metrics recorder and returns the
+/// handle that reads what it captures.
+///
+/// Call this at the start of a test, before anything touches the engine's metrics. The engine
+/// records through a process-wide `LazyLock` static whose handles bind to whichever recorder is
+/// global when the static first initializes, and it executes outputs on a blocking thread, so a
+/// thread-local recorder (`metrics::with_local_recorder`) never sees them. A process keeps one
+/// global recorder for its whole life. Each test gets its own only because nextest runs every
+/// test in a separate process; under a single-process `cargo test` run the second install fails
+/// here rather than letting a test read another test's counts.
+fn install_metrics_recorder() -> Snapshotter {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    recorder.install().expect("no global metrics recorder is installed before this test");
+    snapshotter
+}
+
+/// Every counter `snapshotter` has captured, keyed by metric name.
+///
+/// Taking a snapshot resets the counters it reads, so take it once, after the scenario has run.
+/// A counter the process never registered is absent, which reads the same as 0.
+fn snapshot_counters(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count) => Some((key.key().name().to_string(), count)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `first` and then `second` through an [`ExecutorEngine`] built on `parent`.
+///
+/// `first` is already queued and `second` arrives over the consensus channel, which then closes,
+/// so the engine executes both back to back and stops on the closed stream.
+async fn execute_outputs_back_to_back(
+    reth_env: RethEnv,
+    parent: SealedHeader,
+    gas_accumulator: GasAccumulator,
+    first: ConsensusOutput,
+    second: ConsensusOutput,
+) -> eyre::Result<()> {
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let mut engine = ExecutorEngine::new(
+        reth_env,
+        None,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    engine.push_back_queued_for_test(first);
+    assert!(to_engine.send(second).await.is_ok(), "the engine holds the consensus receiver");
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+    Ok(())
+}
+
+/// Commit and block timestamps observed by [`execute_cross_epoch_commit_regression`].
+struct CrossEpochRegression {
+    /// The `timestamp` of the block that closes [`CLOSING_EPOCH`] (`T`).
+    closing_timestamp: TimestampSec,
+    /// The `committed_at` of the first output of [`OPENING_EPOCH`] (`T - 3`).
+    regressed_committed_at: TimestampSec,
+    /// The `timestamp` of the block built from that output.
+    opening_timestamp: TimestampSec,
+}
+
+/// Closes [`CLOSING_EPOCH`] at EVM timestamp `T`, then executes the first output of
+/// [`OPENING_EPOCH`] with a commit time of `T - 3`.
+///
+/// The regression is the consensus bug the EVM clamp guards against: from the sub-second fork on,
+/// the epoch commit floor keeps an epoch's first commit after the previous epoch's closing block,
+/// and this output is built without it. Each output carries one batch, so each builds exactly one
+/// block and a clamp is counted at most once.
+async fn execute_cross_epoch_commit_regression() -> eyre::Result<CrossEpochRegression> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain, 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let closing_author = committee.authorities().first().expect("first authority").id();
+    let opening_author = committee.authorities().last().expect("last authority").id();
+    let batch_producer =
+        committee.authority(&closing_author).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    let mut batches = batches.into_iter();
+    let closing_batch = batches.next().expect("two batches");
+    let opening_batch = batches.next().expect("two batches");
+
+    // both commit times sit after genesis, so only the regression itself can trigger a clamp
+    let genesis_header = chain.sealed_genesis_header();
+    let closing_timestamp = genesis_header.timestamp + 10;
+    let regressed_committed_at = closing_timestamp - 3;
+
+    //=== Consensus: the output that closes the epoch at `T`
+    let mut closing_leader = Certificate::default();
+    closing_leader.update_header_epoch_for_test(CLOSING_EPOCH);
+    closing_leader.update_header_author_for_test(closing_author);
+    closing_leader.update_header_round_for_test(1);
+    closing_leader.update_header_created_at_for_test(closing_timestamp);
+    let closing_subdag = CommittedSubDag::new(
+        vec![closing_leader.clone()],
+        closing_leader,
+        1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let closing_output = ConsensusOutput::new(
+        closing_subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::from([closing_batch.digest()]),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![closing_batch] }],
+    );
+    assert_eq!(closing_output.committed_at(), closing_timestamp);
+
+    //=== Consensus: the next epoch's first output, committed at `T - 3`
+    //
+    // with neither a previous sub-dag nor an epoch commit floor, the commit time is the leader's
+    let mut opening_leader = Certificate::default();
+    opening_leader.update_header_epoch_for_test(OPENING_EPOCH);
+    opening_leader.update_header_author_for_test(opening_author);
+    opening_leader.update_header_round_for_test(2);
+    opening_leader.update_header_created_at_for_test(regressed_committed_at);
+    let opening_subdag = CommittedSubDag::new(
+        vec![opening_leader.clone()],
+        opening_leader,
+        2,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let opening_output = ConsensusOutput::new(
+        opening_subdag,
+        closing_output.consensus_header_hash(),
+        1,
+        false,
+        VecDeque::from([opening_batch.digest()]),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![opening_batch] }],
+    );
+    assert_eq!(opening_output.leader().epoch(), OPENING_EPOCH);
+    assert_eq!(
+        opening_output.committed_at(),
+        regressed_committed_at,
+        "the regressed commit time must reach execution unchanged"
+    );
+
+    //=== Execution
+    let reth_env = execution_node.get_reth_env().await;
+    execute_outputs_back_to_back(
+        reth_env.clone(),
+        genesis_header,
+        gas_accumulator,
+        closing_output,
+        opening_output,
+    )
+    .await?;
+
+    assert_eq!(reth_env.last_block_number()?, 2, "each output must build exactly one block");
+    let blocks = reth_env.block_with_senders_range(1..=2)?;
+    let [closing_block, opening_block] = blocks.as_slice() else {
+        panic!("expected two executed blocks, got {}", blocks.len());
+    };
+    assert_eq!(closing_block.timestamp, closing_timestamp, "the epoch must close at `T`");
+
+    Ok(CrossEpochRegression {
+        closing_timestamp,
+        regressed_committed_at,
+        opening_timestamp: opening_block.timestamp,
+    })
+}
+
+/// From the sub-second timestamp fork on, an epoch's first block never precedes the previous
+/// epoch's closing block, even when consensus hands execution an earlier commit time, and the
+/// engine counts the clamp.
+///
+/// The closing block is at `T` and the next epoch's first output commits at `T - 3` (see
+/// [`execute_cross_epoch_commit_regression`]). The block built from it is raised to `T` and
+/// `tn_engine.evm_timestamp_clamped_total` reads 1.
+#[tokio::test]
+async fn test_cross_epoch_commit_regression_clamped_to_parent_post_fork() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(true);
+    let snapshotter = install_metrics_recorder();
+    assert!(
+        subsecond_timestamp_active(OPENING_EPOCH),
+        "the pinned fork must be active for the opening leader's epoch"
+    );
+
+    let regression = execute_cross_epoch_commit_regression().await?;
+    assert_eq!(
+        regression.opening_timestamp, regression.closing_timestamp,
+        "a post-fork block must be raised to its parent's timestamp, not take the regressed \
+         commit time {}",
+        regression.regressed_committed_at
+    );
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(2),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        1,
+        "exactly the one clamped block must be counted"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork, a block keeps its output's commit time even when that
+/// precedes the parent block's, so replaying pre-fork history reproduces the original timestamps.
+///
+/// Same scenario as [`test_cross_epoch_commit_regression_clamped_to_parent_post_fork`] with the
+/// fork dormant: the block built from the output committed at `T - 3` keeps `T - 3`, and
+/// `tn_engine.evm_timestamp_clamped_total` stays at 0.
+#[tokio::test]
+async fn test_cross_epoch_commit_regression_unclamped_pre_fork() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(false);
+    let snapshotter = install_metrics_recorder();
+    assert!(
+        !subsecond_timestamp_active(OPENING_EPOCH),
+        "the pinned fork must be dormant for the opening leader's epoch"
+    );
+
+    let regression = execute_cross_epoch_commit_regression().await?;
+    assert_eq!(
+        regression.opening_timestamp, regression.regressed_committed_at,
+        "a pre-fork block must keep its commit time even when it precedes the parent's {}",
+        regression.closing_timestamp
+    );
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(2),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        0,
+        "a pre-fork block is never clamped"
+    );
+
+    Ok(())
+}
+
+/// Consecutive outputs committed within one second share that second as their EVM `timestamp`,
+/// so their EIP-4788 writes land in the same ring-buffer entry and the latest output's
+/// `ConsensusHeader` root wins.
+///
+/// Two outputs commit 500 ms apart inside one second, each with two batches. Every block of both
+/// outputs carries that second. The entry holds the first output's root through the first
+/// output's blocks and the second output's root from the second output's first block on, so at
+/// the tip it holds the latest root. The first root stays reachable because the second output's
+/// `ConsensusHeader` names it as its parent. Blocks that only repeat their parent's timestamp are
+/// not clamps, so the clamp counter stays at 0.
+#[tokio::test]
+async fn test_same_second_outputs_eip4788_latest_root_wins() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    pin_subsecond_fork(true);
+    let snapshotter = install_metrics_recorder();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // two batches per output
+    let chain = test_chain_spec_arc();
+    let batches_1 = tn_reth::test_utils::batches(chain.clone(), 2);
+    let batches_2 = tn_reth::test_utils::batches(chain, 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let all_batches = [batches_1.clone(), batches_2.clone()].concat();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first authority").id();
+    let authority_2 = committee.authorities().last().expect("last authority").id();
+    let batch_producer =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: two outputs committed 500 ms apart within `second`
+    let genesis_header = chain.sealed_genesis_header();
+    let second = genesis_header.timestamp + 1;
+    let mut leader_1 = Certificate::default();
+    leader_1.update_header_author_for_test(authority_1);
+    leader_1.update_header_round_for_test(1);
+    leader_1.update_header_created_at_ms_for_test(TimestampMs::from_parts(second, 200));
+    let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
+        leader_1,
+        1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests_1,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+    );
+
+    let mut leader_2 = Certificate::default();
+    leader_2.update_header_author_for_test(authority_2);
+    leader_2.update_header_round_for_test(2);
+    leader_2.update_header_created_at_ms_for_test(TimestampMs::from_parts(second, 700));
+    let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
+    let subdag_2 = CommittedSubDag::new(
+        vec![leader_2.clone()],
+        leader_2,
+        2,
+        ReputationScores::default(),
+        Some(subdag_1),
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        false,
+        batch_digests_2,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+    );
+
+    // both commits fall inside `second`, the later one strictly after the earlier
+    assert_eq!(consensus_output_1.committed_at(), second);
+    assert_eq!(consensus_output_2.committed_at(), second);
+    assert_eq!(consensus_output_1.committed_at_ms(), TimestampMs::from_parts(second, 200));
+    assert_eq!(consensus_output_2.committed_at_ms(), TimestampMs::from_parts(second, 700));
+
+    let root_1 = consensus_output_1.consensus_header_hash();
+    let root_2 = consensus_output_2.consensus_header_hash();
+    assert_ne!(root_1, root_2, "each output must write its own root");
+    // the overwritten root stays reachable by walking the consensus chain back from the survivor
+    assert_eq!(consensus_output_2.parent_hash(), root_1);
+
+    //=== Execution
+    let reth_env = execution_node.get_reth_env().await;
+    execute_outputs_back_to_back(
+        reth_env.clone(),
+        genesis_header,
+        gas_accumulator,
+        consensus_output_1,
+        consensus_output_2,
+    )
+    .await?;
+
+    let expected_block_height = 4;
+    assert_eq!(reth_env.last_block_number()?, expected_block_height);
+    let executed_blocks = reth_env.block_with_senders_range(1..=expected_block_height)?;
+    assert_eq!(executed_blocks.len() as u64, expected_block_height);
+    for (idx, block) in executed_blocks.iter().enumerate() {
+        assert_eq!(block.timestamp, second, "block {} must carry the shared second", block.number);
+
+        // the entry holds the first output's root through that output's two blocks; the second
+        // output's first block overwrites it, so from there on, tip included, the latest root wins
+        let expected_root = if idx < 2 { root_1 } else { root_2 };
+        assert_eip4788(&reth_env, block.sealed_block(), expected_root)?;
+    }
+
+    let counters = snapshot_counters(&snapshotter);
+    assert_eq!(
+        counters.get(BLOCKS_EXECUTED_TOTAL).copied(),
+        Some(expected_block_height),
+        "the recorder must capture the engine's metrics"
+    );
+    assert_eq!(
+        counters.get(EVM_TIMESTAMP_CLAMPED_TOTAL).copied().unwrap_or_default(),
+        0,
+        "a block that repeats its parent's timestamp is not a clamp"
     );
 
     Ok(())

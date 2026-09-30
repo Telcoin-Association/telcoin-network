@@ -3,8 +3,8 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, proposer::OurDigestMessage,
-    state_sync::CertificateManagerCommand, RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand, metrics::PrimaryMetrics,
+    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use parking_lot::Mutex;
 use std::{
@@ -16,11 +16,11 @@ use std::{
 };
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
-    deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, B256,
-    CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockNumHash, CanonicalExecutionReader, Certificate, CommittedSubDag,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header,
+    Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -29,6 +29,26 @@ use tokio::{
     },
     time::error::Elapsed,
 };
+use tracing::error;
+
+/// Capacity for the `sync_output` broadcast.
+///
+/// Items are full [`ConsensusOutput`]s (subdag + batches), so a deep buffer costs hundreds of
+/// MB when a follower lags. The state-sync producer waits for execution to catch up before each
+/// send and fails fast on a digest-chain mismatch, so a deep buffer buys nothing: 1_000 bounds
+/// worst-case memory while still absorbing bursts.
+const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 1_000;
+/// Capacity for the `exex_certificates` broadcast.
+///
+/// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
+/// native `Lagged` handling rather than needing a deep buffer.
+const EXEX_CERTIFICATES_CHANNEL_CAPACITY: usize = 1_000;
+/// Capacity for the `exex_consensus_output` broadcast.
+///
+/// Items are full [`ConsensusOutput`]s. ExEx handles `Lagged` natively (surfaced as
+/// `TnExExNotification::Lagged` reconciliation), so match the engine's `consensus_output`
+/// capacity instead of buffering hundreds of MB for a slow ExEx.
+const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
@@ -195,6 +215,19 @@ impl NodeMode {
     }
 }
 
+/// Convert the consensus-layer [`NodeMode`] into the serializable [`tn_types::NodeMode`] used at
+/// the RPC boundary. Exhaustive over every variant so a new mode fails to compile until it is
+/// mapped here.
+impl From<NodeMode> for tn_types::NodeMode {
+    fn from(mode: NodeMode) -> Self {
+        match mode {
+            NodeMode::CvvActive => tn_types::NodeMode::CvvActive,
+            NodeMode::CvvInactive => tn_types::NodeMode::CvvInactive,
+            NodeMode::Observer => tn_types::NodeMode::Observer,
+        }
+    }
+}
+
 /// The thread-safe inner type that holds all the channels for inner-consensus
 /// communication between different tasks.
 /// This contains things that exist for the app lifetime.
@@ -214,15 +247,39 @@ pub struct ConsensusBusAppInner {
 
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
-    /// Watch tracking the last gossipped consensus block number and hash.
-    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, BlockHash)>,
+    /// Watch tracking the last gossipped epoch, consensus block number, hash and consensus bytes.
+    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Watch requesting the fetch task backfill a bottom gap the gossip-driven walk cannot reach.
+    ///
+    /// Published by the observer's `state_sync::spawn_stream_consensus_headers` when its catch-up
+    /// loop stalls, carrying `(epoch, target_number, target_hash, floor)`: fill the consensus
+    /// range `floor..=target_number` (walking back from the verified gossip tip
+    /// `target_hash`). Consumed by `state_sync::spawn_fetch_recent_consensus`, which owns the
+    /// in-flight accounting. This is deliberately separate from the gossip watermark so a gap
+    /// below it can still be recovered.
+    tx_consensus_gap: watch::Sender<Option<(Epoch, u64, ConsensusHeaderDigest, u64)>>,
 
-    /// Consensus header.  Note this can be used to create consensus output to execute for non
-    /// validators.
-    consensus_header: broadcast::Sender<ConsensusHeader>,
+    /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
+    /// subscriber for execution. Filled by the state-sync forward drain; used only by
+    /// non-active nodes.
+    sync_output: broadcast::Sender<ConsensusOutput>,
     /// Broadcast the latest output from consensus after committing to the subdag.
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
+
+    /// Broadcast channel for verified certificates (ExEx).
+    ///
+    /// Fed from the consensus-following path (gossip-verified certificates on
+    /// Observer / inactive-CVV nodes), never from the validator hot path. There
+    /// is no own/peer split — a follower has no certificates of its own.
+    exex_certificates: broadcast::Sender<Certificate>,
+    /// Broadcast channel for the full consensus output (ExEx).
+    ///
+    /// Fed from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution. `ConsensusOutput`
+    /// is cheap to clone (Arc-backed), so no outer `Arc` is needed.
+    exex_consensus_output: broadcast::Sender<ConsensusOutput>,
+
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
 
@@ -238,7 +295,53 @@ pub struct ConsensusBusAppInner {
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
-    consensus_request_queue: QueChannel<(Epoch, u64, B256)>,
+    /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
+    consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Prometheus metrics for the primary's consensus pipeline.
+    ///
+    /// Lives on the app-lifetime bus because the bus already reaches every consensus
+    /// component (proposer, certifier, certificate manager, consensus driver).
+    metrics: PrimaryMetrics,
+
+    /// Canonical execution-DB fallback for `wait_for_execution` (installed once the execution
+    /// engine is built); empty until then and in engine-less tests/tools.
+    canonical_reader: CanonicalReaderSlot,
+}
+
+/// Late-bound handle to the canonical execution database, used by
+/// [`ConsensusBusApp::wait_for_execution`] as a fallback when a queried execution tip has been
+/// evicted from the in-memory `recent_blocks` ring.
+///
+/// The bus is constructed before the execution engine exists, so the reader is installed later
+/// (see [`ConsensusBusApp::set_canonical_reader`]). It stays empty in tests and tools that never
+/// wire an engine, in which case `wait_for_execution` keeps its original ring-only behavior.
+#[derive(Default)]
+struct CanonicalReaderSlot(Mutex<Option<Arc<dyn CanonicalExecutionReader>>>);
+
+impl std::fmt::Debug for CanonicalReaderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalReaderSlot").field("installed", &self.0.lock().is_some()).finish()
+    }
+}
+
+impl CanonicalReaderSlot {
+    /// Install (or replace) the canonical reader. Last writer wins, so a per-epoch engine rebuild
+    /// simply refreshes the handle.
+    fn install(&self, reader: Arc<dyn CanonicalExecutionReader>) {
+        *self.0.lock() = Some(reader);
+    }
+
+    /// Confirm that `block` is the canonical execution block persisted at its height.
+    ///
+    /// Returns `false` when no reader is installed, the height is above the persisted tip, or the
+    /// DB hash differs (a genuine fork).
+    fn confirms(&self, block: &BlockNumHash) -> bool {
+        // Clone the handle out and drop the lock before the DB read: never hold a lock across I/O.
+        let reader = self.0.lock().clone();
+        reader
+            .and_then(|reader| reader.canonical_execution_hash(block.number))
+            .is_some_and(|hash| hash == block.hash)
+    }
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -269,13 +372,17 @@ impl ConsensusBusApp {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(None);
         let (tx_last_published_consensus_num_hash, _) =
-            watch::channel((0, 0, BlockHash::default()));
+            watch::channel((0, 0, ConsensusHeaderDigest::default()));
+        let (tx_consensus_gap, _) = watch::channel(None);
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
-        let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
+        let (sync_output, _rx_sync_output) = broadcast::channel(SYNC_OUTPUT_CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
+
+        let (exex_certificates, _) = broadcast::channel(EXEX_CERTIFICATES_CHANNEL_CAPACITY);
+        let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
 
@@ -290,8 +397,11 @@ impl ConsensusBusApp {
                 tx_recent_blocks,
                 tx_last_consensus_header,
                 tx_last_published_consensus_num_hash,
-                consensus_header,
+                tx_consensus_gap,
+                sync_output,
                 consensus_output,
+                exex_certificates,
+                exex_consensus_output,
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
@@ -299,6 +409,10 @@ impl ConsensusBusApp {
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
                 consensus_request_queue: QueChannel::new(),
+                // new_with_labels (not Default): binds to the recorder active at bus
+                // construction instead of caching the first-bound recorder process-wide
+                metrics: PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new()),
+                canonical_reader: CanonicalReaderSlot::default(),
             }),
         }
     }
@@ -308,6 +422,10 @@ impl ConsensusBusApp {
     pub fn reset_for_epoch(&self) {
         self.inner.tx_committed_round_updates.send_replace(Round::default());
         self.inner.tx_primary_round_updates.send_replace(0u32);
+        // Drop any pending gap request from the prior epoch so the fetch task never backfills a
+        // stale (epoch, number, hash) after we have moved on; the new epoch's stream task will
+        // re-signal if it stalls.
+        self.inner.tx_consensus_gap.send_replace(None);
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
@@ -323,6 +441,26 @@ impl ConsensusBusApp {
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner.tx_requested_missing_epoch
+    }
+
+    /// Update requested missing epoch if epoch is newer than the current value.
+    /// Return true if it updates.
+    pub fn set_request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.requested_missing_epoch().send_if_modified(|state| {
+            if epoch > *state {
+                // Not sure we can sanity check this epoch.  However if it is bogus the code
+                // to handle it should be fine, it stops when out of epochs.
+                *state = epoch;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Prometheus metrics handles for the primary's consensus pipeline.
+    pub fn metrics(&self) -> &PrimaryMetrics {
+        &self.inner.metrics
     }
 
     /// Signals a new round
@@ -361,15 +499,63 @@ impl ConsensusBusApp {
         &self.inner.tx_last_consensus_header
     }
 
+    /// Update last consensus header if header is newer than the current value.
+    /// Return true if it was updated.
+    pub fn send_last_consensus_header_if_newer(&self, header: ConsensusHeader) -> bool {
+        self.last_consensus_header().send_if_modified(|state| {
+            if header.number > state.as_ref().map(|h| h.number).unwrap_or_default() {
+                // Update our last seen valid consensus header if it is newer.
+                *state = Some(header);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Watch used by the observer catch-up loop to ask the fetch task to backfill a bottom gap.
+    ///
+    /// Send `Some((epoch, target_number, target_hash, floor))` via `send_replace` to request the
+    /// consensus range `floor..=target_number`; subscribe to consume it in the fetch task. The
+    /// watch coalesces (only the latest request survives), which is intended: the requester
+    /// re-signals with a fresh floor if a request is superseded.
+    pub fn consensus_gap_request(
+        &self,
+    ) -> &watch::Sender<Option<(Epoch, u64, ConsensusHeaderDigest, u64)>> {
+        &self.inner.tx_consensus_gap
+    }
+
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
-    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(Epoch, u64, BlockHash)> {
+    pub fn last_published_consensus_num_hash(
+        &self,
+    ) -> &watch::Sender<(Epoch, u64, ConsensusHeaderDigest)> {
         &self.inner.tx_last_published_consensus_num_hash
     }
 
+    /// Update the last published consensus epoch, number and hash if number is greater than current
+    /// value. Return true if it was updated.
+    pub fn publish_consensus_num_hash_if_newer(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> bool {
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            if number > state.1 {
+                state.0 = epoch;
+                state.1 = number;
+                state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Returns the latest verified consensus block number and hash from gossip.
-    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, BlockHash) {
+    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, ConsensusHeaderDigest) {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
@@ -379,10 +565,10 @@ impl ConsensusBusApp {
         &self.inner.consensus_output
     }
 
-    /// Broadcast channel with consensus header.
-    /// This is useful pre-consensus output when not participating in consensus.
-    pub fn consensus_header(&self) -> &impl TnSender<ConsensusHeader> {
-        &self.inner.consensus_header
+    /// Broadcast channel delivering verified consensus OUTPUTs (header + batches) to a
+    /// following/catching-up subscriber for execution. Used when not participating in consensus.
+    pub fn sync_output(&self) -> &impl TnSender<ConsensusOutput> {
+        &self.inner.sync_output
     }
 
     /// Status of initial sync operation.
@@ -434,6 +620,10 @@ impl ConsensusBusApp {
     }
 
     /// New epoch certs as they are recieved.
+    /// Any vote on the channel has been verified:
+    /// - It is for an EpochRecord we generated and is NOT certified yet.
+    /// - It is from a committee member for the epoch (from our EpochRecord).
+    /// - It has a valid signature.
     pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
         &self.inner.new_epoch_votes
     }
@@ -445,6 +635,10 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscriber (Receiver) for new_epoch_votes.
+    /// Any vote on the channel has been verified:
+    /// - It is for an EpochRecord we generated and is NOT certified yet.
+    /// - It is from a committee member for the epoch (from our EpochRecord).
+    /// - It has a valid signature.
     pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
         self.inner.new_epoch_votes.subscribe()
     }
@@ -461,9 +655,67 @@ impl ConsensusBusApp {
         self.inner.consensus_output.subscribe()
     }
 
-    /// Provide a subscription(Receiver) to consensus_headers.
-    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
-        self.inner.consensus_header.subscribe()
+    /// Provide a subscription(Receiver) to verified sync consensus outputs.
+    pub fn subscribe_sync_output(&self) -> impl TnReceiver<ConsensusOutput> {
+        self.inner.sync_output.subscribe()
+    }
+
+    /// Broadcast sender for verified certificates (ExEx).
+    pub fn exex_certificates(&self) -> &broadcast::Sender<Certificate> {
+        &self.inner.exex_certificates
+    }
+
+    /// Broadcast sender for the full consensus output (ExEx).
+    pub fn exex_consensus_output(&self) -> &broadcast::Sender<ConsensusOutput> {
+        &self.inner.exex_consensus_output
+    }
+
+    /// Send `value` on `sender` only when at least one ExEx receiver is listening.
+    ///
+    /// The clone is skipped entirely when no ExEx is registered — the broadcast
+    /// payload (a full `ConsensusOutput`) can be large, so this guard keeps the
+    /// follow path cheap when nobody is listening.
+    fn notify_exex<T: Clone>(sender: &broadcast::Sender<T>, value: &T) {
+        if sender.receiver_count() > 0 {
+            let _ = sender.send(value.clone());
+        }
+    }
+
+    /// Notify ExEx subscribers about a verified certificate.
+    ///
+    /// Called from the consensus-following path (Observer / inactive CVV) after a
+    /// gossiped certificate verifies against its committee — never from the
+    /// validator hot path.
+    pub fn notify_exex_certificate(&self, certificate: &Certificate) {
+        Self::notify_exex(&self.inner.exex_certificates, certificate);
+    }
+
+    /// Notify ExEx subscribers about a full consensus output.
+    ///
+    /// Called from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution.
+    pub fn notify_exex_consensus_output(&self, output: &ConsensusOutput) {
+        Self::notify_exex(&self.inner.exex_consensus_output, output);
+    }
+
+    /// Subscribe to verified certificate notifications (ExEx).
+    pub fn subscribe_exex_certificates(&self) -> broadcast::Receiver<Certificate> {
+        self.inner.exex_certificates.subscribe()
+    }
+
+    /// Subscribe to full consensus output notifications (ExEx).
+    pub fn subscribe_exex_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.inner.exex_consensus_output.subscribe()
+    }
+
+    /// Install the canonical execution-DB reader used by [`Self::wait_for_execution`] as a
+    /// fallback when a queried tip has been evicted from the `recent_blocks` ring.
+    ///
+    /// Called once by the node manager after the execution engine is built; a per-epoch engine
+    /// rebuild simply refreshes the handle. Bus instances that never wire an engine (tests,
+    /// tooling) leave it unset and keep the original ring-only fork check.
+    pub fn set_canonical_reader(&self, reader: Arc<dyn CanonicalExecutionReader>) {
+        self.inner.canonical_reader.install(reader);
     }
 
     /// Will resolve once we have executed block.
@@ -490,8 +742,14 @@ impl ConsensusBusApp {
             // Once we see our hash, should happen when current_number == target_number- trust
             // digesting for this, we are done.
             Ok(())
+        } else if self.inner.canonical_reader.confirms(&block) {
+            // Not in the in-memory ring, but the local execution DB holds exactly this block as
+            // canonical at its height: the ring merely evicted it (its window is `gc_depth` deep),
+            // so this is a stale ring, not a fork.
+            Ok(())
         } else {
-            // Failed to find our block at it's number.
+            // Not in the ring and not confirmed canonical in the DB: a genuine execution fork, or
+            // the block is simply not persisted yet. Fail hard.
             Err(WaitForExecutionElapsed())
         }
     }
@@ -501,7 +759,7 @@ impl ConsensusBusApp {
     /// Note if the chain is not advancing this may never return.
     pub async fn wait_for_consensus_execution(
         &self,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> Result<(), WaitForExecutionElapsed> {
         let mut watch_execution_result = self.recent_blocks().subscribe();
         if self.recent_blocks().borrow().contains_consensus(hash) {
@@ -518,37 +776,58 @@ impl ConsensusBusApp {
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
+    ///
+    /// `Ok(None)` strictly means the header is legitimately absent: the latest executed block
+    /// has no `parent_beacon_block_root` (genesis) or the digest is unknown to local storage. A
+    /// lookup that FAILS is logged and returned as `Err` - it used to be swallowed into `None`,
+    /// which let startup silently resume from a default header at number 0. Under the
+    /// epoch-gated seed-signature serde, pre-fork packs stay decodable so the error path should
+    /// never fire; it exists so any future format change halts startup loudly instead of
+    /// silently corrupting the chain.
     pub async fn last_executed_consensus_block(
         &self,
         consensus_chain: &ConsensusChain,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let block = self.recent_blocks().borrow().latest_execution_block();
         let header = block.header();
         let (epoch, _) = deconstruct_nonce(header.nonce.into());
         let parent_beacon_block_root = header.parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
             consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
+                .consensus_header_by_digest(epoch, consensus_hash.into())
                 .await
-                .unwrap_or_default()
+                .inspect_err(|e| {
+                    error!(target: "primary", "failed to load the last executed consensus header from storage: {e}");
+                })
         } else {
-            None
+            // The latest executed block has no parent consensus header (genesis): legitimately
+            // absent, not a failure.
+            Ok(None)
         }
     }
 
     /// Returns the ConsensusHeader that was processed.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
+    ///
+    /// `Ok(None)` strictly means the header is legitimately absent from local storage; a lookup
+    /// that FAILS is logged and returned as `Err` (it used to be swallowed into `None`) so
+    /// callers halt or degrade loudly instead of silently resuming from a default header at
+    /// number 0. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable so
+    /// the error path should never fire; it exists so any future format change halts startup
+    /// loudly instead of silently corrupting the chain.
     pub async fn last_consensus_block(
         &self,
         consensus_chain: &ConsensusChain,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
         let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
         consensus_chain
             .consensus_header_by_digest(epoch, latest_consensus.hash)
             .await
-            .unwrap_or_default()
+            .inspect_err(|e| {
+                error!(target: "primary", "failed to load the last processed consensus header from storage: {e}");
+            })
     }
 
     /// Send a request to download the epoch pack file for the provided EpochRecord.
@@ -603,12 +882,14 @@ impl ConsensusBusApp {
     }
 
     /// Channel to request consensus headers to be fetched and cached.
-    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, B256)> {
+    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, ConsensusHeaderDigest)> {
         &self.inner.consensus_request_queue
     }
 
     /// Subscribe to consensus header fetch queue.
-    pub fn subscribe_consensus_request_queue(&self) -> impl TnReceiver<(Epoch, u64, B256)> {
+    pub fn subscribe_consensus_request_queue(
+        &self,
+    ) -> impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)> {
         self.inner.consensus_request_queue.subscribe()
     }
 }
@@ -644,7 +925,7 @@ struct ConsensusBusEpochInner {
     committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: QueChannel<Arc<CommittedSubDag>>,
+    sequence: QueChannel<CommittedSubDag>,
 
     /// Messages to the Certificate Manager.
     certificate_manager: QueChannel<CertificateManagerCommand>,
@@ -769,7 +1050,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
+    pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
         &self.inner_epoch.sequence
     }
 
@@ -844,7 +1125,7 @@ impl ConsensusBus {
     }
 
     /// Subscribe to sequence of ordered certificates to the application layer.
-    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
         self.inner_epoch.sequence.subscribe()
     }
 
@@ -876,5 +1157,34 @@ impl Error for WaitForExecutionElapsed {}
 impl std::fmt::Display for WaitForExecutionElapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+#[cfg(test)]
+mod exex_receiver_count_tests {
+    use super::ConsensusBusApp;
+
+    #[test]
+    fn exex_senders_have_no_receivers_until_subscribed() {
+        // The follow-path send sites guard on `receiver_count() > 0` so they skip
+        // the (potentially large) clone+send when no ExEx is registered. That
+        // optimization relies on the bus starting with zero ExEx receivers — the
+        // initial receivers are dropped at construction.
+        let bus = ConsensusBusApp::new();
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
+
+        // Subscribing (as the ExEx manager does) makes the guards fire.
+        let certs = bus.subscribe_exex_certificates();
+        let output = bus.subscribe_exex_consensus_output();
+        assert_eq!(bus.exex_certificates().receiver_count(), 1);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 1);
+
+        // Dropping the subscriptions (e.g. the non-critical manager dies) returns
+        // to zero, so the guards skip work again.
+        drop(certs);
+        drop(output);
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
     }
 }

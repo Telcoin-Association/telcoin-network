@@ -5,6 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
+    metrics::{ForwardDropReason, WorkerMetrics},
     network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
@@ -17,10 +18,10 @@ use tn_storage::{
     tables::{NodeBatchesCache, OurNodeBatchesCache},
 };
 use tn_types::{
-    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
-    TaskManager, WorkerId,
+    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, BlsPublicKey, Database,
+    SealedBatch, TaskManager, TxnForwarder, WorkerId,
 };
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -33,38 +34,46 @@ pub fn new_worker<DB: Database>(
     validator: Arc<dyn BatchValidation>,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
+    forwarder: Arc<dyn TxnForwarder>,
     consensus_chain: ConsensusChain,
-) -> Worker<DB, QuorumWaiter> {
+) -> eyre::Result<Worker<DB, QuorumWaiter>> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
     let batch_fetcher = BatchFetcher::new(
         network_handle.clone(),
         consensus_config.node_storage().clone(),
         consensus_chain,
+        WorkerMetrics::new_for_worker(id),
     );
-    consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
-        PrimaryReceiverHandler {
-            store: consensus_config.node_storage().clone(),
-            network: Some(network_handle.clone()),
-            batch_fetcher,
-            validator,
-        },
-    ));
+    // This worker's own local network instance: a worker id outside the committee's worker
+    // set is a wiring bug, surfaced as an error rather than a fallback onto another
+    // worker's instance.
+    let local_network = consensus_config
+        .local_network(id)
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("no local network instance for worker id {id}"))?;
+    local_network.set_primary_to_worker_local_handler(Arc::new(PrimaryReceiverHandler {
+        store: consensus_config.node_storage().clone(),
+        network: Some(network_handle.clone()),
+        batch_fetcher,
+        validator,
+    }))?;
     let batch_provider = new_worker_internal(
         id,
         &consensus_config,
-        consensus_config.local_network().clone(),
+        local_network,
         network_handle.clone(),
+        forwarder,
     );
 
     // NOTE: This log entry is used to compute performance.
     info!(target: "worker::worker",
         "Worker {} successfully booted on {}",
         id,
-        consensus_config.config().node_info.p2p_info.worker.network_address
+        consensus_config.worker_address(id).map_or_else(|| "<no address>".to_string(), |addr| addr.to_string())
     );
 
-    batch_provider
+    Ok(batch_provider)
 }
 
 /// Builds a new batch provider responsible for handling client transactions.
@@ -73,6 +82,7 @@ fn new_worker_internal<DB: Database>(
     consensus_config: &ConsensusConfig<DB>,
     client: LocalNetwork,
     network_handle: WorkerNetworkHandle,
+    forwarder: Arc<dyn TxnForwarder>,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Starting handler for transactions");
 
@@ -80,8 +90,24 @@ fn new_worker_internal<DB: Database>(
     // before forwarding the batch to the `Processor`
     // Only have a quorum waiter if we are an authority (validator).
     let quorum_waiter = consensus_config.authority().clone().map(|authority| {
-        QuorumWaiter::new(authority, consensus_config.committee().clone(), network_handle.clone())
+        QuorumWaiter::new(
+            authority,
+            consensus_config.committee().clone(),
+            network_handle.clone(),
+            WorkerMetrics::new_for_worker(id),
+        )
     });
+
+    // Committee BLS keys in slot order (index == committee slot). A non-committee ("observer")
+    // worker forwards each transaction it accepts to the JSON-RPC endpoint advertised by the
+    // validator whose slot owns the sender, matching `submit_txn_if_mine` so nonce ordering is
+    // preserved (issue #804).
+    let committee_slots: Vec<BlsPublicKey> = consensus_config
+        .committee()
+        .authorities()
+        .iter()
+        .map(|authority| *authority.protocol_key())
+        .collect();
 
     Worker::new(
         id,
@@ -90,6 +116,8 @@ fn new_worker_internal<DB: Database>(
         consensus_config.node_storage().clone(),
         consensus_config.parameters().batch_vote_timeout,
         network_handle,
+        forwarder,
+        committee_slots,
     )
 }
 
@@ -112,6 +140,16 @@ pub struct Worker<DB, QW> {
     timeout: Duration,
     /// Worker network handle.
     network_handle: WorkerNetworkHandle,
+    /// Forwards transactions this node accepts to committee validators over their advertised
+    /// JSON-RPC endpoints when this node is not a committee voting validator (issue #804).
+    forwarder: Arc<dyn TxnForwarder>,
+    /// Committee BLS keys in slot order (index == committee slot).
+    ///
+    /// Populated once per epoch at construction: a non-CVV worker forwards each transaction it
+    /// accepts to the validator whose slot owns the sender, so nonce ordering is preserved.
+    committee_slots: Vec<BlsPublicKey>,
+    /// Prometheus metrics for this worker.
+    metrics: WorkerMetrics,
 }
 
 // Need to implement clone directly because of the rx_batches field.
@@ -128,6 +166,9 @@ impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
             rx_batches: None,
             timeout: self.timeout,
             network_handle: self.network_handle.clone(),
+            forwarder: self.forwarder.clone(),
+            committee_slots: self.committee_slots.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -140,6 +181,7 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Create an instance of `Self`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         quorum_waiter: Option<QW>,
@@ -147,6 +189,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         store: DB,
         timeout: Duration,
         network_handle: WorkerNetworkHandle,
+        forwarder: Arc<dyn TxnForwarder>,
+        committee_slots: Vec<BlsPublicKey>,
     ) -> Self {
         let (tx_batches, rx_batches) = tokio::sync::mpsc::channel(1000);
         Self {
@@ -158,6 +202,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             rx_batches: Some(rx_batches),
             timeout,
             network_handle,
+            forwarder,
+            committee_slots,
+            metrics: WorkerMetrics::new_for_worker(id),
         }
     }
 
@@ -192,20 +239,74 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.tx_batches.clone()
     }
 
-    /// Send all the txns in sealed_batch to CVVs so they can be included in blocks.
-    /// Use this when not a CVV so that transactions you accept can be included in a block.
+    /// Forward all the txns in `sealed_batch` to committee validators so they can be included
+    /// in blocks. Use this when not a CVV so that transactions you accept can be included.
+    ///
+    /// Replaces the previous gossip broadcast (issue #804): each transaction is forwarded to the
+    /// JSON-RPC endpoint the owning validator advertised on its worker record, discovered over
+    /// kademlia. Admission is decided here, synchronously, because the `Ok` this method returns
+    /// is what lets the batch builder evict these transactions from its pool as mined: a batch
+    /// that was never handed to a forward task must report [`BlockSealError::NotValidator`] so
+    /// the builder keeps its transactions pending and retries on a later build. Delivery stays
+    /// best-effort on a background task, so batch production is never stalled by a slow or
+    /// unreachable validator; discovery is a snapshot of already-fetched kademlia records, not
+    /// a blocking network round-trip.
     pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
-        for txn in sealed_batch.batch.transactions {
-            if let Err(err) = self.network_handle.publish_txn(txn).await {
-                error!(target: "worker::batch_provider", "Error publishing transaction: {err}");
-            }
+        let transactions = sealed_batch.batch.transactions;
+        if transactions.is_empty() {
+            return Ok(());
         }
-        Ok(())
+
+        // Whole-batch count for the discovery dead ends below (issue #1133).
+        let num_txns = transactions.len();
+        let validator_rpcs = self
+            .network_handle
+            .get_all_validator_rpcs()
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    target: "worker::batch_provider",
+                    ?err,
+                    "failed to discover validator JSON-RPC endpoints for transaction forwarding"
+                );
+                self.metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, num_txns);
+            })
+            .inspect(|rpcs| {
+                // Only the discovery-succeeded-but-empty case earns this message; a
+                // discovery failure already warned above with the actual error.
+                if rpcs.is_empty() {
+                    warn!(
+                        target: "worker::batch_provider",
+                        "no committee validator has advertised a JSON-RPC endpoint; \
+                         cannot forward accepted transactions"
+                    );
+                    self.metrics
+                        .record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, num_txns);
+                }
+            })
+            .unwrap_or_default();
+
+        let admitted = !validator_rpcs.is_empty()
+            && self.forwarder.forward_txns(
+                transactions,
+                self.committee_slots.clone(),
+                validator_rpcs,
+            );
+        admitted.then_some(()).ok_or(BlockSealError::NotValidator)
     }
 
-    /// Seal and broadcast the current batch.
+    /// Seal and broadcast the current batch, treating empty batches as a successful no-op.
     #[instrument(level = "debug", skip_all, fields(batch_size = sealed_batch.size(), num_txs = sealed_batch.batch.transactions.len()))]
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
+        if sealed_batch.batch.transactions.is_empty() {
+            Ok(())
+        } else {
+            self.seal_non_empty(sealed_batch).await
+        }
+    }
+
+    /// Forward or attest a batch after `seal` has confirmed it contains transactions.
+    async fn seal_non_empty(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let Some(quorum_waiter) = &self.quorum_waiter else {
             // We are not a validator so need to send any transactions out for a CVV to pickup.
             return self.disburse_txns(sealed_batch).await;
@@ -239,8 +340,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             num_txs = batch.transactions.len(),
                             "batch sealed"
                         );
-                        // Publish the digest for any nodes listening to this gossip (non-committee
-                        // members). Note, ignore error- this should not
+                        self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
+                        // Publish the digest for the nodes subscribed to this gossip, i.e. the
+                        // committee validators that consume individual current-epoch batches.
+                        // Note, ignore error- this should not
                         // happen and should not cause an issue (except the
                         // underlying p2p network may be in trouble but that will manifest quickly).
                         let _ = self.network_handle.publish_batch(digest).await;
@@ -288,7 +391,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         }
 
         // Send the batch to the primary.
-        let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
+        let message = WorkerOwnBatchMessage::new(self.id, digest);
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             Err(BlockSealError::FailedToReport)

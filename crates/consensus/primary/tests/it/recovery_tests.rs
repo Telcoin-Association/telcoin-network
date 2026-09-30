@@ -4,7 +4,7 @@
 //! - Subdags persist across restarts
 //! - DAG can be reconstructed from storage
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 use tn_storage::{
     consensus::ConsensusChain,
@@ -38,12 +38,20 @@ async fn test_subdag_persists_restart() {
                 .await
                 .unwrap();
 
-        // Create and persist subdags with sequential indices
-        for idx in 0..5u64 {
+        // Create and persist subdags with sequential indices. Numbering starts at 1: a fresh
+        // chain's latest consensus number is 0 and `save_consensus_output` hard-rejects any
+        // number that does not strictly advance it (number 0 used to be silently dropped).
+        for idx in 1..5u64 {
             let leader = certificates.last().cloned().unwrap();
             let reputation = ReputationScores::new(&committee);
-            let subdag =
-                Arc::new(CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None));
+            let subdag = CommittedSubDag::new(
+                certificates.clone(),
+                leader,
+                idx,
+                reputation,
+                None,
+                tn_types::EpochSeedChainValue::genesis_placeholder(),
+            );
 
             consensus_chain.write_subdag_for_test(idx, subdag).await;
         }
@@ -73,7 +81,11 @@ async fn test_subdag_persists_restart() {
             leader_digest,
             "Leader should persist across restart"
         );
-        assert_eq!(latest_subdag.headers.len(), certificates.len(), "Certificates should persist");
+        assert_eq!(
+            latest_subdag.headers().len(),
+            certificates.len(),
+            "Certificates should persist"
+        );
     }
 }
 
@@ -95,12 +107,19 @@ async fn test_subdag_persists_multiple_writes() {
     let (_, headers) = fixture_epoch0.headers_round(0, &genesis);
     let certs_epoch0: Vec<_> = headers.iter().map(|h| fixture_epoch0.certificate(h)).collect();
 
-    // Write subdags for epoch 0 with indices 0, 1, 2
-    for idx in 0..3u64 {
+    // Write subdags for epoch 0 with indices 1, 2 (numbering starts at 1: number 0 does not
+    // advance a fresh chain's latest consensus number of 0 and is hard-rejected).
+    for idx in 1..3u64 {
         let leader = certs_epoch0.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch0);
-        let subdag =
-            Arc::new(CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None));
+        let subdag = CommittedSubDag::new(
+            certs_epoch0.clone(),
+            leader,
+            idx,
+            reputation,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
         consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
@@ -123,8 +142,14 @@ async fn test_subdag_persists_multiple_writes() {
     for idx in 3..6u64 {
         let leader = certs_epoch1.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch1);
-        let subdag =
-            Arc::new(CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None));
+        let subdag = CommittedSubDag::new(
+            certs_epoch1.clone(),
+            leader,
+            idx,
+            reputation,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
         consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
@@ -156,7 +181,7 @@ async fn test_certificate_store_persists_restart() {
     {
         let store = open_db(temp_dir.path());
         store.write_all(&certificates).unwrap();
-        store.persist::<Certificates>().await;
+        store.persist::<Certificates>().await.expect("persist");
         drop(store); // Explicit drop to release DB lock
     }
 
@@ -206,8 +231,8 @@ async fn test_dag_reconstruction_from_store() {
         parents = certs.iter().map(|c| c.digest()).collect();
         all_certs.extend(certs);
     }
-    store.persist::<Certificates>().await;
-    store.persist::<CertificateDigestByRound>().await;
+    store.persist::<Certificates>().await.expect("persist");
+    store.persist::<CertificateDigestByRound>().await.expect("persist");
 
     // Verify we can retrieve certificates by round (simulates DAG reconstruction)
     let gc_round = 0;
@@ -246,22 +271,26 @@ async fn test_last_committed_persists() {
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
-    // Create subdags with different leaders to track last committed per authority
+    // Create subdags with different leaders to track last committed per authority. Numbering
+    // starts at 1: number 0 does not advance a fresh chain's latest consensus number of 0 and
+    // is hard-rejected by `save_consensus_output`.
     for (idx, cert) in certificates.iter().enumerate() {
+        let number = idx as u64 + 1;
         let reputation = ReputationScores::new(&committee);
-        let subdag = Arc::new(CommittedSubDag::new(
+        let subdag = CommittedSubDag::new(
             vec![cert.clone()],
             cert.clone(),
-            idx as u64,
+            number,
             reputation,
             None,
-        ));
-        consensus_chain.write_subdag_for_test(idx as u64, subdag).await;
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        consensus_chain.write_subdag_for_test(number, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
 
     // Read last committed state
-    let last_committed = consensus_chain.read_last_committed(committee.epoch()).await;
+    let last_committed = consensus_chain.read_last_committed(committee.epoch()).await.unwrap();
 
     // Should have entries for authorities that were leaders
     assert!(!last_committed.is_empty(), "Should have last committed entries for authorities");

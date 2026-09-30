@@ -2,15 +2,16 @@
 
 use super::Dag;
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
+use rand::{seq::IndexedRandom as _, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, VotingPower,
+    Authority, AuthorityIdentifier, Certificate, Committee, ConsensusChainReader, ReputationScores,
+    Round, VotingPower,
 };
 use tracing::{debug, trace};
 
@@ -210,7 +211,14 @@ impl LeaderSwapTable {
         if self.bad_nodes.contains_key(leader) {
             let mut seed_bytes = [0u8; 32];
             seed_bytes[32 - 8..].copy_from_slice(&(leader_round as u64).to_le_bytes());
-            let mut rng = StdRng::from_seed(seed_bytes);
+            // The PRNG is pinned deliberately. The good node selected here becomes the leader
+            // for `leader_round`, and the leader certificate is hashed into the
+            // `CommittedSubDag` digest, so two nodes that disagree on this selection fork the
+            // chain. `rand` documents `StdRng` as non-portable, reserving the right to replace
+            // its algorithm in any release, which would turn a routine dependency bump into a
+            // consensus break. `ChaCha12Rng` is the algorithm `StdRng` wraps today, so naming
+            // it directly preserves the current selection exactly while removing that risk.
+            let mut rng = ChaCha12Rng::from_seed(seed_bytes);
 
             let good_node = self
                 .good_nodes
@@ -252,22 +260,22 @@ impl LeaderSchedule {
     /// for the LeaderSchedule.
     pub async fn from_store(
         committee: Committee,
-        consensus_chain: &mut ConsensusChain,
+        consensus_chain: &impl ConsensusChainReader,
         bad_nodes_percent_threshold: u64,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         let table = consensus_chain
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
-            .await;
+            .await?;
         let table = table.map_or(LeaderSwapTable::default(), |subdag| {
             LeaderSwapTable::new(
                 &committee,
                 subdag.leader_round(),
-                &subdag.reputation_score,
+                subdag.reputation_scores(),
                 bad_nodes_percent_threshold,
             )
         });
         // create the schedule
-        Self::new(committee, table)
+        Ok(Self::new(committee, table))
     }
 
     /// Atomically updates the leader swap table with the new provided one. Any leader queried from

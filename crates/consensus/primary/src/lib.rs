@@ -8,11 +8,13 @@ mod certificate_fetcher;
 mod certifier;
 pub mod consensus;
 mod error;
+mod metrics;
 pub mod network;
 mod primary;
 mod proposer;
 mod state_sync;
 
+pub use crate::metrics::{spawn_bus_metrics_mirror, PrimaryMetrics};
 pub use state_sync::StateSynchronizer;
 
 #[cfg(test)]

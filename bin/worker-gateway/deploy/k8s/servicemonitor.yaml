@@ -1,0 +1,21 @@
+# Prometheus Operator ServiceMonitor: tells Prometheus to scrape the gateway's
+# /metrics endpoint via the Service above.
+#
+# Requires the Prometheus Operator CRDs (monitoring.coreos.com) to be installed
+# in the cluster; without them, applying this manifest will fail.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: worker-gateway
+  labels:
+    app: worker-gateway
+    app.kubernetes.io/name: worker-gateway
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  selector:
+    matchLabels:
+      app: worker-gateway
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s

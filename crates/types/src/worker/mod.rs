@@ -26,3 +26,6 @@ pub const DEFAULT_WORKER_PORT: u16 = 44895;
 ///
 /// Workers communicate with peers of the same `WorkerId`.
 pub type WorkerId = u16;
+
+/// The default worker id. Today a primary runs exactly one worker, id `0`.
+pub const DEFAULT_WORKER_ID: WorkerId = 0;

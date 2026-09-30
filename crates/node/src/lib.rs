@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Library for managing all components used by a full-node in a single process.
+
+//! Library for managing all components used by a full-node in a single process.
+//!
+//! `tn-node` assembles the consensus, execution, storage, and networking crates into a running
+//! full node and drives them across epoch boundaries with `EpochManager`.
 
 #![allow(missing_docs)]
 
@@ -9,16 +13,22 @@ use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
 use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
+use tn_types::{
+    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+};
 use tokio::task::JoinHandle;
 
 pub mod engine;
 mod error;
 mod health;
 mod manager;
+mod metrics;
 pub mod primary;
 pub mod worker;
-pub use manager::catchup_accumulator;
+pub use manager::{
+    build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
+    sync_num_workers_from_chain, EpochBaseFees, ExecStateExporter, ExportOutcome,
+};
 
 #[cfg(test)]
 use tempfile as _;
@@ -46,7 +56,13 @@ where
     tokio::spawn(async move {
         // create the epoch manager
         let mut epoch_manager =
-            EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await;
+            match EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await {
+                Ok(epoch_manager) => epoch_manager,
+                Err(err) => {
+                    tracing::error!("Error running node (creating EpochManager): {err}");
+                    return Err(err);
+                }
+            };
         let result = epoch_manager.run().await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
@@ -55,7 +71,8 @@ where
     })
 }
 
-#[derive(Debug)]
+/// Consensus and node metadata exposed by each worker's RPC server.
+#[derive(Clone, Debug)]
 pub struct EngineToPrimaryRpc {
     /// Container for consensus channels.
     consensus_bus: ConsensusBusApp,
@@ -84,7 +101,10 @@ impl EngineToPrimaryRpc {
     }
 
     /// Retrieve the consensus header by hash
-    async fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+    async fn get_epoch_by_hash(
+        &self,
+        hash: EpochDigest,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
         if let Some((r, Some(c))) = self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((r, c))
         } else {
@@ -101,7 +121,7 @@ impl EngineToPrimary for EngineToPrimaryRpc {
     async fn epoch(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> Option<(EpochRecord, EpochCertificate)> {
         match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await,
@@ -110,8 +130,34 @@ impl EngineToPrimary for EngineToPrimaryRpc {
         }
     }
 
+    async fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        match self.consensus_chain.consensus_header_by_digest(epoch, digest).await {
+            Ok(header) => header,
+            Err(e) => {
+                // an unreadable pack is a hard error in storage, but rpc callers only learn
+                // "not found"; the warn keeps the storage failure visible to operators
+                tracing::warn!(
+                    target: "engine",
+                    ?e,
+                    epoch,
+                    ?digest,
+                    "consensus header lookup failed"
+                );
+                None
+            }
+        }
+    }
+
     fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
         &self.node_info
+    }
+
+    fn node_mode(&self) -> tn_types::NodeMode {
+        self.consensus_bus.current_node_mode().into()
     }
 }
 

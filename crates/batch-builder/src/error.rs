@@ -5,7 +5,7 @@ use std::any::Any;
 use tn_reth::{PoolTransactionError, ProviderError, RethError};
 use tokio::sync::{mpsc, oneshot};
 
-/// Result alias for [`TNEngineError`].
+/// Result alias for [`BatchBuilderError`].
 pub(crate) type BatchBuilderResult<T> = Result<T, BatchBuilderError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -17,12 +17,12 @@ pub enum BatchBuilderError {
     /// Error retrieving data from Provider.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// Error from the tn-reth environment.
+    #[error(transparent)]
+    TnReth(#[from] tn_reth::error::TnRethError),
     /// The next batch digest is missing.
     #[error("Missing next batch digest for recovered sealed block with senders.")]
     NextBatchDigestMissing,
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The oneshot channel that receives the ack that the block was persisted and being proposed.
     #[error("Fatal error: failed to receive ack reply that new block was built. Shutting down...")]
     AckChannelClosed,
@@ -41,6 +41,9 @@ pub enum BatchBuilderError {
     /// An operation that requires canonical state did not have it.
     #[error("Missing canonical state.")]
     MissingCanonical,
+    /// A blocking transaction-pool update failed before the next batch could be built.
+    #[error("Blocking transaction-pool update failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
 }
 
 impl From<oneshot::error::RecvError> for BatchBuilderError {

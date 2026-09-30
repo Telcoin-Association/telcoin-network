@@ -1,0 +1,106 @@
+# Reference Deployment for the Telcoin Network node-record API.
+# This is a starting point, not a turnkey manifest -- see ../README.md for the
+# placeholders you must replace before applying it.
+#
+# Create the committee ConfigMap from the chain's committee file first, e.g.
+#   kubectl create configmap node-record-api-committee \
+#     --from-file=committee.yaml=chain-configs/testnet/committee.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-record-api
+  labels:
+    app: node-record-api
+    app.kubernetes.io/name: node-record-api
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  # One replica: the daemon is an in-memory cache refreshed from the DHT; every
+  # replica would dial the same bootstrap peers for the same data.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-record-api
+  template:
+    metadata:
+      labels:
+        app: node-record-api
+        app.kubernetes.io/name: node-record-api
+        app.kubernetes.io/part-of: telcoin-network
+    spec:
+      # Slightly longer than the daemon's own --graceful-shutdown-timeout
+      # (default 30s, NODE_RECORD_API_GRACEFUL_SHUTDOWN_TIMEOUT) so the process
+      # can finish draining in-flight requests before the kubelet sends SIGKILL.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: node-record-api
+          # Replace with your registry ref, e.g. registry.example.com/telcoin/node-record-api:<tag>
+          image: telcoin-node-record-api:latest
+          env:
+            # The API + /healthz + /readyz all listen here.
+            - name: NODE_RECORD_API_LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            # Prometheus /metrics listens on this SEPARATE address (equivalent
+            # to the --metrics flag). Keep it cluster-internal; it is unauthenticated.
+            - name: NODE_RECORD_API_METRICS_ADDR
+              value: "0.0.0.0:9100"
+            # The chain whose worker DHT is read. 2017 is testnet. A wrong value
+            # yields an empty directory, not an error.
+            - name: NODE_RECORD_API_CHAIN_ID
+              value: "2017"
+            # Key floor + worker DHT bootstrap addresses, from the mounted ConfigMap.
+            - name: NODE_RECORD_API_COMMITTEE_FILE
+              value: /etc/node-record-api/committee.yaml
+            # Optional: a node's JSON-RPC for the live committee and epoch-boundary
+            # scheduling. Uncomment and point at your node.
+            # - name: NODE_RECORD_API_RPC_URL
+            #   value: "https://rpc.example/"
+          ports:
+            - name: api
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9100
+          livenessProbe:
+            # /healthz is liveness: always 200 while the process is up.
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            # /readyz is readiness: 200 once the first refresh cycle is done and a
+            # fresh record is cached, else 503. The first cycle dials every
+            # bootstrap peer and looks every key up, so give it a moment.
+            httpGet:
+              path: /readyz
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: committee
+              mountPath: /etc/node-record-api
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            # Matches the non-root uid baked into the image.
+            runAsUser: 1101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: committee
+          configMap:
+            name: node-record-api-committee
+            items:
+              - key: committee.yaml
+                path: committee.yaml

@@ -13,10 +13,12 @@
 
 pub mod args;
 pub mod cli;
+pub mod db;
 pub mod genesis;
 pub mod keytool;
 pub mod node;
 mod open_telemetry;
+pub mod passphrase;
 pub mod version;
 
 /// No Additional arguments

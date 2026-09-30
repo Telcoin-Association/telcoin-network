@@ -10,6 +10,17 @@
 
 pub use bcs::Error as BcsError;
 use bincode::Options;
+
+/// Extracts the next element of a hand-written positional (bcs) field sequence, converting an
+/// early end of input into a field-labeled `missing_field` error (bcs would otherwise surface
+/// only a distal `Eof`). Shared by the epoch-gated `Header` and `CommittedSubDag` visitors.
+pub(crate) fn next_seq_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: serde::Deserialize<'de>,
+{
+    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
+}
 use serde::{Deserialize, Serialize};
 
 /// Decode bytes to a type for a DB key.
@@ -68,6 +79,16 @@ pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> bcs::Result<T> {
 /// This version will be optimized without regard to binary sort order.
 pub fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
     bcs::to_bytes(obj).unwrap_or_else(|_| panic!("Serialization should not fail"))
+}
+
+/// Return the BCS-encoded byte length of `obj` without allocating the bytes.
+///
+/// Runs the same serializer as [`encode`] over a byte counter, so `encoded_size(x)`
+/// equals `encode(x).len()` for any value that serializes, and surfaces the serializer
+/// error instead of panicking. Use it where only the size is needed (e.g. streaming
+/// byte-cap accounting) to avoid the throwaway allocation of encoding just to read `.len()`.
+pub fn encoded_size<T: ?Sized + Serialize>(obj: &T) -> bcs::Result<usize> {
+    bcs::serialized_size(obj)
 }
 
 /// Encode into a provided buffer.

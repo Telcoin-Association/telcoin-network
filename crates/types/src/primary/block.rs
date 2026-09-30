@@ -7,21 +7,45 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, BlockHash, Certificate, Hash, B256};
+use crate::{crypto, BlsPublicKey, BlsSignature, Digest, Epoch, Hash, Round, B256};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Header for the consensus chain.
 ///
 /// The consensus chain records consensus output used to extend the execution chain.
-/// All hashes are Keccak 256.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+///
+/// Consensus-layer digests are BLAKE3 ([`crypto::DefaultHashFunction`]), not Keccak-256.
+/// Keccak-256 is used at the execution layer and for the committee-shuffle seed.
+///
+/// # The `Default` value is the pre-genesis anchor
+///
+/// [`Default`] is derived rather than hand written so the epoch seed chain anchor it carries has
+/// exactly ONE definition, [`CommittedSubDag::default`], which pins it to
+/// [`EpochSeedChainValue::genesis_placeholder`](crate::EpochSeedChainValue::genesis_placeholder).
+/// This default is reached on non-test paths (state sync uses it as the pre-genesis consensus
+/// header), so a second, independently written expression here could drift from that one and give
+/// nodes different genesis anchors, forking the seed chain at its first link. The anchor is a fixed
+/// constant and is never derived from node-local epoch state, for the same reason.
+///
+/// NOTE: the resulting digest is build-dependent and is frozen per build flavor by the
+/// `test_consensus_header_default_digest_pinned` pin. The embedded [`Header`](crate::Header)
+/// default is at epoch 0, and three fields reach the wire, and so the digest, only where their
+/// fork is active for epoch 0: the header's `seed_signature`
+/// ([`seed_signature_active`](crate::forks::seed_signature_active)), and the header's
+/// `created_at_millis` and the sub-dag's `commit_timestamp_millis`
+/// ([`subsecond_timestamp_active`](crate::forks::subsecond_timestamp_active)). Non-adiri builds
+/// activate both forks from genesis and adiri builds neither at epoch 0, so the two flavors
+/// anchor different digests. Both flavors also differ from the pre-#1032 anchor, which built this
+/// sub-dag through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
+/// default certificate's aggregate signature, where this derived default anchors the pinned
+/// placeholder itself (not a fold over it).
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.
-    pub parent_hash: B256,
+    pub parent_hash: ConsensusHeaderDigest,
 
     /// This is the committed sub dag used to extend the execution chain.
-    pub sub_dag: Arc<CommittedSubDag>,
+    pub sub_dag: CommittedSubDag,
 
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
@@ -34,39 +58,25 @@ pub struct ConsensusHeader {
 
 impl ConsensusHeader {
     /// Return the digest for this ConsensusHeader.
-    pub fn digest(&self) -> BlockHash {
+    pub fn digest(&self) -> ConsensusHeaderDigest {
         Self::digest_from_parts(self.parent_hash, &self.sub_dag, self.number)
     }
 
     /// Produce the digest that result from a ConsensusHeader with this data.
     /// This allows digesting in some cases with out cloning a CommittedSubDag.
     pub fn digest_from_parts(
-        parent_hash: B256,
+        parent_hash: ConsensusHeaderDigest,
         sub_dag: &CommittedSubDag,
         number: u64,
-    ) -> BlockHash {
+    ) -> ConsensusHeaderDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(parent_hash.as_slice());
+        hasher.update(parent_hash.as_ref());
         hasher.update(sub_dag.digest().as_ref());
         hasher.update(number.to_le_bytes().as_ref());
         // Include the extra field.
         // Not using this yet but include the default in the hash in prep when we do.
         hasher.update(B256::default().as_slice());
-        BlockHash::from_slice(hasher.finalize().as_bytes())
-    }
-}
-
-impl Default for ConsensusHeader {
-    fn default() -> Self {
-        let cert = Certificate::default();
-        let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![cert.clone()],
-            cert,
-            0,
-            crate::ReputationScores::default(),
-            None,
-        ));
-        Self { parent_hash: B256::default(), sub_dag, number: 0, extra: B256::default() }
+        ConsensusHeaderDigest(Digest { digest: hasher.finalize().into() })
     }
 }
 
@@ -85,5 +95,146 @@ impl From<&[u8]> for ConsensusHeader {
 impl From<&ConsensusHeader> for Vec<u8> {
     fn from(value: &ConsensusHeader) -> Self {
         crate::encode(value)
+    }
+}
+
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusHeader`].
+    pub struct ConsensusHeaderDigest;
+}
+
+/// A consensus header number and a hash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, std::hash::Hash, Serialize, Deserialize)]
+pub struct ConsensusNumHash {
+    /// The number
+    pub number: u64,
+    /// The hash.
+    pub hash: ConsensusHeaderDigest,
+}
+
+impl ConsensusNumHash {
+    /// Creates a new `NumHash` from a number and hash.
+    pub const fn new(number: u64, hash: ConsensusHeaderDigest) -> Self {
+        Self { number, hash }
+    }
+}
+
+/// Info that is published (via gossip) by validators once they reach consensus.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct ConsensusResult {
+    // epoch for this result (i.e. the current epoch)
+    pub epoch: Epoch,
+    // reound for epoch that consensus was reached on
+    pub round: Round,
+    /// the consensus header block number
+    pub number: u64,
+    /// hash of the consensus header that was reached
+    pub hash: ConsensusHeaderDigest,
+    /// the validator that produced this result
+    pub validator: BlsPublicKey,
+    /// the signature of the validator publishing this record
+    /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
+    /// fields
+    pub signature: BlsSignature,
+}
+
+impl ConsensusResult {
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest(&self) -> ConsensusResultDigest {
+        Self::digest_data(self.epoch, self.round, self.number, self.hash)
+    }
+
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// Used for generating the signature of the raw data.
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest_data(
+        epoch: Epoch,
+        round: Round,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> ConsensusResultDigest {
+        let mut hasher = crate::DefaultHashFunction::new();
+        hasher.update(&epoch.to_be_bytes());
+        hasher.update(&round.to_be_bytes());
+        hasher.update(&number.to_be_bytes());
+        hasher.update(hash.as_ref());
+        ConsensusResultDigest(Digest { digest: hasher.finalize().into() })
+    }
+}
+
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusResult`].
+    pub struct ConsensusResultDigest;
+}
+
+#[cfg(test)]
+mod test {
+    use alloy::{eips::NumHash, primitives::B256};
+
+    use crate::{crypto, decode, encode, ConsensusHeaderDigest, ConsensusNumHash};
+
+    /// Verify that ConsensusHeaderDigest encodes/decodes to the same bytes as a B256/BlockHash.
+    #[test]
+    fn test_consensus_digest_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_consensus_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let cdigest: ConsensusHeaderDigest = init_bytes.into();
+        let enc = encode(&cdigest);
+        let b256: B256 = decode(&enc);
+        assert_eq!(init_bytes, b256);
+        let enc = encode(&b256);
+        let cdigest2: ConsensusHeaderDigest = decode(&enc);
+        assert_eq!(cdigest, cdigest2);
+    }
+
+    /// Verify that ConsensusNumHash encodes/decodes to the same bytes as a NumHash.
+    #[test]
+    fn test_consensus_numhash_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_consensus_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let num_hash = NumHash { number: 3, hash: init_bytes };
+        let consensus_num_hash = ConsensusNumHash { number: 3, hash: init_bytes.into() };
+        let enc = encode(&consensus_num_hash);
+        let num_hash2: NumHash = decode(&enc);
+        assert_eq!(num_hash, num_hash2);
+        let enc = encode(&num_hash2);
+        let cnum_hash: ConsensusNumHash = decode(&enc);
+        assert_eq!(consensus_num_hash, cnum_hash);
+    }
+
+    /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] under
+    /// `adiri` (epoch 0 is pre-fork there, so the embedded [`crate::Header::default`]
+    /// serializes the seven legacy fields). State sync uses this default as the pre-genesis
+    /// consensus header, so a change here re-anchors the consensus chain's first link: if
+    /// this pin breaks, that is a compatibility decision to take deliberately, NOT a
+    /// constant to refresh.
+    #[cfg(feature = "adiri")]
+    const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
+        "cda906d203194ef0c9530b53899b7adb02d71da0ce6d307fd70ededebd6a263a";
+
+    /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] without
+    /// `adiri`: every epoch is fork-active, so the embedded [`crate::Header::default`]
+    /// carries `seed_signature` and `created_at_millis` on the wire, the sub-dag digest
+    /// covers `commit_timestamp_millis`, and the anchor deliberately differs from the adiri
+    /// build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as the adiri
+    /// pin.
+    #[cfg(not(feature = "adiri"))]
+    const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
+        "f9a4365f984c09d97b9d17ba33bf9bf362dd6e13147d1cc8906934b4931a060f";
+
+    /// PIN: the pre-genesis anchor digest [`crate::ConsensusHeader::default`], per build
+    /// flavor (the wire layout of the embedded default header is build-dependent).
+    #[test]
+    fn test_consensus_header_default_digest_pinned() {
+        assert_eq!(
+            CONSENSUS_HEADER_DEFAULT_DIGEST_HEX,
+            hex::encode(crate::ConsensusHeader::default().digest()),
+            "pre-genesis anchor digest diverged from the frozen pin"
+        );
     }
 }

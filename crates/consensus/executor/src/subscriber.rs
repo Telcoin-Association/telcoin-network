@@ -1,27 +1,33 @@
 //! Subscriber gathers all information needed from consensus and forwards to the execution engine.
 
-use crate::{errors::SubscriberResult, SubscriberError};
-use futures::{stream::FuturesOrdered, StreamExt};
+use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError};
+use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
-use tn_primary::{
-    network::{ConsensusResult, PrimaryNetworkHandle},
-    ConsensusBus, ConsensusBusApp, NodeMode,
-};
+use tn_network_types::PrimaryToWorkerClient;
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
-    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
-    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender,
-    B256,
+    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusOutput, ConsensusResult, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
+    Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tracing::{debug, error, info, instrument, warn};
+
+/// Interval between stall warnings while a worker's batch-fetch leg is outstanding.
+///
+/// The fetch itself is deliberately unbounded: the sub-dag is committed, so a quorum holds
+/// its batches and `BatchFetcher::fetch_for_primary` retries until they arrive. Cancelling
+/// on a deadline would fail-stop the node during a transient outage (a restart re-enters
+/// the identical wait, a crash loop exactly when the node is furthest behind). The watchdog
+/// keeps the unbounded wait but makes a stall loud instead of silent.
+const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -47,12 +53,12 @@ struct Inner {
     authority_id: Option<AuthorityIdentifier>,
     /// The committee for the epoch.
     committee: Committee,
-    /// The client to request worker batches and build consensus output.
-    client: LocalNetwork,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
     /// Epoch boundary time.
     epoch_boundary: TimestampSec,
+    /// Prometheus metrics for consensus output assembly.
+    metrics: ExecutorMetrics,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -67,7 +73,6 @@ pub fn spawn_subscriber<DB: Database>(
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
-    let client = config.local_network().clone();
     let mode = consensus_bus.app().current_node_mode();
     info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
@@ -77,9 +82,9 @@ pub fn spawn_subscriber<DB: Database>(
         inner: Arc::new(Inner {
             authority_id,
             committee,
-            client,
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
+            metrics: ExecutorMetrics::default(),
         }),
     };
     match mode {
@@ -133,31 +138,36 @@ impl<DB: Database> Subscriber<DB> {
     /// Returns the max number of sub-dag to fetch payloads concurrently.
     const MAX_PENDING_PAYLOADS: usize = 1000;
 
-    /// Turns a ConsensusHeader into a ConsensusOutput and sends it down the consensus_output
-    /// channel for execution.
-    #[instrument(level = "debug", skip_all, fields(number = consensus_header.number))]
-    async fn handle_consensus_header(
-        &self,
-        consensus_header: ConsensusHeader,
-    ) -> SubscriberResult<()> {
-        if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch() {
+    /// Save a verified, fully-formed ConsensusOutput (delivered by the state-sync forward drain)
+    /// and send it down the consensus_output channel for execution.
+    ///
+    /// The output arrives complete (header + batches) and already verified by state-sync, so there
+    /// is no separate batch fetch here.
+    #[instrument(level = "debug", skip_all, fields(number = consensus_output.number()))]
+    async fn handle_sync_output(&self, consensus_output: ConsensusOutput) -> SubscriberResult<()> {
+        if consensus_output.sub_dag().leader_epoch() > self.inner.committee.epoch() {
             // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output
             // before run_epoch() winds down.
             return Ok(());
         }
-        let consensus_output = self
-            .fetch_batches(
-                consensus_header.sub_dag.clone(),
-                consensus_header.parent_hash,
-                consensus_header.number,
-            )
-            .await?;
+        let number = consensus_output.number();
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
-        save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
+        save_consensus(
+            consensus_output.clone(),
+            &mut consensus_chain,
+            self.consensus_bus.metrics(),
+        )
+        .await?;
+
+        // Once we've drained through the staged partial pack's final output, it has all been
+        // written to the main pack in order — drop the staging dir.
+        if self.inner.consensus_chain.staging_final() == Some(number) {
+            self.inner.consensus_chain.clear_staging();
+        }
 
         let last_round = consensus_output.leader_round();
 
@@ -165,6 +175,14 @@ impl<DB: Database> Subscriber<DB> {
         // we send the consensus output.
         self.consensus_bus.committed_round_updates().send_replace(last_round);
         self.consensus_bus.primary_round_updates().send_replace(last_round);
+
+        // ExEx delivery runs on the consensus-following path only — Observer
+        // (`follow_consensus`) and inactive CVV (`catch_up_rejoin_consensus`) both
+        // reach this method, neither runs Bullshark. Hand the full reconstructed
+        // output to any installed ExEx. The active-validator path
+        // (`handle_consensus_output`) deliberately omits this so validators bear
+        // no ExEx overhead.
+        self.consensus_bus.notify_exex_consensus_output(&consensus_output);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -175,25 +193,28 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver and then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
+        // Get a receiver and then stream any missing outputs so we don't miss them.
+        let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
-        while let Some(consensus_header) = rx_consensus_headers.recv().await {
-            let consensus_header_number = consensus_header.number;
-            self.handle_consensus_header(consensus_header).await?;
+        while let Some(output) = rx_sync_output.recv().await {
+            let consensus_header_number = output.number();
+            self.handle_sync_output(output).await?;
             if let Some(last_consensus_header) =
                 self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
                 // If we seem to be on the same number also make sure this is not a stale record.
                 // If that happens during a catch up it will lead to premature cvv active when not
                 // caught up.
+                // freshness is measured in milliseconds so a sub-second commit time is not rounded
+                // away. a pre-fork commit time is whole seconds, and there this equals comparing
+                // whole seconds against the clock rounded down to the second
                 if consensus_header_number == last_consensus_header.number
-                    && last_consensus_header.sub_dag.commit_timestamp().elapsed()
+                    && last_consensus_header.sub_dag.commit_timestamp_ms().elapsed()
                         < Duration::from_secs(5)
                 {
                     // We are caught up enough so try to jump back into consensus
@@ -209,8 +230,8 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Follow along with consensus output but do not try to join consensus.
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
+        // Get a receiver then stream any missing outputs so we don't miss them.
+        let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -218,9 +239,9 @@ impl<DB: Database> Subscriber<DB> {
             self.inner.consensus_chain.clone(),
         );
         let mut processed_count: u64 = 0;
-        while let Some(consensus_header) = rx_consensus_headers.recv().await {
-            let header_number = consensus_header.number;
-            self.handle_consensus_header(consensus_header).await?;
+        while let Some(output) = rx_sync_output.recv().await {
+            let header_number = output.number();
+            self.handle_sync_output(output).await?;
             processed_count += 1;
 
             // Periodically log observer progress (every 100 blocks)
@@ -253,9 +274,12 @@ impl<DB: Database> Subscriber<DB> {
     /// Return the block hash and number of the last executed consensus output.
     ///
     /// This method is called on startup to retrieve the needed information to build the next
-    /// `ConsensusHeader` off of this parent.
-    async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain).await;
+    /// `ConsensusHeader` off of this parent. A failed storage lookup propagates so startup
+    /// fail-stops instead of numbering new output from a silently-defaulted parent at 0.
+    async fn get_last_executed_consensus(&self) -> SubscriberResult<(ConsensusHeaderDigest, u64)> {
+        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain)
+            .await
+            .map_err(|error| SubscriberError::ConsensusChainRead(format!("{error:#}")))?;
 
         info!(
             target: "subscriber",
@@ -267,12 +291,60 @@ impl<DB: Database> Subscriber<DB> {
         Ok(result)
     }
 
+    /// Save consensus output and publish or signature.
+    async fn handle_consensus_output(
+        &self,
+        consensus_chain: &mut ConsensusChain,
+        output: ConsensusOutput,
+    ) -> SubscriberResult<()> {
+        debug!(target: "subscriber", output=?output.digest(), "saving next output");
+        save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        debug!(target: "subscriber", "broadcasting output...");
+        // Publish the consensus result now that we are totally finished.
+        let number = output.number();
+        let this_digest = output.consensus_header_hash();
+
+        // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it
+        // up to date anyway. Note we don't bother sending this to the consensus header
+        // channel since not needed when an active CVV.
+        self.consensus_bus.last_consensus_header().send_replace(Some(output.consensus_header()));
+        let epoch = output.sub_dag().leader_epoch();
+        let round = output.sub_dag().leader_round();
+        let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, this_digest);
+        let sig = self
+            .config
+            .key_config()
+            .request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
+        if let Err(e) = self
+            .network_handle
+            .publish_consensus(
+                epoch,
+                round,
+                number,
+                this_digest,
+                self.config.key_config().public_key(),
+                sig,
+            )
+            .await
+        {
+            error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
+        }
+        if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
+            error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
+            return Err(SubscriberError::ClosedChannel(
+                "failed to broadcast consensus output".to_string(),
+            ));
+        }
+        debug!(target: "subscriber", "output broadcast successfully");
+        Ok(())
+    }
+
     /// Main loop connecting to the consensus to listen to sequence messages.
     #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
     async fn run(
         self,
         rx_shutdown: Noticer,
-        mut rx_sequence: impl TnReceiver<Arc<CommittedSubDag>>,
+        mut rx_sequence: impl TnReceiver<CommittedSubDag>,
         mut consensus_chain: ConsensusChain,
     ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
@@ -298,27 +370,15 @@ impl<DB: Database> Subscriber<DB> {
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
                     // Once we cross epoch boundary then process this last output then we are done.
-                    if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
+                    if sub_dag.reaches_epoch_boundary(self.inner.epoch_boundary) { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more
                     // then MAX_PENDING_PAYLOADS is pending
                     let parent_hash = last_parent;
                     let number = last_number + 1;
-                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
-
-                    // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
-                    // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
-                    let epoch = sub_dag.leader_epoch();
-                    let round = sub_dag.leader_round();
-                    let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
-                    let sig =
-                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
-                    if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
-                        error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
-                    }
                     last_number += 1;
+                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
                     waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
                 },
 
@@ -328,16 +388,7 @@ impl<DB: Database> Subscriber<DB> {
                 // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(output) = waiting.next() => {
                     match output {
-                        Ok(output) => {
-                            debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(output.clone(), &mut consensus_chain).await?;
-                            debug!(target: "subscriber", "broadcasting output...");
-                            if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
-                                error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
-                                return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));
-                            }
-                            debug!(target: "subscriber", "output broadcast successfully");
-                        }
+                        Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");
                             // Failure to fetch batches is a fatal condition, return an error which will trigger node shutdown.
@@ -350,29 +401,13 @@ impl<DB: Database> Subscriber<DB> {
                     // Drain any pending consensus outputs to prevent data loss.
                     // Without this, committed subdags whose batch downloads are in-flight
                     // would be lost on restart, causing consensus chain divergence.
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-                    while !waiting.is_empty() {
-                        tokio::select! {
-                            Some(output) = waiting.next() => {
-                                if let Ok(output) = output {
-                                    if let Err(e) = save_consensus(
-                                        output.clone(),
-                                        &mut consensus_chain,
-                                    ).await {
-                                        warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
-                                        break;
-                                    }
-                                    // Best-effort broadcast: if epoch manager already exited, this is a no-op.
-                                    // The DB-aware drain (Phase 2) handles the gap regardless.
-                                    let _ = self.consensus_bus.consensus_output().send(output).await;
-                                }
-                            }
-                            _ = tokio::time::sleep_until(deadline) => {
-                                warn!(target: "subscriber", "timed out draining pending consensus during shutdown");
-                                break;
-                            }
-                        }
-                    }
+                    drain_pending_on_shutdown(
+                        &self.consensus_bus,
+                        &mut consensus_chain,
+                        waiting,
+                        Duration::from_secs(3),
+                    )
+                    .await;
                     return Ok(())
                 }
 
@@ -405,8 +440,8 @@ impl<DB: Database> Subscriber<DB> {
     #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
-        sub_dag: Arc<CommittedSubDag>,
-        parent_hash: B256,
+        sub_dag: CommittedSubDag,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {
         let num_blocks = sub_dag.num_primary_batches();
@@ -417,20 +452,29 @@ impl<DB: Database> Subscriber<DB> {
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
 
-        let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
+        // Partition the payload per worker id so each digest is fetched through the local
+        // network instance of the worker that owns it (dedup within a worker via the set).
+        let mut batches_by_worker: BTreeMap<WorkerId, BTreeSet<BlockHash>> = BTreeMap::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for header in sub_dag.headers() {
-            for (digest, _) in header.payload().iter() {
-                batch_set.insert(*digest);
+            for (digest, worker_id) in header.payload().iter() {
+                batches_by_worker.entry(*worker_id).or_default().insert(*digest);
                 batch_digests.push_back(*digest);
             }
         }
 
-        // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
-        // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
-        let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
-        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
+        // `MAX_GC_DEPTH` is the garbage-collection horizon, not the depth a commit reaches: a
+        // sub-DAG is usually only a few rounds deep (`order_dag` descends only to `gc_round + 1`
+        // and skips already-committed rounds), but because no certificate at or below
+        // `gc_round` is ever committed, a committed sub-DAG spans at most `MAX_GC_DEPTH`
+        // distinct rounds as a safe over-estimate.  With at most one certificate per
+        // authority per round and at most `MAX_HEADER_NUM_OF_BATCHES` batches per header,
+        // `batch_set` holds at most `committee.size() * MAX_GC_DEPTH *
+        // MAX_HEADER_NUM_OF_BATCHES` unique digests.  The consensus-pack reader
+        // (`max_batches_per_output`) uses that same bound, so every output built here can
+        // later be reconstructed from pack storage.
+        let mut fetched_batches = self.fetch_batches_from_peers(batches_by_worker).await?;
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -457,9 +501,28 @@ impl<DB: Database> Subscriber<DB> {
                     cert_batches.push(batch);
                 } else {
                     // if the batch is a duplicate, the engine will ignore
-                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
-                    if !fetched_digests.contains(digest) {
+                    if let Some(batch) = batches
+                        .iter()
+                        .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
+                        .chain(cert_batches.iter())
+                        .find(|b| b.digest() == *digest)
+                    {
+                        warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
+                        #[cfg(not(feature = "adiri"))]
+                        cert_batches.push(batch.clone());
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+                            // ADIRI BUG
+                            // Epoch 74 and possibly other early epochs of adiri testnet had a bug
+                            // with duplicate batches. We have to
+                            // recreate it in order to sync testnet so we skip this push
+                            // on adiri with early epochs.
+                            cert_batches.push(batch.clone());
+                        }
+                    } else {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                        self.inner.metrics.protocol_violations_total.increment(1);
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
                     }
                 }
@@ -485,6 +548,9 @@ impl<DB: Database> Subscriber<DB> {
             total_txs = total_txs,
             "consensus output ready"
         );
+        self.inner.metrics.outputs_ready_total.increment(1);
+        self.inner.metrics.output_transactions.record(total_txs as f64);
+        self.inner.metrics.output_batches.record(batch_digests.len() as f64);
 
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(ConsensusOutput::new(
@@ -497,36 +563,433 @@ impl<DB: Database> Subscriber<DB> {
         ))
     }
 
+    /// Warn every [`FETCH_BATCHES_STALL_WARN_INTERVAL`] while a worker's fetch leg is
+    /// outstanding.
+    ///
+    /// Never resolves; the caller races it against the fetch itself, so it only ever adds
+    /// log lines and cannot cancel the fetch.
+    async fn stall_watchdog(worker_id: WorkerId) -> std::convert::Infallible {
+        futures::stream::unfold((), |()| async {
+            tokio::time::sleep(FETCH_BATCHES_STALL_WARN_INTERVAL).await;
+            Some(((), ()))
+        })
+        .for_each(|()| {
+            warn!(
+                target: "subscriber",
+                worker_id,
+                "batch fetch from worker still outstanding; waiting on local db or peers"
+            );
+            futures::future::ready(())
+        })
+        .await;
+        // the unfold stream above is infinite, so `for_each` never completes
+        futures::future::pending().await
+    }
+
     /// Send message to relevant workers to fetch batches for execution.
     ///
-    /// The worker is responsible for retrieving the batch from it's local DB or fetching from
-    /// peers.
+    /// One request per worker id, over that worker's local network instance; the worker is
+    /// responsible for retrieving the batch from its local DB or fetching from peers. The
+    /// legs run concurrently, each raced against a stall watchdog that warns every
+    /// [`FETCH_BATCHES_STALL_WARN_INTERVAL`] without cancelling, and any leg's real error
+    /// fails the whole fetch (an incomplete output can never execute).
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: BTreeSet<BlockHash>,
+        batches_by_worker: BTreeMap<WorkerId, BTreeSet<BlockHash>>,
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
-        let mut fetched_blocks = HashMap::new();
+        let num_digests: usize = batches_by_worker.values().map(BTreeSet::len).sum();
+        debug!(target: "subscriber", "Attempting to fetch {num_digests} digests from workers");
 
-        debug!(target: "subscriber", "Attempting to fetch {} digests from workers", batch_digests.len());
-        let batches = match self.inner.client.fetch_batches(batch_digests).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
-                return Err(SubscriberError::ClientRequestsFailed);
+        let legs = batches_by_worker.into_iter().map(|(worker_id, digests)| {
+            // Sub-dag payloads passed `Header::validate`'s worker-id bounds check, so a
+            // missing instance means the committee's worker set and this config disagree:
+            // a protocol-level failure, surfaced with the variant that exists for it.
+            let client = self.config.local_network(worker_id).cloned();
+            async move {
+                let client = client.ok_or(SubscriberError::UnexpectedWorkerId(worker_id))?;
+                let fetch = std::pin::pin!(client.fetch_batches(digests));
+                let watchdog = std::pin::pin!(Self::stall_watchdog(worker_id));
+                match futures::future::select(fetch, watchdog).await {
+                    futures::future::Either::Left((result, _)) => result.map_err(|e| {
+                        error!(target: "subscriber", worker_id, "Failed to fetch batches from peers: {e:?}");
+                        SubscriberError::ClientRequestsFailed
+                    }),
+                    futures::future::Either::Right((never, _)) => match never {},
+                }
             }
+        });
+        futures::future::try_join_all(legs)
+            .await
+            .inspect_err(|_| self.inner.metrics.batch_fetch_failures_total.increment(1))
+            .map(|fetched| {
+                fetched
+                    .into_iter()
+                    .flatten()
+                    .map(|(digest, block)| {
+                        debug!(
+                            target: "subscriber",
+                            "Block {:?} took {:?} seconds since it was received to when it was fetched for execution",
+                            digest,
+                            block.received_at().map(|t| t.elapsed().as_secs_f64()),
+                        );
+                        (digest, block)
+                    })
+                    .collect()
+            })
+    }
+}
+
+/// Drain the batch-fetch futures still pending when graceful shutdown fires.
+///
+/// This is the shutdown counterpart of the steady-state arm in [`Subscriber::run`] and is
+/// deliberately symmetric with it: a fetch `Err` is fail-stop, not skippable. `waiting` is a
+/// [`FuturesOrdered`] that yields in consensus (push) order, so every `Ok` output ahead of a
+/// failed fetch is the contiguous prefix. `try_fold` threads the consensus chain as its
+/// accumulator and short-circuits at the first error, so the drain saves and broadcasts that
+/// contiguous prefix and then stops at the gap: nothing at or past the failed fetch is saved or
+/// broadcast. In steady state the same fetch `Err` returns an error that shuts the node down;
+/// here, already shutting down, the fold simply stops, leaving the drained prefix persisted for
+/// the Phase-2 DB drain and normal restart. Stopping here makes the shutdown path self-evidently
+/// fail-stop instead of relying on the downstream pack/load/replay guards to reject the
+/// non-contiguous consensus number a swallowed fetch `Err` would otherwise let it march past.
+///
+/// `take_until` bounds only the wait for the next completed fetch, not an in-flight save: once
+/// `deadline` passes the drain stops pulling new outputs, but an output already dequeued is always
+/// saved and broadcast to completion. This preserves the original select-based drain's guarantee
+/// that a committed output, once dequeued, is never dropped mid-save during graceful shutdown.
+async fn drain_pending_on_shutdown<Fut>(
+    consensus_bus: &ConsensusBusApp,
+    consensus_chain: &mut ConsensusChain,
+    waiting: FuturesOrdered<Fut>,
+    deadline: Duration,
+) where
+    Fut: std::future::Future<Output = SubscriberResult<ConsensusOutput>>,
+{
+    let stop_at = tokio::time::Instant::now() + deadline;
+    let _ = waiting
+        .take_until(tokio::time::sleep_until(stop_at))
+        .map_err(|e| {
+            // A fetch `Err` is the same fatal condition the steady-state arm fail-stops on;
+            // short-circuiting the fold here stops the drain at the gap.
+            error!(target: "subscriber", "error fetching batches during shutdown drain: {e}");
+        })
+        .try_fold(consensus_chain, |chain, output| async move {
+            if let Err(e) = save_consensus(output.clone(), chain, consensus_bus.metrics()).await {
+                warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
+                Err(())
+            } else {
+                // Best-effort broadcast: if epoch manager already exited, this is a no-op.
+                // The DB-aware drain (Phase 2) handles the gap regardless.
+                let _ = consensus_bus.consensus_output().send(output).await;
+                Ok(chain)
+            }
+        })
+        .await;
+    // A drain that stops because the deadline passed (rather than because `waiting` emptied) has
+    // reached `stop_at`; surface that the way the original select-based drain did.
+    if tokio::time::Instant::now() >= stop_at {
+        warn!(target: "subscriber", "timed out draining pending consensus during shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_pending_on_shutdown;
+    use crate::SubscriberError;
+    use futures::{future, stream::FuturesOrdered};
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tn_primary::ConsensusBusApp;
+    use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+    use tn_test_utils::CommitteeFixture;
+    use tn_types::{
+        Certificate, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
+        ConsensusOutput, ReputationScores, TnReceiver as _, B256,
+    };
+
+    /// Build a valid `ConsensusOutput` at `number` (parent `parent`, sub-dag index `sub_dag_index`)
+    /// from the fixture's certificates, returning it with its consensus-header digest so a caller
+    /// can use that digest as the next output's parent.
+    fn output_at(
+        certificates: &[Certificate],
+        committee: &Committee,
+        number: u64,
+        sub_dag_index: u64,
+        parent: ConsensusHeaderDigest,
+    ) -> (ConsensusOutput, ConsensusHeaderDigest) {
+        let leader = certificates.last().cloned().unwrap();
+        let sub_dag = CommittedSubDag::new(
+            certificates.to_vec(),
+            leader,
+            sub_dag_index,
+            ReputationScores::new(committee),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let digest = ConsensusHeader::digest_from_parts(parent, &sub_dag, number);
+        let output = ConsensusOutput::new(sub_dag, parent, number, false, VecDeque::new(), vec![]);
+        (output, digest)
+    }
+
+    /// A save error mid-drain must fail-stop the drain the same way a fetch `Err` does: the output
+    /// whose save fails is not broadcast, and no later output is saved or broadcast. Reverting the
+    /// save-error arm to swallow-and-continue lets the following contiguous output be saved and
+    /// broadcast, which this test rejects.
+    #[tokio::test]
+    async fn shutdown_drain_fail_stops_at_save_error() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::new().unwrap();
+        let mut consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+
+        let genesis: BTreeSet<_> = fixture.genesis().collect();
+        let (_, headers) = fixture.headers_round(0, &genesis);
+        let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+
+        let parent0: ConsensusHeaderDigest = B256::ZERO.into();
+        // Output 1 saves fine (contiguous).
+        let (out1, digest1) = output_at(&certificates, &committee, 1, 0, parent0);
+        // A NON-contiguous number (3, skipping 2) makes save_consensus reject the write, forcing
+        // the save-error short-circuit.
+        let (out_bad, _) = output_at(&certificates, &committee, 3, 2, digest1);
+        // Output 2 would save fine if the drain wrongly continued past the save failure.
+        let (out_next, _) = output_at(&certificates, &committee, 2, 1, digest1);
+
+        let mut waiting = FuturesOrdered::new();
+        waiting.push_back(future::ready(Ok::<_, SubscriberError>(out1)));
+        waiting.push_back(future::ready(Ok(out_bad)));
+        waiting.push_back(future::ready(Ok(out_next)));
+
+        let mut rx = consensus_bus.subscribe_consensus_output();
+
+        drain_pending_on_shutdown(
+            &consensus_bus,
+            &mut consensus_chain,
+            waiting,
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Only output 1 is broadcast: out_bad's save fails (never broadcast) and stops the drain,
+        // so output 2 is never reached.
+        assert!(rx.recv().await.is_some(), "the drained prefix (output 1) must be broadcast");
+        assert!(rx.try_recv().is_err(), "no output at or past the save failure may be broadcast",);
+        assert!(
+            matches!(consensus_chain.consensus_header_by_number(1).await, Ok(Some(_))),
+            "output 1 (the drained prefix) must be persisted",
+        );
+        assert!(
+            !matches!(consensus_chain.consensus_header_by_number(2).await, Ok(Some(_))),
+            "output 2 (past the save failure) must not be persisted",
+        );
+    }
+
+    /// A fetch that never completes must not hang the drain: the deadline stops it. This pins the
+    /// `take_until` cap added for graceful shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_stops_on_deadline() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::new().unwrap();
+        let mut consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+
+        // A single fetch future that never resolves. With the tokio test clock paused and auto-
+        // advanced, the drain must return when the deadline elapses rather than hang forever.
+        let mut waiting = FuturesOrdered::new();
+        waiting.push_back(future::pending::<Result<ConsensusOutput, SubscriberError>>());
+
+        let mut rx = consensus_bus.subscribe_consensus_output();
+
+        drain_pending_on_shutdown(
+            &consensus_bus,
+            &mut consensus_chain,
+            waiting,
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Nothing was ever fetched, so nothing is saved or broadcast; the point is that the call
+        // returned instead of hanging on the stalled fetch.
+        assert!(rx.try_recv().is_err(), "a stalled fetch must not save or broadcast anything");
+    }
+
+    /// A fetch `Err` in the middle of the graceful-shutdown drain must fail-stop the drain: the
+    /// contiguous prefix ahead of it is saved and broadcast, and nothing at or past the failed
+    /// fetch is. Reverting `drain_pending_on_shutdown` to the old "swallow the `Err` and keep
+    /// draining" shape makes the post-gap output get saved and broadcast, which this test rejects
+    /// (both the broadcast and the persistence assertions flip), so the test genuinely pins the
+    /// fail-stop semantics rather than passing vacuously.
+    #[tokio::test]
+    async fn shutdown_drain_fail_stops_at_fetch_error() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::new().unwrap();
+        let mut consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+
+        // Two valid, CONTIGUOUS consensus outputs (numbers 1 and 2). Number 2 is contiguous so
+        // that if the drain wrongly continued past the failed fetch, its save would succeed and
+        // it would be broadcast -- making the swallow-and-continue bug observable rather than
+        // masked by the pack rejecting a non-contiguous number.
+        let genesis: BTreeSet<_> = fixture.genesis().collect();
+        let (_, headers) = fixture.headers_round(0, &genesis);
+        let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+        let leader = certificates.last().cloned().unwrap();
+
+        let parent0: ConsensusHeaderDigest = B256::ZERO.into();
+        let sub_dag1 = CommittedSubDag::new(
+            certificates.clone(),
+            leader.clone(),
+            0,
+            ReputationScores::new(&committee),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let out1 =
+            ConsensusOutput::new(sub_dag1.clone(), parent0, 1, false, VecDeque::new(), vec![]);
+
+        let digest1 = ConsensusHeader::digest_from_parts(parent0, &sub_dag1, 1);
+        let sub_dag2 = CommittedSubDag::new(
+            certificates.clone(),
+            leader,
+            1,
+            ReputationScores::new(&committee),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let out2 = ConsensusOutput::new(sub_dag2, digest1, 2, false, VecDeque::new(), vec![]);
+
+        // Pending fetch results in consensus (push) order: Ok(1), Err (failed fetch), Ok(2).
+        let mut waiting = FuturesOrdered::new();
+        waiting.push_back(future::ready(Ok(out1)));
+        waiting.push_back(future::ready(Err(SubscriberError::ClientRequestsFailed)));
+        waiting.push_back(future::ready(Ok(out2)));
+
+        // Subscribe before draining so we observe exactly what is broadcast.
+        let mut rx = consensus_bus.subscribe_consensus_output();
+
+        drain_pending_on_shutdown(
+            &consensus_bus,
+            &mut consensus_chain,
+            waiting,
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // The contiguous prefix (output 1) is broadcast, and nothing past the failed fetch is:
+        // output 2 was never broadcast.
+        assert!(rx.recv().await.is_some(), "the drained prefix (output 1) must be broadcast");
+        assert!(rx.try_recv().is_err(), "no output at or past the failed fetch may be broadcast",);
+
+        // The prefix is persisted; the post-gap output is not. Querying a consensus number beyond
+        // the chain head returns either `Ok(None)` or a "number too high" `Err`; either way the
+        // output is absent, whereas a bug that saved output 2 would return `Ok(Some(_))`.
+        assert!(
+            matches!(consensus_chain.consensus_header_by_number(1).await, Ok(Some(_))),
+            "output 1 (the drained prefix) must be persisted",
+        );
+        assert!(
+            !matches!(consensus_chain.consensus_header_by_number(2).await, Ok(Some(_))),
+            "output 2 (past the failed fetch) must not be persisted",
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_fanout_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use tempfile::TempDir;
+    use tn_network_types::MockPrimaryToWorkerClient;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+    use tokio::sync::mpsc;
+
+    /// One fetch leg per worker id, merged into one result; an id with no local network
+    /// instance is the protocol violation `UnexpectedWorkerId` (issue #556).
+    #[tokio::test]
+    async fn fetch_batches_from_peers_fans_out_per_worker() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let primary = fixture.authorities().next().unwrap();
+        let base = primary.consensus_config().clone();
+        // a two-worker committee sizes the per-worker local networks
+        let committee =
+            base.committee().with_num_workers(NonZeroUsize::new(2).expect("2 is not 0"));
+        let config = ConsensusConfig::new_with_committee_for_test(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            committee,
+            base.network_config().clone(),
+        )
+        .expect("two-worker consensus config");
+
+        // each worker's instance serves a disjoint batch
+        let digest_0 = BlockHash::random();
+        let digest_1 = BlockHash::random();
+        let batch = Batch::default();
+        config
+            .local_network(0)
+            .expect("worker 0 local network")
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                batches: HashMap::from([(digest_0, batch.clone())]),
+            }))
+            .expect("register worker 0 mock");
+        config
+            .local_network(1)
+            .expect("worker 1 local network")
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                batches: HashMap::from([(digest_1, batch)]),
+            }))
+            .expect("register worker 1 mock");
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+                .await
+                .expect("consensus chain");
+        let (tx, _rx) = mpsc::channel(5);
+        let consensus_bus = ConsensusBus::new();
+        let subscriber = Subscriber {
+            consensus_bus: consensus_bus.app().clone(),
+            config: config.clone(),
+            network_handle: PrimaryNetworkHandle::new_for_test(tx),
+            inner: Arc::new(Inner {
+                authority_id: config.authority_id(),
+                committee: config.committee().clone(),
+                consensus_chain,
+                epoch_boundary: u64::MAX,
+                metrics: ExecutorMetrics::default(),
+            }),
         };
 
-        for (digest, block) in batches.into_iter() {
-            debug!(
-                target: "subscriber",
-                "Block {:?} took {:?} seconds since it was received to when it was fetched for execution",
-                digest,
-                block.received_at().map(|t| t.elapsed().as_secs_f64()),
-            );
+        // both legs fetch concurrently and the results merge
+        let by_worker =
+            BTreeMap::from([(0, BTreeSet::from([digest_0])), (1, BTreeSet::from([digest_1]))]);
+        let fetched =
+            subscriber.fetch_batches_from_peers(by_worker).await.expect("both worker legs succeed");
+        assert!(fetched.contains_key(&digest_0), "worker 0's batch fetched");
+        assert!(fetched.contains_key(&digest_1), "worker 1's batch fetched");
 
-            fetched_blocks.insert(digest, block);
-        }
-
-        Ok(fetched_blocks)
+        // an id outside the committee's worker set is a protocol violation
+        let unknown = BTreeMap::from([(7, BTreeSet::from([digest_0]))]);
+        assert!(matches!(
+            subscriber.fetch_batches_from_peers(unknown).await,
+            Err(SubscriberError::UnexpectedWorkerId(7))
+        ));
     }
 }

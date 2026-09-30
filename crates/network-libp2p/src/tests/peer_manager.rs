@@ -1,11 +1,15 @@
 //! Unit tests for peer manager
 
 use super::*;
-use crate::common::{create_multiaddr, random_ip_addr};
+use crate::{
+    common::{create_multiaddr, random_ip_addr},
+    consensus::partial_peers_from_get_closest_timeout,
+};
 use assert_matches::assert_matches;
 use libp2p::{
     core::Endpoint,
-    swarm::{ConnectionId, NetworkBehaviour as _},
+    kad::GetClosestPeersError,
+    swarm::{ConnectionId, DialError, NetworkBehaviour as _},
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -26,7 +30,11 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    PeerManager::new(config.network_config().peer_config())
+    PeerManager::new(
+        PeerId::random(),
+        config.network_config().peer_config(),
+        crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
+    )
 }
 
 /// Helper function to extract events of a certain type
@@ -139,7 +147,12 @@ async fn test_add_trusted_peer() {
     // Add trusted peer
     peer_manager.add_trusted_peer_and_dial(
         peer_bls,
-        NetworkInfo { pubkey: peer_netkey, multiaddrs: vec![multiaddr.clone()], timestamp: now() },
+        NetworkInfo {
+            pubkey: peer_netkey,
+            multiaddrs: vec![multiaddr.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
         sender,
     );
 
@@ -244,6 +257,42 @@ async fn test_dial_peer_already_connected() {
     let result = timeout(Duration::from_millis(500), receiver).await;
     let channel_result = result.unwrap().unwrap();
     assert!(channel_result.is_err()); // Dial should have failed with an error
+}
+
+// Regression for #745: a dial failure must surface the *real* `DialError` to the
+// caller, not the hardcoded "dial attempt timedout" string. Pre-fix, `on_dial_failure`
+// -> `register_disconnected` consumed the reply channel with the timeout literal before
+// the genuine cause could be delivered, so every distinct failure (wrong key, refused,
+// firewall, timeout) looked identical to an operator onboarding a validator.
+#[tokio::test]
+async fn test_dial_failure_surfaces_real_error() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+
+    // register an in-flight dial so a reply channel is pending
+    let (sender, receiver) = oneshot::channel();
+    peer_manager.register_dial_attempt(peer_id, Some(sender));
+
+    // a concrete, non-timeout failure cause
+    let error = DialError::Aborted;
+    let expected = NetworkError::from(&error).to_string();
+    peer_manager.on_dial_failure(Some(peer_id), &error);
+
+    let result = timeout(Duration::from_millis(500), receiver).await.unwrap().unwrap();
+    let err = result.expect_err("dial failure must report an error");
+    assert_eq!(
+        err.to_string(),
+        expected,
+        "the real DialError must reach the caller, not a hardcoded cause"
+    );
+
+    // and specifically not the old hardcoded timeout literal
+    let old_timeout = NetworkError::Dial("dial attempt timedout".to_string()).to_string();
+    assert_ne!(
+        err.to_string(),
+        old_timeout,
+        "regression: the real dial error was erased by the hardcoded timeout string"
+    );
 }
 
 #[tokio::test]
@@ -494,6 +543,145 @@ async fn test_process_peer_exchange() {
     assert!(peer_manager.next_dial_request().is_none());
 }
 
+/// Peer exchange entries keyed by their authenticated BLS key.
+type EligibleExchangeMap = HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>;
+
+/// Helper to build an exchange map of `count` eligible peers, returning the map and its ids.
+fn eligible_exchange_map(count: usize, seed: u8) -> (EligibleExchangeMap, HashSet<PeerId>) {
+    let mut rng = StdRng::from_seed([seed; 32]);
+    (0..count).fold(
+        (HashMap::new(), HashSet::new()),
+        |(mut exchange_map, mut exchanged_peers), _| {
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+            let peer_id: PeerId = net.clone().into();
+            exchanged_peers.insert(peer_id);
+            exchange_map.insert(bls, (net, HashSet::from([create_multiaddr(None)])));
+            (exchange_map, exchanged_peers)
+        },
+    )
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_bounds_discovery_to_missing_target() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // pre-seed some discovery peers so the missing target is smaller than the max
+    let preseeded = 3;
+    let preseeded_peers: HashSet<PeerId> = (0..preseeded)
+        .map(|_| {
+            let peer_id = PeerId::random();
+            peer_manager.discovery_peers.insert(peer_id, vec![create_multiaddr(None)]);
+            peer_id
+        })
+        .collect();
+
+    // build an exchange map with more eligible peers than the missing target
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(max_discovery_peers + 8, 1);
+
+    // process the oversized exchange
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify the sample tops up to the max, not to max + preseeded or the full map size
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+
+    // verify the pre-seeded peers survive and exactly the missing target came from the exchange
+    assert!(preseeded_peers.iter().all(|id| peer_manager.discovery_peers.contains_key(id)));
+    let sampled =
+        peer_manager.discovery_peers.keys().filter(|id| exchanged_peers.contains(id)).count();
+    assert_eq!(sampled, max_discovery_peers - preseeded);
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_skips_when_discovery_full() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // fill discovery peers to the max
+    (0..max_discovery_peers).for_each(|_| {
+        peer_manager.discovery_peers.insert(PeerId::random(), vec![create_multiaddr(None)]);
+    });
+
+    // process an exchange with eligible peers
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(5, 2);
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify nothing was added from the exchange
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+    assert!(peer_manager.discovery_peers.keys().all(|id| !exchanged_peers.contains(id)));
+}
+
+/// Helper to build a distinct, deterministic multiaddr per index.
+///
+/// All addresses target the same IP with different ports, the shape of a dial-amplification
+/// payload aimed at one victim host (issue #1183).
+fn multiaddr_for_index(i: usize) -> Multiaddr {
+    Multiaddr::empty()
+        .with(Ipv4Addr::new(203, 0, 113, 1).into())
+        .with(Protocol::Tcp(8000 + u16::try_from(i).expect("index fits u16")))
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_rejects_oversized_multiaddr_list() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls_oversized = *BlsKeypair::generate(&mut rng).public();
+    let bls_at_cap = *BlsKeypair::generate(&mut rng).public();
+    let net_oversized: NetworkPublicKey =
+        NetworkKeypair::generate_ed25519().public().clone().into();
+    let net_at_cap: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let peer_id_oversized: PeerId = net_oversized.clone().into();
+    let peer_id_at_cap: PeerId = net_at_cap.clone().into();
+
+    // one entry with one address more than an honest peer's store can hold
+    let oversized: HashSet<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER + 1).map(multiaddr_for_index).collect();
+    assert_eq!(oversized.len(), crate::peers::MAX_MULTIADDRS_PER_PEER + 1);
+
+    // one entry exactly at the cap
+    let at_cap: HashSet<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER).map(multiaddr_for_index).collect();
+    assert_eq!(at_cap.len(), crate::peers::MAX_MULTIADDRS_PER_PEER);
+
+    let mut exchange_map = HashMap::new();
+    exchange_map.insert(bls_oversized, (net_oversized, oversized));
+    exchange_map.insert(bls_at_cap, (net_at_cap, at_cap));
+
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // the oversized entry is rejected; the at-cap entry is stored
+    assert!(
+        !peer_manager.discovery_peers.contains_key(&peer_id_oversized),
+        "entry over MAX_MULTIADDRS_PER_PEER must not enter discovery"
+    );
+    assert!(
+        peer_manager.discovery_peers.contains_key(&peer_id_at_cap),
+        "entry at MAX_MULTIADDRS_PER_PEER must enter discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_purges_oversized_multiaddr_entry() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // an oversized entry stored before the cap existed (or through any future ingest gap)
+    let peer_id = PeerId::random();
+    let addrs: Vec<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER + 1).map(multiaddr_for_index).collect();
+    peer_manager.discovery_peers.insert(peer_id, addrs);
+
+    peer_manager.discovery_heartbeat();
+
+    // the heartbeat re-checks eligibility: the entry is purged, never dialed
+    assert!(
+        !peer_manager.discovery_peers.contains_key(&peer_id),
+        "oversized entry must be purged by the heartbeat"
+    );
+    assert!(peer_manager.next_dial_request().is_none(), "oversized entry must not be dialed");
+}
+
 #[tokio::test]
 async fn test_prune_connected_peers() {
     let mut peer_manager = create_test_peer_manager(None);
@@ -547,23 +735,961 @@ async fn test_is_validator() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager = PeerManager::new(
+        PeerId::random(),
+        config.network_config().peer_config(),
+        crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
+    );
     let validator = *authority_1.authority().protocol_key();
+    let validator_peer_id: PeerId = config.key_config().primary_network_public_key().into();
     let random_peer_id = PeerId::random();
 
     let info = NetworkInfo {
         pubkey: config.key_config().primary_network_public_key(),
         multiaddrs: vec![config.primary_address()],
         timestamp: now(),
+        rpc: None,
     };
     peer_manager.add_known_peer(validator, info);
 
-    // update epoch with random multiaddr
+    // set the current committee (no previous/next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.new_epoch(committee);
+    peer_manager.update_committees(HashSet::new(), committee, HashSet::new());
+
+    // Verify the registered committee member is a validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+}
+
+#[tokio::test]
+async fn test_update_committees_triggers_missing_authorities_for_unknown_next_keys() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // update with a next committee that contains the unknown key
+    peer_manager.update_committees(HashSet::new(), HashSet::new(), HashSet::from([unknown_bls]));
+
+    // exactly one MissingAuthorities event referencing the unknown key should be emitted
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "Expect one missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.contains(&unknown_bls)
+    );
+}
+
+#[tokio::test]
+async fn test_update_committees_does_not_trigger_for_unknown_previous() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // the unknown key appears ONLY in the previous committee (peers rotating out are not chased)
+    peer_manager.update_committees(HashSet::from([unknown_bls]), HashSet::new(), HashSet::new());
+
+    // no MissingAuthorities event should be emitted for a previous-only unknown key
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous-committee-only unknown keys must not trigger MissingAuthorities"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_committee_dial_unbans_without_touching_slots() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // build a known committee member
+    let mut rng = StdRng::from_seed([3; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+    peer_manager.add_known_peer(bls, info);
+
+    // manually temp-ban the peer
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // prepare the committee for dialing
+    peer_manager.prepare_committee_dial(HashSet::from([bls]));
+
+    // the peer is unbanned but the committee slots remain untouched
+    assert!(!peer_manager.peer_banned(&peer_id), "prepare_committee_dial should unban the peer");
+    assert!(
+        !peer_manager.is_peer_validator(&peer_id),
+        "prepare_committee_dial must not populate committee slots"
+    );
+}
+
+#[tokio::test]
+async fn test_add_known_peer_closes_validator_gap_on_discovery() {
+    // GAP FIX (full): a committee member set by bls before its network identity is known is tracked
+    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad
+    // discovery confirms the identity via `add_known_peer`, the lazy-trust hook makes it a
+    // validator and marks it important -- without waiting for the next epoch's
+    // `update_committees`.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a committee member whose network identity is not yet known to this node
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+
+    // set the current committee with the member present by bls, BEFORE discovering its peer id
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // GAP: the member is tracked by bls, but its libp2p id does not resolve to a validator yet
+    assert!(!peer_manager.is_peer_validator(&peer_id), "unknown peer id must not resolve yet");
+
+    // kad discovery confirms the network identity, which applies committee trust immediately
+    peer_manager.add_known_peer(bls, info);
+
+    // gap closed the instant discovery completed: validator + important (trusted)
+    assert!(peer_manager.is_peer_validator(&peer_id), "discovered member must now be a validator");
+    assert!(
+        peer_manager.peer_is_important(&peer_id),
+        "discovered member must be trusted/important"
+    );
+}
+
+/// Build a well-formed [`NetworkInfo`] with a fresh, random network identity.
+fn random_network_info() -> NetworkInfo {
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    }
+}
+
+#[tokio::test]
+async fn test_discovered_peers_bounded_to_committee_membership() {
+    // Regression (issue #827): a flood of signature-valid kad records for fresh, non-committee keys
+    // must not grow `known_peers`. Only records whose key is a tracked committee member are cached.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a single legitimate current-committee member, tracked by bls before its identity is known
+    let mut rng = StdRng::from_seed([11; 32]);
+    let committee_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([committee_bls]), HashSet::new());
+    assert!(peer_manager.known_peers.is_empty(), "no records cached before discovery");
+
+    // an attacker publishes many valid records for endless fresh keys it controls; none are
+    // committee members, so every one is dropped and `known_peers` never grows
+    let mut attacker_rng = StdRng::from_seed([42; 32]);
+    for _ in 0..1_000 {
+        let attacker_bls = *BlsKeypair::generate(&mut attacker_rng).public();
+        peer_manager.add_discovered_peer(attacker_bls, random_network_info());
+    }
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "non-committee discovered records must all be dropped"
+    );
+
+    // the legitimate committee member's record, arriving via the same discovery path, IS cached
+    peer_manager.add_discovered_peer(committee_bls, random_network_info());
+    assert!(
+        peer_manager.known_peers.contains_key(&committee_bls),
+        "a committee member discovered via kad must be cached"
+    );
+    assert!(peer_manager.known_peers.len() == 1, "only the committee member is cached");
+}
+
+#[tokio::test]
+async fn test_self_advertised_connected_peer_confirmed_not_cached_and_bounded() {
+    // Issue #827 gate refinement: a non-committee peer that pushes its OWN record over its own
+    // authenticated connection (kad-put `source` == the record's advertised network identity) has
+    // its bls<->peer-id identity confirmed so a live connection (e.g. an nvv in the gossip mesh) is
+    // retained, but it is NOT added to the committee-only `known_peers` cache. A relayed record
+    // (source != identity) confirms nothing, and a flood of fresh keys over one connection stays
+    // bounded because the peer store re-keys by peer id.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a non-committee peer self-advertises its own record: source == the advertised network id
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let self_peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public();
+    peer_manager.add_self_advertised_peer(self_peer_id, bls, info);
+
+    // identity confirmed in the peer store (resolvable by peer id) ...
+    assert_eq!(
+        peer_manager.peer_to_bls(&self_peer_id),
+        Some(bls),
+        "self-advertised connected peer must have its identity confirmed"
+    );
+    // ... but NOT cached in the committee-only known_peers
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "self-advertised non-committee peer must not enter the committee-only known_peers cache"
+    );
+
+    // a relayed record (source is not the advertised identity) confirms nothing and is not cached,
+    // so a peer can never displace an identity it does not control
+    let relayed = random_network_info();
+    let relayed_bls = *BlsKeypair::generate(&mut StdRng::from_seed([8; 32])).public();
+    let unrelated_source = PeerId::random();
+    peer_manager.add_self_advertised_peer(unrelated_source, relayed_bls, relayed);
+    assert_eq!(
+        peer_manager.peer_to_bls(&unrelated_source),
+        None,
+        "a relayed record must not confirm an identity the sender does not control"
+    );
+    assert!(peer_manager.known_peers.is_empty(), "relayed record must not be cached");
+
+    // a flood of fresh bls keys all self-advertised over ONE connection stays bounded: the peer
+    // store re-keys by peer id (one confirmed identity per connection) so only the latest survives,
+    // and known_peers never grows
+    let flood_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let flood_peer_id: PeerId = flood_netkey.clone().into();
+    let mut attacker_rng = StdRng::from_seed([42; 32]);
+    let last_bls = (0..1_000).fold(bls, |_, _| {
+        let next_bls = *BlsKeypair::generate(&mut attacker_rng).public();
+        let info = NetworkInfo {
+            pubkey: flood_netkey.clone(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        };
+        peer_manager.add_self_advertised_peer(flood_peer_id, next_bls, info);
+        next_bls
+    });
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "a self-advertised flood must never grow the committee-only known_peers cache"
+    );
+    assert_eq!(
+        peer_manager.peer_to_bls(&flood_peer_id),
+        Some(last_bls),
+        "the flooded connection retains exactly one (the latest) confirmed identity, not 1000"
+    );
+}
+
+#[tokio::test]
+async fn test_self_advertised_multiaddr_set_is_bounded() {
+    // Regression (GHSA-29v6-gvv5-45gx): a non-committee peer that republishes its OWN signed
+    // record over and over, each time advertising a brand-new distinct multiaddr, must not grow
+    // its stored multiaddr set without bound. Before the fix every accepted record `extend`ed the
+    // peer's `multiaddrs` set, so 1_000 records left ~1_000 addresses on a single entry (unbounded
+    // memory growth and O(N) reputation/ban scans). The per-peer cap now bounds the set regardless
+    // of how many records the peer publishes, while a legitimate single-address peer is unaffected.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // one non-committee peer, self-advertising over its own connection (source == advertised id, so
+    // the sender has proven it owns the transport key and takes the confirm-identity path)
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+
+    for _ in 0..1_000 {
+        let info = NetworkInfo {
+            pubkey: netkey.clone(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        };
+        peer_manager.add_self_advertised_peer(peer_id, bls, info);
+    }
+
+    let count = peer_manager.peer_multiaddr_count(&peer_id);
+    assert!(
+        matches!(count, Some(n) if n <= crate::peers::MAX_MULTIADDRS_PER_PEER),
+        "a self-advertised republish flood must keep the stored multiaddr set within \
+         MAX_MULTIADDRS_PER_PEER ({}), got {count:?}",
+        crate::peers::MAX_MULTIADDRS_PER_PEER
+    );
+}
+
+#[tokio::test]
+async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
+    // Regression (issue #827): committee members discovered in one epoch must not accumulate across
+    // rotations, while operator-provisioned (pinned) peers must never be evicted.
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([13; 32]);
+
+    // an operator/bootstrap peer added via `add_known_peer` is pinned even though it is never a
+    // committee member
+    let pinned_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.add_known_peer(pinned_bls, random_network_info());
+
+    // a committee member discovered this epoch via the kad path
+    let member_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([member_bls]), HashSet::new());
+    peer_manager.add_discovered_peer(member_bls, random_network_info());
+    assert!(peer_manager.known_peers.contains_key(&member_bls), "member cached while in committee");
+    assert!(peer_manager.known_peers.contains_key(&pinned_bls), "pinned peer cached");
+
+    // next epoch: `member_bls` falls out of every slot (a member still in `previous` would be kept
+    // one more epoch); a fresh committee replaces it
+    let mut next_rng = StdRng::from_seed([99; 32]);
+    let new_member = *BlsKeypair::generate(&mut next_rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([new_member]), HashSet::new());
+
+    // the rotated-out member is pruned; the pinned operator peer survives
+    assert!(
+        !peer_manager.known_peers.contains_key(&member_bls),
+        "rotated-out member must be pruned"
+    );
+    assert!(
+        peer_manager.known_peers.contains_key(&pinned_bls),
+        "pinned operator peer must survive rotation"
+    );
+}
+
+#[tokio::test]
+async fn test_restored_records_not_pinned_and_pruned_at_rotation() {
+    // Records restored from the persisted kad store at startup are peer-fillable third-party
+    // records (DHT storage duty), so they must NOT be pinned: the first committee rotation prunes
+    // every restored key that does not sit in a tracked slot, restoring the issue #827 bound that
+    // a pinning restore would bypass.
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([17; 32]);
+
+    let restored_a = *BlsKeypair::generate(&mut rng).public();
+    let restored_b = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.add_restored_peer(restored_a, random_network_info());
+    peer_manager.add_restored_peer(restored_b, random_network_info());
+    assert!(peer_manager.auth_to_peer(restored_a).is_some(), "restored record a resolvable");
+    assert!(peer_manager.auth_to_peer(restored_b).is_some(), "restored record b resolvable");
+
+    // first rotation: only `restored_b` occupies a tracked committee slot
+    peer_manager.update_committees(HashSet::new(), HashSet::from([restored_b]), HashSet::new());
+
+    assert!(
+        peer_manager.auth_to_peer(restored_a).is_none(),
+        "restored non-member must be pruned at the first rotation"
+    );
+    assert!(
+        peer_manager.auth_to_peer(restored_b).is_some(),
+        "restored committee member must be retained"
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_peer_pins_existing_entry_without_overwrite() {
+    // A bootstrap peer whose record was already restored (unpinned) from persistence must still
+    // be pinned — otherwise the first rotation would prune it — while the existing, possibly
+    // richer record is not overwritten by the config-derived stub.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+
+    // restored (unpinned) record with distinctive multiaddrs
+    let restored_info = random_network_info();
+    let restored_addrs = restored_info.multiaddrs.clone();
+    peer_manager.add_restored_peer(bls, restored_info);
+
+    // the operator's bootstrap config carries a different (stub) address for the same key
+    let bootstrap_info = random_network_info();
+    assert_ne!(restored_addrs, bootstrap_info.multiaddrs, "addresses must differ for this test");
+    peer_manager.add_bootstrap_peer(bls, bootstrap_info);
+
+    // the restored record won: no overwrite
+    let (_, multiaddrs) = peer_manager.auth_to_peer(bls).expect("bootstrap peer resolvable");
+    assert_eq!(multiaddrs, restored_addrs, "existing record must not be overwritten");
+
+    // rotate to a committee that does NOT include the bootstrap peer: it survives, pinned
+    let new_member = *BlsKeypair::generate(&mut StdRng::from_seed([99; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([new_member]), HashSet::new());
+    let (_, multiaddrs) =
+        peer_manager.auth_to_peer(bls).expect("bootstrap peer must survive rotation");
+    assert_eq!(multiaddrs, restored_addrs, "pinned entry keeps the restored record");
+}
+
+#[tokio::test]
+async fn test_discovered_peer_stale_record_ignored() {
+    // Timestamp monotonicity (defect D2): `get_record` query results bypass the store-side
+    // `is_newer_record` check entirely (close_kad_query -> add_discovered_peer), so without a
+    // cache-side guard a stale-but-valid record served as the only query response would regress
+    // a fresher `known_peers` entry.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([31; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // an older record arriving via the same discovery path is dropped
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, stale);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, fresh_addrs, "stale record must not regress the cached entry");
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+
+    // a strictly newer record applies
+    let mut newer = random_network_info();
+    newer.timestamp = 1_001;
+    let newer_addrs = newer.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, newer);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, newer_addrs, "newer record must replace the cached entry");
+    assert_eq!(cached.timestamp, 1_001, "cached timestamp advanced");
+}
+
+#[tokio::test]
+async fn test_discovered_peer_equal_timestamp_keeps_existing() {
+    // EQUAL timestamps keep the existing entry (benign replay churn) — the same rule as the
+    // store-side `is_newer_record` check.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([37; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut original = random_network_info();
+    original.timestamp = 1_000;
+    let original_addrs = original.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, original);
+
+    // a same-timestamp record with different addresses must not displace the cached entry
+    let mut replay = random_network_info();
+    replay.timestamp = 1_000;
+    assert_ne!(replay.multiaddrs, original_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, replay);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, original_addrs,
+        "equal-timestamp record must keep the existing entry"
+    );
+}
+
+#[tokio::test]
+async fn test_self_advertised_stale_record_ignored() {
+    // A pushed record can pass the store-side `is_newer_record` check yet still be older than the
+    // cached entry (the cache learned a fresher record via a query result the store never saw).
+    // The committee branch of `add_self_advertised_peer` must not regress the cache.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([41; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T via kad discovery
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // a stale record pushed over the peer's own authenticated connection (source == advertised)
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    let source: PeerId = stale.pubkey.clone().into();
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_self_advertised_peer(source, bls, stale);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, fresh_addrs,
+        "stale self-advertised record must not regress the cache"
+    );
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+}
+
+#[tokio::test]
+async fn test_operator_add_overwrites_newer_kad_record() {
+    // Operator-provisioned paths deliberately bypass the staleness guard: `add_known_peer`
+    // (the AddExplicitPeer handler) inserts unconditionally, so an operator can always repair a
+    // bad cached record regardless of its timestamp. In production these handlers stamp now().
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([43; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // a kad-discovered record with a high timestamp
+    let mut discovered = random_network_info();
+    discovered.timestamp = 10_000;
+    let discovered_addrs = discovered.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, discovered);
+
+    // the operator provisions the peer with a LOWER timestamp and different addresses: it wins
+    let mut operator = random_network_info();
+    operator.timestamp = 5_000;
+    let operator_addrs = operator.multiaddrs.clone();
+    assert_ne!(operator_addrs, discovered_addrs, "addresses must differ for this test");
+    peer_manager.add_known_peer(bls, operator);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, operator_addrs, "operator record must overwrite the kad record");
+    assert_eq!(cached.timestamp, 5_000, "operator record timestamp wins");
+}
+
+#[tokio::test]
+async fn test_pinned_peer_kad_record_bypasses_staleness_guard() {
+    // An operator-provisioned (pinned) entry's timestamp is a local now() provisioning stamp,
+    // not a peer-signed record timestamp, and node records are signed once at peer startup. The
+    // staleness guard must therefore not apply to pinned entries: the peer's real signed record
+    // (older stamp, but carrying rpc info and real multiaddrs) must still replace the operator
+    // stub — the flow exercised end-to-end by `test_advertise_rpc_via_kad`.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([47; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // the operator stub: pinned, rpc-less, stamped AFTER the peer signed its own record
+    let mut stub = random_network_info();
+    stub.timestamp = 10_000;
+    peer_manager.add_known_peer(bls, stub);
+
+    // the peer's real record arrives via kad with its startup-signed (older) timestamp
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 5_000;
+    let real_addrs = real.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, real);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, real_addrs, "signed record must refresh the pinned stub");
+    assert_eq!(cached.rpc, Some(rpc), "advertised rpc must reach the cache despite older stamp");
+}
+
+#[tokio::test]
+async fn test_self_advertised_record_from_pinned_peer_cached_before_committee_seed() {
+    // The production ordering for a node joining with a cold datadir: `AddBootstrapPeers` pins an
+    // rpc-less stub for every committee validator, each validator then pushes its real rpc-bearing
+    // record on first connect, and only afterwards does the epoch loop seed the worker swarm's
+    // committee slots. The pushed record must be cached while the committee set is still empty:
+    // the push is one-shot, and the pinned stub otherwise satisfies every re-discovery trigger.
+    //
+    // fails on main: the committee gate in `add_self_advertised_peer` ran before the worker
+    // swarm's slots were seeded, so the record was discarded and the stub kept forever.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([53; 32])).public();
+
+    // (a) the cold-store bootstrap stub: pinned, rpc-less
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+
+    // (b) the peer pushes its own signed record over its authenticated connection while the
+    // committee set is still empty
+    let (real, rpc) = random_network_info_with_rpc();
+    let real_addrs = real.multiaddrs.clone();
+    let source: PeerId = real.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(source, bls, real);
+
+    // (c) the epoch loop seeds the committee afterwards
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // (d) the advertised rpc is resolvable and the real record replaced the stub
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "record pushed before the committee seed must be cached for a pinned peer"
+    );
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, real_addrs, "real record must replace the bootstrap stub");
+}
+
+#[tokio::test]
+async fn test_learned_pinned_record_not_regressed_by_older_push() {
+    // The staleness exemption is scoped to the stub, not to the pin. Once a pinned peer's real
+    // record (peer-signed timestamp T) is cached, an older validly-signed record for the same
+    // key — relayed over kad PUT by ANY connected peer, since the committee/pinned branch does
+    // not require `source == advertised` — must not regress the cached multiaddrs/rpc. Pins are
+    // never cleared, so keying the exemption on `pinned_peers` would leave every bootstrap
+    // validator open to this replay for the life of the process.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([73; 32])).public();
+
+    // pinned + stubbed via bootstrap config
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    assert!(peer_manager.stub_records.contains(&bls), "bootstrap entry starts as a stub");
+
+    // the peer's real record lands over its own connection and replaces the stub
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 1_000;
+    let real_addrs = real.multiaddrs.clone();
+    let own_source: PeerId = real.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(own_source, bls, real);
+    assert!(!peer_manager.stub_records.contains(&bls), "stub cleared after learning");
+
+    // an older record for the same key arrives from an UNRELATED source (replay)
+    let mut older = random_network_info();
+    older.timestamp = 999;
+    assert_ne!(older.multiaddrs, real_addrs, "addresses must differ for this test");
+    peer_manager.add_self_advertised_peer(PeerId::random(), bls, older);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("record cached");
+    assert_eq!(cached.timestamp, 1_000, "older replay must not regress the cached timestamp");
+    assert_eq!(cached.multiaddrs, real_addrs, "older replay must not regress the multiaddrs");
+    assert_eq!(cached.rpc, Some(rpc), "older replay must not drop the advertised rpc");
+}
+
+#[tokio::test]
+async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
+    // Same invariant on the `get_record` result path: a single stale responder must not regress
+    // a learned record held under a pinned key.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([79; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 1_000;
+    let real_addrs = real.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, real);
+    assert!(!peer_manager.stub_records.contains(&bls), "stub cleared after learning");
+
+    let mut older = random_network_info();
+    older.timestamp = 999;
+    assert_ne!(older.multiaddrs, real_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, older);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("record cached");
+    assert_eq!(cached.timestamp, 1_000, "older query result must not regress the timestamp");
+    assert_eq!(cached.multiaddrs, real_addrs, "older query result must not regress multiaddrs");
+    assert_eq!(cached.rpc, Some(rpc), "older query result must not drop the advertised rpc");
+}
+
+/// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
+fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
+    let rpc = RpcInfo {
+        http: "https://validator.example.com:8545/".parse().expect("http url"),
+        ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
+    };
+    let mut info = random_network_info();
+    info.rpc = Some(rpc.clone());
+    (info, rpc)
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_scoped_to_current_committee() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a pinned rpc-advertising peer; pinning keeps its record through committee rotation
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+    let (info, rpc) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(bls, info);
+
+    // known and advertising, but not a current-committee member: excluded
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "pinned non-committee peer must not appear in the snapshot"
+    );
+
+    // once the peer joins the current committee its advertised rpc is returned
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "current-committee member's advertised rpc must be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([22; 32]);
+
+    // rpc-advertising peers with known records, seeded only into previous and next
+    let previous_bls = *BlsKeypair::generate(&mut rng).public();
+    let next_bls = *BlsKeypair::generate(&mut rng).public();
+    let (previous_info, _) = random_network_info_with_rpc();
+    let (next_info, _) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(previous_bls, previous_info);
+    peer_manager.add_known_peer(next_bls, next_info);
+    peer_manager.update_committees(
+        HashSet::from([previous_bls]),
+        HashSet::new(),
+        HashSet::from([next_bls]),
+    );
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // neither the outgoing nor the incoming member appears in the snapshot
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "previous/next-only members must not appear in the snapshot"
+    );
+    // and no discovery is triggered: the current committee has no missing records
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous/next-only members must not trigger discovery from the snapshot call"
+    );
+}
+
+/// A signed record without RPC resolves a bootstrap stub and stops metadata discovery.
+#[tokio::test]
+async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // A configured dial hint is upgraded by a record that actually advertises no RPC.
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+    let record = random_network_info();
+    peer_manager.add_bootstrap_peer(bls, record.clone());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    peer_manager.add_discovered_peer(bls, record.clone());
+    // Reapplying bootstrap configuration must not turn a resolved record back into a stub.
+    peer_manager.add_bootstrap_peer(bls, record);
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // the member advertised nothing, so it is excluded from the snapshot ...
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without advertised rpc must be excluded"
+    );
+    // ... and its record is learned, so no futile re-discovery is triggered
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "a learned record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+/// All operator-provisioned insertion paths leave signed metadata eligible for discovery.
+#[tokio::test]
+async fn test_current_committee_rpcs_fetches_provisioned_records() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([25; 32]);
+    let bootstrap = *BlsKeypair::generate(&mut rng).public();
+    let explicit = *BlsKeypair::generate(&mut rng).public();
+    let trusted = *BlsKeypair::generate(&mut rng).public();
+    let current = HashSet::from([bootstrap, explicit, trusted]);
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    peer_manager.add_bootstrap_peer(bootstrap, random_network_info());
+    peer_manager.add_known_peer(explicit, random_network_info());
+    peer_manager.add_trusted_peer_and_dial(trusted, random_network_info(), reply);
+    peer_manager.update_committees(HashSet::new(), current.clone(), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    assert!(peer_manager.current_committee_rpcs().is_empty());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys)
+                if keys.iter().copied().collect::<HashSet<_>>() == current
+        )),
+        "configured dial hints must not suppress signed-record discovery"
+    );
+}
+
+/// A late observer can fetch an older signed record after learning only bootstrap dial hints.
+#[tokio::test]
+async fn test_current_committee_rpcs_upgrades_late_bootstrap_record() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([26; 32])).public();
+    let (mut record, rpc) = random_network_info_with_rpc();
+    record.timestamp = 5_000;
+    let mut bootstrap = record.clone();
+    bootstrap.timestamp = 10_000;
+    bootstrap.rpc = None;
+    peer_manager.add_bootstrap_peer(bls, bootstrap.clone());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    assert!(peer_manager.current_committee_rpcs().is_empty());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys) if keys.as_slice() == [bls]
+        )),
+        "the late observer must request the validator's signed RPC advertisement"
+    );
+
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PeerEvent::MissingAuthorities(keys) if keys.as_slice() == [bls]
+        )),
+        "explicit authority discovery must also upgrade configured dial hints"
+    );
+
+    peer_manager.add_discovered_peer(bls, record);
+    peer_manager.add_bootstrap_peer(bls, bootstrap);
+    assert_eq!(peer_manager.current_committee_rpcs(), vec![(bls, rpc)]);
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        !events.iter().any(|event| matches!(event, PeerEvent::MissingAuthorities(_))),
+        "a resolved bootstrap record must stop triggering metadata discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_triggers_discovery_for_missing_records() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a current-committee member whose node record was never discovered
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([24; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([unknown_bls]), HashSet::new());
+    // drain the MissingAuthorities that update_committees itself emitted so the assertions
+    // below observe only what the snapshot call emits
+    collect_all_events(&mut peer_manager);
+
+    // no record means no rpc entry, but the call re-triggers kad discovery for the member
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without a record has no rpc to report"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "expect one fresh missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [unknown_bls]
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_rediscovers_members_held_as_bootstrap_stub() {
+    // A bootstrap stub is a config-derived dial hint, not the peer's advertisement record: it
+    // carries no rpc and says nothing about whether the peer advertises one. A current member
+    // held only as a stub must be chased exactly like an unknown member, and the chase must go
+    // quiet once the real record lands.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([59; 32])).public();
+
+    // the cold-store bootstrap stub for a current-committee member
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // the stub has no rpc to report ...
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "bootstrap stub has no rpc to report"
+    );
+    // ... and, being unlearned, re-triggers kad discovery for the member
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "expect one missing authorities event for the stub");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [bls]
+    );
+
+    // the peer's real record arrives via kad: the snapshot converges and the chase stops
+    let (real, rpc) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, real);
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "learned record's rpc must be returned"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.is_empty(), "a learned record must not be re-discovered");
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_no_rediscovery_for_learned_record_without_rpc() {
+    // Chasing is keyed on "is the record learned?", not "does it carry an rpc?": a validator
+    // that genuinely advertises nothing must not cause kad churn, including one whose stub was
+    // replaced by an rpc-less learned record.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([61; 32])).public();
+
+    // the member starts as a bootstrap stub, so it is chased ...
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+
+    // ... until its own signed record arrives, advertising no rpc
+    peer_manager.add_discovered_peer(bls, random_network_info());
+    collect_all_events(&mut peer_manager);
+
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without advertised rpc must be excluded"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "a learned record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_find_authorities_chases_bootstrap_stubs() {
+    // `find_authorities` shares the unlearned predicate with `trigger_missing_authorities`: a
+    // bootstrap stub is reported as missing until the peer's own record replaces it.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([67; 32])).public();
+
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    collect_all_events(&mut peer_manager);
+
+    // the stub is chased
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "find_authorities emits one event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [bls]
+    );
+
+    // the peer's real record arrives via kad (admitted because the key is now a committee member)
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    collect_all_events(&mut peer_manager);
+    let (real, _) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, real);
+
+    // `find_authorities` always emits one event; its payload is now empty
+    peer_manager.find_authorities(vec![bls]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert_eq!(missing_events.len(), 1, "find_authorities emits one event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_peer_does_not_mark_learned_record_as_stub() {
+    // `add_bootstrap_peer` never overwrites an existing record, so it must not mark a learned
+    // record as a stub either: doing so would make discovery chase a record it already holds.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([71; 32])).public();
+
+    // the member's own record is learned first (e.g. a warm kad store)
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    let (learned, rpc) = random_network_info_with_rpc();
+    peer_manager.add_discovered_peer(bls, learned);
+    collect_all_events(&mut peer_manager);
+
+    // then the operator's bootstrap config lands for the same key
+    peer_manager.add_bootstrap_peer(bls, random_network_info());
+    assert!(!peer_manager.stub_records.contains(&bls), "learned record must stay learned");
+    assert!(peer_manager.pinned_peers.contains(&bls), "bootstrap peer must be pinned");
+
+    // the learned rpc is still reported and the member is not chased
+    assert_eq!(peer_manager.current_committee_rpcs(), vec![(bls, rpc)]);
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.is_empty(), "a learned record must not be re-discovered");
 }
 
 #[tokio::test]
@@ -629,7 +1755,12 @@ async fn test_peers_for_exchange() {
         let bls = *BlsKeypair::generate(&mut rng).public();
         peer_manager.add_known_peer(
             bls,
-            NetworkInfo { pubkey: network_key, multiaddrs: vec![addr], timestamp: now() },
+            NetworkInfo {
+                pubkey: network_key,
+                multiaddrs: vec![addr],
+                timestamp: now(),
+                rpc: None,
+            },
         );
     }
 
@@ -767,6 +1898,37 @@ async fn test_peer_action_ban_arms_temporarily_banned() {
     );
 }
 
+// A ban admission that overflows the bounded temporarily-banned cache must unban the evicted
+// oldest peer, mirroring the age-based eviction path. Otherwise the evicted peer would linger on
+// the gossipsub blacklist (installed via the `Banned` event) after leaving the reconnection cache.
+#[tokio::test]
+async fn test_size_cap_eviction_emits_unbanned() {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().max_temporarily_banned_peers = 2;
+    let mut peer_manager = create_test_peer_manager(Some(network_config));
+
+    // ban three distinct peers into a cache capped at two; the first (oldest) is evicted.
+    let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+    peers.iter().for_each(|&peer| {
+        peer_manager.apply_peer_action(peer, PeerAction::Ban(Vec::new()));
+    });
+
+    // occupancy never exceeds the cap and the oldest peer was evicted.
+    assert_eq!(peer_manager.temporarily_banned.len(), 2, "cache must stay within its size cap");
+    assert!(
+        !peer_manager.temporarily_banned.contains(&peers[0]),
+        "the oldest peer must be evicted on overflow"
+    );
+
+    // the evicted oldest peer is unbanned, so downstream blacklist state is released for it.
+    let events = collect_all_events(&mut peer_manager);
+    let unbanned = extract_events(&events, |e| matches!(e, PeerEvent::Unbanned(_)));
+    assert!(
+        unbanned.iter().any(|e| matches!(e, PeerEvent::Unbanned(id) if *id == peers[0])),
+        "cap eviction must emit PeerEvent::Unbanned for the evicted oldest peer"
+    );
+}
+
 // Regression: an in-flight dial whose peer became banned mid-dial must be
 // rejected at `handle_pending_outbound_connection`. Pre-fix, the
 // `dial_attempt_already_registered` short-circuit returned `Ok(vec![])` with
@@ -898,6 +2060,164 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
 
     // should only have one entry
     assert_eq!(peer_manager.discovery_peers.len(), 1);
+    assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
+}
+
+// Regression (issue #1252): `process_peers_for_discovery` bounds the set to
+// `max_discovery_peers` at insert time, so overshoot never persists until the
+// next heartbeat prune. The bound is enforced by random eviction over old and
+// new entries alike, never by rejecting newcomers, so no first-come occupant
+// can starve fresh kad results out of the pool.
+#[tokio::test]
+async fn test_process_peers_for_discovery_caps_inserts() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery = peer_manager.config.max_discovery_peers();
+
+    // flood past the cap in a single batch
+    let flood: Vec<_> = (0..max_discovery + 10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(flood);
+
+    // capped at insert time - no transient overshoot
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // at the cap, another batch still leaves the set exactly at the cap
+    let second_flood: Vec<_> = (0..10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(second_flood);
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // an address update for a tracked peer replaces its entry without growing
+    // the set, and with no excess nothing is evicted
+    let tracked_id = peer_manager.discovery_peers.keys().next().copied();
+    let new_addr = create_multiaddr(None);
+    tracked_id.into_iter().for_each(|tracked_id| {
+        peer_manager.process_peers_for_discovery(vec![PeerInfo {
+            peer_id: tracked_id,
+            addrs: vec![new_addr.clone()],
+        }]);
+        assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+        assert_eq!(peer_manager.discovery_peers.remove(&tracked_id), Some(vec![new_addr.clone()]));
+    });
+}
+
+// Regression (issue #777 Part B): the node's own peer id must never be added to
+// the discovery feed. A self entry (learned via kad closest-peers or peer
+// exchange) would otherwise be selected for a self-dial during the heartbeat.
+#[tokio::test]
+async fn test_self_id_filtered_from_discovery() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    let other = PeerId::random();
+    let addr = create_multiaddr(None);
+
+    // our own id is not eligible; a normal peer is
+    assert!(!peer_manager
+        .eligible_for_discovery(&PeerInfo { peer_id: local, addrs: vec![addr.clone()] }));
+    assert!(peer_manager
+        .eligible_for_discovery(&PeerInfo { peer_id: other, addrs: vec![addr.clone()] }));
+
+    // feeding self + a normal peer through the discovery sink registers only the
+    // normal peer
+    peer_manager.process_peers_for_discovery(vec![
+        PeerInfo { peer_id: local, addrs: vec![addr.clone()] },
+        PeerInfo { peer_id: other, addrs: vec![addr.clone()] },
+    ]);
+    assert!(!peer_manager.discovery_peers.contains_key(&local));
+    assert_eq!(peer_manager.discovery_peers.remove(&other), Some(vec![addr]));
+}
+
+// Regression (issue #777 Part B): routing the node's own peer id through the
+// dial path is a no-op (no dial request, no self-penalty) and reports success so
+// retrying callers do not treat it as a failure.
+#[tokio::test]
+async fn test_self_dial_request_is_noop() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    // mirror the observed hairpin address (192.168.8.1)
+    let hairpin = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(192, 168, 8, 1))));
+    let (sender, receiver) = oneshot::channel();
+
+    peer_manager.dial_peer(local, vec![hairpin], Some(sender));
+
+    // no dial request was queued
+    assert!(peer_manager.next_dial_request().is_none());
+    // the caller is told the no-op succeeded (so `dial_peer_bls` does not retry)
+    let result = timeout(Duration::from_millis(500), receiver).await.unwrap().unwrap();
+    assert!(result.is_ok());
+    // the node never scored or tracked itself
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
+}
+
+// Regression (issue #777 Part B): a penalty targeting the node's own id is a
+// no-op, even a `Fatal` one — a self-connection can never ban the node.
+#[tokio::test]
+async fn test_self_penalty_is_noop() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    peer_manager.process_penalty(local, Penalty::Fatal);
+
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(extract_events(&events, |e| matches!(e, PeerEvent::Banned(_))).is_empty());
+}
+
+// Regression (issue #777 Part B): a self-connection is denied without scoring at
+// the connection-establishment handlers. The pending-outbound guard is the
+// precise fix for kad auto-dialing our own re-learned record; the established
+// handlers are the backstop. A normal peer is still accepted.
+#[tokio::test]
+async fn test_self_connection_denied() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    let other = PeerId::random();
+    let connection_id = ConnectionId::new_unchecked(0);
+    let addr = create_multiaddr(None);
+
+    // kad-initiated dial of our own id is denied at the pending stage
+    assert!(peer_manager
+        .handle_pending_outbound_connection(connection_id, Some(local), &[], Endpoint::Dialer)
+        .is_err());
+    // a normal peer is allowed to be dialed
+    assert!(peer_manager
+        .handle_pending_outbound_connection(connection_id, Some(other), &[], Endpoint::Dialer)
+        .is_ok());
+
+    // an inbound self-connection (loopback/hairpin) is dropped
+    assert!(peer_manager
+        .handle_established_inbound_connection(connection_id, local, &addr, &addr)
+        .is_err());
+
+    // and no self-penalty was ever recorded by any of the above
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
+}
+
+#[tokio::test]
+async fn test_get_closest_peers_timeout_recovers_partial_peers() {
+    // Regression: a kademlia `GetClosestPeers` query that times out still reports
+    // the peers it located before expiring, and those peers must reach the
+    // discovery pool instead of being discarded along with the failed query.
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let addr = create_multiaddr(None);
+    let peer_info = PeerInfo { peer_id, addrs: vec![addr.clone()] };
+
+    // kademlia surfaces a timeout carrying the closest peers found so far
+    let err = GetClosestPeersError::Timeout { key: peer_id.to_bytes(), peers: vec![peer_info] };
+
+    // the recovery helper must hand back exactly the peers the query located
+    let recovered = partial_peers_from_get_closest_timeout(err);
+    assert_eq!(recovered.len(), 1);
+
+    // feeding them through the discovery sink registers the peer as a discovery
+    // candidate, exactly as a successful query would have
+    peer_manager.process_peers_for_discovery(recovered);
     assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
 }
 
@@ -1163,4 +2483,431 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
 
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
+}
+
+/// The cheap-work bound remains independent of the scoring thresholds.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_sheds_after_threshold() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // the first window's worth of records are accepted
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed)
+    });
+
+    // the next record in the same window is shed without a penalty
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+}
+
+/// The first threshold crossing is scored once below the hard ceiling.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_penalizes_flood_once_per_window() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // The honest safe band is shed without a penalty above the cheap-work bound.
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|i| {
+        let expected = if i < MAX_PUT_RECORDS_PER_WINDOW {
+            PutRecordRate::Allowed
+        } else {
+            PutRecordRate::Shed
+        };
+        assert_eq!(peer_manager.put_record_rate_limited(source), expected, "message {}", i + 1);
+    });
+
+    // the message past the penalty threshold floods, exactly once
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+
+    // further messages in the same window are shed, not re-penalized
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+}
+
+/// A fixed PutRecord budget renews exactly when its interval expires.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_resets_after_interval() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW - Duration::from_millis(1)).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+}
+
+/// Expired windows permit a fresh one-time flood penalty.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_reset_clears_penalized() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // drive the source past the penalty threshold so the window is marked penalized
+    (0..PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    assert!(peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
+
+    // Expiry starts a clean window that can receive a fresh flood penalty.
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(!peer_manager.put_record_windows.get(&source).expect("window exists").penalized);
+}
+
+/// Reconnecting cannot refill a partially consumed PutRecord budget.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_partial_budget_survives_reconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    (1..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+}
+
+/// Reconnecting the same source cannot restore an exhausted PutRecord budget.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_exhausted_budget_survives_reconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    });
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+}
+
+/// The local identity never allocates rate-limit state, even above the hard ceiling.
+#[tokio::test]
+async fn test_put_record_rate_limit_never_applies_to_local_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    // the local id is exempt no matter how many records arrive, and never allocates a window
+    (0..=PUT_RECORD_DISCONNECT_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(local), PutRecordRate::Allowed)
+    });
+    assert!(!peer_manager.put_record_windows.contains_key(&local));
+}
+
+/// Rate-limit metrics distinguish unscored sheds from penalty escalations.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_metric_counts_shed_and_flood() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        let source = PeerId::random();
+        // Allowed through the work bound, then shed until the first flood penalty.
+        (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+            peer_manager.put_record_rate_limited(source);
+        });
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let count_for = |outcome: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_network.put_records_rate_limited_total"
+                    && key.key().labels().any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(c) => *c,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                    panic!("rate-limit metric must be a counter")
+                }
+            })
+            .unwrap_or_else(|| panic!("no rate-limit counter for outcome {outcome}"))
+    };
+
+    // Every message between the work and penalty thresholds is shed without scoring.
+    let expected_shed = u64::try_from(PUT_RECORD_PENALTY_THRESHOLD - MAX_PUT_RECORDS_PER_WINDOW)
+        .expect("shed count fits in u64");
+    assert_eq!(count_for("shed"), expected_shed);
+    assert_eq!(count_for("flood"), 1);
+}
+
+/// An upstream store-cap change must not silently exceed the honest safe band.
+#[test]
+fn test_put_record_penalty_threshold_above_honest_ceiling() {
+    let honest_ceiling = libp2p::kad::store::MemoryStoreConfig::default().max_records;
+    assert_eq!(honest_ceiling, KAD_MAX_STORED_RECORDS);
+    assert!(PUT_RECORD_PENALTY_THRESHOLD > honest_ceiling);
+}
+
+/// The hard ceiling is inclusive; each subsequent message escalates the penalty.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_repeats_penalty_above_hard_ceiling() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+    (0..=PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    ((PUT_RECORD_PENALTY_THRESHOLD + 1)..PUT_RECORD_DISCONNECT_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    });
+    (0..3).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    });
+}
+
+/// Reconnecting cannot restore the allowance or clear an already assessed penalty.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_survives_reconnect() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    ((MAX_PUT_RECORDS_PER_WINDOW + 2)..PUT_RECORD_PENALTY_THRESHOLD).for_each(|_| {
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    });
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Flooding);
+    peer_manager.register_disconnected(&source);
+    assert!(peer_manager.register_peer_connection(
+        &source,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+    let window = peer_manager
+        .put_record_windows
+        .get(&source)
+        .ok_or_else(|| eyre::eyre!("the over-limit window must survive reconnect"))?;
+    assert!(window.penalized);
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    Ok(())
+}
+
+/// Heartbeats retain active windows and reclaim expired state without another message.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_window_heartbeat_expires_disconnected_source() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    peer_manager.register_disconnected(&source);
+    peer_manager.heartbeat();
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+    tokio::time::advance(PUT_RECORD_RATE_WINDOW).await;
+    peer_manager.heartbeat();
+    assert!(!peer_manager.put_record_windows.contains_key(&source));
+}
+
+/// The rolling AddProvider allowance is exactly five accepted messages per minute.
+#[tokio::test(start_paused = true)]
+async fn test_add_provider_rate_limited_trips_after_budget() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let provider = PeerId::random();
+
+    // Use the protocol allowance literally so raising the constant breaks the regression.
+    (0..5).for_each(|i| {
+        assert!(
+            !peer_manager.add_provider_rate_limited(provider),
+            "message {i} within budget must be admitted"
+        );
+    });
+
+    // The next message in the same window is over budget and is limited.
+    assert!(
+        peer_manager.add_provider_rate_limited(provider),
+        "message past the per-window budget must be rate limited"
+    );
+}
+
+/// Expired admissions free the sliding budget without rejected messages extending it.
+#[tokio::test(start_paused = true)]
+async fn test_add_provider_rate_limit_resets_after_window() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let provider = PeerId::random();
+
+    // Exhaust the budget so the next call trips.
+    (0..=MAX_ADD_PROVIDERS_PER_WINDOW).for_each(|_| {
+        let _ = peer_manager.add_provider_rate_limited(provider);
+    });
+    assert!(peer_manager.add_provider_rate_limited(provider), "budget exhausted, so limited");
+
+    tokio::time::advance(ADD_PROVIDER_RATE_WINDOW - Duration::from_millis(1)).await;
+    assert!(peer_manager.add_provider_rate_limited(provider));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(
+        !peer_manager.add_provider_rate_limited(provider),
+        "a new window after the interval must be admitted"
+    );
+    assert_eq!(
+        peer_manager.add_provider_windows.get(&provider).expect("window present").admitted.len(),
+        1,
+        "the reset window counts only the current message"
+    );
+}
+
+/// The local provider never consumes a tracked AddProvider budget.
+#[tokio::test]
+async fn test_add_provider_rate_limit_exempts_local_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    // The node's own id is never limited and never allocates a window.
+    (0..MAX_ADD_PROVIDERS_PER_WINDOW * 2).for_each(|_| {
+        assert!(!peer_manager.add_provider_rate_limited(local), "local peer is exempt");
+    });
+    assert!(
+        !peer_manager.add_provider_windows.contains_key(&local),
+        "the local peer must not allocate a rate window"
+    );
+}
+
+/// Reconnecting the same provider cannot restore an exhausted sliding budget.
+#[tokio::test(start_paused = true)]
+async fn test_add_provider_window_survives_reconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let provider = register_peer(&mut peer_manager, None);
+
+    (0..MAX_ADD_PROVIDERS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.add_provider_rate_limited(provider)));
+    peer_manager.register_disconnected(&provider);
+    assert!(
+        peer_manager.add_provider_windows.contains_key(&provider),
+        "disconnecting must preserve the live budget"
+    );
+    assert!(peer_manager.register_peer_connection(
+        &provider,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    ));
+    assert!(peer_manager.add_provider_rate_limited(provider));
+
+    tokio::time::advance(ADD_PROVIDER_RATE_WINDOW).await;
+    assert!(!peer_manager.add_provider_rate_limited(provider));
+}
+
+/// A prior fixed-window boundary frees only the individually expired admission.
+#[tokio::test(start_paused = true)]
+async fn test_add_provider_sliding_window_prevents_boundary_burst() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let provider = PeerId::random();
+
+    assert!(!peer_manager.add_provider_rate_limited(provider));
+    tokio::time::advance(Duration::from_secs(59)).await;
+    (1..MAX_ADD_PROVIDERS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.add_provider_rate_limited(provider)));
+    assert!(peer_manager.add_provider_rate_limited(provider));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(!peer_manager.add_provider_rate_limited(provider));
+    assert!(peer_manager.add_provider_rate_limited(provider), "the four recent admissions remain");
+
+    tokio::time::advance(Duration::from_secs(59)).await;
+    (1..MAX_ADD_PROVIDERS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.add_provider_rate_limited(provider)));
+    assert!(peer_manager.add_provider_rate_limited(provider), "the admission at 60s remains");
+}
+
+/// Heartbeat sweeps disconnected identities only once their complete budgets expire.
+#[tokio::test(start_paused = true)]
+async fn test_kad_rate_windows_heartbeat_retains_live_and_sweeps_expired() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Allowed);
+    assert!(!peer_manager.add_provider_rate_limited(source));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(!peer_manager.add_provider_rate_limited(source));
+    peer_manager.register_disconnected(&source);
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    peer_manager.heartbeat();
+    assert!(!peer_manager.put_record_windows.contains_key(&source));
+    assert!(
+        peer_manager.add_provider_windows.contains_key(&source),
+        "the newest sliding admission is still live"
+    );
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    peer_manager.heartbeat();
+    assert!(peer_manager.add_provider_windows.is_empty());
+}
+
+/// Identity churn cannot exceed either hard cap or evict a live source's budget.
+#[tokio::test(start_paused = true)]
+async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let tracked: Vec<PeerId> = (0..1024).map(|_| PeerId::random()).collect();
+    tracked.iter().for_each(|source| {
+        assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
+        assert!(!peer_manager.add_provider_rate_limited(*source));
+        peer_manager.register_disconnected(source);
+    });
+    assert_eq!(peer_manager.put_record_windows.len(), 1024);
+    assert_eq!(peer_manager.add_provider_windows.len(), 1024);
+
+    (0..32).for_each(|_| {
+        let source = PeerId::random();
+        assert_eq!(peer_manager.put_record_rate_limited(source), PutRecordRate::Shed);
+        assert!(peer_manager.add_provider_rate_limited(source));
+        assert!(!peer_manager.put_record_windows.contains_key(&source));
+        assert!(!peer_manager.add_provider_windows.contains_key(&source));
+    });
+    assert_eq!(peer_manager.put_record_windows.len(), 1024);
+    assert_eq!(peer_manager.add_provider_windows.len(), 1024);
+
+    // Full maps preserve each tracked source's remaining allowance and exhaustion.
+    tracked.iter().for_each(|source| {
+        (1..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+            assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
+        });
+        (1..MAX_ADD_PROVIDERS_PER_WINDOW)
+            .for_each(|_| assert!(!peer_manager.add_provider_rate_limited(*source)));
+        assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Shed);
+        assert!(peer_manager.add_provider_rate_limited(*source));
+    });
+    let local = peer_manager.local_peer_id;
+    assert_eq!(peer_manager.put_record_rate_limited(local), PutRecordRate::Allowed);
+    assert!(!peer_manager.add_provider_rate_limited(local));
+    assert_eq!(peer_manager.put_record_windows.len(), 1024);
+    assert_eq!(peer_manager.add_provider_windows.len(), 1024);
+
+    // Expiry restores capacity through heartbeat, with no live entry eviction.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    peer_manager.heartbeat();
+    assert!(peer_manager.put_record_windows.is_empty());
+    assert!(peer_manager.add_provider_windows.is_empty());
+    let newcomer = PeerId::random();
+    assert_eq!(peer_manager.put_record_rate_limited(newcomer), PutRecordRate::Allowed);
+    assert!(!peer_manager.add_provider_rate_limited(newcomer));
 }

@@ -2,13 +2,15 @@
 
 mod export_staking_args;
 mod generate;
-use self::{export_staking_args::ExportStakingArgs, generate::NodeType};
+mod pop;
+mod set_rpc;
+use self::{export_staking_args::ExportStakingArgs, generate::NodeType, set_rpc::SetRpcArgs};
 use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
 use std::path::{Path, PathBuf};
-use tn_config::TelcoinDirs as _;
+use tn_config::{create_keys_dir, TelcoinDirs as _};
 use tracing::warn;
 
 /// Generate keypairs and node info to go with them and save them to a file.
@@ -33,6 +35,10 @@ pub enum KeySubcommand {
     /// Export hex-encoded staking arguments from node-info.yaml.
     #[command(name = "export-staking-args")]
     ExportStakingArgs(ExportStakingArgs),
+
+    /// Set or clear the worker JSON-RPC endpoint advertised in node-info.yaml.
+    #[command(name = "set-rpc")]
+    SetRpc(SetRpcArgs),
 }
 
 impl KeyArgs {
@@ -40,24 +46,58 @@ impl KeyArgs {
     pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
         match &self.command {
             // generate keys
-            KeySubcommand::Generate(args) => {
-                let args = match &args.node_type {
-                    NodeType::ValidatorKeys(args) => args,
-                    NodeType::ObserverKeys(args) => args,
-                };
-                let authority_key_path = datadir.node_keys_path();
-                // initialize path and warn users if overwriting keys
-                self.init_path(&authority_key_path, args.force)?;
-                // execute and store keypath
-                args.execute(&datadir, passphrase)?;
-            }
+            KeySubcommand::Generate(args) => match &args.node_type {
+                // validator/observer mint fresh keys, so prepare (and guard) the key dir
+                NodeType::ValidatorKeys(a) | NodeType::ObserverKeys(a) => {
+                    // initialize path and warn users if overwriting keys
+                    self.init_path(datadir.node_keys_path(), a.force)?;
+                    // execute and store keypath
+                    a.execute(&datadir, passphrase)?;
+                }
+                // pop re-signs against existing keys - never creates or overwrites keys
+                NodeType::Pop(a) => a.execute(&datadir, passphrase)?,
+            },
             // export staking args from node-info.yaml (does not use datadir or passphrase)
             KeySubcommand::ExportStakingArgs(args) => {
                 args.execute()?;
             }
+            // set or clear the worker rpc endpoint in node-info.yaml (config-only
+            // edit; does not use the BLS passphrase)
+            KeySubcommand::SetRpc(args) => args.execute(&datadir)?,
         }
 
         Ok(())
+    }
+
+    /// Test-only twin of [`Self::execute`]: `generate validator|observer` wrap the fresh BLS
+    /// key with an intentionally weak PBKDF2 round count; every other subcommand never writes
+    /// keys and behaves exactly like [`Self::execute`]. NEVER call this outside tests.
+    #[cfg(feature = "test-utils")]
+    pub fn execute_insecure(
+        &self,
+        datadir: PathBuf,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<()> {
+        if let KeySubcommand::Generate(args) = &self.command {
+            if let NodeType::ValidatorKeys(a) | NodeType::ObserverKeys(a) = &args.node_type {
+                // initialize path and warn users if overwriting keys
+                self.init_path(datadir.node_keys_path(), a.force)?;
+                return a.execute_insecure(&datadir, passphrase, rounds);
+            }
+        }
+        self.execute(datadir, passphrase)
+    }
+
+    /// Whether this keytool invocation needs the BLS key passphrase up front.
+    ///
+    /// `generate validator|observer` encrypts a freshly minted BLS key and
+    /// `generate pop` decrypts the existing key to re-sign, so the binary must
+    /// have the passphrase available before dispatching them. `set-rpc` only
+    /// edits public config in `node-info.yaml` and never touches the BLS key, so
+    /// it must not be gated on a passphrase.
+    pub fn needs_passphrase(&self) -> bool {
+        !matches!(self.command, KeySubcommand::SetRpc(_))
     }
 
     /// Ensure the path exists, and if not, create it.
@@ -66,8 +106,10 @@ impl KeyArgs {
 
         // create the dir if it doesn't exist or is empty
         if self.is_key_dir_empty(rpath) {
-            // authority dir
-            std::fs::create_dir_all(rpath).wrap_err_with(|| {
+            // authority dir, owner-only: this runs before `KeyConfig::generate_and_save`, so a
+            // plain `create_dir_all` here would leave the fresh directory world-traversable
+            // and turn the library's 0700 into a no-op
+            create_keys_dir(rpath).wrap_err_with(|| {
                 format!("Could not create authority key directory {}", rpath.display())
             })?;
         } else if !force {
@@ -94,11 +136,17 @@ impl KeyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::export_staking_args::ExportStakingArgs;
+    use super::{
+        export_staking_args::ExportStakingArgs, generate::KeygenArgs, pop::PopArgs,
+        set_rpc::SetRpcArgs,
+    };
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
-    use tn_types::hex;
+    use tn_types::{
+        hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo, DEFAULT_WORKER_ID,
+    };
+    use url::Url;
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -133,6 +181,111 @@ mod tests {
         .expect("config loaded yaml okay");
     }
 
+    /// A pre-existing loose empty key directory must be tightened even when generation
+    /// aborts before any key is written (here: an invalid worker RPC scheme fails the run
+    /// after `init_path` and before `KeyConfig::generate_and_save`).
+    ///
+    /// This is the leg where the CLI-side `create_keys_dir` call is load-bearing on its own:
+    /// the library key writer never runs, so nothing downstream can repair the mode. The
+    /// seed is an explicit 0755 chmod, so the check does not depend on the ambient umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keytool_generate_tightens_key_dir_when_generation_aborts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::{KeyConfig, TelcoinDirs as _};
+
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let temp_path = tempdir.path();
+        let keys_dir = temp_path.to_path_buf().node_keys_path();
+        std::fs::create_dir_all(&keys_dir).expect("pre-create keys dir");
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen keys dir");
+
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+            "--rpc-http",
+            "ftp://127.0.0.1:8545",
+        ])
+        .expect("cli parsed");
+        let run = tn.run(Some("abort_mode_test".to_string()), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        });
+        assert!(run.is_err(), "an invalid worker RPC scheme must abort key generation");
+        assert!(
+            !KeyConfig::keys_exist(&temp_path.to_path_buf()),
+            "no keys may be written on the aborted run"
+        );
+
+        let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "aborted generate left the keys dir accessible beyond its owner: {:o}",
+            mode & 0o7777
+        );
+    }
+
+    /// The key directory produced by the real `keytool generate` flow must be owner-only.
+    ///
+    /// Regression test: `init_path` used to pre-create the directory with `create_dir_all`
+    /// (0755 at the usual umask) before `KeyConfig::generate_and_save` ran, which turned the
+    /// library's owner-only directory mode into a no-op for every fresh CLI install. The
+    /// pre-created case seeds an explicit 0755 (an older build's layout, or a packaging
+    /// script's mkdir), so the check does not depend on the ambient umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keytool_generate_key_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::TelcoinDirs as _;
+
+        [true, false].into_iter().for_each(|pre_create_loose| {
+            let tempdir = tempfile::TempDir::new().expect("tempdir created");
+            let temp_path = tempdir.path();
+            let keys_dir = temp_path.to_path_buf().node_keys_path();
+            if pre_create_loose {
+                std::fs::create_dir_all(&keys_dir).expect("pre-create keys dir");
+                std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("loosen keys dir");
+            }
+
+            let tn = Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--workers",
+                "1",
+                "--datadir",
+                temp_path.to_str().expect("tempdir path clean"),
+                "--address",
+                "0",
+            ])
+            .expect("cli parsed");
+            tn.run(Some("key_dir_mode_test".to_string()), |_, _, _, _, _| {
+                tokio::spawn(async { Ok(()) })
+            })
+            .expect("generate keys command");
+
+            let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "node-keys dir is accessible beyond its owner \
+                 (pre_create_loose = {pre_create_loose}): {:o}",
+                mode & 0o7777
+            );
+        });
+    }
+
     /// Test that export-staking-args reads node-info.yaml and produces correct byte lengths.
     #[tokio::test]
     async fn test_export_staking_args() {
@@ -162,23 +315,19 @@ mod tests {
         )
         .expect("node info loaded");
 
-        let compressed = node_info.bls_public_key.to_bytes();
-        let uncompressed_pk = node_info.bls_public_key.serialize();
-        let uncompressed_sig = node_info.proof_of_possession.serialize();
+        let compressed_pubkey = node_info.bls_public_key.to_bytes();
+        let compressed_sig = node_info.proof_of_possession.to_bytes();
 
-        assert_eq!(compressed.len(), 96, "compressed BLS pubkey should be 96 bytes");
-        assert_eq!(uncompressed_pk.len(), 192, "uncompressed BLS pubkey should be 192 bytes");
-        assert_eq!(uncompressed_sig.len(), 96, "uncompressed PoP signature should be 96 bytes");
+        assert_eq!(compressed_pubkey.len(), 96, "compressed BLS pubkey should be 96 bytes");
+        assert_eq!(compressed_sig.len(), 48, "compressed PoP signature should be 48 bytes");
 
         // verify hex encoding produces valid 0x-prefixed strings
-        let compressed_hex = format!("0x{}", hex::encode(compressed));
-        let uncompressed_pk_hex = format!("0x{}", hex::encode(uncompressed_pk));
-        let uncompressed_sig_hex = format!("0x{}", hex::encode(uncompressed_sig));
+        let compressed_pubkey_hex = format!("0x{}", hex::encode(compressed_pubkey));
+        let compressed_sig_hex = format!("0x{}", hex::encode(compressed_sig));
 
-        assert!(compressed_hex.starts_with("0x"));
-        assert_eq!(compressed_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
-        assert_eq!(uncompressed_pk_hex.len(), 2 + 192 * 2); // 0x + 192 bytes hex
-        assert_eq!(uncompressed_sig_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert!(compressed_pubkey_hex.starts_with("0x"));
+        assert_eq!(compressed_pubkey_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert_eq!(compressed_sig_hex.len(), 2 + 48 * 2); // 0x + 48 bytes hex
 
         // also test that ExportStakingArgs::execute works with directory path
         let args =
@@ -241,5 +390,825 @@ mod tests {
             "--calldata",
         ]);
         assert!(result.is_err(), "--json and --calldata should be mutually exclusive");
+    }
+
+    /// The target devnet execution address used in the `generate pop` tests.
+    fn new_test_address() -> Address {
+        Address::from_slice(
+            &hex::decode("b4E5ED8167873a3CF3C405Aa7155948Db869DBE3").expect("addr hex"),
+        )
+    }
+
+    /// Build `KeygenArgs` for a fresh single-worker validator (zero fee address,
+    /// no external p2p addrs); `name` selects the optional `--name` value.
+    fn keygen_args(name: Option<String>) -> KeygenArgs {
+        KeygenArgs {
+            workers: 1,
+            force: false,
+            address: Address::ZERO,
+            name,
+            external_primary_addr: None,
+            external_worker_addrs: None,
+            rpc_http: None,
+            rpc_ws: None,
+        }
+    }
+
+    /// Parse the real `set-rpc` argument definitions without constructing the outer node command.
+    fn set_rpc_args(arguments: &[&str]) -> eyre::Result<SetRpcArgs> {
+        let matches = <SetRpcArgs as clap::Args>::augment_args(clap::Command::new("set-rpc"))
+            .try_get_matches_from(std::iter::once("set-rpc").chain(arguments.iter().copied()))?;
+        <SetRpcArgs as clap::FromArgMatches>::from_arg_matches(&matches).map_err(Into::into)
+    }
+
+    /// Generation derives every worker from its own ID, reserves distinct sockets, and only
+    /// applies the legacy RPC flags to worker 0.
+    #[tokio::test]
+    async fn test_generate_multiple_worker_records() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        let http: Url = "https://worker-0.example.com/".parse()?;
+        KeygenArgs { workers: 2, rpc_http: Some(http.clone()), ..keygen_args(None) }
+            .execute(&datadir, None)?;
+        let info: NodeInfo =
+            Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML)?;
+        let keys = tn_config::KeyConfig::read_config(&datadir, None)?;
+        assert_eq!(info.p2p_info.num_workers(), 2);
+        info.p2p_info.workers.iter().zip([0, 1]).for_each(|(worker, worker_id)| {
+            assert_eq!(worker.network_key, keys.worker_network_public_key(worker_id));
+            assert_eq!(
+                worker.network_address.iter().last(),
+                Some(tn_types::Protocol::P2p(worker.network_key.clone().into()))
+            );
+        });
+        let listeners: std::collections::HashSet<tn_types::Multiaddr> =
+            std::iter::once(&info.p2p_info.primary)
+                .chain(info.p2p_info.workers.iter())
+                .map(|node| {
+                    node.network_address
+                        .iter()
+                        .filter(|protocol| !matches!(protocol, tn_types::Protocol::P2p(_)))
+                        .collect()
+                })
+                .collect();
+        assert_eq!(listeners.len(), 3, "primary and workers must use distinct listen sockets");
+        assert_eq!(
+            info.p2p_info.worker(0).and_then(|worker| worker.rpc.as_ref()),
+            Some(&RpcInfo { http, ws: None })
+        );
+        assert!(info.p2p_info.worker(1).is_some_and(|worker| worker.rpc.is_none()));
+        Ok(())
+    }
+
+    /// Explicit worker addresses retain their order and receive the matching derived peer ID.
+    #[tokio::test]
+    async fn test_generate_multiple_worker_external_addresses() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        let addresses: Vec<tn_types::Multiaddr> = [41000, 41001]
+            .into_iter()
+            .map(|port| format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse())
+            .collect::<Result<_, _>>()?;
+        KeygenArgs {
+            workers: 2,
+            external_worker_addrs: Some(addresses.clone()),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)?;
+        let info: NodeInfo =
+            Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML)?;
+        assert_eq!(info.p2p_info.num_workers(), 2);
+        info.p2p_info.workers.iter().zip(addresses).try_for_each(|(worker, address)| {
+            let expected = address
+                .with_p2p(worker.network_key.clone().into())
+                .map_err(|_| eyre::eyre!("test address unexpectedly has a peer ID"))?;
+            assert_eq!(worker.network_address, expected);
+            Ok(())
+        })
+    }
+
+    /// Missing, surplus, or duplicate listen addresses fail before a keystore is written,
+    /// including addresses with different peer IDs on the same socket.
+    #[tokio::test]
+    async fn test_generate_rejects_invalid_worker_layouts() -> eyre::Result<()> {
+        use tn_config::TelcoinDirs as _;
+
+        let address: tn_types::Multiaddr = "/ip4/127.0.0.1/udp/41000/quic-v1".parse()?;
+        let same_socket_with_peer_ids = (0..2)
+            .map(|_| {
+                address.clone().with(tn_types::Protocol::P2p(
+                    tn_types::NetworkKeypair::generate_ed25519().public().to_peer_id(),
+                ))
+            })
+            .collect();
+        [
+            vec![],
+            vec![address.clone()],
+            vec![address.clone(); 3],
+            vec![address; 2],
+            same_socket_with_peer_ids,
+        ]
+        .into_iter()
+        .try_for_each(|addresses| -> eyre::Result<()> {
+            let tempdir = tempfile::TempDir::new()?;
+            let datadir = tempdir.path().to_path_buf();
+            let result = KeygenArgs {
+                workers: 2,
+                external_worker_addrs: Some(addresses),
+                ..keygen_args(None)
+            }
+            .execute(&datadir, None);
+            assert!(result.is_err());
+            assert!(!datadir.node_keys_path().exists());
+            assert!(!datadir.node_info_path().exists());
+            Ok(())
+        })
+    }
+
+    /// Both node roles accept the full WorkerId count range and reject empty or overflowing
+    /// layouts.
+    #[test]
+    fn test_generate_worker_count_cli_bounds() {
+        ["validator", "observer"].into_iter().for_each(|role| {
+            ["1", "2", "5", "65536"].into_iter().for_each(|count| {
+                assert!(Cli::<NoArgs>::try_parse_from([
+                    "telcoin-network",
+                    "keytool",
+                    "generate",
+                    role,
+                    "--address",
+                    "0",
+                    "--workers",
+                    count,
+                ])
+                .is_ok());
+            });
+            ["0", "65537"].into_iter().for_each(|count| {
+                assert!(Cli::<NoArgs>::try_parse_from([
+                    "telcoin-network",
+                    "keytool",
+                    "generate",
+                    role,
+                    "--address",
+                    "0",
+                    "--workers",
+                    count,
+                ])
+                .is_err());
+            });
+        });
+    }
+
+    /// `generate pop` re-signs the proof of possession for a new execution address
+    /// using the node's *existing* keys: the BLS key, p2p info, and name are
+    /// unchanged; only `execution_address` and `proof_of_possession` change, and
+    /// the new PoP verifies for the new address but not the old one.
+    #[tokio::test]
+    async fn test_generate_pop() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let temp_path = tempdir.path();
+
+        // generate base keys + node-info (old execution address = zero address).
+        // passphrase `None` -> cleartext keyfile, so `generate pop` (also `None`)
+        // can read the same keys back.
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+        ])
+        .expect("cli parsed");
+        tn.run(None, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+            .expect("generate keys command");
+
+        let node_info_path = temp_path.join("node-info.yaml");
+        let before = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded before pop");
+
+        // Re-sign the PoP for a new execution address. Call `execute` directly
+        // rather than via a second `run`, to avoid re-initializing global tracing
+        // within a single test (mirrors `test_export_staking_args`).
+        let new_addr = new_test_address();
+        let datadir = temp_path.to_path_buf();
+        PopArgs { address: new_addr }.execute(&datadir, None).expect("generate pop");
+
+        let after = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after pop");
+
+        // BLS identity, p2p info (network keys + addresses), and name are untouched.
+        assert_eq!(before.bls_public_key, after.bls_public_key, "BLS public key must not change");
+        assert_eq!(before.p2p_info, after.p2p_info, "p2p info must not change");
+        assert_eq!(before.name, after.name, "node name must not change");
+
+        // Execution address and proof of possession are updated.
+        assert_eq!(before.execution_address, Address::ZERO, "old address was the zero address");
+        assert_eq!(after.execution_address, new_addr, "execution address should be the new addr");
+        assert_ne!(
+            before.proof_of_possession, after.proof_of_possession,
+            "proof of possession must be re-signed"
+        );
+
+        // The new PoP verifies for the new address, but not the old one.
+        assert!(
+            verify_proof_of_possession_bls(
+                &after.proof_of_possession,
+                &after.bls_public_key,
+                &new_addr
+            )
+            .is_ok(),
+            "new PoP must verify for the new execution address"
+        );
+        assert!(
+            verify_proof_of_possession_bls(
+                &after.proof_of_possession,
+                &after.bls_public_key,
+                &Address::ZERO
+            )
+            .is_err(),
+            "new PoP must NOT verify for the old execution address"
+        );
+    }
+
+    /// `generate pop` errors clearly when keys / node-info are missing, rather
+    /// than panicking or silently creating new keys, and the hint points the
+    /// operator at key generation.
+    #[tokio::test]
+    async fn test_generate_pop_missing_keys_errors() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        let err = PopArgs { address: new_test_address() }
+            .execute(&datadir, None)
+            .expect_err("generate pop must error when keys are missing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("generate keys first"),
+            "missing-keys hint should tell the operator to generate keys first, got: {msg}"
+        );
+    }
+
+    /// `--name` is recorded verbatim in node-info.yaml; without it the name falls
+    /// back to the deterministic `node-<bs58>` form derived from the BLS key.
+    #[tokio::test]
+    async fn test_generate_validator_custom_name() {
+        // Explicit `--name`, exercised through the full CLI parse + run path.
+        let named_dir = tempfile::TempDir::new().expect("tempdir created");
+        let named_path = named_dir.path();
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--datadir",
+            named_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+            "--name",
+            "my-node",
+        ])
+        .expect("cli parsed");
+        tn.run(None, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+            .expect("generate keys command");
+
+        let named = Config::load_from_path::<NodeInfo>(
+            named_path.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("named node info loaded");
+        assert_eq!(named.name, "my-node", "explicit --name must be recorded verbatim");
+
+        // No `--name`: derived fallback. Call `execute` directly rather than a
+        // second `run` to avoid re-initializing global tracing within one test.
+        let derived_dir = tempfile::TempDir::new().expect("tempdir created");
+        let derived_path = derived_dir.path().to_path_buf();
+        keygen_args(None).execute(&derived_path, None).expect("generate keys (no name)");
+
+        let derived = Config::load_from_path::<NodeInfo>(
+            derived_path.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("derived node info loaded");
+        assert!(
+            derived.name.starts_with("node-"),
+            "without --name the node name should derive from the BLS key, got: {}",
+            derived.name
+        );
+    }
+
+    /// `generate validator --rpc-http .. --rpc-ws ..` writes the worker RPC
+    /// descriptor into `node-info.yaml` alongside the freshly minted identity:
+    /// the primary RPC stays unset and the BLS key, name, and execution address
+    /// are all populated (the late `worker.rpc` assignment does not clobber them).
+    #[tokio::test]
+    async fn test_generate_sets_worker_rpc() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
+        KeygenArgs {
+            address: new_test_address(),
+            rpc_http: Some(http.clone()),
+            rpc_ws: Some(ws.clone()),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)
+        .expect("generate keys with rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+
+        // worker rpc is exactly what we passed in.
+        assert_eq!(
+            node_info.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc,
+            Some(RpcInfo { http, ws: Some(ws) }),
+            "worker rpc should match the provided endpoints"
+        );
+        // the primary's rpc is never touched (the runtime never reads it).
+        assert!(node_info.p2p_info.primary.rpc.is_none(), "primary rpc must stay unset");
+        // identity fields are populated by fresh generation and survive the rpc assignment.
+        assert_ne!(
+            node_info.bls_public_key,
+            BlsPublicKey::default(),
+            "BLS public key must be populated"
+        );
+        assert!(
+            node_info.name.starts_with("node-"),
+            "node name must be derived from the BLS key, got: {}",
+            node_info.name
+        );
+        assert_eq!(
+            node_info.execution_address,
+            new_test_address(),
+            "execution address must be the one passed to generate"
+        );
+    }
+
+    /// `generate validator` without the RPC flags leaves the worker RPC descriptor
+    /// unset - the pre-flag default, so existing generation flows are unchanged.
+    #[tokio::test]
+    async fn test_generate_without_rpc_leaves_unset() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys without rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+        assert!(
+            node_info.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "worker rpc should stay unset without --rpc-http"
+        );
+    }
+
+    /// `generate validator` validates the worker RPC endpoint *before* minting
+    /// keys: a non-http(s) scheme is rejected and no `node-info.yaml` is written,
+    /// proving the fail-fast ordering (a typo does not leave keys on disk).
+    #[tokio::test]
+    async fn test_generate_rejects_bad_rpc_scheme() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
+        let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
+        let err = KeygenArgs { rpc_http: Some(http), rpc_ws: None, ..keygen_args(None) }
+            .execute(&datadir, None)
+            .expect_err("generate must reject a non-http(s) scheme");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid worker rpc endpoint"),
+            "error should wrap the validation failure, got: {msg}"
+        );
+
+        // fail-fast: validation runs before any keys / node-info are written.
+        assert!(
+            !datadir.join("node-info.yaml").exists(),
+            "no node-info.yaml should be written when the rpc endpoint is rejected"
+        );
+    }
+
+    /// The `generate validator` RPC flags are wired into clap under the namespaced
+    /// `--rpc-http` / `--rpc-ws` names: both parse together, `--rpc-ws` requires
+    /// `--rpc-http`, and the un-namespaced `--http` (set-rpc's name) is rejected
+    /// here - confirming the deliberate per-command rename.
+    #[test]
+    fn test_generate_rpc_cli_parses() {
+        // both rpc endpoints parse together.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-http",
+                "https://validator.example.com:8545/",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_ok(),
+            "`generate validator --rpc-http .. --rpc-ws ..` should parse"
+        );
+
+        // `--rpc-ws` without `--rpc-http` errors (requires), so a ws endpoint is
+        // never silently dropped for lack of an http endpoint.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_err(),
+            "`--rpc-ws` without `--rpc-http` should error"
+        );
+
+        // the un-namespaced set-rpc name is not accepted by `generate` (confirms the rename).
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--http",
+                "https://validator.example.com:8545/",
+            ])
+            .is_err(),
+            "bare `--http` should be rejected by `generate` (it uses `--rpc-http`)"
+        );
+    }
+
+    /// `generate pop` refuses to run when node-info.yaml records a BLS public key
+    /// that does not match the keys on disk (wrong datadir / mixed-up files),
+    /// rather than silently rewriting the recorded identity.
+    #[tokio::test]
+    async fn test_generate_pop_key_mismatch_errors() {
+        // Two independent nodes, each with a cleartext keyfile (passphrase None).
+        let dir1 = tempfile::TempDir::new().expect("tempdir created");
+        let path1 = dir1.path().to_path_buf();
+        keygen_args(None).execute(&path1, None).expect("generate keys dir1");
+
+        let dir2 = tempfile::TempDir::new().expect("tempdir created");
+        let path2 = dir2.path().to_path_buf();
+        keygen_args(None).execute(&path2, None).expect("generate keys dir2");
+
+        let info1_path = path1.join("node-info.yaml");
+        let mut info1 = Config::load_from_path::<NodeInfo>(&info1_path, ConfigFmt::YAML)
+            .expect("node info dir1 loaded");
+        let info2 = Config::load_from_path::<NodeInfo>(
+            path2.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info dir2 loaded");
+
+        // Point dir1's node-info at dir2's BLS key: the recorded identity no
+        // longer matches the keys stored under dir1.
+        assert_ne!(
+            info1.bls_public_key, info2.bls_public_key,
+            "independently generated nodes must have distinct BLS keys"
+        );
+        info1.bls_public_key = info2.bls_public_key;
+        Config::write_to_path(&info1_path, &info1, ConfigFmt::YAML)
+            .expect("rewrite dir1 node-info");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path1, None)
+            .expect_err("generate pop must error on BLS key mismatch");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mismatch"), "error should report the BLS key mismatch, got: {msg}");
+    }
+
+    /// When the BLS keys exist but cannot be decrypted (wrong passphrase),
+    /// `generate pop` hints at the passphrase rather than telling the operator to
+    /// generate keys (which would be wrong and destructive).
+    #[tokio::test]
+    async fn test_generate_pop_wrong_passphrase_hint() {
+        // Generate an encrypted keyfile (bls.kw) with the correct passphrase.
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None)
+            .execute(&path, Some("correct".to_string()))
+            .expect("generate keys with passphrase");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, Some("wrong".to_string()))
+            .expect_err("generate pop must error on a wrong passphrase");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("passphrase"), "hint should mention the passphrase, got: {msg}");
+        assert!(
+            !msg.contains("generate keys first"),
+            "a wrong passphrase must not tell the operator to generate keys, got: {msg}"
+        );
+    }
+
+    /// The `generate pop` subcommand and its `proof-of-possession` alias are
+    /// wired into clap.
+    #[test]
+    fn test_generate_pop_cli_parses() {
+        for name in ["pop", "proof-of-possession"] {
+            let parsed = Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                name,
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+            ]);
+            assert!(parsed.is_ok(), "`generate {name}` should parse");
+        }
+    }
+
+    /// `set-rpc --http .. --ws ..` writes the worker RPC descriptor into
+    /// `node-info.yaml` and touches nothing else: the primary RPC stays unset and
+    /// the node identity (BLS key, name, execution address) is unchanged.
+    #[tokio::test]
+    async fn test_set_rpc_sets_worker_rpc() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+
+        let node_info_path = datadir.join("node-info.yaml");
+        let before = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded before set-rpc");
+        // the worker starts with no advertised rpc.
+        assert!(
+            before.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "worker rpc should start unset"
+        );
+
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
+        set_rpc_args(&["--http", http.as_str(), "--ws", ws.as_str()])?
+            .execute(&datadir)
+            .expect("set-rpc sets worker rpc");
+
+        let after = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after set-rpc");
+
+        // worker rpc is exactly what we passed in.
+        assert_eq!(
+            after.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc,
+            Some(RpcInfo { http, ws: Some(ws) }),
+            "worker rpc should match the provided endpoints"
+        );
+        // the primary's rpc is never touched (the runtime never reads it).
+        assert!(after.p2p_info.primary.rpc.is_none(), "primary rpc must stay unset");
+        // identity fields are untouched - this is a config-only edit.
+        assert_eq!(before.bls_public_key, after.bls_public_key, "BLS public key must not change");
+        assert_eq!(before.name, after.name, "node name must not change");
+        assert_eq!(
+            before.execution_address, after.execution_address,
+            "execution address must not change"
+        );
+        Ok(())
+    }
+
+    /// `set-rpc --clear` removes a previously-set worker RPC descriptor.
+    #[tokio::test]
+    async fn test_set_rpc_clear() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+        let node_info_path = datadir.join("node-info.yaml");
+
+        // set, then clear.
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        set_rpc_args(&["--http", http.as_str()])?
+            .execute(&datadir)
+            .expect("set-rpc sets worker rpc");
+        let set = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after set");
+        assert!(
+            set.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_some(),
+            "worker rpc should be set before clearing"
+        );
+
+        set_rpc_args(&["--clear"])?.execute(&datadir)?;
+        let cleared = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after clear");
+        assert!(
+            cleared.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "worker rpc should be cleared"
+        );
+        Ok(())
+    }
+
+    /// `set-rpc` errors with a "generate keys first" hint when `node-info.yaml`
+    /// is missing, rather than creating a fresh node-info with default identity.
+    #[tokio::test]
+    async fn test_set_rpc_missing_node_info_errors() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let err = set_rpc_args(&["--http", http.as_str()])?
+            .execute(&datadir)
+            .expect_err("set-rpc must error when node-info.yaml is missing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("generate keys first"),
+            "missing node-info hint should tell the operator to generate keys first, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// `set-rpc` applies the same scheme validation node startup runs: a non-http
+    /// scheme parses as a URL but is rejected, and nothing is persisted.
+    #[tokio::test]
+    async fn test_set_rpc_rejects_bad_scheme() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+
+        // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
+        let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
+        let err = set_rpc_args(&["--http", http.as_str()])?
+            .execute(&datadir)
+            .expect_err("set-rpc must reject a non-http(s) scheme");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid worker rpc endpoint"),
+            "error should wrap the validation failure, got: {msg}"
+        );
+
+        // the rejected endpoint must not have been written.
+        let after = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info still loads");
+        assert!(
+            after.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "rejected endpoint must not be persisted"
+        );
+        Ok(())
+    }
+
+    /// Setting and clearing worker 1 preserves worker 0's endpoint and the rest of node-info.
+    #[tokio::test]
+    async fn test_set_rpc_selects_worker_and_preserves_other_records() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        KeygenArgs {
+            workers: 2,
+            rpc_http: Some("https://worker-0.example.com/".parse()?),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)?;
+        let path = datadir.join("node-info.yaml");
+        let mut expected: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        let http: Url = "https://worker-1.example.com/".parse()?;
+        let ws: Url = "wss://worker-1.example.com/".parse()?;
+        set_rpc_args(&["--worker-id", "1", "--http", http.as_str(), "--ws", ws.as_str()])?
+            .execute(&datadir)?;
+        expected
+            .p2p_info
+            .worker_mut(1)
+            .ok_or_else(|| eyre::eyre!("missing generated worker 1"))?
+            .rpc = Some(RpcInfo { http, ws: Some(ws) });
+        let after: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        assert_eq!(serde_json::to_value(&after)?, serde_json::to_value(&expected)?);
+
+        set_rpc_args(&["--worker-id", "1", "--clear"])?.execute(&datadir)?;
+        expected
+            .p2p_info
+            .worker_mut(1)
+            .ok_or_else(|| eyre::eyre!("missing generated worker 1"))?
+            .rpc = None;
+        let cleared: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
+        assert_eq!(serde_json::to_value(&cleared)?, serde_json::to_value(&expected)?);
+        Ok(())
+    }
+
+    /// A nonexistent worker errors without changing the file, for both set and clear.
+    #[tokio::test]
+    async fn test_set_rpc_rejects_missing_worker_without_writing() -> eyre::Result<()> {
+        let tempdir = tempfile::TempDir::new()?;
+        let datadir = tempdir.path().to_path_buf();
+        KeygenArgs { workers: 2, ..keygen_args(None) }.execute(&datadir, None)?;
+        let path = datadir.join("node-info.yaml");
+        let before = std::fs::read(&path)?;
+        ["2", "65535"].into_iter().try_for_each(|worker_id| -> eyre::Result<()> {
+            [vec!["--http", "https://worker.example.com/"], vec!["--clear"]]
+                .into_iter()
+                .try_for_each(|arguments| -> eyre::Result<()> {
+                    let arguments: Vec<_> =
+                        ["--worker-id", worker_id].into_iter().chain(arguments).collect();
+                    let error = set_rpc_args(&arguments)?
+                        .execute(&datadir)
+                        .err()
+                        .ok_or_else(|| eyre::eyre!("missing worker must fail"))?;
+                    assert!(error.to_string().contains(&format!("has no worker {worker_id}")));
+                    assert_eq!(std::fs::read(&path)?, before);
+                    Ok(())
+                })
+        })?;
+        assert!(set_rpc_args(&["--worker-id", "65536", "--clear"]).is_err());
+        Ok(())
+    }
+
+    /// The `set-rpc` clap relations: `--http` is required unless `--clear`, and
+    /// `--http`/`--ws` conflict with `--clear`.
+    #[test]
+    fn test_set_rpc_parse() {
+        // set with both endpoints parses.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "set-rpc",
+                "--http",
+                "https://validator.example.com:8545/",
+                "--ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_ok(),
+            "`set-rpc --http .. --ws ..` should parse"
+        );
+
+        // clear parses on its own.
+        assert!(
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc", "--clear"])
+                .is_ok(),
+            "`set-rpc --clear` should parse"
+        );
+
+        // bare set-rpc errors: --http is required unless --clear.
+        assert!(
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc"]).is_err(),
+            "`set-rpc` with no flags should error (http required)"
+        );
+
+        // --clear and --http conflict.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "set-rpc",
+                "--clear",
+                "--http",
+                "https://validator.example.com:8545/",
+            ])
+            .is_err(),
+            "`set-rpc --clear --http ..` should error (conflict)"
+        );
+    }
+
+    /// The binary's passphrase gate keys off `KeyArgs::needs_passphrase`. A
+    /// config-only edit (`set-rpc`) must not require the BLS passphrase, while a
+    /// key-touching subcommand (`generate pop`) must.
+    #[test]
+    fn test_set_rpc_needs_no_passphrase() {
+        use crate::cli::Commands;
+
+        // set-rpc only edits public config: no passphrase required.
+        let cli =
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc", "--clear"])
+                .expect("set-rpc --clear parses");
+        match cli.command {
+            Commands::Keytool(keytool) => {
+                assert!(!keytool.needs_passphrase(), "set-rpc must not require the BLS passphrase")
+            }
+            _ => panic!("expected a keytool command"),
+        }
+
+        // generate pop decrypts the existing BLS key: passphrase required.
+        let cli = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "pop",
+            "--address",
+            "0",
+        ])
+        .expect("generate pop parses");
+        match cli.command {
+            Commands::Keytool(keytool) => {
+                assert!(keytool.needs_passphrase(), "generate pop must require the BLS passphrase")
+            }
+            _ => panic!("expected a keytool command"),
+        }
     }
 }

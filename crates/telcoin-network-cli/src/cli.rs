@@ -1,6 +1,6 @@
 //! CLI definition and entrypoint to executable
 use crate::{
-    genesis, keytool, node,
+    db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
 use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
-use tn_reth::{dirs::DEFAULT_ROOT_DIR, LogArgs};
+use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_reth_defaults, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
 use tracing::info_span;
 
@@ -72,23 +72,30 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
     pub logs: LogArgs,
 }
 
-impl Cli {
+impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// Parsers only the default CLI arguments
+    ///
+    /// Seeds reth's process-global defaults first: the clap default for
+    /// `--txpool.max-account-slots` is resolved while the command is built, so seeding after the
+    /// parse would be too late. Prefer this over [`clap::Parser::parse`] for that reason, and note
+    /// that it is generic over `Ext` so an extended binary gets the same defaults as `tn` itself.
     pub fn parse_args() -> Self {
+        init_reth_defaults();
         Self::parse()
     }
 
     /// Parsers only the default CLI arguments from the given iterator
+    ///
+    /// Seeds reth's process-global defaults first, for the same reason as [`Self::parse_args`].
     pub fn try_parse_args_from<I, T>(itr: I) -> Result<Self, clap::error::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        Cli::try_parse_from(itr)
+        init_reth_defaults();
+        Self::try_parse_from(itr)
     }
-}
 
-impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// Execute the configured cli command.
     ///
     /// This accepts a closure that is used to launch the node via the
@@ -100,24 +107,30 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// Parse additional CLI arguments for the node command and use it to configure the node.
     ///
     /// ```no_run
-    /// use clap::Parser;
-    /// use telcoin_network_cli::cli::Cli;
+    /// use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env};
     /// use tn_node::launch_node;
     ///
-    /// #[derive(Debug, Parser)]
+    /// /// Extra CLI args flattened into the `node` subcommand.
+    /// #[derive(Debug, clap::Args)]
     /// pub struct MyArgs {
+    ///     /// Example flag consumed by your ExEx.
+    ///     #[arg(long)]
     ///     pub enable: bool,
     /// }
     ///
-    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse().run(
-    ///     None,
-    ///     |builder, _, tn_datadir, passphrase, version| {
-    ///         launch_node(builder, tn_datadir, passphrase, version)
-    ///     },
-    /// ) {
-    ///     eprintln!("Error: {err:?}");
-    ///     std::process::exit(1);
-    /// }
+    /// // 1. Read (and clear) TN_BLS_PASSPHRASE before any threads exist.
+    /// let preloaded = get_bls_passphrase_from_env();
+    /// // `parse_args` rather than `clap::Parser::parse`: it seeds reth's transaction pool
+    /// // defaults, which must happen before the clap command resolves its own defaults.
+    /// let cli = Cli::<MyArgs>::parse_args();
+    /// // 2. Resolve the passphrase for the parsed subcommand.
+    /// let passphrase = cli.resolve_bls_passphrase(preloaded)?;
+    /// // 3. Run, installing ExExes on the builder before launching the node.
+    /// cli.run(passphrase, |mut builder, _args, tn_datadir, key_config, version| {
+    ///     builder.install_exex("my-exex", |_ctx| async move { Ok(()) });
+    ///     launch_node(builder, tn_datadir, key_config, version)
+    /// })?;
+    /// # Ok::<(), eyre::Report>(())
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
@@ -132,6 +145,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         self.logs.log_file_directory = self.logs.log_file_directory.join("telcoin-network-logs");
 
         match self.command {
+            Commands::Db(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir)
+            }
             Commands::Genesis(command) => {
                 let _guard = self.logs.init_tracing()?;
                 command.execute(datadir)
@@ -152,8 +169,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                         format!("{}-{}", name, key_config.primary_public_key().to_short_string())
                     } else if let Some(instance) = command.instance {
                         format!(
-                            "{}-{}-{}",
-                            if command.observer { "observer" } else { "node" },
+                            "node-{}-{}",
                             instance,
                             key_config.primary_public_key().to_short_string()
                         )
@@ -189,6 +205,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 /// Commands to be executed
 #[derive(Debug, Subcommand)]
 pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
+    /// Inspect and diagnose the execution database.
+    #[command(name = "db")]
+    Db(db::DbCommand),
+
     /// Genesis ceremony for starting the network.
     #[command(name = "genesis")]
     Genesis(Box<genesis::GenesisArgs>),
@@ -196,7 +216,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Key management.
     /// Generate or read keys for node management.
     #[command(name = "keytool")]
-    Keytool(keytool::KeyArgs),
+    Keytool(Box<keytool::KeyArgs>),
 
     /// Start the node
     #[command(name = "node")]
@@ -212,8 +232,13 @@ mod tests {
 
     #[test]
     fn parse_color_mode() {
-        let tn = Cli::try_parse_args_from(["tn", "node", "--color", "always"]).unwrap();
+        let tn = Cli::<NoArgs>::try_parse_args_from(["tn", "node", "--color", "always"]).unwrap();
         assert_eq!(tn.logs.color, ColorMode::Always);
+    }
+
+    #[test]
+    fn parse_db_stats_subcommand() {
+        let _ = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "stats"]).expect("cli parsed");
     }
 
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured
@@ -223,7 +248,7 @@ mod tests {
     fn test_parse_help_all_subcommands() {
         let tn = Cli::<NoArgs>::command();
         for sub_command in tn.get_subcommands() {
-            let err = Cli::try_parse_args_from(["tn", sub_command.get_name(), "--help"])
+            let err = Cli::<NoArgs>::try_parse_args_from(["tn", sub_command.get_name(), "--help"])
                 .err()
                 .unwrap_or_else(|| {
                     panic!("Failed to parse help message {}", sub_command.get_name())
@@ -238,7 +263,7 @@ mod tests {
     /// Tests that the log directory is parsed correctly.
     #[test]
     fn parse_logs_path() {
-        let tn = Cli::try_parse_args_from(["tn", "node"]).unwrap();
+        let tn = Cli::<NoArgs>::try_parse_args_from(["tn", "node"]).unwrap();
         let log_dir = tn.logs.log_file_directory;
 
         // let end = format!("{}/logs", DEFAULT_ROOT_DIR);
@@ -272,7 +297,7 @@ mod tests {
         // Create config files or the run() below will fail.
         Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
         std::env::set_var("RUST_LOG", "info,evm=debug");
-        let tn = Cli::try_parse_args_from([
+        let tn = Cli::<NoArgs>::try_parse_args_from([
             "tn",
             "node",
             "--datadir",

@@ -4,7 +4,6 @@
 use futures::future::join_all;
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::Arc,
     time::Instant,
 };
 use tempfile::TempDir;
@@ -116,23 +115,28 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         .await
         .unwrap();
 
-    // AND we add some commits without any final scores
-    for sequence_number in 0..10 {
+    // AND we add some commits without any final scores. Numbering starts at 1: a fresh chain's
+    // latest consensus number is 0 and `save_consensus_output` hard-rejects any number that
+    // does not strictly advance it (number 0 used to be silently dropped).
+    for sequence_number in 1..10 {
         let cert = Certificate::default();
-        let sub_dag = Arc::new(CommittedSubDag::new(
+        let sub_dag = CommittedSubDag::new(
             vec![cert.clone()],
             cert,
             sequence_number,
             ReputationScores::new(&committee),
             None,
-        ));
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 12 should be returned
-    let commit =
-        consensus_chain.read_latest_commit_with_final_reputation_scores(committee.epoch()).await;
+    let commit = consensus_chain
+        .read_latest_commit_with_final_reputation_scores(committee.epoch())
+        .await
+        .unwrap();
 
     // THEN no commit is returned
     assert!(commit.is_none());
@@ -147,8 +151,14 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         }
 
         let cert = Certificate::default();
-        let sub_dag =
-            Arc::new(CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None));
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            sequence_number,
+            scores,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
@@ -157,9 +167,10 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
     let commit = consensus_chain
         .read_latest_commit_with_final_reputation_scores(committee.epoch())
         .await
+        .unwrap()
         .unwrap();
 
-    assert!(commit.reputation_score.final_of_schedule);
+    assert!(commit.reputation_scores().final_of_schedule);
 }
 
 #[tokio::test]
@@ -275,7 +286,7 @@ async fn test_certificate_store_last_two_rounds() {
 
     // store them in both main and secondary index
     store.write_all(certs.iter()).unwrap();
-    store.persist::<CertificateDigestByRound>().await;
+    store.persist::<CertificateDigestByRound>().await.expect("persist");
 
     // WHEN
     let result = store.last_two_rounds_certs().unwrap();
@@ -335,7 +346,7 @@ async fn test_certificate_store_after_round() {
 
     // store them in both main and secondary index
     store.write_all(certs.iter()).unwrap();
-    store.persist::<CertificateDigestByRound>().await; // Let the writes settle
+    store.persist::<CertificateDigestByRound>().await.expect("persist"); // Let the writes settle
 
     tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
 
@@ -483,7 +494,7 @@ async fn test_certificate_store_delete_store() {
 
     store.delete(to_delete[0]).unwrap();
     store.delete(to_delete[1]).unwrap();
-    store.persist::<Certificates>().await; // Make sure the deletes are complete...
+    store.persist::<Certificates>().await.expect("persist"); // Make sure the deletes are complete...
 
     // THEN
     assert!(store.read(to_delete[0]).unwrap().is_none());

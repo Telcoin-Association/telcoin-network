@@ -1,6 +1,6 @@
 //! Wait for a quorum of acks from workers before sharing with the primary.
 
-use crate::network::WorkerNetworkHandle;
+use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{
     sync::Arc,
@@ -48,6 +48,8 @@ struct QuorumWaiterInner {
     committee: Committee,
     /// A network sender to broadcast the batches to the other workers.
     network: WorkerNetworkHandle,
+    /// Prometheus metrics for quorum attempts.
+    metrics: WorkerMetrics,
 }
 
 /// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
@@ -58,20 +60,33 @@ pub struct QuorumWaiter {
 
 impl QuorumWaiter {
     /// Create a new QuorumWaiter.
-    pub fn new(authority: Authority, committee: Committee, network: WorkerNetworkHandle) -> Self {
-        Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network }) }
+    pub fn new(
+        authority: Authority,
+        committee: Committee,
+        network: WorkerNetworkHandle,
+        metrics: WorkerMetrics,
+    ) -> Self {
+        Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network, metrics }) }
     }
 
     /// Report a batch to a single peer with retry-and-backoff for transient network errors.
     ///
     /// - `Ok(deliver)` — peer accepted the batch
-    /// - `Err(Rejected)` — peer explicitly rejected (RPCError), no retry
+    /// - `Err(Rejected)` — peer explicitly rejected ([`NetworkError::RPCError`]), no retry
     /// - `Err(Network)` — all retry attempts exhausted
+    ///
+    /// Transient errors are retried with exponential backoff before resolving to
+    /// `Err(Network)`. This includes transport failures and a responder's
+    /// [`NetworkError::RPCRetryable`], the recoverable counterpart of
+    /// `RPCError`: a one-off responder-side condition (a momentary batch-store
+    /// write failure, channel pressure during an epoch transition) must land on
+    /// the retry path, not the no-retry rejection path.
     async fn waiter(
         bls: BlsPublicKey,
         network: WorkerNetworkHandle,
         sealed_batch: SealedBatch,
         deliver: VotingPower,
+        metrics: WorkerMetrics,
     ) -> Result<VotingPower, WaiterError> {
         for attempt in 0..MAX_BATCH_REPORT_ATTEMPTS {
             match network.report_batch(bls, sealed_batch.clone()).await {
@@ -91,6 +106,7 @@ impl QuorumWaiter {
                         "Network error, peer {bls}: {err:?}, retrying..."
                     );
                     if attempt + 1 < MAX_BATCH_REPORT_ATTEMPTS {
+                        metrics.record_batch_report_retry();
                         tokio::time::sleep(BATCH_REPORT_RETRY_BACKOFF * 2u32.pow(attempt)).await;
                     }
                 }
@@ -112,6 +128,8 @@ impl QuorumWaiterTrait for QuorumWaiter {
         let (tx, rx) = oneshot::channel();
         let spawner_clone = task_spawner.clone();
         task_spawner.spawn_task(task_name, async move {
+            let metrics = inner.metrics.clone();
+            let quorum_start = Instant::now();
             let timeout_res = tokio::time::timeout(timeout, async move {
                 let start_time = Instant::now();
                 // Broadcast the batch to the other workers.
@@ -133,8 +151,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     let (tx, rx) = oneshot::channel();
                     let network = inner.network.clone();
                     let batch = sealed_batch.clone();
+                    let peer_metrics = inner.metrics.clone();
                     spawner_clone.spawn_task(format!("qw-peer-{i}"), async move {
-                        let res = Self::waiter(name, network, batch, stake).await;
+                        let res = Self::waiter(name, network, batch, stake, peer_metrics).await;
                         let _ = tx.send(res);
                         Ok(())
                     });
@@ -226,13 +245,15 @@ impl QuorumWaiterTrait for QuorumWaiter {
             })
             .await;
 
-            let res = match timeout_res {
-                Ok(res) => match res {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(e),
-                },
-                Err(_elapsed) => Err(QuorumWaiterError::Timeout),
-            };
+            // collapse the timeout outcome into the quorum result: an elapsed
+            // timeout becomes `Timeout`, otherwise flatten to the inner result.
+            let res = timeout_res.map_err(|_elapsed| QuorumWaiterError::Timeout).flatten();
+
+            // success or failure, this measures broadcast + quorum latency
+            metrics.record_quorum_wait(quorum_start.elapsed());
+            if let Err(e) = &res {
+                metrics.record_quorum_failure(e);
+            }
 
             // forward result
             let _ = tx.send(res.clone());

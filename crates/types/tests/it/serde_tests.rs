@@ -72,8 +72,14 @@ fn test_committed_subdag_serde_roundtrip() {
     let leader = certificates.last().cloned().unwrap();
     let reputation = ReputationScores::new(&committee);
 
-    let original_subdag =
-        CommittedSubDag::new(certificates.clone(), leader.clone(), 1, reputation, None);
+    let original_subdag = CommittedSubDag::new(
+        certificates.clone(),
+        leader.clone(),
+        1,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     // Serialize
     let bytes = encode(&original_subdag);
@@ -83,9 +89,9 @@ fn test_committed_subdag_serde_roundtrip() {
 
     // Compare leader and certificates
     assert_eq!(original_subdag.leader().digest(), recovered_subdag.leader().digest());
-    assert_eq!(original_subdag.headers.len(), recovered_subdag.headers.len());
+    assert_eq!(original_subdag.headers().len(), recovered_subdag.headers().len());
 
-    for (orig, recov) in original_subdag.headers.iter().zip(recovered_subdag.headers.iter()) {
+    for (orig, recov) in original_subdag.headers().iter().zip(recovered_subdag.headers().iter()) {
         assert_eq!(orig.digest(), recov.digest());
     }
 }

@@ -1,0 +1,1136 @@
+//! Epoch teardown.
+//!
+//! The methods here form the closing half of [`EpochManager`]'s per-epoch
+//! lifecycle. `run_epoch` (in the sibling `run_epoch` module) calls them in
+//! sequence once an epoch ends, whether that end was a clean epoch boundary or
+//! an early exit.
+//!
+//! Teardown recovers our own batches that never reached consensus — orphaned by
+//! the epoch change or a restart — back into the mempool so their transactions
+//! are not lost. On a non-boundary exit it also drains any consensus output that
+//! was committed but not yet forwarded, sending it to the engine to avoid
+//! orphaning finalized blocks. It then writes the finalized [`EpochRecord`] for
+//! the just-closed epoch and clears the epoch-scoped consensus DB tables so the
+//! next epoch starts from a clean slate. Historic data survives in the
+//! `ConsensusChain` store; only the per-epoch working tables are cleared.
+
+use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
+use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
+use eyre::eyre;
+use std::{collections::BTreeSet, path::Path, time::Duration};
+use tn_config::TelcoinDirs;
+use tn_reth::{recover_raw_transaction, RethEnv};
+use tn_storage::{
+    consensus_pack::DATA_NAME,
+    tables::{
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+        NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+    },
+};
+use tn_types::{
+    deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
+    SealedHeader, TaskManager, TnReceiver,
+};
+use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, info_span, warn, Instrument};
+
+/// Bounded wait for the just-closed epoch's certificate during state export.
+///
+/// Epoch N's certificate is only aggregated at epoch N+1's start, so it is typically absent the
+/// moment N closes. The completion task waits up to this long for the collector to produce it
+/// before failing the export (this epoch's export is abandoned — it is never retried, but future
+/// epochs are still exported). Generous on purpose: the export's full plain-state walk has already
+/// elapsed by the time this wait begins, so the cert is normally present immediately.
+const CERT_WAIT: Duration = Duration::from_secs(90);
+
+/// True iff `name` is exactly the temp-dir name the export path writes for some epoch, i.e.
+/// `epoch-{N}.tmp` where `{N}` is a canonical (no sign, no leading zeros) [`Epoch`] rendering.
+/// [`sweep_stale_tmp_exports`] deletes only matches; anything else in the exports root was not
+/// written by the exporter and is not ours to remove.
+fn is_stale_tmp_export_name(name: &str) -> bool {
+    name.strip_prefix("epoch-").and_then(|rest| rest.strip_suffix(".tmp")).is_some_and(|digits| {
+        digits.parse::<Epoch>().is_ok_and(|epoch| epoch.to_string() == digits)
+    })
+}
+
+/// Remove every `epoch-{N}.tmp` directory under the exports root: orphaned temp export dirs left
+/// by a crashed or interrupted prior run. That exact shape is the only temp the export path ever
+/// writes, so nothing else is swept: final `epoch-{N}` dirs have no `.tmp` suffix, and stray
+/// entries (operator files or dirs that merely end in `.tmp`) never match. Called ONCE at node
+/// startup, where it is safe because no export is in flight; the per-boundary path deliberately
+/// clears only its own epoch's temp so it can never delete another epoch's still-in-flight export
+/// working dir.
+///
+/// Best-effort: a missing exports root or a removal failure is logged at warn and otherwise
+/// ignored, since a failure here must never crash the node.
+pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
+    let entries = match std::fs::read_dir(export_root) {
+        Ok(entries) => entries,
+        // No exports directory yet (nothing exported) — nothing to sweep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(target: "tn::snapshot", path = ?export_root, error = %e, "could not read state-exports dir to sweep stale temps");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Exactly `epoch-{N}.tmp`, and a directory: the one shape the export path writes (final
+        // dirs are `epoch-{N}` with no `.tmp` suffix, so they never match). The directory check
+        // also keeps stray `*.tmp` regular files off the `remove_dir_all` failure path, which
+        // would otherwise warn on every export-enabled startup without ever removing them.
+        let is_stale_tmp_export =
+            path.file_name().and_then(|name| name.to_str()).is_some_and(is_stale_tmp_export_name)
+                && entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if is_stale_tmp_export {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                warn!(target: "tn::snapshot", path = ?path, error = %e, "failed to remove stale temp export dir");
+            }
+        }
+    }
+}
+
+/// Best-effort removal of an export temp dir, logging at warn on failure so a leftover temp is
+/// observable (the next startup's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
+/// `let _ = remove_dir_all(..)` cleanups on the export completion task's failure/skip paths.
+///
+/// Runs the removal on tokio's blocking pool: a partially-written export can be arbitrarily large
+/// (most of a finished state walk plus the copied consensus pack), so an inline `remove_dir_all`
+/// would pin a runtime worker thread. A cancelled/panicked blocking task surfaces through the same
+/// warn path as an IO failure.
+async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
+    let dir = tmp_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
+        .await
+        .map_err(std::io::Error::other)
+        .flatten()
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(target: "tn::snapshot", epoch, path = ?tmp_dir, error = %e, "failed to remove temp export dir");
+        }
+    }
+}
+
+/// Hand every transaction in `batch` back to its worker's mempool.
+///
+/// This is the CVV recovery shape: the pool feeds the batch builder, so the transactions
+/// re-enter the normal build/seal/retry loop instead of being dropped. A transaction whose
+/// bytes no longer recover, or that the pool refuses, is dropped exactly as before: at epoch
+/// close there is no better destination for it.
+async fn repool_batch_txns(pools: &[tn_reth::WorkerTxPool], batch: &tn_types::Batch) {
+    use futures::StreamExt as _;
+    let pool = pools.get(usize::from(batch.worker_id));
+    futures::stream::iter(batch.transactions())
+        .filter_map(|tx_bytes| async move { recover_raw_transaction(tx_bytes).ok() })
+        .for_each(|recovered| async {
+            let _ = futures::future::OptionFuture::from(
+                pool.map(|pool| pool.add_recovered_transaction_external(recovered)),
+            )
+            .await;
+        })
+        .await;
+}
+
+impl<P, DB> EpochManager<P, DB>
+where
+    P: TelcoinDirs + Clone + 'static,
+    DB: TNDatabase,
+{
+    /// Recover our own batches that never reached the consensus chain.
+    ///
+    /// Batches get orphaned when the epoch changes — or the node restarts —
+    /// before they are included in a certificate. Their transactions would be
+    /// lost otherwise, so we reintroduce them. An active CVV re-injects each
+    /// transaction into its worker's mempool to be repackaged next epoch; a
+    /// non-CVV disburses each batch through the worker identified by its batch header.
+    ///
+    /// [`OurNodeBatchesCache`] is read and then immediately cleared: the cached
+    /// batches are now defunct since their contents are back in flight. Recovery
+    /// runs as a spawned task on the epoch [`TaskManager`] so it does not block
+    /// the rest of teardown.
+    pub(super) async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
+        &mut self,
+        epoch_task_manager: &TaskManager,
+        engine: ExecutionNode,
+        workers: Vec<Worker<DB, QuorumWaiter>>,
+        epoch: Epoch,
+    ) -> eyre::Result<()> {
+        // Collect any batches from this epoch that never made it to the consensus chain.
+        let mut orphan_batches: Vec<(BlockHash, Batch)> =
+            // Any batches in this table were created by us but never made it to consensus.
+            self.consensus_db.iter::<OurNodeBatchesCache>().collect();
+        // We have what we need so clear our Batch cache now.
+        // We are reintroducing the transactions so these batches are now defunct.
+        self.consensus_db.clear_table::<OurNodeBatchesCache>()?;
+        if !orphan_batches.is_empty() {
+            let consensus_bus = self.consensus_bus.clone();
+            let span =
+                info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
+            span.record("epoch", epoch.to_string());
+            epoch_task_manager.spawn_task("Orphaned Batches", async move {
+                info!(target: "epoch-manager", "Re-introducing orphaned batches {} transactions", orphan_batches.len());
+                let pools = engine.get_all_worker_transaction_pools().await;
+                let is_cvv = consensus_bus.is_active_cvv();
+                for (digest, batch) in orphan_batches.drain(..) {
+                    // Loop through any orphaned batches and resubmit it's transactions.
+                    // This is most likely because of epoch changes but could be caused by a restart as
+                    // well.
+                    if is_cvv {
+                        // Put the txns back into the mempool.
+                        repool_batch_txns(&pools, &batch).await;
+                    } else {
+                        // If we are not a CVV then go ahead and disburse the txns from the batch directly.
+                        // A refused disbursal (issue #1132) means no forward task owns these
+                        // transactions, and the table that held them was cleared above, so fall
+                        // back to the CVV shape and let the batch builder repackage them
+                        // (issue #1145).
+                        let disbursed = futures::future::OptionFuture::from(
+                            workers.get(usize::from(batch.worker_id)).map(|worker| {
+                                worker.disburse_txns(batch.clone().seal(digest))
+                            }),
+                        )
+                        .await;
+                        if disbursed.is_none_or(|result| result.is_err()) {
+                            repool_batch_txns(&pools, &batch).await;
+                        }
+                    }
+                }
+                Ok(())
+            }.instrument(span));
+        } else {
+            info!(target: "epoch-manager", "No batches leftover");
+        }
+        Ok(())
+    }
+
+    /// Flush any committed-but-unforwarded consensus output to the engine on a
+    /// non-boundary exit.
+    ///
+    /// When the epoch ends early (e.g. a CVV that is behind), output may have
+    /// been committed without yet reaching the engine; forwarding it here keeps
+    /// it from being orphaned. Two phases cover the two ways output can be left
+    /// behind. Phase 1 drains whatever is still queued in the broadcast channel.
+    /// Phase 2 backfills the gap the channel cannot cover: during subscriber
+    /// shutdown, output is saved to the pack-file DB but may never be
+    /// broadcast, so we load every entry between `last_forwarded_consensus_number`
+    /// and the DB latest and forward those too.
+    ///
+    /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
+    /// past the epoch boundary, signalling that an epoch-boundary output was
+    /// reached; `None` if no such output was found. That boundary output's header
+    /// is also stashed in `last_consensus_header` so the caller's close-and-write
+    /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
+    /// record.
+    ///
+    /// A forwarding failure (the engine channel closed) also returns `None`: the
+    /// caller must not wait on execution of output the engine never received, and
+    /// the dead channel resurfaces as a hard error at the next forwarding attempt
+    /// after re-entry.
+    pub(super) async fn send_leftover_consensus_output_to_engine(
+        &mut self,
+        consensus_output: &mut impl TnReceiver<ConsensusOutput>,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+    ) -> Option<ConsensusHeaderDigest> {
+        // Phase 1: Drain broadcast channel (existing behavior)
+        while let Ok(output) = consensus_output.try_recv() {
+            let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
+                // stash the boundary header for the caller's close-and-write sequence
+                self.last_consensus_header = Some(output.clone().into());
+                Some(output.consensus_header_hash())
+            } else {
+                None
+            };
+            // only forward the output to the engine; a send failure means the engine is gone,
+            // so stop draining and report no boundary rather than a hash the caller would
+            // block on forever in wait_for_consensus_execution
+            if let Err(e) = self.process_output(to_engine, output).await {
+                error!(target: "epoch-manager", "error sending leftover consensus output to engine: {}", e);
+                return None;
+            }
+            if result.is_some() {
+                return result;
+            }
+        }
+
+        // Phase 2: Check DB for outputs saved during subscriber shutdown drain.
+        // During shutdown, the subscriber saves outputs to the pack file DB but may not
+        // broadcast them through the channel. Scan for any gap between the last output
+        // we forwarded and the DB latest, loading missing entries from the pack file.
+        let latest_db = self.consensus_chain.latest_consensus_number();
+        let last_sent = self.last_forwarded_consensus_number;
+        if latest_db > last_sent {
+            for number in (last_sent + 1)..=latest_db {
+                match self.consensus_chain.get_consensus_output_current(number).await {
+                    Ok(output) => {
+                        let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
+                            // stash the boundary header for the caller's close-and-write sequence
+                            self.last_consensus_header = Some(output.clone().into());
+                            Some(output.consensus_header_hash())
+                        } else {
+                            None
+                        };
+                        // stop on a send failure: the engine is gone, and forwarding later
+                        // entries would leave a gap; report no boundary rather than a hash
+                        // the caller would block on forever in wait_for_consensus_execution
+                        if let Err(e) = self.process_output(to_engine, output).await {
+                            error!(target: "epoch-manager", number, "error sending leftover consensus output to engine: {}", e);
+                            return None;
+                        }
+                        if result.is_some() {
+                            return result;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: "epoch-manager", number, ?e, "failed to load gap consensus from DB");
+                        break;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
+    /// publish it on `epoch_record_watch` for downstream signing or signature
+    /// collection. The record is flushed durably to disk before returning: the
+    /// certificate-quorum path persists asynchronously, so without the explicit
+    /// flush a crash between this write and that persist would lose the record —
+    /// fatal for epoch 0, which has no peer-fetch anchor to heal from.
+    ///
+    /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
+    /// the initial committee is available before any certificate exists. Once a
+    /// real cert is present we must overwrite that filler, which is why epoch 0
+    /// only short-circuits on a record that already carries a certificate
+    /// (`Some(_)`) — skipping this would leave the dummy in place and break sync.
+    /// For later epochs an existing record short-circuits unconditionally.
+    ///
+    /// When building a fresh record, the previous epoch's `next_committee` must
+    /// match this epoch's committee; a mismatch means the committee handoff is
+    /// inconsistent and is treated as an error rather than silently recorded.
+    pub(super) async fn write_epoch_record(
+        &mut self,
+        epoch: Epoch,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        if epoch == 0 {
+            // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
+            // code using these records. In this case there will not be a cert so we
+            // want to overwrite this with the correct record. That is why we need to
+            // use Some(_) (this means we have a certificate) instead of _ like in the general case.
+            // Without this we never overwrite the dummy epoch 0 record with the proper record and
+            // would break sync.
+            if let Some((epoch_rec, Some(_))) =
+                self.consensus_chain.epochs().get_epoch_by_number(epoch).await
+            {
+                // We already have this record...
+                self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+                return Ok(());
+            }
+        } else if let Some((epoch_rec, _)) =
+            self.consensus_chain.epochs().get_epoch_by_number(epoch).await
+        {
+            // We already have this record...
+            self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+            return Ok(());
+        }
+
+        // CLOSE-TIME READS, INTENTIONALLY POST-BURN: these committee reads see the on-chain
+        // state at epoch CLOSE, not the epoch-start pin used by the entry path. That is by
+        // design: a mid-epoch governance burn swap-and-pops the ejected validator out of the
+        // ConsensusRegistry's committee arrays immediately, and the epoch record is meant to
+        // commit that shrunken committee (`build_epoch_record` tolerates the shrink against
+        // the previous record's `next_committee` promise). Do NOT "fix" these reads to the
+        // epoch-start pin.
+        //
+        // They ARE pinned, though — to `parent_state`, the epoch-closing block this record
+        // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
+        // not the reth canonical tip: the engine publishes each executed output's last block
+        // and its consensus hash in ONE watch write, so the bus can lag the true tip
+        // mid-execution but never lead it. At every call site (the live boundary arm and the
+        // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
+        // `wait_for_consensus_execution` as well as try_restore_state() on startup) the wait
+        // resolved on the exact write that carries the
+        // closing block, so this read IS that block; the pin makes the record's committee reads
+        // and its `final_state` derive from the same header by construction instead of by
+        // timing.
+        //
+        // `parent_state` is sampled ONCE and threaded into the retry below as its pin, and both
+        // committees resolve through ONE batched by-hash read. Sampling once is required, not
+        // merely tidy: the watch is live, so re-sampling it per attempt would both shift the pin
+        // between attempts and desynchronize the committee reads from the `parent_state` passed to
+        // `build_epoch_record` as `final_state`, destroying the same-header-by-construction
+        // property the paragraph above claims.
+        //
+        // READ-FAILURE POLICY: this is a consensus input, so its failure is classified by
+        // committee determinism (`StateReadError`) and BOTH classes halt. There is deliberately
+        // no fail-open arm, despite what `StateReadError::ChainGlobal`'s variant doc says about
+        // keep-current staying committee-consistent: a wrong committee in a SIGNED `EpochRecord`
+        // propagates to every syncing node, while halting is a single-node liveness failure.
+        // A Provider fault is node-local (peers reading the same block may succeed), so retry
+        // briefly before halting; ChainGlobal returns from the first attempt, halting exactly
+        // where it did before the retry existed. The net delta is two extra tries on Provider.
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        let epochs = [epoch, epoch + 1];
+        let committees =
+            retry_provider_faults("epoch-record committee reads", &parent_state, |pin| {
+                engine.validators_for_epochs_at_block(&epochs, pin.hash)
+            })
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed committee read at epoch-closing block {} ({:?}) for the epoch \
+                     {epoch} record - halting rather than recording a committee this node cannot \
+                     verify: {e}",
+                    parent_state.number,
+                    parent_state.hash
+                )
+            })?;
+        let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] =
+            committees.try_into().map_err(|_| {
+                eyre!("committee batch read arity mismatch for the epoch {epoch} record")
+            })?;
+        let prev_record = if epoch == 0 {
+            None
+        } else {
+            self.consensus_chain.epochs().record_by_epoch(epoch - 1).await
+        };
+        let last_consensus_header = self.last_consensus_header.take().ok_or_else(|| {
+            eyre!("epoch {epoch} reached write_epoch_record without its boundary consensus header")
+        })?;
+        let target_hash = last_consensus_header.digest();
+
+        let epoch_rec = build_epoch_record(
+            epoch,
+            committee_keys,
+            next_committee_keys,
+            prev_record.as_ref(),
+            parent_state,
+            ConsensusNumHash::new(last_consensus_header.number, target_hash),
+        )?;
+
+        self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
+        // the cert-quorum path persists asynchronously; a crash before that flush would lose
+        // the record just saved — fatal for epoch 0, which has no peer-fetch anchor — so
+        // flush it durably here before publishing
+        self.consensus_chain.epochs().persist().await?;
+        self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+        Ok(())
+    }
+
+    /// Re-derive the previous epoch's [`EpochRecord`] locally when a restart finds it missing.
+    ///
+    /// This happens when the node was killed at epoch N-1's boundary: the engine had already
+    /// executed the epoch-closing block - whose `concludeEpoch` advanced the on-chain epoch to N,
+    /// so on restart we enter epoch N - but [`Self::write_epoch_record`] had not yet persisted
+    /// record N-1. Execution and the record write are not atomic and cannot be reordered
+    /// (record N-1's `final_state` IS that closing block, which must execute first), so this
+    /// gap is inherent, not corruption.
+    ///
+    /// We still hold everything needed to regenerate the record: the executed closing block and
+    /// record N-2. Recover epoch N-1's boundary consensus header from the closing block (the same
+    /// `parent_beacon_block_root` + nonce decode `try_restore_state` uses) and re-run the exact
+    /// deterministic close-time path via [`Self::write_epoch_record`], so the re-derived record is
+    /// bit-identical to the one every other node sealed - no peer fetch, no certificate.
+    ///
+    /// A cheap no-op whenever the record is already present (the common case), including epoch 0
+    /// and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)` true).
+    pub(super) async fn recover_previous_epoch_record(
+        &mut self,
+        current_epoch: Epoch,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        if current_epoch == 0 {
+            return Ok(());
+        }
+        let previous_epoch = current_epoch - 1;
+        if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
+            // Do not be fooled by the dummy epoch 0 record on the epoch 0 -> 1 transition.
+            if previous_epoch != 0 || !self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                return Ok(());
+            }
+        }
+
+        // Recover epoch `previous_epoch`'s boundary consensus header from the closing block we
+        // already executed (the canonical tip - no epoch-`current_epoch` block has executed yet).
+        let blocks = engine.last_executed_output_blocks(1).await?;
+        let closing_block = blocks.first().ok_or_else(|| {
+            eyre!(
+                "cannot re-derive the epoch {previous_epoch} record: no executed blocks on restart"
+            )
+        })?;
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        if parent_state.hash != closing_block.hash() {
+            return Err(eyre!(
+                "expected last executed state {}/{} does not match on chain closing block {}/{}",
+                parent_state.number,
+                parent_state.hash,
+                closing_block.number,
+                closing_block.hash()
+            ));
+        }
+        let consensus_digest = boundary_consensus_digest(closing_block, previous_epoch)?;
+        let boundary_header = self
+            .consensus_chain
+            .consensus_header_by_digest(previous_epoch, consensus_digest)
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed to READ the consensus store re-deriving the epoch {previous_epoch} \
+                     record (a storage error, not a missing record - do NOT delete chain-data): {e}"
+                )
+            })?
+            .ok_or_else(|| {
+                eyre!(
+                    "cannot re-derive the epoch {previous_epoch} record: its boundary consensus \
+                     header {consensus_digest} is absent from the consensus chain"
+                )
+            })?;
+
+        warn!(
+            target: "epoch-manager",
+            previous_epoch,
+            current_epoch,
+            "previous epoch record missing on restart (killed at its boundary); re-deriving it locally",
+        );
+        // Feed the recovered boundary header into the deterministic close-time path: it reads the
+        // committees at the closing block and chains on record N-2, and build_epoch_record's
+        // continuity check hard-errors rather than persisting a divergent record if inputs are off.
+        self.last_consensus_header = Some(boundary_header);
+        self.write_epoch_record(previous_epoch, engine).await?;
+        Ok(())
+    }
+
+    /// Export the just-closed epoch's final execution state, plus the epoch's consensus pack and a
+    /// bounded epoch-records/certs bundle, into a snapshot bundle.
+    ///
+    /// A no-op unless `--enable-state-export` spawned the exporter. The state export runs on the
+    /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
+    /// logged; the epoch transition does not wait on it. The bundle is written under
+    /// `consensus-db/state_exports/epoch-{N}/` and ends up with four files: `state_data` (the exec
+    /// state pack), `consensus_data` (the closed epoch's consensus pack), `epoch_records` (records
+    /// `0..=N`), and `epoch_certs` (a certificate for every record `>= 1`, which lets an importer
+    /// fully verify the record chain). The block exported is the epoch's final executed block — the
+    /// same value [`write_epoch_record`](Self::write_epoch_record) records as the epoch's
+    /// `final_state`.
+    ///
+    /// Unlike a plain copy of the live shared `epochs.pack` / `epoch_certs.pack`, the records/certs
+    /// bundle is a bounded `0..=N` set assembled in the completion task, so a later epoch appending
+    /// to the live packs cannot race into the export. In the common case it is built by copying the
+    /// previous boundary's published bundle and appending only epoch N's record and cert; when no
+    /// previous bundle validates, it is rebuilt in full through the records-DB actor. The task
+    /// also waits a bounded time for epoch N's own certificate (only aggregated at the next epoch's
+    /// start) and fails the export without it, so an importer never has to store the tip record
+    /// unverified.
+    ///
+    /// Filesystem work that scales with epoch size (the consensus-pack copy and every temp-dir
+    /// removal) runs on tokio's blocking pool ([`tokio::task::spawn_blocking`]), never on a
+    /// runtime worker thread. The one pre-spawn removal below goes through the same offload,
+    /// since `run_epoch` awaits this method on the epoch-close critical path.
+    /// Successful publication applies the optional completed-bundle retention limit on the
+    /// blocking pool. Publication and pruning are serialized across completion tasks; an older
+    /// completion outside the newest retained epochs is skipped before its atomic rename.
+    pub(super) async fn export_epoch_state(
+        &self,
+        primary: &PrimaryNode<DB>,
+        reth_env: &RethEnv,
+    ) -> eyre::Result<()> {
+        let Some(exporter) = &self.exec_state_exporter else {
+            return Ok(());
+        };
+        let epoch = primary.current_committee().await.epoch();
+        let block = self.consensus_bus.latest_execution_block_num_hash();
+        let export_root = self.tn_datadir.consensus_db_path().join("state_exports");
+        let final_dir = export_root.join(format!("epoch-{epoch}"));
+
+        // Idempotent: a completed export for this epoch already sits at the final location (e.g.
+        // the boundary is re-processed after a restart); nothing to do.
+        if final_dir.exists() {
+            debug!(target: "tn::snapshot", epoch, "epoch state already exported; skipping");
+            return Ok(());
+        }
+
+        // Cheap pre-check before the expensive plain-state walk: every HISTORICAL epoch (0..N) must
+        // already have its certificate stored. Epoch N's own cert is aggregated only at the next
+        // epoch's start and is waited for in the completion task, so it is excluded here. A
+        // permanently-missing historical cert (e.g. a network-wide failed-quorum epoch no peer can
+        // supply) would otherwise make every boundary walk the whole state and then fail; skip
+        // early instead. NOT fatal — the next epoch retries, and the record collector keeps
+        // trying to back-fill the cert.
+        if let Some(missing) =
+            self.consensus_chain.epochs().first_missing_historical_cert(epoch).await
+        {
+            warn!(
+                target: "tn::snapshot", epoch, missing_cert_epoch = missing,
+                "skipping state export: certificate for a historical epoch is not yet available; \
+                 retrying next epoch"
+            );
+            return Ok(());
+        }
+
+        // Flush the closed epoch's consensus pack so the copy in the completion task captures a
+        // complete file. The consensus pack is only persisted by the *next* epoch's `new_epoch`, so
+        // persist it here while epoch N is still the current pack. The bounded records/certs bundle
+        // is built through the actor (not copied), so no records-pack flush is needed here. A
+        // persist hiccup must not crash the node, so log and skip the export.
+        // Note, if we are here the epoch has concluded and no more data will be written to the
+        // current epoch pack file.  This why this is safe to do now, it simply means the
+        // file will be flushed before it is copied without depending on the rest of the
+        // epoch close.
+        if let Err(e) = self.consensus_chain.persist_current().await {
+            warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
+            return Ok(());
+        }
+        // The consensus pack is a per-epoch file under the epochs base dir; it is copied into the
+        // bundle. The records/certs are written from the actor in the completion task instead.
+        let epochs_dir = self.tn_datadir.epochs_db_path();
+        let src_consensus = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
+
+        // Cloned into the completion task so it can read the bounded record set from the actor and
+        // nudge the epoch-record collector to backfill epoch N's certificate; both are
+        // node-lifetime handles, safe to outlive the epoch-scoped resources torn down after
+        // this returns.
+        let consensus_chain = self.consensus_chain.clone();
+        let consensus_bus = self.consensus_bus.clone();
+        let state_export_retention = self.state_export_retention.clone();
+
+        // The previous boundary's published bundle, if any: lets the completion task build the
+        // records/certs bundle by copy + single append instead of a full 0..=N rebuild. It can be
+        // legitimately absent (first epoch, a skipped or failed prior export, operator pruning);
+        // the storage layer then falls back to the full rebuild. Published bundles are only ever
+        // read, never appended to in place.
+        let prev_bundle = epoch.checked_sub(1).map(|prev_epoch| {
+            let prev_dir = export_root.join(format!("epoch-{prev_epoch}"));
+            (prev_dir.join("epoch_records"), prev_dir.join("epoch_certs"))
+        });
+
+        // Export into a temp sibling and atomically rename it into place on success, so external
+        // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp for
+        // THIS epoch first: a successful export renames its temp to the final dir (and the
+        // idempotency check above already returned for a completed epoch), so a surviving
+        // `epoch-{N}.tmp` is a stale remnant of a prior crashed run. Only this epoch's temp is
+        // touched — never another epoch's, which may still be an in-flight export's working dir.
+        // If it cannot be removed, writing into it would append onto stale bytes and publish a
+        // doubled bundle, so skip this export — NOT fatal, the next epoch boundary retries.
+        let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
+        // The stale temp can itself be a large partial export from a crashed run, so its removal
+        // is offloaded to the blocking pool too: `run_epoch` awaits this method, so an inline
+        // removal here would block the epoch-close critical path.
+        let stale_tmp = tmp_dir.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&stale_tmp))
+            .await
+            .map_err(std::io::Error::other)
+            .flatten()
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!(target: "tn::snapshot", epoch, path = ?tmp_dir, error = %e, "could not clear stale temp export dir; skipping export (next epoch retries)");
+                return Ok(());
+            }
+        }
+
+        match exporter.trigger_export(reth_env.clone(), block, tmp_dir.clone()) {
+            Ok(rx) => {
+                // fire-and-forget: log the result without blocking the epoch transition.
+                // The reth env task spawner should be the node/app scoped spawner NOT the epoch
+                // scoped spawner (about to die).
+                reth_env.get_task_spawner().spawn_task(format!("exporting execution state for epoch {epoch}"), async move {
+                    match rx.await {
+                        // copy the per-epoch consensus pack, write the bounded records/certs bundle
+                        // (after waiting for epoch N's cert), then atomically move the complete
+                        // bundle into place; external tooling watches for the final dir appearing
+                        // atomically.
+                        Ok(Ok(Some(outcome))) => {
+                            // Safe: the closed epoch's pack is sealed at export time (see the
+                            // persist note above) — no writer appends to a concluded epoch's pack,
+                            // so this reads a complete, immutable file. The pack scales with the
+                            // epoch's consensus throughput, so copy it on the blocking pool
+                            // instead of pinning a runtime worker for the duration; a
+                            // cancelled/panicked blocking task surfaces as the same copy error.
+                            let copy_dst = tmp_dir.join("consensus_data");
+                            let copied = tokio::task::spawn_blocking(move || {
+                                std::fs::copy(&src_consensus, &copy_dst)
+                            })
+                            .await
+                            .map_err(std::io::Error::other)
+                            .flatten();
+                            if let Err(e) = copied {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus pack into export");
+                                remove_tmp_export(&tmp_dir, epoch).await;
+                                return Ok(());
+                            }
+
+                            // nudge the epoch-record collector so an observer backfills epoch N's
+                            // cert. never decrease requested_missing_epoch (mirrors open_epoch_pack).
+                            let current = *consensus_bus.requested_missing_epoch().borrow();
+                            consensus_bus.requested_missing_epoch().send_replace(current.max(epoch));
+
+                            // epoch N's record must already exist (write_epoch_record ran before
+                            // this export); its cert is only aggregated at the next epoch's start,
+                            // so wait a bounded time for it. without a cert an importer would have
+                            // to store the tip record unverified, so fail the export instead.
+                            let Some(record_n) = consensus_chain.epochs().record_by_epoch(epoch).await else {
+                                warn!(target: "tn::snapshot", epoch, "epoch record missing at export time; skipping export");
+                                remove_tmp_export(&tmp_dir, epoch).await;
+                                return Ok(());
+                            };
+                            if consensus_chain
+                                .epochs()
+                                .cert_by_digest_with_timeout(record_n.digest(), CERT_WAIT)
+                                .await
+                                .is_none()
+                            {
+                                warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export of epoch {epoch}");
+                                remove_tmp_export(&tmp_dir, epoch).await;
+                                return Ok(());
+                            }
+
+                            // write the bounded 0..=N records+certs bundle: extend the previous
+                            // boundary's published bundle with epoch N's entries when it
+                            // validates, rebuilding in full through the actor otherwise. either
+                            // way the set is bounded, so a later epoch appending to the live
+                            // packs cannot race into this bundle.
+                            if let Err(e) = consensus_chain
+                                .epochs()
+                                .export_incremental_bundle(
+                                    epoch,
+                                    prev_bundle,
+                                    &tmp_dir.join("epoch_records"),
+                                    &tmp_dir.join("epoch_certs"),
+                                )
+                                .await
+                            {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to write epoch records/certs bundle into export");
+                                remove_tmp_export(&tmp_dir, epoch).await;
+                                return Ok(());
+                            }
+
+                            match state_export_retention.publish(tmp_dir.clone(), epoch).await {
+                                Ok(PublishOutcome::Published) => info!(
+                                    target: "tn::snapshot",
+                                    epoch,
+                                    block = outcome.block.number,
+                                    accounts = outcome.stats.account_count,
+                                    path = ?final_dir,
+                                    "exported epoch state + consensus + records + certs"
+                                ),
+                                Ok(PublishOutcome::Superseded) => {
+                                    info!(target: "tn::snapshot", epoch, "skipped state export publication: newer bundles fill the retention window");
+                                    remove_tmp_export(&tmp_dir, epoch).await;
+                                }
+                                Err(e) => {
+                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
+                                    remove_tmp_export(&tmp_dir, epoch).await;
+                                }
+                            }
+                        }
+                        // intentional skip: the epoch is not resumable, so no bundle was written.
+                        Ok(Ok(None)) => {
+                            info!(target: "tn::snapshot", epoch, "skipped state export for epoch: snapshot would not be resumable; no bundle written");
+                            remove_tmp_export(&tmp_dir, epoch).await;
+                        }
+                        // export failed or the worker went away: drop the partial temp dir.
+                        Ok(Err(e)) => {
+                            warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
+                            remove_tmp_export(&tmp_dir, epoch).await;
+                        }
+                        Err(_) => {
+                            warn!(target: "tn::snapshot", epoch, "epoch state export worker dropped the reply");
+                            remove_tmp_export(&tmp_dir, epoch).await;
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Err(e) => {
+                warn!(target: "tn::snapshot", epoch, error = %e, "could not enqueue epoch state export")
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear the epoch-scoped consensus tables so the next epoch starts clean.
+    ///
+    /// These tables hold only the working state of a single epoch — proposals,
+    /// votes, certificates and their indexes, and the batch cache — so they are
+    /// reset at every boundary. Complete historic data lives in the
+    /// `ConsensusChain` store and is unaffected.
+    ///
+    /// [`OurNodeBatchesCache`] is deliberately left intact: `orphan_batches`
+    /// still reads it to recover our un-consensed batches and clears it itself
+    /// once recovery is done. Clearing it here would drop those batches.
+    pub(super) fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
+        self.consensus_db.clear_table::<LastProposed>()?;
+        self.consensus_db.clear_table::<Votes>()?;
+        self.consensus_db.clear_table::<Certificates>()?;
+        self.consensus_db.clear_table::<CertificateDigestByRound>()?;
+        self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
+        self.consensus_db.clear_table::<ProposedCertificates>()?;
+        self.consensus_db.clear_table::<Payload>()?;
+        self.consensus_db.clear_table::<NodeBatchesCache>()?;
+        // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
+        // orphans and clear then.
+        Ok(())
+    }
+}
+
+/// Build the finalized [`EpochRecord`] for a just-completed epoch.
+///
+/// The committee keys are the fresh on-chain reads for `epoch` and `epoch + 1`
+/// pinned to the epoch-closing block the record commits as `final_state`;
+/// `prev` is the stored record for `epoch - 1`, required
+/// for every epoch after 0. The new record chains to `prev` via `parent_hash`,
+/// and the committee read for this epoch must be compatible with the previous
+/// record's `next_committee` under [`EpochRecord::committee_compatible`]: the
+/// same set (in any stored order), or a tolerated shrink when governance ejects
+/// a validator mid-epoch (`burn` / slash-to-zero swap-and-pops the on-chain
+/// committee array). A committee that grew, swapped in an unknown member, or
+/// shrank below the sync tolerance is still an error rather than silently
+/// recorded — sync would reject such a record, so producing it would only hide
+/// the divergence.
+pub fn build_epoch_record(
+    epoch: Epoch,
+    committee_keys: Vec<BlsPublicKey>,
+    next_committee_keys: Vec<BlsPublicKey>,
+    prev: Option<&EpochRecord>,
+    final_state: BlockNumHash,
+    final_consensus: ConsensusNumHash,
+) -> eyre::Result<EpochRecord> {
+    let parent_hash = if epoch == 0 {
+        EpochDigest::default()
+    } else if let Some(prev) = prev {
+        prev.digest()
+    } else {
+        error!(
+            target: "epoch-manager",
+            "failed to find previous epoch record when starting epoch",
+        );
+        return Err(eyre!("failed to find previous epoch record when starting epoch"));
+    };
+
+    let record = EpochRecord {
+        epoch,
+        committee: committee_keys,
+        next_committee: next_committee_keys,
+        parent_hash,
+        final_state,
+        final_consensus,
+    };
+
+    if let Some(prev) = prev {
+        let expected: BTreeSet<BlsPublicKey> = prev.next_committee.iter().copied().collect();
+        if !record.committee_compatible(&expected) {
+            error!(
+                target: "epoch-manager",
+                "Last epochs next committee not compatible with this epochs committee! previous {:?}, current {:?}",
+                prev.next_committee,
+                record.committee
+            );
+            return Err(eyre!(
+                "Last epochs next committee not compatible with this epochs committee!"
+            ));
+        }
+        if record.committee.len() < expected.len() {
+            let ejected: Vec<_> =
+                expected.iter().filter(|key| !record.committee.contains(key)).collect();
+            warn!(
+                target: "epoch-manager",
+                ?ejected,
+                epoch,
+                "committee shrank mid-epoch: validator(s) ejected on-chain; recording shrunken committee"
+            );
+        }
+    }
+
+    Ok(record)
+}
+
+/// Decode which consensus header the executed closing block points to, and verify it closes the
+/// epoch we intend to re-derive.
+///
+/// Extracted from [`EpochManager::recover_previous_epoch_record`] so the decode is unit-testable
+/// against a synthetic header. The closing block's `parent_beacon_block_root` IS the producing
+/// consensus header's digest, and its nonce encodes the producing epoch (`epoch << 32 | round`,
+/// read back by [`deconstruct_nonce`]). A nonce epoch other than `previous_epoch` means the
+/// executed tip is not the boundary block we expect, so we refuse to re-derive from it.
+fn boundary_consensus_digest(
+    closing_block: &SealedHeader,
+    previous_epoch: Epoch,
+) -> eyre::Result<ConsensusHeaderDigest> {
+    let Some(consensus_digest) = closing_block.parent_beacon_block_root else {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the closing block is missing \
+             the required consensus block digest (parent_beacon_block_root) - refusing to re-derive \
+             from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
+        ));
+    };
+    let consensus_digest: ConsensusHeaderDigest = consensus_digest.into();
+    let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
+    if header_epoch != previous_epoch {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
+             by epoch {header_epoch} - refusing to re-derive from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
+        ));
+    }
+    Ok(consensus_digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::{BlsKeypair, ExecHeader, B256};
+
+    /// Deterministic BLS public keys, one per seed byte.
+    fn keys(seeds: std::ops::Range<u8>) -> Vec<BlsPublicKey> {
+        seeds.map(|i| *BlsKeypair::generate(&mut StdRng::from_seed([i; 32])).public()).collect()
+    }
+
+    /// A previous-epoch record promising `next_committee` for the epoch under test.
+    fn prev_record(next_committee: Vec<BlsPublicKey>) -> EpochRecord {
+        EpochRecord {
+            epoch: 0,
+            committee: next_committee.clone(),
+            next_committee,
+            ..Default::default()
+        }
+    }
+
+    fn final_state() -> BlockNumHash {
+        BlockNumHash::new(42, BlockHash::repeat_byte(7))
+    }
+
+    fn final_consensus() -> ConsensusNumHash {
+        ConsensusNumHash::new(9, ConsensusHeaderDigest::default())
+    }
+
+    /// A synthetic executed closing block whose nonce encodes `epoch` (the payload builder's
+    /// `nonce = epoch << 32 | round` layout, matching node.rs `tip_at`) and whose
+    /// `parent_beacon_block_root` is `parent_beacon` — the two fields `boundary_consensus_digest`
+    /// reads.
+    fn closing_block(epoch: u32, parent_beacon: B256) -> SealedHeader {
+        let header = ExecHeader {
+            nonce: ((epoch as u64) << 32).into(),
+            parent_beacon_block_root: Some(parent_beacon),
+            ..Default::default()
+        };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    /// A closing block produced by the expected epoch yields its parent-beacon consensus digest.
+    #[test]
+    fn boundary_digest_matches_expected_epoch() {
+        let parent_beacon = B256::repeat_byte(0x11);
+        let tip = closing_block(2, parent_beacon);
+        let got = boundary_consensus_digest(&tip, 2).expect("a tip closing epoch 2 is accepted");
+        assert_eq!(got, ConsensusHeaderDigest::from(parent_beacon));
+    }
+
+    /// A closing block whose nonce encodes a different epoch than the one we are re-deriving is
+    /// refused (the tip is not the boundary block we expect).
+    #[test]
+    fn boundary_digest_rejects_wrong_epoch() {
+        let tip = closing_block(5, B256::repeat_byte(0x22));
+        let err = boundary_consensus_digest(&tip, 2)
+            .expect_err("a tip produced by the wrong epoch must be refused");
+        assert!(err.to_string().contains("produced by epoch 5"), "unexpected error: {err}");
+    }
+
+    /// identical committee handoff succeeds and preserves the read order.
+    #[test]
+    fn build_epoch_record_unchanged_committee() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let rec = build_epoch_record(
+            1,
+            five.clone(),
+            five.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("unchanged committee handoff must succeed");
+        assert_eq!(rec.epoch, 1);
+        assert_eq!(rec.parent_hash, prev.digest());
+        assert_eq!(rec.committee, five, "stored order must be exactly the on-chain read order");
+        assert_eq!(rec.next_committee, five);
+        assert_eq!(rec.final_state, final_state());
+        assert_eq!(rec.final_consensus, final_consensus());
+    }
+
+    /// a governance `burn` mid-epoch swap-and-pops the ejected key out of the on-chain
+    /// committee array, so the closing read is a 4-member subset of the 5 the previous
+    /// record promised. The record must still build or every node halts at the boundary.
+    #[test]
+    fn build_epoch_record_tolerates_mid_epoch_ejection() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        // swap-and-pop of five[2]: the last element moves into its slot
+        let shrunken = vec![five[0], five[1], five[4], five[3]];
+        let rec = build_epoch_record(
+            1,
+            shrunken.clone(),
+            shrunken.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("mid-epoch ejection must not prevent the epoch record from building");
+        assert_eq!(rec.committee, shrunken);
+        assert_eq!(rec.parent_hash, prev.digest());
+    }
+
+    /// the same five keys in a different stored order are the same committee.
+    #[test]
+    fn build_epoch_record_reordered_only() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let mut rotated = five.clone();
+        rotated.rotate_left(2);
+        let rec = build_epoch_record(
+            1,
+            rotated.clone(),
+            five.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("same committee in a different stored order must succeed");
+        assert_eq!(rec.committee, rotated);
+        assert_eq!(rec.parent_hash, prev.digest());
+    }
+
+    /// shrinking past the tolerance floor or bound stays an error — producing a record
+    /// sync would reject only hides the divergence.
+    #[test]
+    fn build_epoch_record_rejects_below_tolerance() {
+        // 4 -> 3 violates the minimum-committee floor of 4
+        let four = keys(0..4);
+        let prev = prev_record(four.clone());
+        let three = four[..3].to_vec();
+        assert!(build_epoch_record(
+            1,
+            three.clone(),
+            three,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+
+        // 8 -> 5 violates the ceil(2n/3) tolerance bound (needs >= 6 of 8)
+        let eight = keys(0..8);
+        let prev = prev_record(eight.clone());
+        let five = eight[..5].to_vec();
+        assert!(build_epoch_record(
+            1,
+            five.clone(),
+            five,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+    }
+
+    /// a committee containing a key the previous record never promised is rejected —
+    /// current committees cannot legitimately grow or swap members mid-epoch.
+    #[test]
+    fn build_epoch_record_rejects_unknown_member() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let fresh = *BlsKeypair::generate(&mut StdRng::from_seed([99; 32])).public();
+        let committee = vec![five[0], five[1], five[2], five[3], fresh];
+        assert!(build_epoch_record(
+            1,
+            committee.clone(),
+            committee,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+    }
+
+    /// epoch 0 has no previous record to hand off from.
+    #[test]
+    fn build_epoch_record_epoch_zero_skips_handoff() {
+        let five = keys(0..5);
+        let rec = build_epoch_record(
+            0,
+            five.clone(),
+            five.clone(),
+            None,
+            final_state(),
+            final_consensus(),
+        )
+        .expect("epoch 0 must build without a previous record");
+        assert_eq!(rec.parent_hash, EpochDigest::default());
+        assert_eq!(rec.committee, five);
+    }
+
+    /// any later epoch without its previous record is an error.
+    #[test]
+    fn build_epoch_record_missing_prev_errors() {
+        let five = keys(0..5);
+        assert!(build_epoch_record(1, five.clone(), five, None, final_state(), final_consensus())
+            .is_err());
+    }
+
+    #[test]
+    fn sweep_removes_only_temp_export_dirs() {
+        // Finding #13: the startup sweep must clear every `epoch-{N}.tmp` orphaned by a prior run
+        // while leaving completed `epoch-{N}` dirs and everything the exporter did not write
+        // untouched.
+        let root = tempfile::tempdir().expect("temp dir");
+        let export_root = root.path();
+        for name in ["epoch-1.tmp", "epoch-2.tmp", "epoch-5"] {
+            std::fs::create_dir_all(export_root.join(name)).expect("mkdir");
+        }
+        std::fs::write(export_root.join("keep.txt"), b"x").expect("write file");
+        // Not exporter-written: a `.tmp` directory without the `epoch-{N}` stem, a directory whose
+        // epoch is not a canonical `Epoch` rendering, and a regular file that is name-shaped like
+        // a temp export. The sweep must leave all three (the file without even attempting the
+        // `remove_dir_all` that would warn on every export-enabled startup).
+        std::fs::create_dir_all(export_root.join("stray.tmp")).expect("mkdir");
+        std::fs::create_dir_all(export_root.join("epoch-x.tmp")).expect("mkdir");
+        std::fs::write(export_root.join("epoch-7.tmp"), b"x").expect("write file");
+
+        sweep_stale_tmp_exports(export_root);
+
+        assert!(!export_root.join("epoch-1.tmp").exists(), "orphaned temp dir must be swept");
+        assert!(!export_root.join("epoch-2.tmp").exists(), "orphaned temp dir must be swept");
+        assert!(export_root.join("epoch-5").exists(), "completed export dir must survive");
+        assert!(export_root.join("keep.txt").exists(), "unrelated file must survive");
+        assert!(export_root.join("stray.tmp").exists(), "non-epoch `.tmp` dir must survive");
+        assert!(export_root.join("epoch-x.tmp").exists(), "non-numeric `.tmp` dir must survive");
+        assert!(export_root.join("epoch-7.tmp").exists(), "`.tmp` regular file must survive");
+
+        // A missing exports root is a no-op (must not panic).
+        sweep_stale_tmp_exports(&export_root.join("does-not-exist"));
+    }
+
+    /// The completion-task cleanup must remove this epoch's temp dir (contents and all) via the
+    /// blocking pool, and treat an already-missing dir as the silent NotFound fast path.
+    #[tokio::test]
+    async fn remove_tmp_export_removes_dir_and_tolerates_missing() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let tmp_dir = root.path().join("epoch-3.tmp");
+        std::fs::create_dir_all(tmp_dir.join("nested")).expect("mkdir");
+        std::fs::write(tmp_dir.join("nested").join("state_data"), b"x").expect("write file");
+
+        remove_tmp_export(&tmp_dir, 3).await;
+        assert!(!tmp_dir.exists(), "temp export dir must be removed recursively");
+
+        // Second call hits the NotFound arm: must be a silent no-op, not an error.
+        remove_tmp_export(&tmp_dir, 3).await;
+        assert!(!tmp_dir.exists(), "missing temp dir must remain a no-op");
+    }
+}

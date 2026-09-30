@@ -28,3 +28,6 @@ rustversion = "1.0.9"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

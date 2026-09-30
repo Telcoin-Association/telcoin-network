@@ -141,6 +141,74 @@ impl<const DIGEST_LEN: usize> From<Digest<DIGEST_LEN>> for [u8; DIGEST_LEN] {
     }
 }
 
+/// Define a [`DIGEST_LENGTH`]-byte digest newtype wrapping [`Digest`].
+///
+/// Consensus uses several distinct-but-structurally-identical digest types (one per
+/// semantic domain, e.g. consensus output vs. consensus header) so that the type
+/// system prevents mixing them up. This macro generates the boilerplate shared by all
+/// of them: the wrapped struct, the standard derives, `AsRef<[u8]>`, conversions
+/// to/from [`Digest`], [`B256`] and `[u8; DIGEST_LENGTH]`, and `Debug`/`Display`
+/// (Display truncates to the first 16 chars, matching [`Digest`]'s bs58 rendering).
+///
+/// The struct is constructed via the generated `From` impls (or its tuple form within
+/// the defining module, e.g. `Foo(Digest { digest: hasher.finalize().into() })`).
+macro_rules! digest_newtype {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident;) => {
+        $(#[$meta])*
+        #[derive(
+            Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord,
+            ::serde::Serialize, ::serde::Deserialize,
+        )]
+        $vis struct $name($crate::crypto::Digest<{ $crate::crypto::DIGEST_LENGTH }>);
+
+        impl AsRef<[u8]> for $name {
+            fn as_ref(&self) -> &[u8] {
+                &self.0.digest
+            }
+        }
+
+        impl From<$name> for $crate::crypto::Digest<{ $crate::crypto::DIGEST_LENGTH }> {
+            fn from(d: $name) -> Self {
+                d.0
+            }
+        }
+
+        // Convenience conversion to EL `B256`; note both are `DIGEST_LENGTH` bytes.
+        impl From<$name> for $crate::B256 {
+            fn from(value: $name) -> Self {
+                $crate::B256::from_slice(value.as_ref())
+            }
+        }
+
+        // Convenience conversion from EL `B256`; note both are `DIGEST_LENGTH` bytes.
+        impl From<$crate::B256> for $name {
+            fn from(value: $crate::B256) -> Self {
+                Self($crate::crypto::Digest { digest: value.into() })
+            }
+        }
+
+        impl From<[u8; $crate::crypto::DIGEST_LENGTH]> for $name {
+            fn from(value: [u8; $crate::crypto::DIGEST_LENGTH]) -> Self {
+                Self($crate::crypto::Digest { digest: value })
+            }
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                write!(f, "{}", self.0.to_string().get(0..16).ok_or(::core::fmt::Error)?)
+            }
+        }
+    };
+}
+
+pub(crate) use digest_newtype;
+
 /// Trait implemented by hash functions providing a output of fixed length
 pub trait HashFunction<const DIGEST_LENGTH: usize>: Default {
     /// The length of this hash functions digests in bytes.

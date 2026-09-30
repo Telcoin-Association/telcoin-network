@@ -1,17 +1,45 @@
-//! Transaction factory to create legit transactions for execution.
+//! Test-support toolkit for `tn-reth`, compiled only with the `test-utils` feature or
+//! `cfg(test)`. Despite the historical name, this is much more than a transaction factory.
+//! Grouped by role:
+//!
+//! - [`TransactionFactory`]: deterministic keypair plus nonce tracking to create, sign, and submit
+//!   EIP-1559, legacy, EIP-4844, and EIP-7702 transactions.
+//! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
+//!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
+//!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
+//!   `get_worker_fee_configs`), plus the pinned `WorkerConfigs` table read
+//!   [`read_worker_config_entries_at`].
+//! - Batch fixtures: `transaction`, `batch`, `batches`, `fixture_batch_with_transactions`,
+//!   `batch_with_transactions`.
+//! - Genesis builders: `seeded_genesis_from_random_batch(es)`, and the
+//!   `test_genesis_with_consensus_registry*` family, which runs the real pre-genesis ceremony (see
+//!   `env/genesis.rs`) so the registry/worker-configs state matches the current bytecode.
+//! - Governance and committee helpers: `governance_owner_factory`, `governance_burn_tx`,
+//!   `create_committee_from_state`.
+//! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
+//!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
+//!   canonical tip, standing in for the engine's payload builder.
+//! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
+//!   backdoor into storage state for reconstructing pre-fix crash layouts.
 
 use crate::{
-    error::TnRethResult,
+    error::{StateReadResult, TnRethResult},
     evm::TNEvm,
+    payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState},
-    RethEnv, WorkerTxPool,
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
-    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
-    eips::eip7594::BlobTransactionSidecarVariant,
+    consensus::{
+        SignableTransaction as _, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxLegacy,
+    },
+    eips::{eip7594::BlobTransactionSidecarVariant, eip7702::Authorization},
     hex,
-    primitives::ChainId,
+    primitives::{utils::parse_ether, ChainId},
     signers::{
         k256::sha2::{Digest as _, Sha256},
         local::PrivateKeySigner,
@@ -19,28 +47,41 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
-use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives::{sign_message, Account};
+use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
+use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
+use reth_provider::{
+    CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
+};
 use reth_revm::{
-    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
+    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
 };
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
-    Secp256k1,
+    SECP256K1,
 };
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
+use tn_config::{NodeInfo, WORKER_CONFIGS_ADDRESS};
 use tn_types::{
-    address, calculate_transaction_root, gas_accumulator::RewardsCounter, keccak256, now,
-    test_chain_spec_arc, test_genesis, AccessList, Address, Batch, BlobTransactionSidecar, Block,
-    BlockBody, BlockHash, BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718,
-    EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock,
-    SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId,
-    B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    address, calculate_transaction_root,
+    gas_accumulator::{GasAccumulator, WorkerConfigEntry, WorkerFeeConfig},
+    generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
+    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
+    BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
+    Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, ReputationScores, SealedHeader,
+    SignatureVerificationState, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
+use tracing::debug;
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
@@ -49,7 +90,7 @@ pub use alloy::eips::{
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
 /// Typedef for a complex type to make clippy happy (and be a bit more readable?).
-pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>;
+pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<StateProviderBox>>>;
 
 // methods for tests
 impl RethEnv {
@@ -57,49 +98,21 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }
 
     /// Retrieve the state at the provided block hash.
     pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
-        Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
-    }
-
-    /// Retrieve the account balance.
-    pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
-        Ok(self.inner.blockchain_provider.basic_account(address)?)
+        Ok(self.blockchain_provider().state_by_block_hash(hash)?)
     }
 
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
-        let header = self.header(hash)?.expect("provided hash in header table");
-        let state: Box<dyn reth_provider::StateProvider> = self.state_by_block_hash(hash)?;
-        let db = State::builder()
-            .with_database(StateProviderDatabase::new(state))
-            .with_bundle_update()
-            .build();
-        Ok(self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(db, self.inner.evm_config.evm_env(&header)?))
-    }
-
-    /// Execute a read-only system call against a contract and return the result.
-    ///
-    /// Useful for integration tests that need to read precompile state after
-    /// block execution without importing the `Evm` trait.
-    pub fn read_contract_state(
-        &self,
-        block_hash: BlockHash,
-        contract: Address,
-        calldata: Bytes,
-    ) -> eyre::Result<ResultAndState> {
-        use reth_evm::Evm;
-        let mut evm = self.tn_evm(block_hash)?;
-        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
+        let header = self.sealed_header_by_hash(hash)?.expect("provided hash in header table");
+        let db = self.read_only_state_db(&header)?;
+        Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -111,7 +124,7 @@ impl RethEnv {
         &self,
         txs: Vec<Vec<u8>>,
         parent: &SealedHeader,
-    ) -> BundleState {
+    ) -> eyre::Result<BundleState> {
         // create "empty" header with default values
         let mut header = ExecHeader {
             parent_hash: parent.hash(),
@@ -137,16 +150,21 @@ impl RethEnv {
             requests_hash: None,
         };
 
-        // decode transactions
-        let mut decoded_txs = Vec::with_capacity(txs.len());
-        let mut signers = Vec::with_capacity(txs.len());
-        for tx_bytes in &txs {
-            let tx = recover_raw_transaction(tx_bytes)
-                .expect("raw transaction recovered for test")
-                .into_inner();
-            signers.push(tx.recover_signer().expect("recover signer for test tx"));
-            decoded_txs.push(tx);
-        }
+        // decode transactions and recover their signers
+        let (decoded_txs, signers): (Vec<_>, Vec<_>) = txs
+            .iter()
+            .map(|tx_bytes| {
+                let tx = recover_raw_transaction(tx_bytes)
+                    .map_err(|e| eyre::eyre!("recover raw test transaction: {e:?}"))?
+                    .into_inner();
+                let signer = tx
+                    .recover_signer()
+                    .map_err(|e| eyre::eyre!("recover signer for test tx: {e:?}"))?;
+                Ok::<_, eyre::Report>((tx, signer))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
 
         // update header's transactions root
         header.transactions_root = if txs.is_empty() {
@@ -167,14 +185,22 @@ impl RethEnv {
 
         // create execution db
         let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
+            self.latest()
+                .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
-        let executor = self.inner.evm_config.executor(&mut db);
+        let executor = self.evm_config().executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
-            .expect("execute one block");
+            .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
 
-        res.state
+        // a reverted tx still commits (with a failed receipt), silently yielding bundle
+        // state that is missing the tx's intended effects; fail loudly with the receipts
+        // so the offending tx is identifiable instead of surfacing later as missing
+        // genesis state (see #863)
+        let all_succeeded = res.result.receipts.iter().all(|receipt| receipt.success);
+        all_succeeded.then_some(res.state).ok_or_else(|| {
+            eyre::eyre!("setup tx reverted during simulated execution: {:?}", res.result.receipts)
+        })
     }
 
     /// Retrieve validator rewards.
@@ -215,6 +241,41 @@ impl RethEnv {
         )?;
         Ok(info)
     }
+
+    /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
+    /// to the state of the block identified by `block_hash`.
+    ///
+    /// Every node issuing this read at the same block decodes the identical committee — even
+    /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
+    /// unpinned canonical-tip read would not. No unpinned sibling exists: this is the only
+    /// per-epoch validator-info accessor, and it is `test-utils`-gated because production takes
+    /// the whole committee from `RethEnv::epoch_state_at_epoch_start` instead.
+    pub fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        debug!(target: "engine", ?block_hash, "retrieving validators for epoch {epoch} at pinned block");
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
+    }
+
+    /// Read worker fee configs from the `WorkerConfigs` contract at the canonical tip.
+    ///
+    /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
+    /// arity between the count and the per-worker arrays is validated in
+    /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count. Each row's `data`
+    /// word is projected out here; tests that need it read entries through
+    /// [`read_worker_config_entries_at`].
+    pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
+        let canonical_tip = self.canonical_tip();
+        let (_num_workers, entries) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(entries.into_iter().map(|entry| entry.config).collect())
+    }
 }
 
 /// Transaction factory
@@ -239,25 +300,22 @@ impl TransactionFactory {
     /// Secret: 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
     pub fn new() -> Self {
         let mut rng = StdRng::from_seed([0; 32]);
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rng);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut rng);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a provided seed.
     pub fn new_random_from_seed<R: Rng + ?Sized>(rand: &mut R) -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(rand);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(rand);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a random seed.
     pub fn new_random() -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut StdRng::from_os_rng());
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut StdRng::from_os_rng());
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
@@ -367,14 +425,94 @@ impl TransactionFactory {
         TransactionSigned::new_unhashed(variant.into(), signature)
     }
 
-    /// Create and sign an EIP4844 transaction.
-    pub async fn create_and_submit_eip4844(
+    /// Create a signed EIP-2930 access-list transaction.
+    pub fn create_eip2930(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        to: Address,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // access-list transaction
+        let tx = TxEip2930 {
+            chain_id,
+            nonce: self.nonce,
+            gas_price,
+            gas_limit,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
+    /// Create a signed EIP-7702 set-code transaction carrying one authorization
+    /// signed by this factory's key, so the envelope is well-formed and its type
+    /// byte is the only reason a fork-blind validator could reject it.
+    pub fn create_eip7702(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // authorization signed by this factory's key; for a self-sponsored delegation
+        // the account nonce at authorization check time is the tx nonce + 1 (the
+        // sender's nonce increments before the authorization list is processed)
+        let authorization = Authorization {
+            chain_id: U256::from(chain_id),
+            address: Address::ZERO,
+            nonce: self.nonce + 1,
+        };
+        let auth_signature = self.sign_hash(authorization.signature_hash());
+        let signed_authorization = authorization.into_signed(auth_signature);
+
+        // set-code transaction
+        let tx = TxEip7702 {
+            chain_id,
+            nonce: self.nonce,
+            gas_limit,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 0,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![signed_authorization],
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
+    /// Create and sign a valid EIP-4844 (blob) transaction, wrapped as a pooled transaction with
+    /// its sidecar and ready to submit. Uses the "zero blob" whose KZG commitment and proof are the
+    /// known point at infinity, so the envelope passes KZG validation and the only reason a pool
+    /// can reject it is a type-level policy such as `no_eip4844`.
+    pub fn create_eip4844_pooled(
         &mut self,
         chain: Arc<RethChainSpec>,
         gas_limit: Option<u64>,
         gas_price: u128,
-        pool: WorkerTxPool,
-    ) -> TxHash {
+    ) -> EthPooledTransaction {
         // Use the "zero blob" - a blob filled with zeros
         // This has known valid KZG commitments and proofs
         let blob_data = [0u8; 131072]; // 128KB of zeros
@@ -405,15 +543,13 @@ impl TransactionFactory {
         let sidecar: BlobTransactionSidecarVariant =
             BlobTransactionSidecarVariant::Eip4844(sidecar);
 
-        // construct transaction, sign, and submit to pool
+        // construct transaction and sign
         let blob_versioned_hashes = vec![versioned_hash.into()]; // use computed hash
         let signed_tx =
             self.create_eip4844(chain.chain_id(), gas_limit, gas_price, blob_versioned_hashes);
         let recovered = signed_tx.try_into_recovered().expect("recovered tx");
-        let pooled_tx = EthPooledTransaction::try_from_eip4844(recovered, sidecar)
-            .expect("recovered into eth pooled tx");
-        let hash = pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool");
-        hash.hash
+        EthPooledTransaction::try_from_eip4844(recovered, sidecar)
+            .expect("recovered into eth pooled tx")
     }
 
     /// Create and sign an EIP1559 transaction with all possible parameters passed.
@@ -538,7 +674,7 @@ impl TransactionFactory {
         Ok(signer)
     }
 
-    /// Create and submit the next transaction to the provided [TransactionPool].
+    /// Create and submit the next transaction to the provided [`WorkerTxPool`].
     pub async fn create_and_submit_eip1559_pool_tx(
         &mut self,
         chain: Arc<RethChainSpec>,
@@ -698,4 +834,255 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
     }
     let committee = committee_builder.build();
     Ok(committee)
+}
+
+/// The deterministic governance owner wallet (seed 33) that owns the `ConsensusRegistry` in
+/// test genesis fixtures (see [`test_genesis_with_consensus_registry`] and the close-epoch
+/// tests), funded there to sign owner-gated transactions like `mint` and `burn`.
+pub fn governance_owner_factory() -> TransactionFactory {
+    TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33))
+}
+
+/// Create a signed, encoded governance `ConsensusRegistry::burn(validator)` transaction.
+///
+/// Burning a validator's ConsensusNFT forcibly ejects it from the current and both future
+/// committees. The caller supplies the governance factory (see [`governance_owner_factory`])
+/// so nonces stay sequential across multiple governance transactions.
+pub fn governance_burn_tx(
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    validator: Address,
+) -> Vec<u8> {
+    let calldata = ConsensusRegistry::burnCall { validatorAddress: validator }.abi_encode().into();
+    governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    )
+}
+
+/// Build a block from a [`TNPayload`] and transactions, then commit it as the new canonical
+/// tip (chain-state update + finalization normally handled by `tn_engine`'s payload builder).
+///
+/// Every block persists before the next build here, so a fresh empty
+/// [`crate::OutputTrieOverlay`] per block is exact (#1301).
+pub fn execute_payload_and_update_canonical_chain(
+    reth_env: &RethEnv,
+    payload: TNPayload,
+    transactions: Vec<Vec<u8>>,
+) -> eyre::Result<ExecutedBlock> {
+    let block = reth_env.build_block_from_batch_payload(
+        payload,
+        &transactions,
+        &mut crate::OutputTrieOverlay::new(),
+    )?;
+    // update chain state - normally handled by tn_engine::payload_builder
+    let canonical_header = block.recovered_block.clone_sealed_header();
+    let canonical_in_memory_state = reth_env.blockchain_provider().canonical_in_memory_state();
+    canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+    canonical_in_memory_state.set_canonical_head(canonical_header.clone());
+    reth_env.finish_executing_output(vec![block.clone()], None)?;
+    reth_env.finalize_block(canonical_header.clone())?;
+    Ok(block)
+}
+
+/// Plant the persisted finalized/safe markers at `header` and seed the in-memory watches to
+/// match, simulating a restart on a database written by a pre-fix node version.
+///
+/// Pre-fix versions committed blocks and the finalized/safe markers in separate database
+/// transactions, so a crash between the two commits restarted the node with the marker lagging
+/// the persisted canonical tip — the state `RethEnv::heal_finalized_to_persisted_tip` repairs.
+/// Current versions commit both atomically in `RethEnv::finish_executing_output`, so tests use
+/// this direct write to construct the pre-fix state.
+pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre::Result<()> {
+    let provider = reth_env.blockchain_provider().database_provider_rw()?;
+    provider.save_finalized_block_number(header.number)?;
+    provider.save_safe_block_number(header.number)?;
+    provider.commit()?;
+    // a restarting node seeds the finalized/safe watches from the (stale) database rows at
+    // provider construction; mirror that so watch readers see the planted marker
+    reth_env.blockchain_provider().set_finalized(header.clone());
+    reth_env.blockchain_provider().set_safe(header);
+    Ok(())
+}
+
+/// Execute `getAllWorkerConfigs()` against the state of `block` and decode the raw return bytes
+/// through the production seam (`decode_worker_fee_configs`) — the exact decode the closing
+/// block's `record_next_epoch_base_fees` uses — returning the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker (fee strategy plus the raw `data` word).
+///
+/// Cross-crate epoch-close tests use this to read the next-epoch base fee a closing block
+/// recorded in an EIP-1559 worker's `data` word, pinned at that block's state and observed
+/// through the same system-call + decode path that produced the write.
+pub fn read_worker_config_entries_at(
+    env: &RethEnv,
+    block: B256,
+) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+    let mut tn_evm = env.tn_evm(block)?;
+    let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+    let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+    let data = match res.result {
+        ExecutionResult::Success { output, .. } => output.into_data(),
+        other => eyre::bail!("getAllWorkerConfigs failed at pinned block {block}: {other:?}"),
+    };
+    decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
+}
+
+/// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
+/// (so the new ABI surface like `getValidatorsInfo` exists) and seeded with `num_validators`
+/// active validators forming the genesis committee.
+///
+/// Unlike [`test_genesis`], which embeds the committed testnet `genesis.yaml` verbatim and can
+/// therefore drift from the compiled contract, this deploys the registry at test runtime so the
+/// genesis state always matches the current bytecode. Use it for close-epoch tests that run
+/// system calls reading the registry (e.g. committee shuffling), which revert against the stale
+/// embedded registry.
+///
+/// NOTE: this is sync but must be called from within a tokio runtime (e.g. a `#[tokio::test]`),
+/// because deploying the registry spins up a temporary `RethEnv`.
+pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
+    test_genesis_with_consensus_registry_and_workers(num_validators, vec![(0u8, 30_000_000u64)])
+}
+
+/// [`test_genesis_with_consensus_registry`] with explicit `WorkerConfigs` deployment parameters.
+///
+/// `worker_configs` is one `(strategy, value)` pair per worker (strategy 0 = EIP-1559 with
+/// `value` as the gas target, strategy 1 = static with `value` as the fee), so its length is the
+/// genesis `numWorkers()`. Use this for tests that need a multi-worker `WorkerConfigs` contract;
+/// the single-worker default above matches the canonical testnet genesis.
+pub fn test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> Genesis {
+    try_test_genesis_with_consensus_registry_and_workers(num_validators, worker_configs)
+        .expect("create consensus registry genesis accounts")
+}
+
+/// Fallible [`test_genesis_with_consensus_registry_and_workers`]: returns the genesis-creation
+/// error instead of panicking, so tests can assert that a ceremony with contract-illegal
+/// `worker_configs` (strategy > `MAX_STRATEGY`, empty list) fails loudly instead of committing
+/// a reverted constructor's empty storage.
+pub fn try_test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> eyre::Result<Genesis> {
+    // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
+    let all_validators: Vec<Address> = (1..=num_validators)
+        .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
+        .collect();
+
+    // build active validator info with deterministic BLS keys + proofs of possession
+    let validators: Vec<NodeInfo> = all_validators
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            let bls_pubkey = bls.public();
+            let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                .expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls_pubkey,
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+
+    // Mirror the canonical testnet `StakeConfig` (the CLI genesis defaults that built the embedded
+    // testnet genesis) so this drop-in registry matches what `test_genesis` provided before its
+    // bytecode went stale. NOTE: `epochIssuance` (25_806 TEL) is even, so a closed epoch's rewards
+    // split exactly between leaders (close-epoch reward assertions compare against `div_ceil(2)`).
+    let initial_stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+        minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw amount")),
+        epochIssuance: U256::from(parse_ether("25_806").expect("parse epoch issuance")),
+        epochDuration: 60 * 60 * 8, // 8hrs (testnet default)
+    };
+
+    // deterministic, funded governance owner
+    let governance_multisig = governance_owner_factory();
+    let governance = governance_multisig.address();
+    let base_genesis = test_genesis().extend_accounts([(
+        governance,
+        GenesisAccount::default()
+            .with_balance(U256::from(parse_ether("50_000_000").expect("parse governance balance"))),
+    )]);
+
+    // overwrite the embedded registry account at `CONSENSUS_REGISTRY_ADDRESS` with a freshly
+    // deployed registry seeded with the active validators above
+    RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        base_genesis,
+        initial_stake_config,
+        governance,
+        worker_configs,
+    )
+}
+
+/// Helper function for creating a consensus output for tests.
+pub fn consensus_output_for_tests(
+    round: u32,
+    epoch: u32,
+    subdag_index: u64,
+    close_epoch: bool,
+) -> ConsensusOutput {
+    consensus_output_for_tests_at(round, epoch, subdag_index, close_epoch, now())
+}
+
+/// Create a consensus output with an explicit commit timestamp for reproducible execution.
+///
+/// Like [`consensus_output_for_tests`], this seeds each output from the epoch root and does not
+/// model the seed chain across multiple commits in the same epoch.
+pub fn consensus_output_for_tests_at(
+    round: u32,
+    epoch: u32,
+    subdag_index: u64,
+    close_epoch: bool,
+    timestamp: u64,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    // set signature for deterministic test results
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_created_at_for_test(timestamp);
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        subdag_index,
+        reputation_scores,
+        previous_sub_dag,
+        // Anchor on `epoch`'s root rather than the genesis placeholder, which would freeze the
+        // shuffle seed to one constant for every epoch and leave the epoch-close tests in
+        // `crate::env::epoch` pinning that constant instead of a seed-dependent committee.
+        //
+        // CAVEAT: this re-derives the root on EVERY call, ignoring `subdag_index`, so it models
+        // production only for the FIRST commit of `epoch`. `CommittedSubDag::new` documents
+        // `seed_chain` as the previous commit's value (the epoch root only at the first commit),
+        // and this fixture does not thread that chain forward. Two calls with the same `epoch`
+        // therefore produce the same seed even though they stand in for different commits. That is
+        // currently harmless because the seed is only read when `close_epoch` is true
+        // (`TNPayload::new`) and every such call site here uses a freshly incremented epoch. A new
+        // test that closes the same epoch twice would silently pin a degenerate seed: thread the
+        // prior output's `committee_shuffle_seed()` in instead of calling this helper again.
+        tn_types::EpochSeedChainValue::epoch_root(epoch),
+    );
+    ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeader::default().digest(),
+        subdag_index,
+        close_epoch,
+        VecDeque::new(),
+        Vec::new(),
+    )
 }

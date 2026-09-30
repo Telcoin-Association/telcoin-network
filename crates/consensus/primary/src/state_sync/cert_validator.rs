@@ -72,7 +72,9 @@ where
         &self,
         certificate: &mut Certificate,
     ) -> CertManagerResult<()> {
-        self.process_certificate(certificate, true).await
+        self.process_certificate(certificate, true).await.inspect(|_| {
+            self.consensus_bus.app().metrics().certificates_received_total.increment(1);
+        })
     }
 
     fn gc_round(&self) -> Round {

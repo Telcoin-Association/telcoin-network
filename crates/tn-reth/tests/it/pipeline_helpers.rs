@@ -5,7 +5,6 @@
 //! signature recovery, block building, state persistence, and finalization.
 
 use alloy::sol_types::SolCall;
-use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::VecDeque,
@@ -17,6 +16,7 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::mintCall;
 use tn_reth::{
     payload::TNPayload,
+    system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -107,6 +107,9 @@ pub(crate) struct PipelineTestEnv {
     pub(crate) canonical_header: SealedHeader,
     /// Monotonically increasing block timestamp.
     pub(crate) block_timestamp: u64,
+    /// Timestamp of the genesis block, the base for fixture timestamps.
+    #[cfg(not(feature = "faucet"))]
+    genesis_timestamp: u64,
     /// Monotonically increasing subdag index for consensus output.
     subdag_index: u64,
     _db_permit: DbPermit,
@@ -176,18 +179,27 @@ impl PipelineTestEnv {
                     .with_balance(governance_safe_balance)
                     .with_code(Some(Bytes::from_static(GOVERNANCE_FORWARDER_BYTECODE))),
             ),
-            // Precompile account with balance and total supply storage
+            // Precompile account with balance and total supply storage.
+            //
+            // `extend_accounts` replaces the canonical `0x7e1` entry inherited from
+            // `test_genesis()` rather than merging into it, so the genesis code has to be restated
+            // here. Without it the account is code-less, and once its balance reaches zero (a full
+            // burn of the pool) it is empty by EIP-158 and gets cleared at the end of the block
+            // that touched it - taking the total supply slot with it.
             (
                 TELCOIN_PRECOMPILE_ADDRESS,
-                GenesisAccount::default().with_balance(precompile_balance).with_storage(Some({
-                    let mut storage = std::collections::BTreeMap::new();
-                    // Slot 100 = totalSupply
-                    storage.insert(
-                        tn_types::B256::from(U256::from(100)),
-                        tn_types::B256::from(total_supply),
-                    );
-                    storage
-                })),
+                GenesisAccount::default()
+                    .with_balance(precompile_balance)
+                    .with_code(Some(Bytes::from_static(PRECOMPILE_GENESIS_BYTECODE)))
+                    .with_storage(Some({
+                        let mut storage = std::collections::BTreeMap::new();
+                        // Slot 100 = totalSupply
+                        storage.insert(
+                            tn_types::B256::from(U256::from(100)),
+                            tn_types::B256::from(total_supply),
+                        );
+                        storage
+                    })),
             ),
         ];
         #[cfg(feature = "faucet")]
@@ -216,7 +228,8 @@ impl PipelineTestEnv {
         #[cfg(feature = "faucet")]
         recipient_factory.set_nonce(0);
 
-        let block_timestamp = canonical_header.timestamp + 1;
+        let genesis_timestamp = canonical_header.timestamp;
+        let block_timestamp = genesis_timestamp + 1;
 
         Self {
             reth_env,
@@ -227,12 +240,23 @@ impl PipelineTestEnv {
             recipient_factory,
             canonical_header,
             block_timestamp,
+            #[cfg(not(feature = "faucet"))]
+            genesis_timestamp,
             subdag_index: 1,
             _db_permit: db_permit,
             _tmp_dir: tmp_dir,
             _task_manager: task_manager,
             _runtime: runtime,
         }
+    }
+
+    /// The genesis block's timestamp in seconds.
+    ///
+    /// Fixtures that pick their own block timestamps offset them from this value so every
+    /// block lands after genesis, as it does on a real chain.
+    #[cfg(not(feature = "faucet"))]
+    pub(crate) fn genesis_timestamp(&self) -> u64 {
+        self.genesis_timestamp
     }
 
     /// Execute a block containing the given encoded transactions.
@@ -243,6 +267,10 @@ impl PipelineTestEnv {
     }
 
     /// Execute a block with a specific timestamp (for timelock tests).
+    ///
+    /// `timestamp` is absolute and must not precede the parent's: from the sub-second timestamp
+    /// fork on, execution raises it to the parent's timestamp (`evm_block_timestamp` in
+    /// `crates/tn-reth/src/payload.rs`).
     pub(crate) fn execute_block_at_timestamp(
         &mut self,
         txs: Vec<Vec<u8>>,
@@ -255,10 +283,13 @@ impl PipelineTestEnv {
         // 2. Build TNPayload
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
-        // 3. Build and execute block
-        let anchor_hash = self.canonical_header.hash();
-        let block =
-            self.reth_env.build_block_from_batch_payload(payload, &txs, anchor_hash, &[])?;
+        // 3. Build and execute block. Each block persists in step 5 before the next build,
+        // so a fresh empty overlay per block is exact (#1301).
+        let block = self.reth_env.build_block_from_batch_payload(
+            payload,
+            &txs,
+            &mut tn_reth::OutputTrieOverlay::new(),
+        )?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -332,23 +363,15 @@ impl PipelineTestEnv {
         self.read_precompile_u256(calldata)
     }
 
-    /// Execute a read-only system call to the precompile and decode a U256 result.
+    /// Execute a read-only contract call to the precompile and decode a U256 result.
     fn read_precompile_u256(&self, calldata: Vec<u8>) -> U256 {
         let hash = self.canonical_header.hash();
-        let result = self
+        let bytes = self
             .reth_env
-            .read_contract_state(hash, TELCOIN_PRECOMPILE_ADDRESS, Bytes::from(calldata))
-            .expect("read_contract_state");
-        match result.result {
-            ExecutionResult::Success { output, .. } => match output {
-                Output::Call(bytes) => {
-                    assert!(bytes.len() >= 32, "output too short for U256");
-                    U256::from_be_slice(&bytes[..32])
-                }
-                _ => panic!("unexpected output type"),
-            },
-            other => panic!("expected Success, got {other:?}"),
-        }
+            .read_contract_at_block(hash, TELCOIN_PRECOMPILE_ADDRESS, Bytes::from(calldata))
+            .expect("read contract");
+        assert!(bytes.len() >= 32, "output too short for U256");
+        U256::from_be_slice(&bytes[..32])
     }
 
     /// Check if a transaction in the most recent block succeeded.
@@ -381,7 +404,7 @@ impl PipelineTestEnv {
 /// Create a `ConsensusOutput` with a controlled timestamp.
 ///
 /// Adapted from `lib.rs:1478-1510`.
-fn consensus_output_for_test(
+pub(crate) fn consensus_output_for_test(
     round: u32,
     epoch: u32,
     subdag_index: u64,
@@ -397,13 +420,14 @@ fn consensus_output_for_test(
     leader.update_header_epoch_for_test(epoch);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let sub_dag = Arc::new(CommittedSubDag::new(
+    let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         subdag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     ConsensusOutput::new(
         sub_dag,
         ConsensusHeader::default().digest(),
@@ -412,4 +436,22 @@ fn consensus_output_for_test(
         VecDeque::new(),
         Vec::new(),
     )
+}
+
+/// A built block retains no cumulative ancestor trie overlay (#1266).
+///
+/// No consumer on the node's path reads `anchored_trie_input`: persistence and
+/// canonical-chain notifications use the per-block sorted deltas, and state roots and
+/// RPC proofs over unpersisted blocks assemble their trie input from those same deltas.
+/// Building the cumulative overlay cost `O(N^2 * M)` copy work and transient memory per
+/// consensus output, because reth's parent-reuse fast path deep-copies it for every
+/// block whose parent bundle is still alive.
+#[test]
+fn test_built_block_retains_no_cumulative_trie_overlay() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let first = env.execute_block(Vec::new())?;
+    let second = env.execute_block(Vec::new())?;
+    assert!(first.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    assert!(second.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    Ok(())
 }

@@ -1,11 +1,13 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
+use tn_reth::{
+    recover_raw_transaction, recover_signed_transaction, RethEnv, TxPool as _, WorkerTxPool,
+};
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
+    batch_allowlisted_tx_type, max_batch_gas, max_batch_size, BatchValidation,
     BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
-    WorkerId,
+    TxHash, Typed2718 as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -24,8 +26,11 @@ pub struct BatchValidator {
     tx_pool: Option<WorkerTxPool>,
     /// Worker id for this validator.
     worker_id: WorkerId,
-    /// Current base fee for this validators worker.
-    base_fee: BaseFeeContainer,
+    /// Base fee for this validator's worker for the current epoch.
+    ///
+    /// Base fee is constant within an epoch and the validator is recreated each epoch, so this is
+    /// a plain `u64` snapshot taken at epoch start rather than a shared container.
+    base_fee: u64,
     /// Epoch we are validating for.
     epoch: Epoch,
 }
@@ -34,6 +39,10 @@ impl BatchValidation for BatchValidator {
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
+    ///
+    /// On success (and only on success) the batch's transaction hashes are recorded in the
+    /// worker pool's deferral window, so this node's batch builder skips them while the peer
+    /// batch is in flight (issue #1329). A node without a pool (an observer) records nothing.
     fn validate_batch(&self, sealed_batch: SealedBatch) -> BatchValidationResult<()> {
         // ensure digest matches batch
         let (batch, digest) = sealed_batch.split();
@@ -67,8 +76,8 @@ impl BatchValidation for BatchValidator {
         // validate txs decode
         let decoded_txs = self.decode_transactions(transactions, digest)?;
 
-        // validate no txs are eip4844
-        self.validate_no_blob_txs(&decoded_txs)?;
+        // validate every tx type is on the executable allowlist
+        self.validate_tx_type_allowlist(&decoded_txs)?;
 
         // validate gas limit
         // Use the parent timestamp for consistency with the batch builder.
@@ -76,6 +85,16 @@ impl BatchValidation for BatchValidator {
 
         // validate base fee- all batches for a worker and epoch have the same base fee.
         self.validate_basefee(batch.base_fee_per_gas)?;
+
+        // the batch is valid: remember its transactions so this node's own builder does not pack
+        // a copy of something a peer is already proposing (issue #1329). Recording happens only
+        // after every check passes, so an invalid batch never defers anything, and the deferral
+        // expires on its own (see `PEER_BATCH_DEFER_TTL`) if the peer batch is abandoned.
+        if let Some(pool) = &self.tx_pool {
+            let hashes: Vec<TxHash> = decoded_txs.iter().map(|tx| *tx.hash()).collect();
+            pool.record_peer_batch(&hashes);
+        }
+
         Ok(())
     }
 
@@ -110,7 +129,7 @@ impl BatchValidator {
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
         worker_id: WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Self {
         Self { reth_env, tx_pool, worker_id, base_fee, epoch }
@@ -184,7 +203,7 @@ impl BatchValidator {
 
     /// Validate the block's basefee
     fn validate_basefee(&self, base_fee: u64) -> BatchValidationResult<()> {
-        let expected_base_fee = self.base_fee.base_fee();
+        let expected_base_fee = self.base_fee;
         if base_fee != expected_base_fee {
             Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee })
         } else {
@@ -192,15 +211,26 @@ impl BatchValidator {
         }
     }
 
-    /// Validate the block's basefee
-    fn validate_no_blob_txs(
+    /// Validate every transaction's EIP-2718 type is on the executable allowlist.
+    ///
+    /// The protocol admits only legacy, EIP-2930, and EIP-1559 envelopes in batches,
+    /// uniformly across chain configurations; the batch builder and the worker gateway
+    /// enforce the same `batch_allowlisted_tx_type` predicate on the producing side.
+    /// EIP-4844 keeps its dedicated error for continuity with existing peer penalties;
+    /// any other decodable type (EIP-7702 today) maps to `UnsupportedTxType`. A type
+    /// byte outside the envelope's decodable set never reaches this check: it fails
+    /// transaction decode first and surfaces as `RecoverTransaction`.
+    fn validate_tx_type_allowlist(
         &self,
         transactions: &[TransactionSigned],
     ) -> BatchValidationResult<()> {
-        if let Some(blob_tx) = transactions.iter().find(|tx| tx.is_eip4844()) {
-            return Err(BatchValidationError::InvalidTx4844(*blob_tx.hash()));
-        }
-        Ok(())
+        transactions.iter().find(|tx| !batch_allowlisted_tx_type(*tx)).map_or(Ok(()), |tx| {
+            if tx.is_eip4844() {
+                Err(BatchValidationError::InvalidTx4844(*tx.hash()))
+            } else {
+                Err(BatchValidationError::UnsupportedTxType { tx_type: tx.ty(), hash: *tx.hash() })
+            }
+        })
     }
 
     /// Helper function for decoding and recovering transactions.
@@ -234,9 +264,11 @@ mod tests {
     use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_test_utils::wait_until;
     use tn_types::{
-        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
-        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::BaseFeeContainer, max_batch_gas, test_genesis, Address, Batch, Bytes,
+        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Return the next valid sealed batch
@@ -303,9 +335,9 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
-        let tx_pool = reth_env.init_txn_pool().unwrap();
+        let tx_pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         let validator =
-            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, BaseFeeContainer::default(), 0);
+            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
         let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
@@ -327,6 +359,37 @@ mod tests {
         let different_block = batch.seal_slow();
         let result = validator.validate_batch(different_block);
         assert!(result.is_ok());
+    }
+
+    /// Each worker accepts its own otherwise-valid batch and rejects every other worker's batch.
+    #[tokio::test]
+    async fn test_multi_worker_batch_validation_isolation() -> std::io::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        (0..3).for_each(|validator_worker| {
+            let validator = BatchValidator { worker_id: validator_worker, ..validator.clone() };
+            (0..3).for_each(|batch_worker| {
+                // Reseal after changing the ID so a digest mismatch cannot mask the worker check.
+                let batch = Batch { worker_id: batch_worker, ..batch.clone() }.seal_slow();
+                let result = validator.validate_batch(batch);
+                if validator_worker == batch_worker {
+                    assert!(result.is_ok(), "worker {validator_worker}: {result:?}");
+                } else {
+                    assert_matches!(
+                        result,
+                        Err(BatchValidationError::InvalidWorkerId {
+                            expected_worker_id,
+                            worker_id,
+                        }) if expected_worker_id == validator_worker && worker_id == batch_worker
+                    );
+                }
+            });
+        });
+        Ok(())
     }
 
     //#[tokio::test]
@@ -663,6 +726,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_invalid_tx_eip7702() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // eip7702 set-code transaction carrying a signed authorization, so the
+        // only invalid thing about the envelope is its type byte
+        let mut tx_factory = TransactionFactory::new_random();
+        let signed_tx =
+            tx_factory.create_eip7702(validator.reth_env.chainspec().chain_id(), None, 7);
+
+        // test batch with eip7702 tx
+        batch.transactions = vec![signed_tx.encoded_2718()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::UnsupportedTxType { tx_type: 4, hash: _ })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_batch_legacy_and_eip2930() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // positive control for the admit direction of the allowlist: the valid
+        // fixture already proves EIP-1559, so cover legacy and EIP-2930
+        let mut tx_factory = TransactionFactory::new_random();
+        let chain_id = validator.reth_env.chainspec().chain_id();
+        let legacy_tx = tx_factory
+            .create_explicit_legacy_tx(
+                Some(chain_id),
+                None,
+                None,
+                None,
+                Some(Address::ZERO),
+                None,
+                None,
+            )
+            .encoded_2718();
+        let eip2930_tx = tx_factory.create_eip2930(chain_id, None, 7, Address::ZERO).encoded_2718();
+        batch.transactions = vec![legacy_tx, eip2930_tx];
+
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+    }
+
     /// Compute the committee slot a sender address would be routed to.
     fn compute_sender_slot(address: &Address, committee_size: u64) -> u64 {
         let mut bytes = [0_u8; 8];
@@ -671,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_routes_to_correct_slot() {
+    async fn test_submit_txn_if_mine_routes_to_correct_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -693,12 +808,13 @@ mod tests {
         validator.submit_txn_if_mine(&encoded, committee_size, expected_slot);
 
         // Poll for the spawned task to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for tx in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 1)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 1);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -730,7 +846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_same_sender_same_slot() {
+    async fn test_submit_txn_if_mine_same_sender_same_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -754,12 +870,13 @@ mod tests {
         }
 
         // Poll for all 3 spawned tasks to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending < 3 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for txs in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 3)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 3);
+
+        Ok(())
     }
 
     #[test]

@@ -73,3 +73,130 @@ Consensus headers have to be retrieved in "reverse" from a newer hash backwards 
   - This can be done in parallel (as epoch records come in for instance)
   - Once the latest committee is known then the node can download the latest output as it received
 - Once an unbroken chain of consensus output has been retrieved then start executing it in order to create the execution chain.
+
+## Bootstrapping From a State Snapshot (Export / Import)
+
+The metadata chains above let a node sync trustlessly from genesis, but re-executing every epoch's
+consensus output to rebuild the execution state is expensive for a node joining an established network.
+As an alternative, a running node can periodically **export** its final execution state together with
+the consensus/epoch metadata as a portable **bundle**, and a fresh node can **import** that bundle to
+start near the network tip and then sync *forward* using the same metadata-chain mechanisms above.
+
+The snapshot narrows what must be re-derived rather than replacing the trust model:
+- The **epoch records** in the bundle are re-verified on import against the genesis committee, exactly
+  as in the trustless flow — each record's certificate is checked and the committee is chained forward
+  from epoch 0. A tampered record chain is rejected.
+- The **consensus pack** for the snapshot epoch is rebuilt and its final header is checked against the
+  (certificate-verified) epoch record's final consensus hash.
+- The **execution state** is rebuilt from the bundle and bound to the same certificate chain. Its state
+  root is recomputed from scratch as it is stored and must match both the root the pack declares and the
+  `state_root` of the snapshot block, whose hash comes from the (certificate-verified) epoch record's
+  final execution state. The ancestor headers shipped with it must be parent-hash linked up to that
+  block, so the same certificate pins them too. What the bundle's producer still picks unchecked is how
+  far back the header window reaches: a short window is accepted, and blocks below it are scaffolded
+  with zero hashes, so `BLOCKHASH` at those heights reads zero on the restored node.
+
+### The export bundle
+
+With `--enable-state-export`, at each epoch boundary the node attempts to write a bundle for the
+just-closed epoch to `consensus-db/state_exports/epoch-{N}/` (atomically — the directory only appears
+once the export is complete) containing four files:
+- `state_data` — the EVM state at the epoch's final block (accounts, storage, bytecode, block headers).
+- `consensus_data` — the closed epoch's consensus pack (`data` stream).
+- `epoch_records` — the epoch-records pack (`epochs.pack`).
+- `epoch_certs` — the epoch-certificates pack, which lets the importer verify the records.
+
+The just-closed (tip) epoch's certificate is not aggregated until the next epoch starts (see The Epoch
+Chain above), so at export time the node waits up to 90 s for it and **skips the bundle** if it has not
+arrived (the next epoch's boundary attempts a fresh export instead — a skipped epoch is not retried).
+A bundle is therefore only written once the tip epoch's certificate exists, and on import **every**
+epoch — including the tip — is fully verified against its certificate; a bundle missing any
+certificate is rejected.
+
+### 1. Enabling export on a running node
+
+Add the `--enable-state-export` flag to the `node` command (it is a flag on the `node` command, not a
+top-level CLI global like `--datadir`):
+
+```
+telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
+  --datadir DATADIR --enable-state-export --state-export-keep 2
+```
+
+A `DATADIR/consensus-db/state_exports/epoch-{N}/` directory appears only for epochs whose export
+succeeds — not every epoch produces one. The epoch must be certificate-complete (every epoch `0..=N`
+has its certificate) and fee-resumable, and an export is skipped for several reasons (a still-pending
+tip certificate, an un-resumable snapshot, or a transient I/O error). Watch the `tn::snapshot` log
+target to see which epochs were exported or skipped.
+
+`--state-export-keep N` retains the newest `N` completed bundles, deleting older completed bundles
+after a successful export and when an export-enabled node starts. `N` must be at least 1; omitting
+the option preserves unlimited retention. The option has no effect without `--enable-state-export`.
+Cleanup failures are logged and retried on later passes, so filesystem errors can leave more than
+`N` bundles. A late-finishing export is skipped if `N` newer completed bundles already exist.
+Use `N >= 2` to keep a previous bundle available during overlapping exports. `N = 1` is valid, but an
+overlapping export may need to rebuild its records and certificates if pruning removes its previous
+bundle before it is opened.
+
+Each completed bundle contains a full execution-state copy for its epoch. Retention limits the
+number of bundles, not their size, and a temporary export also needs space while it is written.
+Unlimited retention can fill the data volume as the state and the number of exports grow. Monitor
+free space even with a finite limit. The `tn_state_export_completed_bundles` gauge reports the
+completed bundle count observed by retention maintenance.
+
+Copy the `epoch-{N}` directory you want to bootstrap from outside `consensus-db/state_exports/`
+before the next pruning pass, then transfer that copy to the new node's machine. Bundles left under
+the export root can be deleted by retention while a copy or import is in progress.
+
+### 2. Initializing a new node from a bundle
+
+Into a **fresh** datadir (the importer refuses one that already holds reth chain data), load the bundle:
+
+```
+telcoin-network db load-state /path/to/epoch-N --chain adiri --datadir NEW_DATADIR
+```
+
+`--chain` selects the genesis and genesis committee (the trust root) and must match the network the
+bundle came from. `db load-state`:
+- verifies the bundle's entire epoch-record certificate chain against the genesis committee first,
+  in memory, before it writes any chain data — so a bundle from the wrong network, or with a forged
+  certificate, a broken parent link, or a missing certificate, is refused in seconds rather than
+  after the state import has already run,
+- restores the execution state into a new reth database,
+- rebuilds the fully-indexed epoch-records and consensus packs, re-verifying every record against
+  its certificate as they are persisted, and
+- writes the consensus "latest" slot hint so a restart resumes at epoch N.
+
+### 3. Starting the node
+
+Start the node normally against the same datadir (configured with keys/identity as usual — the import
+only adds chain state):
+
+```
+telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
+  --datadir NEW_DATADIR
+```
+
+Node role is derived from committee membership, including after an import. A key outside the current
+committee runs as an observer without any role flag. `--observer` is deprecated and ignored; to take
+a validator out of consensus, exit it on chain.
+
+On startup the node reads the slot hint, opens epoch N's consensus pack, and begins syncing *forward*
+from epoch N — downloading and verifying newer epoch records and consensus output via the metadata
+chains above — instead of replaying from genesis.
+
+### Caveats
+
+- Epoch 0: a bundle taken at the end of epoch 0 restores state and records but not an epoch-0 consensus
+  pack (reconstructing it needs a pre-epoch-0 genesis descriptor the bundle does not carry), so no
+  resume hint is written. Bootstrap from a later epoch.
+- The target datadir must be fresh, all four bundle files must be present, and `--chain` must match the source network.
+- If an import fails it removes only the chain-data directories it created (`db`, `static_files`, `consensus-db`) and leaves your keys and config intact. Never delete the whole datadir (it holds your node keys) — just fix the bundle and re-run.
+- If an import is *killed* rather than failed (SIGKILL, OOM, power loss), that cleanup never runs, so
+  partially written `db`, `static_files`, and `consensus-db` directories are left behind and the next
+  attempt refuses the datadir as non-empty. The remedy is the same surgical one the failure path
+  performs: remove those three directories under the datadir — never the datadir itself, which holds
+  your keys — and re-run. A bundle rejected during the pre-import certificate check creates none of
+  those three directories, so this only applies to a run that was killed after the import started.
+  (`--chain` still materializes `genesis/committee.yaml` if it is absent, since that file is the
+  trust root the check reads; it is config, not chain data, and re-running is unaffected by it.)

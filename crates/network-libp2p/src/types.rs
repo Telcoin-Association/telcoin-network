@@ -7,17 +7,15 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
-    request_response::ResponseChannel,
-    Multiaddr, PeerId, Stream, TransportError,
+    request_response::ResponseChannel as Libp2pResponseChannel,
+    Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+use tn_types::{BlsPublicKey, NetworkPublicKey, P2pNode};
+// Re-export the shared RPC endpoint type so callers can keep referring to
+// `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
+pub use tn_types::RpcInfo;
 use tokio::sync::{mpsc, oneshot};
-
-#[cfg(test)]
-#[path = "tests/types.rs"]
-mod network_types;
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -46,12 +44,113 @@ pub trait IntoRpcError<E> {
     fn into_error(error: E) -> Self;
 }
 
-/// The topic for NVVs to subscribe to for published worker batches.
-pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
-/// The topic for NVVs to subscribe to for published primary certificates.
-pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
-/// The topic for NVVs to subscribe to for published consensus chain.
-pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
+pub use tn_node_record::NetworkType;
+
+/// The [`StreamProtocol`] forms of the per-role, chain-namespaced wire-protocol
+/// names [`NetworkType`] builds.
+///
+/// The names live in `tn-node-record` (returned as `String`) so a read-only
+/// client can negotiate kad without this crate; these wrappers keep the
+/// node-side call sites on a [`NetworkResult`] so a malformed name surfaces as a
+/// [`NetworkError`] rather than a panic.
+pub(crate) trait NetworkTypeExt {
+    /// Request-response wire protocol. See [`NetworkType::req_res_protocol_name`].
+    fn req_res_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+
+    /// Kademlia wire protocol. See [`NetworkType::kad_protocol_name`].
+    fn kad_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+
+    /// Bulk-sync streaming wire protocol. See [`NetworkType::sync_protocol_name`].
+    ///
+    /// The stream behaviour registers this as its sole upgrade; the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams negotiated
+    /// with this protocol.
+    fn sync_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+
+    /// Peer-exchange goodbye wire protocol. See [`NetworkType::peer_exchange_protocol_name`].
+    ///
+    /// A dedicated request-response protocol for the [`PeerExchangeMap`](crate::PeerExchangeMap)
+    /// a node shares when it gracefully disconnects. Goodbyes prefer this protocol and fall
+    /// back to the variant embedded in the consensus request enums when the peer has not
+    /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
+    fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+}
+
+impl NetworkTypeExt for NetworkType {
+    fn req_res_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.req_res_protocol_name(chain_id))
+    }
+
+    fn kad_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.kad_protocol_name(chain_id))
+    }
+
+    fn sync_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.sync_protocol_name(chain_id))
+    }
+
+    fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.peer_exchange_protocol_name(chain_id))
+    }
+}
+
+/// The chain-namespaced stream protocol a node advertises on the stream
+/// behaviour: the per-role sync protocol the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer rides on. It carries the chain id,
+/// so the stream subsystem isolates chains the same way req-res and kad do.
+pub(crate) fn stream_protocol(
+    network_type: NetworkType,
+    chain_id: u64,
+) -> NetworkResult<StreamProtocol> {
+    network_type.sync_protocol(chain_id)
+}
+
+pub use tn_node_record::gossip_protocol_id_prefix;
+
+/// Build an owned [`StreamProtocol`] from a runtime name, surfacing a malformed
+/// name (one that does not start with `/`) as a [`NetworkError`] instead of a panic.
+///
+/// The names this crate builds are always well formed, so the error path is not
+/// expected to fire; returning a result keeps the construction panic-free.
+fn owned_protocol(name: String) -> NetworkResult<StreamProtocol> {
+    StreamProtocol::try_from_owned(name).map_err(|e| NetworkError::ProtocolError(e.to_string()))
+}
+
+/// A channel for sending the response to an inbound RPC, bound to the peer that
+/// opened the exchange.
+///
+/// This is the crate-owned equivalent of libp2p's
+/// [`ResponseChannel`](libp2p::request_response::ResponseChannel): it wraps the
+/// same response sink but also carries the [`PeerId`] captured when the inbound
+/// request was accepted, so the requesting peer's identity travels with the
+/// channel instead of being re-derived from a side map at response time. Keeping the
+/// type crate-owned also keeps libp2p's request-response types out of the public
+/// API, so a libp2p upgrade does not ripple into the consumer crates.
+#[derive(Debug)]
+pub struct ResponseChannel<Res> {
+    /// The peer that opened this exchange.
+    peer_id: PeerId,
+    /// The underlying libp2p response sink.
+    inner: Libp2pResponseChannel<Res>,
+}
+
+impl<Res> ResponseChannel<Res> {
+    /// Bind a libp2p response channel to the peer that opened the exchange.
+    pub(crate) fn new(peer_id: PeerId, inner: Libp2pResponseChannel<Res>) -> Self {
+        Self { peer_id, inner }
+    }
+
+    /// The peer that opened this exchange.
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Consume the wrapper, returning the underlying libp2p response sink so the
+    /// swarm task can deliver the response.
+    pub(crate) fn into_inner(self) -> Libp2pResponseChannel<Res> {
+        self.inner
+    }
+}
 
 /// Events created from network activity.
 #[derive(Debug)]
@@ -67,20 +166,51 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received and propagation source.
-    Gossip(GossipMessage, BlsPublicKey),
+    /// Gossip message received, with the relaying peer's and the author's BLS identities
+    /// when they have resolved.
+    ///
+    /// Both identities are `Option` because a peer is `Connected` — and can relay or author
+    /// gossip — before its signed `NodeRecord` (which carries the BLS key) has been resolved.
+    /// The payload is delivered regardless, because the message author is already authenticated
+    /// during gossip verification; the identities are used only for penalty attribution and a
+    /// log label, never for the payload itself.
+    ///
+    /// `relayer` (the forwarding `propagation_source`) and `author` (the publishing
+    /// `GossipMessage::source`) are distinct peers, and charging a content fault to the wrong
+    /// one bans honest peers (see issues #801/#819); they are named rather than positional so
+    /// the two cannot be transposed.
+    ///
+    /// The payload is boxed as [`GossipPayload`] so this variant does not size the whole enum.
+    Gossip(Box<GossipPayload>),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
     ///
-    /// The application is responsible for reading any correlation data
-    /// (e.g. request digest) from the raw stream.
+    /// Every stream negotiates the per-role sync protocol and carries the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer, with the request in its first
+    /// frame.
     InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
         /// The established raw p2p stream for reading data.
         stream: Stream,
     },
+}
+
+/// Boxed payload of [`NetworkEvent::Gossip`].
+///
+/// Held behind a `Box` in the variant so `NetworkEvent` is not sized to two inline
+/// `BlsPublicKey`s (288 B each); that indirection is what lets `NetworkEvent` carry no
+/// `#[allow(clippy::large_enum_variant)]`. See [`NetworkEvent::Gossip`] for the relayer
+/// and author identity semantics.
+#[derive(Debug)]
+pub struct GossipPayload {
+    /// The gossip message payload.
+    pub message: GossipMessage,
+    /// BLS identity of the relaying peer (`propagation_source`), when resolved.
+    pub relayer: Option<BlsPublicKey>,
+    /// BLS identity of the message author (`GossipMessage::source`), when resolved.
+    pub author: Option<BlsPublicKey>,
 }
 
 // ============================================================================
@@ -216,6 +346,13 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
+    /// Unsubscribe from a topic.
+    Unsubscribe {
+        /// The topic to unsubscribe from.
+        topic: String,
+        /// The reply to caller: true if this node was subscribed.
+        reply: oneshot::Sender<bool>,
+    },
     /// Publish a message to topic subscribers.
     Publish {
         /// The topic to publish the message on.
@@ -230,10 +367,15 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
     },
-    /// Collection of this node's connected peers.
+    /// Peer IDs connected or currently being dialed by the peer manager.
     ConnectedPeerIds {
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Number of established peers available to `SendRequestAny`.
+    EstablishedPeerCount {
+        /// Reply to caller, excluding pending dials.
+        reply: oneshot::Sender<usize>,
     },
     /// Collection of this node's connected peers.
     ConnectedPeers {
@@ -279,9 +421,19 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Start a new epoch.
-    NewEpoch {
-        /// The epoch committee.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    UpdateCommittees {
+        /// The previous epoch committee.
+        previous: HashSet<BlsPublicKey>,
+        /// The current epoch committee.
+        current: HashSet<BlsPublicKey>,
+        /// The next epoch committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
+    /// committee slots.
+    PrepareCommitteeDial {
+        /// The committee whose peers should be unbanned for dialing.
         committee: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
@@ -291,13 +443,28 @@ where
     },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller
-    /// is responsible for writing any correlation data to the stream.
+    /// The open negotiates the per-role sync protocol and the caller writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation is penalty-exempt (honest version/role skew), so
+    /// the caller can retry another peer.
     OpenStream {
         /// The peer to open the stream to.
         peer: BlsPublicKey,
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
+    },
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    GetValidatorRpc {
+        /// The authority's BLS public key.
+        bls_key: BlsPublicKey,
+        /// The reply to caller.
+        reply: oneshot::Sender<Option<RpcInfo>>,
+    },
+    /// Snapshot of the current committee's advertised RPCs; triggers kad discovery
+    /// for members with no known record.
+    GetAllValidatorRpcs {
+        /// The reply to caller.
+        reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
     /// Read a single record from the local kad store by BLS key.
     ///
@@ -448,6 +615,20 @@ where
         res.map_err(Into::into)
     }
 
+    /// Unsubscribe from a topic.
+    ///
+    /// Gossipsub subscriptions live on the process-lifetime swarm, so a topic subscribed for one
+    /// epoch stays subscribed until it is explicitly dropped. This also clears the topic's
+    /// authorized-publisher entry, restoring the "not subscribed here" state that
+    /// `verify_gossip` expects for an absent entry.
+    ///
+    /// Return `true` if this node was subscribed to the topic.
+    pub async fn unsubscribe(&self, topic: String) -> NetworkResult<bool> {
+        let (reply, was_subscribed) = oneshot::channel();
+        self.sender.send(NetworkCommand::Unsubscribe { topic, reply }).await?;
+        Ok(was_subscribed.await?)
+    }
+
     /// Publish a message on a certain topic.
     pub async fn publish(&self, topic: String, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
@@ -455,11 +636,24 @@ where
         published.await?.map_err(Into::into)
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Count peers connected or currently being dialed by the peer manager.
+    ///
+    /// Pending dials may not support requests yet. Use [`Self::established_peer_count`] for
+    /// readiness checks.
     pub async fn connected_peer_count(&self) -> NetworkResult<usize> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
         Ok(peers.await?.len())
+    }
+
+    /// Count established peers in the queue used by [`Self::send_request_any`], excluding dials
+    /// that have not established a connection yet.
+    ///
+    /// This is a snapshot: a peer can disconnect before a subsequent request is sent.
+    pub async fn established_peer_count(&self) -> NetworkResult<usize> {
+        let (reply, count) = oneshot::channel();
+        self.sender.send(NetworkCommand::EstablishedPeerCount { reply }).await?;
+        count.await.map_err(Into::into)
     }
 
     /// Retrieve a collection of connected peers.
@@ -536,9 +730,26 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    pub async fn update_committees(
+        &self,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
+        Ok(())
+    }
+
+    /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
+    /// [`Self::update_committees`].
+    pub async fn prepare_committee_dial(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PrepareCommitteeDial { committee }).await?;
         Ok(())
     }
 
@@ -550,69 +761,53 @@ where
 
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller is
-    /// responsible for writing any application-layer correlation data (e.g.
-    /// request digest) to the stream after it is established.
+    /// The open negotiates the per-role sync protocol; the caller then writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation returns an error without penalizing the peer
+    /// (honest version/role skew), so the caller can retry another peer.
     pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
         rx.await.map_err(Into::into)
     }
-}
 
-/// List of addresses for a node, signature will be the nodes BLS signature
-/// over the addresses to verify they are from the node in question.
-/// Used to publish this to kademlia.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeRecord {
-    /// The network information contained within the record.
-    pub info: NetworkInfo,
-    /// Signature of the info field with the node's BLS key.
-    /// This is part of a kademlia record keyed on a BLS public key
-    /// that can be used for verifiction.  Intended to stop malicious
-    /// nodes from poisoning the routing table.
-    pub signature: BlsSignature,
-}
-
-impl NodeRecord {
-    /// Helper method to build a signed node record.
-    pub fn build<F>(pubkey: NetworkPublicKey, multiaddr: Multiaddr, signer: F) -> NodeRecord
-    where
-        F: FnOnce(&[u8]) -> BlsSignature,
-    {
-        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now() };
-        let data = encode(&info);
-        let signature = signer(&data);
-        Self { info, signature }
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    ///
+    /// Returns `None` if the authority is unknown or has not advertised RPC info.
+    /// Callers that need fresh data should call [`Self::find_authorities`] first
+    /// and wait for discovery to complete.
+    ///
+    /// RPC info is advertised only on worker [`NodeRecord`]s, so this is meaningful
+    /// on a worker network handle; a primary handle always returns `None`. Together
+    /// with [`Self::get_all_validator_rpcs`] this backs a worker gateway: a load
+    /// balancer that discovers validators' advertised worker RPC endpoints and
+    /// routes client traffic across them.
+    pub async fn get_validator_rpc(&self, bls_key: BlsPublicKey) -> NetworkResult<Option<RpcInfo>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetValidatorRpc { bls_key, reply }).await?;
+        rx.await.map_err(Into::into)
     }
 
-    /// Verify if a signature matches the record.
-    pub fn verify(self, pubkey: &BlsPublicKey) -> Option<(BlsPublicKey, NodeRecord)> {
-        let data = encode(&self.info);
-        if self.signature.verify_raw(&data, pubkey) {
-            Some((*pubkey, self))
-        } else {
-            None
-        }
-    }
-
-    /// Return a reference to the record's [NetworkInfo].
-    pub fn info(&self) -> &NetworkInfo {
-        &self.info
+    /// Snapshot of the current committee's advertised RPCs.
+    ///
+    /// Returns the RPC info for every current-committee validator that has
+    /// advertised it. Pinned operator peers and previous/next committee members
+    /// never appear. The call itself (re)triggers kad discovery for current
+    /// members whose node records are still unknown, so a polling caller picks
+    /// up their entries on a later call once the records arrive.
+    ///
+    /// Only worker [`NodeRecord`]s carry RPC info, so this returns entries on a
+    /// worker network handle and an empty list on a primary handle. This is the
+    /// discovery primitive behind a worker gateway that maps client traffic across
+    /// every validator's advertised worker RPC endpoint.
+    pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
     }
 }
 
-/// The network information needed for consensus.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NetworkInfo {
-    /// The node's [NetworkPublicKey].
-    pub pubkey: NetworkPublicKey,
-    /// Network address for node.
-    pub multiaddrs: Vec<Multiaddr>,
-    /// The timestamps when this was published.
-    /// Useful for nodes to compare latest records.
-    pub timestamp: TimestampSec,
-}
+pub use tn_node_record::{NetworkInfo, NodeRecord, RecordDomain};
 
 /// Outbound kad query from this node.
 #[derive(Debug)]

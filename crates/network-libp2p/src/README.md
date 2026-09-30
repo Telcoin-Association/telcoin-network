@@ -4,8 +4,11 @@ The [`ConsensusNetwork`](./consensus.rs) is the main event loop for all network 
 
 ## LibP2P Behaviours
 
-Consensus network currently uses three network behaviors.
-Below is specific information on how they are managed.
+Consensus network currently uses seven network behaviors, in this order:
+peer manager, connection limits, gossipsub, request/response, peer exchange, kademlia, and the sync stream behavior.
+The order matters: the peer manager is first so banned-peer denials short-circuit before any other behavior registers the connection,
+and connection limits are second so an over-cap connection is denied before the remaining behaviors allocate per-peer state for it.
+Below is specific information on how the main three are managed.
 The only supported transport layer is QUIC.
 
 ### Request/Response

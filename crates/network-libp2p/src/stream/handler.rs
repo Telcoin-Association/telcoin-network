@@ -1,21 +1,39 @@
 use libp2p::{
     swarm::{
-        handler::{ConnectionEvent, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-        ConnectionHandler, ConnectionHandlerEvent, SubstreamProtocol,
+        handler::{
+            ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
+        },
+        ConnectionHandler, ConnectionHandlerEvent, StreamUpgradeError, SubstreamProtocol,
     },
-    Stream,
+    Stream, StreamProtocol,
 };
 use std::{
     collections::VecDeque,
+    convert::Infallible,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::oneshot;
 
 use crate::{
     error::NetworkError,
-    stream::upgrade::{StreamError, TNStreamProtocol},
+    stream::upgrade::{StreamError, StreamFailure, TNStreamProtocol},
     types::NetworkResult,
 };
+
+/// Timeout for negotiating a single outbound stream substream.
+///
+/// Enforced by libp2p via [`SubstreamProtocol::with_timeout`]; on expiry the
+/// handler receives a [`StreamUpgradeError::Timeout`].
+pub(crate) const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on outbound opens a single connection handler will buffer before
+/// shedding load. Streams normally drain in a single poll, so a non-trivial
+/// backlog means the peer (or this node) is unhealthy.
+const MAX_PENDING_OUTBOUND: usize = 256;
+
+/// Upper bound on handler-to-behaviour events buffered before shedding load.
+const MAX_HANDLER_EVENTS: usize = 256;
 
 /// Commands from behavior to handler.
 #[derive(Debug)]
@@ -27,6 +45,14 @@ pub(crate) enum HandlerCommand {
     },
 }
 
+/// An in-flight outbound open, carried as the substream's open info so the
+/// handler can answer the caller.
+#[derive(Debug)]
+pub(crate) struct OutboundOpen {
+    /// Channel for returning the established stream (or error) to the caller.
+    reply: oneshot::Sender<NetworkResult<Stream>>,
+}
+
 /// Events from handler to behavior.
 #[derive(Debug)]
 pub(crate) enum StreamHandlerEvent {
@@ -35,6 +61,11 @@ pub(crate) enum StreamHandlerEvent {
         /// The established stream.
         stream: Stream,
     },
+    /// An outbound stream open failed; classified for peer scoring.
+    OutboundFailure {
+        /// The classified failure.
+        failure: StreamFailure,
+    },
 }
 
 /// Connection handler for streaming data.
@@ -42,11 +73,14 @@ pub(crate) enum StreamHandlerEvent {
 /// Manages streams on a single peer connection, processing inbound stream
 /// requests and initiating outbound streams when commanded. Outbound streams
 /// are returned directly to callers via oneshot channels passed through
-/// `OutboundOpenInfo`, bypassing the behavior layer entirely.
-#[derive(Default)]
+/// `OutboundOpenInfo`, bypassing the behavior layer entirely. Open negotiation
+/// is bounded by [`STREAM_OPEN_TIMEOUT`]; failures are classified and reported
+/// to the behaviour for scoring.
 pub(crate) struct StreamHandler {
-    /// Pending outbound stream reply channels.
-    pending_outbound: VecDeque<oneshot::Sender<NetworkResult<Stream>>>,
+    /// The chain-namespaced per-role sync protocol advertised on this connection.
+    sync: StreamProtocol,
+    /// Pending outbound opens.
+    pending_outbound: VecDeque<OutboundOpen>,
     /// Events to send to the behavior.
     events: VecDeque<StreamHandlerEvent>,
 }
@@ -61,9 +95,37 @@ impl std::fmt::Debug for StreamHandler {
 }
 
 impl StreamHandler {
-    /// Create a new stream handler.
-    pub(crate) fn new() -> Self {
-        Self { pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    /// Create a new stream handler advertising the per-role sync protocol on
+    /// this connection.
+    pub(crate) fn new(sync: StreamProtocol) -> Self {
+        Self { sync, pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    }
+
+    /// The upgrade this handler advertises: the per-role sync protocol, for both
+    /// inbound listens and outbound opens.
+    fn listen_upgrade(&self) -> TNStreamProtocol {
+        TNStreamProtocol::new(self.sync.clone())
+    }
+
+    /// Queue an event to the behaviour, dropping it if the buffer is saturated.
+    fn push_event(&mut self, event: StreamHandlerEvent) {
+        if self.events.len() < MAX_HANDLER_EVENTS {
+            self.events.push_back(event);
+        }
+    }
+}
+
+/// Classify an outbound upgrade error into a scoring failure plus the
+/// caller-facing error returned through the open's oneshot.
+fn classify_outbound(error: StreamUpgradeError<Infallible>) -> (StreamFailure, StreamError) {
+    match error {
+        StreamUpgradeError::Timeout => (StreamFailure::Timeout, StreamError::Timeout),
+        StreamUpgradeError::NegotiationFailed => {
+            (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
+        }
+        StreamUpgradeError::Io(e) => (StreamFailure::Io(e.kind()), StreamError::UpgradeIo),
+        // `TNStreamProtocol`'s upgrade error is `Infallible`, so `Apply` is unconstructable.
+        StreamUpgradeError::Apply(infallible) => match infallible {},
     }
 }
 
@@ -73,16 +135,20 @@ impl ConnectionHandler for StreamHandler {
     type InboundProtocol = TNStreamProtocol;
     type OutboundProtocol = TNStreamProtocol;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = oneshot::Sender<NetworkResult<Stream>>;
+    type OutboundOpenInfo = OutboundOpen;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(TNStreamProtocol, ())
+        SubstreamProtocol::new(self.listen_upgrade(), ())
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
             HandlerCommand::OpenStream { reply } => {
-                self.pending_outbound.push_back(reply);
+                if self.pending_outbound.len() >= MAX_PENDING_OUTBOUND {
+                    let _ = reply.send(Err(NetworkError::Stream(StreamError::TooManyPending)));
+                } else {
+                    self.pending_outbound.push_back(OutboundOpen { reply });
+                }
             }
         }
     }
@@ -102,19 +168,32 @@ impl ConnectionHandler for StreamHandler {
                 protocol: stream,
                 ..
             }) => {
-                self.events.push_back(StreamHandlerEvent::InboundStream { stream });
+                self.push_event(StreamHandlerEvent::InboundStream { stream });
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: stream,
-                info: reply,
+                info: OutboundOpen { reply },
                 ..
             }) => {
-                // Return the stream directly to the caller via oneshot
+                // Return the stream directly to the caller via oneshot. The
+                // caller chose the protocol, so it already knows the kind.
                 let _ = reply.send(Ok(stream));
             }
-            ConnectionEvent::DialUpgradeError(e) => {
-                // Return the error directly to the caller via oneshot
-                let _ = e.info.send(Err(NetworkError::Stream(StreamError::UpgradeFailed)));
+            ConnectionEvent::DialUpgradeError(DialUpgradeError {
+                info: OutboundOpen { reply },
+                error,
+            }) => {
+                // Return the error to the caller, which drives its retry.
+                let (failure, stream_error) = classify_outbound(error);
+                let _ = reply.send(Err(NetworkError::Stream(stream_error)));
+                // An open that fails negotiation only means the peer does not
+                // speak the sync protocol yet: honest version/role skew, like a
+                // request-response `UnsupportedProtocols`, so the probe is
+                // penalty-exempt. Every other failure is still reported.
+                let penalty_exempt_probe = matches!(failure, StreamFailure::UnsupportedProtocol);
+                if !penalty_exempt_probe {
+                    self.push_event(StreamHandlerEvent::OutboundFailure { failure });
+                }
             }
             _ => {}
         }
@@ -135,13 +214,39 @@ impl ConnectionHandler for StreamHandler {
             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
         }
 
-        // Request outbound streams
-        if let Some(reply) = self.pending_outbound.pop_front() {
+        // Request outbound streams, bounding negotiation with a timeout. The open
+        // advertises the per-role sync protocol (or fails negotiation).
+        if let Some(open) = self.pending_outbound.pop_front() {
+            let upgrade = TNStreamProtocol::new(self.sync.clone());
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(TNStreamProtocol, reply),
+                protocol: SubstreamProtocol::new(upgrade, open).with_timeout(STREAM_OPEN_TIMEOUT),
             });
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_outbound;
+    use crate::stream::upgrade::{StreamError, StreamFailure};
+    use libp2p::swarm::StreamUpgradeError;
+    use std::io;
+
+    /// Outbound upgrade errors map to the right scoring failure and caller error.
+    #[test]
+    fn classify_outbound_maps_upgrade_errors() {
+        let (failure, error) = classify_outbound(StreamUpgradeError::Timeout);
+        assert!(matches!(failure, StreamFailure::Timeout));
+        assert!(matches!(error, StreamError::Timeout));
+
+        let (failure, error) = classify_outbound(StreamUpgradeError::NegotiationFailed);
+        assert!(matches!(failure, StreamFailure::UnsupportedProtocol));
+        assert!(matches!(error, StreamError::UpgradeFailed));
+
+        let (failure, error) = classify_outbound(StreamUpgradeError::Io(io::Error::other("boom")));
+        assert!(matches!(failure, StreamFailure::Io(_)));
+        assert!(matches!(error, StreamError::UpgradeIo));
     }
 }

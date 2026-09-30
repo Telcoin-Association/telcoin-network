@@ -3,34 +3,64 @@
 // unused deps lint confusion
 #![allow(unused_crate_dependencies)]
 
+mod multi_worker;
+
+use jsonrpsee::core::server::{Methods, MethodsError};
 use rand::{rngs::StdRng, SeedableRng as _};
+use serde_json::{json, Value as JsonValue};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
 use tempfile::TempDir;
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, WORKER_CONFIGS_ADDRESS};
 use tn_engine::ExecutorEngine;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
-use tn_node::catchup_accumulator;
+use tn_node::{
+    build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
+    sync_num_workers_from_chain, EngineToPrimaryRpc,
+};
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
     network::PrimaryNetworkHandle,
     ConsensusBus,
 };
-use tn_reth::{test_utils::seeded_genesis_from_random_batches, RethChainSpec};
+use tn_reth::{
+    payload::TNPayload,
+    system_calls::WorkerConfigs,
+    test_utils::{
+        create_committee_from_state, execute_payload_and_update_canonical_chain,
+        governance_burn_tx, governance_owner_factory, plant_finalized_marker,
+        read_worker_config_entries_at, seeded_genesis_from_random_batches,
+        test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
+        TransactionFactory,
+    },
+    ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
+};
+use tn_rpc::{
+    EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
+};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    adiri_genesis,
+    forks::subsecond_timestamp_active,
+    gas_accumulator::{
+        compute_next_base_fee_eip1559, next_base_fee_for_config, GasAccumulator, WorkerFeeConfig,
+    },
+    test_chain_spec_arc, Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate,
+    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochSeedChainValue, ExecHeader,
+    GenesisAccount, Multiaddr, Notifier, ReputationScores, SealedHeader,
+    SignatureVerificationState, SolCall as _, TaskManager, TimestampMs, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
+use tn_worker::WorkerNetworkHandle;
 use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
@@ -69,7 +99,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -90,11 +120,12 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -147,7 +178,18 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+
+    // Base fees are owned by the epoch entry seeding, not catchup: the container keeps its MIN
+    // default (which IS the committee value for epoch 0 - fees only move at the first close).
+    assert_eq!(
+        recovered.base_fee(worker_id).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "catchup rebuilds gas stats and leader counts only - fees keep the epoch-0 MIN default",
+    );
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
@@ -169,6 +211,551 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
     assert_eq!(expected, recovered.rewards_counter().get_address_counts());
 
+    // Simulate a pre-fix database: rewind the persisted finalized marker to a mid-chain header
+    // and seed the watches to match, as if this node restarted on a database written by a
+    // version that committed blocks and the marker in separate transactions and died between
+    // them. Current versions commit both atomically, so only a pre-fix database presents this
+    // lag.
+    let tip_header = reth_env.finalized_header()?.expect("live run finalized the tip");
+    let rewind_to =
+        reth_env.sealed_header_by_number(tip_header.number / 2)?.expect("mid-chain header exists");
+    plant_finalized_marker(&reth_env, rewind_to.clone())?;
+    let stale = reth_env.finalized_header()?.expect("rewound finalized header");
+    assert_eq!(stale.number, rewind_to.number, "precondition: the marker lags the tip");
+
+    // startup's heal advances the marker back to the persisted tip...
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, tip_header.number, "heal restores the marker to the tip");
+    assert_eq!(healed.hash(), tip_header.hash(), "healed marker carries the tip's hash");
+
+    // ...so a fresh catchup rebuilds the gap rounds' gas AND leader counts in full: identical
+    // to the live accumulator, with the leader bound coming from the healed tip's nonce
+    let healed_recovery = GasAccumulator::new(1);
+    healed_recovery.rewards_counter().set_committee(fixture.committee());
+    catchup_accumulator(reth_env.clone(), &healed_recovery, &mut consensus_chain, canonical_epoch)
+        .await?;
+    assert_eq!(gas_accumulator.get_values(worker_id), healed_recovery.get_values(worker_id));
+    assert_eq!(expected, healed_recovery.rewards_counter().get_address_counts());
+
+    Ok(())
+}
+
+/// No-op [`EngineToPrimary`] for tests that only need worker components initialized.
+///
+/// These methods back the `tn` RPC namespace, which `initialize_worker_components` registers but
+/// never calls during setup (and these tests never issue RPC requests), so the bodies are
+/// `unreachable!`.
+struct NoopEngineToPrimary;
+
+impl EngineToPrimary for NoopEngineToPrimary {
+    fn get_latest_consensus_block(&self) -> ConsensusHeader {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    async fn epoch(
+        &self,
+        _epoch: Option<Epoch>,
+        _hash: Option<EpochDigest>,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    async fn consensus_header_by_digest(
+        &self,
+        _epoch: Epoch,
+        _digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    fn node_info(&self) -> &RpcNodeInfo {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    fn node_mode(&self) -> tn_types::NodeMode {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+}
+
+/// `EngineToPrimaryRpc::consensus_header_by_digest` finds a stored header by (epoch, digest) and
+/// answers `None` for a digest the epoch never stored or an epoch whose pack this node lacks.
+#[tokio::test]
+async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("test_consensus_header_by_digest")?;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // store one header in the current epoch's pack
+    let number = consensus_chain.latest_consensus_number() + 1;
+    let leader = Certificate::default();
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    consensus_chain.write_subdag_for_test(number, sub_dag).await;
+    let stored =
+        consensus_chain.consensus_header_by_number(number).await?.expect("header was just stored");
+    let epoch = stored.sub_dag.leader_epoch();
+
+    let rpc = engine_to_primary_rpc(
+        &config,
+        &consensus_bus,
+        &consensus_chain,
+        "consensus header by digest test",
+    );
+
+    let found = rpc
+        .consensus_header_by_digest(epoch, stored.digest())
+        .await
+        .expect("stored header is found by its epoch and digest");
+    assert_eq!(found.digest(), stored.digest());
+    assert_eq!(found, stored);
+
+    // the digest of the next header, which this chain has not stored
+    let unknown = ConsensusHeader::digest_from_parts(stored.digest(), &stored.sub_dag, number + 1);
+    assert!(rpc.consensus_header_by_digest(epoch, unknown).await.is_none());
+
+    // a known digest routed to an epoch with no pack on disk is a miss, not a panic or a hit
+    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await.is_none());
+
+    Ok(())
+}
+
+/// `tn_getBlockTimestampMillis`, served by the node's own [`EngineToPrimaryRpc`], reports each
+/// execution block's consensus commit time in milliseconds whether the block's consensus header
+/// sits in the sealed (static) pack of a closed epoch or in the current epoch's pack, by block
+/// number and by block hash.
+///
+/// Each execution block references its consensus header through `parent_beacon_block_root` and
+/// names the header's epoch in its nonce (`(epoch << 32) | round`), which routes the pack lookup.
+/// The header the consensus bus publishes as the latest resolves from the bus alone, and a block
+/// whose epoch has no pack on this node is `NotFound`, which clients can tell apart from the
+/// `null` of an unknown block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_block_timestamp_millis_across_static_and_current_packs() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("rpc_block_timestamp_millis")?;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let committee = fixture.committee();
+    let consensus_bus = ConsensusBus::new();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await?;
+    let task_manager = TaskManager::new("rpc block timestamp millis test");
+    let chain = test_chain_spec_arc();
+    let reth_env = RethEnv::new_for_temp_chain(
+        chain.clone(),
+        temp_dir.path().join("reth"),
+        &task_manager,
+        None,
+    )?;
+    let genesis = chain.sealed_genesis_header();
+
+    let static_epoch: Epoch = 0;
+    let current_epoch = static_epoch + 1;
+    let unpacked_epoch = current_epoch + 1;
+
+    // consensus numbers 1-2 fall in the static epoch and 3-4 in the current one; 5 is published
+    // on the bus but held by no pack, and 6 belongs to an epoch this node has no pack for. leaders
+    // are created a few seconds past genesis, each with its own sub-second part
+    let mut parent = ConsensusHeader::default().digest();
+    let mut outputs = Vec::new();
+    for (number, epoch) in [
+        (1, static_epoch),
+        (2, static_epoch),
+        (3, current_epoch),
+        (4, current_epoch),
+        (5, current_epoch),
+        (6, unpacked_epoch),
+    ] {
+        let created_at_ms = (genesis.timestamp + number) * 1000 + number * 111;
+        let output = millis_consensus_output(epoch, number, parent, created_at_ms);
+        parent = output.consensus_header_hash();
+        outputs.push(output);
+    }
+    let (closed, rest) = outputs.split_at(2);
+    let (opened, rest) = rest.split_at(2);
+    let [bus_only, unpacked] = rest else { unreachable!("six outputs") };
+
+    for output in closed {
+        consensus_chain.save_consensus_output(output.clone()).await?;
+    }
+    // opening the next epoch seals the closed epoch's pack, which is then read as a static pack;
+    // the closed epoch's record maps its consensus numbers to that pack
+    let closing = closed.last().expect("the closed epoch has outputs");
+    let closed_record = EpochRecord {
+        epoch: static_epoch,
+        committee: committee.bls_keys().iter().copied().collect(),
+        next_committee: committee.bls_keys().iter().copied().collect(),
+        final_consensus: ConsensusNumHash {
+            number: closing.number(),
+            hash: closing.consensus_header_hash(),
+        },
+        ..Default::default()
+    };
+    consensus_chain
+        .new_epoch(closed_record.clone(), committee.advance_epoch_for_test(current_epoch))
+        .await?;
+    consensus_chain.epochs().save_record(closed_record).await?;
+    for output in opened {
+        consensus_chain.save_consensus_output(output.clone()).await?;
+    }
+    let mut stored = Vec::new();
+    for output in closed.iter().chain(opened) {
+        let header = consensus_chain
+            .consensus_header_by_number(output.number())
+            .await?
+            .expect("saved consensus header reads back");
+        assert_eq!(header.digest(), output.consensus_header_hash());
+        stored.push(header);
+    }
+    for output in [bus_only, unpacked] {
+        let epoch = output.sub_dag().leader_epoch();
+        assert!(
+            consensus_chain
+                .consensus_header_by_digest(epoch, output.consensus_header_hash())
+                .await?
+                .is_none(),
+            "no pack holds consensus output {}",
+            output.number()
+        );
+    }
+
+    // one execution block per consensus output, stamped as the payload builder stamps them
+    let mut blocks = Vec::new();
+    let mut parent_block = genesis;
+    for output in &outputs {
+        let payload = TNPayload::new_for_test(parent_block, output);
+        let executed = execute_payload_and_update_canonical_chain(&reth_env, payload, Vec::new())?;
+        parent_block = executed.recovered_block.clone_sealed_header();
+        assert_eq!(
+            parent_block.parent_beacon_block_root,
+            Some(output.consensus_header_hash().into()),
+            "the block references its consensus header"
+        );
+        assert_eq!(
+            RethEnv::extract_epoch_from_header(&parent_block),
+            output.sub_dag().leader_epoch(),
+            "the block's nonce names its consensus header's epoch"
+        );
+        blocks.push(parent_block.clone());
+    }
+    let [.., bus_only_block, unpacked_block] = blocks.as_slice() else {
+        unreachable!("six blocks")
+    };
+
+    let rpc = engine_to_primary_rpc(
+        &config,
+        &consensus_bus,
+        &consensus_chain,
+        "block timestamp millis test",
+    );
+    // the latest consensus header is the current pack's last, as a validator publishes it once
+    // saved; its block takes the latest-header fast path, which must agree with the pack
+    let latest = stored.last().expect("headers were stored").clone();
+    consensus_bus.app().last_consensus_header().send_replace(Some(latest));
+
+    for by_hash in [false, true] {
+        // a fresh namespace per pass starts with an empty commit-time cache, so both passes
+        // resolve every consensus header rather than replaying the first pass's answers
+        let module = TelcoinNetworkRpcExt::new(reth_env.clone(), rpc.clone()).into_rpc();
+        for (block, header) in blocks.iter().zip(&stored) {
+            let id = if by_hash { json!(block.hash()) } else { json!(block_number_id(block)) };
+            let response = block_timestamp_millis(&module, id).await?;
+            assert_eq!(
+                response,
+                expected_block_timestamp_millis(block, header),
+                "consensus header {} (epoch {}), by hash: {by_hash}",
+                header.number,
+                header.sub_dag.leader_epoch()
+            );
+        }
+    }
+
+    let module = TelcoinNetworkRpcExt::new(reth_env.clone(), rpc.clone()).into_rpc();
+
+    // state sync can publish a header fetched from a peer as the latest while it sits only in
+    // the consensus cache, before a pack holds it. until published no source can answer for its
+    // block; once published the bus alone answers, which shows the lookup consults the latest
+    // header before the packs
+    let bus_only_id = json!(block_number_id(bus_only_block));
+    let unpublished = block_timestamp_millis(&module, bus_only_id.clone()).await;
+    assert!(is_not_found(&unpublished), "no source holds the header yet: {unpublished:?}");
+    let bus_only_header = bus_only.consensus_header();
+    consensus_bus.app().last_consensus_header().send_replace(Some(bus_only_header.clone()));
+    assert_eq!(
+        block_timestamp_millis(&module, bus_only_id).await?,
+        expected_block_timestamp_millis(bus_only_block, &bus_only_header)
+    );
+
+    // the block exists but its consensus header's epoch has no pack here: an error clients can
+    // tell apart from the `null` of an unknown block
+    let result = block_timestamp_millis(&module, json!(block_number_id(unpacked_block))).await;
+    assert!(is_not_found(&result), "a block whose epoch has no local pack: {result:?}");
+
+    Ok(())
+}
+
+/// Consensus output `number` chained to `parent`, whose epoch-`epoch` leader was created at
+/// `created_at_ms`.
+///
+/// Without a previous sub-dag or an epoch commit floor the commit time is the leader's creation
+/// time, which keeps its sub-second part only where the sub-second timestamp fork is active for
+/// `epoch`.
+fn millis_consensus_output(
+    epoch: Epoch,
+    number: u64,
+    parent: ConsensusHeaderDigest,
+    created_at_ms: u64,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    // the epoch goes first: the header builder keeps the sub-second part only for epochs where
+    // the fork is active
+    leader.update_header_epoch_for_test(epoch);
+    leader.update_header_round_for_test(2);
+    leader.update_header_created_at_ms_for_test(TimestampMs::from_millis(created_at_ms));
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+        EpochSeedChainValue::epoch_root(epoch),
+    );
+    ConsensusOutput::new_with_subdag(sub_dag, parent, number)
+}
+
+/// The `tn_getBlockTimestampMillis` response for execution `block`, executed from consensus
+/// `header`: the header's commit time in milliseconds, flagged sub-second when the fork is
+/// active for the header's leader epoch.
+fn expected_block_timestamp_millis(block: &SealedHeader, header: &ConsensusHeader) -> JsonValue {
+    let commit_ms = header.sub_dag.commit_timestamp_ms();
+    let sub_second = subsecond_timestamp_active(header.sub_dag.leader_epoch());
+    // a sub-second part tells the consensus commit time apart from the block's whole-second
+    // timestamp scaled to milliseconds, so the fixture must carry one wherever the fork is active
+    assert_eq!(commit_ms.subsec_millis() != 0, sub_second, "fixture commit time {commit_ms}");
+    json!({
+        "blockNumber": format!("{:#x}", block.number),
+        "blockHash": block.hash(),
+        "timestamp": format!("{:#x}", block.timestamp),
+        "timestampMillis": format!("{:#x}", commit_ms.as_millis()),
+        "subSecond": sub_second,
+        "consensusNumber": format!("{:#x}", header.number),
+        "consensusDigest": B256::from(header.digest()),
+    })
+}
+
+/// Call `tn_getBlockTimestampMillis` for block `id` on the `tn` namespace `methods`.
+async fn block_timestamp_millis(
+    methods: &Methods,
+    id: JsonValue,
+) -> Result<JsonValue, MethodsError> {
+    methods.call("tn_getBlockTimestampMillis", [id]).await
+}
+
+/// `block`'s number as a JSON-RPC block id: a hex quantity.
+fn block_number_id(block: &SealedHeader) -> String {
+    format!("{:#x}", block.number)
+}
+
+/// Whether `result` is the `tn` namespace's not-found error, EIP-1474 "resource not found"
+/// (code -32001).
+fn is_not_found(result: &Result<JsonValue, MethodsError>) -> bool {
+    matches!(result, Err(MethodsError::JsonRpc(error)) if error.code() == -32001)
+}
+
+/// An [`EngineToPrimaryRpc`] over `consensus_chain` and `consensus_bus`, identifying as the
+/// authority `config` belongs to.
+fn engine_to_primary_rpc(
+    config: &ConsensusConfig<MemDatabase>,
+    consensus_bus: &ConsensusBus,
+    consensus_chain: &ConsensusChain,
+    name: &str,
+) -> EngineToPrimaryRpc {
+    let key_config = config.key_config();
+    let key = key_config.primary_public_key();
+    EngineToPrimaryRpc::new(
+        consensus_bus.app().clone(),
+        consensus_chain.clone(),
+        RpcNodeInfo {
+            chain_id: config.chain_id(),
+            version: "test",
+            name: name.to_owned(),
+            bls_public_key: key,
+            authority_id: key.into(),
+            execution_address: Address::ZERO,
+            primary_network_key: key_config.primary_network_public_key(),
+            worker_network_key: key_config.worker_network_public_key(0),
+            primary_external_address: Multiaddr::empty(),
+            worker_external_address: Multiaddr::empty(),
+        },
+    )
+}
+
+/// A worker's transaction pool charges the base fee supplied at epoch setup (the
+/// accumulator's per-worker value) instead of a hardcoded `MIN_PROTOCOL_BASE_FEE`, and
+/// `set_worker_base_fee` updates it for the every-epoch (respawn) path.
+#[tokio::test]
+async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("test_worker_pool_base_fee")?;
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
+
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+
+    let worker_id: WorkerId = 0;
+    // a deliberately non-MIN value: proves the pool doesn't hardcodes MIN_PROTOCOL_BASE_FEE.
+    let base_fee = MIN_PROTOCOL_BASE_FEE + 1234;
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.base_fee(worker_id).set_base_fee(base_fee);
+
+    execution_node
+        .initialize_worker_components(
+            worker_id,
+            NoopEngineToPrimary,
+            gas_accumulator.base_fee(worker_id),
+            gas_accumulator.worker_base_fee(worker_id),
+        )
+        .await?;
+
+    let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
+    assert_eq!(
+        pool.block_info().pending_basefee,
+        base_fee,
+        "worker pool base fee should equal the value passed at setup",
+    );
+
+    // the every-epoch setter updates the pool (covers the respawn path where init is skipped).
+    let new_fee = base_fee + 50;
+    execution_node.set_worker_base_fee(worker_id, new_fee).await?;
+    let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
+    assert_eq!(
+        pool.block_info().pending_basefee,
+        new_fee,
+        "set_worker_base_fee should update the worker pool base fee",
+    );
+
+    Ok(())
+}
+
+/// Independent workers keep separate RPC listeners and fees across epoch rollover and regrowth.
+#[tokio::test]
+async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    use tn_node::engine::{ExecutionNode, TnBuilder};
+    use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
+
+    tn_reth::init_reth_defaults();
+    let temp_dir = TempDir::with_prefix("test_multi_worker_components")?;
+    let task_manager = TaskManager::default();
+    let accumulator = GasAccumulator::new(2);
+    let config = tn_config::Config::default_for_test();
+    let node_config = RethConfig::new(
+        RethCommand {
+            rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+            txpool: Default::default(),
+            db: Default::default(),
+        },
+        None,
+        temp_dir.path(),
+        true,
+        Arc::new(config.chain_spec()),
+    );
+    let reth_db = RethEnv::new_database(&node_config, temp_dir.path().join("reth"))?;
+    let reth_env =
+        RethEnv::new(&node_config, &task_manager, reth_db.clone(), None, accumulator.clone())?;
+    let builder = TnBuilder::new(node_config, config, reth_db);
+    let engine = ExecutionNode::new(&builder, reth_env)?;
+    futures::stream::iter(0..2)
+        .then(|worker_id| {
+            let engine = &engine;
+            let accumulator = &accumulator;
+            async move {
+                let fee = MIN_PROTOCOL_BASE_FEE + 1000 * (u64::from(worker_id) + 1);
+                accumulator.base_fee(worker_id).set_base_fee(fee);
+                assert!(!engine.is_worker_initialized(worker_id).await);
+                engine
+                    .initialize_worker_components(
+                        worker_id,
+                        NoopEngineToPrimary,
+                        accumulator.base_fee(worker_id),
+                        accumulator.worker_base_fee(worker_id),
+                    )
+                    .await?;
+                assert!(engine.is_worker_initialized(worker_id).await);
+                assert_eq!(
+                    engine
+                        .get_worker_transaction_pool(&worker_id)
+                        .await?
+                        .block_info()
+                        .pending_basefee,
+                    fee,
+                );
+                eyre::Ok(())
+            }
+        })
+        .try_collect::<()>()
+        .await?;
+
+    let pool_zero = engine.get_worker_transaction_pool(&0).await?;
+    let pool_one = engine.get_worker_transaction_pool(&1).await?;
+    let rpc_zero = engine
+        .worker_http_local_address(&0)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker zero RPC listener missing"))?;
+    let rpc_one = engine
+        .worker_http_local_address(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker one RPC listener missing"))?;
+    assert_ne!(rpc_zero, rpc_one, "workers must not share an RPC listener");
+    let zero_fee = pool_zero.block_info().pending_basefee;
+    let retained_fee = accumulator.base_fee(1);
+    accumulator.set_num_workers(1);
+    accumulator.set_num_workers(2);
+    let next_fee = MIN_PROTOCOL_BASE_FEE + 9000;
+    accumulator.base_fee(1).set_base_fee(next_fee);
+    engine.set_worker_base_fee(1, next_fee).await?;
+
+    // Canonical maintenance retains the pool's original fee handle across worker-count changes.
+    assert_eq!(retained_fee.base_fee(), next_fee);
+    let genesis = engine.get_reth_env().await.chainspec().sealed_genesis_header();
+    pool_one.update_canonical_state(&genesis, Some(u128::MAX), vec![], vec![]).await?;
+    assert_eq!(pool_one.block_info().pending_basefee, next_fee);
+    assert_eq!(pool_zero.block_info().pending_basefee, zero_fee);
+    assert_eq!(engine.worker_http_local_address(&0).await?, Some(rpc_zero));
+    assert_eq!(engine.worker_http_local_address(&1).await?, Some(rpc_one));
+
+    engine
+        .respawn_worker_network_tasks(
+            1,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        )
+        .await?;
+    assert!(engine
+        .respawn_worker_network_tasks(
+            2,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        )
+        .await
+        .is_err());
     Ok(())
 }
 
@@ -204,7 +791,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -222,11 +809,12 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -292,13 +880,14 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
             empty_leader.update_header_created_at_for_test(tn_types::now());
             empty_leader.update_header_author_for_test(leader.clone());
 
-            let empty_subdag = Arc::new(CommittedSubDag::new(
+            let empty_subdag = CommittedSubDag::new(
                 vec![empty_leader.clone()],
                 empty_leader,
                 synthetic_number,
                 ReputationScores::default(),
                 None,
-            ));
+                tn_types::EpochSeedChainValue::genesis_placeholder(),
+            );
             let empty_output = ConsensusOutput::new(
                 empty_subdag.clone(),
                 output.parent_hash(),
@@ -326,7 +915,9 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let worker_id = 0;
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
 
     let expected: BTreeMap<_, _> = rewards
@@ -371,7 +962,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -390,11 +981,12 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
         Ok(())
@@ -437,7 +1029,9 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
 
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
 
     let worker_id = 0;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
@@ -454,6 +1048,2166 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     Ok(())
 }
 
+/// `sync_num_workers_from_chain` sizes the accumulator to the on-chain `WorkerConfigs` count,
+/// growing an undersized accumulator and shrinking an oversized one.
+#[tokio::test]
+async fn test_sync_num_workers_from_chain_adjusts_to_on_chain_count() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_num_workers")?;
+    // genesis deploys WorkerConfigs with 2 workers (worker 0 EIP-1559, worker 1 static)
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node =
+        default_test_execution_node(Some(chain), None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+
+    // the startup default (1 worker) grows to the on-chain count
+    let gas_accumulator = GasAccumulator::new(1);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await?;
+    assert_eq!(gas_accumulator.num_workers(), 2, "undersized accumulator grows to on-chain count");
+
+    // an oversized accumulator shrinks to the on-chain count
+    let gas_accumulator = GasAccumulator::new(3);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await?;
+    assert_eq!(gas_accumulator.num_workers(), 2, "oversized accumulator shrinks to on-chain count");
+
+    Ok(())
+}
+
+/// FAIL-HARD: on a chain without the `WorkerConfigs` contract, the worker-count sync must
+/// error - the caller (startup catchup or the epoch-0 entry arm) cannot proceed on an
+/// unverifiable count.
+///
+/// The accumulator starts at 3 workers (not 1) so the second assertion also discriminates a
+/// clean error from a partial resize: an erroring read that still wrote a clamped count would
+/// drop 3 to 1 and fail it.
+#[tokio::test]
+async fn test_sync_num_workers_errors_when_contract_absent() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_num_workers_fail_hard")?;
+    // strip the WorkerConfigs account from the alloc so the contract read is guaranteed to fail
+    let mut genesis = test_genesis_with_consensus_registry(4);
+    genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node =
+        default_test_execution_node(Some(chain), None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+
+    let gas_accumulator = GasAccumulator::new(3);
+    let result = sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await;
+    assert!(result.is_err(), "a missing WorkerConfigs contract must be a hard error");
+    assert_eq!(gas_accumulator.num_workers(), 3, "a failed sync must not resize the accumulator");
+
+    Ok(())
+}
+
+/// Recovery on a chain whose `WorkerConfigs` declares 2 workers, staged so one chain pins both
+/// entry shapes for the idle worker (consensus still only produces worker-0 blocks; worker
+/// spawning is a follow-up):
+///
+/// 1. MID-EPOCH-0: hold the epoch-closing output back and recover at startup —
+///    `catchup_accumulator` sizes the accumulator from pinned chain state and restores per-worker
+///    gas stats. Worker 0's totals must match the live accumulator exactly; fees are owned by the
+///    entry seeding and hold `MIN_PROTOCOL_BASE_FEE` for BOTH workers, which IS the committee value
+///    during epoch 0 (containers hold the MIN default until the FIRST close).
+/// 2. Close epoch 0 with the held output.
+/// 3. RESTART-AFTER-CLOSE (the crash-after-close shape on a 2-worker chain): catchup scans an empty
+///    range at a closing-block tip, so post-catchup worker 1 still holds MIN, and the entry READ of
+///    the closing block's on-chain record (`read_base_fees_for_entered_epoch`) must flip it to the
+///    governance-set `Static { fee: 500 }` — restarting nodes converge with the fee the live
+///    committee computed at the boundary.
+#[tokio::test]
+async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_then_catchup").unwrap();
+    // create deterministic committee fixture and use first authority's components
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // make certificates with batches of txs (all worker 0)
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // 2-worker WorkerConfigs at genesis; fund the batch senders so txs execute
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
+    );
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // live accumulator sized 2, as the startup sync would have left it
+    let gas_accumulator = GasAccumulator::new(2);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // manually create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    // start engine
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    // subscribe to output early
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // spawn consensus to send output to engine for full execution
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    // send certificates to trigger subdag commit
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // PHASE 1 (mid-epoch-0): collect the committed outputs, holding the epoch-closing one back
+    // so recovery is exercised against a mid-epoch chain first
+    let mut outputs = Vec::new();
+    loop {
+        let output = timeout(Duration::from_secs(30), consensus_output.recv())
+            .await?
+            .expect("consensus output");
+        let done = output.leader_round() as u64 >= last_executed_round;
+        outputs.push(output);
+        if done {
+            break;
+        }
+    }
+    let mut closing_output = outputs.pop().expect("epoch-closing output");
+
+    // forward every pre-close output, then wait for the engine to execute each (the engine
+    // sends exactly one update per consensus output) so every block recovery scans is committed
+    let sent = outputs.len();
+    for output in outputs {
+        to_engine.send(output).await?;
+    }
+    for _ in 0..sent {
+        timeout(Duration::from_secs(30), engine_update_rx.recv())
+            .await?
+            .expect("engine update per output");
+    }
+
+    // finish_executing_output commits the blocks AND the finalized/safe markers in one
+    // transaction before it sends the engine update, so the persisted marker cannot lag the
+    // persisted tip here. The in-memory finalized watch catchup reads, though, is set by
+    // finalize_block moments later in the engine task — settle it deterministically with the
+    // same header the engine writes (idempotent) instead of racing that update. A real restart
+    // never sees this transient: the watch is seeded from the settled database rows.
+    let settled_tip = reth_env
+        .sealed_header_by_number(reth_env.last_block_number()?)?
+        .expect("persisted tip header exists");
+    reth_env.finalize_block(settled_tip)?;
+
+    // simulate node recovery at startup: catchup sizes the accumulator from pinned chain state
+    // and rebuilds gas stats (fees are owned by the entry seeding)
+    let recovered = GasAccumulator::new(1);
+    recovered.rewards_counter().set_committee(fixture.committee());
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    assert_eq!(recovered.num_workers(), 2, "catchup sizes the accumulator to the on-chain count");
+
+    // worker 0: totals restored to match the live accumulator. LOAD-BEARING: with the
+    // independent header scan deleted, this recovered==live equality is the ONLY remaining
+    // cross-check that the accumulator the closing block prices from matches the chain's
+    // headers — do not delete it believing the capstone covers this (the capstone's gas
+    // identity is tautological within its own harness).
+    let (blocks, gas_used, gas_limit) = recovered.get_values(0);
+    assert_eq!((blocks, gas_used, gas_limit), gas_accumulator.get_values(0));
+    assert!(gas_used > 0, "worker 0 accumulated gas this epoch");
+    // BOTH workers hold the MIN default: catchup does not seed fees, and MIN is the committee
+    // value during epoch 0 anyway (fees only move at the first close)
+    assert_eq!(recovered.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    // worker 1: idle governance-declared slot stays at defaults
+    assert_eq!(recovered.get_values(1), (0, 0, 0));
+    assert_eq!(recovered.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    // rewards restored identically
+    assert_eq!(
+        gas_accumulator.rewards_counter().get_address_counts(),
+        recovered.rewards_counter().get_address_counts()
+    );
+
+    // (Mid-epoch-0 there is nothing more to seed: worker 1's Static { fee: 500 } activates
+    // entering epoch 1 — the first epoch a closing block has priced — not during epoch 0.)
+
+    // PHASE 2: close epoch 0 with the held-back output (mirrors process_output's boundary flag)
+    closing_output.set_epoch_close();
+    to_engine.send(closing_output).await?;
+    let engine_task = timeout(Duration::from_secs(30), &mut rx).await;
+    assert!(engine_task.is_ok(), "engine exits at max round after executing the epoch close");
+
+    // PHASE 3 (restart after close — the crash-after-close shape on a 2-worker chain): the
+    // pinned tip IS epoch 0's closing block, so catchup scans an empty range and restores
+    // nothing; the entry read of the closing block's on-chain record alone must recover every
+    // configured worker's fee.
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(
+        RethEnv::extract_epoch_from_header(&closing),
+        0,
+        "closing block's nonce carries the closed epoch",
+    );
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(entered_state.epoch, 1, "registry state crossed to the entered epoch");
+
+    let restarted = GasAccumulator::new(1);
+    restarted.rewards_counter().set_committee(fixture.committee());
+    catchup_accumulator(reth_env.clone(), &restarted, &mut consensus_chain, entered_state.epoch)
+        .await?;
+    assert_eq!(restarted.num_workers(), 2, "catchup sizes from the closing block's configs");
+    // post-catchup: fees still hold the MIN default — the entry read below owns them
+    assert_eq!(restarted.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
+    entry.apply(&restarted);
+
+    // worker 1 never produced a block, yet its governance-set Static { fee: 500 } is recovered
+    // from the closing block's WorkerConfigs — restarting nodes converge with the fee the live
+    // committee computed at the boundary.
+    assert_eq!(entry.fees[1], 500, "idle worker's fee reads from chain, not MIN");
+    assert_eq!(restarted.base_fee(1).base_fee(), 500);
+
+    // worker 0's entry fee is the value the closing block itself recorded: the close priced it
+    // from the fee the epoch ran at and the epoch's real gas (including the closing block's
+    // own), the same inputs this oracle folds
+    let held_fee = closing.base_fee_per_gas.expect("executed blocks carry a base fee");
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    assert_eq!(entry.fees[0], compute_next_base_fee_eip1559(held_fee, live_gas_used, 30_000_000));
+    assert_eq!(restarted.base_fee(0).base_fee(), entry.fees[0]);
+
+    Ok(())
+}
+
+/// Minimal consensus output for driving the payload builder directly (no live consensus).
+///
+/// Mirrors the shape `tn-reth`'s close-epoch tests use: a default leader certificate with a
+/// verified (default) BLS signature so `CommittedSubDag::new` derives deterministic randomness.
+fn manual_consensus_output(
+    round: u32,
+    epoch: Epoch,
+    number: u64,
+    close_epoch: bool,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
+    leader.update_header_created_at_for_test(tn_types::now());
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        number,
+        close_epoch,
+        VecDeque::new(),
+        vec![],
+    )
+}
+
+/// Build a payload extending `parent` with an explicit worker base fee (mirrors
+/// `TNPayload::new_for_test` but lets the test choose the fee the chain carries).
+fn payload_with_base_fee(
+    parent: SealedHeader,
+    output: &ConsensusOutput,
+    base_fee_per_gas: u64,
+    worker_id: WorkerId,
+) -> TNPayload {
+    let gas_limit = parent.gas_limit;
+    TNPayload::new(
+        parent,
+        Address::random(),
+        0,
+        B256::random(),
+        output,
+        B256::ZERO,
+        base_fee_per_gas,
+        gas_limit,
+        B256::random(),
+        worker_id,
+    )
+}
+
+/// Make an executed block canonical, mirroring `tn_engine`'s payload-builder chain update.
+///
+/// `finish_executing_output` commits the finalized/safe markers atomically with the block, so
+/// the persisted marker tracks the tip here; the in-memory watch update (`finalize_block`) is
+/// left to the caller. Tests that need a chain whose finality lags the canonical tip plant the
+/// lag afterwards via `plant_finalized_marker` (simulating a pre-fix database).
+fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Result<SealedHeader> {
+    let header = block.recovered_block.clone_sealed_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+    canonical_in_memory_state.set_canonical_head(header.clone());
+    reth_env.finish_executing_output(vec![block], None)?;
+    Ok(header)
+}
+
+/// Catchup pins every chain-derived input (scan range, worker-count read block, leader-count
+/// bound) to the ONE finalized header, and startup heals that marker to the persisted
+/// canonical tip BEFORE catchup runs (`RethEnv::heal_finalized_to_persisted_tip`). A lagging
+/// marker is the artifact of pre-fix versions that committed blocks and the marker in
+/// separate transactions — current versions commit both atomically, so each phase plants the
+/// lag directly (`plant_finalized_marker`) to model such a database. Healing is sound because
+/// every persisted canonical block is consensus-final by construction.
+///
+/// Phase A — mid-epoch lag (block 1 finalized; block 2 canonical-only; both carry a real
+/// transfer): catchup ALONE still pins its scan to the stale marker and undercounts (control),
+/// while heal-then-catchup counts BOTH blocks' gas — the startup sequence recovers the gap.
+///
+/// Phase B — boundary-crossing lag (block 3 closes epoch 0, canonical-only): catchup ALONE
+/// refuses with the cross-view guard error (control — post-heal, a firing guard means genuine
+/// database inconsistency, so it stays a tripwire), while heal-then-catchup for the entered
+/// epoch 1 succeeds where startup previously hard-halted: the marker advances to the closing
+/// block, epoch 1's first block (4) lies past the healed tip (3), and the empty scan counts
+/// zero gas.
+///
+/// Leader counting stays out of scope here: Phase A's healed pin (round 1, epoch 0) walks this
+/// test's EMPTY consensus DB (a harmless no-op), and Phase B's pin carries epoch 0's nonce
+/// while the entered epoch is 1, so the epoch gate skips it. `test_catchup_accumulator` covers
+/// healed leader recounts against real consensus data.
+#[tokio::test]
+async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_heals_finality_lag")?;
+    // committee fixture only backs the consensus-chain handle catchup takes
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // registry-backed genesis (so the epoch-closing system call can run at block 3) with a
+    // funded sender so blocks 1 and 2 carry real gas
+    let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let genesis = test_genesis_with_consensus_registry(4).extend_accounts([(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000u64)),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // worker 0's on-chain fee for epoch 0: distinguishable from MIN
+    let worker_id: WorkerId = 0;
+    let chain_fee = MIN_PROTOCOL_BASE_FEE + 77;
+
+    // block 1: mid-epoch-0 block carrying worker 0's fee and one executed transfer (so gas
+    // stats accumulate) - canonical AND finalized
+    let transfer = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let genesis_header = chain.sealed_genesis_header();
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, chain_fee, worker_id);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &vec![transfer],
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+    reth_env.finalize_block(block1_header.clone())?;
+    assert!(block1_header.gas_used > 0, "block 1's transfer must land for sharp gas assertions");
+
+    // block 2 (epoch 0): canonical but NOT finalized - the pre-fix crash-window mid-epoch lag
+    // - with a second executed transfer so the healed recount is measurably larger than the
+    // control
+    let transfer2 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let output2 = manual_consensus_output(1, 0, 2, false);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, chain_fee, worker_id);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &vec![transfer2],
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    // extend committed the marker atomically with block 2; rewind it to block 1 (database rows
+    // + watches) to model a pre-fix database whose separate marker write was lost in a crash
+    plant_finalized_marker(&reth_env, block1_header.clone())?;
+    assert!(block2_header.gas_used > 0, "block 2's transfer must land for sharp gas assertions");
+
+    // Phase A control: catchup ALONE pins its scan to the stale marker (block 1), passes the
+    // guard (same epoch), and misses block 2's gas - the undercount the startup heal prevents
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    assert_eq!(canonical_epoch, 0, "mid-epoch canonical tip stays in epoch 0");
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    let (blocks_counted, gas_used, _gas_limit) = recovered.get_values(worker_id);
+    assert!(blocks_counted > 0, "mid-epoch lag alone must not skip the restore");
+    assert_eq!(
+        gas_used, block1_header.gas_used,
+        "catchup alone is bounded by the stale finalized marker and misses block 2",
+    );
+    // catchup leaves fees to the entry seeding: block 1's non-MIN fee is NOT adopted
+    assert_eq!(recovered.base_fee(worker_id).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+    // Phase A heal: the marker advances to the persisted canonical tip - the heal rewrites the
+    // database rows and updates the in-memory watch catchup reads through finalize_block
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, block2_header.number, "heal advances the marker to the tip");
+    assert_eq!(healed.hash(), block2_header.hash(), "healed marker carries the tip's hash");
+
+    // Phase A: heal-then-catchup (the startup sequence) recovers the gap block's gas
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    let (_blocks_counted, gas_used, _gas_limit) = recovered.get_values(worker_id);
+    assert_eq!(
+        gas_used,
+        block1_header.gas_used + block2_header.gas_used,
+        "healed catchup counts the previously-unfinalized block 2",
+    );
+
+    // block 3: closes epoch 0 - canonical but NOT finalized (the lag now crosses the boundary)
+    let no_txs: Vec<Vec<u8>> = vec![];
+    let output3 = manual_consensus_output(2, 0, 3, true);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, chain_fee, worker_id);
+    let block3 = reth_env.build_block_from_batch_payload(
+        payload3,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
+    // rewind the atomically-committed marker to block 2: the pre-fix lag now crosses the
+    // epoch boundary
+    plant_finalized_marker(&reth_env, block2_header.clone())?;
+
+    // precondition: the views genuinely disagree at epoch granularity - the canonical tip's
+    // epoch state places the epoch start PAST the finalized header (block 2)
+    let finalized = reth_env.finalized_header()?.expect("finalized header");
+    assert_eq!(finalized.number, block2_header.number, "finality pinned at block 2");
+    let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(tip_state.epoch, 1, "canonical tip state crossed the epoch boundary");
+    assert_eq!(
+        tip_state.epoch_info.blockHeight,
+        block3_header.number + 1,
+        "epoch 1's first block is the one after the closing block",
+    );
+    assert!(
+        tip_state.epoch_info.blockHeight > finalized.number,
+        "entered-epoch range start ({}) must exceed the finalized range end ({})",
+        tip_state.epoch_info.blockHeight,
+        finalized.number,
+    );
+
+    // Phase B control: catchup ALONE refuses the boundary-crossing lag rather than rebuilding
+    // against the wrong epoch's state - the guard stays a tripwire (post-heal, its firing
+    // means genuine database inconsistency)
+    let recovered = GasAccumulator::new(1);
+    let err =
+        catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, tip_state.epoch)
+            .await
+            .expect_err("boundary-crossing finality lag must refuse the restore");
+    assert!(
+        err.to_string().contains("across an epoch boundary"),
+        "error must identify the cross-boundary view disagreement: {err}",
+    );
+    // the guard fires before any write: the accumulator is untouched
+    assert_eq!(recovered.num_workers(), 1);
+    assert_eq!(recovered.get_values(worker_id), (0, 0, 0));
+
+    // Phase B heal: the marker advances across the epoch boundary to the closing block
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, block3_header.number, "heal advances the marker to block 3");
+    assert_eq!(healed.hash(), block3_header.hash(), "healed marker carries block 3's hash");
+
+    // Phase B: heal-then-catchup recovers where startup previously hard-halted. The healed pin
+    // is epoch 0's closing block, whose epoch state reports the entered epoch 1: the guard
+    // passes, the scan (4..=3) is empty, the worker count syncs from chain state, and leader
+    // counting is skipped (the pin's nonce carries epoch 0, not 1)
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, tip_state.epoch)
+        .await?;
+    assert_eq!(recovered.num_workers(), 1, "worker count synced from chain state");
+    assert_eq!(
+        recovered.get_values(worker_id),
+        (0, 0, 0),
+        "entered epoch 1 has no executed blocks yet - the healed scan is empty",
+    );
+
+    Ok(())
+}
+
+/// The heal refuses a node whose finalized marker points PAST the persisted canonical tip: the
+/// marker only ever trails or equals the tip (it commits atomically with the blocks; pre-fix
+/// versions committed the blocks first), so a marker ahead of it means the execution database
+/// lost blocks this node already attested as final.
+#[tokio::test]
+async fn heal_errors_when_finalized_marker_ahead_of_tip() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("heal_marker_ahead")?;
+    let execution_node =
+        default_test_execution_node(None, None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // Plant a marker past the (genesis-only) tip via a direct database write - only a
+    // corrupted or pre-fix database can present this state, since the production path commits
+    // the marker atomically with the blocks and can never run ahead of them.
+    let ahead = SealedHeader::new(ExecHeader { number: 5, ..Default::default() }, B256::random());
+    plant_finalized_marker(&reth_env, ahead)?;
+
+    let err = reth_env
+        .heal_finalized_to_persisted_tip()
+        .expect_err("a marker past the tip means the db lost attested blocks");
+    assert!(
+        err.to_string().contains("ahead of the persisted canonical tip"),
+        "error must name the marker-ahead condition: {err}",
+    );
+
+    Ok(())
+}
+
+/// On a fresh genesis chain the heal is a no-op: the marker was never written, the tip is
+/// genesis, and genesis must STAY unfinalized so
+/// `finalized_block_hash_number_for_startup`'s genesis fallback still marks a fresh node.
+#[tokio::test]
+async fn heal_noop_on_fresh_genesis() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("heal_fresh_genesis")?;
+    let execution_node =
+        default_test_execution_node(None, None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    reth_env.heal_finalized_to_persisted_tip()?;
+    assert!(
+        reth_env.finalized_header()?.is_none(),
+        "fresh genesis stays unfinalized after the heal",
+    );
+
+    Ok(())
+}
+
+/// The kill-between-commits gap can no longer open: blocks and the finalized/safe markers
+/// commit in ONE database transaction (`RethEnv::finish_executing_output`), so a node that
+/// dies immediately after the blocks-commit — before `finalize_block`'s in-memory update ever
+/// runs — restarts on a database whose finalized marker ALREADY equals the persisted tip.
+/// There is no between-commits state, so the startup heal has nothing to repair and takes its
+/// no-op path (no warn-path heal needed).
+#[tokio::test]
+async fn finalized_marker_commits_atomically_with_blocks() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("atomic_finalized_marker")?;
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // execute one consensus output and commit it WITHOUT calling finalize_block: the exact
+    // on-disk state of a node killed right after finish_executing_output's commit
+    let genesis_header = chain.sealed_genesis_header();
+    let no_txs: Vec<Vec<u8>> = vec![];
+    let output = manual_consensus_output(0, 0, 1, false);
+    let payload = payload_with_base_fee(genesis_header.clone(), &output, MIN_PROTOCOL_BASE_FEE, 0);
+    let block =
+        reth_env.build_block_from_batch_payload(payload, &no_txs, &mut OutputTrieOverlay::new())?;
+    let block_header = extend_canonical_chain(&reth_env, block)?;
+
+    // fresh read-only provider reads: the persisted marker already equals the persisted tip
+    assert_eq!(reth_env.last_block_number()?, block_header.number);
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        block_header.number,
+        "the finalized marker commits atomically with the blocks",
+    );
+
+    // the heal has nothing to repair: it takes the no-op path, which never touches the
+    // in-memory watches (still unset because finalize_block never ran)
+    reth_env.heal_finalized_to_persisted_tip()?;
+    assert!(
+        reth_env.finalized_header()?.is_none(),
+        "a no-op heal leaves the watches untouched - no warn-path heal was needed",
+    );
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        block_header.number,
+        "the no-op heal leaves the settled marker in place",
+    );
+
+    Ok(())
+}
+
+/// A committed block referencing a worker id at or beyond the on-chain `WorkerConfigs` count
+/// means the chain and the contract disagree about the worker set. Catchup fails the restore
+/// with a descriptive error - naming the scanned range, the offending id, and the on-chain
+/// count - instead of writing out-of-range per-worker state or dying on `inc_block`'s panic
+/// (which remains the live-path tripwire for the same condition).
+///
+/// Chain shape (manual blocks like the finality-lag test, worker ids stamped directly): the
+/// genesis `WorkerConfigs` declares ONE worker;
+/// - block 1 (epoch 0): worker 0, non-MIN fee, one executed transfer (real gas);
+/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the out-of-range
+///   datum. Canonical AND finalized.
+#[tokio::test]
+async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_worker_id_bound")?;
+    // committee fixture only backs the consensus-chain handle catchup takes
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // ONE-worker WorkerConfigs at genesis, with a funded sender so both blocks carry real gas
+    let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let genesis = test_genesis_with_consensus_registry(4).extend_accounts([(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000u64)),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // distinct non-MIN fees so the restore provably reads each worker's own block
+    let worker0_fee = MIN_PROTOCOL_BASE_FEE + 77;
+    let worker1_fee = MIN_PROTOCOL_BASE_FEE + 500;
+
+    // block 1 (epoch 0): worker 0 with one executed transfer. Leader round 0 keeps catchup's
+    // leader-count stage (gated on `last_executed_round > 0`) out of scope; this test pins the
+    // fee-restore and gas-stat stages.
+    let transfer0 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        1_000,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker0_fee, 0);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &vec![transfer0],
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+
+    // block 2 (epoch 0): worker 1 with one executed transfer - the out-of-range datum.
+    // Canonical AND finalized so the pinned scan covers it.
+    let transfer1 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        1_000,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let output2 = manual_consensus_output(0, 0, 2, false);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, worker1_fee, 1);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &vec![transfer1],
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    reth_env.finalize_block(block2_header.clone())?;
+
+    // the scanned range genuinely carries worker-1 data
+    assert!(block2_header.gas_used > 0, "worker 1's block must carry real gas");
+
+    // the on-chain count (1) cannot cover the block-observed worker id (1): the restore must
+    // fail with the descriptive bound error, not grow the accumulator and not panic
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    let recovered = GasAccumulator::new(1);
+    let err =
+        catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+            .await
+            .expect_err("a worker id at/beyond the on-chain count must fail the restore");
+    assert!(
+        err.to_string().contains("reference worker id 1"),
+        "error must name the offending worker id: {err}",
+    );
+    assert_eq!(recovered.num_workers(), 1, "the failed restore must not grow the accumulator");
+    assert_eq!(recovered.get_values(0), (0, 0, 0), "the bound check fires before gas accrual");
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "no per-worker state is written on the error path",
+    );
+
+    Ok(())
+}
+
+/// The production entry read prices a Static worker from its config's `value` word — and the
+/// close never writes its `data` word. After an epoch closes, a node whose finalized tip is the
+/// closing block reads the entered epoch's per-worker base fees from that block's on-chain state.
+/// This is the entry state shared by all three `close_epoch(None, ..)` shapes -
+/// replay-and-close, crash-after-close, and the live leftover-drain - which previously skipped
+/// both the close-time `adjust_base_fees` and the epoch-entry seeding, leaving a fresh
+/// accumulator stuck at `MIN_PROTOCOL_BASE_FEE` while the committee agreed on the configured fee.
+///
+/// Worker 0 is configured `Static { fee: 12_345 }` in the genesis `WorkerConfigs`. A full epoch
+/// of batches executes and the last output is flagged as the epoch close (so the closing block
+/// runs the boundary system calls). A fresh accumulator then follows the production entry order -
+/// `read_base_fees_for_entered_epoch` at the closing block, then `apply` (which also sizes
+/// the worker count) - and must land on 12_345 while the worker's raw on-chain `data` word is
+/// STILL ZERO: `record_next_epoch_base_fees` skips Static workers, and the read maps
+/// Static → config value, never the data word. Also pins read idempotence (the entry fee is a
+/// pure function of the closing block).
+#[tokio::test]
+async fn test_entry_reads_static_fee_at_boundary() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("entry_static_boundary").unwrap();
+    // create deterministic committee fixture and use first authority's components
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // make certificates with batches of txs (all worker 0)
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Static { fee: 12_345 } (strategy 1) in the genesis WorkerConfigs;
+    // fund the batch senders so txs execute
+    let static_fee = 12_345u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, static_fee)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // manually create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    // start engine
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    // subscribe to output early
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // spawn consensus to send output to engine for full execution
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    // send certificates to trigger subdag commit
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward consensus output to engine, flagging the final output as the epoch close so the
+    // closing block runs the boundary system calls (mirrors process_output's boundary flag)
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                }
+                to_engine.send(output).await?;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    // production preconditions shared by every close_epoch(None) recovery shape: the pinned
+    // tip IS the closed epoch's closing block (nonce still carries epoch 0) while the registry
+    // state it holds already reports the entered epoch
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(
+        RethEnv::extract_epoch_from_header(&closing),
+        0,
+        "closing block's nonce carries the closed epoch",
+    );
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(entered_state.epoch, 1, "registry state crossed to the entered epoch");
+    assert_eq!(
+        entered_state.epoch_info.blockHeight,
+        closing.number + 1,
+        "entered epoch starts on the block after the closing block",
+    );
+
+    // simulate the restart shapes: fresh accumulator recovered in the production entry order
+    let recovered = GasAccumulator::new(1);
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "the failure state: a fresh accumulator holds the MIN default before derivation",
+    );
+
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
+    entry.apply(&recovered);
+
+    // the committee-agreed fee is recovered instead of running the epoch at MIN
+    assert_eq!(entry.num_workers, 1);
+    assert_eq!(entry.fees, vec![static_fee]);
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        static_fee,
+        "entry read must recover the governance-set static fee",
+    );
+
+    // the static worker's raw data word is STILL ZERO after the close: the closing block's
+    // record (`record_next_epoch_base_fees`) skips Static workers — their fee already lives in
+    // the config's value word — so the entry fee above was priced from the config, not from a
+    // written word
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, closing.hash())?;
+    assert_eq!(num_workers, 1);
+    assert_eq!(entries[0].config, WorkerFeeConfig::Static { fee: static_fee });
+    assert!(entries[0].data.is_zero(), "a static worker's data word is never written");
+
+    // the epoch carried real gas, and apply() must NOT have copied it — the entered epoch
+    // starts at zero gas
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    assert_eq!(recovered.get_values(0), (0, 0, 0), "apply must not touch gas counters");
+
+    // idempotence: the entry fee is a pure function of the closing block's chain state
+    let entry_again = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
+    assert_eq!(entry, entry_again, "the entry read must be deterministic and idempotent");
+
+    Ok(())
+}
+
+/// Regression: pin the closing-block identity the
+/// base-fee config reads depend on. The close-time read (`adjust_base_fees`, at the canonical
+/// tip) asserts the identity as its tripwire, and the entry seeding resolves its closing block
+/// directly from the entered epoch's `blockHeight - 1`, so both price fees off the true closing
+/// block ONLY because `concludeEpoch` stamps the entered epoch's `blockHeight = closing block +
+/// 1` (ConsensusRegistry) AND the close system call is pinned to the LAST batch of the boundary
+/// output (`ConsensusOutput::close_epoch_for_last_batch`). A future multi-block-boundary or
+/// contract change would otherwise break that convention silently.
+///
+/// This drives a REAL epoch close through the ExecutorEngine/`spawn_consensus` scaffold where the
+/// boundary output is MULTI-BLOCK (its committed subdag flattens to more than one batch, so it
+/// executes as more than one block), then pins:
+/// - `canonical_tip().number + 1 == epoch_info.blockHeight`, with the epoch info read AT the tip
+///   via `epoch_state_from_canonical_tip` — exactly the read the close-time tripwire in
+///   `adjust_base_fees` performs (`epoch_state_at_header(&canonical_tip())`), so this exercises
+///   that tripwire's happy path on a real boundary (the check returns `Ok` here);
+/// - the close is pinned to the LAST batch: the boundary output's penultimate block has NOT yet
+///   advanced the epoch, so the tip IS the boundary output's last (closing) block. This is why the
+///   identity holds even for a multi-block boundary output — the exact fact the identity's safety
+///   argument rests on.
+#[tokio::test]
+async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("epoch_block_height_identity").unwrap();
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // full epoch of certificates with batches (all worker 0), so the committed boundary subdag
+    // flattens to several batches -> a multi-block boundary output
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Static { fee } so the close-time config read at the tip returns a real
+    // per-worker config (mirrors the derive-boundary fixture)
+    let static_fee = 7_777u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, static_fee)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward outputs, flagging the boundary output as the epoch close (mirrors process_output);
+    // stash the FIRST flagged output - the engine stops right after executing it (max_round), so
+    // it is THE boundary output whose LAST batch runs concludeEpoch
+    let mut boundary_output: Option<ConsensusOutput> = None;
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                    if boundary_output.is_none() {
+                        boundary_output = Some(output.clone());
+                    }
+                }
+                let _ = to_engine.send(output).await;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    let boundary_output = boundary_output.expect("a boundary output was flagged and executed");
+
+    // the boundary output is MULTI-BLOCK: a non-empty committed subdag flattens to one block per
+    // batch, so this pins the identity across a boundary output that produced more than one block
+    let boundary_blocks = boundary_output.flatten_batches().len();
+    assert!(
+        boundary_blocks >= 2,
+        "regression requires a multi-block boundary output, got {boundary_blocks} block(s)",
+    );
+
+    // the canonical tip is the closing block (last executed); its nonce still carries the closed
+    // epoch while the registry state it holds already reports the entered epoch
+    let closing = reth_env.canonical_tip();
+    let closed_epoch = RethEnv::extract_epoch_from_header(&closing);
+    assert_eq!(closed_epoch, 0, "closing block's nonce carries the closed epoch");
+    assert_eq!(
+        reth_env.finalized_header()?.expect("closing block finalized").number,
+        closing.number,
+        "canonical tip is the finalized closing block",
+    );
+
+    // THE IDENTITY, read AT the tip via `epoch_state_from_canonical_tip` == the close-time
+    // tripwire's `epoch_state_at_header(&canonical_tip())`: the entered epoch's on-chain
+    // blockHeight is the closing block + 1. This is that tripwire's happy path on a real
+    // multi-block boundary - the check returns Ok here.
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(
+        entered_state.epoch,
+        closed_epoch + 1,
+        "registry state crossed to the entered epoch",
+    );
+    assert_eq!(
+        closing.number + 1,
+        entered_state.epoch_info.blockHeight,
+        "canonical tip + 1 must equal the entered epoch's blockHeight",
+    );
+
+    // the close is pinned to the LAST batch of the boundary output: because the output is
+    // multi-block, its penultimate block (closing.number - 1) is one of ITS batches, and that block
+    // must NOT have advanced the epoch yet - concludeEpoch runs only in the last batch (the tip).
+    // So the tip IS the boundary output's last block, and the identity holds despite >1 block.
+    let penultimate = reth_env
+        .sealed_header_by_number(closing.number - 1)?
+        .expect("penultimate boundary block exists");
+    assert_eq!(
+        reth_env.epoch_state_at_header(&penultimate)?.epoch,
+        closed_epoch,
+        "epoch must not advance until the boundary output's LAST batch (the tip is that block)",
+    );
+
+    // the close-time tripwire's second read (worker configs at the SAME tip) also resolves: the one
+    // configured worker is present at the closing block
+    let (num_workers, entries) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+    assert_eq!(num_workers, 1, "one configured worker at the closing block");
+    assert_eq!(entries.len(), 1, "config arity matches the worker count");
+
+    Ok(())
+}
+
+/// PIVOTAL write↔read equivalence pin — the Eip1559 variant of
+/// [`test_entry_reads_static_fee_at_boundary`]: a real epoch of gas drives a real close, and the
+/// closing block's on-chain `WorkerConfigs.data` word, the tn-types formula oracle, the
+/// production entry read, and the accumulator state `apply()` installs must all be ONE value:
+///
+/// ```text
+/// data == compute_next_base_fee_eip1559(closing-time fee, live gas incl. closing block, target)
+///      == read_base_fees_for_entered_epoch(..).fees[0] == applied accumulator fee
+/// ```
+///
+/// The oracle's inputs are exactly what `record_next_epoch_base_fees` priced the write from:
+/// `held_fee` is the fee the closing block carries (== the accumulator fee the epoch ran at, by
+/// the input-consistency guarantee) and the gas total is the live accumulator's epoch total
+/// INCLUDING the closing block's own gas (the record folds that in itself; the engine's
+/// `inc_block` adds it after execution).
+#[tokio::test]
+async fn test_entry_read_matches_close_written_eip1559_fee() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("entry_read_eip1559").unwrap();
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Eip1559 (strategy 0) with a small target the epoch's gas far exceeds,
+    // so the derived fee must move instead of staying floored at MIN
+    let target_gas = 1_000_000u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, target_gas)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                }
+                to_engine.send(output).await?;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(RethEnv::extract_epoch_from_header(&closing), 0);
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // the independent oracle: the ONE formula over the fee the epoch ran at (the closing
+    // block's own fee — input-consistency keeps header fee == accumulator fee) and the live
+    // accumulator's gas total, which includes the closing block's own gas (the engine's
+    // inc_block added it after execution; the on-chain record folded it in itself)
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    let held_fee = closing.base_fee_per_gas.expect("executed blocks carry a base fee");
+    let expected = compute_next_base_fee_eip1559(held_fee, live_gas_used, target_gas);
+    // gas far above target: the priced fee must have actually moved off the held value
+    assert!(expected > held_fee, "gas above target must raise the fee");
+
+    // (a) the WRITE: the closing block's own system call recorded exactly the oracle value in
+    // worker 0's WorkerConfigs.data word
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, closing.hash())?;
+    assert_eq!(num_workers, 1);
+    assert!(!entries[0].data.is_zero(), "the close must write the eip1559 worker's data word");
+    assert_eq!(entries[0].data.to::<u64>(), expected, "written data != oracle");
+
+    // (b) the READ: the production entry read returns the written value
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
+    assert_eq!(entry.num_workers, 1);
+    assert_eq!(entry.fees, vec![expected], "entry read != written data");
+
+    // (c) the INSTALL: apply() seats the same value in a fresh accumulator
+    let recovered = GasAccumulator::new(1);
+    entry.apply(&recovered);
+    assert_eq!(recovered.base_fee(0).base_fee(), expected, "applied fee != written data");
+
+    Ok(())
+}
+
+/// A synthetic/empty close still WRITES the eip1559 worker's next-epoch fee — and the entry read
+/// prices from that written word, never from the synthetic block's header fee.
+///
+/// An epoch that closes with NO batches makes the engine build a synthetic block that is stamped
+/// worker 0 and copies its PARENT's base fee (`batch_digest = B256::ZERO`, carried in
+/// `ommers_hash`). Genesis carries a non-MIN base fee here, so that copied fee is a
+/// distinguishable poison: pricing worker 0 from the synthetic block's header would fold its
+/// `Eip1559` config from the poison fee (a non-MIN result). The close instead prices from the
+/// live accumulator — an at-MIN worker with zero gas — so the closing block's data word records
+/// exactly `MIN_PROTOCOL_BASE_FEE` (the write happens even for an empty close) and the entry
+/// read returns MIN, exactly what the live committee held. The poison fold stays as the negative
+/// assertion discriminating a header-priced regression.
+#[tokio::test]
+async fn test_entry_reads_written_fee_after_empty_close() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("entry_after_empty_close").unwrap();
+    // registry + WorkerConfigs genesis: worker 0 Eip1559 { target_gas: 30M } (strategy 0), with
+    // a genesis base fee the synthetic block will copy — provably different from the MIN the
+    // close writes for an at-MIN worker AND from any fold of the copied fee
+    let poison_fee = MIN_PROTOCOL_BASE_FEE + 777;
+    let mut genesis =
+        test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, 30_000_000u64)]);
+    genesis.base_fee_per_gas = Some(poison_fee as u128);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.clone()),
+    )?;
+    // the empty-close path resolves the leader's execution address through the rewards
+    // counter's committee, so build the committee from on-chain registry state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    // consensus output with NO batches and close_epoch: true -> the engine executes the single
+    // synthetic block to close the epoch
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_round_for_test(0);
+    leader.update_header_epoch_for_test(0);
+    leader.update_header_created_at_for_test(tn_types::now());
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        0,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true, // close_epoch
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        parent.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+
+    to_engine.send(output).await?;
+    // drop the sending channel so the engine drains and exits
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+    let engine_result = timeout(Duration::from_secs(30), rx).await??;
+    assert!(engine_result.is_err(), "engine should return error when stream closes");
+
+    // the closing block is the synthetic empty-close shape: worker-0 stamped, zero batch
+    // digest in ommers_hash, parent's (non-MIN) base fee copied, zero user gas
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(closing.number, 1);
+    assert_eq!(RethEnv::extract_epoch_from_header(&closing), 0);
+    assert_eq!(closing.ommers_hash, B256::ZERO, "synthetic block carries a zero batch digest");
+    assert_eq!(
+        closing.base_fee_per_gas,
+        Some(poison_fee),
+        "synthetic block copies its parent's base fee - the attribution poison",
+    );
+    assert_eq!(closing.base_fee_per_gas, parent.base_fee_per_gas);
+    assert_eq!(closing.gas_used, 0, "system calls never count toward gas_used");
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch closed");
+
+    // the value a header-priced regression would produce: the synthetic block's parent-copied
+    // fee folded through worker 0's Eip1559 config — provably distinct from the correct value
+    // (the close prices from the accumulator's real MIN fee and zero gas, not from the header)
+    let poisoned_fold = compute_next_base_fee_eip1559(poison_fee, 0, 30_000_000);
+    assert_ne!(
+        poisoned_fold, MIN_PROTOCOL_BASE_FEE,
+        "setup: the poison fold must be distinguishable from the written value",
+    );
+
+    // the WRITE happened even for the empty close: the closing block's data word records the
+    // at-MIN worker's next-epoch fee — MIN, priced from (MIN fee, zero gas) — not the poison
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, closing.hash())?;
+    assert_eq!(num_workers, 1);
+    assert!(!entries[0].data.is_zero(), "an empty close still writes the eip1559 data word");
+    assert_eq!(entries[0].data.to::<u64>(), MIN_PROTOCOL_BASE_FEE);
+    assert_ne!(entries[0].data.to::<u64>(), poisoned_fold, "write must not price from the header");
+
+    // the entry read returns the written value — the committee fee, not the poison fold
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
+    assert_eq!(entry.num_workers, 1);
+    assert_eq!(
+        entry.fees,
+        vec![MIN_PROTOCOL_BASE_FEE],
+        "the entry read prices from the written word, not the synthetic block's header fee",
+    );
+    assert_ne!(entry.fees[0], poisoned_fold);
+
+    // apply() writes EVERY configured worker: a stale container value is overwritten with the
+    // read fee (leaving the slot untouched would have kept 4242 in place)
+    let recovered = GasAccumulator::new(1);
+    recovered.base_fee(0).set_base_fee(4242);
+    entry.apply(&recovered);
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "apply must install the read fee for every configured worker",
+    );
+
+    Ok(())
+}
+
+/// An idle `Eip1559` worker's fee decays once per boundary through the WRITE↔READ chain: each
+/// closing block writes the worker's next-epoch fee into its `WorkerConfigs.data` word (priced
+/// from the live accumulator's fee and the worker's ZERO gas), the entry read returns exactly
+/// the written word, and re-seeding the accumulator through that read supplies the input the
+/// NEXT close prices from — so the per-boundary oracle chain
+/// `compute_next_base_fee_eip1559(prev, 0, target)` threads write → read → write across
+/// boundaries with no header scan anywhere.
+///
+/// Manual two-epoch chain over a LIVE accumulator (wired into the execution node so the closing
+/// blocks' `record_next_epoch_base_fees` prices from it):
+/// - epoch-0 entry sizes the accumulator from genesis state, then worker 1's container is preloaded
+///   with a stand-in non-MIN fee (the capstone's `START_FEE` pattern) so the decay is observable at
+///   full scale; its one epoch-0 block carries the same fee (input-consistency);
+/// - block 2 closes epoch 0: writes worker 1's decayed fee — boundary-1 oracle;
+/// - the accumulator is re-seeded FOR epoch 1 via the production entry read (clear + apply),
+///   exactly how `run_epoch` seeds between boundaries;
+/// - block 3 (epoch 1): worker 0 only — worker 1 is idle;
+/// - block 4 closes epoch 1: writes worker 1's fee decayed AGAIN, priced from the read-seeded
+///   accumulator value — boundary-2 oracle; the epoch-2 entry read returns it.
+#[tokio::test]
+async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("entry_reads_idle").unwrap();
+    // 2-worker WorkerConfigs: worker 0 Eip1559 { 30M }, worker 1 Eip1559 { 1M } (strategy 0)
+    let target_gas = 1_000_000u64;
+    let cfg1 = WorkerFeeConfig::Eip1559 { target_gas };
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (0u8, target_gas)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    // the LIVE accumulator, shared with the execution node so each closing block's on-chain
+    // record prices from exactly this state
+    let acc = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(acc.clone()),
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // epoch-0 entry: size the accumulator from genesis WorkerConfigs state (the production
+    // epoch-0 seam), then preload worker 1's stand-in fee; worker 0 keeps MIN
+    sync_num_workers_from_chain(&reth_env, &acc, 0).await?;
+    assert_eq!(acc.num_workers(), 2, "accumulator sized from the on-chain worker count");
+    let worker1_fee = 1_000_000u64;
+    acc.base_fee(1).set_base_fee(worker1_fee);
+
+    let no_txs: Vec<Vec<u8>> = vec![];
+
+    // block 1 (epoch 0): worker 1's only block, carrying its accumulator fee (input-consistency)
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker1_fee, 1);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+
+    // block 2: closes epoch 0 (worker 0 at MIN) — its 4th system call writes both workers'
+    // next-epoch fees, pricing worker 1 from (worker1_fee, zero gas)
+    let output2 = manual_consensus_output(1, 0, 2, true);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, MIN_PROTOCOL_BASE_FEE, 0);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+    // boundary-1 oracle: one zero-gas decay from the preloaded fee
+    let fee_entering_1 = compute_next_base_fee_eip1559(worker1_fee, 0, target_gas);
+    assert!(
+        fee_entering_1 > MIN_PROTOCOL_BASE_FEE,
+        "decay from a non-MIN fee must stay non-MIN for the oracle to be meaningful",
+    );
+    assert_eq!(fee_entering_1, next_base_fee_for_config(cfg1, worker1_fee, 0), "one-formula seam");
+
+    // (a) the WRITE at boundary 1: epoch 0's closing block recorded the oracle value in worker
+    // 1's data word (and MIN in worker 0's — zero gas under its 30M target folds back to MIN)
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, block2_header.hash())?;
+    assert_eq!(num_workers, 2);
+    assert_eq!(entries[1].data.to::<u64>(), fee_entering_1, "written data != boundary-1 oracle");
+    assert_eq!(entries[0].data.to::<u64>(), MIN_PROTOCOL_BASE_FEE);
+
+    // (b) the READ at boundary 1: the idle worker's entry fee IS the written word
+    let entry_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header).await?;
+    assert_eq!(entry_1.num_workers, 2);
+    assert_eq!(entry_1.fees, vec![MIN_PROTOCOL_BASE_FEE, fee_entering_1]);
+
+    // seed epoch 1 exactly as production does between boundaries: clear the closed epoch's
+    // gas, then apply the entry read — the value the NEXT close prices from
+    acc.clear();
+    entry_1.apply(&acc);
+    assert_eq!(acc.num_workers(), 2);
+    assert_eq!(acc.base_fee(1).base_fee(), fee_entering_1, "read seeds the idle worker's fee");
+    assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+    // block 3 (epoch 1): worker 0 only - worker 1 goes idle
+    let output3 = manual_consensus_output(0, 1, 3, false);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, MIN_PROTOCOL_BASE_FEE, 0);
+    let block3 = reth_env.build_block_from_batch_payload(
+        payload3,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
+
+    // block 4: closes epoch 1 — prices worker 1 from the READ-SEEDED fee and zero gas
+    let output4 = manual_consensus_output(1, 1, 4, true);
+    let payload4 = payload_with_base_fee(block3_header.clone(), &output4, MIN_PROTOCOL_BASE_FEE, 0);
+    let block4 = reth_env.build_block_from_batch_payload(
+        payload4,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block4_header = extend_canonical_chain(&reth_env, block4)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2, "epoch 1 closed");
+
+    // boundary-2 oracle: the SECOND zero-gas decay, chained from the boundary-1 value
+    let fee_entering_2 = compute_next_base_fee_eip1559(fee_entering_1, 0, target_gas);
+    assert_ne!(fee_entering_2, fee_entering_1, "the second boundary must decay again");
+
+    // (a) the WRITE at boundary 2: the idle worker's word decayed once more — the close read
+    // the fee the entry read installed, so the oracle chain threads write -> read -> write
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, block4_header.hash())?;
+    assert_eq!(num_workers, 2);
+    assert_eq!(entries[1].data.to::<u64>(), fee_entering_2, "written data != boundary-2 oracle");
+
+    // (b) the READ entering epoch 2 returns it, and apply installs it
+    let entry_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &block4_header).await?;
+    assert_eq!(entry_2.num_workers, 2);
+    assert_eq!(entry_2.fees[1], fee_entering_2, "entry read covers the idle worker");
+    // worker 0 ran epoch 1 at MIN with zero gas: written and read back as MIN
+    assert_eq!(entry_2.fees[0], MIN_PROTOCOL_BASE_FEE);
+    acc.clear();
+    entry_2.apply(&acc);
+    assert_eq!(acc.base_fee(1).base_fee(), fee_entering_2);
+
+    Ok(())
+}
+
+/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: the atomic
+/// `epoch_state_at_epoch_start` read yields the entered epoch's state together with the pin
+/// header — the previous epoch's closing block (`blockHeight - 1`, written once at the
+/// boundary) — and the worker count and every worker's base fee read+apply from that pinned
+/// state (`read_base_fees_for_entered_epoch`, the production entry path). Epoch 0 has no prior
+/// epoch: the count syncs from genesis `WorkerConfigs` state and fees keep the MIN defaults.
+async fn run_epoch_entry_sequence(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+) -> eyre::Result<()> {
+    // run_epoch's entry read is pinned to the previous epoch's closing block; the pin resolves
+    // from boundary-written-once scalars, so any mid-epoch tip yields the identical header
+    let (entered_state, epoch_start_header) = reth_env.epoch_state_at_epoch_start()?;
+    if entered_state.epoch == 0 {
+        sync_num_workers_from_chain(
+            reth_env,
+            gas_accumulator,
+            entered_state.epoch_info.blockHeight,
+        )
+        .await?;
+    } else {
+        read_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)
+            .await?
+            .apply(gas_accumulator);
+    }
+    Ok(())
+}
+
+/// A ModeChange re-entry re-runs the epoch-entry sequence mid-epoch while the engine may still
+/// be executing leftover consensus output (`send_leftover_consensus_output_to_engine` forwards
+/// it WITHOUT waiting for execution). What makes that safe is NOT quiescence but
+/// value-stability: the entered epoch's `blockHeight` is written once at the boundary and the
+/// entry read is pinned to the prior epoch's closing state, so the re-entry re-reads identical
+/// values - the resize no-ops and the fee writes rewrite the same values - while in-flight
+/// `inc_block` calls (ids < count) keep landing.
+///
+/// Chain shape (2 static workers so both derive sub-paths carry non-MIN fees):
+/// - block 1 closes epoch 0 (worker 0 at MIN - the live epoch-0 fee; statics activate entering
+///   epoch 1);
+/// - block 2 (epoch 1): worker 0 at its static fee - chain-consistent with the derived value;
+/// - block 3 (epoch 1): the "leftover" executed between the entries, advancing the tip.
+///
+/// The first entry seeds count = 2 and fees [700, 500] (both Static: the read maps each
+/// worker's fee to its config's value word). Live gas
+/// accumulates, block 3 lands, then the re-entry runs while a hammer thread plays the engine
+/// still executing leftovers - `inc_block`/`base_fee` for both workers (worker 1 = count - 1
+/// pins the no-shrink-below-in-flight-id bound). Asserts: count unchanged, every fee
+/// unchanged, accumulated gas exactly preserved (sequential + concurrent increments), no
+/// panic. The thread overlap is best-effort; every assertion is timing-independent.
+#[tokio::test]
+async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
+    const WORKER0_FEE: u64 = 700;
+    const WORKER1_FEE: u64 = 500;
+    const HAMMER_BLOCKS: u64 = 20_000;
+
+    let temp_dir = TempDir::with_prefix("mode_change_reentry").unwrap();
+    // 2-worker WorkerConfigs, both Static (strategy 1) so the epoch-1 fees are non-MIN for
+    // both the produced (worker 0) and the idle (worker 1) slot
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(1u8, WORKER0_FEE), (1u8, WORKER1_FEE)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+    let no_txs: Vec<Vec<u8>> = vec![];
+
+    // block 1: closes epoch 0 (worker 0 at MIN - containers hold MIN until the first close)
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 =
+        payload_with_base_fee(genesis_header.clone(), &output1, MIN_PROTOCOL_BASE_FEE, 0);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+    // block 2 (epoch 1): worker 0 produces at its now-active static fee; worker 1 stays idle
+    let output2 = manual_consensus_output(0, 1, 2, false);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, WORKER0_FEE, 0);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    reth_env.finalize_block(block2_header.clone())?;
+
+    // FIRST entry (mid-epoch-1): read from epoch 0's closing block, then apply
+    let gas_accumulator = GasAccumulator::new(1);
+    let block_height_first = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    run_epoch_entry_sequence(&reth_env, &gas_accumulator).await?;
+    assert_eq!(gas_accumulator.num_workers(), 2, "count read from the closing block's configs");
+    assert_eq!(
+        gas_accumulator.base_fee(0).base_fee(),
+        WORKER0_FEE,
+        "worker 0's static fee reads from the closing block's config",
+    );
+    assert_eq!(
+        gas_accumulator.base_fee(1).base_fee(),
+        WORKER1_FEE,
+        "idle worker 1's static fee reads from the closing block's config",
+    );
+
+    // live execution before the mode change: deterministic totals the re-entry must preserve
+    gas_accumulator.inc_block(0, 100_000, 150_000);
+    gas_accumulator.inc_block(1, 42_000, 60_000);
+
+    // a leftover output executes between the exit and the re-entry (there is no execution
+    // wait): block 3 extends epoch 1 at the SAME fee - mid-epoch fees are constants
+    let output3 = manual_consensus_output(1, 1, 3, false);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, WORKER0_FEE, 0);
+    let block3 = reth_env.build_block_from_batch_payload(
+        payload3,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
+    reth_env.finalize_block(block3_header)?;
+
+    // the count-read input is value-stable across the advanced tip: epoch info is written once
+    // at the boundary
+    let block_height_second = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    assert_eq!(block_height_second, block_height_first, "entry reads pin the same closing block");
+
+    // RE-ENTRY (ModeChange): re-run the entry sequence while a hammer thread drives in-flight
+    // execution - inc_block for both workers (worker 1 = count - 1 pins the id bound) plus fee
+    // reads that must only ever observe the seeded epoch values
+    let hammer_accumulator = gas_accumulator.clone();
+    let hammer = std::thread::spawn(move || {
+        for _ in 0..HAMMER_BLOCKS {
+            hammer_accumulator.inc_block(0, 21_000, 30_000_000);
+            hammer_accumulator.inc_block(1, 10_000, 30_000_000);
+            assert_eq!(hammer_accumulator.base_fee(0).base_fee(), WORKER0_FEE);
+            assert_eq!(hammer_accumulator.base_fee(1).base_fee(), WORKER1_FEE);
+        }
+    });
+    let reentry = run_epoch_entry_sequence(&reth_env, &gas_accumulator).await;
+    hammer.join().expect("in-flight inc_block/base_fee must not panic across the re-entry");
+    reentry?;
+
+    // idempotent: the resize is a no-op and every per-worker fee is unchanged
+    assert_eq!(gas_accumulator.num_workers(), 2, "re-entry resize must be a no-op");
+    assert_eq!(gas_accumulator.base_fee(0).base_fee(), WORKER0_FEE, "re-read rewrites same value");
+    assert_eq!(gas_accumulator.base_fee(1).base_fee(), WORKER1_FEE, "re-read rewrites same value");
+
+    // the epoch's accumulated gas is exactly preserved: sequential + concurrent increments,
+    // nothing cleared or overwritten by the re-entry
+    assert_eq!(
+        gas_accumulator.get_values(0),
+        (1 + HAMMER_BLOCKS, 100_000 + HAMMER_BLOCKS * 21_000, 150_000 + HAMMER_BLOCKS * 30_000_000,),
+        "worker 0's live gas totals must survive the re-entry",
+    );
+    assert_eq!(
+        gas_accumulator.get_values(1),
+        (1 + HAMMER_BLOCKS, 42_000 + HAMMER_BLOCKS * 10_000, 60_000 + HAMMER_BLOCKS * 30_000_000),
+        "worker 1's live gas totals must survive the re-entry",
+    );
+
+    Ok(())
+}
+
+/// A governance-added worker's data word is written at the very close that creates its slot,
+/// and the next epoch's entry read prices it identically.
+///
+/// Governance grows the worker set mid-epoch (`setWorkerConfig(1, ..)` then `setNumWorkers(2)`,
+/// owner-only, in one epoch-0 block). The live accumulator still has ONE slot — the protocol's
+/// count is pinned at boundaries — so when the epoch closes, `record_next_epoch_base_fees`
+/// iterates the CONTRACT's close-time count (2), finds worker 1 without an accumulator slot,
+/// and prices it as a fresh slot: `next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE, 0)` —
+/// the formula oracle, not a hardcoded constant. The pins:
+/// - BEFORE the close, the new slot's data word is zero (governance wrote the config, no fee);
+/// - the creation close WRITES it (non-zero word == the fresh-slot oracle);
+/// - entering the next epoch, `read_base_fees_for_entered_epoch` returns the same value and `apply`
+///   resizes the accumulator to 2 and installs it — every entry shape prices the new worker
+///   identically to the committee that closed the epoch.
+#[tokio::test]
+async fn test_boundary_added_worker_data_written_at_creation_close() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("boundary_added_worker").unwrap();
+    // genesis WorkerConfigs declares ONE worker (worker 0 Eip1559 { 30M })
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, 30_000_000u64)]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    // the LIVE accumulator: sized for the epoch's pinned count (1) the whole epoch, so the
+    // close must price the added worker as a fresh slot, not from an accumulator read
+    let acc = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(acc.clone()),
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // epoch-0 entry: the production epoch-0 seam sizes from genesis state
+    sync_num_workers_from_chain(&reth_env, &acc, 0).await?;
+    assert_eq!(acc.num_workers(), 1, "the running epoch's accumulator holds the pinned count");
+
+    // mid-epoch-0 governance adds worker 1 (Eip1559 { target_gas: 1M }): setWorkerConfig FIRST
+    // (the contract requires it before the count grows), then setNumWorkers(2)
+    let new_cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+    let mut governance = governance_owner_factory();
+    let set_config_calldata = WorkerConfigs::setWorkerConfigCall {
+        workerId: 1,
+        strategy: 0,
+        value: 1_000_000,
+        data: Default::default(),
+    }
+    .abi_encode()
+    .into();
+    let set_config_tx = governance.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(WORKER_CONFIGS_ADDRESS),
+        U256::ZERO,
+        set_config_calldata,
+    );
+    let set_count_calldata =
+        WorkerConfigs::setNumWorkersCall { numWorkers_: 2 }.abi_encode().into();
+    let set_count_tx = governance.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(WORKER_CONFIGS_ADDRESS),
+        U256::ZERO,
+        set_count_calldata,
+    );
+
+    // block 1 (epoch 0): worker 0 carries the two governance transactions
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let payload1 =
+        payload_with_base_fee(genesis_header.clone(), &output1, MIN_PROTOCOL_BASE_FEE, 0);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &vec![set_config_tx, set_count_tx],
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+    assert!(block1_header.gas_used > 0, "the governance transactions must have executed");
+
+    // pre-close: the contract already reports 2 workers, but the new slot's data word is ZERO —
+    // governance wrote the config, and only an epoch close writes a fee
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, block1_header.hash())?;
+    assert_eq!(num_workers, 2, "governance grew the on-chain worker set mid-epoch");
+    assert_eq!(entries[1].config, new_cfg);
+    assert!(entries[1].data.is_zero(), "no close has priced the new worker yet");
+
+    // block 2: closes epoch 0 (worker 0, still a 1-slot accumulator)
+    let output2 = manual_consensus_output(1, 0, 2, true);
+    let no_txs: Vec<Vec<u8>> = vec![];
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, MIN_PROTOCOL_BASE_FEE, 0);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &no_txs,
+        &mut OutputTrieOverlay::new(),
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+    // the fresh-slot oracle: a worker with no accumulator slot prices from (MIN, zero gas)
+    // through the ONE formula — computed, not hardcoded
+    let fresh_slot_fee = next_base_fee_for_config(new_cfg, MIN_PROTOCOL_BASE_FEE, 0);
+
+    // the creation close WROTE the new worker's data word
+    let (num_workers, entries) = read_worker_config_entries_at(&reth_env, block2_header.hash())?;
+    assert_eq!(num_workers, 2);
+    assert!(
+        !entries[1].data.is_zero(),
+        "the close that creates the slot must write the new worker's data word",
+    );
+    assert_eq!(entries[1].data.to::<u64>(), fresh_slot_fee, "written data != fresh-slot oracle");
+
+    // entering epoch 1, the production entry read prices the new worker identically and
+    // apply() resizes the accumulator to include it
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header).await?;
+    assert_eq!(entry.num_workers, 2, "the entry read returns the grown worker count");
+    assert_eq!(entry.fees[1], fresh_slot_fee, "entry read != creation-close write");
+    acc.clear();
+    entry.apply(&acc);
+    assert_eq!(acc.num_workers(), 2, "apply seats the governance-added worker's slot");
+    assert_eq!(acc.base_fee(1).base_fee(), fresh_slot_fee);
+
+    Ok(())
+}
+
+/// IT-3: the epoch-record chain survives a mid-epoch governance ejection end-to-end.
+///
+/// A 5-validator registry chain closes epoch 0 normally (rec0), then governance burns a
+/// current-committee validator mid-epoch-1 before the epoch-1 close. The producer's inputs
+/// are REAL post-ejection chain reads (the same `getCommitteeBlsPubkeys` path the node's
+/// `write_epoch_record` uses), so rec1's committee is the shrunken, swap-and-popped 4-member
+/// array while rec0's `next_committee` promised 5 — the exact shape that made
+/// `build_epoch_record`'s strict comparison halt every node at the boundary before it
+/// tolerated compatible shrinks via [`EpochRecord::committee_compatible`]. Epoch 2 then
+/// closes with an exact 4-member handoff (rec2), and all three records round-trip the
+/// epoch-record db in order.
+#[tokio::test]
+async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()> {
+    let record_dir = TempDir::with_prefix("epoch_record_ejection_records")?;
+    let reth_dir = TempDir::with_prefix("epoch_record_ejection_reth")?;
+    // the committee fixture only backs the consensus-chain handle holding the record store
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let consensus_chain =
+        ConsensusChain::new_for_test(record_dir.path().to_owned(), fixture.committee()).await?;
+    let records = consensus_chain.epochs();
+
+    // 5-validator registry genesis so one ejection leaves a 4-member committee (the sync
+    // tolerance floor)
+    let genesis = test_genesis_with_consensus_registry(5);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let task_manager = TaskManager::new("epoch record ejection test");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
+
+    // committee reads through the same `getCommitteeBlsPubkeys` path the node performs for
+    // `write_epoch_record`. The node pins that read to the epoch-closing block; every read
+    // below happens while the canonical tip IS the relevant closing block.
+    let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
+        Ok(reth_env
+            .bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?
+            .iter()
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+            .collect())
+    };
+
+    // block 1: close epoch 0 normally
+    let worker_id: WorkerId = 0;
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 = payload_with_base_fee(
+        chain.sealed_genesis_header(),
+        &output1,
+        MIN_PROTOCOL_BASE_FEE,
+        worker_id,
+    );
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload1, vec![])?;
+    let header1 = block1.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // rec0 from real post-close reads: a full 5-member handoff
+    let committee0 = keys_for_epoch(0)?;
+    assert_eq!(committee0.len(), 5);
+    let rec0 = build_epoch_record(
+        0,
+        committee0,
+        keys_for_epoch(1)?,
+        None,
+        BlockNumHash::new(header1.number, header1.hash()),
+        ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+    )?;
+    records.save_record(rec0.clone()).await?;
+
+    // mid-epoch 1: governance burns a seated validator (a middle slot so swap-and-pop
+    // visibly reorders the survivors)
+    let epoch1_pre_burn = keys_for_epoch(1)?;
+    assert_eq!(epoch1_pre_burn, rec0.next_committee, "epoch 1 starts on the promised committee");
+    let target_bls = epoch1_pre_burn[1];
+    let target_addr = reth_env.epoch_state_from_canonical_tip()?.validators[1].validatorAddress;
+    let mut governance = governance_owner_factory();
+    let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target_addr);
+    let output2 = manual_consensus_output(1, 1, 2, false);
+    let payload2 = payload_with_base_fee(header1, &output2, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload2, vec![burn_tx])?;
+    let header2 = block2.recovered_block.clone_sealed_header();
+
+    // block 3: close epoch 1 over the shrunken committee
+    let output3 = manual_consensus_output(2, 1, 3, true);
+    let payload3 = payload_with_base_fee(header2, &output3, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload3, vec![])?;
+    let header3 = block3.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2);
+
+    // rec1 from real post-ejection reads, chained to the db round-tripped rec0: the exact
+    // producer shape that halted the network before the tolerance fix
+    let committee1 = keys_for_epoch(1)?;
+    assert_eq!(committee1.len(), 4, "on-chain committee shrank mid-epoch");
+    assert!(!committee1.contains(&target_bls));
+    let prev0 = records.record_by_epoch(0).await.expect("rec0 round-trips the record db");
+    assert_eq!(prev0, rec0);
+    let rec1 = build_epoch_record(
+        1,
+        committee1.clone(),
+        keys_for_epoch(2)?,
+        Some(&prev0),
+        BlockNumHash::new(header3.number, header3.hash()),
+        ConsensusNumHash::new(3, ConsensusHeaderDigest::default()),
+    )
+    .expect("mid-epoch ejection must not prevent the epoch record from building");
+    assert_eq!(rec1.committee, committee1, "the record carries the shrunken on-chain read");
+    assert_eq!(rec1.parent_hash, prev0.digest(), "rec1 chains to rec0");
+
+    // the producer built exactly the shape the sync verifier's tolerance accepts
+    let promised: BTreeSet<BlsPublicKey> = prev0.next_committee.iter().copied().collect();
+    assert!(rec1.committee_compatible(&promised));
+    let recorded: BTreeSet<BlsPublicKey> = rec1.committee.iter().copied().collect();
+    assert!(recorded.is_subset(&promised));
+    let ejected: Vec<_> = promised.difference(&recorded).collect();
+    assert_eq!(ejected, vec![&target_bls], "exactly the burned key left the committee");
+    records.save_record(rec1.clone()).await?;
+
+    // block 4: close epoch 2 — the chain continues normally after the ejection epoch
+    let output4 = manual_consensus_output(1, 2, 4, true);
+    let payload4 = payload_with_base_fee(header3, &output4, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block4 = execute_payload_and_update_canonical_chain(&reth_env, payload4, vec![])?;
+    let header4 = block4.recovered_block.clone_sealed_header();
+
+    let committee2 = keys_for_epoch(2)?;
+    let prev1 = records.record_by_epoch(1).await.expect("rec1 round-trips the record db");
+    assert_eq!(prev1, rec1);
+    assert_eq!(committee2, prev1.next_committee, "the post-ejection handoff is exact again");
+    let rec2 = build_epoch_record(
+        2,
+        committee2,
+        keys_for_epoch(3)?,
+        Some(&prev1),
+        BlockNumHash::new(header4.number, header4.hash()),
+        ConsensusNumHash::new(4, ConsensusHeaderDigest::default()),
+    )?;
+    assert_eq!(rec2.parent_hash, prev1.digest(), "rec2 chains through the ejection epoch");
+    records.save_record(rec2.clone()).await?;
+
+    // the full record chain reads back in order
+    for expected in [&rec0, &rec1, &rec2] {
+        let stored =
+            records.record_by_epoch(expected.epoch).await.expect("saved record is readable");
+        assert_eq!(&stored, expected);
+    }
+
+    Ok(())
+}
+
+/// ENTRY-READ INVARIANT end-to-end: the previous epoch's closing block rules the ENTIRE epoch —
+/// re-entry timing cannot change the committee or the rewards rows.
+///
+/// A governance `burn` swap-and-pops the ejected validator out of the CURRENT epoch's stored
+/// committee arrays immediately, so a node re-entering `run_epoch` mid-epoch (crash-restart or
+/// ModeChange) that read the canonical tip would seed `RewardsCounter::set_committee` with the
+/// shrunken post-burn committee. `get_address_counts` resolves tallied authorities through that
+/// committee, so the ejected leader's accumulated reward row silently vanishes and the
+/// `generate_withdrawals` set the closing block commits diverges from peers that kept the
+/// epoch-start committee — a different `withdrawals_root`, a different closing-block hash, and
+/// a different epoch-record digest across the fleet. The entry read is therefore pinned to the
+/// previous epoch's closing block (`epoch_state_at_epoch_start`), making every entry shape
+/// derive the identical committee.
+///
+/// Four legs:
+/// - A: on-time entry (before the burn) derives the full committee from the pinned read and seeds
+///   the counter exactly as `run_epoch` does; every member tallies leader blocks.
+/// - B: after a mid-epoch burn, the RE-ENTRY pinned read returns the identical committee (victim
+///   included) while the tip read shows the shrunken set; re-seeding from the pinned read preserves
+///   the victim's row and the production close consumer (`generate_withdrawals`, the
+///   `withdrawals_root` input) still emits all N entries.
+/// - C: control proving the machinery detects the pre-fix bug — the same tallies seeded from the
+///   post-burn TIP committee drop the victim's row and emit N-1 withdrawals.
+/// - D: epoch 0 pins genesis, and the pinned-read committee equals the tip-read committee — entry
+///   semantics for the genesis epoch are unchanged.
+#[tokio::test]
+async fn mid_epoch_burn_reentry_keeps_epoch_start_committee_and_rewards() -> eyre::Result<()> {
+    const VICTIM_LEADER_BLOCKS: u32 = 7;
+
+    let reth_dir = TempDir::with_prefix("burn_reentry_reth")?;
+    // 5-validator registry genesis: one ejection leaves 4 members, so pinned (5) and tip (4)
+    // committee sizes are distinguishable
+    let genesis = test_genesis_with_consensus_registry(5);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let task_manager = TaskManager::new("burn reentry test");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
+
+    // block 1: close epoch 0 — this closing block seats epoch 1's committee and is the pin
+    // every epoch-1 entry read must derive from
+    let worker_id: WorkerId = 0;
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 = payload_with_base_fee(
+        chain.sealed_genesis_header(),
+        &output1,
+        MIN_PROTOCOL_BASE_FEE,
+        worker_id,
+    );
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload1, vec![])?;
+    let header1 = block1.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // Leg A — entry BEFORE the burn: the pinned read production performs at every entry
+    let (state_a, pin_a) = reth_env.epoch_state_at_epoch_start()?;
+    assert_eq!(state_a.epoch, 1);
+    assert_eq!(pin_a.hash(), header1.hash(), "pin is epoch 0's closing block");
+    // the soon-to-be-burned victim: a middle slot so swap-and-pop visibly reorders survivors
+    let victim_addr = state_a.validators[1].validatorAddress;
+    let victim_bls = BlsPublicKey::from_literal_bytes(state_a.bls_pubkeys[1].as_ref())
+        .map_err(|err| eyre::eyre!("failed to decode victim bls key: {err:?}"))?;
+    let committee_a = create_committee_from_state(state_a).await?;
+    assert_eq!(committee_a.epoch(), 1);
+    assert_eq!(committee_a.size(), 5, "on-time entry derives the full epoch-start committee");
+
+    // seed the counter exactly as run_epoch does at entry, then tally leader blocks for every
+    // member — the victim's count is distinctive so its row is unmistakable
+    let gas_accumulator = GasAccumulator::new(1);
+    let rewards = gas_accumulator.rewards_counter();
+    rewards.set_committee(committee_a.clone());
+    for authority in committee_a.authorities() {
+        let count =
+            if authority.execution_address() == victim_addr { VICTIM_LEADER_BLOCKS } else { 1 };
+        for _ in 0..count {
+            rewards.inc_leader_count(&authority.id());
+        }
+    }
+    let counts_a = rewards.get_address_counts();
+    assert_eq!(counts_a.len(), 5, "every committee member has a reward row");
+    assert_eq!(counts_a.get(&victim_addr), Some(&VICTIM_LEADER_BLOCKS));
+
+    // Leg B — mid-epoch burn, then re-entry (the crash-restart / ModeChange shape)
+    let mut governance = governance_owner_factory();
+    let burn_tx = governance_burn_tx(&mut governance, chain.clone(), victim_addr);
+    let output2 = manual_consensus_output(1, 1, 2, false);
+    let payload2 = payload_with_base_fee(header1, &output2, MIN_PROTOCOL_BASE_FEE, worker_id);
+    execute_payload_and_update_canonical_chain(&reth_env, payload2, vec![burn_tx])?;
+
+    // the tip view shrinks immediately — this is what a pre-fix re-entry would have read
+    let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(tip_state.epoch, 1);
+    assert_eq!(tip_state.validators.len(), 4, "tip committee shrank post-burn");
+    assert!(tip_state.validators.iter().all(|v| v.validatorAddress != victim_addr));
+
+    // RE-ENTRY read: pinned to the same closing block, so the committee is IDENTICAL to leg
+    // A's — victim included; the pin is exactly what differs from the tip read above
+    let (state_b, pin_b) = reth_env.epoch_state_at_epoch_start()?;
+    assert_eq!(pin_b.hash(), pin_a.hash(), "pin unchanged by the burn");
+    let committee_b = create_committee_from_state(state_b).await?;
+    assert_eq!(
+        committee_b.bls_keys(),
+        committee_a.bls_keys(),
+        "re-entry derives the exact epoch-start committee"
+    );
+    assert!(committee_b.bls_keys().contains(&victim_bls), "the burned victim is still a member");
+
+    // re-seed from the pinned read as a real re-entry does: every accumulated reward row
+    // survives, and the production close consumer (generate_withdrawals feeds the closing
+    // block's withdrawals_root) still emits all 5 entries
+    rewards.set_committee(committee_b);
+    let counts_b = rewards.get_address_counts();
+    assert_eq!(counts_b, counts_a, "re-entry preserves every reward row");
+    let withdrawals_b = rewards.generate_withdrawals();
+    assert_eq!(withdrawals_b.len(), 5, "the epoch close pays every epoch-start member");
+    assert!(withdrawals_b
+        .iter()
+        .any(|w| w.address == victim_addr && w.amount == VICTIM_LEADER_BLOCKS as u64));
+
+    // Leg C — control: the same tallies seeded from the post-burn TIP committee drop the
+    // victim's row — the divergence the pin prevents, proving the assertions above would
+    // catch a regression to tip-seeded entry
+    let tip_committee = create_committee_from_state(tip_state).await?;
+    assert_eq!(tip_committee.size(), 4);
+    let control = GasAccumulator::new(1).rewards_counter();
+    for authority in committee_a.authorities() {
+        let count =
+            if authority.execution_address() == victim_addr { VICTIM_LEADER_BLOCKS } else { 1 };
+        for _ in 0..count {
+            control.inc_leader_count(&authority.id());
+        }
+    }
+    control.set_committee(tip_committee);
+    let control_counts = control.get_address_counts();
+    assert_eq!(control_counts.len(), 4, "tip seeding silently drops the ejected leader's row");
+    assert!(!control_counts.contains_key(&victim_addr));
+    let control_withdrawals = control.generate_withdrawals();
+    assert_eq!(control_withdrawals.len(), 4);
+    assert_ne!(
+        control_withdrawals, withdrawals_b,
+        "tip-seeded close builds different withdrawals — a divergent withdrawals_root"
+    );
+
+    // Leg D — epoch 0: a fresh chain pins genesis, and the pinned committee equals the tip
+    // committee — genesis-epoch entry semantics are unchanged by the pin
+    let fresh_dir = TempDir::with_prefix("burn_reentry_epoch0")?;
+    let fresh_task_manager = TaskManager::new("burn reentry epoch 0");
+    let fresh_env =
+        RethEnv::new_for_temp_chain(chain.clone(), fresh_dir.path(), &fresh_task_manager, None)?;
+    let (state_0, pin_0) = fresh_env.epoch_state_at_epoch_start()?;
+    assert_eq!(pin_0.number, 0, "epoch 0 pins genesis");
+    assert_eq!(state_0.epoch, 0);
+    let committee_0 = create_committee_from_state(state_0).await?;
+    let committee_0_tip =
+        create_committee_from_state(fresh_env.epoch_state_from_canonical_tip()?).await?;
+    assert_eq!(committee_0.size(), 5);
+    assert_eq!(
+        committee_0.bls_keys(),
+        committee_0_tip.bls_keys(),
+        "epoch 0's pinned view matches the tip view"
+    );
+
+    Ok(())
+}
+
 /// Helper to spawn consensus components.
 async fn spawn_consensus(
     fixture: &CommitteeFixture<MemDatabase>,
@@ -461,7 +3215,7 @@ async fn spawn_consensus(
     batches: HashMap<B256, Batch>,
     config: ConsensusConfig<MemDatabase>,
     task_manager: &TaskManager,
-    mut consensus_chain: ConsensusChain,
+    consensus_chain: ConsensusChain,
 ) {
     // components for tasks
     let committee = fixture.committee();
@@ -485,19 +3239,24 @@ async fn spawn_consensus(
         task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         3,
@@ -508,7 +3267,13 @@ async fn spawn_consensus(
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
-    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, consensus_bus, bullshark, task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
 }

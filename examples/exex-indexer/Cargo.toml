@@ -1,0 +1,18 @@
+[package]
+name = "exex-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Example ExEx: a minimal stateful block indexer skeleton."
+
+[dependencies]
+tn-exex = { path = "../../crates/exex" }
+tn-types = { path = "../../crates/types" }
+eyre = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

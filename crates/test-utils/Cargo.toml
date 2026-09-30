@@ -13,6 +13,8 @@ publish = false
 [dependencies]
 tempfile = { workspace = true }
 eyre = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 clap = { workspace = true, features = ["env"] }
 indexmap = { workspace = true }
 tn-node = { workspace = true }
@@ -21,6 +23,9 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 telcoin-network-cli = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]
 workspace = true

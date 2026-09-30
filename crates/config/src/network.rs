@@ -1,10 +1,14 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
-use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, time::Duration};
-use tn_types::Round;
+use libp2p::kad::K_VALUE;
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
+use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tracing::warn;
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -24,17 +28,69 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// The hostname for the validator.
     hostname: String,
+    /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
+    ///
+    /// A nonempty map replaces the genesis bootstrap set in full; entries are never merged.
+    /// An empty or absent map preserves the genesis fallback. A CLI override takes precedence
+    /// over this map, with an explicitly empty override selecting the genesis fallback.
+    /// Committee membership and gossip publisher authorization remain derived from chain state.
+    bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl NetworkConfig {
+    /// Return the configured bootstrap dial hints.
+    pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
+        &self.bootstrap_peers
+    }
+
+    /// Select bootstrap dial hints: CLI override, then network config, then genesis.
+    ///
+    /// The selected override or config map replaces genesis in full when nonempty. An empty
+    /// selected map falls back to genesis, including when the CLI explicitly supplies `{}`.
+    pub fn resolve_bootstrap_peers(
+        &self,
+        genesis: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        let configured = cli_override.unwrap_or(&self.bootstrap_peers);
+        if configured.is_empty() {
+            genesis.clone()
+        } else {
+            configured.clone()
+        }
+    }
+
     /// Return a reference to the [SyncConfig].
     pub fn sync_config(&self) -> &SyncConfig {
         &self.sync_config
     }
 
+    /// Return a mutable reference to the [SyncConfig].
+    pub fn sync_config_mut(&mut self) -> &mut SyncConfig {
+        &mut self.sync_config
+    }
+
     /// Return a reference to the [LibP2pConfig].
     pub fn libp2p_config(&self) -> &LibP2pConfig {
         &self.libp2p_config
+    }
+
+    /// The chain id used to namespace this node's wire protocols and gossip topics.
+    ///
+    /// Sourced from genesis and stamped via [`Self::set_chain_id`] at node startup.
+    /// Defaults to `0` until set; every protocol and topic reads this one value, so
+    /// an unset id yields a self-consistent `0` namespace rather than a mismatch.
+    pub fn chain_id(&self) -> u64 {
+        self.libp2p_config.chain_id
+    }
+
+    /// Stamp the genesis chain id onto this config.
+    ///
+    /// Called once during node startup so wire protocols and gossip topics read a
+    /// single, genesis-derived source. Genesis is authoritative: this overwrites
+    /// whatever the (non-persisted) field held.
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.libp2p_config.chain_id = chain_id;
     }
 
     /// Return a mutable reference to the [LibP2pConfig].
@@ -65,9 +121,24 @@ impl NetworkConfig {
     }
 
     /// Read a network config file.
+    ///
+    /// Logs a warning when [`SyncConfig::max_header_time_drift_tolerance`] exceeds one second.
     pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
         let path = tn_datadir.network_config_path();
-        Self::load_from_path_or_default(path, ConfigFmt::YAML)
+        let config: Self = Self::load_from_path_or_default(path, ConfigFmt::YAML)?;
+
+        // the voter waits out a future-dated header's lead, up to this tolerance, before deciding
+        // whether to vote, so a large value lets a proposer's clock skew delay that vote as long
+        let drift_tolerance = config.sync_config.max_header_time_drift_tolerance;
+        if drift_tolerance > Duration::from_secs(1) {
+            warn!(
+                target: "tn::config",
+                ?drift_tolerance,
+                "max_header_time_drift_tolerance exceeds 1s; votes on future-dated headers may wait this long"
+            );
+        }
+
+        Ok(config)
     }
 
     /// Write the current network config to file.
@@ -77,22 +148,28 @@ impl NetworkConfig {
     }
 }
 
+/// The maximum size, in bytes, of a gossip message payload (`GossipMessage::data`).
+///
+/// This is a protocol constant, not a per-node tunable, and is deliberately identical on every
+/// node. The gossip reject path Fatal-bans the *relaying* peer for delivering an oversized payload
+/// (`RejectReason::TooLarge` -> `RejectPenalty::FatalRelayer`), and that attribution is sound only
+/// if every honest node applies the identical bound: under gossipsub `Strict` validation a peer
+/// that deems a message `TooLarge` reports `Reject` and never forwards it, so a delivered oversized
+/// payload is genuine relayer misbehavior. The bound is enforced symmetrically on both the publish
+/// path (the network layer refuses to originate a larger message) and the receive path, so an
+/// honest node never emits one for its peers to reject. A per-node bound would instead let an
+/// honest relayer configured with a larger limit be Fatal-banned for forwarding a payload that is
+/// under its own limit but over ours, so the bound is fixed here network-wide rather than read from
+/// operator config. The largest legitimate gossip message is a `Certificate`; 12,000 bytes is sized
+/// to accommodate it.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 12_000;
+
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct LibP2pConfig {
-    /// The supported inbound/outbound protocols for request/response behavior.
-    /// - ex) "/telcoin-network/mainnet/0.0.1"
-    #[serde(with = "protocol_vec")]
-    pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
-    /// Maximum message size for gossipped network messages in bytes.
-    ///
-    /// The largest gossip message is likely a `Certificate`.
-    /// The default of 12,000 bytes should be enough for legit gossip.
-    /// Large messages should not be gossipped
-    pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     ///
     /// The strategy for TN is to rely on QUIC to send keep alive messages instead of adding
@@ -121,63 +198,103 @@ pub struct LibP2pConfig {
     pub kad_record_ttl: Duration,
     /// How often this node republishes its own kademlia records.
     ///
-    /// Must be < `kad_record_ttl`, otherwise records expire before they are
-    /// refreshed.
+    /// Must be nonzero to give republication a positive cadence. Must also be <
+    /// `kad_record_ttl`, otherwise records expire before they are refreshed.
     pub kad_publication_interval: Duration,
+    /// How often this node replicates every stored record (its own and others') to the
+    /// `replication_factor` closest peers.
+    ///
+    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
+    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
+    /// so the value is a deliberate choice rather than an inherited libp2p default; the
+    /// default matches the libp2p default (1h).
+    ///
+    /// Exactly zero panics libp2p's replication job on the first swarm poll. Must also be <
+    /// `kad_record_ttl`, otherwise other publishers' records expire before they are re-replicated.
+    pub kad_replication_interval: Duration,
+    /// The chain id, used to namespace every libp2p wire protocol and gossip
+    /// topic so nodes on different chains never negotiate a connection or share
+    /// a gossip mesh.
+    ///
+    /// Sourced from `genesis.config.chain_id` and stamped onto this config at
+    /// node startup (see `NetworkConfig::set_chain_id`). It is not an operator
+    /// tunable, so it is intentionally skipped during (de)serialization and
+    /// never written to the config file; genesis is the single source of truth.
+    #[serde(skip)]
+    pub chain_id: u64,
 }
 
 impl LibP2pConfig {
-    /// Return topics for primary.
-    pub fn primary_topic() -> String {
-        String::from("tn-primary")
+    /// Reject kad cadences that would panic the network task or break record persistence.
+    ///
+    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
+    /// equal to the current time, triggering its unconditional assertion on the first swarm
+    /// poll. Publication and replication must also occur before records expire. Validate at
+    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
+    /// configuration error before either critical network task starts.
+    pub fn validate(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.kad_replication_interval.is_zero(),
+            "LibP2pConfig.kad_replication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_replication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_replication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are re-replicated",
+            self.kad_replication_interval,
+            self.kad_record_ttl,
+        );
+        eyre::ensure!(
+            !self.kad_publication_interval.is_zero(),
+            "LibP2pConfig.kad_publication_interval must be non-zero",
+        );
+        eyre::ensure!(
+            self.kad_publication_interval < self.kad_record_ttl,
+            "LibP2pConfig.kad_publication_interval ({:?}) must be < kad_record_ttl ({:?}) \
+             or records expire before they are refreshed",
+            self.kad_publication_interval,
+            self.kad_record_ttl,
+        );
+        Ok(())
     }
 
-    /// Return topics for primary.
-    pub fn consensus_output_topic() -> String {
-        String::from("tn-consensus-output")
+    /// Return the primary gossip topic for `chain_id`.
+    pub fn primary_topic(chain_id: u64) -> String {
+        format!("tn-primary-{chain_id}")
     }
 
-    /// Return topics for epoch votes.
-    pub fn epoch_vote_topic() -> String {
-        String::from("tn-epoch-vote")
+    /// Return the consensus-output gossip topic for `chain_id`.
+    pub fn consensus_output_topic(chain_id: u64) -> String {
+        format!("tn-consensus-output-{chain_id}")
     }
 
-    /// Return topics for worker.
-    pub fn worker_batch_topic() -> String {
-        String::from("tn-worker")
+    /// Return the epoch-vote gossip topic for `chain_id`.
+    pub fn epoch_vote_topic(chain_id: u64) -> String {
+        format!("tn-epoch-vote-{chain_id}")
     }
 
-    /// Return topics for worker.
-    pub fn worker_txn_topic() -> String {
-        String::from("tn-txn")
-    }
-
-    /// Protocol for identify behavior.
-    pub fn identify_protocol(&self) -> &'static str {
-        Self::protocol()
-    }
-
-    /// Return the protocol string.
-    pub fn protocol() -> &'static str {
-        "/telcoin-network/0.0.0"
+    /// Return the worker-batch gossip topic for worker `worker_id` on `chain_id`.
+    ///
+    /// Every worker has its own batch gossip mesh, so a batch gossiped by worker `k` of one
+    /// validator only reaches worker `k` of the others.
+    pub fn worker_batch_topic(chain_id: u64, worker_id: WorkerId) -> String {
+        format!("tn-worker-{chain_id}-{worker_id}")
     }
 }
 
 impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
-            supported_req_res_protocols: vec![(
-                StreamProtocol::new(Self::protocol()),
-                ProtocolSupport::Full,
-            )],
-            max_rpc_message_size: 1024 * 1024, // 1 MiB
-            max_gossip_message_size: 12_000,   // 12kb
+            max_rpc_message_size: 1024 * 1024,                    // 1 MiB
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            kad_replication_interval: Duration::from_secs(60 * 60),
+            // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
+            chain_id: 0,
         }
     }
 }
@@ -218,11 +335,32 @@ pub struct SyncConfig {
     pub max_consenus_round_timeout: Duration,
     /// The maximum number of rounds that a proposed header can be behind the node's local round.
     pub max_proposed_header_age_limit: Round,
-    /// The tolerable amount of time to wait if a header is proposed before the current time.
+    /// How far a header's creation time may run ahead of this node's clock before the voter
+    /// stops waiting it out.
     ///
-    /// This accounts for small drifts in time keeping between nodes. The timestamp for headers is
-    /// currently measured in secs.
-    pub max_header_time_drift_tolerance: u64,
+    /// This absorbs small clock drift between validators. The voter measures how far the header
+    /// is ahead of local time and responds in one of three ways:
+    ///
+    /// - Within this tolerance, it waits out the lead in milliseconds, then decides whether to
+    ///   vote.
+    /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
+    ///   it answers with a retryable response and charges no penalty. The proposer retries the
+    ///   request, and by then the lead may be back within tolerance.
+    /// - Further ahead, it rejects the header and penalizes the proposer.
+    ///
+    /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
+    /// second.
+    ///
+    /// The within-tolerance check compares milliseconds when
+    /// [`tn_types::forks::subsecond_timestamp_active`] holds for the header's epoch. Earlier
+    /// epochs carry whole-second header timestamps, so there the check rounds this tolerance up
+    /// to the next whole second: the 250 ms default behaves as 1 s.
+    ///
+    /// The config file accepts either a bare integer, read as whole seconds (the format older
+    /// config files use, and logged as a warning when read), or a humantime string such as
+    /// `"250ms"` or `"1s"`. The value is always written back as a humantime string.
+    #[serde(deserialize_with = "secs_or_humantime", serialize_with = "humantime_serde::serialize")]
+    pub max_header_time_drift_tolerance: Duration,
     /// The maximum number of missing certificates a CVV peer can request within GC window.
     ///
     /// NOTE: this DOES NOT affect nodes that are syncing full state.
@@ -236,6 +374,19 @@ pub struct SyncConfig {
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_chunk_size: usize,
+    /// How long the observer's consensus-header catch-up loop waits between polls of local
+    /// storage while a missing range is being fetched.
+    ///
+    /// Used by `state_sync::spawn_stream_consensus_headers`. Only affects nodes that follow
+    /// consensus (CVV-inactive / observer), not active CVVs.
+    pub consensus_header_catch_up_poll_interval: Duration,
+    /// Number of consecutive no-progress catch-up polls the observer tolerates before it
+    /// re-drives a state-sync request for the missing consensus-header range.
+    ///
+    /// At the default poll interval this bounds a single passive wait to roughly
+    /// `consensus_header_catch_up_poll_interval * consensus_header_catch_up_max_no_progress`
+    /// before the observer actively re-requests the range instead of waiting for gossip.
+    pub consensus_header_catch_up_max_no_progress: u32,
 }
 
 impl Default for SyncConfig {
@@ -246,10 +397,13 @@ impl Default for SyncConfig {
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
             max_consenus_round_timeout: Duration::from_secs(30),
             max_proposed_header_age_limit: 3,
-            max_header_time_drift_tolerance: 1,
+            max_header_time_drift_tolerance: Duration::from_millis(250),
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+            // 600 * 100ms = 60 seconds of passive polling before actively re-driving a request.
+            consensus_header_catch_up_poll_interval: Duration::from_millis(100),
+            consensus_header_catch_up_max_no_progress: 600,
         }
     }
 }
@@ -278,6 +432,12 @@ pub struct QuicConfig {
     /// Max unacknowledged data in bytes that may be sent in total on all streams
     /// of a connection.
     pub max_connection_data: u32,
+    /// Answer every incoming QUIC connection attempt whose source address is not
+    /// validated with a QUIC Retry packet (RFC 9000 section 8.1) before the listener
+    /// creates connection state. The remote must echo the token from its address.
+    ///
+    /// Default `true`. Set `false` only as an operator rollback switch.
+    pub retry_unvalidated_incoming: bool,
 }
 
 impl Default for QuicConfig {
@@ -292,6 +452,7 @@ impl Default for QuicConfig {
             // maximum throughput = (buffer size / round-trip time)
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
+            retry_unvalidated_incoming: true,
         }
     }
 }
@@ -306,10 +467,6 @@ pub struct PeerConfig {
     pub target_num_peers: usize,
     /// The timeout for dialing a peer.
     pub dial_timeout: Duration,
-    /// The threshold before a peer is disconnected
-    pub min_score_for_disconnect: f64,
-    /// The threshold before a peer is banned.
-    pub min_score_for_ban: f64,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
     ///
@@ -340,6 +497,14 @@ pub struct PeerConfig {
     pub max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
     pub max_disconnected_peers: usize,
+    /// The maximum number of entries retained in the temporarily-banned reconnection cache.
+    ///
+    /// This bounds the `temporarily_banned` cache (`BannedPeerCache`), which is keyed by `PeerId`
+    /// and otherwise grows only with the reputation-ban rate between heartbeats. On overflow the
+    /// oldest entry is evicted, so the cache never exceeds this size regardless of ban admission
+    /// rate. This is distinct from `max_banned_peers`, which bounds the reputation-ban table in
+    /// `AllPeers`; this knob bounds the swarm-level reconnection-timeout cache.
+    pub max_temporarily_banned_peers: usize,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
 }
@@ -353,8 +518,6 @@ impl Default for PeerConfig {
             heartbeat_interval: 30,
             target_num_peers,
             dial_timeout: Duration::from_secs(15),
-            min_score_for_disconnect: -20.0,
-            min_score_for_ban: -50.0,
             peer_excess_factor: 0.3,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
@@ -362,6 +525,7 @@ impl Default for PeerConfig {
             excess_peers_reconnection_timeout: Duration::from_secs(600),
             max_banned_peers: 100,
             max_disconnected_peers: 100,
+            max_temporarily_banned_peers: 100,
             score_config: ScoreConfig::default(),
         }
     }
@@ -413,9 +577,6 @@ impl PeerConfig {
 pub struct ScoreConfig {
     /// The default score for new peers.
     pub default_score: f64,
-    /// The threshold for a peer's score before they are banned, regardless of any other scoring
-    /// parameters.
-    pub min_application_score_before_ban: f64,
     /// The maximum score a peer can obtain.
     pub max_score: f64,
     /// The minimum score a peer can obtain.
@@ -424,9 +585,15 @@ pub struct ScoreConfig {
     pub score_halflife: f64,
     /// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
     pub banned_before_decay_secs: u64,
-    /// Minimum score before a peer is disconnected.
+    /// Aggregate score at or below which a peer is disconnected.
+    ///
+    /// This is the live disconnect threshold read by the reputation decision; lowering it makes
+    /// the node more tolerant of misbehaving peers before disconnecting them.
     pub min_score_before_disconnect: f64,
-    /// Minimum score before a peer is banned.
+    /// Aggregate score at or below which a peer is banned.
+    ///
+    /// This is the live ban threshold: it drives both the reputation decision and the ban/decay
+    /// lockout, so the two always agree.
     pub min_score_before_ban: f64,
 }
 
@@ -434,7 +601,6 @@ impl Default for ScoreConfig {
     fn default() -> Self {
         ScoreConfig {
             default_score: 0.0,
-            min_application_score_before_ban: -60.0,
             max_score: 100.0,
             min_score: -100.0,
             // 5-minute halflife: transient WAN penalties (peer flap, slow request) decay
@@ -463,73 +629,204 @@ impl ScoreConfig {
     pub fn halflife_decay(&self) -> f64 {
         -(2.0f64.ln()) / self.score_halflife
     }
+
+    /// Reject a score configuration that would panic or silently disable peer reputation.
+    ///
+    /// Every field here is read live on the peer-scoring path, so a bad value crashes or
+    /// corrupts scoring at an unpredictable later moment rather than at config load:
+    ///
+    /// - `Score::add` clamps the aggregate score into `[min_score, max_score]` with `f64::clamp`,
+    ///   which panics if `min_score > max_score` or if either bound is `NaN`.
+    /// - `min_score_before_disconnect` / `min_score_before_ban` gate every reputation decision; a
+    ///   `NaN` there makes each `score <= threshold` comparison false, so a misbehaving peer is
+    ///   never disconnected or banned (a silent DoS-tolerance failure).
+    /// - `default_score` seeds every new peer's score; a `NaN` there poisons the same comparisons
+    ///   for that peer.
+    /// - `Self::halflife_decay` divides `-ln(2)` by `score_halflife`; a `0.0` yields `-inf` and a
+    ///   negative value flips exponential decay into unbounded growth.
+    ///
+    /// Validate at startup, on the same footing as `Parameters::validate`, so a bad score
+    /// config fails fast with a field-named error rather than halting the running swarm at
+    /// the first peer penalty.
+    pub fn validate(&self) -> eyre::Result<()> {
+        [
+            ("default_score", self.default_score),
+            ("max_score", self.max_score),
+            ("min_score", self.min_score),
+            ("min_score_before_disconnect", self.min_score_before_disconnect),
+            ("min_score_before_ban", self.min_score_before_ban),
+            ("score_halflife", self.score_halflife),
+        ]
+        .into_iter()
+        .try_for_each(|(name, value)| {
+            eyre::ensure!(value.is_finite(), "ScoreConfig.{name} must be finite, got {value}");
+            Ok(())
+        })?;
+        eyre::ensure!(
+            self.min_score <= self.max_score,
+            "ScoreConfig.min_score ({}) must be <= max_score ({})",
+            self.min_score,
+            self.max_score,
+        );
+        eyre::ensure!(
+            self.score_halflife > 0.0,
+            "ScoreConfig.score_halflife must be > 0, got {}",
+            self.score_halflife,
+        );
+        Ok(())
+    }
 }
 
-// Serialize and deserialize for tuples of protocols
-mod protocol_vec {
-    use super::*;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+/// Deserialize a [`Duration`] from either a bare integer of seconds or a humantime string.
+///
+/// The integer form keeps older config files loading: nodes persisted
+/// `max_header_time_drift_tolerance: 1` when that field was a whole number of seconds, and a
+/// plain humantime deserializer rejects the bare integer.
+///
+/// Reading the integer form logs a warning each time it is parsed. Older binaries persisted
+/// their whole-second default, so an upgraded node keeps that value, rather than the sub-second
+/// default, until an operator rewrites it.
+fn secs_or_humantime<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// Accepts an unsigned integer as seconds or a string parsed by humantime.
+    struct SecsOrHumantime;
 
-    pub(crate) fn serialize<S>(
-        protocols: &[(StreamProtocol, ProtocolSupport)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Simply convert to a Vec of string tuples
-        let string_tuples: Vec<(String, String)> = protocols
-            .iter()
-            .map(|(protocol, support)| {
-                let support_str = match support {
-                    ProtocolSupport::Inbound => "inbound".to_string(),
-                    ProtocolSupport::Outbound => "outbound".to_string(),
-                    ProtocolSupport::Full => "full".to_string(),
-                };
-                (protocol.as_ref().to_string(), support_str)
-            })
-            .collect();
+    impl Visitor<'_> for SecsOrHumantime {
+        type Value = Duration;
 
-        string_tuples.serialize(serializer)
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .write_str("a whole number of seconds or a humantime duration such as \"250ms\"")
+        }
+
+        fn visit_u64<E: de::Error>(self, secs: u64) -> Result<Duration, E> {
+            let drift_tolerance = Duration::from_secs(secs);
+            warn!(
+                target: "tn::config",
+                ?drift_tolerance,
+                default = ?SyncConfig::default().max_header_time_drift_tolerance,
+                "max_header_time_drift_tolerance is a bare integer of seconds, the format older \
+                 binaries wrote, so this node runs with that tolerance instead of the default; set \
+                 a humantime value such as \"250ms\" in the network config to change it"
+            );
+            Ok(drift_tolerance)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Duration, E> {
+            humantime_serde::re::humantime::parse_duration(value).map_err(E::custom)
+        }
     }
 
-    pub(crate) fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Vec<(StreamProtocol, ProtocolSupport)>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let string_tuples: Vec<(String, String)> = Vec::deserialize(deserializer)?;
-
-        string_tuples
-            .into_iter()
-            .map(|(protocol_str, support_str)| {
-                // Convert the protocol string to StreamProtocol
-                let protocol = StreamProtocol::try_from_owned(protocol_str).map_err(|_| {
-                    D::Error::custom("Invalid protocol: must start with a forward slash")
-                })?;
-
-                // Convert the support string to ProtocolSupport
-                let support = match support_str.as_str() {
-                    "inbound" => ProtocolSupport::Inbound,
-                    "outbound" => ProtocolSupport::Outbound,
-                    "full" => ProtocolSupport::Full,
-                    _ => {
-                        return Err(D::Error::custom(format!(
-                            "Invalid protocol support: {support_str}, expected inbound, outbound, or full"
-                        )))
-                    }
-                };
-
-                Ok((protocol, support))
-            })
-            .collect()
-    }
+    deserializer.deserialize_any(SecsOrHumantime)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Use the checked-in genesis peers so fixtures exercise real key decoding.
+    fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
+        serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
+            .map(|committee| committee.bootstrap_servers())
+            .map_err(Into::into)
+    }
+
+    /// Network config round-trips every worker and peer in the current bootstrap format.
+    #[test]
+    fn bootstrap_peers_yaml_round_trips_multiple_workers() -> eyre::Result<()> {
+        let mut peers = bootstrap_fixture()?;
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(peers.values().all(|server| server.num_workers() == 2));
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        let yaml = serde_yaml::to_string(&config)?;
+        let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+        assert_eq!(parsed.bootstrap_peers(), &peers);
+        Ok(())
+    }
+
+    /// Missing files, absent keys, and explicit empty maps preserve the genesis fallback.
+    #[test]
+    fn bootstrap_peers_default_and_legacy_configs_use_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let dir = tempfile::tempdir()?;
+        let missing = NetworkConfig::read_config(&dir.path().to_path_buf())?;
+        assert!(missing.bootstrap_peers().is_empty());
+        assert_eq!(missing.resolve_bootstrap_peers(&genesis, None), genesis);
+
+        let mut legacy = serde_yaml::to_value(NetworkConfig::default())?;
+        assert!(legacy
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected network config mapping"))?
+            .remove(&serde_yaml::Value::String("bootstrap_peers".into()))
+            .is_some());
+        ["{}".to_owned(), "bootstrap_peers: {}".to_owned(), serde_yaml::to_string(&legacy)?]
+            .into_iter()
+            .try_for_each(|yaml| -> eyre::Result<()> {
+                let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+                assert!(parsed.bootstrap_peers().is_empty());
+                assert_eq!(parsed.resolve_bootstrap_peers(&genesis, None), genesis);
+                Ok(())
+            })
+    }
+
+    /// The map inherits BootstrapServer's legacy single-worker reader.
+    #[test]
+    fn bootstrap_peers_accept_legacy_worker_shape() -> eyre::Result<()> {
+        let expected = bootstrap_fixture()?;
+        let mut peers = serde_yaml::to_value(&expected)?;
+        peers
+            .as_mapping_mut()
+            .ok_or_else(|| eyre::eyre!("expected peer map"))?
+            .iter_mut()
+            .try_for_each(|(_, server)| -> eyre::Result<()> {
+                let worker = server
+                    .get("workers")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .and_then(|workers| workers.first())
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("expected a worker"))?;
+                let server =
+                    server.as_mapping_mut().ok_or_else(|| eyre::eyre!("expected server map"))?;
+                assert!(server.remove(&serde_yaml::Value::String("workers".into())).is_some());
+                server.insert(serde_yaml::Value::String("worker".into()), worker);
+                Ok(())
+            })?;
+        let mut config = serde_yaml::Mapping::new();
+        config.insert(serde_yaml::Value::String("bootstrap_peers".into()), peers);
+        let parsed: NetworkConfig = serde_yaml::from_value(serde_yaml::Value::Mapping(config))?;
+        assert_eq!(parsed.bootstrap_peers(), &expected);
+        assert!(parsed.bootstrap_peers().values().all(|server| server.num_workers() == 1));
+        Ok(())
+    }
+
+    /// A nonempty configured map replaces all genesis peers, including colliding entries.
+    #[test]
+    fn bootstrap_peers_config_replaces_genesis() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let mut peers: BTreeMap<_, _> = genesis.clone().into_iter().take(1).collect();
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(genesis.len() > peers.len());
+        let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, None), peers);
+        Ok(())
+    }
+
+    /// CLI peers win over YAML; an explicitly empty CLI map restores genesis.
+    #[test]
+    fn bootstrap_peers_cli_override_has_precedence() -> eyre::Result<()> {
+        let genesis = bootstrap_fixture()?;
+        let configured = genesis.clone().into_iter().take(1).collect();
+        let mut cli: BTreeMap<_, _> = genesis.clone().into_iter().skip(1).collect();
+        cli.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        assert!(!cli.is_empty());
+        let config = NetworkConfig { bootstrap_peers: configured, ..Default::default() };
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&cli)), cli);
+        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&BTreeMap::new())), genesis);
+        Ok(())
+    }
 
     #[test]
     fn empty_yaml_deserializes_to_default() {
@@ -542,6 +839,10 @@ mod tests {
             parsed.libp2p_config.kad_publication_interval,
             default.libp2p_config.kad_publication_interval
         );
+        assert_eq!(
+            parsed.libp2p_config.kad_replication_interval,
+            default.libp2p_config.kad_replication_interval
+        );
         assert_eq!(parsed.peer_config.target_num_peers, default.peer_config.target_num_peers);
         assert_eq!(
             parsed.sync_config.max_skip_rounds_for_missing_certs,
@@ -551,16 +852,34 @@ mod tests {
     }
 
     #[test]
+    fn temporarily_banned_cap_has_valid_default() {
+        // The temporarily-banned cache cap must ship with a sane, positive default so the cache is
+        // bounded out of the box, parallel to `max_banned_peers`.
+        let default = PeerConfig::default();
+        assert!(
+            default.max_temporarily_banned_peers > 0,
+            "max_temporarily_banned_peers default must be positive"
+        );
+        assert_eq!(
+            default.max_temporarily_banned_peers, 100,
+            "default should mirror the sibling max_banned_peers cap"
+        );
+
+        // an empty config falls back to the default, so operators inherit the bound automatically.
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        assert_eq!(
+            parsed.peer_config.max_temporarily_banned_peers,
+            default.max_temporarily_banned_peers,
+        );
+    }
+
+    #[test]
     fn partial_yaml_uses_defaults_for_missing_fields() {
         // libp2p_config provided with only a subset of fields; the two new kad
         // fields (and others) are absent and must fall back to defaults.
         let yaml = r#"
 libp2p_config:
-  supported_req_res_protocols:
-    - - /telcoin-network/0.0.0
-      - full
   max_rpc_message_size: 2097152
-  max_gossip_message_size: 12000
   max_idle_connection_timeout:
     secs: 65
     nanos: 0
@@ -582,6 +901,7 @@ hostname: "my-validator"
         // missing new fields fall back to defaults
         assert_eq!(parsed.libp2p_config.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.libp2p_config.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.libp2p_config.kad_replication_interval, default.kad_replication_interval);
 
         // entirely-missing sub-sections also default
         assert_eq!(parsed.peer_config.target_num_peers, PeerConfig::default().target_num_peers);
@@ -606,6 +926,10 @@ hostname: "my-validator"
             mapping.remove(&serde_yaml::Value::String("kad_publication_interval".into())).is_some(),
             "kad_publication_interval must be present in the default serialization"
         );
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_replication_interval".into())).is_some(),
+            "kad_replication_interval must be present in the default serialization"
+        );
         let legacy = serde_yaml::to_string(&value).expect("serialize stripped value");
 
         let parsed: LibP2pConfig =
@@ -613,7 +937,305 @@ hostname: "my-validator"
 
         assert_eq!(parsed.kad_record_ttl, default.kad_record_ttl);
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.kad_replication_interval, default.kad_replication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    /// The shipped kad cadences must pass startup validation.
+    #[test]
+    fn default_libp2p_config_validates() -> eyre::Result<()> {
+        LibP2pConfig::default().validate()
+    }
+
+    /// Positive cadences strictly below the TTL remain valid at the upper boundary.
+    #[test]
+    fn libp2p_config_accepts_intervals_below_ttl() -> eyre::Result<()> {
+        LibP2pConfig {
+            kad_record_ttl: Duration::from_secs(2),
+            kad_replication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            kad_publication_interval: Duration::from_secs(2) - Duration::from_nanos(1),
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding replication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_replication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_replication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_replication_interval")
+                    }),
+                    "replication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// Zero, TTL-equal, and TTL-exceeding publication cadences fail with the field name.
+    #[test]
+    fn libp2p_config_rejects_invalid_publication_intervals() {
+        let default = LibP2pConfig::default();
+        [Duration::ZERO, default.kad_record_ttl, default.kad_record_ttl + Duration::from_nanos(1)]
+            .into_iter()
+            .for_each(|interval| {
+                let config = LibP2pConfig { kad_publication_interval: interval, ..default.clone() };
+                assert!(
+                    config.validate().is_err_and(|error| {
+                        error.to_string().contains("LibP2pConfig.kad_publication_interval")
+                    }),
+                    "publication interval {interval:?} must fail with a field-named error",
+                );
+            });
+    }
+
+    /// A zero record TTL cannot satisfy either positive cadence.
+    #[test]
+    fn libp2p_config_rejects_zero_record_ttl() {
+        let config = LibP2pConfig { kad_record_ttl: Duration::ZERO, ..Default::default() };
+        assert!(
+            config.validate().is_err_and(|error| error.to_string().contains("kad_record_ttl")),
+            "a zero record TTL must fail with an error naming the TTL",
+        );
+    }
+
+    /// Operator-provided zero durations deserialize but fail the startup cadence guard.
+    #[test]
+    fn libp2p_config_rejects_zero_intervals_from_yaml() -> eyre::Result<()> {
+        ["kad_replication_interval", "kad_publication_interval"].into_iter().try_for_each(|field| {
+            let yaml = format!("libp2p_config:\n  {field}: {{secs: 0, nanos: 0}}\n");
+            let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
+            assert!(
+                parsed.libp2p_config().validate().is_err_and(|error| {
+                    error.to_string().contains(&format!("LibP2pConfig.{field}"))
+                }),
+                "a deserialized zero {field} must fail with a field-named error",
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn gossip_topics_are_chain_namespaced() {
+        // Every gossip topic embeds the chain id so two chains never share a mesh
+        // (issue #765).
+        assert_eq!(LibP2pConfig::primary_topic(2017), "tn-primary-2017");
+        assert_eq!(LibP2pConfig::consensus_output_topic(2017), "tn-consensus-output-2017");
+        assert_eq!(LibP2pConfig::epoch_vote_topic(2017), "tn-epoch-vote-2017");
+        assert_eq!(LibP2pConfig::worker_batch_topic(2017, 0), "tn-worker-2017-0");
+        // each worker has its own batch mesh
+        assert_ne!(
+            LibP2pConfig::worker_batch_topic(2017, 0),
+            LibP2pConfig::worker_batch_topic(2017, 1)
+        );
+        // a different chain id yields a different topic
+        assert_ne!(LibP2pConfig::primary_topic(1), LibP2pConfig::primary_topic(2));
+    }
+
+    #[test]
+    fn set_chain_id_is_read_back() {
+        let mut config = NetworkConfig::default();
+        assert_eq!(config.chain_id(), 0, "defaults to 0 until stamped from genesis");
+        config.set_chain_id(2017);
+        assert_eq!(config.chain_id(), 2017);
+        assert_eq!(config.libp2p_config().chain_id, 2017);
+    }
+
+    #[test]
+    fn chain_id_is_never_persisted() {
+        // chain_id is genesis-derived, not operator-configurable: it must never be
+        // written to (or read from) the config file, so genesis stays authoritative.
+        let libp2p = LibP2pConfig { chain_id: 2017, ..Default::default() };
+        let yaml = serde_yaml::to_string(&libp2p).expect("serialize libp2p config");
+        assert!(!yaml.contains("chain_id"), "chain_id must not be serialized: {yaml}");
+
+        // The load-bearing guard: a config file that *does* contain an explicit
+        // chain_id (hand-edited by an operator) must ignore it on read, so genesis
+        // stays the only source and cannot be overridden from disk.
+        let from_disk: LibP2pConfig =
+            serde_yaml::from_str("max_rpc_message_size: 1\nchain_id: 999\n")
+                .expect("deserialize libp2p config with an explicit chain_id");
+        assert_eq!(from_disk.chain_id, 0, "an on-disk chain_id must be ignored on read");
+        assert_eq!(from_disk.max_rpc_message_size, 1, "other fields still load");
+    }
+
+    #[test]
+    fn default_score_config_validates() {
+        // Mirrors `Parameters::default().validate()` must succeed: the shipped default must
+        // never be the thing that trips the startup guard.
+        ScoreConfig::default().validate().expect("default score config must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_min_greater_than_max() {
+        // Pins the `min_score <= max_score` invariant: without it, `Score::add`'s `f64::clamp`
+        // panics on the first non-fatal peer penalty. Confirmed by mutation: deleting that
+        // `ensure!` makes `validate()` return `Ok` for this config, so this test (asserting
+        // `is_err`) fails.
+        let config = ScoreConfig { min_score: 1.0, max_score: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "min_score greater than max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_accepts_min_equal_to_max() {
+        // The clamp precondition is `min <= max`, so equal bounds are valid and must not be
+        // rejected (guards against an over-tight `<` check).
+        let config = ScoreConfig { min_score: 5.0, max_score: 5.0, ..Default::default() };
+        config.validate().expect("min_score == max_score must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_max_score() {
+        // A `NaN` bound panics `f64::clamp` regardless of ordering.
+        let config = ScoreConfig { max_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_min_score() {
+        let config = ScoreConfig { min_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN min_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_default_score() {
+        // `default_score` seeds every new peer's score; a NaN there poisons every later
+        // threshold comparison for that peer.
+        let config = ScoreConfig { default_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN default_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_disconnect_threshold() {
+        // A NaN disconnect/ban threshold makes `score <= threshold` always false, so no peer
+        // is ever disconnected or banned: a silent reputation-enforcement failure.
+        let config = ScoreConfig { min_score_before_disconnect: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN disconnect threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_ban_threshold() {
+        let config = ScoreConfig { min_score_before_ban: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN ban threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_zero_halflife() {
+        // `halflife_decay` divides by `score_halflife`; `0.0` yields a `-inf` decay constant.
+        // Pins the `score_halflife > 0.0` invariant.
+        let config = ScoreConfig { score_halflife: 0.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a zero score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_negative_halflife() {
+        // A negative halflife flips exponential decay into unbounded growth.
+        let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_halflife() {
+        // A NaN halflife is caught by the finite check before the `> 0.0` comparison (which a
+        // NaN would fail anyway); pin it explicitly so the ordering of the two checks is safe.
+        let config = ScoreConfig { score_halflife: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN score_halflife must be rejected");
+    }
+
+    #[test]
+    fn header_drift_tolerance_defaults_to_250ms() {
+        assert_eq!(
+            SyncConfig::default().max_header_time_drift_tolerance,
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn header_drift_tolerance_reads_legacy_integer_as_seconds() -> eyre::Result<()> {
+        // the shape persisted in network.yaml while the field was a whole number of seconds
+        let parsed: NetworkConfig =
+            serde_yaml::from_str("sync_config:\n  max_header_time_drift_tolerance: 1\n")?;
+        assert_eq!(parsed.sync_config.max_header_time_drift_tolerance, Duration::from_secs(1));
+
+        let parsed: SyncConfig = serde_yaml::from_str("max_header_time_drift_tolerance: 0")?;
+        assert_eq!(parsed.max_header_time_drift_tolerance, Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn header_drift_tolerance_reads_humantime_strings() -> eyre::Result<()> {
+        for (yaml, expected) in [
+            ("max_header_time_drift_tolerance: \"250ms\"", Duration::from_millis(250)),
+            ("max_header_time_drift_tolerance: 250ms", Duration::from_millis(250)),
+            ("max_header_time_drift_tolerance: \"1s\"", Duration::from_secs(1)),
+            ("max_header_time_drift_tolerance: 1s 500ms", Duration::from_millis(1_500)),
+        ] {
+            let parsed: SyncConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(parsed.max_header_time_drift_tolerance, expected, "{yaml}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn header_drift_tolerance_rejects_malformed_values() {
+        for yaml in [
+            "max_header_time_drift_tolerance: -1",
+            "max_header_time_drift_tolerance: 1.5",
+            "max_header_time_drift_tolerance: soon",
+            "max_header_time_drift_tolerance:\n  secs: 1\n  nanos: 0",
+        ] {
+            assert!(serde_yaml::from_str::<SyncConfig>(yaml).is_err(), "{yaml} must be rejected");
+        }
+    }
+
+    #[test]
+    fn header_drift_tolerance_round_trips_as_humantime() -> eyre::Result<()> {
+        for tolerance in [
+            Duration::ZERO,
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            Duration::from_millis(1_500),
+            Duration::from_nanos(1),
+        ] {
+            let config =
+                SyncConfig { max_header_time_drift_tolerance: tolerance, ..Default::default() };
+            let yaml = serde_yaml::to_string(&config)?;
+
+            // the field is written as a humantime string, not serde's `{ secs, nanos }` map
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+            let written = value
+                .get("max_header_time_drift_tolerance")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("drift tolerance serializes as a string");
+            assert_eq!(
+                written,
+                humantime_serde::re::humantime::format_duration(tolerance).to_string()
+            );
+
+            let parsed: SyncConfig = serde_yaml::from_str(&yaml)?;
+            assert_eq!(parsed.max_header_time_drift_tolerance, tolerance);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sync_config_without_header_drift_tolerance_uses_default() -> eyre::Result<()> {
+        let config = SyncConfig { max_proposed_header_age_limit: 7, ..Default::default() };
+        let mut value = serde_yaml::to_value(&config)?;
+        let mapping = value.as_mapping_mut().expect("sync config serializes to a mapping");
+        assert!(mapping
+            .remove(&serde_yaml::Value::String("max_header_time_drift_tolerance".into()))
+            .is_some());
+
+        let parsed: SyncConfig = serde_yaml::from_value(value)?;
+        assert_eq!(parsed.max_header_time_drift_tolerance, Duration::from_millis(250));
+        // the remaining fields still load from the file rather than from the default
+        assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
+        Ok(())
     }
 }

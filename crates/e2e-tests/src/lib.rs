@@ -12,14 +12,97 @@ use std::{
     sync::OnceLock,
 };
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
-use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
+use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
+use tn_reth::init_reth_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::{error, info};
 // unused deps warnings
 
-/// Only compile main bin once for all tests.
-pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
+/// A telcoin-network binary for the e2e tests.
+///
+/// Building the node binary via escargot costs ~3-10s of cargo overhead per test process.
+/// Setting `TN_BIN_PATH` to a prebuilt binary (see `make build-e2e-bin`) skips that
+/// entirely; when it is unset we fall back to an escargot build so `cargo nextest` and
+/// `cargo test` still work with no extra setup.
+#[derive(Debug)]
+pub enum TestBinary {
+    /// Prebuilt binary located via the `TN_BIN_PATH` environment variable.
+    Prebuilt(PathBuf),
+    /// Binary built on demand by escargot.
+    Cargo(CargoRun),
+}
+
+impl TestBinary {
+    /// Build a [`std::process::Command`] that runs this binary.
+    ///
+    /// Pins every fork-epoch override on the child so spawned nodes run the fork points the
+    /// harness states rather than their build defaults (non-adiri builds are otherwise active
+    /// from genesis for every fork). With nothing in the harness environment the seed-signature,
+    /// multi-workers and PREVRANDAO pins are `u32::MAX`, holding those forks dormant:
+    /// wire-identical to pre-fork mainnet for the seed signature, the legacy single-worker layout
+    /// for the committee worker list, the legacy `output_digest ^ batch_digest` mix hash for
+    /// PREVRANDAO. The leader-seeded-ordering and sub-second-timestamp pins default to `0`
+    /// instead: their gates (`tn_types::forks::leader_seeded_ordering_active` and
+    /// `tn_types::forks::subsecond_timestamp_active`) conjoin the seed-signature fork
+    /// fail-closed, so with the seed fork dormant the seeded ordering and the millisecond
+    /// timestamps stay off regardless of these pins, and `0` means "the fork point itself never
+    /// blocks; the seed fork governs", which is what a non-adiri production build does. A
+    /// harness-level value is forwarded verbatim so a lane can export
+    /// `TN_SEED_SIGNATURE_FORK_EPOCH=0`, `TN_MULTI_WORKERS_FORK_EPOCH=1`,
+    /// `TN_PREVRANDAO_FORK_EPOCH=0`, `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=1` or
+    /// `TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=1`, and a single test can still override a pin with
+    /// its own later `env()` call. Only binaries built with `tn-types/test-utils` (pulled in via
+    /// `tn-storage/test-utils`, see `make build-e2e-bin`) consult these variables; production
+    /// binaries ignore them.
+    ///
+    /// The governance-Safe pin is the odd one out: its whole mechanism is `adiri`-gated, so a
+    /// default e2e binary neither honors the forwarded value nor reports it (its
+    /// `fork_epoch_overrides` row is carried under the same cfg as its consumer). It is forwarded
+    /// all the same, with the same dormant `u32::MAX` default, so that the one lane running an
+    /// `adiri` binary (`make test-e2e-governance-safe`, see `tests/it/governance_safe_fork.rs`)
+    /// pins the fork rather than inheriting the compiled-in constant, and so no other test on
+    /// that binary can pick the fork up by accident.
+    pub fn command(&self) -> std::process::Command {
+        let mut command = match self {
+            TestBinary::Prebuilt(path) => std::process::Command::new(path),
+            TestBinary::Cargo(run) => run.command(),
+        };
+        // one loop rather than a block per variable so the forks cannot drift apart in mechanism;
+        // they arm independently, so each is read and forwarded on its own, and each carries its
+        // own default. The conjoined forks are why the defaults are not uniform: reaching the
+        // seeded PREVRANDAO derivation needs the seed fork armed too (`prevrandao_seed_active`),
+        // so pinning PREVRANDAO dormant here keeps a seed-armed lane from silently arming it on a
+        // non-adiri build, while the leader-seeded and sub-second-timestamp forks are governed by
+        // that same seed conjunct and so default to the always-armed 0 rather than dormant
+        [
+            ("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX),
+            ("TN_MULTI_WORKERS_FORK_EPOCH", u32::MAX),
+            ("TN_PREVRANDAO_FORK_EPOCH", u32::MAX),
+            ("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", 0),
+            ("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", 0),
+            ("TN_GOVERNANCE_SAFE_FORK_EPOCH", u32::MAX),
+        ]
+        .into_iter()
+        .for_each(|(var, default)| {
+            let fork_epoch = std::env::var(var).unwrap_or_else(|_| default.to_string());
+            command.env(var, fork_epoch);
+        });
+        command
+    }
+}
+
+/// Resolve the main bin once for all tests.
+pub static TELCOIN_BINARY: OnceLock<TestBinary> = OnceLock::new();
+
+/// PBKDF2 round count for test-generated BLS keyfiles.
+///
+/// Tests intentionally wrap keys with a trivially weak KDF so suites don't spend CPU on
+/// 1,000,000-round PBKDF2 per node. The round count is not stored on disk; the spawned node
+/// binary, which does not share this constant (its only test hooks are the storage/types
+/// `test-utils` features), recovers these keys by trying the weak round count when reading
+/// (and warns that they are weakly wrapped).
+const INSECURE_TEST_KDF_ROUNDS: u32 = 1;
 
 /// RPC endpoints for a single node across all transports.
 #[derive(Debug)]
@@ -38,27 +121,47 @@ pub fn create_validator_info(
     address: &str,
     passphrase: Option<String>,
 ) -> eyre::Result<()> {
-    let datadir = dir.to_path_buf();
+    create_validator_info_with_workers(dir, address, passphrase, 1)
+}
 
-    // keytool
-    let keys_command =
-        CommandParser::<KeyArgs>::parse_from(["tn", "generate", "validator", "--address", address]);
-    keys_command.args.execute(datadir, passphrase)?;
-
-    Ok(())
+/// Generate all validator worker records through the same CLI arguments operators use.
+fn create_validator_info_with_workers(
+    dir: &Path,
+    address: &str,
+    passphrase: Option<String>,
+    workers: usize,
+) -> eyre::Result<()> {
+    let workers = workers.to_string();
+    let keys_command = CommandParser::<KeyArgs>::try_parse_from([
+        "tn",
+        "generate",
+        "validator",
+        "--address",
+        address,
+        "--workers",
+        &workers,
+    ])?;
+    keys_command.args.execute_insecure(dir.to_path_buf(), passphrase, INSECURE_TEST_KDF_ROUNDS)
 }
 
 /// Execute observer config inside tempdir
-fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
+fn create_observer_info(
+    datadir: PathBuf,
+    passphrase: Option<String>,
+    workers: usize,
+) -> eyre::Result<()> {
+    let workers = workers.to_string();
     // keytool
-    let keys_command = CommandParser::<KeyArgs>::parse_from([
+    let keys_command = CommandParser::<KeyArgs>::try_parse_from([
         "tn",
         "generate",
         "observer",
         "--address",
         "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    ]);
-    keys_command.args.execute(datadir, passphrase)
+        "--workers",
+        &workers,
+    ])?;
+    keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)
 }
 
 /// Create validator info, genesis ceremony, and configure local testnet.
@@ -79,6 +182,64 @@ pub fn config_local_testnet_with_epoch_duration(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
 ) -> eyre::Result<()> {
+    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[], None)
+}
+
+/// Like [`config_local_testnet_with_epoch_duration`], but also lets the caller set per-worker
+/// fee strategies at genesis via `--worker-fee-config`.
+///
+/// Each entry is a `"WORKER_ID:STRATEGY:VALUE"` string, where `STRATEGY` is `0` for EIP-1559
+/// (`VALUE` = target gas) or `1` for a static fee (`VALUE` = fee in wei). Entries must cover
+/// contiguous worker ids starting at 0 (the genesis ceremony validates this).
+/// Validators and the observer provision that many worker records through `keytool generate`.
+///
+/// When `worker_fee_configs` is empty this is identical to
+/// [`config_local_testnet_with_epoch_duration`]: the genesis CLI default
+/// `Eip1559 { target_gas: u64::MAX }` applies, which keeps every worker pinned at
+/// `MIN_PROTOCOL_BASE_FEE`. When it is non-empty, the provided configs *replace* that default —
+/// do not also pass the default value.
+pub fn config_local_testnet_with_worker_fee_configs(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    epoch_duration_secs: Option<u32>,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<()> {
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        epoch_duration_secs,
+        worker_fee_configs,
+        None,
+    )
+}
+
+/// Like [`config_local_testnet`], but sets a restart-test garbage-collection depth so a
+/// killed CVV crosses the `CvvInactive` demotion threshold after a shorter downtime.
+pub fn config_local_testnet_with_gc_depth(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    gc_depth: Option<u32>,
+) -> eyre::Result<()> {
+    config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
+}
+
+/// Shared implementation for the `config_local_testnet*` helpers.
+///
+/// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs` and one
+/// `--worker-fee-config` flag per entry in `worker_fee_configs`, runs the genesis ceremony, and
+/// distributes the resulting genesis/committee/parameters files to every validator and the
+/// observer.
+fn config_local_testnet_inner(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    epoch_duration_secs: Option<u32>,
+    worker_fee_configs: &[&str],
+    gc_depth: Option<u32>,
+) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
         ("validator-2", "0x2222222222222222222222222222222222222222"),
@@ -90,20 +251,22 @@ pub fn config_local_testnet_with_epoch_duration(
     let shared_genesis_dir = temp_path.join("shared-genesis");
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
-    // create validator info and copy to shared genesis dir
-    for (v, addr) in validators.iter() {
+    // The fee configuration and generated identities describe the same worker prefix.
+    let workers = worker_fee_configs.len().max(1);
+    validators.iter().try_for_each(|(v, addr)| -> eyre::Result<()> {
         let dir = temp_path.join(v);
         // init genesis ceremony to create committee files
-        create_validator_info(&dir, addr, passphrase.clone())?;
+        create_validator_info_with_workers(&dir, addr, passphrase.clone(), workers)?;
 
         // copy to shared genesis dir
         std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
-    }
+        Ok(())
+    })?;
 
     // Create an observer config.
     let dir = temp_path.join("observer");
     // init config ceremony for observer
-    create_observer_info(dir, passphrase.clone())?;
+    create_observer_info(dir, passphrase.clone(), workers)?;
 
     // create committee from shared genesis dir
     let mut genesis_args: Vec<String> = vec![
@@ -115,16 +278,39 @@ pub fn config_local_testnet_with_epoch_duration(
         "--dev-funded-account".into(),
         "test-source".into(),
         "--max-header-delay-ms".into(),
-        "1000".into(),
-        "--min-header-delay-ms".into(),
         "500".into(),
+        "--min-header-delay-ms".into(),
+        "250".into(),
+        "--max-batch-delay-ms".into(),
+        "250".into(),
     ];
     if let Some(duration) = epoch_duration_secs {
         genesis_args.push("--epoch-duration-in-secs".into());
         genesis_args.push(duration.to_string());
     }
+    if let Some(gc_depth) = gc_depth {
+        genesis_args.push("--gc-depth".into());
+        genesis_args.push(gc_depth.to_string());
+    }
+    // Append one `--worker-fee-config` flag per provided entry. When empty, clap falls back to the
+    // genesis default (`0:0:u64::MAX`, an inert EIP-1559 strategy). Any provided configs replace
+    // that default, so callers must supply contiguous worker ids starting at 0.
+    for cfg in worker_fee_configs {
+        genesis_args.push("--worker-fee-config".into());
+        genesis_args.push((*cfg).to_string());
+    }
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
+
+    // Every node in this harness runs on one host and advertises `http://127.0.0.1:<port>`, which
+    // the observer's transaction forwarder refuses by default (issue #1092). This is the
+    // single-host deployment the opt-in exists for, so enable it on the shared parameters before
+    // they are distributed, rather than leaving observer forwarding silently dead in e2e tests.
+    let parameters_path = shared_genesis_dir.join("parameters.yaml");
+    let mut parameters: Parameters = Config::load_from_path(&parameters_path, ConfigFmt::YAML)?;
+    parameters.allow_private_forward_targets = true;
+    Config::write_to_path(&parameters_path, &parameters, ConfigFmt::YAML)?;
+
     // If provided optional accounts then hack them into genesis now...
     if let Some(accounts) = accounts {
         let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
@@ -192,6 +378,9 @@ pub fn spawn_local_testnet(
             ipc_path: ipc_path_str.clone(),
         });
 
+        // seed reth's process-global defaults before the parse resolves
+        // `--txpool.max-account-slots`
+        init_reth_defaults();
         let command = NodeCommand::parse_from([
             "tn",
             "--http",
@@ -301,23 +490,72 @@ pub fn setup_log_dir(
     test_dir
 }
 
-/// Helper to retrieve and build the main project binary.
-pub fn get_telcoin_network_binary() -> &'static CargoRun {
-    info!("building main binary for e2e tests");
+/// Retrieve the main project binary, resolving it once for the whole test process.
+///
+/// Honors `TN_BIN_PATH`: when set, the prebuilt binary at that path is used and no
+/// per-process cargo build runs. Otherwise the binary is built once via escargot.
+pub fn get_telcoin_network_binary() -> &'static TestBinary {
     TELCOIN_BINARY.get_or_init(|| {
+        if let Ok(prebuilt) = std::env::var("TN_BIN_PATH") {
+            let path = PathBuf::from(&prebuilt);
+            assert!(path.is_file(), "TN_BIN_PATH is set to {prebuilt:?} but no file exists there");
+            info!("using prebuilt telcoin-network binary from TN_BIN_PATH: {prebuilt}");
+            return TestBinary::Prebuilt(path);
+        }
+
+        // TN_BIN_PATH is unset, so build the node binary in-process via escargot. Under the
+        // `e2e` profile (opt-level 2) this is a multi-minute compile, and nextest captures
+        // stdout/stderr, so without this notice the first e2e test looks frozen until the build
+        // finishes. Announce it on stderr (shown on completion, and live under `--no-capture`) so
+        // the delay is attributable rather than an invisible hang.
+        eprintln!(
+            "e2e: TN_BIN_PATH not set; building telcoin-network via cargo before the first test. \
+             This can take several minutes (opt-level 2 under the `e2e` profile), and nextest \
+             hides it until the build finishes (add `--no-capture` to watch it). To skip it, run \
+             `make test-e2e`, or prebuild once and point TN_BIN_PATH at the built binary \
+             (see crates/e2e-tests/README.md)."
+        );
+        info!("building main binary for e2e tests");
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let path = PathBuf::from(manifest_dir);
         let workspace_root =
             path.parent().and_then(|p| p.parent()).expect("Cannot find workspace root");
 
-        CargoBuild::new()
-            .bin("telcoin-network")
-            .features("tn-storage/test-utils")
-            .manifest_path(workspace_root.join("Cargo.toml"))
-            .target_dir(workspace_root.join("target"))
-            .current_target()
-            .run()
-            .expect("Failed to build telcoin-network binary")
+        // Build under the `e2e` profile (opt-level 2, safety checks kept on; defined in
+        // .cargo/config.toml) so this in-process build and `make build-e2e-bin` produce and
+        // share one set of artifacts under `<target root>/e2e/`.
+        //
+        // No `.current_target()`: passing `--target <triple>` would emit into
+        // `<target root>/<triple>/e2e/`, a tree that shares no artifacts with the plain
+        // `<target root>/e2e/` that `make build-e2e-bin` and ordinary `cargo build --profile e2e`
+        // populate, forcing a guaranteed cold rebuild. Building into `<target root>/e2e/` lets
+        // escargot reuse an already-compiled binary (reported "Fresh" by cargo) instead.
+        TestBinary::Cargo(
+            CargoBuild::new()
+                .bin("telcoin-network")
+                .features("tn-storage/test-utils")
+                // Match the Makefile's `build-e2e-bin`: opt-level 2 with debug-assertions and
+                // overflow-checks kept on (see `[profile.e2e]` in .cargo/config.toml).
+                .args(["--profile", "e2e"])
+                .manifest_path(workspace_root.join("Cargo.toml"))
+                // escargot's `.target_dir()` emits a `--target-dir` CLI flag, which outranks the
+                // `CARGO_TARGET_DIR` environment variable. Honor the developer's configured
+                // target root when set (matching `make build-e2e-bin` and `test-and-attest.sh`)
+                // and fall back to cargo's default `<workspace root>/target` otherwise. An empty
+                // value counts as unset (mirroring the shell `:-` fallback at the other two
+                // sites), and a relative value is anchored at the workspace root so this in-test
+                // build shares one tree with the root-invoked builds even though nextest sets
+                // the test cwd to the package directory (`Path::join` keeps an absolute value
+                // as-is).
+                .target_dir(
+                    std::env::var_os("CARGO_TARGET_DIR")
+                        .filter(|dir| !dir.is_empty())
+                        .map(|dir| workspace_root.join(dir))
+                        .unwrap_or_else(|| workspace_root.join("target")),
+                )
+                .run()
+                .expect("Failed to build telcoin-network binary"),
+        )
     })
 }
 

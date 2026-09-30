@@ -11,11 +11,13 @@ description.workspace = true
 exclude.workspace = true
 
 [dependencies]
-telcoin-network-cli = { workspace = true }
+telcoin-network-cli = { workspace = true, features = ["test-utils"] }
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
-tn-config = { workspace = true, features = ["test-utils"]}
+tn-config = { workspace = true }
 tn-node = { workspace = true }
+# not dev-only: `src/lib.rs` seeds reth's transaction pool defaults before it parses a node command
+tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
 tracing = { workspace = true }
 jsonrpsee = { workspace = true }
@@ -30,7 +32,12 @@ escargot = { workspace = true }
 alloy = { workspace = true }
 
 [dev-dependencies]
-tn-reth = { workspace = true, features = ["test-utils"] }
+futures = { workspace = true }
+# `pack_validate` re-runs a node's own epoch pack integrity checks from the harness. `test-utils`
+# is `tn-types/test-utils`, which the fork-epoch overrides live behind: the harness decodes pack
+# bytes itself, so it has to honor the same fork pins it forwards to every spawned node.
+tn-storage = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -50,7 +57,7 @@ secp256k1 = { workspace = true, features = [
 
 [features]
 default = []
-faucet = ["dep:futures"]
+faucet = ["dep:futures", "tn-reth/faucet"]
 
 [lints]
 workspace = true

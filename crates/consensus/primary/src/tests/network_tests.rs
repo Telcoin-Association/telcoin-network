@@ -3,29 +3,56 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{ConsensusResult, PrimaryGossip, PrimaryResponse},
-        MissingCertificatesRequest, PendingEpochStream, RequestHandler,
-        MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
+        message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
+        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
+        PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use rand::{rngs::StdRng, SeedableRng};
+use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroUsize,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::Parameters;
-use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
-use tn_test_utils_committee::CommitteeFixture;
+use tn_config::{ConsensusConfig, KeyConfig, Parameters};
+use tn_network_libp2p::{
+    error::NetworkError,
+    types::{
+        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
+        NetworkResult,
+    },
+    GossipMessage, Penalty, TopicHash,
+};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    mem_db::MemDatabase,
+    tables::Votes,
+    CertificateStore, VoteDigestStore as _,
+};
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, Database, Epoch, EpochVote, ExecHeader, Hash as _, HeaderDigest,
-    SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
+    encode,
+    error::HeaderError,
+    forks::{
+        seed_signature_fork_epoch_override, subsecond_timestamp_active,
+        subsecond_timestamp_fork_epoch_override,
+    },
+    now, now_ms, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockHeader,
+    BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _,
+    Header, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager, TimestampMs,
+    TnReceiver as _, TnSender as _, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -45,9 +72,231 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds().expect("decode missing bounds");
+        missing_req.get_bounds(1_000, 4).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
+
+/// A `RoaringBitmap` is a *compressed* set, so a `MissingCertificates` request that stays under the
+/// 1 MiB RPC size cap can still decode to millions of skip rounds (and, via run containers -- which
+/// the deserializer accepts -- to the full ~4.29e9 `u32` range; see GHSA-wwqq-q2xx-4jf9 /
+/// GHSA-4ggp-fcpj-g9f3). `get_bounds` must reject such a request by cardinality *before*
+/// materializing the set into a `BTreeSet`, otherwise `.collect()` allocates tens of GB and
+/// OOM-kills the validator.
+#[test]
+fn test_get_bounds_rejects_oversized_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    // 5M set bits serialize to ~0.6 MiB: comfortably under the 1 MiB RPC cap, yet 5000x the
+    // per-authority skip-round limit. The bound is checked on cardinality (not serialized size), so
+    // a regression here fails by returning `Ok` rather than by OOM-ing the test runner.
+    let mut bomb = RoaringBitmap::new();
+    assert_eq!(bomb.insert_range(0..=5_000_000), 5_000_001);
+    let mut serialized = Vec::new();
+    bomb.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+    assert!(
+        serialized.len() < 1024 * 1024,
+        "bomb stays under the RPC cap: {} bytes",
+        serialized.len()
+    );
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    // Rejected on cardinality, before the ~5M-element `BTreeSet` is materialized (the ~77 dense
+    // containers clear the container-count gate, so the cardinality gate is what fires).
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, 4),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("too large:")
+    );
+}
+
+/// Nothing but the committee size bounds how many `skip_rounds` entries a request can name:
+/// each accepted entry costs a bitmap decode plus a retained `BTreeSet`, so tens of thousands
+/// of entries (each individually under the per-authority limit) would still materialize a
+/// multi-hundred-MiB map. `get_bounds` must reject on entry count before decoding anything.
+#[test]
+fn test_get_bounds_rejects_too_many_authorities() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+    let max_authorities = 4;
+
+    // One more entry than the committee has authorities; every entry is individually tiny and
+    // well-formed, so the rejection can only come from the entry-count gate.
+    let skip_rounds: Vec<_> = (0..=4u8)
+        .map(|i| {
+            let mut serialized = Vec::new();
+            [1u32, 2, 3]
+                .into_iter()
+                .collect::<RoaringBitmap>()
+                .serialize_into(&mut serialized)
+                .expect("serialize skip-round bitmap");
+            (AuthorityIdentifier::dummy_for_test(i), serialized)
+        })
+        .collect();
+    assert_eq!(skip_rounds.len(), max_authorities + 1);
+
+    let request =
+        MissingCertificatesRequest { exclusive_lower_bound: 0, skip_rounds, max_response_size: 0 };
+
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, max_authorities),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("exceeds committee size")
+    );
+}
+
+/// A skip-round count at or below the limit still decodes normally: the cardinality gate must not
+/// reject legitimate `MissingCertificates` requests.
+#[test]
+fn test_get_bounds_accepts_within_limit_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    let mut bitmap = RoaringBitmap::new();
+    assert_eq!(bitmap.insert_range(0..=(max_skip_rounds as u32 - 1)), max_skip_rounds as u64);
+    let mut serialized = Vec::new();
+    bitmap.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 10,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(max_skip_rounds, 4).expect("within-limit ok");
+    assert_eq!(lower_bound, 10);
+    assert_eq!(skip_rounds[&AuthorityIdentifier::dummy_for_test(0)].len(), max_skip_rounds);
+}
+
+#[test]
+// for primary::network::message
+fn test_missing_certs_request_skip_round_overflow() {
+    let mut serialized = Vec::new();
+    [1u32, 2]
+        .into_iter()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    // `exclusive_lower_bound + 2` exceeds u32::MAX and must surface as an invalid request
+    // instead of wrapping (release) or panicking (debug) on peer-supplied input
+    let missing_req = MissingCertificatesRequest {
+        exclusive_lower_bound: Round::MAX - 1,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    assert_matches!(missing_req.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_decompression_bomb() {
+    // A serialized RoaringBitmap header declaring 65_536 run containers is only 4 bytes on the
+    // wire, yet `deserialize_from` would expand it to ~512 MiB of heap (roaring 0.10 has no run
+    // store, so each run container becomes an ~8 KiB array/bitmap store). The container count is
+    // read straight from the header and rejected before a single container is allocated.
+    // See GHSA-4ggp-fcpj-g9f3.
+    const RUN_COOKIE: u32 = 12347;
+    let container_count: u32 = 65_536;
+    let cookie = ((container_count - 1) << 16) | RUN_COOKIE;
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), cookie.to_le_bytes().to_vec())],
+        max_response_size: 10,
+    };
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_oversized_cardinality() {
+    // A well-formed bitmap whose cardinality exceeds the limit is rejected before the
+    // `O(cardinality)` collect, even though it occupies a single cheap container.
+    let mut serialized = Vec::new();
+    (0..=1_000u32)
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    // 1_001 rounds against a limit of 1_000
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_cardinality_at_limit() {
+    // The bound is inclusive: a bitmap with exactly the maximum number of rounds is accepted.
+    let expected: BTreeSet<Round> = (1..=1_000).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(1_000, 4).expect("bitmap at the limit is accepted");
+    assert_eq!(lower_bound, 0);
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_container_count_at_limit() {
+    // Pin the pre-deserialize container-count gate's inclusive boundary: a legitimate bitmap of
+    // `cap` rounds, each in a distinct 65_536-round block, occupies exactly `cap` containers and
+    // must be accepted. A `<` instead of `<=` on the container check would wrongly reject it, and
+    // the single-container fixtures above would not catch that. See GHSA-4ggp-fcpj-g9f3.
+    let expected: BTreeSet<Round> = (0..1_000u32).map(|block| block * 65_536).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (_, skip_rounds) =
+        request.get_bounds(1_000, 4).expect("max-container bitmap at the limit is accepted");
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_malformed_bitmap_header() {
+    // An unrecognized cookie and a truncated header are both rejected without deserializing.
+    let unknown_cookie = vec![0xFF, 0xFF, 0xFF, 0xFF];
+    let truncated = vec![0x3A, 0x30]; // first two bytes of the NO_RUNCONTAINER cookie (12346)
+    for serialized in [unknown_cookie, truncated] {
+        let request = MissingCertificatesRequest {
+            exclusive_lower_bound: 0,
+            skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+            max_response_size: 10,
+        };
+        assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+    }
 }
 
 /// The type for holding testng components.
@@ -96,7 +345,11 @@ async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) 
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
     cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
@@ -135,7 +388,11 @@ async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
     cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
@@ -144,6 +401,133 @@ async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
     let handler =
         RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// Like [`create_test_types`] but seeds every authority's `ConsensusConfig` with a non-default
+/// `prior_epoch_record`. The handler's config therefore verifies header seed signatures against
+/// [`EpochSeedMessage`] anchored to `prior_epoch_record`, and fixture-built headers are stamped
+/// with a matching seed signature - so a test can exercise the real cross-epoch seed path.
+async fn create_test_types_with_prior_epoch_record(
+    path: &Path,
+    prior_epoch_record: EpochDigest,
+) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .with_prior_epoch_record(prior_epoch_record)
+        .build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// Like [`create_test_types`] but with an explicit committee size, so a test can exercise a
+/// quorum threshold larger than the default four-node committee (e.g. to keep a set of colluding
+/// co-signers strictly below quorum).
+async fn create_test_types_with_committee_size(
+    path: &Path,
+    committee_size: NonZeroUsize,
+) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(committee_size)
+        .build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+#[tokio::test]
+async fn test_retrieve_consensus_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // Populate a few consensus outputs in the epoch-0 pack. Numbers start at 1 so each is greater
+    // than the latest consensus number and is actually saved (mirror of storage_tests.rs).
+    for number in 1..=3u64 {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // The server serves the raw output bytes for every stored number.
+    for number in 1..=3u64 {
+        let bytes = handler
+            .consensus_output_bytes(number)
+            .await
+            .expect("stored consensus output should be served");
+        assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
+    }
+
+    // A number we do not have is a benign miss: it errors and carries no penalty.
+    let err =
+        handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
+            PackError::ConsensusNumberTooHigh
+        ))
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
 }
 
 #[tokio::test]
@@ -167,6 +551,74 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test for issue #803: a node that is **not** a member of the current committee must
+/// reject an inbound vote request with a graceful error instead of panicking. The vote path
+/// previously called `authority_id().expect("only validators can vote")`, which aborts the whole
+/// process for any non-validator that reaches it (e.g. an observer served a misrouted request).
+#[tokio::test]
+async fn test_vote_non_committee_member_returns_error() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+
+    // Build a ConsensusConfig keyed by an identity that is NOT in the committee, so that
+    // `authority_id()` is `None` (a non-validator / observer node). Reuse the fixture's
+    // genesis-aligned `Config` and `NetworkConfig`, swapping only the signing key.
+    let base = committee.first_authority().consensus_config();
+    let outsider_key =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = ConsensusConfig::new_with_committee_for_test(
+        base.config().clone(),
+        MemDatabase::default(),
+        outsider_key,
+        committee.committee(),
+        base.network_config().clone(),
+    )?;
+    assert!(config.authority_id().is_none(), "outsider key must not be a committee member");
+
+    // Build the handler against the outsider config, mirroring `create_test_types_with_params`.
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // Seed the latest execution result to genesis so a round-1 header passes execution checks.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee())
+            .await
+            .unwrap();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+
+    // A valid round-1 header proposed by a real committee member (identical to test_vote_succeeds),
+    // so the request passes the peer/author and header validation and reaches the former panic
+    // site.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // The non-validator must return a graceful error rather than panicking.
+    let res = handler.vote(peer, header, vec![]).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotCommitteeMember)));
+
+    // keep the synchronizer's task alive until the vote has been processed
+    drop(task_manager);
     Ok(())
 }
 
@@ -336,7 +788,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong == wrong_time);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong.as_millis() == wrong_time * 1000);
     Ok(())
 }
 
@@ -392,6 +844,87 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Regression for #802: the Byzantine errors the vote RPC returns must be penalizable.
+///
+/// `process_vote_request` now reports `(&err).into()` before collapsing the result into a
+/// response, exactly like every sibling request handler. That wiring only penalizes a
+/// misbehaving peer if the vote handler's error variants map to `Some(Penalty)` in the
+/// central `From<&PrimaryNetworkError>` table. Pin that contract here so a future error
+/// reshuffle that silently downgrades a vote error to `None` (re-opening #802 from the
+/// other side) is caught.
+#[tokio::test]
+async fn test_vote_byzantine_errors_are_penalizable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A vote request whose peer is not the header's author -> PeerNotAuthor.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let not_author = BlsPublicKey::default();
+    let err = handler
+        .vote(not_author, header, Vec::new())
+        .await
+        .expect_err("a vote whose peer is not the header author must fail");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor));
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "a non-author vote must penalize the peer so process_vote_request can report it"
+    );
+
+    // A vote request authored by an authority outside the committee -> UnknownAuthority.
+    let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
+    let header = committee
+        .header_builder_last_authority()
+        .author(wrong_authority.clone())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let err = handler
+        .vote(peer, header, Vec::new())
+        .await
+        .expect_err("a vote authored by an unknown authority must fail");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(ref a))
+            if *a == wrong_authority.to_string()
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "an unknown-authority vote must penalize the peer"
+    );
+
+    Ok(())
+}
+
+/// #802 follow-through: header errors that reflect a LOCAL or transient condition (our own
+/// storage failure, or our execution lagging behind a peer that is merely ahead) must NOT
+/// penalize the peer now that the vote RPC is wired into the penalty pipeline. Pin the
+/// central table so these stay `None`, consistent with the sibling
+/// `PrimaryNetworkError::Storage` and `*::Timeout` arms.
+#[test]
+fn test_local_header_errors_are_not_penalized() {
+    let storage: PrimaryNetworkError = HeaderError::Storage(eyre::eyre!("local db failure")).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&storage).into();
+    assert!(penalty.is_none(), "a local storage failure must not penalize the peer");
+
+    let exec_lag: PrimaryNetworkError =
+        HeaderError::UnknownExecutionResult(BlockNumHash::new(0, BlockHash::default())).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&exec_lag).into();
+    assert!(
+        penalty.is_none(),
+        "a peer that is merely ahead of our execution must not be penalized"
+    );
+}
+
 /// Test that primary pub/sub is enforcing topics.
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {
@@ -400,7 +933,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let goodish_msg =
         GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&goodish_msg).await;
@@ -409,23 +942,23 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&good_msg).await.is_ok());
 
-    // EpochVote::default() has an invalid signature, so check_signature() fails in the handler
-    // and returns InvalidHeader(PeerNotAuthor).
+    // EpochVote::default()'s all-zero public_key is not a committee member, so the committee gate
+    // rejects it (before the signature verify); see GHSA-j2g4-553f-875r.
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&good_msg).await;
-    // Not rejected for InvalidTopic — rejected for invalid signature instead.
+    // Not rejected for InvalidTopic — rejected for non-committee membership instead.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&bad_msg).await;
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
@@ -433,15 +966,419 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
+}
+
+// ============================================================================
+// EpochVote Authorization-Before-Verify Tests (GHSA-j2g4-553f-875r)
+// ============================================================================
+// The handler cannot assume the network-layer publisher allowlist already screened the author -
+// the two checks live in different layers, and the application layer must not rely on the
+// network layer having run. It must authorize a vote (committee membership by epoch number)
+// *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
+// the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
+
+/// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
+fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
+    let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(chain_id));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// Seed an uncertified epoch-0 [`EpochRecord`] (committee = the fixture's committee) into the
+/// handler's consensus chain so the gossip gate's `get_epoch_by_number(0)` returns
+/// `Some((record, None))`, and return that record. Tests sign their vote over the returned record
+/// so the vote's `epoch_hash` matches exactly what the handler compares against; the handler now
+/// admits a vote only for the not-yet-certified record it already holds.
+async fn seed_uncertified_epoch0(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+) -> EpochRecord {
+    let record = EpochRecord {
+        epoch: 0,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed uncertified epoch-0 record");
+    record
+}
+
+/// A vote whose `public_key` is not in the committee for a *known* epoch must be rejected by the
+/// committee gate *before* the signature verify. The error variant is the evidence: had the
+/// verify run first, the garbage signature would surface as `InvalidHeader(PeerNotAuthor)` (a
+/// `Fatal` penalty charged to the relayer on the gossip path); the gate running first surfaces
+/// the benign, non-penalizing `PeerNotInCommittee`. This is the core guarantee of
+/// GHSA-j2g4-553f-875r.
+#[tokio::test]
+async fn test_epoch_vote_non_committee_rejected_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Seed the epoch-0 record so the vote clears the record-match gate; the all-zero `public_key`
+    // is not a committee member, so the committee gate rejects it before the signature verify.
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let vote = EpochVote { epoch: 0, epoch_hash: record.digest(), ..Default::default() };
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::PeerNotInCommittee(_)),
+        "a non-committee vote for a known epoch must be rejected by the committee gate before the \
+         verify (which would yield the Fatal PeerNotAuthor charged to the relayer): {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "a rejected vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// A vote for an epoch whose committee the node does not know must be dropped *before* the verify
+/// (so a garbage `epoch`/`epoch_hash` cannot force a pairing verify), and dropped silently — no
+/// error, no penalty. Under the pre-fix ordering the garbage signature ran through the verify and
+/// surfaced `InvalidHeader(PeerNotAuthor)`; here it returns `Ok`.
+#[tokio::test]
+async fn test_epoch_vote_unknown_epoch_dropped_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Epoch 9999 has no stored record in the fixture, so `get_epoch_by_number` returns `None`.
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let vote = EpochVote { epoch: 9999, ..Default::default() };
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+
+    assert!(
+        res.is_ok(),
+        "an unknown-epoch vote must be dropped before the verify (pre-fix this returned \
+         Err(PeerNotAuthor) from the verify): {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "an unknown-epoch vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// A valid vote from a committee member of a known epoch must pass the committee gate and the
+/// verify and be forwarded to the collector. Guards the reorder against over-rejecting
+/// legitimate votes (a liveness regression).
+#[tokio::test]
+async fn test_epoch_vote_valid_committee_member_forwarded() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Sign a vote over the record the handler holds for epoch 0 with a real committee member's
+    // key, so `epoch_hash` matches the stored record, `public_key` is a committee member, and
+    // `check_signature` succeeds.
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let epoch_rec = seed_uncertified_epoch0(&handler, &committee).await;
+    let vote = epoch_rec.sign_vote(&key_config);
+    assert!(vote.check_signature(), "test vote must be validly signed");
+
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    handler.process_gossip(&epoch_vote_gossip(vote, 0)).await?;
+
+    let received = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("a valid committee vote must be forwarded to the collector")
+        .expect("epoch vote channel unexpectedly closed");
+    assert_eq!(received.public_key, vote.public_key);
+    assert_eq!(received.epoch, vote.epoch);
+    Ok(())
+}
+
+/// Documents the residual of GHSA-j2g4-553f-875r. An attacker who copies a committee member's
+/// public BLS key (public information) passes the committee gate, so a garbage-signed
+/// impersonation vote still reaches `check_signature` (forcing one pairing verify) and fails it
+/// with `InvalidHeader(PeerNotAuthor)`. That variant is relayer-attributed and `Fatal`, matching
+/// how the codebase attributes other embedded-signer faults; the peer manager's `Validator` trust
+/// exemption means a committee relayer is never banned, so consensus-mesh peers are safe. Fully
+/// removing this residual (the forced verify and the attribution edge for a non-committee relayer)
+/// needs the network-layer topic restriction, not the handler.
+#[tokio::test]
+async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A real committee member's public key with the correct `epoch_hash` but a default (invalid)
+    // signature: the record and committee gates admit it (matching digest, key in the committee),
+    // so the verify runs and fails.
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let member = committee
+        .authorities()
+        .next()
+        .expect("committee has authorities")
+        .consensus_config()
+        .key_config()
+        .public_key();
+    let vote = EpochVote {
+        epoch: 0,
+        epoch_hash: record.digest(),
+        public_key: member,
+        ..Default::default()
+    };
+
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
+        "a committee-key vote with a bad signature must reach and fail the verify (PeerNotAuthor), \
+         documenting the copied-key residual: {res:?}"
+    );
+    Ok(())
+}
+
+/// A vote from a committee member whose `epoch_hash` does not match the record we hold for that
+/// epoch is rejected with `InvalidEpochVote` *before* the signature verify and is not forwarded.
+/// Epoch records are deterministic, so a mismatched digest is a bogus (or forked) vote; the
+/// resulting `Mild` penalty is author-attributed (see `is_author_content_fault`), so an honest
+/// relayer of the gossip is never charged.
+#[tokio::test]
+async fn test_epoch_vote_wrong_digest_rejected_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Seed the real epoch-0 record, then sign a vote over a DIFFERENT record (empty committee →
+    // different digest) with a real committee member's key. Only the digest differs from what the
+    // handler holds.
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let forked = EpochRecord { epoch: 0, ..Default::default() };
+    assert_ne!(forked.digest(), record.digest(), "forked record must differ from the stored one");
+    let vote = forked.sign_vote(&key_config);
+
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidEpochVote(0, _, _)),
+        "a vote whose epoch_hash does not match the stored record must be rejected: {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "a mismatched-digest vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// The other half of the ingress gate: a vote for an epoch we hold but that is ALREADY CERTIFIED
+/// (`get_epoch_by_number` returns `Some((record, Some(cert)))`) must be dropped silently — no
+/// error, no penalty, not forwarded. Certification is complete so further votes are surplus, and
+/// the benign drop must not be charged to the (honest) relayer on the gossip path. Companion to
+/// `test_epoch_vote_wrong_digest_rejected_before_verify`, which covers the digest arm.
+#[tokio::test]
+async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Seed the epoch-0 record, then store a certificate for it so the gate sees it as certified.
+    // This branch never verifies the cert, so a minimal one (a valid BLS signature reused from a
+    // vote, empty signer bitmap) is enough to flip `get_epoch_by_number`'s `None` -> `Some(cert)`.
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let vote = record.sign_vote(&key_config);
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: vote.signature,
+        signed_authorities: RoaringBitmap::new(),
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_certificate(record.digest(), cert)
+        .await
+        .expect("store epoch-0 certificate");
+
+    // The vote is otherwise valid (correct digest, real committee member) — it is dropped ONLY
+    // because the epoch is already certified.
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    assert!(
+        res.is_ok(),
+        "a vote for an already-certified epoch must be dropped without error or penalty: {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "a vote for an already-certified epoch must not reach the collector"
+    );
+    Ok(())
+}
+
+/// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
+/// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
+/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
+/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
+/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+///
+/// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
+/// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
+/// `ResponseChannel`; `InboundStream` needs a live `Stream`), and a valid committee epoch-vote
+/// gossip is forwarded to the observable `new_epoch_votes` channel. The queuing is a property of
+/// the shared channel and the recv loop, so exercising it with one event type validates it for all.
+#[tokio::test]
+async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+
+    // ----- application-scoped parts (outlive any single epoch's PrimaryNetwork) -----
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let auth0 = committee.authority_fixture_by_idx(0).expect("committee has authority 0");
+    let auth1 = committee.authority_fixture_by_idx(1).expect("committee has authority 1");
+    let config = auth0.consensus_config();
+    let chain_id = config.chain_id();
+    // Distinct committee signers so the "exercise" and "gap" votes are distinguishable and do not
+    // collide in the handler's per-authority equivocation map.
+    let key0 = config.key_config().clone();
+    let key1 = auth1.consensus_config().key_config().clone();
+
+    let cb = ConsensusBus::new();
+    let app = cb.app().clone();
+
+    // Long-lived task manager for the StateSynchronizer (kept alive for the whole test).
+    let state_sync_manager = TaskManager::default();
+    let state_sync =
+        StateSynchronizer::new(config.clone(), cb.clone(), state_sync_manager.get_spawner());
+    state_sync.spawn(&state_sync_manager);
+
+    // Seed the genesis execution result, mirroring `create_test_types`.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(0, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), Some(parent));
+    app.recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee()).await?;
+
+    // Seed the uncertified epoch-0 record both epochs' networks validate votes against; the
+    // injected votes are signed over it so their `epoch_hash` matches the stored record.
+    let epoch0_record = EpochRecord {
+        epoch: 0,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        ..Default::default()
+    };
+    consensus_chain.epochs().save_record(epoch0_record.clone()).await?;
+
+    // The sender the node-scope swarm holds across epochs to push events at the application.
+    let events_tx = app.primary_network_events_cloned();
+    // Dummy response sink for the test handle; the valid-vote path never uses it, but keep the
+    // receiver bound so any stray send cannot error.
+    let (handle_tx, _handle_rx) = tokio::sync::mpsc::channel(10);
+    let network_handle = PrimaryNetworkHandle::new_for_test(handle_tx);
+
+    // Observe forwarded epoch votes. `new_epoch_votes` is a plain `QueChannel`, so hold this one
+    // subscription for the whole test (a second concurrent subscribe would panic).
+    let mut votes_rx = app.subscribe_new_epoch_votes();
+
+    let sign_vote = |key: &KeyConfig| epoch0_record.sign_vote(key);
+
+    // ===== Epoch A: bring up a PrimaryNetwork and exercise it =====
+    let mut epoch_a = TaskManager::new("epoch-a");
+    let spawner_a = epoch_a.get_spawner();
+    PrimaryNetwork::new(
+        app.subscribe_primary_network_events(),
+        network_handle.clone(),
+        config.clone(),
+        app.clone(),
+        state_sync.clone(),
+        spawner_a.clone(),
+        consensus_chain.clone(),
+    )
+    .spawn(&spawner_a);
+
+    let vote_a = sign_vote(&key0);
+    let pubkey_a = vote_a.public_key;
+    events_tx
+        .send(NetworkEvent::Gossip(Box::new(GossipPayload {
+            message: epoch_vote_gossip(vote_a, chain_id),
+            relayer: None,
+            author: None,
+        })))
+        .await
+        .expect("inject epoch-A event");
+    let received = tokio::time::timeout(Duration::from_millis(500), votes_rx.recv())
+        .await
+        .expect("epoch-A network must process the injected event")
+        .expect("epoch vote channel closed");
+    assert_eq!(received.public_key, pubkey_a, "epoch-A network must forward the injected vote");
+
+    // ===== Drop epoch A and confirm its event-loop task has finished =====
+    // `update_tasks()` is REQUIRED before abort: tasks spawned via the spawner sit in the manager's
+    // pending queue until drained into `self.tasks`. Skip it and abort/await are no-ops, leaking
+    // the loop task that still holds the app-scoped receiver — which would panic the
+    // re-subscribe below.
+    epoch_a.update_tasks();
+    epoch_a.abort_all_tasks();
+    epoch_a.wait_for_task_shutdown().await;
+
+    // ===== Gap: inject an event while no PrimaryNetwork is running =====
+    let vote_gap = sign_vote(&key1);
+    let pubkey_gap = vote_gap.public_key;
+    events_tx
+        .send(NetworkEvent::Gossip(Box::new(GossipPayload {
+            message: epoch_vote_gossip(vote_gap, chain_id),
+            relayer: None,
+            author: None,
+        })))
+        .await
+        .expect("inject gap event");
+    // With nothing consuming the channel the event must be queued, not processed or lost.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), votes_rx.recv()).await.is_err(),
+        "with no PrimaryNetwork running the gap event must be queued, not processed",
+    );
+
+    // ===== Epoch B: spawn a new PrimaryNetwork over the SAME app-scoped parts =====
+    let mut epoch_b = TaskManager::new("epoch-b");
+    let spawner_b = epoch_b.get_spawner();
+    // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
+    // (`subscribe()` panics if a receiver is still checked out).
+    PrimaryNetwork::new(
+        app.subscribe_primary_network_events(),
+        network_handle.clone(),
+        config.clone(),
+        app.clone(),
+        state_sync.clone(),
+        spawner_b.clone(),
+        consensus_chain.clone(),
+    )
+    .spawn(&spawner_b);
+
+    // The event queued during the gap must now be delivered to and processed by the new network.
+    let received = tokio::time::timeout(Duration::from_millis(500), votes_rx.recv())
+        .await
+        .expect("epoch-B network must process the event queued during the gap")
+        .expect("epoch vote channel closed");
+    assert_eq!(
+        received.public_key, pubkey_gap,
+        "the event queued between epochs must be processed by the next epoch's network",
+    );
+
+    epoch_b.update_tasks();
+    epoch_b.abort_all_tasks();
+    epoch_b.wait_for_task_shutdown().await;
+    Ok(())
 }
 
 // ============================================================================
@@ -517,6 +1454,310 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A recast with a different digest at the same (author, epoch, round) must fail closed
+/// after a crash: even when no certificate is found in storage, the node must refuse to
+/// sign a second, different vote, because a crash could have lost a certificate formed
+/// from the earlier vote (issue #963). This exercises `vote_inner`'s storage-backed guard
+/// directly, with the in-memory `auth_last_vote` guard empty as it would be after restart.
+#[tokio::test]
+async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Simulate crash recovery: a durable vote_info for this author at the current
+    // (epoch, round) survives on disk, but the in-memory `auth_last_vote` guard is empty
+    // (fresh handler). The placeholder vote_digest will not match the fresh vote computed
+    // below, so `vote_inner` reaches the recast guard.
+    let author_id = committee.last_authority().id();
+    let seeded = VoteInfo {
+        epoch: committee.committee().epoch(),
+        round: 1,
+        vote_digest: VoteDigest::default(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author_id, &seeded)?;
+
+    // A different header at the same (author, epoch, round) => a different vote digest.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // No certificate exists in storage, but the node must still refuse: a crash could have
+    // lost a certificate formed from the earlier vote, so re-voting could equivocate.
+    let res = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
+        "recast with a different digest at the same round must fail closed"
+    );
+
+    Ok(())
+}
+
+/// A header whose epoch-close seed signature does not verify against the author's protocol key
+/// over the canonical seed message for its `(epoch, round)` must be refused with
+/// `HeaderError::InvalidSeedSignature` (no vote), while a header carrying a valid seed
+/// signature earns a vote (#1032). Refusing to vote is what guarantees any certified header's
+/// seed - and so the epoch-close committee-shuffle randomness - carries at least f+1 honest
+/// attestations of validity.
+#[tokio::test]
+async fn test_vote_rejects_invalid_seed_signature() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A wrong seed signature: valid BLS bytes from the right author, but signed over a DIFFERENT
+    // epoch's seed message, so it cannot verify against this epoch's canonical message.
+    let wrong_message_sig = committee.last_authority().seed_signature(42, 1);
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .seed_signature(wrong_message_sig)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a wrong-message seed signature must refuse the vote"
+    );
+
+    // A header with a valid seed signature (stamped by the fixture builder) from a different
+    // authority earns a vote through the same handler.
+    let valid_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let valid_header = valid_author
+        .header_builder(&committee.committee())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let valid_peer = *valid_author.authority().protocol_key();
+
+    let res = handler.vote(valid_peer, valid_header, vec![]).await?;
+    assert_matches!(res, PrimaryResponse::Vote(_), "a valid seed signature must earn a vote");
+
+    Ok(())
+}
+
+/// End-to-end cross-epoch-entropy pin (#1032): the epoch-close seed signature is verified against
+/// the voter's *configured* `prior_epoch_record`, not a hardcoded default. A committee - and so the
+/// voting handler's config - is seeded with a real non-default anchor `D`; a header whose seed
+/// signature is over `D` earns a vote, while a header signed over a different anchor `D' != D` is
+/// refused with `HeaderError::InvalidSeedSignature`. This exercises the real
+/// `ConsensusConfig::prior_epoch_record()` -> `vote_inner` verify path: mutating the handler's
+/// verify site (or the proposer's sign site) to `EpochDigest::default()` breaks the valid-vote
+/// case, because `D` is non-default.
+#[tokio::test]
+async fn test_vote_seed_signature_uses_configured_prior_epoch_record() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+
+    // A real, non-default cross-epoch anchor `D` (the digest of a prior epoch's record). The whole
+    // committee - and thus the voting handler's config - is seeded with it.
+    let anchor = EpochRecord { epoch: 3, ..Default::default() }.digest();
+    assert_ne!(
+        anchor,
+        EpochDigest::default(),
+        "anchor D must be non-default to catch the mutation"
+    );
+
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_with_prior_epoch_record(temp_dir.path(), anchor).await;
+    let epoch = committee.committee().epoch();
+
+    // A header whose seed signature is over a DIFFERENT anchor `D' != D`, signed by the real
+    // author. It must be refused: the handler verifies against its configured anchor `D`.
+    let other_anchor = EpochRecord { epoch: 9, ..Default::default() }.digest();
+    assert_ne!(other_anchor, anchor, "D' must differ from D");
+    let author_config = committee.last_authority().consensus_config();
+    // The fixture builder proposes at round 1, so bind that round and vary only the anchor.
+    let mismatched_sig =
+        EpochSeedMessage::new(epoch, 1, other_anchor).sign(author_config.key_config());
+    let mismatched_header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .seed_signature(mismatched_sig)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let res = handler.vote(peer, mismatched_header, vec![]).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a seed signature over a different prior_epoch_record must refuse the vote"
+    );
+
+    // A header from a different authority whose seed signature is over the SAME anchor `D` (stamped
+    // by the fixture from that authority's config) earns a vote. This is the case the mutation
+    // breaks: with the verify site hardcoded to the default digest, this valid header - signed over
+    // the non-default `D` - would fail verification.
+    let valid_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let valid_header = valid_author
+        .header_builder(&committee.committee())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let valid_peer = *valid_author.authority().protocol_key();
+    let res = handler.vote(valid_peer, valid_header, vec![]).await?;
+    assert_matches!(
+        res,
+        PrimaryResponse::Vote(_),
+        "a seed signature over the configured prior_epoch_record must earn a vote"
+    );
+
+    // The same pair again at round 3, so the anchor and the round are exercised jointly rather
+    // than only at the builder's default round 1. A sign or verify site hardcoded to
+    // `EpochDigest::default()` still breaks the positive case here, and one hardcoded to round 1
+    // breaks it too.
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let parents = seed_round_two_quorum(&committee, &store)?;
+    let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
+        a.header_builder_at_round(&committee.committee(), 3)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .seed_signature(seed_signature)
+            .build()
+    };
+
+    // Round 3 signed over `D'`: refused.
+    let mismatched_author =
+        committee.authority_fixture_by_idx(2).expect("4 authorities in fixture");
+    let mismatched_round_three = round_three(
+        mismatched_author,
+        EpochSeedMessage::new(epoch, 3, other_anchor)
+            .sign(mismatched_author.consensus_config().key_config()),
+    );
+    let mismatched_peer = *mismatched_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(mismatched_peer, mismatched_round_three, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a round-3 seed signature over a different prior_epoch_record must refuse the vote"
+    );
+
+    // Round 3 signed over `D` (the fixture's configured anchor): earns a vote.
+    let anchored_author = committee.last_authority();
+    let anchored_round_three =
+        round_three(anchored_author, anchored_author.seed_signature(epoch, 3));
+    let anchored_peer = *anchored_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(anchored_peer, anchored_round_three, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a round-3 seed signature over the configured prior_epoch_record must earn a vote"
+    );
+
+    Ok(())
+}
+
+/// Seed `store` with a full round-2 certificate quorum for `committee` and return the parent
+/// digest set a round-3 header must reference.
+///
+/// The round-2 headers carry no batches and are built with
+/// [`AuthorityFixture::header_builder_at_round`], so a round-3 header built the same way is
+/// strictly newer than every parent and reaches a real vote decision with nothing to sync from a
+/// worker and no wall-clock dependence.
+fn seed_round_two_quorum<DB: Database + CertificateStore>(
+    committee: &CommitteeFixture<DB>,
+    store: &DB,
+) -> eyre::Result<BTreeSet<HeaderDigest>> {
+    let committee_obj = committee.committee();
+    let certs: Vec<_> = committee
+        .authorities()
+        .map(|a| committee.certificate(&a.header_builder_at_round(&committee_obj, 2).build()))
+        .collect();
+    store.write_all(certs.iter())?;
+    Ok(certs.iter().map(|c| c.digest()).collect())
+}
+
+/// The vote path verifies a header's seed signature against THAT HEADER'S round, never a fixed
+/// one (#1032 / rolling commit seed).
+///
+/// Catches two mutations at `vote_inner`'s verify site:
+/// - Verifying against a hardcoded or config-sourced round instead of `header.round()`. Every
+///   fixture header defaults to round 1, so a verifier pinned to round 1 stays green on the rest of
+///   the suite; here it refuses the correctly-signed round-3 header and fails the positive half.
+/// - Deleting the seed-signature check. The negative half - a round-3 header carrying its author's
+///   round-1 signature - would then be voted on.
+#[tokio::test]
+async fn test_vote_rejects_seed_signature_for_wrong_round() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let epoch = committee_obj.epoch();
+
+    // The voter is the fixture's first authority, so its store is the one the vote path reads.
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let parents = seed_round_two_quorum(&committee, &store)?;
+
+    let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
+        a.header_builder_at_round(&committee_obj, 3)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .seed_signature(seed_signature)
+            .build()
+    };
+
+    // Negative half: a round-3 header carrying the author's round-1 signature. Valid BLS bytes
+    // from the right author over the right epoch and prior record - only the round is stale.
+    let stale_author = committee.last_authority();
+    let stale_header = round_three(stale_author, stale_author.seed_signature(epoch, 1));
+    let stale_peer = *stale_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(stale_peer, stale_header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a round-3 header signed for round 1 must refuse the vote"
+    );
+
+    // Positive half: a round-3 header signed for round 3 earns a vote. A different authority is
+    // used so the per-authority equivocation guard plays no part in the outcome.
+    let valid_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let valid_header = round_three(valid_author, valid_author.seed_signature(epoch, 3));
+    let valid_peer = *valid_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(valid_peer, valid_header, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a header signed for its own round must earn a vote"
+    );
+
+    Ok(())
+}
+
+/// #1032 robustness pin: a header carrying the DEFAULT (BLS infinity) seed signature is refused
+/// with `HeaderError::InvalidSeedSignature`. blst's subgroup check rejects the infinity element, so
+/// the removed silent `unwrap_or_else(BlsSignature::default())` fallback can never be reintroduced
+/// as a way to skip seed verification - a default signature is not a valid signature over any
+/// message.
+#[tokio::test]
+async fn test_vote_rejects_default_seed_signature() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .seed_signature(BlsSignature::default())
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a default (infinity) seed signature must refuse the vote"
+    );
+
+    Ok(())
+}
+
 /// Test that voting for older round after voting for newer round is rejected.
 #[tokio::test]
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {
@@ -562,10 +1803,10 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
 // ============================================================================
 // These tests cover the per-authority locking and timeout behavior added to vote().
 
-/// Helper: same as `create_test_types` but overrides `max_header_delay`.
-async fn create_test_types_with_delay(path: &Path, max_header_delay: Duration) -> TestTypes {
-    let mut params = Parameters::default();
-    params.max_header_delay = max_header_delay;
+/// Helper: same as `create_test_types` but overrides [`Parameters::vote_timeout`], the voter-side
+/// bound on evaluating one vote request.
+async fn create_test_types_with_vote_timeout(path: &Path, vote_timeout: Duration) -> TestTypes {
+    let params = Parameters { vote_timeout, ..Default::default() };
     create_test_types_with_params(path, Some(params)).await
 }
 
@@ -608,21 +1849,24 @@ async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<(
     Ok(())
 }
 
-/// When `vote_inner` blocks longer than `max_header_delay`, `vote()` must return
-/// `PrimaryNetworkError::Timeout`.
+/// When `vote_inner` blocks longer than [`Parameters::vote_timeout`], `vote()` must return
+/// `PrimaryNetworkError::Timeout` once that timeout elapses.
 ///
-/// To force a reliable block we request a header whose `latest_execution_block` is at
-/// block number 1, while the test environment only has block 0.  This causes
-/// `wait_for_execution` to suspend on the watch channel.  We use
-/// `tokio::time::pause/advance` so the test completes instantly without real sleeping.
-#[tokio::test]
+/// `vote_timeout` is the voter-side limit on evaluating one vote request, including every wait for
+/// execution, parents, batches, or a future-dated header's lead. To force a reliable block the
+/// header's `latest_execution_block` is at block number 1 while the test environment only has
+/// block 0, so `wait_for_execution` suspends on the watch channel. The paused clock jumps from
+/// timer to timer, so the virtual time the call takes pins the configured timeout rather than the
+/// 5 s default or any other header-cadence setting.
+///
+/// The timeout is recoverable: it carries no penalty and answers the requester with a
+/// `RecoverableError`, so the proposer asks again instead of giving up on this voter.
+#[tokio::test(start_paused = true)]
 async fn test_vote_inner_timeout() -> eyre::Result<()> {
-    tokio::time::pause();
-
+    let vote_timeout = Duration::from_millis(10);
     let temp_dir = TempDir::new().unwrap();
-    // Use a 50 ms timeout — short enough to be clearly exceeded after a 100 ms advance.
     let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_with_delay(temp_dir.path(), Duration::from_millis(50)).await;
+        create_test_types_with_vote_timeout(temp_dir.path(), vote_timeout).await;
 
     // Block number 1 will never be executed in this test; vote_inner blocks in
     // wait_for_execution until the outer timeout fires.
@@ -634,14 +1878,25 @@ async fn test_vote_inner_timeout() -> eyre::Result<()> {
         .build();
     let peer = *committee.last_authority().authority().protocol_key();
 
-    // Spawn on a separate task so we can advance the mock clock while it is suspended.
-    let vote_task = tokio::spawn(async move { handler.vote(peer, header, vec![]).await });
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header, vec![])
+        .await
+        .expect_err("a vote request that never finishes evaluating must time out");
+    let waited = start.elapsed();
 
-    // Advance mock clock past the 50 ms deadline.
-    tokio::time::advance(Duration::from_millis(100)).await;
-
-    let res = vote_task.await.expect("vote task panicked");
-    assert_matches!(res, Err(PrimaryNetworkError::Timeout(_)), "expected Timeout error");
+    assert_matches!(err, PrimaryNetworkError::Timeout(_), "expected Timeout error");
+    assert!(
+        waited >= vote_timeout && waited < vote_timeout * 2,
+        "the vote must time out after the configured vote_timeout {vote_timeout:?}, waited \
+         {waited:?}"
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "a vote timeout must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "a vote timeout must answer the requester with a retryable response"
+    );
 
     Ok(())
 }
@@ -694,6 +1949,620 @@ async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
 }
 
 // ============================================================================
+// Timestamp Tests
+// ============================================================================
+// These tests pin the voter's timestamp rules: the parent rule on each side of the sub-second
+// timestamp fork, the millisecond range, and the three tiers for a header created ahead of the
+// local clock.
+
+/// Pins this test process's sub-second timestamp fork to active (or dormant) from genesis, with
+/// the seed-signature fork it requires active from genesis.
+///
+/// The gates read their `test-utils` environment overrides once per process, so this must run
+/// before anything consults a gate, including building the committee fixture. nextest runs each
+/// test in its own process, which is what keeps one test's pin from reaching another; a
+/// single-process `cargo test` run shares one latch across the whole test binary instead. Reading
+/// the overrides back turns a value that latched before the pin into a named failure.
+fn pin_subsecond_fork(active: bool) {
+    let subsecond_fork: Epoch = if active { 0 } else { Epoch::MAX };
+    std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", "0");
+    std::env::set_var("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", subsecond_fork.to_string());
+    assert_eq!(
+        seed_signature_fork_epoch_override(),
+        Some(0),
+        "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    assert_eq!(
+        subsecond_timestamp_fork_epoch_override(),
+        Some(subsecond_fork),
+        "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH latched to another value before this test pinned it"
+    );
+    // anti-vacuity: the fixture committees these tests build sit at epoch 0
+    assert_eq!(subsecond_timestamp_active(0), active, "epoch 0 must sit in the pinned regime");
+}
+
+/// Seed `store` with one round-1 certificate per authority, in fixture order, each created at the
+/// matching entry of `created_at`, and return their digests: the parent set of a round-2 header.
+///
+/// The certificates carry no batches, so a round-2 header built on them reaches a vote decision
+/// with nothing to sync from a worker.
+fn seed_round_one_parents_at<DB: Database + CertificateStore>(
+    committee: &CommitteeFixture<DB>,
+    store: &DB,
+    created_at: &[TimestampMs],
+) -> eyre::Result<BTreeSet<HeaderDigest>> {
+    assert_eq!(committee.authorities().count(), created_at.len(), "one timestamp per authority");
+    let committee_obj = committee.committee();
+    let certs: Vec<_> = committee
+        .authorities()
+        .zip(created_at)
+        .map(|(a, created_at)| {
+            committee.certificate(
+                &a.header_builder_at_round(&committee_obj, 1).created_at_ms(*created_at).build(),
+            )
+        })
+        .collect();
+    store.write_all(certs.iter())?;
+    Ok(certs.iter().map(|c| c.digest()).collect())
+}
+
+/// The voter's drift tolerance and vote timeout, read from the configuration its handler uses.
+fn drift_limits(committee: &CommitteeFixture<MemDatabase>) -> (Duration, Duration) {
+    let config = committee.first_authority().consensus_config();
+    (
+        config.network_config().sync_config().max_header_time_drift_tolerance,
+        config.parameters().vote_timeout,
+    )
+}
+
+/// `d` in whole milliseconds, for offsetting a [`TimestampMs`].
+fn whole_millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).expect("test durations fit in u64 milliseconds")
+}
+
+/// Drive [`PrimaryNetworkHandle::request_vote`] for `header` against `handler`, in process.
+///
+/// The test handle's command channel stands in for the swarm: every vote request the requester
+/// sends to `voter` is answered by `handler.vote` with `author` as the requesting peer, converted
+/// into a response the way `PrimaryNetwork::process_vote_request` converts it. Returns the
+/// requester's result and every response the voter sent, in order.
+async fn request_vote_in_process(
+    handler: &RequestHandler<MemDatabase>,
+    voter: BlsPublicKey,
+    author: BlsPublicKey,
+    header: Header,
+) -> (NetworkResult<RequestVoteResult>, Vec<PrimaryResponse>) {
+    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(10);
+    let requester = PrimaryNetworkHandle::new_for_test(commands_tx);
+    let mut responses = Vec::new();
+    let result = tokio::select! {
+        result = requester.request_vote(voter, header, Vec::new()) => result,
+        () = async {
+            while let Some(command) = commands_rx.recv().await {
+                let NetworkCommand::SendRequest {
+                    peer,
+                    request: PrimaryRequest::Vote { header, parents },
+                    reply,
+                } = command
+                else {
+                    panic!("the requester sent something other than a vote request");
+                };
+                assert_eq!(peer, voter, "the vote request must go to the voter");
+                let response =
+                    handler.vote(author, Arc::unwrap_or_clone(header), parents).await.into_response();
+                responses.push(response.clone());
+                // the requester awaits this reply, so the send cannot fail
+                let _ = reply.send(Ok(NetworkResponseMessage { peer, result: response }));
+            }
+        } => unreachable!("the requester holds the command channel open"),
+    };
+    (result, responses)
+}
+
+/// Once sub-second timestamps are active for a header's epoch, the header must be strictly newer
+/// than every parent on the combined millisecond timestamp.
+///
+/// The round-1 parents are created 1 ms apart within one second, so the boundary sits on the
+/// newest one: a round-2 header created in the same millisecond as it is refused with
+/// `InvalidParentTimestamp`, and one created 1 ms later earns a vote. Relaxing the voter's strict
+/// `>` to `>=` votes for the tied header and fails this test, and so does comparing whole seconds.
+#[tokio::test]
+async fn test_vote_fails_invalid_parent_timestamp() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // the voter is the fixture's first authority, so its store is the one the vote path reads.
+    // the parents sit a minute in the past so the drift check plays no part
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let oldest = TimestampMs::from_parts(now() - 60, 500);
+    let created_at: Vec<_> =
+        committee.authorities().zip(0..).map(|(_, i)| oldest.saturating_add_millis(i)).collect();
+    let newest = *created_at.last().expect("4 authorities in fixture");
+    let parents = seed_round_one_parents_at(&committee, &store, &created_at)?;
+    let round_two = |author: &AuthorityFixture<MemDatabase>, created_at: TimestampMs| {
+        author
+            .header_builder_at_round(&committee_obj, 2)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+
+    let tied_author = committee.last_authority();
+    let tied = round_two(tied_author, newest);
+    assert_eq!(tied.created_at_ms(), newest, "a fork-active header must keep its millisecond part");
+    assert_matches!(
+        handler.vote(*tied_author.authority().protocol_key(), tied, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidParentTimestamp {
+            header: header_ms,
+            parent: parent_ms,
+        })) if header_ms == newest && parent_ms == newest,
+        "a header created in the same millisecond as a parent must be refused"
+    );
+
+    // a different author, so the per-authority equivocation guard plays no part in the outcome
+    let newer_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let newer = round_two(newer_author, newest.saturating_add_millis(1));
+    assert_matches!(
+        handler.vote(*newer_author.authority().protocol_key(), newer, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a header 1 ms newer than its newest parent must earn a vote"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork, timestamps are whole seconds and several rounds can share
+/// one second, so a header only has to be no older than each parent: a round-2 header created in
+/// the same second as its parents earns a vote, and one created a second earlier is refused with
+/// `InvalidParentTimestamp`.
+///
+/// Tightening the pre-fork comparison to a strict `>` refuses the same-second header and fails
+/// this test.
+#[tokio::test]
+async fn test_vote_pre_fork_parent_timestamp_allows_equal_seconds() -> eyre::Result<()> {
+    pin_subsecond_fork(false);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // pre-fork headers drop their millisecond parts, so every parent lands on `second`
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let second = now() - 60;
+    let created_at: Vec<_> = committee
+        .authorities()
+        .zip(0..)
+        .map(|(_, i)| TimestampMs::from_parts(second, 500).saturating_add_millis(i))
+        .collect();
+    let parents = seed_round_one_parents_at(&committee, &store, &created_at)?;
+    let round_two = |author: &AuthorityFixture<MemDatabase>, created_at: TimestampMs| {
+        author
+            .header_builder_at_round(&committee_obj, 2)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+
+    let same_second_author = committee.last_authority();
+    let same_second = round_two(same_second_author, TimestampMs::from_parts(second, 999));
+    assert_eq!(
+        same_second.created_at_ms(),
+        TimestampMs::from_parts(second, 0),
+        "a pre-fork header must drop its millisecond part"
+    );
+    assert_matches!(
+        handler.vote(*same_second_author.authority().protocol_key(), same_second, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a pre-fork header created in the same second as its parents must earn a vote"
+    );
+
+    // a different author, so the per-authority equivocation guard plays no part in the outcome
+    let older_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let older = round_two(older_author, TimestampMs::from_parts(second - 1, 0));
+    assert_matches!(
+        handler.vote(*older_author.authority().protocol_key(), older, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidParentTimestamp {
+            header: header_ms,
+            parent: parent_ms,
+        })) if header_ms == TimestampMs::from_parts(second - 1, 0)
+            && parent_ms == TimestampMs::from_parts(second, 0),
+        "a pre-fork header created a second before its parents must be refused"
+    );
+
+    Ok(())
+}
+
+/// A header whose `created_at_millis` is 1000 or more never reaches the vote path.
+///
+/// Every `Header` constructor keeps the millisecond part below 1000, so the only way to present
+/// such a header is crafted wire bytes, and decoding refuses them: a fork-active vote request
+/// whose header claims 1000 ms fails to decode with an error naming the field. `Header::validate`
+/// repeats the range check on the vote path as `HeaderError::InvalidTimestampMillis`, which no
+/// header built outside `tn-types` can reach, so this test pins what that error costs the author
+/// instead: a fatal penalty and a permanent, non-retryable answer.
+#[tokio::test]
+async fn test_vote_request_with_out_of_range_millis_is_rejected() {
+    pin_subsecond_fork(true);
+    let committee = CommitteeFixture::builder(MemDatabase::default).build();
+    let header = committee
+        .header_builder_last_authority()
+        .created_at_ms(TimestampMs::from_parts(now(), 999))
+        .build();
+    assert_eq!(
+        header.created_at_millis(),
+        999,
+        "a fork-active header must keep its millisecond part"
+    );
+    let request = PrimaryRequest::Vote { header: Arc::new(header), parents: Vec::new() };
+    let mut bytes = encode(&request);
+    assert_eq!(
+        try_decode::<PrimaryRequest>(&bytes).expect("an in-range vote request must decode"),
+        request
+    );
+
+    // bcs writes the header's fields in declaration order with `created_at_millis`, a little-endian
+    // u16, last; only the empty parent list follows it, as a single zero length byte
+    let millis_at = bytes.len() - 3;
+    assert_eq!(bytes[bytes.len() - 1], 0, "the empty parent list must end the request");
+    assert_eq!(
+        bytes[millis_at..millis_at + 2],
+        999u16.to_le_bytes(),
+        "patch the millisecond field"
+    );
+    bytes[millis_at..millis_at + 2].copy_from_slice(&1000u16.to_le_bytes());
+
+    let err = try_decode::<PrimaryRequest>(&bytes)
+        .expect_err("a vote request whose header claims 1000 ms must not decode");
+    assert!(
+        err.to_string().contains("created_at_millis below 1000"),
+        "decode must fail on the millisecond range: {err}"
+    );
+
+    let err: PrimaryNetworkError = HeaderError::InvalidTimestampMillis(1000).into();
+    assert_matches!(
+        Option::<Penalty>::from(&err),
+        Some(Penalty::Fatal),
+        "an out-of-range millisecond part must cost the author a fatal penalty"
+    );
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "an out-of-range millisecond part must be answered as a permanent rejection"
+    );
+}
+
+/// A header created up to the drift tolerance ahead of the local clock earns a vote once the voter
+/// has waited out its exact lead in milliseconds.
+///
+/// The header leads the local clock by 50 ms, inside the drift tolerance. The call must take at
+/// least the lead, since the voter never votes while the header is still in the future, and well
+/// under a second, since it sleeps the lead itself rather than a whole second.
+#[tokio::test]
+async fn test_vote_waits_out_millisecond_lead() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let lead = Duration::from_millis(50);
+    assert!(lead < tolerance, "the lead must fall inside the drift tolerance");
+    let builder = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()));
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let start = Instant::now();
+    let created_at = now_ms().saturating_add_millis(whole_millis(lead));
+    let header = builder.created_at_ms(created_at).build();
+    assert_eq!(
+        header.created_at_ms(),
+        created_at,
+        "a fork-active header must keep its millisecond part"
+    );
+    let res = handler.vote(peer, header, vec![]).await?;
+    let waited = start.elapsed();
+
+    assert_matches!(
+        res,
+        PrimaryResponse::Vote(_),
+        "a header inside the drift tolerance must earn a vote"
+    );
+    assert!(
+        now_ms() >= created_at,
+        "the voter must not vote while the header is still in the future"
+    );
+    // `now_ms` truncates to the millisecond, so the lead measured from `start` can fall short of
+    // `lead` by under 1 ms
+    assert!(
+        waited + Duration::from_millis(1) >= lead,
+        "the voter must wait out the {lead:?} lead, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(500),
+        "the voter must sleep the lead, not a whole second: waited {waited:?}"
+    );
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork the voter also waits out a future-dated header's lead in
+/// milliseconds.
+///
+/// A whole-second header can only lead the local clock by the gap to its second, so the test
+/// first moves into the 700..=900 ms part of a second and then presents a header created at the
+/// next second: a lead of roughly 100 to 300 ms, which the rounded-up whole-second tolerance
+/// admits. Sleeping the lead takes well under half a second; sleeping a whole second would not.
+#[tokio::test]
+async fn test_vote_pre_fork_waits_out_millisecond_lead() -> eyre::Result<()> {
+    pin_subsecond_fork(false);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let builder = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()));
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let subsec = u64::from(now_ms().subsec_millis());
+    if subsec < 700 {
+        tokio::time::sleep(Duration::from_millis(700 - subsec)).await;
+    } else if subsec > 900 {
+        tokio::time::sleep(Duration::from_millis(1_700 - subsec)).await;
+    }
+
+    let start = Instant::now();
+    let now = now_ms();
+    let header = builder.created_at(now.secs() + 1).build();
+    let created_at = header.created_at_ms();
+    let lead = Duration::from_millis(created_at.as_millis().saturating_sub(now.as_millis()));
+    // anti-vacuity: a real sub-second lead, which a whole-second sleep would overshoot
+    assert!(
+        lead > Duration::ZERO && lead < Duration::from_millis(500),
+        "the header must lead the local clock by under half a second, leads by {lead:?}"
+    );
+    let res = handler.vote(peer, header, vec![]).await?;
+    let waited = start.elapsed();
+
+    assert_matches!(
+        res,
+        PrimaryResponse::Vote(_),
+        "a header inside the drift tolerance must earn a vote"
+    );
+    assert!(
+        now_ms() >= created_at,
+        "the voter must not vote while the header is still in the future"
+    );
+    // `now_ms` truncates to the millisecond, so `lead` can exceed the time since `start` by under
+    // 1 ms
+    assert!(
+        waited + Duration::from_millis(1) >= lead,
+        "the voter must wait out the {lead:?} lead, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(500),
+        "the voter must sleep the lead, not a whole second: waited {waited:?}"
+    );
+
+    Ok(())
+}
+
+/// A header further ahead of the local clock than the drift tolerance, but by no more than the
+/// tolerance plus the vote timeout, gets a recoverable answer that decides nothing about it.
+///
+/// The answer is `Ok`, and `PrimaryNetwork::process_vote_request` penalizes only an error, so the
+/// author pays nothing. Nothing is recorded either: no durable vote record, and the author's
+/// in-memory vote-cache entry is left as it was, so a different header from the same author for
+/// the same round is judged on its own merits and earns a vote. Recording the recoverable outcome
+/// would refuse that header as `AlreadyVotedForLaterRound` although this node never voted in the
+/// round.
+#[tokio::test]
+async fn test_vote_tier_two_lead_is_recoverable_and_uncached() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+    };
+
+    let ahead = builder()
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(tolerance) + 100))
+        .build();
+    assert_matches!(
+        handler.vote(peer, ahead, vec![]).await,
+        Ok(PrimaryResponse::RecoverableError(_)),
+        "a header beyond the drift tolerance but within the vote window must get a recoverable \
+         answer, not an error"
+    );
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a recoverable answer must not record a vote");
+
+    let legit = builder().created_at(1).build();
+    assert_matches!(
+        handler.vote(peer, legit, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the recoverable answer must leave the author free to earn a vote in the same round"
+    );
+
+    Ok(())
+}
+
+/// The requester retries a tier-two answer, and once the header's lead has shrunk inside the
+/// drift tolerance the retry earns the vote.
+///
+/// The header leads the voter's clock by the tolerance plus 100 ms, so the first request gets a
+/// recoverable answer. [`PrimaryNetworkHandle::request_vote`] sleeps before each retry, which
+/// brings the lead inside the tolerance, where the voter waits out the rest and votes.
+#[tokio::test]
+async fn test_request_vote_retries_tier_two_lead_until_vote() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, _) = drift_limits(&committee);
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(tolerance) + 100))
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(result, Ok(RequestVoteResult::Vote(_)), "a retry must earn the vote");
+    let (last, retried) = responses.split_last().expect("the voter answered");
+    assert_matches!(last, PrimaryResponse::Vote(_));
+    assert!(
+        !retried.is_empty()
+            && retried.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the first answer must be recoverable, as must every answer before the vote: {responses:?}"
+    );
+
+    Ok(())
+}
+
+/// A tier-two answer that outlasts every retry reaches the certifier as
+/// `NetworkError::RPCRetryable`, so it backs off and asks again rather than treating the voter's
+/// answer as a permanent rejection.
+///
+/// The paused clock skips the requester's retry delays, so the header's wall-clock lead stays in
+/// tier two for every attempt.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_persistent_tier_two_lead_is_retryable() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let lead = tolerance + vote_timeout / 2;
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(
+        result,
+        Err(NetworkError::RPCRetryable(_)),
+        "a recoverable answer that outlasts the retries must stay retryable"
+    );
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(
+                r,
+                PrimaryResponse::RecoverableError(PrimaryRPCError(msg))
+                    if msg.contains("ahead of the local clock")
+            )),
+        "the requester must retry, and every answer must be the tier-two answer: {responses:?}"
+    );
+
+    Ok(())
+}
+
+/// A header further ahead of the local clock than the drift tolerance plus the vote timeout is
+/// rejected for good: `InvalidTimestamp`, a severe penalty, and a verdict cached for its digest.
+///
+/// The repeat request is answered from the cache with the already-converted response; a fresh
+/// evaluation would return the error itself instead.
+#[tokio::test]
+async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let lead = tolerance + vote_timeout + Duration::from_secs(1);
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let created_at = header.created_at_ms();
+
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("a header beyond the vote window must be rejected");
+    assert_matches!(
+        &err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
+            if *created == created_at
+    );
+    assert_matches!(
+        Option::<Penalty>::from(&err),
+        Some(Penalty::Severe),
+        "a header beyond the vote window must cost the author a severe penalty"
+    );
+
+    let repeat = handler.vote(peer, header, vec![]).await?;
+    assert_eq!(
+        repeat,
+        PrimaryResponse::into_error_ref(&err),
+        "the repeat request must be answered from the cached verdict"
+    );
+    assert_matches!(repeat, PrimaryResponse::Error(_), "the cached verdict must be permanent");
+
+    Ok(())
+}
+
+/// A voter that cannot finish evaluating a vote request within its `vote_timeout` answers with a
+/// recoverable response on every attempt, which reaches the certifier as
+/// `NetworkError::RPCRetryable` rather than a permanent `RPCError`.
+///
+/// The header's execution block never arrives, so every evaluation stalls in `wait_for_execution`
+/// until the voter's 10 ms `vote_timeout` fires. The paused clock skips both those timeouts and
+/// the requester's retry delays.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_voter_timeout_is_retryable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_with_vote_timeout(temp_dir.path(), Duration::from_millis(10)).await;
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at(1)
+        .build();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+
+    assert_matches!(
+        result,
+        Err(NetworkError::RPCRetryable(_)),
+        "a voter that times out must leave the request retryable"
+    );
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the requester must retry, and every timed-out answer must be recoverable: {responses:?}"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // behind_consensus Tests
 // ============================================================================
 // These tests verify the behind_consensus detection logic, including the fix
@@ -725,7 +2594,7 @@ async fn test_behind_consensus_committed_round_prevents_false_positive() {
     // Without the fix: effective_exec_round = 18, 18 + 40 = 58 < 59 → false positive!
     // With the fix: effective_exec_round = max(0, 18, 59) = 59, 59 + 40 = 99 > 59 → correct.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(18, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(18, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
 
     // Set committed round to 59 (as Bullshark would)
@@ -746,7 +2615,7 @@ async fn test_behind_consensus_genuinely_behind() {
     // Incoming gossip is at round 60 in the same epoch.
     // effective_exec_round = max(0, 5, 5) = 5, gc_depth = 40, 5 + 40 = 45 < 60 → behind.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(5, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
     consensus_bus.committed_round_updates().send_replace(5);
 
@@ -754,59 +2623,604 @@ async fn test_behind_consensus_genuinely_behind() {
     assert!(result, "genuinely behind node should be detected");
 }
 
-/// A peer that re-requests the same epoch while an entry is already pending must not be
-/// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
-/// could re-request every 20s and hold a slot forever. This test exercises the
-/// preservation logic used by `process_epoch_stream` and verifies the entry is evicted on
-/// schedule relative to the *original* insertion time.
+/// Serving a partial prefix over the sync protocol (`EpochPackPartial`, item 9)
+/// writes `Ack` then streams exactly the verifiable prefix bytes as `Data` frames:
+/// the bytes reassembled from the frames must equal the data file truncated at
+/// `output_end(k)`, and a later cutoff must stream strictly more (with the smaller
+/// prefix a true prefix of it).
 #[tokio::test]
-async fn test_pending_epoch_stream_replacement_preserves_created_at() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
-    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingEpochStream> = HashMap::new();
+async fn test_sync_partial_epoch_pack_over_stream() {
+    use tokio::io::AsyncReadExt as _;
 
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = *committee.first_authority().authority().protocol_key();
+
+    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
+    let num_outputs = 15u64;
+    for number in 1..=num_outputs {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // Reassemble the pack bytes streamed by the sync serve for a stop point `k`: read
+    // the leading `Ack`, then feed the remaining `Data`/`End` frames through
+    // `sync_pack_reader` (the reader the real requester uses).
+    async fn reassemble_partial(
+        consensus_chain: &tn_storage::consensus::ConsensusChain,
+        stop_number: u64,
+        peer: BlsPublicKey,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+            &mut out,
+            consensus_chain,
+            0,
+            Some(stop_number),
+            Duration::from_secs(10),
+            peer,
+        )
+        .await
+        .expect("serve partial epoch pack over sync");
+
+        let mut cursor = futures::io::Cursor::new(out);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let ack = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack frame");
+        assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
+
+        let mut reassembled = Vec::new();
+        crate::network::sync_codec::sync_pack_reader(cursor)
+            .read_to_end(&mut reassembled)
+            .await
+            .expect("reassemble partial pack data frames");
+        reassembled
+    }
+
+    // The reassembled bytes must equal the verifiable prefix the chain exposes, i.e.
+    // the data file truncated at `output_end(k)`.
+    let k = 9u64;
+    let reassembled = reassemble_partial(handler.consensus_chain(), k, peer).await;
+    let (stream, len) =
+        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
+    let mut expected = Vec::new();
+    stream.take(len).read_to_end(&mut expected).await.unwrap();
+    assert_eq!(reassembled.len() as u64, len, "streamed byte count must equal the partial cutoff");
+    assert_eq!(reassembled, expected, "reassembled bytes must equal the verifiable prefix");
+
+    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
+    let reassembled_more = reassemble_partial(handler.consensus_chain(), num_outputs, peer).await;
+    assert!(reassembled_more.len() > reassembled.len(), "a later cutoff must stream more bytes");
+    assert_eq!(
+        &reassembled_more[..reassembled.len()],
+        &reassembled[..],
+        "smaller prefix must prefix the larger one"
+    );
+}
+
+/// A full epoch pack the responder does not hold is shed with
+/// `Deny(Unavailable)`, so a sync requester retries another peer immediately
+/// instead of waiting out its ack timeout. (The `Ack`+`Data`+`End` happy path is
+/// unit-tested in `sync_codec` and exercised end-to-end by the ignored
+/// observer-pack-import e2e test.)
+#[tokio::test]
+async fn test_sync_epoch_pack_unavailable_denies() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
     let peer = BlsPublicKey::default();
-    let digest = B256::random();
-    let key = (peer, digest);
-    let epoch: u32 = 7;
 
-    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
-    // assert eviction without waiting on wall-clock time
-    let t0 = Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1);
-    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    pending_map.insert(key, PendingEpochStream::new_with_created_at(epoch, permit, t0));
+    // epoch 0 has no finalized pack, so the responder cannot serve a full epoch pack
+    let mut out: Vec<u8> = Vec::new();
+    crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+        &mut out,
+        handler.consensus_chain(),
+        0,
+        None,
+        Duration::from_secs(5),
+        peer,
+    )
+    .await
+    .expect("serving an unavailable pack sheds cleanly without erroring");
 
-    // simulate a re-request: production code looks up the existing entry's
-    // `created_at` and reuses it when building the replacement
-    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    let preserved_created_at =
-        pending_map.get(&key).map(|p| p.created_at).unwrap_or_else(Instant::now);
-    let replacement =
-        PendingEpochStream { epoch, created_at: preserved_created_at, _permit: new_permit };
-    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
-
-    // the replacement must carry the original `created_at`, not a fresh one
-    let after = pending_map.get(&key).expect("entry present after replacement");
-    assert_eq!(
-        after.created_at, t0,
-        "replacement must preserve original created_at to prevent cleanup-timer reset"
+    // the first (and only) frame must be Deny(Unavailable)
+    let (mut dec, mut comp) = (Vec::new(), Vec::new());
+    let frame = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+        &mut futures::io::Cursor::new(out),
+        &mut dec,
+        &mut comp,
+        crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+    )
+    .await
+    .expect("read deny frame");
+    assert_matches!(
+        frame,
+        tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
     );
+}
 
-    // cleanup mirrors `PrimaryNetwork::cleanup_stale_pending_requests`: entries whose
-    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
-    // the entry must drop.
-    let now = Instant::now();
-    pending_map
-        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
+/// `EpochRecord` request-response admission must cap a single peer at
+/// [`MAX_PENDING_REQUESTS_PER_PEER`] concurrent serves and free the slot when a serve ends
+/// (GHSA-vc2r-9cp2-w74j). Before the fix, `process_epoch_record_request` spawned an unbounded,
+/// penalty-free task per request, so a non-committee peer could exhaust task/CPU capacity.
+#[test]
+fn test_epoch_record_admission_enforces_per_peer_cap() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(1);
+    let peer = *BlsKeypair::generate(&mut rng).public();
 
+    // A single peer is admitted exactly MAX_PENDING_REQUESTS_PER_PEER times.
+    let held: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
+        .map(|_| {
+            try_admit_epoch_record(&semaphore, &peers, peer)
+                .expect("a peer under its per-peer cap must be admitted")
+        })
+        .collect();
+    assert_eq!(held.len(), MAX_PENDING_REQUESTS_PER_PEER);
+
+    // The next request from the same peer is refused while its serves are still in flight.
     assert!(
-        pending_map.is_empty(),
-        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
+        try_admit_epoch_record(&semaphore, &peers, peer).is_none(),
+        "a peer at its per-peer cap must be refused"
     );
 
-    // and the permit must have returned to the semaphore
-    assert_eq!(
-        semaphore.available_permits(),
-        MAX_CONCURRENT_EPOCH_STREAMS,
-        "dropping the evicted pending entry must release its semaphore permit"
+    // Ending the in-flight serves (dropping the permits) frees the peer's slots again.
+    drop(held);
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, peer).is_some(),
+        "dropping a peer's in-flight serves must free its per-peer capacity"
     );
+}
+
+/// `EpochRecord` request-response admission must cap the concurrent serve count across all peers
+/// at [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`] and free the budget when serves end
+/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn and, since a permit is held for the
+/// serve's lifetime, the total in-flight certificate-wait budget as well.
+#[test]
+fn test_epoch_record_admission_enforces_global_cap() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(2);
+
+    // Enough distinct peers that the *global* cap, not any per-peer cap, is the binding limit:
+    // one serve per peer fills every global permit while each peer stays under its per-peer cap.
+    let peer_pool: Vec<_> = (0..MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)
+        .map(|_| *BlsKeypair::generate(&mut rng).public())
+        .collect();
+    let held: Vec<_> = peer_pool
+        .iter()
+        .map(|peer| {
+            try_admit_epoch_record(&semaphore, &peers, *peer)
+                .expect("a global permit must be available while the budget is not exhausted")
+        })
+        .collect();
+    assert_eq!(held.len(), MAX_CONCURRENT_EPOCH_RECORD_REQUESTS);
+
+    // A further distinct peer is refused: the global concurrency budget is exhausted even though
+    // this peer is under its own per-peer cap.
+    let extra = *BlsKeypair::generate(&mut rng).public();
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_none(),
+        "a fresh peer must be refused when the global concurrency budget is exhausted"
+    );
+
+    // Ending the in-flight serves frees the global budget again.
+    drop(held);
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
+        "dropping in-flight serves must free global concurrency"
+    );
+}
+
+/// The shed budget admits exactly [`MAX_CONCURRENT_SHED_TASKS`] concurrent shed
+/// tasks, denies the next, and frees a slot when a shed permit drops (#1308).
+/// Before the fix, `process_inbound_sync_stream` spawned a task per denied
+/// stream, so the cost of refusing work scaled with the arrival rate of refused
+/// work rather than with the cap.
+#[test]
+fn test_shed_admit_enforces_budget_and_frees_on_drop() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+
+    // fill the shed budget
+    let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
+        .map(|_| try_admit_shed(&semaphore).expect("admit below the shed budget"))
+        .collect();
+    assert_eq!(semaphore.available_permits(), 0);
+
+    // at the budget: the next shed spawn is refused (stream dropped, no task)
+    assert!(try_admit_shed(&semaphore).is_none());
+
+    // dropping a shed permit frees its slot for the next denied stream
+    drop(permits);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
+    assert!(try_admit_shed(&semaphore).is_some());
+}
+
+// ============================================================================
+// Consensus Result Signature Aggregation Tests
+// ============================================================================
+// These tests cover how the handler counts the validator signatures gossiped for a
+// consensus result. A result is only "published" (forwarded to followers) once a quorum of
+// *distinct* validators have signed it, and each validator must count at most once.
+
+/// Build a gossip message carrying a [`ConsensusResult`] signed by `auth` over the given
+/// `(epoch, round, number, hash)` tuple. Mirrors how the subscriber publishes results: the
+/// signature is over `to_intent_message(ConsensusResult::digest_data(..))`.
+fn signed_consensus_gossip(
+    auth: &AuthorityFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> GossipMessage {
+    let digest = ConsensusResult::digest_data(epoch, round, number, hash);
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(digest)));
+    let validator = key_config.public_key();
+    let result = ConsensusResult { epoch, round, number, hash, validator, signature };
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let topic =
+        TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A quorum (`1/3 + 1`) of distinct validators signing the same consensus result must cause
+/// the handler to publish it, and not before. This also pins the entry-creation path: the
+/// very first signature must be recorded (a regression here would mean a quorum is never
+/// reached and the result is never published).
+#[tokio::test]
+async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Feed distinct signers one at a time; nothing should publish until the quorum-th.
+    for (seen, auth) in authorities.iter().take(quorum).enumerate() {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+
+        if seen + 1 < quorum {
+            assert_eq!(
+                consensus_bus.published_consensus_num_hash(),
+                (0, 0, ConsensusHeaderDigest::default()),
+                "must not publish before a quorum of distinct signers ({} of {quorum})",
+                seen + 1,
+            );
+        }
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// The same validator gossiping a result repeatedly must be counted once. Replaying one
+/// signer more times than the quorum must not publish; only adding the remaining *distinct*
+/// signers may.
+#[tokio::test]
+async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Replay the first signer's result more than `quorum` times. If duplicates were counted,
+    // this alone would reach quorum and publish — it must not.
+    let dup = signed_consensus_gossip(authorities[0], epoch, round, number, hash);
+    for _ in 0..quorum + 1 {
+        handler.process_gossip(&dup).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "repeated signatures from one validator must count once and stay below quorum",
+    );
+
+    // Add the remaining distinct signers (signer 0 already counted once) to reach quorum.
+    for auth in authorities.iter().take(quorum).skip(1) {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "a quorum of distinct signers must publish even after duplicates were ignored",
+    );
+    Ok(())
+}
+
+/// A single committee member equivocating on one consensus number (many distinct hashes for the
+/// same number) must not grow `consensus_certs` without bound. The per-(signer, number)
+/// equivocation limit caps a lone flooder at `MAX_TALLIES_PER_SIGNER_PER_NUMBER` live tallies for
+/// that number no matter how many hashes it signs. The limit must not break legitimate
+/// aggregation: the SAME validator's genuine signature for a *different* number is not throttled,
+/// so a real quorum still publishes afterward.
+#[tokio::test]
+async fn test_consensus_certs_same_number_flood_bounded() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Flood: 50 distinct hashes for the SAME number (1) from a single validator. Each hash is a
+    // distinct digest, none reaches quorum, so nothing clears the map.
+    for _ in 0..50 {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash);
+        handler.process_gossip(&msg).await?;
+    }
+
+    // The per-(signer, number) limit holds the flooder to at most MAX_TALLIES_PER_SIGNER_PER_NUMBER
+    // live tallies for number 1, far below the committee-scaled memory cap.
+    assert!(
+        handler.consensus_certs_len() <= MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        "one signer must not create more than MAX_TALLIES_PER_SIGNER_PER_NUMBER tallies for a \
+         single number, got {}",
+        handler.consensus_certs_len(),
+    );
+
+    // A legitimate result for a DIFFERENT number must still reach quorum and publish — even from a
+    // quorum that includes the flooder, because the limit is per (signer, number), not per signer.
+    let hash_l = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().take(quorum) {
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_l),
+        "a legitimate quorum must publish despite the same-number flood",
+    );
+    // Publishing clears the map.
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// Two (or more) colluding committee members can co-sign an unbounded stream of distinct hashes
+/// for the same consensus number. Each tuple then carries two valid signatures, so a heuristic
+/// that only evicts *singleton* entries would keep every one of them (the residual of
+/// GHSA-2r5c-c4h7-gp5h). The per-(signer, number) equivocation limit bounds the map regardless of
+/// how many members collude: each colluder can be a signer of only
+/// `MAX_TALLIES_PER_SIGNER_PER_NUMBER` distinct live tallies for a number, so `f` colluders occupy
+/// at most `f * MAX_TALLIES_PER_SIGNER_PER_NUMBER` tallies. A genuine quorum must still publish
+/// afterward.
+#[tokio::test]
+async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    // A committee of seven has a quorum of three, so two co-signers stay strictly below quorum:
+    // their entries never publish and therefore never clear the map during the flood.
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    assert!(quorum > 2, "collusion test needs quorum > 2 so two co-signers stay sub-quorum");
+    let authorities: Vec<_> = committee.authorities().collect();
+
+    // Flood: 50 distinct hashes for number 1, each co-signed by the SAME two validators. Every
+    // resulting entry has two signers, so a "keep any entry with more than one signer" guard would
+    // retain all 50. None reaches the quorum of three, so no publish clears the map mid-flood.
+    for _ in 0..50 {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        for auth in authorities.iter().take(2) {
+            let msg = signed_consensus_gossip(auth, epoch, round, 1, hash);
+            handler.process_gossip(&msg).await?;
+        }
+    }
+
+    // Two colluders can be signers of at most 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER live tallies
+    // for number 1 (fewer when they co-sign the same digests, as here).
+    assert!(
+        handler.consensus_certs_len() <= 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        "colluders must not create more than 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER tallies for one \
+         number, got {}",
+        handler.consensus_certs_len(),
+    );
+
+    // A legitimate quorum for a different number must still publish after the collusion flood.
+    let hash_l = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().take(quorum) {
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_l),
+        "a legitimate quorum must publish even after a collusion flood",
+    );
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// A same-number equivocation flood must not evict an honest tally that is still climbing to
+/// quorum. A Byzantine member signs an unbounded stream of distinct hashes for number 1; before
+/// each honest signature for the real result (number 2) a burst larger than the cap is injected.
+/// Under LRU eviction alone every burst would fill the map and evict the honest tally, and because
+/// honest validators gossip each result only once the lost signatures never return — a permanent
+/// stall (GHSA-2r5c-c4h7-gp5h / GHSA-pvhw-9pmg-q2hg). The per-(signer, number) limit caps the
+/// flooder at a couple of slots so the map never fills and the honest tally survives to publish.
+#[tokio::test]
+async fn test_consensus_certs_publisher_flood_cannot_evict_honest_tally() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum + 1, "need a flooder plus a distinct honest quorum");
+
+    let hash_real = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().skip(1).take(quorum) {
+        for _ in 0..(MAX_CONSENSUS_CERTS + 5) {
+            let flood = ConsensusHeaderDigest::from(B256::random());
+            handler
+                .process_gossip(&signed_consensus_gossip(authorities[0], epoch, round, 1, flood))
+                .await?;
+        }
+        handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 2, hash_real)).await?;
+        assert!(
+            handler.consensus_certs_len() <= MAX_TALLIES_PER_SIGNER_PER_NUMBER + 1,
+            "map must stay bounded during the flood, got {}",
+            handler.consensus_certs_len(),
+        );
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_real),
+        "the honest tally must survive the same-number flood and publish at quorum",
+    );
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// An honest validator that is the first to gossip several consecutive still-un-quorumed consensus
+/// numbers on a lagging receiver must NOT have its own signatures dropped. Each result is for a
+/// different number, so the per-(signer, number) equivocation limit never fires. A per-signer
+/// limit that counted tallies across all numbers would instead drop the validator's own genuine
+/// signature for the third number — an honest-liveness regression. This is the guard for that
+/// (GHSA-pvhw-9pmg-q2hg): under such a limit `consensus_certs_has(&d3)` is false and number 3
+/// never publishes.
+#[tokio::test]
+async fn test_consensus_certs_honest_creator_across_numbers_not_dropped() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    let h = authorities[0];
+
+    let h1 = ConsensusHeaderDigest::from(B256::random());
+    let h2 = ConsensusHeaderDigest::from(B256::random());
+    let h3 = ConsensusHeaderDigest::from(B256::random());
+    let d1 = ConsensusResult::digest_data(epoch, round, 1, h1);
+    let d2 = ConsensusResult::digest_data(epoch, round, 2, h2);
+    let d3 = ConsensusResult::digest_data(epoch, round, 3, h3);
+
+    // H is the first to gossip numbers 1, 2 and 3. None has reached quorum on this receiver yet,
+    // so all three tallies stay live and each contains H. The per-(signer, number) limit does not
+    // fire because each tally is for a different number.
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 1, h1)).await?;
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 2, h2)).await?;
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 3, h3)).await?;
+    assert!(handler.consensus_certs_has(&d1), "H's tally for number 1 must be live");
+    assert!(handler.consensus_certs_has(&d2), "H's tally for number 2 must be live");
+    assert!(handler.consensus_certs_has(&d3), "H's OWN tally for number 3 must NOT be dropped");
+
+    // Number 3 reaches quorum using H's retained signature plus other honest signers.
+    for auth in authorities.iter().skip(1).take(quorum - 1) {
+        handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 3, h3)).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 3, h3),
+        "number 3 must reach quorum including H's retained signature",
+    );
+    Ok(())
+}
+
+/// At a committee large enough that `2 * f` exceeds the `MAX_CONSENSUS_CERTS` floor, a FIXED cap
+/// would let Byzantine members fill the map and evict the honest tally (the large-committee gap;
+/// Telcoin targets ~100 validators). The committee-scaled cap keeps the effective cap above the
+/// Byzantine footprint (`f * MAX_TALLIES_PER_SIGNER_PER_NUMBER`), so the honest result still
+/// reaches quorum and publishes. Committee 34 -> f = 11, quorum = 12, 2f = 22 > 20.
+#[tokio::test]
+async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(34).unwrap())
+            .await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let f = (committee.committee().size() - 1) / 3;
+    assert!(
+        2 * f >= MAX_CONSENSUS_CERTS,
+        "committee must be large enough to break a fixed cap; 2f={}",
+        2 * f
+    );
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= f + quorum, "need a Byzantine set plus a disjoint honest quorum");
+
+    // Byzantine set = authorities[0..f]; honest quorum = authorities[f..f+quorum]. Before each
+    // honest signature for the real result (number 2), every Byzantine key signs a batch of fresh
+    // distinct hashes for number 1. The per-(signer, number) limit caps the whole Byzantine set at
+    // f * MAX_TALLIES_PER_SIGNER_PER_NUMBER = 2f tallies for number 1, and the committee-scaled cap
+    // (= committee size) stays above that, so the map never fills and the honest number-2 tally is
+    // never evicted. Under a fixed cap this same flood would evict it and number 2 would stall.
+    let hash_real = ConsensusHeaderDigest::from(B256::random());
+    for h in f..(f + quorum) {
+        for b in 0..f {
+            for _ in 0..MAX_TALLIES_PER_SIGNER_PER_NUMBER {
+                let flood = ConsensusHeaderDigest::from(B256::random());
+                handler
+                    .process_gossip(&signed_consensus_gossip(
+                        authorities[b],
+                        epoch,
+                        round,
+                        1,
+                        flood,
+                    ))
+                    .await?;
+            }
+        }
+        handler
+            .process_gossip(&signed_consensus_gossip(authorities[h], epoch, round, 2, hash_real))
+            .await?;
+        assert!(
+            handler.consensus_certs_len() <= 2 * f + 1,
+            "map must stay near the Byzantine footprint (2f) plus the honest tally, got {}",
+            handler.consensus_certs_len(),
+        );
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_real),
+        "the honest result must survive the large-committee flood and publish",
+    );
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
 }

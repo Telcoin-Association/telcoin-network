@@ -15,6 +15,8 @@ pub enum CommitError {
     IndexFileSync(io::Error),
     /// DB is opened read-only.
     ReadOnly,
+    /// DB is in the failed state; contains a copy of the io error that caused that state.
+    Failed(io::Error),
 }
 
 impl Error for CommitError {}
@@ -26,6 +28,7 @@ impl fmt::Display for CommitError {
             Self::DataFileSync(io_err) => write!(f, "data sync: {io_err}"),
             Self::IndexFileSync(io_err) => write!(f, "index sync: {io_err}"),
             Self::ReadOnly => write!(f, "read only"),
+            Self::Failed(io_err) => write!(f, "pack failed: {io_err}"),
         }
     }
 }

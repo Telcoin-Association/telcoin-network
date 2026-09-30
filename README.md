@@ -16,8 +16,9 @@ Check out the repo and update the submodules:
 
 ### Run an observer against testnet
 
-Build a release version of the node software:
-`cargo build --bin telcoin-network --release`
+Build a release version of the node software with the `adiri` feature (required to join the
+adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
+`cargo build -p telcoin-network --bin telcoin-network --release --features adiri`
 
 Generate a config and keys for your observer node:
 `target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
@@ -25,9 +26,13 @@ Generate a config and keys for your observer node:
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
 Start your observer node:
-`target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
+
+Node role is derived from committee membership: a key outside the current committee runs as an
+observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
+chain.
 
 ### Run a validator
 
@@ -41,6 +46,14 @@ telcoin-network --datadir DATADIR --bls-passphrase-source ask \
 ```
 
 This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
+
+Worker network configuration is checked before any swarm starts. Each entry in
+`node_info.p2p_info.workers` must advertise the network key derived for its worker ID from the
+loaded BLS keystore, and worker listen addresses must be distinct, ignoring trailing `/p2p/`
+identities. Configurations with mismatched keys or duplicate addresses fail startup with an
+error naming the offending field.
+Restore worker key entries using the expected Base58 key printed in the startup error and
+configure a separate listen address for each worker.
 
 - `--address` is the execution layer address that receives fees
 - `--external-primary-addr` should be set to the node's public IP and port
@@ -152,6 +165,34 @@ curl 127.0.0.1:8545 \
 -X POST \
 -H "Content-Type: application/json" \
 --data '{"method":"eth_chainId","params":[],"id":1,"jsonrpc":"2.0"}'
+
+## Gas over-reservation penalty
+
+Telcoin Network charges a gas penalty when a transaction sets a gas limit far above its actual usage.
+The penalty is zero when the gas limit is at or below 210,000, or when the transaction uses at least 10 percent of its limit.
+Below that, the penalty grows quadratically and is deducted from the unused-gas refund, then credited to the chain's base-fee address.
+Transaction receipts do not show the penalty.
+See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
+
+## Documentation
+
+Developer documentation lives in [`docs/`](docs/) and is built into a static site with [mdBook](https://rust-lang.github.io/mdBook/) 0.5.4.
+Markdown sources are in `docs/src/`, with `docs/src/SUMMARY.md` defining the sidebar.
+`docs/book.toml` is the book configuration and `docs/theme/` holds the site theme.
+CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`), and on every `v*` tag push.
+The site is versioned: `main` is served at the site root as **latest** (the default), and every `v*` tag that contains `docs/book.toml` is served under `/<tag>/`; readers switch versions with the picker in the book header.
+Intended site behaviors (version switching, sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
+
+To preview locally, install mdBook with `cargo install mdbook --version 0.5.4 --locked`, then:
+
+```bash
+make book        # build the book and open it in your browser
+make book-serve  # serve at localhost:3000 with live reload
+```
+
+Treat the docs as part of the protocol: a change that alters documented behavior should update the affected pages in `docs/src/` in the same PR.
+The pages most often affected are `rpc-methods/` for RPC behavior, `basefees.md`, `gas-limit-penalty.md`, and `gas-penalty.md` for fees and penalties, `epoch-boundaries.md` and `canonical-updates.md` for epochs and consensus records, `staking/` for the validator lifecycle, and `evm-compatibility.md` for precompiles and block header semantics.
+A new page must also be added to `docs/src/SUMMARY.md` or it will not appear in the book.
 
 ## TN-Contracts Submodule
 

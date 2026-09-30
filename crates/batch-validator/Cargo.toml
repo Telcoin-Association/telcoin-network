@@ -18,9 +18,11 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+eyre = { workspace = true }
 assert_matches = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["sync", "time"] }
+tn-test-utils = { workspace = true }
 
 [features]
 default = []

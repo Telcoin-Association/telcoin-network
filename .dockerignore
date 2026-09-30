@@ -1,0 +1,27 @@
+# Never send these to the Docker build context.
+
+# Cargo build output (tens of GB locally) — also collides with the ./target cache mount
+target
+**/target
+
+# Git metadata — the commit hash is injected via the GIT_SHA build-arg (vergen override),
+# so neither .git nor the git binary is needed inside the build.
+.git
+.gitignore
+.gitmodules
+
+# Secrets / local / dev / runtime state
+.env
+.env.example
+tasks
+test_logs
+**/test_logs
+data
+local-validators
+gha-creds-*.json
+
+# CI / editor / OS cruft
+.github
+.vscode
+.idea
+**/.DS_Store

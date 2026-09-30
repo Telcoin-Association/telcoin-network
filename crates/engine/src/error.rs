@@ -4,7 +4,7 @@ use tn_reth::error::TnRethError;
 use tn_types::AuthorityIdentifier;
 use tokio::sync::oneshot;
 
-/// Result alias for [`TNEngineError`].
+/// Result alias for [`TnEngineError`].
 pub(crate) type EngineResult<T> = Result<T, TnEngineError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -16,27 +16,22 @@ pub enum TnEngineError {
     /// The next block digest is missing.
     #[error("Missing next block digest for recovered sealed block with senders.")]
     NextBlockDigestMissing,
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The oneshot channel that receives the result from executing output on a blocking thread.
     #[error("The oneshot channel sender inside blocking task dropped during output execution.")]
     ChannelClosed,
     /// The queued output that triggered the engine build was not found.
     #[error("Engine trying to build from empty queue.")]
     EmptyQueue,
-    /// Failed to recover the signer for a transaction.
-    #[error("Could not recover signer for transaction")]
-    MissingSigner,
-    /// Failed to find the block we need to finalize- forked?.
-    #[error("Could not finalize execution block- forked?")]
-    MissingFinalBlock,
     /// The consensus stream has closed.
     #[error("Consensus output stream closed.")]
     ConsensusOutputStreamClosed,
     /// The output's leader is unknown.
     #[error("Unknown authority for block rewards {0}")]
     UnknownAuthority(AuthorityIdentifier),
+    /// A ConsensusOutput produced a different number of batches and batch digests.
+    /// This should not happen outside of a bug in ConsensusOutput production...
+    #[error("Uneven number of sealed blocks from batches and batch digests, batches {0}, batch digests {1}")]
+    ConsensusOutputUnevenBatches(usize, usize),
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

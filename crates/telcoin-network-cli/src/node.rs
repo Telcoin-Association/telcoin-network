@@ -6,12 +6,23 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
+    thread::available_parallelism,
+};
 use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
-use tn_reth::{parse_socket_address, RethCommand, RethConfig};
+use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
+use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+/// Parse bootstrap dial hints using the same map and legacy worker decoding as NetworkConfig.
+fn parse_bootstrap_peers(
+    raw: &str,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, serde_yaml::Error> {
+    serde_yaml::from_str(raw)
+}
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -32,6 +43,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "NAMED_TN_NETWORK", verbatim_doc_comment)]
     pub chain: Option<NamedChain>,
 
+    /// Bootstrap dial hints as a YAML or JSON map keyed by BLS public key.
+    ///
+    /// Replaces network-config bootstrap_peers for this process only. A nonempty map replaces
+    /// all genesis seeds; an explicit '{}' selects the genesis fallback. Each entry contains
+    /// primary and workers (a list). Committee membership still comes from chain state.
+    #[arg(long, value_name = "MAP", value_parser = parse_bootstrap_peers, allow_hyphen_values = true)]
+    bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+
     /// Enable Prometheus consensus metrics.
     ///
     /// The metrics will be served at the given interface and port.
@@ -43,20 +62,45 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Configures the ports of the node to avoid conflicts with the defaults.
     /// This is useful for running multiple nodes on the same machine.
     ///
-    /// Max number of instances is 200. It is chosen in a way so that it's not possible to have
-    /// port numbers that conflict with each other.
+    /// Instance numbers run from 1 to 200. The max is chosen in a way so that it's not possible
+    /// to have port numbers that conflict with each other. 0 is rejected at parse time: the port
+    /// arithmetic below subtracts `instance - 1`, which underflows on 0.
     ///
     /// Changes to the following port numbers:
     /// - `HTTP_RPC_PORT`: default - `instance` + 1
     /// - `WS_RPC_PORT`: default + `instance` * 2 - 2
     /// - `IPC_PATH`: default + `-instance`
-    #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(..=200))]
+    #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(1..=200))]
     pub instance: Option<u16>,
 
-    /// Is this an observer node?  True if set, an observer will never be in the committee
-    /// but will follow consensus and provide node RPC access.
-    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
+    /// Deprecated and ignored. Node role is derived from committee membership.
+    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false, hide = true)]
     pub observer: bool,
+
+    /// Export each epoch's final execution state to a snapshot pack under
+    /// `consensus-db/state_exports/epoch-{N}/`.
+    ///
+    /// Each epoch writes a full execution-state copy. Retention is unlimited by default and can
+    /// fill the data volume; use --state-export-keep N to limit the number of completed bundles.
+    #[arg(long, global = true, default_value_t = false)]
+    pub enable_state_export: bool,
+
+    /// Keep the newest N completed state-export bundles (N must be at least 1).
+    ///
+    /// Only applies with --enable-state-export. Unset keeps all bundles. Each epoch exports the
+    /// full execution state, so unlimited retention can fill the data volume. This limits bundle
+    /// count, not bytes. Use N >= 2 to retain a previous bundle during overlapping exports.
+    #[arg(long, global = true, value_name = "N")]
+    state_export_keep: Option<NonZeroUsize>,
+
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259).
+    ///
+    /// Opt-in telemetry: when set, execution keeps a bounded rolling window of recently
+    /// executed transaction hashes and reports (a counter and a rate-bounded warning) batches
+    /// that re-pack transactions first packed by another producer's batch. A node that does
+    /// not opt in builds no window and hashes nothing.
+    #[arg(long, global = true, default_value_t = false)]
+    pub enable_repack_monitor: bool,
 
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
@@ -110,9 +154,69 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
+        if self.observer {
+            warn!(
+                target: "cli",
+                "--observer is deprecated and ignored (Telcoin-Association/telcoin-network#1355). \
+                 Node role is derived from committee membership. To take a validator out of \
+                 consensus, exit it on chain."
+            );
+        }
+
+        // Log the compiled fork schedule once per process start (#1086) so operators can diff it
+        // across the fleet before a fork epoch arrives; several fork constants document this log
+        // as their only in-protocol detection for a mismatched binary. Every epoch-gated adiri
+        // constant belongs in the adiri line, and every fork belongs in the non-adiri sentence
+        // (there is no non-adiri PREVRANDAO constant to log: that build's gate is a hardcoded
+        // `true`, active from genesis like the rest).
+        #[cfg(feature = "adiri")]
+        info!(
+            target: "cli",
+            consensus_registry_fork_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH,
+            seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
+            multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
+            prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
+            leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
+            subsecond_timestamp_fork_epoch = tn_types::forks::SUBSECOND_TIMESTAMP_FORK_EPOCH,
+            governance_safe_fork_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH,
+            "fork schedule (adiri)"
+        );
+        #[cfg(not(feature = "adiri"))]
+        info!(
+            target: "cli",
+            "fork schedule: seed_signature, multi_workers, prevrandao, \
+             leader_seeded_ordering, and subsecond_timestamp active from genesis"
+        );
+
+        // Both lines above report compiled fork points, which a `test-utils` binary does not have
+        // to obey: the e2e harness spawns nodes with all but the leader-seeded and sub-second
+        // forks pinned dormant (the sub-second gate stays dormant anyway while the seed-signature
+        // pin is dormant), and they log "active from genesis" while executing the legacy
+        // derivations. Name the pins
+        // that are actually in force so the startup log stays diffable there too. Empty and
+        // silent in a production binary, where the overrides are compiled out of `tn-types`
+        // entirely.
+        for (var, fork_epoch) in tn_types::forks::fork_epoch_overrides() {
+            warn!(
+                target: "cli",
+                var,
+                fork_epoch,
+                "fork schedule OVERRIDDEN by the environment; this is a test-utils build"
+            );
+        }
+
         // Raise the fd limit of the process.
         // Does not do anything on windows.
         raise_fd_limit()?;
+
+        // Install the global metrics recorder before any reth components are constructed
+        // (in particular before `RethEnv::new_database`). Reth's derive-style metric
+        // handles bind to whatever recorder is installed at construction time; anything
+        // registered against the default noop recorder is silently lost. Nodes without
+        // `--metrics` keep the zero-overhead noop recorder.
+        if self.metrics.is_some() {
+            tn_metrics::install_recorder()?;
+        }
 
         // limit global rayon thread pool for batch validator
         //
@@ -141,14 +245,37 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } else {
             Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
         };
+        #[cfg(not(feature = "adiri"))]
+        if tn_config.genesis().config.chain_id == 2017 {
+            // If we are trying to start an Adiri node without the adiri feature flag then error
+            // out.
+            return Err(eyre::eyre!(
+                "Must compile with adiri feature flag in order to connect to adiri (testnet)!"
+            ));
+        }
+        #[cfg(feature = "adiri")]
+        if tn_config.genesis().config.chain_id != 2017 {
+            // If we are trying to start an Adiri node without the adiri feature flag then error
+            // out.
+            return Err(eyre::eyre!(
+                "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
+            ));
+        }
+        // Runtime value, not a #[cfg], so the check holds no matter which crate in the
+        // build graph enabled the faucet feature.
+        validate_faucet_build(FAUCET_ENABLED, tn_config.genesis())?;
         debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
+            chain: _, // Used above
+            bootstrap_peers,
             observer: _, // Used above
             metrics,
+            enable_state_export,
+            state_export_keep,
+            enable_repack_monitor,
             instance,
             with_unused_ports,
             reth,
@@ -169,8 +296,250 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder = TnBuilder { node_config, tn_config, metrics, healthcheck, reth_db };
+        let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
+            .with_state_export_keep(state_export_keep)
+            .with_bootstrap_peers(bootstrap_peers);
+        builder.metrics = metrics;
+        builder.healthcheck = healthcheck;
+        builder.enable_state_export = enable_state_export;
+        builder.enable_repack_monitor = enable_repack_monitor;
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
+    }
+}
+
+/// Refuse to run a faucet-compiled binary against canonical Telcoin mainnet.
+///
+/// The `faucet` cargo feature swaps the TEL precompile's `mint` dispatch table (the
+/// instant, role-gated `mint(address,uint256)` replaces the timelocked, governance-only
+/// `mint(uint256)`), so a faucet build joining mainnet computes different state roots
+/// than the rest of the network for the same block: a consensus split, not a local
+/// misconfiguration. No attacker is required; cargo feature unification can enable the
+/// feature transitively without the operator ever typing it.
+///
+/// The check keys on the genesis block hash, the identity peers actually agree on,
+/// rather than either alternative:
+///
+/// - Chain id: the guard the issue literally proposed (refuse `chain_id != 2017` in faucet builds)
+///   would reject both supported faucet flows, the docker devnet scripts at chain id 487
+///   (`etc/genesis.sh`) and the e2e faucet test at the default 911329; keying on mainnet's own 487
+///   instead would still reject the devnet flow, which shares that id.
+/// - Struct equality on [`Genesis`]: the fork-config fields (`config`) sit outside the genesis
+///   header preimage, so a genesis differing from canonical mainnet only in such a field still
+///   computes mainnet's genesis block hash (and could join mainnet consensus) while comparing
+///   unequal.
+///
+/// Only the canonical embedded mainnet genesis is refused; adiri/testnet (2017) is
+/// faucet-intended and separately covered by the `adiri` feature guard at the call
+/// site in [`NodeCommand::execute`].
+pub(crate) fn validate_faucet_build(faucet_enabled: bool, genesis: &Genesis) -> eyre::Result<()> {
+    let joins_mainnet = faucet_enabled
+        .then(|| serde_yaml::from_str::<Genesis>(MAINNET_GENESIS))
+        .transpose()?
+        .is_some_and(|mainnet| genesis_block_hash(genesis.clone()) == genesis_block_hash(mainnet));
+    (!joins_mainnet).then_some(()).ok_or_else(|| {
+        eyre::eyre!("Must NOT compile with faucet feature flag when connecting to Telcoin mainnet!")
+    })
+}
+
+/// The genesis block hash of `genesis`: the hash of the sealed genesis header, covering
+/// the header fields plus the state root computed from `alloc`, built by the same
+/// chain-spec construction the node itself boots with.
+fn genesis_block_hash(genesis: Genesis) -> B256 {
+    RethChainSpec::from(genesis).sealed_genesis_header().hash()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+    use tn_types::adiri_genesis;
+
+    /// Legacy observer commands still parse, but neither help view advertises the ignored flag.
+    #[test]
+    fn deprecated_observer_flag_parses_but_is_hidden() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        let default = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        let legacy = NodeCommand::<NoArgs>::try_parse_from(["node", "--observer"])?;
+        assert!(!default.observer);
+        assert!(legacy.observer);
+        let mut command = NodeCommand::<NoArgs>::command();
+        assert!(!command.render_help().to_string().contains("--observer"));
+        assert!(!command.render_long_help().to_string().contains("--observer"));
+        Ok(())
+    }
+
+    /// The CLI accepts the same multi-worker map as network-config, in YAML or JSON form.
+    #[test]
+    fn bootstrap_peers_cli_parses_yaml_and_json() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        assert!(!peers.is_empty());
+        peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
+        [serde_yaml::to_string(&peers)?, serde_json::to_string(&peers)?].into_iter().try_for_each(
+            |raw| -> eyre::Result<()> {
+                let command = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])?;
+                assert_eq!(command.bootstrap_peers, Some(peers.clone()));
+                Ok(())
+            },
+        )
+    }
+
+    /// An omitted option and an explicit empty override retain distinct precedence semantics.
+    #[test]
+    fn bootstrap_peers_cli_distinguishes_absent_and_empty() -> eyre::Result<()> {
+        let absent = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(absent.bootstrap_peers, None);
+        let empty = NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", "{}"])?;
+        assert_eq!(empty.bootstrap_peers, Some(BTreeMap::new()));
+        Ok(())
+    }
+
+    /// Invalid keys and empty worker lists fail at argument parsing, before node startup.
+    #[test]
+    fn bootstrap_peers_cli_rejects_invalid_entries() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        peers.values_mut().for_each(|server| server.workers.clear());
+        ["{invalid-key: {}}".to_owned(), serde_yaml::to_string(&peers)?].into_iter().for_each(
+            |raw| {
+                let result = NodeCommand::<NoArgs>::try_parse_from([
+                    "node",
+                    "--bootstrap-peers",
+                    raw.as_str(),
+                ])
+                .map(|_| ())
+                .map_err(|error| error.kind());
+                assert_eq!(result, Err(ErrorKind::ValueValidation));
+            },
+        );
+        Ok(())
+    }
+
+    /// Parse `--instance <raw>` through the node command and return the parsed value, or the
+    /// clap error kind that rejected it.
+    fn parse_instance(raw: &str) -> Result<Option<u16>, ErrorKind> {
+        NodeCommand::<NoArgs>::try_parse_from(["node", "--instance", raw])
+            .map(|cmd| cmd.instance)
+            .map_err(|err| err.kind())
+    }
+
+    /// `--instance 0` must fail at parse time. reth's `adjust_instance_ports` computes
+    /// `instance - 1` on `u16`, so 0 panics under overflow checks and wraps in release (instance
+    /// 0 then takes HTTP port 8546, instance 1's WebSocket port). The upper bound is reth's too.
+    #[test]
+    fn instance_rejects_zero_and_above_max_at_parse() {
+        let rejected = ["0", "201"].map(parse_instance);
+        assert_eq!(rejected, [Err(ErrorKind::ValueValidation), Err(ErrorKind::ValueValidation)]);
+    }
+
+    /// Both ends of the documented `1-200` range parse, and an absent flag stays `None`.
+    #[test]
+    fn instance_accepts_documented_bounds() {
+        let accepted = ["1", "200"].map(parse_instance);
+        assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
+        let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
+        assert!(matches!(absent, Ok(None)));
+    }
+
+    /// Retention defaults to unlimited, accepts positive counts, and rejects zero.
+    ///
+    /// A retention setting alone does not enable exports.
+    #[test]
+    fn state_export_keep_parses_optional_nonzero_limit() -> Result<(), clap::Error> {
+        let command = NodeCommand::<NoArgs>::try_parse_from(["node"])?;
+        assert_eq!(command.state_export_keep, None);
+        assert!(!command.enable_state_export);
+
+        let parsed = NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", "0"])
+            .map(|command| command.state_export_keep)
+            .map_err(|error| error.kind());
+        assert_eq!(parsed, Err(ErrorKind::ValueValidation));
+
+        [("1", 1), ("2", 2), ("10", 10)].into_iter().try_for_each(|(raw, expected)| {
+            let command =
+                NodeCommand::<NoArgs>::try_parse_from(["node", "--state-export-keep", raw])?;
+            assert_eq!(command.state_export_keep.map(NonZeroUsize::get), Some(expected));
+            assert!(!command.enable_state_export);
+            Ok::<(), clap::Error>(())
+        })?;
+
+        let enabled = NodeCommand::<NoArgs>::try_parse_from([
+            "node",
+            "--enable-state-export",
+            "--state-export-keep",
+            "2",
+        ])?;
+        assert_eq!(enabled.state_export_keep.map(NonZeroUsize::get), Some(2));
+        assert!(enabled.enable_state_export);
+        Ok(())
+    }
+
+    /// A faucet build configured with the canonical mainnet genesis must refuse to start.
+    #[test]
+    fn faucet_build_rejects_canonical_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert!(validate_faucet_build(true, &mainnet).is_err());
+        Ok(())
+    }
+
+    /// A default (non-faucet) build starts against the canonical mainnet genesis.
+    #[test]
+    fn default_build_accepts_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert!(validate_faucet_build(false, &mainnet).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build on the adiri/testnet genesis is allowed; that chain is
+    /// faucet-intended and separately covered by the `adiri` feature guard.
+    #[test]
+    fn faucet_build_accepts_testnet_genesis() -> eyre::Result<()> {
+        assert!(validate_faucet_build(true, &adiri_genesis()).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build on a devnet genesis that reuses mainnet's chain id 487 (the
+    /// documented docker-devnet flow) must NOT be rejected: the guard keys on genesis
+    /// identity, not chain id.
+    #[test]
+    fn faucet_build_accepts_devnet_genesis_with_mainnet_chain_id() -> eyre::Result<()> {
+        let base: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let devnet = Genesis { timestamp: base.timestamp.wrapping_add(1), ..base };
+        assert_eq!(devnet.config.chain_id, 487);
+        assert!(validate_faucet_build(true, &devnet).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build must be refused on a genesis whose fork config diverges from
+    /// canonical mainnet while header and alloc stay identical: such a genesis computes
+    /// mainnet's exact genesis block hash (the positive control below), so it could
+    /// still join mainnet consensus. Struct equality would wrongly admit it; hash
+    /// identity refuses it.
+    #[test]
+    fn faucet_build_rejects_config_only_divergence_from_mainnet() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let mut divergent = mainnet.clone();
+        divergent.config.dao_fork_support = !divergent.config.dao_fork_support;
+        assert_ne!(divergent, mainnet);
+        assert_eq!(genesis_block_hash(divergent.clone()), genesis_block_hash(mainnet));
+        assert!(validate_faucet_build(true, &divergent).is_err());
+        Ok(())
+    }
+
+    /// The compiled feature set gates the canonical mainnet genesis exactly: refused
+    /// when the binary carries the faucet feature and accepted otherwise. This
+    /// exercises the same `FAUCET_ENABLED` value the [`NodeCommand::execute`] call site
+    /// wires in, under whichever feature set the test build resolved.
+    #[test]
+    fn compiled_feature_set_gates_canonical_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert_eq!(validate_faucet_build(FAUCET_ENABLED, &mainnet).is_err(), FAUCET_ENABLED);
+        Ok(())
     }
 }

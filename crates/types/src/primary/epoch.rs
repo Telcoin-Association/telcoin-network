@@ -7,13 +7,14 @@
 //! execute with known correct consensus outputs.
 
 use crate::{
-    crypto, encode, serde::RoaringBitmapSerde, BlockHash, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, BlsSigner, Epoch, Intent, IntentMessage, IntentScope,
-    ValidatorAggregateSignature as _, B256,
+    crypto, encode, serde::RoaringBitmapSerde, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+    BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope, ProtocolSignature as _,
+    Round, ValidatorAggregateSignature as _,
 };
 use alloy::eips::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::BTreeSet;
 
 /// Record of an Epoch.  Will be created at epoch start for the previous epoch
 /// and signed by that epochs committee members.
@@ -27,22 +28,22 @@ pub struct EpochRecord {
     /// This can be used for trustless syncing.
     pub next_committee: Vec<BlsPublicKey>,
     /// Hash of the previous EpochRecord.
-    pub parent_hash: B256,
+    pub parent_hash: EpochDigest,
     /// The block number and hash of the last execution state of this epoch.
     /// Basically the execution genesis for the next epoch after this one.
     /// Also a signed checkpoint of execution state (with the certificate).
     pub final_state: BlockNumHash,
     /// The hash and consensus block number of the last ['ConsensusHeader'] of this epoch.
     /// Can be used as a signed checkpoint for consensus (with the certificate).
-    pub final_consensus: BlockNumHash,
+    pub final_consensus: ConsensusNumHash,
 }
 
 impl EpochRecord {
     /// Return the digest for this ConsensusHeader.
-    pub fn digest(&self) -> B256 {
+    pub fn digest(&self) -> EpochDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
         hasher.update(&encode(self));
-        BlockHash::from_slice(hasher.finalize().as_bytes())
+        (*hasher.finalize().as_bytes()).into()
     }
 
     /// Use signer to generate an [`EpochVote`] for this EpochRecord.
@@ -91,8 +92,73 @@ impl EpochRecord {
     /// Provide a super quorum, this is 2/3 of committee size plus one.
     /// With this many signers of an epoch record we are safe unless a
     /// super majority of validators are byzantine.
+    ///
+    /// The quorum base is this record's own committee. When that committee is a
+    /// tolerated mid-epoch shrink of the previous record's `next_committee`
+    /// (see [`Self::committee_compatible`]), the margin thins at the floor:
+    /// with `e` expected members shrunk to `n = ceil(2e/3)`, the
+    /// certificate-overlap margin `2 * super_quorum(n) - n` only meets — no
+    /// longer exceeds — the expected committee's fault bound `f = (e - 1) / 3`
+    /// (e.g. e = 10, n = 7: quorum 5, overlap 3 = f). Safety still holds for a
+    /// single step: honest nodes derive the record deterministically (they
+    /// never sign two digests for one epoch), and a shrunken committee must be
+    /// a subset of `expected` with at least `ceil(2e/3)` members, so any
+    /// quorum over it contains more than `f` members of the expected set. This
+    /// argument is per-step only; see the cumulative-shrink caveat on
+    /// [`Self::committee_compatible`].
     pub fn super_quorum(&self) -> usize {
         ((self.committee.len() * 2) / 3) + 1
+    }
+
+    /// Return true if this record's committee is an acceptable committee given
+    /// `expected` (normally the previous epoch record's `next_committee`).
+    ///
+    /// This is the shared predicate used by both the epoch record producer and
+    /// the sync-time verifier so they accept exactly the same shapes. The
+    /// committees will usually be equal, but governance can forcibly eject a
+    /// validator on-chain *after* the previous record sealed its
+    /// `next_committee`, leaving this record's committee a strict subset of
+    /// `expected`.
+    ///
+    /// Rules (`n = self.committee.len()`, `e = expected.len()`):
+    /// - a committee with duplicate members is always invalid (duplicates would mask the real
+    ///   signer count behind the certificate quorum)
+    /// - `n > e`: invalid - a committee can never grow mid-epoch
+    /// - `n == e`: the committees must be equal as sets
+    /// - `n < e`: valid only if the shrunken committee keeps at least 4 members, keeps a BFT-safe
+    ///   super majority of the expected committee (`n * 3 >= e * 2`, an integer-safe `n >=
+    ///   ceil(2e/3)`), and every member was part of `expected`
+    ///
+    /// # Cumulative-shrink caveat
+    ///
+    /// The `n * 3 >= e * 2` bound is applied per record-chain step, against the
+    /// immediately-previous record only. Consecutive tolerated shrinks
+    /// compound: k shrinking epochs can retain as little as `(2/3)^k` of the
+    /// last full-strength committee (10 -> 7 -> 5 -> 4 in three epochs, each
+    /// step individually valid). A compounded committee's `super_quorum` can
+    /// fall to the fault bound of the original committee (`super_quorum(4) ==
+    /// 3 == (10 - 1) / 3`), so the guarantee that a record quorum always
+    /// exceeds the original committee's byzantine bound holds per step but NOT
+    /// cumulatively. This is a deliberate trade-off to keep the record chain
+    /// live under honest governance ejections; a rolling-baseline bound and an
+    /// on-chain committee floor are tracked as follow-up work.
+    pub fn committee_compatible(&self, expected: &BTreeSet<BlsPublicKey>) -> bool {
+        let committee: BTreeSet<BlsPublicKey> = self.committee.iter().copied().collect();
+        if committee.len() != self.committee.len() {
+            // Duplicate keys in a committee are always malformed.
+            return false;
+        }
+        match self.committee.len().cmp(&expected.len()) {
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => &committee == expected,
+            std::cmp::Ordering::Less => {
+                // Make sure we still have a reasonable committee size, i.e. don't
+                // let a bogus record with one signer through, etc.
+                self.committee.len() >= 4
+                    && self.committee.len() * 3 >= expected.len() * 2
+                    && committee.is_subset(expected)
+            }
+        }
     }
 }
 
@@ -107,7 +173,7 @@ pub struct EpochVote {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
-    pub epoch_hash: B256,
+    pub epoch_hash: EpochDigest,
     /// Public key of the committee member that signed this.
     /// This needs to be verified to be a committee member.
     pub public_key: BlsPublicKey,
@@ -136,7 +202,7 @@ pub struct EpochCertificate {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
-    pub epoch_hash: B256,
+    pub epoch_hash: EpochDigest,
     /// Signatures of a quorum of committee member for the epoch.
     pub signature: BlsSignature,
     /// Bitmap defining which committee members signed this certificate.
@@ -154,6 +220,82 @@ impl EpochCertificate {
     }
 }
 
+crate::crypto::digest_newtype! {
+    /// Digest of a [`EpochRecord`].
+    pub struct EpochDigest;
+}
+
+/// The canonical per-`(author, round)` message a proposer signs to feed the epoch seed chain.
+///
+/// The signature over this message is a mandatory field of every [`Header`](crate::Header) a
+/// proposer builds, and the committing leader's signature is folded into the epoch seed chain (see
+/// [`EpochSeedChainValue`](crate::EpochSeedChainValue)) whose value at the epoch's closing commit
+/// seeds the committee shuffle. The message satisfies three properties that make the derived
+/// randomness unforkable:
+///
+/// - **Canonical**: all three fields are pinned per header - the epoch and round are covered by the
+///   header digest and cross-checked by `Header::validate`, and the prior epoch record is
+///   chain-anchored epoch state every node syncs - so every honest node derives byte-identical
+///   message bytes for a given `(authority, epoch, round)`.
+/// - **Not leader-controllable**: the prior epoch record is sealed by the previous committee before
+///   the current epoch starts, and a header's round is fixed by the DAG, so a leader cannot vary
+///   either input to search for a message it prefers.
+/// - **Reachable**: it depends only on the epoch record (never the asynchronously-arriving epoch
+///   record *certificate*), so signing it can never block header proposal.
+///
+/// The message is deliberately **not** fixed for the epoch. Binding the round means an authority's
+/// signature for round `r` first becomes public when it proposes at round `r`, so no observer can
+/// enumerate any authority's *future* contributions from the headers it has already seen.
+///
+/// What round binding does NOT provide is last-actor resistance, and the claim here is deliberately
+/// narrow. The epoch's closing leader can evaluate the seed its own commit would produce before
+/// deciding whether to broadcast: the preceding commit's chain value is public once that commit
+/// lands, and BLS signing is deterministic, so its own contribution for its own round is something
+/// it can compute at will. It can therefore withhold or delay a proposal whose resulting seed it
+/// dislikes, at the cost of forfeiting that commit. That residual last-actor bias is accepted. What
+/// is removed is cheap offline grinding: no participant can enumerate other authorities' future
+/// contributions, and no candidate value can be evaluated at all until the preceding commit is
+/// published (see [`EpochSeedChainValue`](crate::EpochSeedChainValue)).
+#[derive(PartialEq, Eq, Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct EpochSeedMessage {
+    /// The epoch whose committee shuffle this seed feeds.
+    epoch: Epoch,
+    /// The round of the header this signature is stamped on.
+    round: Round,
+    /// Digest of the previous epoch's [`EpochRecord`] ([`EpochDigest::default`] for epoch 0,
+    /// which has no prior record - matching the repo's epoch-0 filler convention).
+    prior_epoch_record: EpochDigest,
+}
+
+impl EpochSeedMessage {
+    /// Create the canonical seed message for `(epoch, round)` anchored to the prior epoch's record
+    /// digest.
+    pub fn new(epoch: Epoch, round: Round, prior_epoch_record: EpochDigest) -> Self {
+        Self { epoch, round, prior_epoch_record }
+    }
+
+    /// The domain-separated intent message this seed commits to.
+    ///
+    /// Kept private so signing and verifying can never diverge on the encoded bytes.
+    fn intent_message(&self) -> IntentMessage<Self> {
+        IntentMessage::new(Intent::consensus(IntentScope::EpochCloseSeed), *self)
+    }
+
+    /// Sign the domain-separated seed message with the proposer's BLS key.
+    ///
+    /// BLS signatures are deterministic, so signing the same message with the same key always
+    /// yields byte-identical output - exactly one valid signature exists per `(key, message)`, and
+    /// therefore per `(authority, epoch, round)`.
+    pub fn sign<S: BlsSigner>(&self, signer: &S) -> BlsSignature {
+        signer.request_signature_direct(&encode(&self.intent_message()))
+    }
+
+    /// Verify `signature` is `author`'s signature over this seed message.
+    pub fn verify(&self, signature: &BlsSignature, author: &BlsPublicKey) -> bool {
+        signature.verify_secure(&self.intent_message(), author)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -161,7 +303,8 @@ mod test {
     use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng as _};
     use roaring::RoaringBitmap;
 
-    use crate::{BlsKeypair, Signer as _};
+    use crate::{crypto, decode, encode, BlsKeypair, ConsensusNumHash, Signer as _};
+    use alloy::primitives::B256;
 
     use super::*;
 
@@ -194,9 +337,9 @@ mod test {
             epoch: 0,
             committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
-            parent_hash: B256::default(),
+            parent_hash: EpochDigest::default(),
             final_state: BlockNumHash::default(),
-            final_consensus: BlockNumHash::default(),
+            final_consensus: ConsensusNumHash::default(),
         };
         let vote1 = record.sign_vote(&com1);
         let vote2 = record.sign_vote(&com2);
@@ -207,7 +350,7 @@ mod test {
         assert!(vote1.check_signature(), "vote1 failed sig check");
         assert!(vote2.check_signature(), "vote2 failed sig check");
         assert!(vote3.check_signature(), "vote3 failed sig check");
-        let sigs = vec![vote1.signature, vote2.signature, vote3.signature];
+        let sigs = [vote1.signature, vote2.signature, vote3.signature];
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -230,5 +373,168 @@ mod test {
                 panic!("failed to aggregate epoch record signatures",);
             }
         }
+    }
+
+    /// Deterministic BLS public key for committee-shape tests.
+    fn test_bls_key(seed: u64) -> BlsPublicKey {
+        let mut rng = StdRng::seed_from_u64(seed);
+        *BlsKeypair::generate(&mut rng).public()
+    }
+
+    /// Build a record with `committee` and check compatibility against `expected`.
+    fn compatible(expected: &[BlsPublicKey], committee: &[BlsPublicKey]) -> bool {
+        let record = EpochRecord { committee: committee.to_vec(), ..Default::default() };
+        let expected: BTreeSet<BlsPublicKey> = expected.iter().copied().collect();
+        record.committee_compatible(&expected)
+    }
+
+    #[test]
+    fn test_committee_compatible_equal_and_reordered() {
+        let keys: Vec<_> = (0..5).map(test_bls_key).collect();
+        // Same set, same order.
+        assert!(compatible(&keys, &keys));
+        // Same set, different order - compatibility is order-insensitive.
+        let rotated = [keys[4], keys[2], keys[0], keys[3], keys[1]];
+        assert!(compatible(&keys, &rotated));
+    }
+
+    #[test]
+    fn test_committee_compatible_one_ejected_from_five() {
+        let keys: Vec<_> = (0..5).map(test_bls_key).collect();
+        // Swap-and-pop ejection of keys[2]: the last member moves into its slot.
+        let ejected = [keys[0], keys[1], keys[4], keys[3]];
+        assert!(compatible(&keys, &ejected));
+        // Same size as the ejected shape but one member substituted with a
+        // non-member: invalid.
+        let substituted = [keys[0], keys[1], test_bls_key(9), keys[3]];
+        assert!(!compatible(&keys, &substituted));
+        // A duplicated member masking the true signer count: invalid.
+        let duplicated = [keys[0], keys[1], keys[1], keys[3]];
+        assert!(!compatible(&keys, &duplicated));
+    }
+
+    #[test]
+    fn test_committee_compatible_floor_and_bound_table() {
+        let keys: Vec<_> = (0..9).map(test_bls_key).collect();
+        // (expected size, record size, compatible?)
+        let table = [
+            (4, 3, false), // below the 4-member floor
+            (5, 4, true),
+            (7, 5, true),
+            (7, 4, false), // 4*3 < 7*2: below ceil(2/3) of expected
+            (8, 6, true),
+            (8, 5, false), // 5*3 < 8*2: below ceil(2/3) of expected
+            (4, 5, false), // a record committee larger than expected is never valid
+        ];
+        for (expected_len, record_len, valid) in table {
+            assert_eq!(
+                compatible(&keys[..expected_len], &keys[..record_len]),
+                valid,
+                "expected len {expected_len}, record len {record_len}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_with_cert_quorum_on_shrunken_committee() {
+        // A 5-member committee that lost one member mid-epoch leaves a 4-member
+        // record: the certificate quorum is 2/3+1 of the *shrunken* committee.
+        let signers: Vec<_> =
+            (0..4).map(|i| TestBlsKeypair::new(&mut StdRng::seed_from_u64(i))).collect();
+        let committee: Vec<_> = signers.iter().map(|s| s.public_key()).collect();
+        let record = EpochRecord { committee, ..Default::default() };
+        assert_eq!(record.super_quorum(), 3);
+
+        let cert = |count: usize| {
+            let sigs: Vec<_> =
+                signers.iter().take(count).map(|s| record.sign_vote(s).signature).collect();
+            let signature = BlsAggregateSignature::aggregate(&sigs[..], true)
+                .expect("aggregate")
+                .to_signature();
+            let mut signed_authorities = RoaringBitmap::new();
+            for i in 0..count as u32 {
+                signed_authorities.push(i);
+            }
+            EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities }
+        };
+
+        // 3 of 4 committee votes: quorum met.
+        assert!(record.verify_with_cert(&cert(3)));
+        // 2 of 4 committee votes: below quorum.
+        assert!(!record.verify_with_cert(&cert(2)));
+    }
+
+    /// Verify that EpochDigest encodes/decodes to the same bytes as a B256/BlockHash.
+    #[test]
+    fn test_epoch_digest_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_epoch_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let edigest: EpochDigest = init_bytes.into();
+        let enc = encode(&edigest);
+        let b256: B256 = decode(&enc);
+        assert_eq!(init_bytes, b256);
+        let enc = encode(&b256);
+        let edigest2: EpochDigest = decode(&enc);
+        assert_eq!(edigest, edigest2);
+    }
+
+    /// Pin: BLS signing of the epoch-close seed message is deterministic (#1032).
+    ///
+    /// The proposer signs one message per header - the whole design rests on the same
+    /// `(key, epoch, round, prior record)` always yielding byte-identical signatures, while any
+    /// change to the epoch or the prior record yields a different signature.
+    #[test]
+    fn test_epoch_seed_signature_deterministic() {
+        let signer = TestBlsKeypair::new(&mut StdRng::seed_from_u64(1032));
+        let message = EpochSeedMessage::new(7, 3, EpochDigest::default());
+
+        let first = message.sign(&signer);
+        let second = message.sign(&signer);
+        assert_eq!(first, second, "same key + message must yield byte-identical signatures");
+        assert_eq!(first.to_bytes(), second.to_bytes(), "signature bytes must match");
+        assert!(message.verify(&first, &signer.public_key()), "signature must verify");
+
+        // A different epoch yields a different signature (and cross-verification fails).
+        let other_epoch = EpochSeedMessage::new(8, 3, EpochDigest::default());
+        let other_epoch_sig = other_epoch.sign(&signer);
+        assert_ne!(first, other_epoch_sig, "different epoch must yield a different signature");
+        assert!(
+            !other_epoch.verify(&first, &signer.public_key()),
+            "epoch-7 signature must not verify for the epoch-8 message"
+        );
+
+        // A different prior epoch record yields a different signature.
+        let record = EpochRecord { epoch: 6, ..Default::default() };
+        let other_record_sig = EpochSeedMessage::new(7, 3, record.digest()).sign(&signer);
+        assert_ne!(
+            first, other_record_sig,
+            "different prior epoch record must yield a different signature"
+        );
+    }
+
+    /// Pin: domain separation of the epoch-close seed intent (#1032).
+    ///
+    /// The seed message's encoded intent starts with scope byte 4 ([`IntentScope::EpochCloseSeed`])
+    /// while votes start with scope byte 2 ([`IntentScope::ConsensusDigest`]), and even the SAME
+    /// value bytes under the two scopes encode to equal-length but different messages - a seed
+    /// signature can never be replayed as a vote or vice versa.
+    #[test]
+    fn test_epoch_seed_domain_separation() {
+        let seed_encoding = encode(&IntentMessage::new(
+            Intent::consensus(IntentScope::EpochCloseSeed),
+            EpochSeedMessage::new(1, 1, EpochDigest::default()),
+        ));
+        assert_eq!(seed_encoding.first(), Some(&4u8), "seed intent must start with scope byte 4");
+
+        let value = EpochDigest::default();
+        let vote_scoped = encode(&crate::to_intent_message(value));
+        assert_eq!(vote_scoped.first(), Some(&2u8), "vote intent must start with scope byte 2");
+
+        // Craft equal-length messages: the identical value under both scopes.
+        let seed_scoped =
+            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochCloseSeed), value));
+        assert_eq!(seed_scoped.len(), vote_scoped.len(), "crafted messages must be equal length");
+        assert_ne!(seed_scoped, vote_scoped, "equal values must still encode differently");
     }
 }

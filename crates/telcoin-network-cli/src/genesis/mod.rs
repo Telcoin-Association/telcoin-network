@@ -106,15 +106,26 @@ pub struct GenesisArgs {
     /// Min delay for a node to produce a new header.
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
+    /// Max time a worker waits before sealing a batch of pending transactions. Paces block
+    /// production under transaction load; it does not seal empty batches, so it does not
+    /// gate idle round advance (the header delays do that).
+    #[arg(long)]
+    pub max_batch_delay_ms: Option<u64>,
+    /// Garbage-collection depth in DAG rounds. Lowering it demotes a lagging CVV to
+    /// `CvvInactive` after fewer rounds of downtime (the follow/state-sync path). Test-only
+    /// knob; when unset, `Parameters::default` uses the `MAX_GC_DEPTH` protocol default.
+    #[arg(long)]
+    pub gc_depth: Option<u32>,
     /// Numeric chain id that will go in the genesis.
-    /// Default is 0x7e1 (2017).
-    #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
+    /// Default is 0xde7e1 (911329).  Used mostly for testing.
+    #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
     pub chain_id: u64,
     /// Per-worker fee config overrides at genesis.
     ///
     /// Format: WORKER_ID:STRATEGY:VALUE (e.g., 0:0:100000000 for worker 0 with EIP-1559 at 100M
     /// gas target, or 1:1:200 for worker 1 with static fee of 200 wei).
-    /// Can be specified multiple times for different workers.
+    /// Can be specified multiple times for different workers. The number of entries must match
+    /// the worker count advertised by every genesis validator.
     ///
     /// See types/src/gas_accumulator.rs for all `WorkerFeeConfig` types.
     #[arg(
@@ -157,6 +168,19 @@ impl GenesisArgs {
     ///
     /// The worker id is validated to match the index position (0, 1, 2, ...).
     fn parse_worker_fee_configs(&self) -> eyre::Result<Vec<(u8, u64)>> {
+        /// Highest strategy id the `WorkerConfigs` contract accepts; mirrors
+        /// `WorkerConfigs.sol`'s `MAX_STRATEGY` (0 = EIP-1559, 1 = static fee).
+        const MAX_STRATEGY: u8 = 1;
+
+        // `WorkerConfigs.sol` reverts `NumWorkersBelowMinimum()` on an empty config set. The
+        // clap default guarantees one entry when the flag is absent, but guard programmatic
+        // construction too so the ceremony fails at parse time, not at the pre-genesis deploy.
+        if self.worker_fee_configs.is_empty() {
+            eyre::bail!(
+                "at least one --worker-fee-config is required: WorkerConfigs deploys with numWorkers >= 1"
+            );
+        }
+
         let mut configs: Vec<(u16, u8, u64)> = self
             .worker_fee_configs
             .iter()
@@ -173,6 +197,13 @@ impl GenesisArgs {
                 let strategy: u8 = parts[1].parse().map_err(|e| {
                     eyre::eyre!("invalid strategy '{}' in --worker-fee-config: {e}", parts[1])
                 })?;
+                // reject strategies the contract's constructor would revert on
+                // (`InvalidStrategy`) so a ceremony typo fails loudly at parse time
+                if strategy > MAX_STRATEGY {
+                    eyre::bail!(
+                        "invalid strategy {strategy} in --worker-fee-config '{s}': accepted strategies are 0 (EIP-1559) and 1 (static fee)"
+                    );
+                }
                 let value: u64 = parts[2].parse().map_err(|e| {
                     eyre::eyre!("invalid value '{}' in --worker-fee-config: {e}", parts[2])
                 })?;
@@ -195,7 +226,7 @@ impl GenesisArgs {
         Ok(configs.into_iter().map(|(_, strategy, value)| (strategy, value)).collect())
     }
 
-    /// Execute command
+    /// Validate the ceremony inputs, then generate the genesis and initial committee files.
     pub fn execute(&self, data_dir: PathBuf) -> eyre::Result<()> {
         info!(target: "genesis::ceremony", "Creating a new chain genesis with initial validators");
 
@@ -204,10 +235,18 @@ impl GenesisArgs {
         let mut network_genesis =
             NetworkGenesis::new_from_path_and_genesis(&data_dir, chain.genesis().clone())?;
 
-        // validate only checks proof of possession for now
-        //
-        // the signatures must match the expected genesis file before consensus registry is added
+        // Verify signatures and the shared worker count before deploying the genesis contracts.
         network_genesis.validate()?;
+        let committee = network_genesis.create_committee()?;
+        let worker_fee_configs = self.parse_worker_fee_configs()?;
+        let num_workers = committee.number_of_workers();
+        if worker_fee_configs.len() != num_workers {
+            eyre::bail!(
+                "genesis validators advertise {num_workers} workers but {} --worker-fee-config \
+                 entries were supplied: provide exactly one fee config per worker",
+                worker_fee_configs.len()
+            );
+        }
 
         // execute data so committee is on-chain and in genesis
         let validators: Vec<_> = network_genesis.validators().values().cloned().collect();
@@ -222,8 +261,6 @@ impl GenesisArgs {
         let mut genesis = network_genesis.genesis().clone();
         set_genesis_defaults(&mut genesis);
         genesis.config.chain_id = self.chain_id;
-
-        let worker_fee_configs = self.parse_worker_fee_configs()?;
 
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
@@ -282,7 +319,13 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
-        parameters.basefee_address = Some(self.basefee_address);
+        if let Some(max_batch_delay_ms) = self.max_batch_delay_ms {
+            parameters.max_batch_delay = Duration::from_millis(max_batch_delay_ms);
+        }
+        if let Some(gc_depth) = self.gc_depth {
+            parameters.gc_depth = gc_depth;
+        }
+        parameters.basefee_address = self.basefee_address;
 
         // write genesis and config to file
         Config::write_to_path(
@@ -291,9 +334,6 @@ impl GenesisArgs {
             ConfigFmt::YAML,
         )?;
         Config::write_to_path(data_dir.node_config_parameters_path(), parameters, ConfigFmt::YAML)?;
-
-        // generate initial committee for genesis
-        let committee = network_genesis.create_committee()?;
 
         // write to file
         Config::write_to_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
@@ -305,7 +345,119 @@ impl GenesisArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tn_types::{Address, U256};
+    use clap::Parser as _;
+    use tn_config::NodeInfo;
+    use tn_types::{
+        generate_proof_of_possession_bls_for_test, test_utils::CommandParser, Address, BlsKeypair,
+        Committee, Multiaddr, NetworkKeypair, NodeP2pInfo, U256,
+    };
+
+    /// Prepare signed validator inputs and parse the real genesis CLI defaults and fee flags.
+    fn worker_count_ceremony(
+        num_workers: usize,
+        configs: &[&str],
+    ) -> eyre::Result<(tempfile::TempDir, GenesisArgs)> {
+        let directory = tempfile::tempdir()?;
+        let validators = directory.path().join("genesis/validators");
+        std::fs::create_dir_all(&validators)?;
+        (1_u8..=4).try_for_each(|index| -> eyre::Result<()> {
+            let keypair = BlsKeypair::generate(&mut StdRng::from_seed([index; 32]));
+            let address = Address::from([index; 20]);
+            let primary =
+                (NetworkKeypair::generate_ed25519().public().clone().into(), Multiaddr::empty())
+                    .into();
+            let workers = (0..num_workers)
+                .map(|_| {
+                    (NetworkKeypair::generate_ed25519().public().clone().into(), Multiaddr::empty())
+                        .into()
+                })
+                .collect();
+            let validator = NodeInfo {
+                name: format!("validator-{index}"),
+                bls_public_key: *keypair.public(),
+                p2p_info: NodeP2pInfo::new(primary, workers),
+                execution_address: address,
+                proof_of_possession: generate_proof_of_possession_bls_for_test(&keypair, &address)?,
+            };
+            Config::write_to_path(
+                validators.join(format!("validator-{index}.yaml")),
+                validator,
+                ConfigFmt::YAML,
+            )
+        })?;
+        let args = CommandParser::<GenesisArgs>::try_parse_from(
+            std::iter::once("tn")
+                .chain(configs.iter().flat_map(|config| ["--worker-fee-config", *config])),
+        )?
+        .args;
+        Ok((directory, args))
+    }
+
+    /// A mismatched ceremony must name both counts and leave all output files absent.
+    fn assert_worker_fee_count_mismatch(num_workers: usize, configs: &[&str]) -> eyre::Result<()> {
+        let (directory, args) = worker_count_ceremony(num_workers, configs)?;
+        let data_dir = directory.path().to_path_buf();
+        let error = args.execute(data_dir.clone()).err().ok_or_else(|| {
+            eyre::eyre!("genesis must reject a fee count different from its committee worker count")
+        })?;
+        let fee_count = configs.len().max(1);
+        assert!(
+            error.to_string().contains(&format!(
+                "genesis validators advertise {num_workers} workers but {fee_count} --worker-fee-config entries were supplied"
+            )),
+            "unexpected ceremony error: {error}"
+        );
+        assert!(
+            [
+                data_dir.genesis_file_path(),
+                data_dir.committee_path(),
+                data_dir.node_config_parameters_path(),
+            ]
+            .iter()
+            .all(|path| !path.exists()),
+            "rejected ceremony must not write genesis, committee or parameters"
+        );
+        Ok(())
+    }
+
+    /// Extra fee entries cannot silently widen the on-chain count beyond the committee.
+    #[test]
+    fn test_genesis_rejects_excess_worker_fee_configs() -> eyre::Result<()> {
+        assert_worker_fee_count_mismatch(1, &["0:0:30000000", "1:1:500"])
+    }
+
+    /// Omitting fee flags keeps clap's single entry, which cannot configure two workers.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn test_genesis_rejects_missing_worker_fee_configs() -> eyre::Result<()> {
+        assert!(
+            tn_types::forks::multi_workers_fork_active(0),
+            "this lane requires the multi-workers fork at genesis"
+        );
+        assert_worker_fee_count_mismatch(2, &[])
+    }
+
+    /// Matching fee and validator counts retain the configured committee and write all outputs.
+    #[test]
+    fn test_genesis_accepts_matching_worker_fee_configs() -> eyre::Result<()> {
+        let cases: &[(usize, &[&str])] = &[(1, &[]), (2, &["0:0:30000000", "1:1:500"])];
+        cases
+            .iter()
+            .filter(|(num_workers, _)| {
+                *num_workers == 1 || tn_types::forks::multi_workers_fork_active(0)
+            })
+            .try_for_each(|(num_workers, configs)| -> eyre::Result<()> {
+                let (directory, args) = worker_count_ceremony(*num_workers, configs)?;
+                let data_dir = directory.path().to_path_buf();
+                args.execute(data_dir.clone())?;
+                let committee: Committee =
+                    Config::load_from_path(data_dir.committee_path(), ConfigFmt::YAML)?;
+                assert_eq!(committee.number_of_workers(), *num_workers);
+                assert!(data_dir.genesis_file_path().is_file());
+                assert!(data_dir.node_config_parameters_path().is_file());
+                Ok(())
+            })
+    }
 
     fn args_with_configs(configs: Vec<&str>) -> GenesisArgs {
         GenesisArgs {
@@ -318,6 +470,8 @@ mod tests {
             dev_funded_account: None,
             max_header_delay_ms: None,
             min_header_delay_ms: None,
+            max_batch_delay_ms: None,
+            gc_depth: None,
             chain_id: 2017,
             worker_fee_configs: configs.into_iter().map(String::from).collect(),
             accounts: None,
@@ -364,5 +518,161 @@ mod tests {
         let args = args_with_configs(vec!["bad"]);
         let result = args.parse_worker_fee_configs();
         assert!(result.is_err());
+    }
+
+    /// Regression: strategies above `WorkerConfigs.sol`'s `MAX_STRATEGY` (= 1) must fail at
+    /// parse time with a message naming the offending entry, instead of reverting the
+    /// pre-genesis constructor.
+    #[test]
+    fn test_parse_worker_fee_configs_rejects_strategy_above_max() {
+        let args = args_with_configs(vec!["0:0:30000000", "1:2:500"]);
+        let err = args.parse_worker_fee_configs().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid strategy 2 in --worker-fee-config '1:2:500'"),
+            "error must name the offending entry, got: {msg}"
+        );
+        assert!(
+            msg.contains("accepted strategies are 0 (EIP-1559) and 1 (static fee)"),
+            "error must state the accepted range, got: {msg}"
+        );
+    }
+
+    /// The exact `default_value` clap injects when `--worker-fee-config` is absent must keep
+    /// parsing (flag absent means one worker with the EIP-1559 strategy).
+    #[test]
+    fn test_parse_worker_fee_configs_clap_default() {
+        let args = args_with_configs(vec!["0:0:18446744073709551615"]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, u64::MAX)]);
+    }
+
+    /// Regression: an empty config list (only reachable programmatically — clap's default
+    /// guarantees one entry) must fail at parse time; the contract constructor would revert
+    /// `NumWorkersBelowMinimum`.
+    #[test]
+    fn test_parse_worker_fee_configs_empty_errors() {
+        let args = args_with_configs(vec![]);
+        let err = args.parse_worker_fee_configs().unwrap_err();
+        assert!(
+            err.to_string().contains("at least one --worker-fee-config is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The committed mainnet placeholder owner: `--consensus-registry-owner` AND the
+    /// dev-funded account of the committed `chain-configs/mainnet/genesis.yaml` (see
+    /// `etc/genesis.sh`); restated here so regeneration reproduces the same identity.
+    const MAINNET_PLACEHOLDER_OWNER: &str = "0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a";
+
+    /// Regenerate the committed `chain-configs/mainnet/{genesis,committee,parameters}.yaml`
+    /// placeholders from the CURRENT tn-contracts artifacts (issue #1063).
+    ///
+    /// WHEN to run: after a tn-contracts submodule/artifact bump, or whenever the tn-config
+    /// mainnet gates fail (`mainnet_genesis_registry_code_matches_current_artifact` /
+    /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config`, or
+    /// `test_mainnet_genesis_registry_serves_post_fork_reads` in `crates/tn-reth`).
+    ///
+    /// HOW to run: `cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs --
+    /// --ignored` then commit the three rewritten yaml files.
+    ///
+    /// This is the full genesis ceremony (`GenesisArgs::execute`) driven in-process the same
+    /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): mint 4 placeholder
+    /// validators via the in-process keytool, then run the ceremony with flags mirroring the
+    /// committed placeholder identity:
+    /// - chain id 0x1e7 (487), unchanged from the committed genesis;
+    /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
+    /// - basefee address 0x99..99, preserving the committed parameters.yaml;
+    /// - epoch duration 86400s, decoded from the committed registry `StakeConfig` storage (stake
+    ///   amount / min withdrawal / epoch issuance stay on the clap defaults, which also match the
+    ///   committed storage: 1M TEL / 1k TEL / 25,806 TEL);
+    /// - 1s max/min header delays, preserving the committed parameters.yaml.
+    ///
+    /// The validator BLS/network keys are freshly minted placeholders by design: the
+    /// committed placeholder identities' proof-of-possession signatures cannot be
+    /// reproduced (the keytool mints random keys), and `chain-configs/README.md` documents
+    /// these files as placeholders until the real mainnet ceremony.
+    ///
+    /// All three ceremony outputs are read into memory BEFORE any file under
+    /// `chain-configs/mainnet` is written, so a missing/unreadable output aborts without
+    /// leaving a half-regenerated (2-of-3) config set behind.
+    #[test]
+    #[ignore = "regenerates chain-configs/mainnet in the working tree from the current tn-contracts artifacts; run explicitly after an artifact bump or when the mainnet config gates fail"]
+    fn regenerate_mainnet_chain_configs() {
+        use crate::keytool::KeyArgs;
+
+        let tmp = tempfile::tempdir().expect("tempdir for the mainnet regeneration ceremony");
+        let shared = tmp.path().join("mainnet-genesis");
+        let validators_dir = shared.join("genesis").join("validators");
+        std::fs::create_dir_all(&validators_dir).expect("create genesis validators dir");
+
+        // placeholder validators mirror the committed placeholder execution addresses
+        let placeholders = [
+            ("validator-1", "0x1111111111111111111111111111111111111111"),
+            ("validator-2", "0x2222222222222222222222222222222222222222"),
+            ("validator-3", "0x3333333333333333333333333333333333333333"),
+            ("validator-4", "0x4444444444444444444444444444444444444444"),
+        ];
+        placeholders.iter().for_each(|(name, address)| {
+            let datadir = tmp.path().join(name);
+            let keytool = CommandParser::<KeyArgs>::parse_from([
+                "tn",
+                "generate",
+                "validator",
+                "--address",
+                address,
+            ]);
+            keytool.args.execute(datadir.clone(), None).expect("keytool generate validator");
+            std::fs::copy(
+                datadir.join("node-info.yaml"),
+                validators_dir.join(format!("{name}.yaml")),
+            )
+            .expect("copy node-info.yaml into the shared genesis dir");
+        });
+
+        let ceremony = CommandParser::<GenesisArgs>::parse_from([
+            "tn",
+            "--chain-id",
+            "0x1e7",
+            "--consensus-registry-owner",
+            MAINNET_PLACEHOLDER_OWNER,
+            "--dev-funded-account",
+            MAINNET_PLACEHOLDER_OWNER,
+            "--basefee-address",
+            "0x9999999999999999999999999999999999999999",
+            "--epoch-duration-in-secs",
+            "86400",
+            "--max-header-delay-ms",
+            "1000",
+            "--min-header-delay-ms",
+            "1000",
+        ]);
+        ceremony.args.execute(shared.clone()).expect("mainnet genesis ceremony");
+
+        // splice the ceremony output over the committed placeholders: read ALL three
+        // outputs first (any read failure aborts before chain-configs is touched), then
+        // write, so a partial ceremony can never leave a half-regenerated config set
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("chain-configs")
+            .join("mainnet");
+        let outputs = [
+            (shared.join("genesis").join("genesis.yaml"), target.join("genesis.yaml")),
+            (shared.join("genesis").join("committee.yaml"), target.join("committee.yaml")),
+            (shared.join("parameters.yaml"), target.join("parameters.yaml")),
+        ];
+        let contents: Vec<(std::path::PathBuf, Vec<u8>)> = outputs
+            .into_iter()
+            .map(|(source, destination)| {
+                let bytes = std::fs::read(&source)
+                    .unwrap_or_else(|e| panic!("read ceremony output {}: {e}", source.display()));
+                (destination, bytes)
+            })
+            .collect();
+        contents.iter().for_each(|(destination, bytes)| {
+            std::fs::write(destination, bytes)
+                .unwrap_or_else(|e| panic!("write regenerated {}: {e}", destination.display()))
+        });
     }
 }

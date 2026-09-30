@@ -1,23 +1,34 @@
 //! Codec for encoding/decoding consensus network messages.
 
 use crate::PeerExchangeMap;
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response::Codec, StreamProtocol};
 use serde::{de::DeserializeOwned, Serialize};
 use snap::read::FrameDecoder;
 use std::{
     fmt,
+    future::Future,
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
 use tn_types::encode_into_buffer;
+
+/// Maximum number of bytes pulled from the wire in a single read while streaming in the compressed
+/// body.
+///
+/// Reading the body in bounded increments keeps committed memory proportional to the bytes that
+/// have actually arrived rather than to the attacker-declared length prefix.
+const BODY_READ_CHUNK_SIZE: usize = 8 * 1024;
 
 /// Decode a single length-prefixed, snappy-compressed BCS message from an async reader.
 ///
 /// Wire format: `[4-byte uncompressed_len][4-byte compressed_len][compressed_data]`
 ///
 /// The caller provides reusable buffers to avoid repeated allocation.
+///
+/// The length prefixes are only used to bound the read; the buffers grow with the bytes that
+/// actually arrive, so a peer that declares a large body and then withholds it cannot force a large
+/// up-front allocation.
 pub async fn decode_message<T, M>(
     io: &mut T,
     decode_buffer: &mut Vec<u8>,
@@ -55,17 +66,39 @@ where
         ));
     }
 
-    // resize buffers to reported sizes
-    decode_buffer.resize(uncompressed_len, 0);
-    compressed_buffer.resize(compressed_len, 0);
+    // Stream the compressed body in bounded chunks so committed memory tracks the bytes that
+    // actually arrive rather than the attacker-declared `compressed_len`. A peer that declares a
+    // large body but withholds it stalls here holding only what it has sent, until the request
+    // timeout reaps the stream, instead of forcing a large zero-filled allocation up front.
+    let mut remaining = compressed_len;
+    let mut chunk = [0u8; BODY_READ_CHUNK_SIZE];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        let read = io.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "compressed body shorter than reported compressed size",
+            ));
+        }
+        compressed_buffer.extend_from_slice(&chunk[..read]);
+        remaining -= read;
+    }
 
-    // read compressed data
-    io.read_exact(compressed_buffer).await?;
-
-    // decompress
+    // Decompress, bounding the output to the validated `uncompressed_len` so a malformed snappy
+    // stream cannot expand past `max_message_size`, and growing `decode_buffer` only as bytes are
+    // produced rather than committing it up front.
+    let decode_limit = u64::try_from(uncompressed_len).map_err(std::io::Error::other)?;
     let reader = std::io::Cursor::new(&*compressed_buffer);
-    let mut decoder = FrameDecoder::new(reader);
-    decoder.read_exact(decode_buffer)?;
+    let mut decoder = FrameDecoder::new(reader).take(decode_limit);
+    decoder.read_to_end(decode_buffer)?;
+
+    // the decompressed output must match the reported uncompressed length
+    if decode_buffer.len() != uncompressed_len {
+        return Err(std::io::Error::other(
+            "decompressed size does not match reported uncompressed size",
+        ));
+    }
 
     // deserialize
     bcs::from_bytes(decode_buffer).map_err(std::io::Error::other)
@@ -133,6 +166,21 @@ pub trait TNMessage:
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
 }
 
+/// The codec for the dedicated peer-exchange goodbye protocol.
+///
+/// Both directions carry a bare [`PeerExchangeMap`]: the request is the disconnecting
+/// node's exchange map and the response is an ack (empty today, though the symmetric
+/// shape leaves room for a reciprocal exchange). Reuses the hardened length-prefixed
+/// snappy codec, so the goodbye path keeps the same bounded-read guarantees as the
+/// consensus RPCs.
+pub(crate) type PeerExchangeCodec = TNCodec<PeerExchangeMap, PeerExchangeMap>;
+
+impl TNMessage for PeerExchangeMap {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        Some(self.clone())
+    }
+}
+
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
@@ -170,7 +218,6 @@ impl<Req, Res> TNCodec<Req, Res> {
     }
 }
 
-#[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where
     Req: TNMessage,
@@ -180,11 +227,11 @@ where
     type Request = Req;
     type Response = Res;
 
-    async fn read_request<T>(
+    fn read_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
-    ) -> std::io::Result<Self::Request>
+    ) -> impl Future<Output = std::io::Result<Self::Request>> + Send
     where
         T: AsyncRead + Unpin + Send,
     {
@@ -194,7 +241,6 @@ where
             &mut self.compressed_buffer,
             self.max_chunk_size,
         )
-        .await
     }
 
     async fn read_response<T>(

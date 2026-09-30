@@ -13,9 +13,11 @@ authors = [
 
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
+comfy-table = "7.2.2"
 eyre = { workspace = true }
 const-str = { workspace = true }
 fdlimit = { workspace = true }
+human_bytes = "0.4.3"
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand",
@@ -45,23 +47,38 @@ tracing-opentelemetry = { workspace = true }
 
 alloy = { workspace = true }
 tn-types = { workspace = true }
+tn-metrics = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
+tn-storage = { workspace = true }
 rayon = { workspace = true }
+rpassword = { workspace = true }
 dirs-next = { workspace = true }
 bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-config = { workspace = true, features = ["test-utils"]}
 tempfile = { workspace = true }
+rand = { workspace = true }
+roaring = { workspace = true }
 
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [lints]
 workspace = true
+
+[features]
+# Enables the insecure key-generation twins (weak PBKDF2 rounds) for tests.
+# Purely additive: it must never change how the secure paths behave.
+test-utils = ["tn-config/test-utils"]
+# Adiri testnet: propagate to the node graph + this crate's directly-gated fork logic.
+adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
+# Opt back in to reth's RocksDB storage backend: propagate to the node graph.
+rocksdb = ["tn-node/rocksdb", "tn-reth/rocksdb"]

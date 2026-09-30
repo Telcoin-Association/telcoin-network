@@ -17,11 +17,18 @@ use tn_types::{
     Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, enabled, error, info, instrument};
+use tracing::{debug, enabled, error, info, instrument, warn};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
 mod certifier_tests;
+
+/// The vote-request attempt from which the retry delay in [`Certifier::request_vote`] stays at
+/// its 10 s ceiling.
+///
+/// A request still failing at this attempt has used up the fast retries and is logged once at
+/// warn; the requests after it keep retrying at the ceiling until the proposal is superseded.
+const VOTE_RETRY_CEILING_ATTEMPT: u32 = 7;
 
 /// This component is responisble for proposing headers to peers, collecting votes on headers,
 /// and certifying headers into certificates.
@@ -52,6 +59,8 @@ pub(crate) struct Certifier<DB> {
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// Prometheus metrics for vote collection and certificate formation.
+    metrics: crate::PrimaryMetrics,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -72,6 +81,7 @@ impl<DB: Database> Certifier<DB> {
 
         // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
+        let metrics = consensus_bus.app().metrics().clone();
         // Subscribe before spawning so the channel is active before any messages are sent.
         let rx_headers = consensus_bus.subscribe_headers();
         task_manager.spawn_critical_task("certifier task", async move {
@@ -106,6 +116,7 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                metrics,
             }
             .run(rx_headers)
             .await;
@@ -184,8 +195,27 @@ impl<DB: Database> Certifier<DB> {
                                 return Err(DagError::NetworkError(format!(
                                     "irrecoverable error requesting vote for {header}: {error}"
                                 )));
-                            } else {
-                                error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+                            }
+                            // retries are unbounded until the proposal is superseded, so a peer
+                            // that keeps failing must not produce a line per attempt
+                            if attempt == VOTE_RETRY_CEILING_ATTEMPT {
+                                warn!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    ?error,
+                                    header = %header.digest(),
+                                    attempt,
+                                    "vote request still failing after the fast retries; retrying every 10s until the proposal is superseded"
+                                );
+                            } else if attempt.is_power_of_two() {
+                                debug!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    ?error,
+                                    header = %header.digest(),
+                                    attempt,
+                                    "retryable error requesting vote"
+                                );
                             }
 
                             missing_parents = None;
@@ -209,6 +239,7 @@ impl<DB: Database> Certifier<DB> {
                 4 => 1_000,
                 5 => 2_000,
                 6 => 5_000,
+                // from VOTE_RETRY_CEILING_ATTEMPT on
                 _ => 10_000,
             }))
             .await;
@@ -251,6 +282,7 @@ impl<DB: Database> Certifier<DB> {
     #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
     async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
+        let proposal_start = std::time::Instant::now();
 
         // only propose headers in current epoch
         if header.epoch() != self.committee.epoch() {
@@ -325,6 +357,7 @@ impl<DB: Database> Certifier<DB> {
                         // happy path
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
+                            self.metrics.votes_received_total.increment(1);
                             // prevent invalid votes from derailing certification process
                             certificate = match votes_aggregator.append(
                                 vote,
@@ -334,6 +367,7 @@ impl<DB: Database> Certifier<DB> {
                                 Ok(cert) => cert,
                                 Err(e) => {
                                     error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
+                                    self.metrics.invalid_votes_total.increment(1);
                                     None
                                 }
                             }
@@ -346,6 +380,7 @@ impl<DB: Database> Certifier<DB> {
                                 auth=?self.authority_id,
                                 "failed to get vote for header {header:?}: {e:?}"
                             );
+                            self.metrics.vote_request_failures_total.increment(1);
                         }
 
                         // all sending channels have dropped
@@ -387,6 +422,9 @@ impl<DB: Database> Certifier<DB> {
         })?;
 
         debug!(target: "primary::certifier", auth=?self.authority_id, "Assembled {certificate:?}");
+
+        self.metrics.certificates_formed_total.increment(1);
+        self.metrics.certificate_form_duration_seconds.record(proposal_start.elapsed());
 
         Ok(certificate)
     }
@@ -433,6 +471,49 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
                             return Err(TaskError::from_message(e.to_string()));
                         }
+
+                        // Release the proposal lock now that the guard record is written.
+                        //
+                        // The lock exists to make the already-certified check at the top of this
+                        // method atomic with the insert above, and that pair is now complete: the
+                        // insert updates the in-memory layer synchronously, so any later proposal
+                        // reaching that check already observes this certificate. Nothing below
+                        // needs the exclusion.
+                        //
+                        // Holding it across the barrier would be actively harmful, because
+                        // `persist` is a *whole-DB* barrier - the table parameter is unused
+                        // and only selects which of the three DBs to target - so it defers while
+                        // any write txn on the epoch DB is open and drains only at refcount zero,
+                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
+                        // of milliseconds during which every other proposal would queue behind this
+                        // lock. Do not widen this critical section back out.
+                        drop(_guard);
+
+                        // Wait for the `ProposedCertificates` record to be durable before
+                        // externalizing. The epoch DB persists asynchronously, so the insert above
+                        // returns before the record hits disk; `process_own_certificate` below already
+                        // externalizes (it forwards the certificate on the parents bus and triggers
+                        // fetching), and the gossip publish follows. A crash in that window loses the
+                        // record, so on restart the guard at the top of this method misses and the
+                        // certifier re-proposes the same header, re-collecting votes over an unordered
+                        // channel, which can aggregate a different 2f+1 subset into a distinct aggregate
+                        // signature and thereby perturb the leader-signature randomness. See #934, #963.
+                        // If the barrier reports a failed commit (disk full, `EIO`, checksum), the
+                        // record is not on disk, so the internal processing and gossip publish below
+                        // would externalize a certificate whose guard record can be lost on restart -
+                        // exactly the re-proposal and leader-signature perturbation this barrier
+                        // exists to prevent. Refuse and fail the task (mirroring the insert failure
+                        // handled above) rather than externalize a non-durable certificate
+                        // (issue #975).
+                        self.config
+                            .node_storage()
+                            .persist::<ProposedCertificates>()
+                            .await
+                            .map_err(|e| {
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");
+                                TaskError::from_message(e.to_string())
+                            })?;
+
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");

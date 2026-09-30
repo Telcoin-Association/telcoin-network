@@ -32,7 +32,7 @@ impl<DB: Database> Primary<DB> {
         consensus_bus: &ConsensusBus,
         primary_network: PrimaryNetworkHandle,
         state_sync: StateSynchronizer<DB>,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         // Write the parameters to the logs.
         config.parameters().tracing();
 
@@ -42,14 +42,18 @@ impl<DB: Database> Primary<DB> {
             config.authority().as_ref().map(|a| a.protocol_key().encode_base58()),
         );
 
-        let worker_receiver_handler =
-            WorkerReceiverHandler::new(consensus_bus.clone(), config.node_storage().clone());
+        // Register as the worker-to-primary handler on every worker's local network, each
+        // handler bound to that instance's worker id so the seam establishes the reporting
+        // worker's identity instead of trusting the message's self-stamped id.
+        config.local_networks().try_for_each(|(worker_id, local_network)| {
+            local_network.set_worker_to_primary_local_handler(Arc::new(WorkerReceiverHandler::new(
+                worker_id,
+                consensus_bus.clone(),
+                config.node_storage().clone(),
+            )))
+        })?;
 
-        config
-            .local_network()
-            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
-
-        Self { primary_network, state_sync }
+        Ok(Self { primary_network, state_sync })
     }
 
     /// Spawns the primary.
@@ -60,10 +64,26 @@ impl<DB: Database> Primary<DB> {
         leader_schedule: LeaderSchedule,
         task_manager: &TaskManager,
     ) {
-        // Probably don't need this for a non-committee member but it keeps channels drained and is
-        // not a problem.
-        self.state_sync.spawn(task_manager);
-
+        // Every `spawn` below subscribes to its channels synchronously and only then starts its
+        // task, so the order of these calls decides which channels are live before the first
+        // message is sent. `QueChannel::send` silently DROPS when nothing is subscribed (it returns
+        // `Ok(())` without enqueuing), so a sender that starts before its consumer subscribes loses
+        // messages with no error anywhere. Two such dependencies exist here:
+        //
+        //   - `StateSynchronizer` replays the last two rounds of certificates onto the `parents`
+        //     channel from `recover_state`, and the `Proposer` is the only subscriber.
+        //   - `StateSynchronizer` also drives the `certificate_fetcher` channel, whose only
+        //     subscriber is the `CertificateFetcher`.
+        //
+        // So `state_sync` is spawned LAST, after every consumer it feeds is already subscribed.
+        // Previously it was spawned first, which raced both subscriptions: a restarted proposer
+        // could lose its recovery parents outright and be left with nothing to advance on.
+        //
+        // Spawning the consumers first is safe in the other direction because none of them can
+        // send to a not-yet-subscribed channel before `state_sync` is up: the certifier blocks on
+        // `rx_headers` until the proposer proposes, and the proposer's first header cannot be sent
+        // until the certifier has subscribed, because `Certifier::spawn` runs before the proposer
+        // task can reach its first send.
         Certifier::spawn(
             config.clone(),
             consensus_bus.clone(),
@@ -96,6 +116,12 @@ impl<DB: Database> Primary<DB> {
 
             proposer.spawn(task_manager);
         }
+
+        // Probably don't need this for a non-committee member but it keeps channels drained and is
+        // not a problem.
+        //
+        // Spawned last: see the ordering note above.
+        self.state_sync.spawn(task_manager);
 
         // NOTE: This log entry is used to compute performance.
         info!(

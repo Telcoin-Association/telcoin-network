@@ -9,7 +9,7 @@ use tn_primary::{
 };
 use tn_storage::{certificate_pack::CertificatePack, consensus::ConsensusChain};
 use tn_types::{
-    Committee, Database as ConsensusDatabase, Notifier, TaskManager,
+    Committee, Database as ConsensusDatabase, ShutdownNotifier, TaskManager,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::RwLock;
@@ -74,15 +74,15 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &self,
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
-        mut consensus_chain: ConsensusChain,
+        consensus_chain: ConsensusChain,
         certificate_pack: Option<CertificatePack>,
     ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
-            &mut consensus_chain,
+            &consensus_chain,
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
         )
-        .await;
+        .await?;
 
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
@@ -96,10 +96,10 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             consensus_bus,
             ordering_engine,
             task_manager,
-            consensus_chain.clone(),
+            &consensus_chain,
             certificate_pack,
         )
-        .await;
+        .await?;
 
         Ok(leader_schedule)
     }
@@ -116,12 +116,12 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         consensus_bus: ConsensusBus,
         network: PrimaryNetworkHandle,
         state_sync: StateSynchronizer<CDB>,
-    ) -> PrimaryNode<CDB> {
-        let primary = Primary::new(consensus_config.clone(), &consensus_bus, network, state_sync);
+    ) -> eyre::Result<PrimaryNode<CDB>> {
+        let primary = Primary::new(consensus_config.clone(), &consensus_bus, network, state_sync)?;
 
         let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };
 
-        Self { internal: Arc::new(RwLock::new(inner)) }
+        Ok(Self { internal: Arc::new(RwLock::new(inner)) })
     }
 
     pub async fn start(
@@ -152,8 +152,8 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         self.internal.read().await.primary.state_sync()
     }
 
-    /// Return the [Noticer] shutdown for consensus.
-    pub async fn shutdown_signal(&self) -> Notifier {
+    /// Return the [ShutdownNotifier] shutdown for consensus.
+    pub async fn shutdown_signal(&self) -> ShutdownNotifier {
         self.internal.read().await.consensus_config.shutdown().clone()
     }
 

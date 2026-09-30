@@ -12,17 +12,20 @@
 
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
 use tn_config::Config;
+use tn_exex::ExExInstallFn;
 use tn_reth::{
-    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
-    WorkerTxPool,
+    error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
+    RethDb, RethEnv, WorkerTxPool,
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
+    repack_monitor::RepackMonitor,
+    BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -34,7 +37,6 @@ pub use tn_reth::worker::*;
 ///
 /// Used to build the node until upstream reth supports
 /// broader node customization.
-#[derive(Clone, Debug)]
 pub struct TnBuilder {
     /// The node configuration.
     pub node_config: RethConfig,
@@ -52,8 +54,130 @@ pub struct TnBuilder {
     /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
     /// var.
     pub healthcheck: Option<u16>,
+    /// Export each epoch's final execution state to a snapshot pack when set.
+    pub enable_state_export: bool,
+    /// Maximum completed export bundles to retain, or unlimited when absent.
+    ///
+    /// Only applied when `enable_state_export` is set.
+    state_export_keep: Option<NonZeroUsize>,
+    /// Watch executed batches for cross-producer transaction re-packing (issue #1259) when set.
+    ///
+    /// Default off: a node that does not opt in builds no window and hashes nothing.
+    pub enable_repack_monitor: bool,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
+    /// Registered ExEx install functions.
+    ///
+    /// Each entry is a `(name, notification_channel_capacity, install_fn)` tuple.
+    /// These are consumed during node startup to spawn ExEx tasks on the
+    /// node-level task manager, each with its own bounded notification channel of
+    /// the given capacity.
+    pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
+    /// Optional process-local bootstrap dial hints, taking precedence over the network config.
+    /// An explicitly empty map selects the genesis fallback.
+    bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+}
+
+impl TnBuilder {
+    /// Create a builder with the required execution configuration and database.
+    ///
+    /// Metrics, health checks, state exports, and the repack monitor are disabled. Export
+    /// retention is unlimited, and no execution extensions are registered.
+    /// No bootstrap override is configured.
+    pub fn new(node_config: RethConfig, tn_config: Config, reth_db: RethDb) -> Self {
+        Self {
+            node_config,
+            tn_config,
+            metrics: None,
+            healthcheck: None,
+            enable_state_export: false,
+            state_export_keep: None,
+            enable_repack_monitor: false,
+            reth_db,
+            exex_fns: Vec::new(),
+            bootstrap_peers: None,
+        }
+    }
+
+    /// Set the maximum completed export bundles to retain, or leave retention unlimited.
+    ///
+    /// This limit is only applied when `enable_state_export` is set.
+    pub fn with_state_export_keep(mut self, keep: Option<NonZeroUsize>) -> Self {
+        self.state_export_keep = keep;
+        self
+    }
+
+    /// Return the maximum completed export bundles to retain, or `None` for unlimited.
+    ///
+    /// This limit is only applied when `enable_state_export` is set.
+    pub fn state_export_keep(&self) -> Option<NonZeroUsize> {
+        self.state_export_keep
+    }
+
+    /// Set the process-local bootstrap override without persisting it to disk.
+    pub fn with_bootstrap_peers(
+        mut self,
+        peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> Self {
+        self.bootstrap_peers = peers;
+        self
+    }
+
+    /// Return the process-local bootstrap override, if supplied.
+    pub fn bootstrap_peers(&self) -> Option<&BTreeMap<BlsPublicKey, BootstrapServer>> {
+        self.bootstrap_peers.as_ref()
+    }
+
+    /// Register an Execution Extension (ExEx) plugin.
+    ///
+    /// ExExes are long-running tasks that receive notifications about the full
+    /// transaction lifecycle: certificate accepted, consensus committed, and
+    /// chain executed.
+    ///
+    /// The notification channel uses the default capacity
+    /// ([`tn_exex::exex_channel_capacity`]); use [`install_exex_with_capacity`]
+    /// to size it for a heavyweight ExEx on a high-throughput chain.
+    ///
+    /// [`install_exex_with_capacity`]: Self::install_exex_with_capacity
+    pub fn install_exex<F, Fut>(&mut self, name: impl Into<String>, install_fn: F) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.install_exex_with_capacity(name, tn_exex::exex_channel_capacity(), install_fn)
+    }
+
+    /// Register an ExEx plugin with an explicit notification channel capacity.
+    ///
+    /// A larger capacity lets a persistently-slightly-slow ExEx absorb bursts
+    /// without dropping notifications (which would surface as
+    /// [`TnExExNotification::Lagged`](tn_exex::TnExExNotification::Lagged) and
+    /// force a replay). See [`install_exex`](Self::install_exex) for the default.
+    pub fn install_exex_with_capacity<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        capacity: usize,
+        install_fn: F,
+    ) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.exex_fns.push((name.into(), capacity, Box::new(|ctx| Box::pin(install_fn(ctx)))));
+        self
+    }
+}
+
+impl std::fmt::Debug for TnBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TnBuilder")
+            .field("node_config", &self.node_config)
+            .field("tn_config", &self.tn_config)
+            .field("metrics", &self.metrics)
+            .field("healthcheck", &self.healthcheck)
+            .field("exex_count", &self.exex_fns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Wrapper for the inner execution node components.
@@ -76,39 +200,88 @@ impl ExecutionNode {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown, gas_accumulator, engine_update_tx).await
+        guard
+            .start_engine(rx_output, rx_shutdown, gas_accumulator, repack_monitor, engine_update_tx)
+            .await
     }
 
     /// Initialize the worker's transaction pool and public RPC.
     ///
-    /// This method should be called on node startup.
+    /// This method can run before startup synchronization. Call
+    /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
+    ///
+    /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
+    /// live container so canonical updates always charge the current epoch's fee (issue
+    /// #1262). `worker_base_fee` is the worker's per-query epoch base-fee handle: the RPC
+    /// server keeps it so `eth_feeHistory` resolves the worker's current fee on every quote,
+    /// surviving worker-count changes (#1282).
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
-        network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        base_fee: BaseFeeContainer,
+        worker_base_fee: WorkerBaseFee,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
-        guard.initialize_worker_components(worker_id, network_handle, engine_to_primary).await
+        guard
+            .initialize_worker_components(worker_id, engine_to_primary, base_fee, worker_base_fee)
+            .await
     }
 
-    /// Respawn any tasks on the worker network when we get a new epoch task manager.
+    /// Update the pending base fee on a worker's transaction pool.
     ///
-    /// This method should be called on epoch rollover.
-    pub async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
-        let guard = self.internal.write().await;
-        guard.respawn_worker_network_tasks(network_handle).await
+    /// Called every epoch so the pool charges the accumulator's current base fee for the worker,
+    /// including on the respawn path where [`Self::initialize_worker_components`] is skipped.
+    pub async fn set_worker_base_fee(
+        &self,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> eyre::Result<()> {
+        let guard = self.internal.read().await;
+        guard.set_worker_base_fee(worker_id, base_fee)
+    }
+
+    /// Respawn one worker's network tasks with its own handle for the new epoch.
+    ///
+    /// Call once at every epoch entry, including for a worker whose RPC bound during startup.
+    pub async fn respawn_worker_network_tasks(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+    ) -> eyre::Result<()> {
+        let guard = self.internal.read().await;
+        guard.respawn_worker_network_tasks(worker_id, network_handle)
+    }
+
+    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    ///
+    /// The epoch manager's node-mode watch task drives this on every mode change so the
+    /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
+    pub async fn set_workers_syncing(&self, syncing: bool) {
+        let guard = self.internal.read().await;
+        guard.set_workers_syncing(syncing)
     }
 
     /// Returns true if worker components have already been initialized.
     pub async fn are_workers_initialized(&self) -> bool {
         !self.internal.read().await.workers.is_empty()
+    }
+
+    /// Returns true if the worker identified by `worker_id` has been initialized.
+    ///
+    /// A worker's components (RPC server + transaction pool) are created once and never torn
+    /// down across epoch transitions. Worker 0 is created during process startup, before
+    /// startup epoch-record sync; other workers on the first epoch entry where their id is
+    /// active. Backs the `/health/workers` readiness endpoint.
+    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+        self.internal.read().await.workers.get(worker_id as usize).is_some()
     }
 
     /// Batch maker
@@ -130,7 +303,7 @@ impl ExecutionNode {
     pub async fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
@@ -138,7 +311,7 @@ impl ExecutionNode {
     }
 
     /// Retrieve the last executed block from the database to restore consensus.
-    pub async fn last_executed_output(&self) -> eyre::Result<B256> {
+    pub async fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
         let guard = self.internal.read().await;
         guard.last_executed_output()
     }
@@ -207,14 +380,75 @@ impl ExecutionNode {
     }
 
     /// Read [EpochState] from the canonical tip.
+    ///
+    /// The committee arrays this returns mutate mid-epoch: a governance `burn` swap-and-pops the
+    /// ejected validator out of the CURRENT epoch's stored committees immediately, so tip reads
+    /// before and after the burn disagree. Epoch-scoped consensus reads must use
+    /// [`Self::epoch_state_at_epoch_start_from_tip`] / [`Self::validators_for_epochs_at_block`]
+    /// instead; the tip read remains correct for point-in-time queries (its `epoch` scalar is
+    /// boundary-written-once).
     pub async fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let guard = self.internal.read().await;
         guard.epoch_state_from_canonical_tip()
     }
 
-    /// Read committee validator keys for epoch.
-    pub async fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
+    /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
+    /// (genesis for epoch 0), returning the pin header alongside it.
+    ///
+    /// The bootstrap `tip` is the caller's, not a fresh sample: the pin derives from the epoch
+    /// number and `blockHeight` read AT `tip`, both of which `concludeEpoch` rewrites at every
+    /// boundary, so only a caller-held sample makes a retried read provably resolve one pin.
+    pub async fn epoch_state_at_epoch_start_from_tip(
+        &self,
+        tip: &SealedHeader,
+    ) -> StateReadResult<(EpochState, SealedHeader)> {
         let guard = self.internal.read().await;
-        guard.validators_for_epoch(epoch)
+        guard.epoch_state_at_epoch_start_from_tip(tip)
+    }
+
+    /// Read committee validator keys for epoch, pinned to `header`'s state.
+    ///
+    /// Every committee-keys read the engine exposes is PINNED: an unpinned (canonical-tip)
+    /// variant would make the result depend on when the caller runs relative to a mid-epoch
+    /// governance burn. Callers must choose their pin explicitly. The `_at_header` variants serve
+    /// the entry path, which already holds the epoch-start header;
+    /// [`Self::validators_for_epochs_at_block`] serves callers holding only a `BlockNumHash` (the
+    /// epoch-record close). [`Self::epoch_state_from_canonical_tip`] still exposes tip-read
+    /// committee fields, for point-in-time queries only.
+    pub async fn validators_for_epoch_at_header(
+        &self,
+        epoch: u32,
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epoch_at_header(epoch, header)
+    }
+
+    /// Read several epochs' committee validator keys, pinned to `header`'s state.
+    ///
+    /// The whole batch executes against ONE pinned EVM and the returned key sets are ordered to
+    /// match `epochs`; each set decodes like [`Self::validators_for_epoch_at_header`].
+    pub async fn validators_for_epochs_at_header(
+        &self,
+        epochs: &[Epoch],
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epochs_at_header(epochs, header)
+    }
+
+    /// Read several epochs' committee validator keys, pinned to the block identified by
+    /// `block_hash`.
+    ///
+    /// The by-hash sibling of [`Self::validators_for_epochs_at_header`]: ONE header lookup and
+    /// ONE pinned EVM for the whole batch, so every returned set provably derives from the same
+    /// block rather than from two independently-resolved reads.
+    pub async fn validators_for_epochs_at_block(
+        &self,
+        epochs: &[Epoch],
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epochs_at_block(epochs, block_hash)
     }
 }

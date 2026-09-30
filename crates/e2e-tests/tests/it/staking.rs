@@ -48,14 +48,19 @@ fn make_payload(
 }
 
 /// Execute a payload with transactions and commit the block to the canonical chain.
+///
+/// Every block persists before the next build here, so a fresh empty
+/// `OutputTrieOverlay` per block is exact (#1301).
 fn execute_and_commit(
     reth_env: &RethEnv,
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
 ) -> eyre::Result<SealedHeader> {
-    let anchor_hash = payload.parent_header.hash();
-    let block =
-        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
+    let block = reth_env.build_block_from_batch_payload(
+        payload,
+        &transactions,
+        &mut tn_reth::OutputTrieOverlay::new(),
+    )?;
     let header = block.recovered_block.clone_sealed_header();
     let state = reth_env.canonical_in_memory_state();
     state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
@@ -116,10 +121,9 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         ConfigFmt::YAML,
     )?;
 
-    // Sanity: verify key byte lengths match expected BLS sizes
+    // Sanity: verify key byte lengths match the compressed encodings the stake flow uses
     assert_eq!(node_info.bls_public_key.to_bytes().len(), 96, "compressed BLS pubkey");
-    assert_eq!(node_info.bls_public_key.serialize().len(), 192, "uncompressed BLS pubkey");
-    assert_eq!(node_info.proof_of_possession.serialize().len(), 96, "uncompressed PoP sig");
+    assert_eq!(node_info.proof_of_possession.to_bytes().len(), 48, "compressed PoP signature");
 
     // ── 4. Build genesis with ConsensusRegistry ──
     let stake_amount = U256::from(parse_ether("1_000_000").unwrap());

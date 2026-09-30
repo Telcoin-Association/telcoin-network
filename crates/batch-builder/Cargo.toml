@@ -15,16 +15,21 @@ authors = [
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 [dev-dependencies]
 # unit tests
+alloy = { workspace = true }
 assert_matches = { workspace = true }
+metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "time", "sync", "rt", "test-util"] }
 
 # integration tests
 tn-worker = { workspace = true, features = ["test-utils"] }
@@ -33,6 +38,7 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
 
 [features]
 default = []

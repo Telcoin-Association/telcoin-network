@@ -1088,7 +1088,7 @@ async fn propose_header_to_form_certificate() {
     ));
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_failure() {
     let mut cx = CertifierContext::new();
     let committee = cx.fixture.committee();
@@ -1132,7 +1132,7 @@ async fn propose_header_failure() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_scenario_with_bad_sigs() {
     // expect cert if less than 2 byzantines, otherwise no cert
     run_vote_aggregator_with_param(6, 0, true).await;

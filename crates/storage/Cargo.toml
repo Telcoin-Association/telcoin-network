@@ -18,11 +18,16 @@ eyre = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
-# For the persist async implemetation.
-tokio = { workspace = true, features = [ "sync", "fs" ] }
+# For the persist async implemetation. `rt` is needed for `spawn_blocking` (offloading the blocking
+# pack writes in `export_bounded_bundle`); declared explicitly rather than relying on workspace
+# feature unification so a lib-only `cargo build -p tn-storage` also resolves it.
+tokio = { workspace = true, features = [ "sync", "fs", "rt" ] }
 crc32fast = "1.5.0"
 cfg-if = { workspace = true }
 serde = { workspace = true }
+# Headers are stored RLP-encoded (their canonical form); the BCS record codec cannot
+# round-trip alloy's serde types (skip_serializing_if / quantity attributes).
+alloy-rlp = { workspace = true }
 zstd = "0.13.3"
 
 # redb backend
@@ -41,12 +46,21 @@ tn-reth = { workspace = true }
 tn-test-utils = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
+# Async barrier tests for the durable `persist` need a runtime + timers. `test-util` is for the
+# paused-clock tests of the bounded waits in `epoch_records`, which would otherwise depend on
+# another workspace member happening to enable it for the whole build.
+tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util" ] }
 
 [features]
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
-test-utils = []
+# Re-exports tn-types' test hooks: `make build-e2e-bin` enables `tn-storage/test-utils` on the
+# node binary, and the `TN_SEED_SIGNATURE_FORK_EPOCH` override the e2e harness pins lives
+# behind `tn-types/test-utils`. Left empty, the e2e binary cannot consult the override at all.
+test-utils = ["tn-types/test-utils"]
+# Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
+adiri = ["tn-types/adiri"]
 
 [lints]
 workspace = true

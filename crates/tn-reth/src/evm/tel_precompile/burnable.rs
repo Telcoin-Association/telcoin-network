@@ -4,7 +4,12 @@
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
 //! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
 //!    crediting governance safe's native balance and incrementing `totalSupply`.
-//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
+//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account. `burn` is
+//!    the one payable selector: the EVM credits attached `msg.value` to the precompile before the
+//!    handler runs, topping up the pool the burn draws from, so `msg.value == amount` funds and
+//!    burns in one transaction and any excess stays in the pool for a later `burn`. That transfer
+//!    happens inside the EVM and emits nothing, so the handler mirrors it as an inbound
+//!    `Transfer(caller, precompile, msg.value)` log ahead of the burn events.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
 //! tokens enter circulation. A second `mint` call **overwrites** any pending mint, which
@@ -55,7 +60,8 @@ sol! {
     event Claim(address indexed recipient, uint256 amount);
     /// Emitted when tokens are burned.
     event Burn(uint256 amount);
-    /// Emitted when tokens are minted (from address(0)) or burned (to address(0)).
+    /// Emitted when tokens are minted (from address(0)), burned (to address(0)), or sent to the
+    /// precompile as call value funding a `burn`.
     event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
@@ -84,6 +90,13 @@ pub(super) fn handle_total_supply(
     internals: &mut EvmInternals<'_>,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for the one storage read this view performs.
+    ///
+    /// A single cold `SLOAD` of [`TOTAL_SUPPLY_SLOT`] at the Cancun price: `1 * 2_100 = 2_100`.
+    /// The charge is exactly the EVM cost of the read (`1.00x` coverage); there is no logging,
+    /// account access, or write to price in.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "View functions".
     const GAS_COST: u64 = 2_100;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -157,6 +170,16 @@ pub(super) fn handle_mint(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for creating a timelocked pending mint.
+    ///
+    /// Worst case is the *first* mint, where both pending slots move cold `0 -> nonzero` and the
+    /// `Mint` log (2 topics, 64 bytes of data) is emitted: `22_100 + 22_100 + 1_637 = 45_837`.
+    /// At `41_000` this covers `0.89x` of the worst case, so a first mint is **undercharged** by
+    /// `4_837` relative to equivalent Solidity. Overwriting an existing pending mint touches two
+    /// cold `nonzero -> nonzero` slots (this handler never `SLOAD`s them first) and costs `11_637`,
+    /// comfortably inside the budget.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`mint` (mainnet)".
     const GAS_COST: u64 = 41_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -223,6 +246,19 @@ pub(super) fn handle_claim(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for finalizing a pending mint.
+    ///
+    /// The worst case is nine metered operations: three cold `SLOAD`s of the amount, timestamp,
+    /// and supply slots (`3 * 2_100`), a cold `load_account` of the recipient (`2_600`), three
+    /// warm `SSTORE`s clearing the two pending slots and bumping supply (`3 * 2_900`), and the
+    /// `Claim` and `Transfer` logs (`1_381 + 1_756`), totalling `20_737`. At `25_000` this covers
+    /// `1.21x` of the worst case, the thinnest margin of any handler in this precompile that
+    /// over-covers its worst case at all — the views charge exactly `1.00x`, and `burn` is
+    /// undercharged, as is the mainnet `mint` in a non-`faucet` build and `grantMintRole` in a
+    /// `faucet` one. The two `nonzero -> 0` clears earn `9_600` in refunds at transaction end, but
+    /// refunds never reduce the amount that has to be available upfront.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`claim`".
     const GAS_COST: u64 = 25_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -312,6 +348,14 @@ pub(super) fn handle_claim(
 ///
 /// Decrements the precompile's native balance by `amount`, then decrements `totalSupply`.
 ///
+/// `value` is the call value the EVM credited to the precompile before this handler ran. The
+/// dispatcher's payability gate admits it for this selector alone, and only when the precompile is
+/// the actual transfer target, so nonzero `value` is always `caller` topping up the pool this
+/// handler draws from. That transfer happens inside the EVM and emits nothing, so the handler
+/// mirrors it as `Transfer(caller, precompile, value)` ahead of the burn events: an indexer
+/// reconstructing TEL as an ERC-20 from these logs would otherwise watch tokens leave a pool they
+/// were never seen entering, and drift negative.
+///
 /// # Access control
 /// Governance-only via [`has_governance_role`].
 pub(super) fn handle_burn(
@@ -319,7 +363,20 @@ pub(super) fn handle_burn(
     calldata: &[u8],
     caller: Address,
     gas_limit: u64,
+    value: U256,
 ) -> PrecompileResult {
+    /// Flat charge for destroying tokens held by the precompile.
+    ///
+    /// A warm `load_account` of the precompile itself (`100`: revm pre-warms every registered
+    /// precompile address, so `0x7e1` is never cold), a cold `SLOAD` plus warm `nonzero ->
+    /// nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), and the `Burn` and `Transfer` logs
+    /// (`1_006 + 1_756`): `7_862` for a zero-value burn, which the flat `8_000` covers in full
+    /// (`1.02x`). A value-funded burn adds the inbound `Transfer` mirroring the top-up (`1_756`)
+    /// for `9_618`, and is therefore **undercharged** by `1_618` (`0.83x`) relative to equivalent
+    /// Solidity. Burning is governance-only, so that subsidy is not reachable by untrusted
+    /// callers.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`burn`".
     const GAS_COST: u64 = 8_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -350,6 +407,27 @@ pub(super) fn handle_burn(
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT, new_supply)
         .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
+    // Emit Transfer(caller, precompile, value) — mirrors the EVM's own silent value transfer that
+    // funded this burn, keeping the event log a complete account of the pool's balance across
+    // every path that runs precompile code. One inlet stays outside those paths: under EIP-6780 a
+    // `SELFDESTRUCT` naming 0x7e1 as beneficiary still transfers its balance (only the account
+    // deletion was removed), crediting the pool with no log and no frame here to observe it. An
+    // indexer should reconcile against the account's native balance rather than treat this log
+    // stream as closed.
+    if !value.is_zero() {
+        let funding_log = reth_revm::primitives::Log::new(
+            TELCOIN_PRECOMPILE_ADDRESS,
+            vec![
+                Transfer::SIGNATURE_HASH,
+                caller.into_word(),
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+            ],
+            value.to_be_bytes_vec().into(),
+        )
+        .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
+        internals.log(funding_log);
+    }
+
     // Emit Burn(uint256 amount)
     let topic0 = Burn::SIGNATURE_HASH;
     let log = reth_revm::primitives::Log::new(
@@ -379,7 +457,7 @@ pub(super) fn handle_burn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::tel_precompile::test_utils::*;
+    use crate::evm::precompile_test_utils::*;
     use alloy::sol_types::SolCall;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
     use tn_types::U256;

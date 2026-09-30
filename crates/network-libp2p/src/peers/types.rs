@@ -10,6 +10,46 @@ use std::{
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 
+/// Domain identity for a tracked peer.
+///
+/// Telcoin associates a [BlsPublicKey] with a peer once its network settings are known
+/// (committee, trusted, or otherwise known peers). Until then a peer discovered through
+/// libp2p - an inbound connection or a kad-dialed candidate - is known only by its libp2p
+/// [PeerId]. This sum type captures that distinction so the domain key (the bls public key)
+/// is used wherever it is known, and the libp2p id only where it isn't.
+///
+/// `Confirmed` and `Unidentified` are distinct keys: a peer first seen as `Unidentified`
+/// is re-keyed onto its `Confirmed` identity once its bls key is learned.
+///
+/// The variants differ in size (a bls key is larger than a libp2p id), but this type is a
+/// `Copy` map key resolved on every libp2p connection event; boxing would forfeit `Copy` and
+/// add indirection to those lookups, so the inline layout is intentional.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum PeerIdentity {
+    /// A peer whose [BlsPublicKey] is known. This is the telcoin-domain identity.
+    Confirmed(BlsPublicKey),
+    /// A peer known only by its libp2p [PeerId] (no bls key learned yet).
+    Unidentified(PeerId),
+}
+
+/// Why a peer is exempt from the score model and penalties for the current epoch.
+///
+/// A peer subject to normal scoring has no basis (`None`). The two provenances are kept
+/// distinct on purpose (issue #715): operator allowlisting is sticky - set at construction
+/// and never altered by epoch rotation - whereas validator status is derived live from the
+/// tracked committee slots, so a validator rotating out of committee can never strip operator
+/// trust.
+/// Only the exemption *decision* (presence) drives behaviour; the variant is carried for
+/// observability (it names which provenance suppressed a penalty in logs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrustBasis {
+    /// Explicitly allowlisted by the node operator.
+    Operator,
+    /// Sits in a tracked committee slot: the previous, current, or next epoch's committee.
+    Validator,
+}
+
 /// Events for the `PeerManager`.
 #[derive(Debug)]
 pub(crate) enum PeerEvent {

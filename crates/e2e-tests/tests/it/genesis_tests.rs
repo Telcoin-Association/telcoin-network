@@ -15,13 +15,13 @@ use jsonrpsee::{
 use std::{collections::HashMap, time::Duration};
 use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
-    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON,
-    GENESIS_ACCOUNT_STATE_YAML, ISSUANCE_ADDRESS, ISSUANCE_JSON,
+    NetworkGenesis, CONSENSUS_REGISTRY_JSON, GENESIS_ACCOUNT_STATE_YAML, ISSUANCE_ADDRESS,
+    ISSUANCE_JSON,
 };
 use tn_reth::{
-    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE},
     test_utils::TransactionFactory,
-    RethEnv,
+    RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
 };
 use tn_types::{Address, Bytes, FromHex, GenesisAccount};
 use tracing::debug;
@@ -63,7 +63,7 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
     let expected: HashMap<Address, GenesisAccount> =
         serde_yaml::from_str(GENESIS_ACCOUNT_STATE_YAML).expect("yaml parsing failure");
 
-    // verify count matches (currently 9 precompile accounts)
+    // verify count matches (currently 25 precompile accounts)
     assert_eq!(
         precompile_accounts.len(),
         expected.len(),
@@ -95,19 +95,41 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         CONSENSUS_REGISTRY_JSON,
         Some("deployedBytecode.object"),
     )?;
-    let unlinked_runtimecode =
+    let registry_runtimecode =
         registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
-    let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
-    let tao_address =
-        Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
-    let blsg1_address = tao_address.create(0).to_string();
-    let registry_deployed_bytecode =
-        RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
-
-    let blsg1_runtimecode_binding =
-        RethEnv::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-    let blsg1_deployed_bytecode =
-        blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?;
+    // The registry calls the BLS precompile directly at `BLS_G1_PRECOMPILE_ADDRESS` (no linked
+    // library), so its deployed bytecode is used as-is. The precompile address itself carries a
+    // single `0xfe` (INVALID) byte of code rather than deployed library code. See
+    // `create_consensus_registry_genesis_accounts`.
+    let blsg1_address = BLS_G1_PRECOMPILE_ADDRESS.to_string();
+    let registry_deployed_bytecode = Bytes::from_hex(registry_runtimecode)?;
+    // The ceremony splices the tmp-chain DEPLOYED registry code (issue #1278): identical to
+    // the compile-time artifact outside `deployedBytecode.immutableReferences`, with the
+    // constructor-patched (non-zero) Solady EIP712 immutables inside each site.
+    let registry_immutable_sites: Vec<(usize, usize)> = RethEnv::fetch_value_from_json_str(
+        CONSENSUS_REGISTRY_JSON,
+        Some("deployedBytecode.immutableReferences"),
+    )?
+    .as_object()
+    .map(|refs| {
+        refs.values()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|site| {
+                site.get("start")
+                    .and_then(serde_json::Value::as_u64)
+                    .zip(site.get("length").and_then(serde_json::Value::as_u64))
+                    .map(|(start, length)| (start as usize, length as usize))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    // Fail loud on artifact schema drift: with zero parsed sites the comparison below
+    // degrades to byte-equality, which a still-zeroed genesis satisfies (issue #1278).
+    assert!(
+        !registry_immutable_sites.is_empty(),
+        "registry artifact must list immutable sites (the Solady EIP712 cache)"
+    );
 
     let issuance_json_val =
         RethEnv::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
@@ -136,9 +158,28 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         .request("eth_getCode", rpc_params!(blsg1_address))
         .await
         .expect("Failed to fetch BLS G1 bytecode");
-    assert_eq!(
-        Bytes::from_hex(&returned_registry_bytecode)?,
-        Bytes::from(registry_deployed_bytecode)
+    // Compare modulo the immutable sites: byte-equal outside, non-zero inside every site
+    // (the genesis code carries the constructor-patched values, not the artifact's zeros).
+    let returned_registry_bytes = Bytes::from_hex(&returned_registry_bytecode)?;
+    let inside_site = |i: usize| {
+        registry_immutable_sites.iter().any(|(start, length)| i >= *start && i < start + length)
+    };
+    assert_eq!(returned_registry_bytes.len(), registry_deployed_bytecode.len());
+    assert!(
+        returned_registry_bytes
+            .iter()
+            .zip(registry_deployed_bytecode.iter())
+            .enumerate()
+            .all(|(i, (onchain, compiled))| inside_site(i) || onchain == compiled),
+        "genesis registry code diverges from the artifact outside the immutable sites"
+    );
+    assert!(
+        registry_immutable_sites.iter().all(|(start, length)| {
+            returned_registry_bytes
+                .get(*start..start + length)
+                .is_some_and(|segment| segment.iter().any(|byte| *byte != 0))
+        }),
+        "genesis registry code ships an ALL-ZERO EIP712 immutable segment (issue #1278)"
     );
     assert_eq!(
         Bytes::from_hex(&returned_issuance_bytecode)?,
@@ -146,7 +187,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     );
     assert_eq!(
         Bytes::from_hex(&returned_blsg1_bytecode)?,
-        Bytes::from_hex(blsg1_deployed_bytecode)?
+        Bytes::from(PRECOMPILE_GENESIS_BYTECODE)
     );
 
     // verify all precompile-config.yaml accounts are present in genesis on-chain
@@ -218,15 +259,16 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     assert_eq!(epochIssuance, expected_epoch_issuance);
     assert_eq!(stakeVersion, 0);
 
-    let validators = consensus_registry
+    // `getValidators` returns validator addresses directly (the full structs are available via
+    // `getValidatorsInfo`).
+    let validator_addresses = consensus_registry
         .getValidators(ConsensusRegistry::ValidatorStatus::Active.into())
         .call()
         .await
         .expect("failed active validators read");
 
-    let validator_addresses: Vec<_> = validators.iter().map(|v| v.validatorAddress).collect();
     assert_eq!(committee, validator_addresses);
-    debug!(target: "genesis-test", "active validators??\n{:?}", validators);
+    debug!(target: "genesis-test", "active validators??\n{:?}", validator_addresses);
 
     Ok(())
 }

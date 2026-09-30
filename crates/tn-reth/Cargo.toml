@@ -11,11 +11,15 @@ authors = [
 publish = false
 
 [dependencies]
-jsonrpsee = { workspace = true }
+# `server` + `macros` back the TN eth-method overrides (`rpc_fee_history` and the
+# `--rpc.txfeecap` guard's `rpc_fee_cap`).
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }
 tn-worker = { workspace = true }
+tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
 
@@ -31,12 +35,14 @@ reth-primitives = { workspace = true }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
-reth-engine-tree = { workspace = true }
 reth-revm = { workspace = true }
 reth-evm = { workspace = true }
 reth-node-builder = { workspace = true }
 reth-provider = { workspace = true }
 reth-primitives-traits = { workspace = true }
+reth-stages-types = { workspace = true }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
 
 reth-errors = { workspace = true }
@@ -49,7 +55,9 @@ reth-eth-wire = { workspace = true }
 reth-tasks = { workspace = true }
 reth-tokio-util = { workspace = true }
 reth-tracing = { workspace = true }
+reth-metrics = { workspace = true }
 
+metrics = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 futures = { workspace = true }
@@ -57,24 +65,60 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
-alloy = { workspace = true, features = ["genesis"] }
+# `json-rpc` exposes the request/response packet types the size-capped forwarder transport
+# implements `Service` over (issue #1275).
+alloy = { workspace = true, features = ["genesis", "json-rpc"] }
 alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "time"] }
+url = { workspace = true }
+tokio = { workspace = true, features = ["macros", "time", "sync"] }
+# `Service` impl for the size-capped forwarder transport (issue #1275). Only the trait; the
+# HTTP client underneath comes through alloy's re-export so the TLS backend stays alloy's.
+tower = { workspace = true }
+tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
+serde_yaml = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
+rand = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+# `rt` and `test-util` back the forwarder's bound tests: they drive spawned forwards and run
+# them on a paused clock so a two-minute budget costs no wall time. `net` and `io-util` back
+# the forwarder's response-size-cap tests: they stand up a loopback HTTP endpoint that
+# overfeeds the capped transport (issue #1275).
+tokio = { workspace = true, features = [
+    "macros",
+    "time",
+    "sync",
+    "rt",
+    "test-util",
+    "net",
+    "io-util",
+] }
 
 [features]
 default = []
 faucet = []
 test-utils = ["dep:secp256k1"]
+# Expose the production sorted-run accumulator to the allocation benchmark.
+bench-internals = []
+adiri = ["faucet", "tn-types/adiri"]
+# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
+# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
+# zero-size stub and the 332-translation-unit native compile is skipped entirely.
+# Required before any storage-v2 / `StorageSettings` experimentation.
+rocksdb = ["reth/rocksdb"]
+
+[[bench]]
+name = "output_overlay"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true

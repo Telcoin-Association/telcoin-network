@@ -1,10 +1,119 @@
 //! The types that build blocks for EVM execution.
+//!
+//! `TNBlockExecutionCtx` carries the consensus-derived inputs for one EVM block (one batch of a
+//! `ConsensusOutput`), `TNBlockExecutor` executes transactions plus the TN system calls, and
+//! `TNBlockAssembler` seals the results into a header. The TN-specific, consensus-critical
+//! behavior lives in two places: the pre-block system calls and the epoch-close sequence in
+//! `TNBlockExecutor::finish`.
+//!
+//! # Pre-execution order (`apply_pre_execution_changes`)
+//!
+//! 1. Set the EIP-161 state-clear flag per the Spurious Dragon activation.
+//! 2. EIP-4788 beacon-root call — runs only on the FIRST batch of a consensus output
+//!    (`TNBlockExecutionCtx::first_batch`), writing the parent `ConsensusHeader` digest once per
+//!    output rather than once per block.
+//! 3. EIP-2935 blockhashes call — runs on every block, recording the parent block hash.
+//!
+//! Both calls are additionally subject to the usual hardfork and genesis gates.
+//!
+//! # The epoch-close sequence (`finish`)
+//!
+//! When `ctx.close_epoch` is `Some(randomness)`, `finish` closes the epoch with system calls in
+//! this exact order:
+//!
+//! 1. (`adiri` builds only) `apply_consensus_registry_fork` then `apply_worker_configs_fork` — fire
+//!    only when the concluding epoch (`deconstruct_nonce(ctx.nonce).0`), plus one (checked), equals
+//!    `CONSENSUS_REGISTRY_FORK_EPOCH`. The registry swap replaces the registry's runtime bytecode
+//!    in place, then runs the one-time `migrateValidatorSets()`; the worker-configs swap then
+//!    replaces the `WorkerConfigs` runtime bytecode (code only, no initializer). The two ship at
+//!    the same boundary because the registry swap flips this very block's close onto the post-fork
+//!    sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
+//!    `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
+//!    block.
+//! 2. (`adiri` builds only) `apply_governance_safe_fork` — fires only when the concluding epoch,
+//!    plus one (checked), equals `governance_safe_fork_epoch()` (`GOVERNANCE_SAFE_FORK_EPOCH`, 554
+//!    on adiri, so it runs once, in the block that closes epoch 553; a `test-utils` build can move
+//!    it through `TN_GOVERNANCE_SAFE_FORK_EPOCH`). It etches the canonical Safe v1.4.1 suite, swaps
+//!    the `Safe` singleton and `SafeProxyFactory` code, and moves the governance Safe proxy onto
+//!    `SafeL2`, failing closed unless the singleton, factory and proxy code hashes and the proxy's
+//!    slot 0 match their pre-fork pins. Nothing in the close reads Safe state, so its position
+//!    after the registry pair and before the boundary calls is the fork-leads convention, not a
+//!    data dependency.
+//! 3. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
+//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`, then
+//!    `setWorkerConfigsData(uint16[],uint184[])`. The reward infos carry the leader counts from
+//!    `ctx.gas_accumulator`'s rewards counter; committee membership is drawn by the
+//!    `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding), run AFTER
+//!    `applySlashes` commits so the eligible-pool read and the committee reflect any slash-to-zero
+//!    ejections. The ordering is a consensus-safety obligation the protocol owns: incentives weight
+//!    on pre-slash collateral, slashes land before the committee is assembled, and `concludeEpoch`
+//!    settles queued stake version changes from post-slash balances. While the deployed registry
+//!    still carries the pre-fork adiri code, the close instead replays the legacy pair
+//!    `applyIncentives` then `concludeEpoch(address[])` (same code-hash gate as the committee-pool
+//!    read), keeping pre-fork history re-executable; the post-fork sequence differs by the
+//!    interposed `applySlashes` call and the trailing worker-config write, and both share
+//!    byte-identical `applyIncentives` and `concludeEpoch(address[])` selectors.
+//!
+//! The fourth call (`record_next_epoch_base_fees`) writes each EIP-1559 worker's next-epoch base
+//! fee into its `WorkerConfigs` `data` word: an epoch-boundary snapshot that lets a node entering
+//! the epoch read the fee from one state slot instead of scanning the whole prior epoch's headers
+//! to recompute it. It runs last because it is the only step that reads no registry state and
+//! writes to no registry state, so nothing in the epoch transition depends on its position.
+//!
+//! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
+//! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
+//! for the remainder of this very block, and the post-fork `concludeEpoch` validates the
+//! committee size against the cached `eligibleValidatorCount` that only `migrateValidatorSets()`
+//! populates.
+//!
+//! Every step is fatal on failure: the error aborts execution of the consensus output and
+//! propagates out of the engine loop, so the node stops executing rather than committing a
+//! block whose state diverges from the rest of the fleet.
+//!
+//! Note for auditors: protocol-side slashing is not live - the `slashes` array passed to
+//! `applySlashes` is always empty (production builds; tests may inject slashes through the
+//! `cfg(test)` seam on `TNPayload`).
+//!
+//! # System-call state hygiene
+//!
+//! `SYSTEM_ADDRESS` is a caller convention, not a real account mutation; it must never enter a
+//! block's changeset. Every commit of a system-call result in this file strips it first:
+//! `transact_and_commit_system_call` removes `SYSTEM_ADDRESS` from the result state, and the
+//! EIP-4788/EIP-2935 pre-block calls `retain` only their target contract (also dropping the
+//! touched beneficiary). Committing a system-call result without this cleanup places a spurious
+//! touched account into the bundle and diverges the state root across nodes.
+//!
+//! # Randomness
+//!
+//! The epoch-close `randomness` (`ctx.close_epoch`) is whichever seed
+//! `ConsensusOutput::committee_shuffle_seed` yields for the closing epoch, and that is epoch-gated
+//! on `tn_types::forks::seed_signature_active`. For epochs where the gate is inactive (every
+//! `adiri` epoch before `SEED_SIGNATURE_FORK_EPOCH`) it stays the LEGACY seed, keccak256 of the
+//! leader certificate's aggregate BLS signature, wire-identical to pre-fork releases; for active
+//! epochs it is the epoch seed chain value as of the closing commit, folded per commit in
+//! `CommittedSubDag::new`. Do not read this module as describing the seed chain unconditionally:
+//! the whole point of the gate is that pre-fork epochs re-execute exactly as they always did.
+//!
+//! Either way the value is carried through the payload, seeds the deterministic committee shuffle,
+//! AND is stored as the block's `extra_data`, which is how the replay path (`context_for_block`)
+//! rebuilds the ctx from the sealed header — identical up to `gas_accumulator`, which is the live
+//! shared accumulator rather than header-derived (see the `evm/config.rs` module docs for the
+//! replay caveat and the `block.body.withdrawals` reconstruction follow-up). The RNG draw order
+//! inside the shuffle is consensus-critical: any refactor that reorders the draws selects a
+//! different committee.
+//!
+//! From the PREVRANDAO fork epoch onward the same epoch seed chain value also feeds each block's
+//! `mix_hash` (the EVM's `PREVRANDAO`, derived per block by `ConsensusOutput::prev_randao`). It
+//! carries the same accepted last-actor bias: the committing leader can compute it before
+//! broadcasting, so it is not unbiasable randomness.
 
 use crate::{
     error::{TnRethError, TnRethResult},
+    metrics::{gas_spent, EpochCloseGas},
     system_calls::{
+        decode_worker_fee_configs, log_registry_event,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
-        CONSENSUS_REGISTRY_ADDRESS,
+        RegistryEvents, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
     },
     SYSTEM_ADDRESS,
 };
@@ -15,7 +124,8 @@ use alloy::{
         eip4788::BEACON_ROOTS_ADDRESS,
         eip7685::{Requests, EMPTY_REQUESTS_HASH},
     },
-    sol_types::SolCall as _,
+    primitives::{aliases::U184, Log},
+    sol_types::{SolCall as _, SolEventInterface as _},
 };
 use alloy_evm::{Database, Evm};
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
@@ -37,13 +147,14 @@ use reth_revm::{
         result::{ExecutionResult, ResultAndState},
         Block as _,
     },
-    db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
+use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
-    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+    Address, Bytes, Encodable2718, ExecHeader, Receipt, TransactionSigned, Withdrawals, WorkerId,
+    B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, error, trace};
 
@@ -61,17 +172,35 @@ pub struct TNBlockExecutionCtx {
     /// This is the batch that was validated by consensus and executed
     /// to produce the EVM block.
     pub ommers_hash: B256,
-    /// Keccak hash of the bls signature for the leader certificate.
+    /// The epoch-close committee-shuffle seed. `Some` only for the
+    /// final batch of the epoch's last `ConsensusOutput`.
     ///
-    /// Executor makes closing epoch system call when this if included.
-    /// The hash is stored in the `extra_data` field so clients know when the
-    /// closing epoch call was made.
+    /// When included, the executor runs the epoch-closing system calls (see the module docs) and
+    /// seeds the deterministic committee shuffle with this value. It is derived per commit in
+    /// `CommittedSubDag::new`: for fork-active epochs (#1086, `seed_signature_active`) it folds
+    /// the previous commit's chain value with the leader header's digest-pinned `seed_signature`;
+    /// pre-fork epochs retain the legacy keccak of the leader certificate's aggregate signature.
+    /// It is also stored in the block's `extra_data`: both the marker
+    /// clients use to recognize an epoch-closing block and the value the replay path
+    /// (`context_for_block`) reads back to rebuild an identical ctx from the sealed header.
     pub close_epoch: Option<B256>,
     /// Difficulty- this contains the worker id and batch index:
     /// `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
     pub difficulty: U256,
-    /// Counter used to allocate rewards for block leaders.
-    pub rewards_counter: RewardsCounter,
+    /// Live shared accumulator for the current epoch: per-worker gas totals, current base fees,
+    /// worker count, and the leader counts used to allocate block rewards.
+    ///
+    /// Cloned from the EVM config by both context builders, so it is the same object every other
+    /// component holds rather than a header-derived snapshot (see the `evm/config.rs` module docs
+    /// for the replay caveat that follows from that). Execution reads only the rewards counter
+    /// today — the gas and fee data is carried so the epoch-closing block executor can reach it.
+    pub gas_accumulator: GasAccumulator,
+    /// Test-only slash injection for the epoch boundary, copied from the payload
+    /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
+    /// can drive a non-empty slash list through the production close path. Production builds have
+    /// no such field.
+    #[cfg(test)]
+    pub epoch_boundary_slashes: Vec<ConsensusRegistry::Slash>,
 }
 
 impl TNBlockExecutionCtx {
@@ -93,7 +222,7 @@ impl TNBlockExecutionCtx {
     /// zero-check without extracting the actual batch_index value.
     ///
     /// # Example
-    /// ```
+    /// ```text
     /// // If difficulty = 0x00001234, then:
     /// // - worker_id = 0x1234 (bits 0-15)
     /// // - batch_index = 0x0000 (bits 16+)
@@ -102,8 +231,21 @@ impl TNBlockExecutionCtx {
     ///
     /// This is used during execution to write the consensus header hash
     /// to `BEACON_ROOTS` contract (eip4788).
+    ///
+    /// The gate makes that write once per consensus output rather than once per EVM block. It does
+    /// not make the write unique per `timestamp`: see `apply_consensus_root_contract_call` for how
+    /// outputs committed within the same second share one ring-buffer entry.
     fn first_batch(&self) -> bool {
         self.difficulty < U256::from(65536)
+    }
+
+    /// The worker id packed into the low 16 bits of `difficulty`.
+    ///
+    /// Same mask the header-side [`crate::snapshot::worker_id_from_header`] applies, so a block's
+    /// worker attribution is identical whether it is read from the execution context or from the
+    /// sealed header afterwards (the gas accumulator's per-worker totals depend on that).
+    fn worker_id(&self) -> WorkerId {
+        (self.difficulty.into_limbs()[0] & 0xffff) as WorkerId
     }
 }
 
@@ -123,9 +265,115 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
     receipts: Vec<R::Receipt>,
     /// Total gas used by transactions in this block.
     gas_used: u64,
+    /// Gas spent by the epoch-boundary system calls this block issued, accumulated as they run
+    /// and published once by [`Self::finish`] (`crate::metrics::record_epoch_close_gas`).
+    ///
+    /// Every caller of [`Self::transact_and_commit_system_call`] is an epoch-boundary call, so
+    /// this stays empty on the overwhelming majority of blocks — and an empty `Vec` does not
+    /// allocate, so a non-closing block pays nothing for the instrumentation.
+    epoch_close_gas: EpochCloseGas,
+}
+
+/// Surface the logs a successful system call emitted, off-consensus.
+///
+/// A system call produces no receipt (see [`TNBlockExecutor::transact_and_commit_system_call`],
+/// which owns that constraint), so the `ConsensusRegistry` lifecycle events its `onlySystemCall`
+/// paths emit are otherwise visible only in the `trace!(?res)` dump. Each log from
+/// [`CONSENSUS_REGISTRY_ADDRESS`] is decoded into its typed event and emitted at `info!` by
+/// [`log_registry_event`], named, so an operator's log shows every epoch boundary, activation,
+/// exit, slash, and retirement.
+///
+/// Decoding goes through [`RegistryEvents`], generated from the compiled artifact, so it covers
+/// the registry's whole event ABI rather than the subset the call surface curates — including the
+/// inherited ERC-721 `Transfer` that a slash-to-zero ejection's NFT burn emits, which is named
+/// here rather than falling through as an unknown topic. A registry log whose topic even that
+/// binding does not know (a deployment this build's artifact does not cover, in either direction —
+/// see [`SystemCallLog::UnknownRegistryTopic`]), and any log from another
+/// contract (the `WorkerConfigs` writes emit `WorkerConfigUpdated`), are emitted raw at `debug!`
+/// with address, topics, and data: never dropped, never promoted to a line that looks decoded.
+///
+/// Observational only: reads the logs, writes nothing, and a non-closing block never reaches this
+/// function. Volume per closing block: `applyIncentives` emits nothing; `concludeEpoch` emits
+/// `NewEpoch` plus one event per queue entry (activation, exit, or stake-version settlement, which
+/// adds up to two) — bounded by the ConsensusNFT supply, not by the committee size;
+/// `migrateValidatorSets` emits exactly one `ValidatorSetsMigrated`, once, at the fork. So `info!`
+/// is not a flood risk today. `applySlashes` is the exception to watch: it adds one
+/// `ValidatorSlashed` per entry and roughly five more per slash-to-zero ejection, and its bound is
+/// the system-call gas cap rather than the validator count, because the slash array is
+/// caller-supplied and the contract does not dedupe it. That is moot while
+/// [`TNBlockExecutor::epoch_boundary_slashes`] returns an empty list, but enabling slashing should
+/// revisit this level rather than assume the bound above.
+fn surface_system_call_logs(description: &str, logs: &[Log]) {
+    logs.iter().map(classify_system_call_log).for_each(|classified| match classified {
+        SystemCallLog::Registry(log, event) => log_registry_event(description, log, &event),
+        SystemCallLog::UnknownRegistryTopic(log, error) => debug!(
+            target: "engine",
+            %error,
+            topics = ?log.topics(),
+            data = %log.data.data,
+            "{description} emitted registry log with unknown topic"
+        ),
+        SystemCallLog::Foreign(log) => debug!(
+            target: "engine",
+            address = %log.address,
+            topics = ?log.topics(),
+            data = %log.data.data,
+            "{description} emitted non-registry log"
+        ),
+    })
+}
+
+/// One log a system call emitted, classified for [`surface_system_call_logs`].
+///
+/// Split out of the emitting function so the classification is testable without a tracing
+/// subscriber: the variant decides which log line fires, and the decoded payload rides inside it.
+enum SystemCallLog<'a> {
+    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] that decoded into a bound registry event, paired
+    /// with the raw log it came from. [`log_registry_event`] names the event by looking its
+    /// topic-0 up in the artifact's selector table, so the source log rides along rather than
+    /// being re-encoded to recover a hash the caller already has.
+    Registry(&'a Log, RegistryEvents),
+    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] whose topic the artifact binding does not know,
+    /// with the decode error. Reachable against any deployment whose event ABI this build's
+    /// artifact does not cover, an OLDER one as readily as a newer one: on an `adiri` build below
+    /// `CONSENSUS_REGISTRY_FORK_EPOCH` the legacy close is what runs at every production epoch
+    /// close today, and it routes its logs through this same classifier. Both pinned deployments
+    /// are covered all the same — the pre-fork registry's 18 events are a byte-identical subset of
+    /// the artifact's 27, so even a pre-fork `NewEpoch` decodes by name. An unknown topic here is
+    /// a genuine fallback, not a sign of a redeploy that never happened.
+    UnknownRegistryTopic(&'a Log, alloy::sol_types::Error),
+    /// A log from any other contract.
+    Foreign(&'a Log),
+}
+
+/// Classify one system-call log: a registry log is decoded through the artifact-generated events
+/// binding, every other log passes through untouched.
+fn classify_system_call_log(log: &Log) -> SystemCallLog<'_> {
+    if log.address == CONSENSUS_REGISTRY_ADDRESS {
+        RegistryEvents::decode_log(log)
+            .map(|decoded| SystemCallLog::Registry(log, decoded.data))
+            .unwrap_or_else(|error| SystemCallLog::UnknownRegistryTopic(log, error))
+    } else {
+        SystemCallLog::Foreign(log)
+    }
 }
 
 // alloy-evm
+/// One account the governance-Safe fork installs: canonical runtime bytecode for a canonical
+/// cross-chain address, an optional pre-fork pin when the address is an in-place swap of a
+/// live recompiled deployment (`None` means a fresh etch, which forces its canonical bytes over
+/// whatever the address holds), and the storage slots a fresh etch must seed (constructor
+/// effects the etched code never runs).
+#[cfg(feature = "adiri")]
+struct GovernanceSafeForkInstall {
+    name: &'static str,
+    address: Address,
+    bytecode: reth_revm::bytecode::Bytecode,
+    code_hash: B256,
+    pre_fork_code_hash: Option<B256>,
+    storage: &'static [(U256, U256)],
+}
+
 impl<'db, Evm, Spec, R, DB> TNBlockExecutor<Evm, Spec, R>
 where
     DB: Database + 'db,
@@ -139,120 +387,141 @@ where
 {
     /// Creates a new [`TNBlockExecutor`]
     pub(crate) fn new(evm: Evm, ctx: TNBlockExecutionCtx, spec: Spec, receipt_builder: R) -> Self {
-        Self { evm, ctx, receipts: Vec::new(), gas_used: 0, spec, receipt_builder }
+        Self {
+            evm,
+            ctx,
+            receipts: Vec::new(),
+            gas_used: 0,
+            spec,
+            receipt_builder,
+            epoch_close_gas: EpochCloseGas::default(),
+        }
     }
 
-    /// Increase the beneficiary account balance and withdraw from governance safe.
+    /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
     ///
-    /// This must be called once per epoch, before the conclude epoch call.
-    fn apply_consensus_block_rewards(
+    /// Shared implementation for the epoch system calls (`applyIncentives`, `applySlashes`,
+    /// `concludeEpoch`, the legacy pre-fork close pair, `migrateValidatorSets`). Any failure —
+    /// the call itself erroring or the execution result being unsuccessful — is fatal to the
+    /// block; `description` names the call in the log and error strings, and a revert's decoded
+    /// reason (with its selector and raw output in the log) rides along so the deterministic
+    /// fleet halt this causes is diagnosable from the error alone.
+    ///
+    /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
+    /// the system caller, not a real state change — leaving it in the changeset would put a
+    /// spurious account into the bundle and diverge the state root. Every commit of a
+    /// system-call result must uphold this invariant; the EIP-4788/EIP-2935 pre-block calls do
+    /// so with a `retain` of their target contract, which also drops the touched beneficiary.
+    ///
+    /// On success the gas the call SPENT (see [`gas_spent`]) is accumulated under `label` for
+    /// [`Self::finish`] to publish. `label` is the `call` label value the gauge carries, so it is
+    /// a stable machine-readable name rather than the human `description`: the two are separate
+    /// because renaming a log line must not silently rename a metric series. Only the success arm
+    /// records — a revert or halt aborts the block, leaving no epoch close to report gas for.
+    ///
+    /// No receipt is built for a system call, matching Ethereum: the logs it emits reach neither
+    /// the receipts root, the header `logs_bloom`, nor `eth_getLogs`, and they must not, since
+    /// adding them would change `receipts_root` and be a hard fork. The success arm instead hands
+    /// them to [`surface_system_call_logs`], which is where the node-side `info!` lines and their
+    /// rationale live. That path is observational only and runs after the result is known good;
+    /// it touches neither `res.state` nor the gas accounting.
+    fn transact_and_commit_system_call(
         &mut self,
-        rewards: BTreeMap<Address, u32>,
+        contract: Address,
+        calldata: Bytes,
+        description: &str,
+        label: &'static str,
     ) -> TnRethResult<()> {
-        let calldata = self.generate_apply_incentives_calldata(
-            rewards.iter().map(|(address, count)| (*address, *count)).collect(),
-        )?;
-
-        trace!(target: "engine", ?calldata, "apply incentives calldata");
-
-        // execute system call to consensus registry
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
-            CONSENSUS_REGISTRY_ADDRESS,
-            calldata,
-        ) {
+        let mut res = match self.evm.transact_system_call(SYSTEM_ADDRESS, contract, calldata) {
             Ok(res) => res,
             Err(e) => {
                 // fatal error
-                error!(target: "engine", "error applying consensus block rewards contract call: {:?}", e);
+                error!(target: "engine", "error executing {description} contract call: {:?}", e);
+                return Err(TnRethError::EVMCustom(format!("{description} failed: {e}")));
+            }
+        };
+
+        // return error if the call executed but did not succeed, keeping Revert (decoded
+        // reason + selector) distinguishable from Halt
+        match &res.result {
+            ExecutionResult::Success { gas_used, gas_refunded, logs, .. } => {
+                self.epoch_close_gas.push(label, gas_spent(*gas_used, *gas_refunded));
+                surface_system_call_logs(description, logs);
+            }
+            ExecutionResult::Revert { output, gas_used } => {
+                let reason = alloy::sol_types::decode_revert_reason(output)
+                    .unwrap_or_else(|| "<undecodable revert reason>".to_string());
+                let selector = output
+                    .get(..4)
+                    .map(alloy::hex::encode_prefixed)
+                    .unwrap_or_else(|| format!("<{} bytes>", output.len()));
+                error!(
+                    target: "engine",
+                    %selector,
+                    raw_output = %output,
+                    gas_used,
+                    "failed {description} call: reverted: {reason}"
+                );
                 return Err(TnRethError::EVMCustom(format!(
-                    "applying consensus block rewards failed: {e}"
+                    "failed {description}: reverted: {reason}"
                 )));
             }
-        };
-
-        // return error if closing epoch call failed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed applying consensus block rewards call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom(
-                "failed applying consensus block rewards".to_string(),
-            ));
-        }
-        trace!(target: "engine", ?res, "applying consensus block rewards");
-
-        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
-        res.state.remove(&SYSTEM_ADDRESS);
-        // commit the changes
-        self.evm.db_mut().commit(res.state);
-
-        Ok(())
-    }
-
-    /// Apply the closing epoch call to ConsensusRegistry.
-    fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> TnRethResult<()> {
-        debug!(target: "engine", ?randomness, "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
-        trace!(target: "engine", ?calldata, "close epoch calldata");
-
-        // execute system call to consensus registry
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
-            CONSENSUS_REGISTRY_ADDRESS,
-            calldata,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", "error executing closing epoch contract call: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("epoch closing execution failed: {e}")));
+            ExecutionResult::Halt { reason, gas_used } => {
+                error!(
+                    target: "engine",
+                    gas_used,
+                    "failed {description} call: halted: {reason:?}"
+                );
+                return Err(TnRethError::EVMCustom(format!(
+                    "failed {description}: halted: {reason:?} (gas used {gas_used})"
+                )));
             }
-        };
-
-        trace!(target: "engine", ?res, "transact system call for conclude epoch");
-
-        // return error if closing epoch call failed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed to apply closing epoch call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom("failed to close epoch".to_string()));
         }
-
-        trace!(target: "engine", "closing epoch logs:\n{:?}", res.result.logs());
+        trace!(target: "engine", ?res, "{description}");
 
         // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
         res.state.remove(&SYSTEM_ADDRESS);
         // commit the changes
         self.evm.db_mut().commit(res.state);
+
         Ok(())
     }
 
-    /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
-    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
-        // shuffle all validators for new committee
-        let mut new_committee = self.shuffle_new_committee(randomness)?;
-
-        // sort addresses in ascending order (0x0...0xf)
-        new_committee.sort();
-        debug!(target: "engine", ?new_committee, "new committee sorted by address");
-
-        // encode the call to bytes with method selector and args
-        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
-            .abi_encode()
-            .into();
-
-        Ok(bytes)
-    }
-
-    /// Generate calldata for applying incentives when concluding the epoch.
-    fn generate_apply_incentives_calldata(
+    /// Close the epoch through the four boundary system calls, in order:
+    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`,
+    /// `setWorkerConfigsData(uint16[],uint184[])`.
+    ///
+    /// The order is a consensus-safety invariant. `applySlashes` commits before the committee is
+    /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
+    /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
+    /// validator is never seated in a future committee. Slashing is not live, so the slashes array
+    /// is always empty (production builds) and `applySlashes` is a no-op today; the call is
+    /// issued regardless so the sequence is correct by construction when slashing ships. The
+    /// base-fee record trails the registry calls (see [`Self::record_next_epoch_base_fees`]): it
+    /// touches a different contract, so nothing in the epoch transition reads what it writes.
+    fn apply_closing_epoch_contract_call(
         &mut self,
-        reward_infos: Vec<(Address, u32)>,
-    ) -> TnRethResult<Bytes> {
-        debug!(target: "engine", ?reward_infos, "applying incentives");
+        randomness: B256,
+        rewards: BTreeMap<Address, u32>,
+    ) -> TnRethResult<()> {
+        debug!(target: "engine", ?randomness, "applying closing contract call");
+        let reward_infos: Vec<(Address, u32)> =
+            rewards.iter().map(|(address, count)| (*address, *count)).collect();
 
-        // encode the call to bytes with method selector and args
-        let bytes = ConsensusRegistry::applyIncentivesCall {
+        // While the deployed registry still carries the pre-fork adiri code, close with the
+        // legacy two-call sequence instead, so every pre-fork epoch close (fresh-node onboarding,
+        // full resync) executes byte-identically to the historical chain. At the fork boundary
+        // `apply_consensus_registry_fork` swaps the code first, so this gate already sees the
+        // upgraded hash and takes the post-fork sequence below. The post-fork `applyIncentives`
+        // and `concludeEpoch(address[])` selectors are byte-identical to the legacy ones; the
+        // post-fork sequence differs only by the interposed `applySlashes` call.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.apply_closing_epoch_contract_call_legacy(randomness, reward_infos);
+        }
+
+        // 1. incentives, weighted on pre-slash collateral
+        let calldata = ConsensusRegistry::applyIncentivesCall {
             rewardInfos: reward_infos
                 .iter()
                 .map(|(address, count)| RewardInfo {
@@ -263,30 +532,1019 @@ where
         }
         .abi_encode()
         .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying incentives",
+            "apply_incentives",
+        )?;
+
+        // 2. slashes, landing before the committee is read
+        let slashes = self.epoch_boundary_slashes();
+        let calldata = ConsensusRegistry::applySlashesCall { slashes }.abi_encode().into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying slashes",
+            "apply_slashes",
+        )?;
+
+        // 3. assemble the committee from the post-slash eligible pool, then conclude
+        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
+        trace!(target: "engine", ?calldata, "close epoch calldata");
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+            "conclude_epoch",
+        )?;
+
+        // 4. publish the next epoch's per-worker base fees for the epoch that just began
+        self.record_next_epoch_base_fees()
+    }
+
+    /// Record every EIP-1559 worker's NEXT-epoch base fee in the `WorkerConfigs` contract's
+    /// per-worker `data` word.
+    ///
+    /// Fourth and last of the closing block's system calls, so the write lands in the same block
+    /// that seats the new committee: a node entering the epoch reads each worker's fee from one
+    /// state slot instead of scanning the whole prior epoch's headers to recompute it.
+    ///
+    /// The epoch entry CONSUMES this word rather than re-deriving it: the next epoch's entry read
+    /// (`read_base_fees_for_entered_epoch` in `tn_node::manager`) returns it through
+    /// `entry_fee_for_worker` (`tn-types`), which owns the per-row interpretation — so whatever is
+    /// written here IS the fee the fleet enters the next epoch on. The batch validator snapshots a
+    /// plain `u64` per epoch and compares base fees for exact equality, which leaves two binding
+    /// equalities: (a) the value written MUST equal the [`next_base_fee_for_config`] oracle over
+    /// the accumulator's current fee and the worker's epoch gas including this block's own, and
+    /// (b) it MUST equal what the live producer's close-time `adjust_base_fees` (in
+    /// `tn_node::manager`) computes, for as long as that tripwire survives (its removal is a noted
+    /// FOLLOW-UP in `tn-node`). Three details carry those equalities:
+    ///
+    /// - The worker set comes from the CONTRACT's `numWorkers`, not the accumulator's. Governance
+    ///   may have grown the worker set mid-epoch (a `setNumWorkers` only takes effect at this
+    ///   boundary), and the close-time adjustment reads the count at this same closing block. A
+    ///   worker with no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)` — the
+    ///   fresh-slot rule shared with `adjust_base_fees`' resize-then-compute.
+    /// - This block's own gas is folded into its worker's total. The accumulator does not include
+    ///   it yet (`inc_block` runs after the payload executes), while the close-time adjustment
+    ///   counts this block (it runs post-`inc_block`).
+    /// - The accumulator is only READ. It is shared live with the batch validator and the node
+    ///   manager, so resizing or clearing it here would corrupt state those readers depend on.
+    ///
+    /// `Static` workers are skipped: their fee is already on-chain in the config's `value` word,
+    /// so recording it would be redundant. A closing block with no EIP-1559 worker therefore
+    /// issues no system call at all — an emptiness every node computes identically from the same
+    /// contract state, so skipping cannot diverge the fleet.
+    ///
+    /// Fatal on any failure (read, decode, or a reverting/halting write), like every other step of
+    /// the close: the error aborts execution of the consensus output rather than committing a
+    /// block whose state diverges from the rest of the fleet. That is deliberately the opposite
+    /// of the manager-side close-time update (`apply_close_time_fee_updates` in `tn-node`), which
+    /// fails OPEN on a chain-global `WorkerConfigs` read failure — keeping the current fees is
+    /// safe there because every node deterministically computes the same keep. A silently skipped
+    /// write here would instead leave a stale `data` word for the entry-time read of the recorded
+    /// fee to trust later, so fatal-and-halt beats silently-wrong state.
+    fn record_next_epoch_base_fees(&mut self) -> TnRethResult<()> {
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let data = self.read_state_on_chain(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let (num_workers, entries) = decode_worker_fee_configs(&data).map_err(|e| {
+            error!(target: "engine", "failed to decode worker configs at epoch close: {e}");
+            TnRethError::EVMCustom(format!(
+                "failed to decode worker configs while recording next-epoch base fees: {e}"
+            ))
+        })?;
+
+        let own_worker = self.ctx.worker_id();
+        let own_gas = self.gas_used;
+        let accumulator_workers = self.ctx.gas_accumulator.num_workers();
+
+        let mut worker_ids: Vec<WorkerId> = Vec::new();
+        let mut datas: Vec<U184> = Vec::new();
+        for (worker_id, entry) in entries.iter().enumerate() {
+            let worker_id = worker_id as WorkerId;
+            match entry.config {
+                WorkerFeeConfig::Eip1559 { .. } => {}
+                // a static worker's fee is the config's `value` on-chain already
+                WorkerFeeConfig::Static { .. } => continue,
+            }
+
+            let (current_fee, gas_used) = if (worker_id as usize) < accumulator_workers {
+                let (_blocks, gas_used, _gas_limit) =
+                    self.ctx.gas_accumulator.get_values(worker_id);
+                (self.ctx.gas_accumulator.base_fee(worker_id).base_fee(), gas_used)
+            } else {
+                // governance added this worker mid-epoch: it has no slot to read, and a fresh
+                // slot is created with the min fee and zero gas
+                (MIN_PROTOCOL_BASE_FEE, 0)
+            };
+            // this block's gas reaches the accumulator only after execution finishes
+            let gas_used =
+                if worker_id == own_worker { gas_used.saturating_add(own_gas) } else { gas_used };
+
+            worker_ids.push(worker_id);
+            datas.push(U184::from(next_base_fee_for_config(entry.config, current_fee, gas_used)));
+        }
+
+        if worker_ids.is_empty() {
+            debug!(
+                target: "engine",
+                num_workers,
+                own_worker,
+                own_gas,
+                "no eip1559 workers configured; skipping next-epoch base fee record"
+            );
+            return Ok(());
+        }
+
+        debug!(
+            target: "engine",
+            num_workers,
+            own_worker,
+            own_gas,
+            ?worker_ids,
+            ?datas,
+            "recording next-epoch base fees"
+        );
+
+        let calldata = WorkerConfigs::setWorkerConfigsDataCall { workerIds: worker_ids, datas }
+            .abi_encode()
+            .into();
+        self.transact_and_commit_system_call(
+            WORKER_CONFIGS_ADDRESS,
+            calldata,
+            "recording next-epoch base fees",
+            "record_base_fees",
+        )
+    }
+
+    /// The slashes to submit at this epoch boundary.
+    ///
+    /// Slashing is not live: this always returns an empty list (production builds) and
+    /// `applySlashes` runs as a no-op. An automated slash producer plugs in here and nowhere
+    /// else. The caller sequences the returned slashes through `applySlashes` BEFORE the
+    /// committee size and eligible pool are read, so a slash-to-zero ejection is always
+    /// reflected in the committee that `concludeEpoch` validates. That end-to-end ordering is
+    /// pinned by `test_epoch_boundary_slash_ejects_through_production_close`, which injects a
+    /// slash-to-zero through the test seam and drives it through this production close path.
+    ///
+    /// Sizing contract for a future slash producer: amounts must be computed against
+    /// POST-incentive balances. `applyIncentives` credits `balances[validator]` before
+    /// `applySlashes` runs, and the registry ejects only when `balance <= slash.amount`
+    /// (otherwise it decrements and keeps the validator seated) — so an amount sized from the
+    /// pre-boundary balance under-slashes: the validator keeps the incentive delta and is never
+    /// ejected.
+    ///
+    /// Determinism: every node must derive an identical list (content and order) from the same
+    /// certified consensus output, or the boundary block diverges across the fleet.
+    #[cfg(not(test))]
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        Vec::new()
+    }
+
+    /// Test-only body for the epoch-boundary slash seam: yields the slashes injected through
+    /// `TNPayload::with_epoch_boundary_slashes` (carried on the execution ctx). See the
+    /// production body above for the ordering, sizing, and determinism contract.
+    #[cfg(test)]
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        self.ctx.epoch_boundary_slashes.clone()
+    }
+
+    /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed
+    /// by `concludeEpoch(address[])`.
+    ///
+    /// Byte-exact replay of the two system calls every pre-fork epoch close was produced with,
+    /// in the same order, so re-executed pre-fork blocks derive identical state roots. Pre-fork
+    /// chains never executed `applySlashes` (slashing was never live), so it is absent here. The
+    /// committee shuffle routes its pool read through the legacy ABI via the same code-hash gate
+    /// (`read_committee_eligible_pool`).
+    #[cfg(feature = "adiri")]
+    fn apply_closing_epoch_contract_call_legacy(
+        &mut self,
+        randomness: B256,
+        reward_infos: Vec<(Address, u32)>,
+    ) -> TnRethResult<()> {
+        use crate::system_calls::LegacyConsensusRegistry;
+
+        let calldata = LegacyConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| LegacyConsensusRegistry::RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying consensus block rewards",
+            "apply_incentives",
+        )?;
+
+        let mut new_committee = self.shuffle_new_committee(randomness)?;
+        new_committee.sort();
+        debug!(target: "engine", ?new_committee, "legacy new committee sorted by address");
+        let calldata = LegacyConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+            "conclude_epoch",
+        )
+    }
+
+    /// The upgraded `ConsensusRegistry` runtime bytecode and its code hash, sourced from the same
+    /// embedded artifact genesis deploys (`CONSENSUS_REGISTRY_JSON` `deployedBytecode.object`).
+    ///
+    /// Materialized once. The embedded artifact is a compile-time `include_str!` constant (the same
+    /// bytes genesis generation decodes, and exercised by the fork unit test), so a decode failure
+    /// here is a corrupt build — uniform across the fleet — not a live-node runtime condition;
+    /// hence `expect` rather than a fallible return.
+    #[cfg(feature = "adiri")]
+    fn consensus_registry_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+        use tn_config::CONSENSUS_REGISTRY_JSON;
+
+        static CODE: LazyLock<(Bytecode, B256)> = LazyLock::new(|| {
+            let value = crate::RethEnv::fetch_value_from_json_str(
+                CONSENSUS_REGISTRY_JSON,
+                Some("deployedBytecode.object"),
+            )
+            .expect("embedded consensus registry artifact json is valid");
+            let hex_str = value.as_str().expect("registry deployedBytecode.object is a string");
+            let raw =
+                alloy::hex::decode(hex_str).expect("registry deployedBytecode.object is valid hex");
+            let bytecode = Bytecode::new_raw(raw.into());
+            let code_hash = bytecode.hash_slow();
+            (bytecode, code_hash)
+        });
+
+        &CODE
+    }
+
+    /// The upgraded `WorkerConfigs` runtime bytecode and its code hash, sourced from the same
+    /// embedded artifact genesis deploys (`WORKER_CONFIGS_JSON` `deployedBytecode.object`).
+    ///
+    /// Materialized once. The embedded artifact is a compile-time `include_str!` constant (the
+    /// same bytes genesis generation decodes, and exercised by the fork unit test), so a decode
+    /// failure here is a corrupt build — uniform across the fleet — not a live-node runtime
+    /// condition; hence `expect` rather than a fallible return.
+    #[cfg(feature = "adiri")]
+    fn worker_configs_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+        use tn_config::WORKER_CONFIGS_JSON;
+
+        static CODE: LazyLock<(Bytecode, B256)> = LazyLock::new(|| {
+            let value = crate::RethEnv::fetch_value_from_json_str(
+                WORKER_CONFIGS_JSON,
+                Some("deployedBytecode.object"),
+            )
+            .expect("embedded worker configs artifact json is valid");
+            let hex_str =
+                value.as_str().expect("worker configs deployedBytecode.object is a string");
+            let raw = alloy::hex::decode(hex_str)
+                .expect("worker configs deployedBytecode.object is valid hex");
+            let bytecode = Bytecode::new_raw(raw.into());
+            let code_hash = bytecode.hash_slow();
+            (bytecode, code_hash)
+        });
+
+        &CODE
+    }
+
+    /// Apply the in-protocol `ConsensusRegistry` fork.
+    ///
+    /// Swaps the deployed registry runtime bytecode to the upgraded version — preserving the
+    /// account's balance, nonce, and **all** existing storage (the new state is a clean append, so
+    /// the swap rewrites only the account-code leaf) — then runs the one-time
+    /// `migrateValidatorSets()` that back-fills the appended per-status `validatorSets` and cached
+    /// `eligibleValidatorCount` from the preserved `currentStatus` source of truth.
+    ///
+    /// Fires exactly once, from the epoch-closing block that concludes
+    /// `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, as the FIRST step of that block's close-epoch handling
+    /// — before `concludeEpoch`, which then runs on the swapped-in code with
+    /// the migrated sets (the new committee read and eligible-count guard require them). From
+    /// this block onward every node runs on the new code with populated sets.
+    ///
+    /// Determinism: the production path (`context_for_next_block`) and the replay path
+    /// (`context_for_block`) build an identical `ctx.nonce`/`ctx.close_epoch` from the same
+    /// `ConsensusOutput`, and this routine is a pure function of the committed state plus the
+    /// embedded artifact, so every node re-derives a byte-identical `state_root`.
+    ///
+    /// Fail-closed gate: the swap proceeds only if the registry account's current code hash
+    /// equals the pinned `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`; any other deployment aborts the
+    /// block. Aborting cannot split the network: the check is a pure function of committed
+    /// state, so every fork-capable node evaluates it identically and fails (or passes) in
+    /// lockstep.
+    ///
+    /// Fatal on failure — a partial or failed migration diverges state across the fleet.
+    #[cfg(feature = "adiri")]
+    fn apply_consensus_registry_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState},
+            Database as _,
+        };
+
+        let (code, code_hash) = Self::consensus_registry_runtime_code().clone();
+
+        // Preserve the registry account's balance + nonce; only the code changes. Reading via
+        // `basic` also loads the account into the `State` cache so the code-only commit below takes
+        // the `change` path (info updated, storage left intact) rather than creating a new account.
+        let current = self
+            .evm
+            .db_mut()
+            .basic(CONSENSUS_REGISTRY_ADDRESS)
+            .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
+            .unwrap_or_default();
+
+        // Fail closed on an unexpected pre-fork deployment. The swap + `migrateValidatorSets()`
+        // assume the exact storage layout of the pinned pre-fork registry code (the registry is
+        // non-upgradeable, so on the live chain this is the fixed genesis code hash); migrating
+        // over anything else risks silent state corruption. Abort the block instead — the check is
+        // a pure function of committed state, so every fork-capable node fails uniformly rather
+        // than diverging.
+        if current.code_hash != tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_swap_code_hash = %current.code_hash,
+                expected = %tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+                "consensus registry fork failing closed: unexpected pre-fork registry code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "consensus registry fork failing closed: pre-swap code hash {} does not match \
+                 the pinned pre-fork deployment {}",
+                current.code_hash,
+                tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+            )));
+        }
+
+        debug!(
+            target: "engine",
+            pre_swap_code_hash = %current.code_hash,
+            new_code_hash = %code_hash,
+            "applying consensus registry fork",
+        );
+
+        // Commit a code-only override: an empty storage map and a plain `Touched` status (never
+        // `Created`/`SelfDestructed`) so no storage slot enters the bundle and the existing storage
+        // root is preserved — only the single account-code leaf changes. The new bytecode is
+        // carried inline on the account info, so it is registered in the bundle's contracts
+        // (for post-restart `code_by_hash`) and is immediately loadable by the migration
+        // call below.
+        let account = Account {
+            info: AccountInfo {
+                balance: current.balance,
+                nonce: current.nonce,
+                code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+            status: AccountStatus::Touched,
+            ..Default::default()
+        };
+        self.evm.db_mut().commit(EvmState::from_iter([(CONSENSUS_REGISTRY_ADDRESS, account)]));
+
+        // Run the one-time migration. Dispatches to the just-swapped new code.
+        let calldata = ConsensusRegistry::migrateValidatorSetsCall {}.abi_encode().into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "consensus registry migration",
+            "registry_migration",
+        )?;
+
+        // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
+        // deliberately non-fatal: the migration is already committed above, so a hiccup on this
+        // cosmetic read must not abort the block (which would discard a valid, deterministic
+        // migration) — and must not alarm at `error!` either, hence the `try_` variant + `debug!`.
+        // Pure read — state is not committed.
+        let calldata = ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into();
+        let eligible = self
+            .try_read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)
+            .inspect_err(|e| {
+                debug!(target: "engine", "non-fatal eligible-count readback after migration failed: {e}");
+            })
+            .ok()
+            .and_then(|data| {
+                <U256 as alloy::sol_types::SolValue>::abi_decode(&data)
+                    .inspect_err(|e| {
+                        debug!(
+                            target: "engine",
+                            "non-fatal eligible-count readback after migration returned undecodable data: {e}"
+                        );
+                    })
+                    .ok()
+            });
+
+        tracing::info!(target: "engine", ?eligible, %code_hash, "consensus registry fork applied");
+        Ok(())
+    }
+
+    /// Apply the in-protocol `WorkerConfigs` fork.
+    ///
+    /// Swaps the deployed worker-configs runtime bytecode to the current artifact's — preserving
+    /// the account's balance, nonce, and **all** existing storage (slots 0-3: `_owner`, the
+    /// `_pendingOwner` + `numWorkers` packing, the `_workerConfigs` mapping, and
+    /// `_workerConfigSet`), so the swap rewrites only the account-code leaf.
+    ///
+    /// Ships at the SAME fork boundary as [`Self::apply_consensus_registry_fork`] (the
+    /// epoch-closing block of `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, registry first) because the
+    /// two are coupled through this very block's close: the registry swap flips the code-hash
+    /// gate in `apply_closing_epoch_contract_call` onto the post-fork sequence, whose fourth
+    /// call ([`Self::record_next_epoch_base_fees`]) invokes the `setWorkerConfigsData` selector
+    /// — absent from the live pre-fork `WorkerConfigs` deployment (an old build whose
+    /// `WorkerConfig.data` is a `uint128` and which exposes no protocol write path at all). A
+    /// build applying one swap but not the other therefore diverges from fork-capable peers: its
+    /// own fourth system call reverts and aborts this block.
+    ///
+    /// Unlike the registry fork there is NO migrate-style initializer call: the pre-fork
+    /// deployment already holds `_workerConfigSet[0] = true` and `numWorkers = 1`, so
+    /// `getAllWorkerConfigs` (and the `_workerConfigSet` guard inside `setWorkerConfigsData`)
+    /// work immediately post-swap. The appended `maxStrategy` slot (slot 4) deliberately reads 0
+    /// after the code-only swap: a documented governance runbook item — one owner
+    /// `setMaxStrategy(1)` transaction after the fork (see
+    /// `tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH`). The protocol write path never reads
+    /// `maxStrategy`, so the zeroed ceiling gates future governance actions only.
+    ///
+    /// Fail-closed gate: the swap proceeds only if the worker-configs account's current code
+    /// hash equals the pinned `WORKER_CONFIGS_PRE_FORK_CODE_HASH`; any other deployment aborts
+    /// the block. Aborting cannot split the network: the check is a pure function of committed
+    /// state, so every fork-capable node evaluates it identically and fails (or passes) in
+    /// lockstep.
+    ///
+    /// Fatal on failure — a partial swap diverges state across the fleet.
+    #[cfg(feature = "adiri")]
+    fn apply_worker_configs_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState},
+            Database as _,
+        };
+
+        let (code, code_hash) = Self::worker_configs_runtime_code().clone();
+
+        // Preserve the worker-configs account's balance + nonce; only the code changes. Reading
+        // via `basic` also loads the account into the `State` cache so the code-only commit below
+        // takes the `change` path (info updated, storage left intact) rather than creating a new
+        // account.
+        let current = self
+            .evm
+            .db_mut()
+            .basic(WORKER_CONFIGS_ADDRESS)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!("worker configs account read failed: {e}"))
+            })?
+            .unwrap_or_default();
+
+        // Fail closed on an unexpected pre-fork deployment. The code-only swap assumes the exact
+        // storage layout of the pinned pre-fork worker-configs code (on the live chain this is
+        // the fixed genesis code hash); swapping over anything else risks silent state
+        // corruption. Abort the block instead — the check is a pure function of committed state,
+        // so every fork-capable node fails uniformly rather than diverging.
+        if current.code_hash != tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_swap_code_hash = %current.code_hash,
+                expected = %tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "worker configs fork failing closed: unexpected pre-fork worker configs code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "worker configs fork failing closed: pre-swap code hash {} does not match the \
+                 pinned pre-fork deployment {}",
+                current.code_hash,
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+            )));
+        }
+
+        debug!(
+            target: "engine",
+            pre_swap_code_hash = %current.code_hash,
+            new_code_hash = %code_hash,
+            "applying worker configs fork",
+        );
+
+        // Commit a code-only override: an empty storage map and a plain `Touched` status (never
+        // `Created`/`SelfDestructed`) so no storage slot enters the bundle and the existing
+        // storage root is preserved — only the single account-code leaf changes. The new bytecode
+        // is carried inline on the account info, so it is registered in the bundle's contracts
+        // (for post-restart `code_by_hash`) and is immediately callable by the fourth system call
+        // of this same block's close.
+        let account = Account {
+            info: AccountInfo {
+                balance: current.balance,
+                nonce: current.nonce,
+                code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+            status: AccountStatus::Touched,
+            ..Default::default()
+        };
+        self.evm.db_mut().commit(EvmState::from_iter([(WORKER_CONFIGS_ADDRESS, account)]));
+
+        tracing::info!(target: "engine", %code_hash, "worker configs fork applied");
+        Ok(())
+    }
+
+    /// The canonical Safe v1.4.1 suite the governance-Safe fork installs, decoded once from
+    /// the vendored byte-exact Ethereum-mainnet captures embedded at compile time.
+    ///
+    /// Row order, addresses, and hashes come from
+    /// `tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`; every decoded byte string is
+    /// asserted against its pinned hash at materialization, so a drifted or corrupt vendored
+    /// file is a corrupt build — uniform across the fleet — not a live-node runtime condition;
+    /// hence panics rather than fallible returns, on the same terms as
+    /// [`Self::consensus_registry_runtime_code`]. (The tn-types pin test
+    /// `test_governance_safe_fork_canonical_suite_pinned` checks the identical property in
+    /// default-feature CI.)
+    #[cfg(feature = "adiri")]
+    fn governance_safe_fork_suite() -> &'static [GovernanceSafeForkInstall] {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+
+        /// The vendored canonical runtime bytes, in
+        /// `GOVERNANCE_SAFE_FORK_CANONICAL_SUITE` row order — the same files mainnet genesis
+        /// etches (`tn-contracts/deployments/genesis/canonical-bytecode/`, provenance in its
+        /// README).
+        const VENDORED_HEX: [&str; 13] = [
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/Safe.hex"),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeProxyFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/CompatibilityFallbackHandler.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Setup.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSend.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSendCallOnly.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SignMessageLib.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/CreateCall.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SimulateTxAccessor.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeSingletonFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeMigration.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Migration.hex"
+            ),
+        ];
+
+        /// SafeL2's `threshold` slot (4) seeds 1, replicating the constructor the etched code
+        /// never runs; without it anyone could `setup()`-hijack the fresh singleton. The Safe
+        /// singleton needs no row: its slot 4 = 1 came from the live recompile's constructor
+        /// and survives the code-only swap.
+        const SAFE_L2_THRESHOLD_STORAGE: &[(U256, U256)] =
+            &[(U256::from_limbs([4, 0, 0, 0]), U256::from_limbs([1, 0, 0, 0]))];
+
+        static SUITE: LazyLock<Vec<GovernanceSafeForkInstall>> = LazyLock::new(|| {
+            tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+                .iter()
+                .zip(VENDORED_HEX)
+                .map(|((name, address, expected_hash), hex)| {
+                    let raw = alloy::hex::decode(hex.trim())
+                        .unwrap_or_else(|e| panic!("vendored {name}.hex is valid hex: {e}"));
+                    let bytecode = Bytecode::new_raw(raw.into());
+                    let code_hash = bytecode.hash_slow();
+                    assert_eq!(
+                        code_hash, *expected_hash,
+                        "{name}: vendored canonical bytecode must hash to its \
+                         GOVERNANCE_SAFE_FORK_CANONICAL_SUITE pin",
+                    );
+                    let pre_fork_code_hash = match *name {
+                        "Safe" => Some(tn_types::forks::SAFE_SINGLETON_PRE_FORK_CODE_HASH),
+                        "SafeProxyFactory" => {
+                            Some(tn_types::forks::SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH)
+                        }
+                        _ => None,
+                    };
+                    let storage: &'static [(U256, U256)] =
+                        if *name == "SafeL2" { SAFE_L2_THRESHOLD_STORAGE } else { &[] };
+                    GovernanceSafeForkInstall {
+                        name,
+                        address: *address,
+                        bytecode,
+                        code_hash,
+                        pre_fork_code_hash,
+                        storage,
+                    }
+                })
+                .collect()
+        });
+
+        &SUITE
+    }
+
+    /// Apply the in-protocol governance-Safe fork.
+    ///
+    /// Brings live adiri's Safe stack to parity with mainnet genesis in one deterministic
+    /// commit (see `tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH` for the full runbook):
+    /// - **etch** the eleven canonical v1.4.1 contracts adiri lacks (SafeL2, the fallback handler,
+    ///   the delegatecall libraries, both migration helpers, the singleton factory) — forcing the
+    ///   canonical bytes over whatever the address holds, so the boundary is idempotent over an
+    ///   already-canonical deployment and an unknown occupant is displaced at `warn!` rather than
+    ///   halting the fleet (balance and unseeded storage are preserved; the nonce clamps up to the
+    ///   EIP-161 contract-account value 1, mirroring mainnet genesis);
+    /// - **swap** the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical bytes —
+    ///   code-only, preserving balance, nonce, and all storage, gated fail-closed on the pinned
+    ///   pre-fork hashes (Safe v1.4.1 storage layout is identical between the recompile and the
+    ///   canonical build, so the preserved slots stay valid);
+    /// - **migrate** the governance Safe proxy onto SafeL2: slot 0 (singleton) and the
+    ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's pinned
+    ///   code hash AND on slot 0 still holding the L1 singleton. Owners, threshold, the Safe nonce,
+    ///   and the TEL balance are untouched (preserved by omission — only changed slots enter the
+    ///   bundle). The handler slot itself is written unconditionally — it is a slot the fork
+    ///   defines — and an owner-installed third-party handler is recorded at `warn!` rather than
+    ///   aborting the boundary;
+    /// - **mark** the Safe Singleton Factory's deployer EOA at nonce 1, the one mainnet-genesis
+    ///   leaf adiri would otherwise lack because it never ran the presigned deployment transaction.
+    ///   Nonce-only and monotonic, so it neither disturbs a live account nor rewinds under replay.
+    ///
+    /// Fires exactly once, from the epoch-closing block that concludes
+    /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` (one-shot `==` trigger in `finish`). No system call
+    /// follows it in this block that reads Safe state, so ordering relative to the epoch-close
+    /// sequence is not load-bearing; it runs before the close for symmetry with the registry
+    /// fork.
+    ///
+    /// Determinism: a pure function of committed state plus the embedded vendored bytes —
+    /// every gate reads committed state only, so the whole fleet passes or aborts in lockstep
+    /// and re-derives a byte-identical `state_root`. Nothing is committed until every gate
+    /// holds; fatal on failure, like the registry fork.
+    #[cfg(feature = "adiri")]
+    fn apply_governance_safe_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`/`storage`; imported anonymously to avoid
+        // clashing with the `alloy_evm::Database` already in module scope.
+        use alloy::primitives::address;
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorage, EvmStorageSlot},
+            Database as _,
+        };
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        let suite = Self::governance_safe_fork_suite();
+        let address_of = |name: &str| {
+            suite
+                .iter()
+                .find(|install| install.name == name)
+                .map(|install| install.address)
+                .expect("governance safe fork suite carries every canonical row")
+        };
+        let safe_l1_singleton = address_of("Safe");
+        let safe_l2_singleton = address_of("SafeL2");
+        let fallback_handler = address_of("CompatibilityFallbackHandler");
+
+        // Stage every account before committing anything: each gate is a pure function of
+        // committed state, so every fork-capable node evaluates the full set identically and
+        // fails (or passes) in lockstep, and a failure aborts the block with no partial
+        // migration. Reading via `basic` also loads each account into the `State` cache, which
+        // the commit below requires even for absent accounts.
+        let mut staged: Vec<(Address, Account)> = Vec::with_capacity(suite.len() + 2);
+        for install in suite {
+            let current = self
+                .evm
+                .db_mut()
+                .basic(install.address)
+                .map_err(|e| {
+                    TnRethError::EVMCustom(format!("{}: account read failed: {e}", install.name))
+                })?
+                .unwrap_or_default();
+
+            let account = if let Some(pin) = install.pre_fork_code_hash {
+                // In-place swap of a live recompiled deployment: rewrite only the
+                // account-code leaf (empty storage map + plain `Touched`, same shape as the
+                // registry swap).
+                //
+                // An already-canonical singleton is this fork's own end state, not drift:
+                // accept it and let the restated write drop out of the changeset, so
+                // re-executing the boundary over already-forked state is a no-op rather than a
+                // fleet-wide abort. Any OTHER hash still fails closed — unlike the etch rows
+                // this branch preserves the account's storage, which is only sound over a
+                // layout the pin vouches for.
+                if current.code_hash != pin && current.code_hash != install.code_hash {
+                    error!(
+                        target: "engine",
+                        contract = install.name,
+                        pre_swap_code_hash = %current.code_hash,
+                        expected = %pin,
+                        "governance safe fork failing closed: unexpected pre-fork code",
+                    );
+                    return Err(TnRethError::EVMCustom(format!(
+                        "governance safe fork failing closed: {} code hash {} does not match \
+                         the pinned pre-fork deployment {}",
+                        install.name, current.code_hash, pin,
+                    )));
+                }
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce,
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                }
+            } else {
+                // Etch the canonical bytes. Deliberately NOT fail-closed on an occupied
+                // address, for the same reason as the fallback-handler slot below: the
+                // boundary exists to put the canonical suite at the canonical addresses, and
+                // halting the whole fleet on the epoch-closing block would sacrifice the
+                // migration over an address the fork itself defines. Three pre-states reach
+                // here and all three land on the canonical end state:
+                // - **no code** — the live chain's state, and what the etch is written for;
+                // - **already the canonical bytes** — a legitimate deployment through the Safe
+                //   singleton factory, which the vendored-bytecode README markets as the supported
+                //   way to add canonical Safe contracts. The write restates what is already there:
+                //   the code leaf is unchanged and each seeded slot is read through below, so an
+                //   already-seeded value drops out of the changeset via the `is_changed` filter and
+                //   `state_root` is unaffected. That is also what makes the whole boundary
+                //   idempotent under re-execution;
+                // - **an unknown occupant** — displaced, loudly. Only the seeded slots are written,
+                //   so the occupant's other storage survives untouched and its code hash stays
+                //   recoverable from the node record.
+                if !current.is_empty_code_hash() && current.code_hash != install.code_hash {
+                    tracing::warn!(
+                        target: "engine",
+                        contract = install.name,
+                        address = %install.address,
+                        displaced_code_hash = %current.code_hash,
+                        canonical_code_hash = %install.code_hash,
+                        "governance safe fork displacing an unexpected deployment at a \
+                         canonical Safe address: the displaced code hash is recorded here and \
+                         the account's storage is left in place",
+                    );
+                }
+                // read each seeded slot through rather than assuming an empty account: a
+                // canonical deployment already ran the constructor this seeding replicates
+                // (SafeL2 inherits `Safe`'s `threshold = 1`), so the honest original value
+                // keeps the revert accurate and lets the no-op drop out of the changeset
+                let mut storage = EvmStorage::default();
+                for (slot, value) in install.storage {
+                    let live = self.evm.db_mut().storage(install.address, *slot).map_err(|e| {
+                        TnRethError::EVMCustom(format!(
+                            "{}: storage slot {slot} read failed: {e}",
+                            install.name,
+                        ))
+                    })?;
+                    storage.insert(*slot, EvmStorageSlot::new_changed(live, *value, 0));
+                }
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce.max(1),
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    storage,
+                    // plain `Touched`, never `Created`: over an occupied address `Created`
+                    // routes `apply_account_state` onto `newly_created`, which swaps the cache
+                    // account's storage map out wholesale and marks the bundle entry
+                    // `InMemoryChange` — in-block reads of any unseeded slot would then answer
+                    // zero while the state trie, which wipes only on `was_destroyed`, still
+                    // carries the committed value. `Touched` reaches that same
+                    // `InMemoryChange` for an address that never existed, so the empty path is
+                    // bit-for-bit unchanged.
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                }
+            };
+            staged.push((install.address, account));
+        }
+
+        // governance Safe proxy: two storage writes behind two gates, everything else untouched
+        let governance = self
+            .evm
+            .db_mut()
+            .basic(GOVERNANCE_SAFE_ADDRESS)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe account read failed: {e}"))
+            })?
+            .unwrap_or_default();
+        if governance.code_hash != tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_fork_code_hash = %governance.code_hash,
+                expected = %tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+                "governance safe fork failing closed: unexpected governance proxy code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy code hash {} does not \
+                 match the pinned pre-fork deployment {}",
+                governance.code_hash,
+                tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+            )));
+        }
+        let singleton_slot =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, U256::ZERO).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe slot 0 read failed: {e}"))
+            })?;
+        let expected_singleton = U256::from_be_bytes(safe_l1_singleton.into_word().0);
+        let migrated_singleton = U256::from_be_bytes(safe_l2_singleton.into_word().0);
+        // slot 0 already on SafeL2 is this fork's own end state, not drift: accept it so a
+        // re-execution over already-forked state is a no-op. Any other singleton means the
+        // proxy was repointed at an unknown implementation and the migration's assumptions
+        // about its layout no longer hold, so that still fails closed.
+        if singleton_slot != expected_singleton && singleton_slot != migrated_singleton {
+            error!(
+                target: "engine",
+                slot0 = %singleton_slot,
+                expected = %expected_singleton,
+                "governance safe fork failing closed: governance proxy slot 0 is not the L1 \
+                 Safe singleton",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy slot 0 holds {} instead \
+                 of the pre-fork L1 Safe singleton {}",
+                singleton_slot, expected_singleton,
+            )));
+        }
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, derived exactly as the Safe source
+        // does. Unlike the two gates above, this slot is deliberately NOT fail-closed: the
+        // migration is entitled to own it, so all three reachable pre-states are written
+        // through rather than aborting the block.
+        // - **unset** (`U256::ZERO`) — the live chain's state, and the reason the write exists at
+        //   all: SafeL2 routes unknown selectors through the handler, so the proxy needs the
+        //   canonical one before it runs on the L2 singleton.
+        // - **already canonical** — the write is a no-op and drops straight out of the changeset
+        //   via the `is_changed` filter, so the `state_root` is unaffected.
+        // - **a third-party handler** — reachable at any time: `setFallbackHandler` is `authorized`
+        //   (`msg.sender == address(this)`), so an owner quorum can repoint this slot at any point
+        //   before the boundary (on adiri, the block that closes epoch 553; the fork epoch is 554).
+        //   The fork overwrites it anyway. Aborting would stall the entire fleet on the
+        //   epoch-closing block over a slot the migration defines, and the canonical handler is the
+        //   value the post-fork SafeL2 stack expects; getting the intended storage and bytecode in
+        //   place is what the boundary is for. The overwrite is loud rather than silent — the
+        //   `warn!` below records the displaced address alongside its replacement, so the prior
+        //   value stays recoverable from the node record and the owners can re-install it
+        //   afterwards with an ordinary `execTransaction`.
+        let handler_slot = U256::from_be_bytes(
+            alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
+        );
+        let current_handler =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, handler_slot).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe handler slot read failed: {e}"))
+            })?;
+        let canonical_handler = U256::from_be_bytes(fallback_handler.into_word().0);
+        if current_handler != U256::ZERO && current_handler != canonical_handler {
+            tracing::warn!(
+                target: "engine",
+                displaced_handler = %current_handler,
+                canonical_handler = %canonical_handler,
+                "governance safe fork overwriting a non-canonical fallback handler: the \
+                 displaced value is recorded here and can be re-installed by owner action",
+            );
+        }
+        let governance_storage: EvmStorage = [
+            (U256::ZERO, EvmStorageSlot::new_changed(singleton_slot, migrated_singleton, 0)),
+            (handler_slot, EvmStorageSlot::new_changed(current_handler, canonical_handler, 0)),
+        ]
+        .into_iter()
+        .collect();
+        staged.push((
+            GOVERNANCE_SAFE_ADDRESS,
+            Account {
+                // account info passes through unchanged: balance, nonce, and code stay exactly
+                // as committed — the migration is the two storage slots above
+                info: governance,
+                storage: governance_storage,
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
+        /// Safe Singleton Factory deployer EOA.
+        ///
+        /// Mainnet genesis allocates this account `nonce: 0x1, balance: 0x0` with no code, to
+        /// mark its nonce-0 presigned deployment transaction as spent — the same treatment
+        /// every other deployer EOA in that alloc receives (see
+        /// `tn-contracts/deployments/genesis/canonical-bytecode/README.md`, "Nonces are set as
+        /// if the deployments happened"). Note this one is not a Nick's-method keyless address:
+        /// Safe holds the key and signs one deployment transaction per chain, which is why the
+        /// marker has to be written rather than earned by replaying a public transaction.
+        const SAFE_SINGLETON_FACTORY_DEPLOYER: Address =
+            address!("0xE1CB04A0fA36DdD16a06ea828007E35e1a3cBC37");
+
+        // Adiri never ran that presigned transaction, so the etch above installs the factory
+        // without its deployer marker and post-fork adiri would differ from mainnet genesis by
+        // exactly this one state-trie leaf. Touch the nonce here to close the gap. Nonce-only:
+        // balance, code, and any storage pass through untouched (empty storage map + plain
+        // `Touched`, the same shape as the code-only swaps above).
+        //
+        // Deliberately not fail-closed, for the same reason as the handler slot: an unexpected
+        // occupant is worth a record, not a fleet-wide halt on the epoch-closing block. Raising
+        // the nonce of an account that somehow carries code is harmless — it neither disturbs
+        // that code nor its storage — whereas aborting would sacrifice the whole migration over
+        // a leaf with no bearing on the Safe stack's behavior.
+        //
+        // `.max(1)` rather than `= 1` so the write is monotonic. A nonce is only ever raised by
+        // execution, so clamping up preserves determinism under replay: a node re-executing
+        // this block over state where the account has already moved past 1 (a live transaction,
+        // or a re-run against already-forked state) lands on the same value every other node
+        // does, instead of rewinding the leaf and deriving a different `state_root`.
+        let deployer = self
+            .evm
+            .db_mut()
+            .basic(SAFE_SINGLETON_FACTORY_DEPLOYER)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!(
+                    "safe singleton factory deployer account read failed: {e}"
+                ))
+            })?
+            .unwrap_or_default();
+        if !deployer.is_empty_code_hash() {
+            tracing::warn!(
+                target: "engine",
+                address = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+                found_code_hash = %deployer.code_hash,
+                "governance safe fork marking the singleton-factory deployer nonce over an \
+                 account that unexpectedly carries code: code and storage are left untouched",
+            );
+        }
+        staged.push((
+            SAFE_SINGLETON_FACTORY_DEPLOYER,
+            Account {
+                info: AccountInfo { nonce: deployer.nonce.max(1), ..deployer },
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
+        self.evm.db_mut().commit(EvmState::from_iter(staged));
+
+        tracing::info!(
+            target: "engine",
+            installed = suite.len(),
+            singleton = %safe_l2_singleton,
+            handler = %fallback_handler,
+            factory_deployer = %SAFE_SINGLETON_FACTORY_DEPLOYER,
+            "governance safe fork applied: canonical Safe v1.4.1 suite installed, singleton \
+             factory deployer nonce marked, governance proxy migrated to SafeL2",
+        );
+        Ok(())
+    }
+
+    /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
+    ///
+    /// The seeded shuffle decides committee membership; the shuffled addresses are then sorted
+    /// ascending, so the encoded committee list is order-normalized while membership remains a
+    /// pure function of the RNG draws.
+    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
+        // shuffle all validators for new committee. Runs after `applySlashes` has committed, so
+        // the eligible-pool read reflects any slash-to-zero ejections
+        let mut new_committee = self.shuffle_new_committee(randomness)?;
+
+        // sort addresses in ascending order (0x0...0xf)
+        new_committee.sort();
+        debug!(target: "engine", ?new_committee, "new committee sorted by address");
+
+        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
 
         Ok(bytes)
     }
 
     /// Read eligible validators from latest state and shuffle the committee deterministically.
+    ///
+    /// The deterministic assembly, trim, and undersized-committee check live in the pure
+    /// [`assemble_new_committee`] free function; this method only performs the on-chain reads and
+    /// seeds the RNG so that the assembly logic stays unit-testable without a live EVM state.
+    ///
+    /// `randomness` is `ctx.close_epoch`, the epoch-gated committee-shuffle seed (epoch seed chain
+    /// value for fork-active epochs, legacy leader-aggregate keccak before the fork), used
+    /// verbatim as the `StdRng` seed, so every node derives the same RNG
+    /// stream. The downstream draw order is consensus-critical: the draws decide which
+    /// validators survive the truncation to committee size.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
-        // read all active validators from consensus registry
-        let calldata =
-            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
-                .abi_encode()
-                .into();
-        let state =
-            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-
-        trace!(target: "engine", "get validators call:\n{:?}", state);
-
-        let all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> =
-            alloy::sol_types::SolValue::abi_decode(&state)?;
+        let all_active_validators = self.read_committee_eligible_pool()?;
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
-        // create seed from hashed bls agg signature
+        // create seed from the epoch-close randomness carried in `ctx.close_epoch`
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
         trace!(target: "engine", ?seed, "seed after");
@@ -294,74 +1552,148 @@ where
         // used as deterministic randomness
         let mut rng = StdRng::from_seed(seed);
 
-        // 1) separate active and pending validators
-        // 2) check if active length is sufficient
-        // 3) if missing, randomly select from the pending validators
-        let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
-            .into_iter()
-            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
-
-        let active_validator_count = active_validators.len();
-        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
-            // enough active validators for next committee
-            active_validators
-        } else {
-            // NOTE: already checked if active_validator_count >= new_committee_size above
-            let num_missing = new_committee_size - active_validator_count;
-
-            // randomly take enough pending exit validators to reach new committee size
-            let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
-            active_validators.extend(random_pending);
-            active_validators
-        };
-
-        // simple Fisher-Yates shuffle
-        for i in (1..validators_for_shuffle.len()).rev() {
-            let j = rng.random_range(0..=i);
-            validators_for_shuffle.swap(i, j);
-        }
-
-        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
-
-        let mut new_committee =
-            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
-
-        // trim the shuffled committee to maintain correct size
-        new_committee.truncate(new_committee_size);
-
-        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
-
-        Ok(new_committee)
+        assemble_new_committee(new_committee_size, all_active_validators, &mut rng)
     }
 
-    /// Read state on-chain.
+    /// Read the committee-eligible validator pool from the consensus registry.
+    ///
+    /// The registry's per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status
+    /// set; the committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit
+    /// }` (the statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes
+    /// the O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool*
+    /// by unioning these queries off-chain. We use `getValidatorsInfo` (full structs) because the
+    /// pending-exit validators are separated out by `currentStatus` in `shuffle_new_committee`.
+    fn read_committee_eligible_pool(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        // While the deployed registry still carries the pre-fork adiri code, `getValidatorsInfo`
+        // does not exist on-chain — speak the legacy ABI instead. This keeps every pre-fork epoch
+        // close (fresh-node onboarding, full resync, a fork-capable build deployed before
+        // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain. At
+        // the fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
+        // already sees the upgraded hash and takes the post-fork read below.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.read_committee_eligible_pool_legacy();
+        }
+
+        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
+        for status in [
+            ValidatorStatus::Active,
+            ValidatorStatus::PendingActivation,
+            ValidatorStatus::PendingExit,
+        ] {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
+                .abi_encode()
+                .into();
+            let state =
+                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
+            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+                alloy::sol_types::SolValue::abi_decode(&state)?;
+            all_active_validators.extend(validators);
+        }
+
+        Ok(all_active_validators)
+    }
+
+    /// Whether the deployed `ConsensusRegistry` still carries the pre-fork adiri runtime code.
+    ///
+    /// Compares the registry account's code hash against the pinned
+    /// [`tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]. A pure `basic()` read: the
+    /// account is neither touched nor committed, so the gate never enters the bundle/state root —
+    /// it is a deterministic function of committed state, identical on the production and replay
+    /// paths.
+    ///
+    /// A DB error propagates as an error; only a genuinely absent account (impossible on any real
+    /// TN chain) falls through to the default (non-pre-fork) hash. An infra failure must never be
+    /// silently read as "not V1".
+    #[cfg(feature = "adiri")]
+    fn registry_code_is_pre_fork(&mut self) -> TnRethResult<bool> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::Database as _;
+
+        let code_hash = self
+            .evm
+            .db_mut()
+            .basic(CONSENSUS_REGISTRY_ADDRESS)
+            .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
+            .unwrap_or_default()
+            .code_hash;
+
+        Ok(code_hash == tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH)
+    }
+
+    /// Read the committee-eligible pool via the PRE-fork registry ABI.
+    ///
+    /// Byte-exact replay of the protocol read every pre-fork epoch close was produced with: the
+    /// pre-fork contract's `getValidators(uint8)` folds the whole committee-eligible union into
+    /// the `Active` query and returns full `ValidatorInfo` structs. One call, one decode — the
+    /// single-call return order feeds the Fisher-Yates shuffle exactly as the historical chain
+    /// computed it, so re-executed pre-fork blocks derive byte-identical committees and state
+    /// roots.
+    ///
+    /// The `getValidators(uint8)` selector is identical pre/post fork (only the declared return
+    /// type changed), so encoding through the current `getValidatorsCall` binding produces the
+    /// same calldata bytes the pre-fork node sent; the pre-fork `ValidatorInfo[]` return payload
+    /// is decoded directly via `SolValue` (the struct layout is byte-identical across the fork),
+    /// bypassing the binding's post-fork `address[]` return type.
+    #[cfg(feature = "adiri")]
+    fn read_committee_eligible_pool_legacy(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let state =
+            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        trace!(target: "engine", "legacy get validators call:\n{:?}", state);
+        let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+            alloy::sol_types::SolValue::abi_decode(&state)?;
+
+        Ok(validators)
+    }
+
+    /// Read state on-chain, logging any failure at `error!` level.
+    ///
+    /// Thin wrapper over [`Self::try_read_state_on_chain`] for consensus-critical reads, where a
+    /// failure aborts the block and warrants an operator-facing error log.
     fn read_state_on_chain(
         &mut self,
         caller: Address,
         contract: Address,
         calldata: Bytes,
     ) -> TnRethResult<Bytes> {
+        self.try_read_state_on_chain(caller, contract, calldata).inspect_err(|e| {
+            error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {e}");
+        })
+    }
+
+    /// Read state on-chain without logging failures.
+    ///
+    /// The two failure cases (the system call itself erroring vs an unsuccessful execution
+    /// result) stay distinguishable through the error strings. Callers pick the log level their
+    /// context warrants: consensus-critical reads go through [`Self::read_state_on_chain`]
+    /// (`error!`), best-effort reads log at `debug!`.
+    fn try_read_state_on_chain(
+        &mut self,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> TnRethResult<Bytes> {
         // read from state
-        let res = match self.evm.transact_system_call(caller, contract, calldata) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {}", e);
-                return Err(TnRethError::EVMCustom(format!("failed to read state on chain: {e}")));
-            }
-        };
+        let res = self
+            .evm
+            .transact_system_call(caller, contract, calldata)
+            .map_err(|e| TnRethError::EVMCustom(format!("failed to read state on chain: {e}")))?;
 
         // retrieve data from execution result
-        let data = match res.result {
-            ExecutionResult::Success { output, .. } => output.into_data(),
-            e => {
-                // fatal error
-                error!(target: "engine", "error reading state on chain: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}")));
-            }
-        };
-
-        Ok(data)
+        match res.result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            e => Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}"))),
+        }
     }
 
     /// Return the next committee size.
@@ -380,6 +1712,22 @@ where
     }
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
+    ///
+    /// The contract is a ring buffer of 8191 entries keyed by `timestamp % 8191`. Each write stores
+    /// the block's `timestamp` alongside the root, and a lookup by timestamp succeeds only while
+    /// the entry still holds that exact timestamp.
+    ///
+    /// The EVM `timestamp` has one-second granularity and every block of a consensus output
+    /// carries the same value. This call runs only for the output's first batch, so each output
+    /// writes once, but several outputs committed within the same second all write the same entry
+    /// and the latest write wins. Once the chain has moved past that second, a lookup for it
+    /// returns the root written by the last output committed in it. Before then, a contract
+    /// executing in an earlier output of that second that queries its own block's `timestamp` sees
+    /// its own output's root, because the later outputs have not written yet.
+    ///
+    /// This is accepted behavior, not a bug. `ConsensusHeader`s are hash-linked, so the roots of
+    /// the earlier outputs in that second remain recoverable by walking the consensus chain back
+    /// from the root that survived.
     fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
         if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp().saturating_to()) {
             return Ok(());
@@ -513,13 +1861,16 @@ where
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number().saturating_to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
-        // apply system calls and cleanup state
+        // pre-block system calls; each commit retains only the target contract's state
         if self.ctx.first_batch() {
-            // only write consensus root once per output
+            // EIP-4788: write the consensus header digest only once per output (first batch)
+            //
+            // outputs committed within the same second share a `timestamp`, so they overwrite
+            // one ring-buffer entry and the latest root wins (see the callee's docs)
             self.apply_consensus_root_contract_call()?;
         }
 
-        // apply blockhashes cleanup state after
+        // EIP-2935: record the parent block hash on every block
         self.apply_blockhashes_contract_call()?;
 
         Ok(())
@@ -534,17 +1885,80 @@ where
         // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", ?randomness, "ctx indicates close epoch");
-            self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
-                .map_err(|e| {
+
+            // In-protocol ConsensusRegistry fork boundary. `deconstruct_nonce(nonce).0` is the
+            // epoch being concluded by this block; firing when `concluding_epoch + 1 ==
+            // FORK_EPOCH` makes the swapped code + migrated per-status sets live for
+            // the remainder of this very block.
+            //
+            // This MUST run BEFORE the conclude call below. `shuffle_new_committee`
+            // (inside `apply_closing_epoch_contract_call`) routes its committee-pool read
+            // by the registry's code hash (`read_committee_eligible_pool`): swapping first
+            // flips that gate to the post-fork `getValidatorsInfo` union for the remainder
+            // of this very block, and the new `concludeEpoch` guards the committee size
+            // against the cached `eligibleValidatorCount` that only `migrateValidatorSets`
+            // populates — so the fork leads. Reward math and the epoch transition then run
+            // on the new code over the byte-identical preserved storage. (Every epoch close
+            // BEFORE this boundary sees the pre-fork code hash and takes the gate's legacy
+            // branch instead, keeping pre-fork history re-executable on this same binary.)
+            //
+            // Both the production and replay paths reach this with an identical `ctx`, so the
+            // resulting `state_root` is byte-identical across the fleet.
+            #[cfg(feature = "adiri")]
+            if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
+                == Some(tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH)
+            {
+                self.apply_consensus_registry_fork().map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
                 })?;
 
-            self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
+                // The `WorkerConfigs` swap rides the same boundary, AFTER the registry swap:
+                // the registry swap just flipped this block's close onto the post-fork
+                // sequence, whose fourth call (`record_next_epoch_base_fees`) needs the
+                // `setWorkerConfigsData` selector the pre-fork deployment lacks. Code-only —
+                // no migrate-style call — see `apply_worker_configs_fork` for the storage
+                // preservation and `maxStrategy` runbook notes.
+                self.apply_worker_configs_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
+
+            // In-protocol governance-Safe fork boundary: same one-shot trigger shape as the
+            // registry fork above, keyed on its own (independently armed) epoch constant —
+            // `governance_safe_fork_epoch()` is the compile-time
+            // `GOVERNANCE_SAFE_FORK_EPOCH` unless a test-utils build overrides it via
+            // `TN_GOVERNANCE_SAFE_FORK_EPOCH`. Nothing in this block's close reads Safe
+            // state, so the position (after the registry pair, before the close) mirrors the
+            // fork-leads convention rather than a data dependency. Both the production and
+            // replay paths reach this with an identical `ctx`, so the resulting `state_root`
+            // is byte-identical across the fleet.
+            #[cfg(feature = "adiri")]
+            if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
+                == Some(tn_types::forks::governance_safe_fork_epoch())
+            {
+                self.apply_governance_safe_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
+
+            self.apply_closing_epoch_contract_call(
+                randomness,
+                self.ctx.gas_accumulator.rewards_counter().get_address_counts(),
+            )
+            .map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
-            // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+            // deliberately NO merge_transitions here: both reth wrappers merge after finish()
+            // returns, and revm pushes a reverts entry per merge — merging in here too gives
+            // every epoch-closing block a phantom empty bundle.reverts entry (len 2 vs 1)
+
+            // Publish what the boundary's system calls spent. Observation only — nothing below
+            // reads it and no state is touched. It lands here, after the calls have succeeded,
+            // because any failure above already aborted the block: there is no partial epoch
+            // close to report gas for. A system call runs at `gas_price: 0`, so this gas never
+            // enters `self.gas_used` and these gauges are the only place it is visible.
+            crate::metrics::record_epoch_close_gas(&self.epoch_close_gas);
         }
 
         Ok((
@@ -559,7 +1973,11 @@ where
     }
 
     fn set_state_hook(&mut self, _hook: Option<Box<dyn OnStateHook>>) {
-        unimplemented!("not using SystemCaller - nothing to set hook on")
+        // TN does not use reth's SystemCaller, so there is nothing to attach a hook to. The
+        // trait returns `()`, leaving no way to refuse: log loudly and drop the hook instead of
+        // panicking mid-block. A caller that relied on hook callbacks silently degrades — the
+        // error line is the only signal.
+        error!(target: "engine", "set_state_hook called but TN has no SystemCaller; dropping hook");
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
@@ -578,6 +1996,13 @@ where
 
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
+        //
+        // The subtraction cannot underflow: `gas_used` only grows in `commit_transaction`, by a
+        // result whose gas consumption is capped by its transaction's gas limit — which this
+        // check proved fits in the remaining budget. Under the execute-then-commit-per-tx
+        // protocol (the trait's provided `execute_transaction*` methods and reth's
+        // `BasicBlockBuilder` both pair each execution with its commit before the next), the
+        // invariant `gas_used <= gas_limit` therefore holds at every entry.
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
 
         if recovered.tx().gas_limit() > block_available_gas {
@@ -683,7 +2108,7 @@ where
         let extra_data = ctx.close_epoch.map(|hash| hash.to_vec().into()).unwrap_or_default();
         let (withdrawals, withdrawals_root) = if ctx.close_epoch.is_some() {
             // closing epoch so include rewards info
-            let withdrawals = ctx.rewards_counter.generate_withdrawals();
+            let withdrawals = ctx.gas_accumulator.rewards_counter().generate_withdrawals();
             let withdrawals_root = calculate_withdrawals_root(withdrawals.as_ref());
             (Some(withdrawals), Some(withdrawals_root))
         } else {
@@ -700,6 +2125,10 @@ where
             withdrawals_root,
             logs_bloom,
             timestamp,
+            // fork-gated upstream (`ConsensusOutput::prev_randao`, #1247): legacy
+            // `output_digest ^ batch_digest` pre-fork, seed-chain keccak post-fork. The
+            // committing leader keeps one propose-or-withhold choice per commit either way,
+            // so this opcode alone is not unbiasable randomness.
             mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce,
             base_fee_per_gas: Some(evm_env.block_env.basefee()),
@@ -718,5 +2147,926 @@ where
             header,
             body: BlockBody { transactions, ommers: Default::default(), withdrawals },
         })
+    }
+}
+
+/// Deterministically assemble the next committee from the eligible validator pool.
+///
+/// Given `randomness`-seeded `rng`, this partitions the pool into active and pending-exit
+/// validators, folds in randomly chosen pending-exit validators only when the active set is short
+/// of `new_committee_size`, runs an in-place Fisher-Yates shuffle, and trims the result to the
+/// target size.
+///
+/// [`Vec::truncate`] caps the length at `new_committee_size` but is a silent no-op when the
+/// assembled pool is already smaller, so a pool below the target would otherwise flow through as an
+/// undersized committee. The registry invariant `nextCommitteeSize <= eligibleValidatorCount` makes
+/// that unreachable in practice, and the on-chain `concludeEpoch` guard rejects a wrong-length
+/// committee, but the final client-side check fails here with the exact counts
+/// ([`TnRethError::UndersizedCommittee`]) instead of forwarding calldata that can only revert
+/// on-chain.
+///
+/// Split out of [`TNBlockExecutor::shuffle_new_committee`] as a pure function so the
+/// assembly/trim/validate logic is unit-testable without a live EVM state. The RNG draw sequence is
+/// preserved verbatim from the historical implementation, so committees stay byte-identical to the
+/// chain's replayed history.
+fn assemble_new_committee(
+    new_committee_size: usize,
+    eligible_pool: Vec<ConsensusRegistry::ValidatorInfo>,
+    rng: &mut StdRng,
+) -> TnRethResult<Vec<Address>> {
+    // a zero target would sail through the final length check below (`0 == 0`) and forward
+    // `concludeEpoch([])` — an opaque on-chain revert; refuse it here with a distinct message
+    if new_committee_size == 0 {
+        return Err(TnRethError::EVMCustom(
+            "next committee size is zero: refusing to conclude the epoch with an empty committee"
+                .to_string(),
+        ));
+    }
+
+    // 1) separate active and pending validators
+    // 2) check if active length is sufficient
+    // 3) if missing, randomly select from the pending validators
+    let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) =
+        eligible_pool.into_iter().partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
+
+    let active_validator_count = active_validators.len();
+    let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
+        // enough active validators for next committee
+        active_validators
+    } else {
+        // NOTE: already checked if active_validator_count >= new_committee_size above
+        let num_missing = new_committee_size - active_validator_count;
+
+        // randomly take enough pending exit validators to reach new committee size
+        let random_pending = pending_exit.into_iter().choose_multiple(rng, num_missing);
+        active_validators.extend(random_pending);
+        active_validators
+    };
+
+    // simple Fisher-Yates shuffle; the draw order is consensus-critical, so it is preserved
+    // verbatim as a `for_each` over the same reversed range rather than rewritten in a way that
+    // would reorder the RNG draws.
+    (1..validators_for_shuffle.len()).rev().for_each(|i| {
+        let j = rng.random_range(0..=i);
+        validators_for_shuffle.swap(i, j);
+    });
+
+    debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
+
+    let mut new_committee =
+        validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+
+    // trim the shuffled committee to maintain correct size
+    new_committee.truncate(new_committee_size);
+
+    trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
+
+    // truncate only ever shrinks, so a length mismatch here means the eligible pool was undersized.
+    let committee_len = new_committee.len();
+    (committee_len == new_committee_size).then_some(new_committee).ok_or(
+        TnRethError::UndersizedCommittee { expected: new_committee_size, got: committee_len },
+    )
+}
+
+/// Unit tests for the deterministic committee-assembly logic.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        payload::TNPayload,
+        system_calls::EpochState,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            test_genesis_with_consensus_registry, TransactionFactory,
+        },
+        RethChainSpec, RethEnv,
+    };
+    use alloy::primitives::utils::parse_ether;
+    use tempfile::TempDir;
+    use tn_config::NodeInfo;
+    #[cfg(feature = "adiri")]
+    use tn_config::{CONSENSUS_REGISTRY_JSON, WORKER_CONFIGS_JSON};
+    use tn_types::{
+        generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
+        TaskManager,
+    };
+
+    /// Build a minimal [`ConsensusRegistry::ValidatorInfo`] for committee-assembly tests.
+    ///
+    /// Only `validatorAddress` and `currentStatus` steer [`assemble_new_committee`]; the remaining
+    /// fields are irrelevant to shuffling and trimming, so they are zeroed.
+    fn validator(last_byte: u8, status: ValidatorStatus) -> ConsensusRegistry::ValidatorInfo {
+        ConsensusRegistry::ValidatorInfo {
+            validatorAddress: Address::with_last_byte(last_byte),
+            activationEpoch: 0,
+            exitEpoch: 0,
+            currentStatus: status,
+            isRetired: false,
+            stakeVersion: 0,
+            region: 0,
+        }
+    }
+
+    /// An eligible pool smaller than the target size must surface
+    /// [`TnRethError::UndersizedCommittee`] with the exact counts instead of silently returning a
+    /// short committee.
+    #[test]
+    fn assemble_rejects_undersized_pool() {
+        let pool =
+            vec![validator(1, ValidatorStatus::Active), validator(2, ValidatorStatus::Active)];
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let result = assemble_new_committee(5, pool, &mut rng);
+
+        assert!(matches!(result, Err(TnRethError::UndersizedCommittee { expected: 5, got: 2 })));
+    }
+
+    /// A pool at least as large as the target yields a committee of exactly the target size drawn
+    /// only from the eligible pool.
+    #[test]
+    fn assemble_trims_oversized_pool_to_target() {
+        let pool_addrs: Vec<Address> = (1u8..=5).map(Address::with_last_byte).collect();
+        let pool = pool_addrs
+            .iter()
+            .map(|address| ConsensusRegistry::ValidatorInfo {
+                validatorAddress: *address,
+                activationEpoch: 0,
+                exitEpoch: 0,
+                currentStatus: ValidatorStatus::Active,
+                isRetired: false,
+                stakeVersion: 0,
+                region: 0,
+            })
+            .collect();
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
+
+        assert!(committee
+            .is_some_and(|c| c.len() == 3 && c.iter().all(|address| pool_addrs.contains(address))));
+    }
+
+    /// A pool with too few active validators fills the committee from pending-exit validators and
+    /// still reaches the exact target size (the folding branch of the assembly).
+    #[test]
+    fn assemble_fills_from_pending_exit_when_active_is_short() {
+        let pool = vec![
+            validator(1, ValidatorStatus::Active),
+            validator(2, ValidatorStatus::PendingExit),
+            validator(3, ValidatorStatus::PendingExit),
+        ];
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let result = assemble_new_committee(3, pool, &mut rng);
+
+        assert!(matches!(&result, Ok(committee) if committee.len() == 3));
+    }
+
+    /// At the exact-size boundary (active validator count == target) the committee is drawn only
+    /// from the active set, with pending-exit validators ignored, and its deterministic order is
+    /// pinned to a golden value. This locks the RNG draw sequence: any change to the shuffle path,
+    /// or a `>=`-to-`>` slip in the active-vs-target comparison (which would perturb the draws via
+    /// `choose_multiple(rng, 0)`), reorders the committee and fails here rather than silently
+    /// diverging into a different same-length committee that the on-chain length guard cannot
+    /// catch.
+    #[test]
+    fn assemble_at_exact_size_boundary_pins_deterministic_active_only_committee() {
+        let pool = vec![
+            validator(1, ValidatorStatus::Active),
+            validator(2, ValidatorStatus::Active),
+            validator(3, ValidatorStatus::Active),
+            validator(4, ValidatorStatus::PendingExit),
+            validator(5, ValidatorStatus::PendingExit),
+        ];
+        let mut rng = StdRng::from_seed([42u8; 32]);
+
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
+
+        // Golden order for seed [42; 32]; regenerate only when the shuffle algorithm changes on
+        // purpose. All three addresses are from the active set, proving pending-exit is ignored.
+        assert_eq!(
+            committee,
+            Some(vec![
+                Address::with_last_byte(2),
+                Address::with_last_byte(1),
+                Address::with_last_byte(3),
+            ])
+        );
+    }
+
+    /// The `ConsensusRegistry` fork must fail closed over an unexpected pre-fork deployment.
+    ///
+    /// The swap + `migrateValidatorSets()` assume the exact storage layout of the pinned
+    /// pre-fork registry code. Here the genesis fixture's registry account is overwritten with
+    /// the post-fork artifact bytes (any hash other than
+    /// `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` — a stand-in for an unknown deployment), and the
+    /// fork-boundary block must abort with the fail-closed gate error instead of silently
+    /// migrating over an unverified layout. (Without the gate this block would execute: the
+    /// migration is idempotent on the new code, making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_consensus_registry_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // overwrite the registry's code (keeping balance + storage) with the post-fork artifact
+        let mut genesis = tn_types::test_genesis();
+        let v2_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let v2_code: Bytes =
+            alloy::hex::decode(v2_value.as_str().expect("deployedBytecode.object is a string"))?
+                .into();
+        genesis
+            .alloc
+            .get_mut(&CONSENSUS_REGISTRY_ADDRESS)
+            .expect("testnet genesis must allocate the ConsensusRegistry account")
+            .code = Some(v2_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // drive the fork boundary: the concluding epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("fail closed test");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected registry deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("failing closed"),
+            "abort must come from the fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The `WorkerConfigs` fork must fail closed over an unexpected pre-fork deployment.
+    ///
+    /// Mirrors the registry's fail-closed test above: the genesis fixture's worker-configs
+    /// account is overwritten with the post-fork artifact bytes (any hash other than
+    /// `WORKER_CONFIGS_PRE_FORK_CODE_HASH` — a stand-in for an unknown deployment) while the
+    /// registry account keeps its pinned pre-fork code, so the registry swap that leads the
+    /// fork boundary succeeds and the abort is attributable to the WorkerConfigs gate alone.
+    /// (Without the gate this block would execute: the code-only swap is a no-op over the
+    /// current artifact, making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_worker_configs_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // overwrite the worker-configs code (keeping balance + storage) with the post-fork
+        // artifact
+        let mut genesis = tn_types::test_genesis();
+        let v2_value = RethEnv::fetch_value_from_json_str(
+            WORKER_CONFIGS_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let v2_code: Bytes =
+            alloy::hex::decode(v2_value.as_str().expect("deployedBytecode.object is a string"))?
+                .into();
+        genesis
+            .alloc
+            .get_mut(&WORKER_CONFIGS_ADDRESS)
+            .expect("testnet genesis must allocate the WorkerConfigs account")
+            .code = Some(v2_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // drive the fork boundary: the concluding epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("worker configs fail closed test");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected worker-configs deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("worker configs fork failing closed"),
+            "abort must come from the WorkerConfigs fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must fail closed over an unexpected pre-fork swap target.
+    ///
+    /// The `Safe` singleton account is overwritten with the post-fork registry artifact bytes
+    /// (any hash other than `SAFE_SINGLETON_PRE_FORK_CODE_HASH` or the canonical post-fork
+    /// hash — a stand-in for "adiri's Safe state moved since the pins were taken"), and the
+    /// boundary must abort rather than swap over an unknown storage layout. The pin is what
+    /// makes this gate meaningful: unlike the etch rows, the swap branch preserves the
+    /// account's existing storage, which is only sound over a layout the pin vouches for.
+    ///
+    /// (Without the gate this block would execute — the swap is storage-compatible with the
+    /// stand-in code — making this test the discriminating check.)
+    ///
+    /// The etch rows deliberately carry no such gate, because they overwrite storage rather
+    /// than inherit it; see
+    /// `test_governance_safe_fork_forces_canonical_code_over_an_occupied_etch_target` below.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // an arbitrary wrong code blob: the post-fork registry artifact (hash matches no pin)
+        let stand_in_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let stand_in_code: Bytes = alloy::hex::decode(
+            stand_in_value.as_str().expect("deployedBytecode.object is a string"),
+        )?
+        .into();
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+
+        // by name, not by index: the table's row order is coupled to the vendored bytecode
+        // list above, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+
+        // swap target (the recompiled Safe singleton) off its pre-fork pin
+        let mut genesis = tn_types::test_genesis();
+        let safe_singleton = suite_address("Safe");
+        genesis
+            .alloc
+            .get_mut(&safe_singleton)
+            .expect("testnet genesis must allocate the recompiled Safe singleton")
+            .code = Some(stand_in_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork fail closed swap");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected Safe singleton deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("governance safe fork failing closed"),
+            "abort must come from the governance fail-closed gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The etch branch must force the canonical end state over every pre-state, not just an
+    /// empty address.
+    ///
+    /// Both cases used to abort the boundary and both must now succeed:
+    /// 1. an **unknown occupant** at the canonical `SafeL2` address — the canonical bytes replace
+    ///    its code, the seeded threshold lands, and its unrelated storage survives;
+    /// 2. the **already-canonical** bytes, the shape a legitimate deployment through the Safe
+    ///    singleton factory leaves behind — the boundary restates them and commits the same state,
+    ///    which is what makes re-executing the fork idempotent.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_forces_canonical_code_over_an_occupied_etch_target(
+    ) -> eyre::Result<()> {
+        use reth_provider::StateProvider as _;
+
+        /// The canonical SafeL2 runtime bytes, from the same vendored file
+        /// `governance_safe_fork_suite` embeds.
+        const SAFE_L2_HEX: &str = include_str!(
+            "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex"
+        );
+
+        // an arbitrary wrong code blob: the post-fork registry artifact (hash matches no row)
+        let stand_in_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let stand_in_code: Bytes = alloy::hex::decode(
+            stand_in_value.as_str().expect("deployedBytecode.object is a string"),
+        )?
+        .into();
+        let canonical_code: Bytes = alloy::hex::decode(SAFE_L2_HEX.trim())?.into();
+
+        // by name, not by index: the table's row order is coupled to the vendored bytecode list
+        let (safe_l2, canonical_hash) = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+            .iter()
+            .find_map(|(name, address, hash)| (*name == "SafeL2").then_some((*address, *hash)))
+            .expect("SafeL2 must be a canonical Safe suite row");
+
+        // a slot the occupant owns, proving the displacement leaves unseeded storage alone
+        let bystander_slot = B256::with_last_byte(9);
+        let threshold_slot = B256::with_last_byte(4);
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+
+        for (label, planted, planted_nonce) in
+            [("unknown occupant", stand_in_code, 3u64), ("already canonical", canonical_code, 1)]
+        {
+            let mut genesis = tn_types::test_genesis();
+            genesis.alloc.insert(
+                safe_l2,
+                GenesisAccount::default()
+                    .with_code(Some(planted))
+                    .with_nonce(Some(planted_nonce))
+                    .with_storage(Some([(bystander_slot, B256::with_last_byte(42))].into())),
+            );
+
+            let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+            let genesis_header = chain.sealed_genesis_header();
+            let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+            let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+            let tmp = TempDir::new().unwrap();
+            let tm = TaskManager::new("governance fork occupied etch target");
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+            if let Err(e) = execute_payload_and_update_canonical_chain(&env, payload, vec![]) {
+                panic!("{label}: the boundary must force the canonical end state, got: {e:#}");
+            }
+
+            let post = env.latest()?;
+            assert_eq!(
+                post.account_code(&safe_l2)?.expect("SafeL2 has code post-fork").0.hash_slow(),
+                canonical_hash,
+                "{label}: SafeL2 must end the boundary on its canonical code hash"
+            );
+            assert_eq!(
+                post.storage(safe_l2, threshold_slot)?,
+                Some(U256::ONE),
+                "{label}: the fork must seed threshold = 1 over an occupied target"
+            );
+            assert_eq!(
+                post.storage(safe_l2, bystander_slot)?,
+                Some(U256::from(42)),
+                "{label}: unseeded storage of the displaced account must survive untouched"
+            );
+            assert_eq!(
+                post.basic_account(&safe_l2)?.expect("SafeL2 account exists").nonce,
+                planted_nonce,
+                "{label}: an occupied target keeps its own nonce, clamped up to EIP-161's 1"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must OVERWRITE a third-party fallback handler, not abort.
+    ///
+    /// This is the deliberate asymmetry with the two gates exercised above, and it lives
+    /// beside them so the contrast is readable in one place: the proxy's code hash and slot 0
+    /// fail closed, while the fallback-handler slot is one the migration defines and therefore
+    /// writes through every reachable pre-state.
+    ///
+    /// The slot is genuinely owner-mutable right up to the boundary (on adiri, the block that
+    /// closes epoch 553; the fork epoch is 554) — `FallbackManager.setFallbackHandler` is
+    /// `authorized` (`msg.sender == address(this)`), so a quorum of the live 3-of-7 Safe can
+    /// point it anywhere, including at an address with no code.
+    /// `test_governance_safe_fork_migrates_proxy_to_safe_l2` covers only the
+    /// unset -> canonical transition that the committed genesis fixture exhibits; nothing else
+    /// in the tree seeds a non-zero pre-state, so without this test the overwrite branch is
+    /// unexercised.
+    ///
+    /// Asserts: with a third-party handler pre-seeded in the governance proxy's handler slot,
+    /// the fork boundary block still executes, the handler slot lands on the canonical
+    /// `CompatibilityFallbackHandler`, and the rest of the migration (slot 0 -> SafeL2) is
+    /// unaffected. The displaced value is surfaced at `warn!` by `apply_governance_safe_fork`
+    /// so it stays recoverable from the node record.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_overwrites_third_party_fallback_handler() -> eyre::Result<()>
+    {
+        use reth_provider::StateProvider as _;
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        // by name, not by index: the suite's row order is coupled to the vendored bytecode
+        // list, so a future reordering must not silently repoint these at other contracts
+        let suite_address = |name: &str| {
+            tn_types::forks::governance_safe_fork_canonical_address(name)
+                .unwrap_or_else(|| panic!("{name} must be a canonical Safe suite row"))
+        };
+        let canonical_handler = suite_address("CompatibilityFallbackHandler");
+        let safe_l2 = suite_address("SafeL2");
+
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`
+        let handler_slot: B256 = alloy::primitives::keccak256(b"fallback_manager.handler.address");
+        // an owner-installed handler that is neither unset nor canonical. Code-free on purpose:
+        // `setFallbackHandler` requires no code at the target, so this is a state the live Safe
+        // can actually reach
+        let third_party = Address::with_last_byte(0xbe);
+
+        let mut genesis = tn_types::test_genesis();
+        let proxy = genesis
+            .alloc
+            .get_mut(&GOVERNANCE_SAFE_ADDRESS)
+            .expect("testnet genesis must allocate the governance proxy");
+        let mut storage = proxy.storage.clone().unwrap_or_default();
+        // fixture guard: the committed genesis leaves the slot unset, so the seed below is the
+        // only thing separating this case from the happy path
+        assert!(
+            storage.insert(handler_slot, third_party.into_word()).is_none(),
+            "committed genesis must leave the governance proxy's handler slot unset"
+        );
+        proxy.storage = Some(storage);
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork third-party handler");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect("a third-party fallback handler must not abort the fork boundary");
+
+        // read back through a fresh `StateProvider` over the canonicalized chain
+        let post = env.latest()?;
+        let as_slot_value = |addr: Address| U256::from_be_bytes(addr.into_word().0);
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, handler_slot)?,
+            Some(as_slot_value(canonical_handler)),
+            "the fork must displace a third-party handler with the canonical one"
+        );
+        assert_eq!(
+            post.storage(GOVERNANCE_SAFE_ADDRESS, B256::ZERO)?,
+            Some(as_slot_value(safe_l2)),
+            "the rest of the migration must complete: slot 0 still flips to SafeL2"
+        );
+
+        Ok(())
+    }
+
+    /// Guards the committee backfill path in `block.rs::shuffle_new_committee`: when there are
+    /// fewer strictly-active validators than the committee size, the shuffle must backfill from
+    /// the `PendingExit` pool so the next committee still reaches the required size. Five
+    /// genesis validators form a committee of 5; two begin exiting, leaving 3 active + 2
+    /// pending-exit. Since `committeeSize (5) > active (3)`, every subsequent committee must
+    /// include the two exiting validators - otherwise `concludeEpoch` would revert on its
+    /// committee-size check.
+    #[tokio::test]
+    async fn test_committee_backfill_from_pending_exit() -> eyre::Result<()> {
+        // the two validators that begin exiting need EOAs to sign their `beginExit` txns
+        let mut exit_a_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(101));
+        let exit_a = exit_a_eoa.address();
+        let mut exit_b_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(102));
+        let exit_b = exit_b_eoa.address();
+
+        let all_validators = [
+            Address::from_slice(&[0x11; 20]),
+            Address::from_slice(&[0x33; 20]),
+            Address::from_slice(&[0x44; 20]),
+            exit_a,
+            exit_b,
+        ];
+        let validators: Vec<_> = all_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut rng = StdRng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
+                NodeInfo {
+                    name: format!("validator-{i}"),
+                    bls_public_key: *bls.public(),
+                    p2p_info: NodeP2pInfo::default(),
+                    execution_address: *addr,
+                    proof_of_possession: pop,
+                }
+            })
+            .collect();
+
+        let epoch_duration = 60 * 60 * 24;
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: epoch_duration,
+        };
+
+        let governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([
+            (
+                governance,
+                GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)),
+            ),
+            (exit_a, GenesisAccount::default().with_balance(U256::from(parse_ether("1_000")?))),
+            (exit_b, GenesisAccount::default().with_balance(U256::from(parse_ether("1_000")?))),
+        ]);
+
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators.clone(),
+            tmp_genesis,
+            initial_stake_config.clone(),
+            governance,
+            vec![(0u8, 30_000_000u64)],
+        )?;
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Backfill Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+
+        // sanity: genesis committee is the full set of 5 validators
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        assert_eq!(committee.len(), 5);
+
+        // two validators begin exiting (Active -> PendingExit)
+        let begin_exit_a = exit_a_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::beginExitCall {}.abi_encode().into(),
+        );
+        let begin_exit_b = exit_b_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::beginExitCall {}.abi_encode().into(),
+        );
+
+        // execute the exits in the first block (no epoch close yet)
+        let mut expected_epoch = 0u32;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![begin_exit_a, begin_exit_b],
+        )?;
+        let mut canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // close several epochs so the post-exit committees (computed 2 epochs ahead by the shuffle)
+        // become current. If the backfill is broken, `concludeEpoch` reverts on the size check.
+        for round in 2..=6u64 {
+            expected_epoch += 1;
+            let consensus_output = consensus_output_for_tests(2, expected_epoch, round, true);
+            let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+            let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+            canonical_header = block.recovered_block.clone_sealed_header();
+
+            // the committee must stay full at every close: active(3) < committeeSize(5) forces the
+            // shuffle to backfill from the pending-exit pool each epoch
+            let EpochState { validators: committee, .. } =
+                reth_env.epoch_state_from_canonical_tip()?;
+            assert_eq!(committee.len(), 5, "committee stays full via pending-exit backfill");
+        }
+
+        // with active(3) < committeeSize(5), the backfill must keep every committee full and
+        // include the two pending-exit validators
+        let EpochState { validators: committee, .. } = reth_env.epoch_state_from_canonical_tip()?;
+        let committee_addrs: Vec<Address> = committee.iter().map(|v| v.validatorAddress).collect();
+        assert_eq!(committee_addrs.len(), 5, "committee stays full via pending-exit backfill");
+        assert!(committee_addrs.contains(&exit_a), "pending-exit validator A backfilled");
+        assert!(committee_addrs.contains(&exit_b), "pending-exit validator B backfilled");
+
+        // the backfilled validators remain PendingExit (still serving, not yet exited)
+        for exiting in [exit_a, exit_b] {
+            let info = reth_env.get_validator_info(canonical_header.hash(), exiting)?;
+            assert_eq!(
+                info.currentStatus,
+                ConsensusRegistry::ValidatorStatus::PendingExit,
+                "backfilled validator stays PendingExit"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Pins the classification the off-consensus log surfacing in
+    /// `transact_and_commit_system_call` depends on: a real `concludeEpoch` system call against
+    /// the deployed registry, run on a side-effect-free EVM at the genesis tip, must emit a log
+    /// that [`classify_system_call_log`] routes to `SystemCallLog::Registry(_, NewEpoch)`
+    /// carrying the decoded next epoch id and committee, and no log that falls through as
+    /// `UnknownRegistryTopic` or `Foreign`. The unit test in `system_calls.rs` round-trips a
+    /// hand-built log through the binding; this one runs the contract's own emit against the
+    /// deployed bytecode, so a divergence between the artifact this crate compiles against and
+    /// the registry actually deployed in genesis (which would silently demote every epoch
+    /// boundary to the raw "unknown topic" line) fails here rather than in an operator's log.
+    ///
+    /// Contract note: `concludeEpoch` emits the STARTING committee of the new epoch, which at
+    /// genesis is the initial validator set the constructor seeded for epochs 0..=2 in ceremony
+    /// order. `test_genesis_with_consensus_registry` seeds ascending addresses, so that committee
+    /// equals the sorted `newCommittee` passed in (which the contract files for epoch 3).
+    #[tokio::test]
+    async fn system_call_logs_classify_to_named_registry_events() -> eyre::Result<()> {
+        use crate::system_calls::RegistryEvents as E;
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("System Call Logs Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // genesis committee: every validator is Active, so `nextCommitteeSize == 4` and the
+        // registry expects a sorted, full committee of these same addresses
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        let genesis_committee: Vec<Address> =
+            committee.iter().map(|v| v.validatorAddress).collect();
+        let new_committee: Vec<Address> = genesis_committee
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(new_committee.len(), 4, "genesis committee is the full validator set");
+        assert_eq!(
+            new_committee, genesis_committee,
+            "ceremony order is ascending, so epoch 1's starting committee is the sorted set"
+        );
+        let expected_epoch_id = epoch.checked_add(1).expect("next epoch id fits u32");
+
+        // side-effect-free EVM at the genesis tip: the call runs, nothing is committed
+        let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
+        let calldata = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee.clone() }
+            .abi_encode()
+            .into();
+        let res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(
+            res.result.is_success(),
+            "concludeEpoch at genesis must succeed, got {:?}",
+            res.result
+        );
+        let logs = res.result.logs();
+        assert!(
+            !logs.is_empty(),
+            "concludeEpoch succeeded (gas used {}) but emitted no logs",
+            res.result.gas_used()
+        );
+
+        let classified: Vec<SystemCallLog<'_>> =
+            logs.iter().map(classify_system_call_log).collect();
+
+        // (b) every log a registry system call emits decodes to a named registry event: nothing
+        // falls through as an unknown topic or as a foreign contract's log
+        let unclassified: Vec<(Address, Vec<B256>)> = logs
+            .iter()
+            .zip(classified.iter())
+            .filter(|(_, c)| !matches!(c, SystemCallLog::Registry(..)))
+            .map(|(log, _)| (log.address, log.topics().to_vec()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "logs that did not decode to a registry event (address, topics): {unclassified:?}"
+        );
+
+        // (a) the `NewEpoch` for the next epoch carries the decoded id and committee
+        let new_epoch_count = classified
+            .iter()
+            .filter(|c| matches!(c, SystemCallLog::Registry(_, E::NewEpoch(_))))
+            .count();
+        let matching = classified
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    SystemCallLog::Registry(_, E::NewEpoch(e))
+                        if e.epoch.epochId == expected_epoch_id
+                            && e.epoch.committee == new_committee
+                )
+            })
+            .count();
+        assert_eq!(
+            matching,
+            1,
+            "expected exactly one NewEpoch(epochId {expected_epoch_id}, committee \
+             {new_committee:?}); saw {new_epoch_count} NewEpoch log(s) among {} log(s), gas used {}",
+            logs.len(),
+            res.result.gas_used()
+        );
+
+        Ok(())
+    }
+
+    /// The sibling pin for the inherited half of the log surface: a slash-to-zero ejection's
+    /// ERC-721 `Transfer`, driven by the contract's own `_burn` rather than by a hand-built log.
+    ///
+    /// `applySlashes` with `amount >= balance` takes the ejection branch (`balances[v] > amount`
+    /// is false), which runs `_consensusBurn` → `_burnConsensusNFT` → OpenZeppelin's ERC-721
+    /// `_burn`, so the burn `Transfer(validator, 0x0, tokenId)` is emitted from
+    /// [`CONSENSUS_REGISTRY_ADDRESS`] on a system-call path — a path that produces no receipt, so
+    /// this log line is the only place it surfaces. The unit test in `system_calls.rs` pins the
+    /// same event from a hand-built log; this one proves the real contract's emit classifies,
+    /// which a binding limited to the registry's OWN events cannot do: it would route the burn to
+    /// `SystemCallLog::UnknownRegistryTopic` and demote every ejection to the raw `debug!` line.
+    ///
+    /// Runs on the same side-effect-free EVM at the genesis tip as the `concludeEpoch` test above.
+    /// Ejecting one of four genesis validators leaves three eligible and three-member epoch-1 and
+    /// epoch-2 committees, which clears the registry's `_checkCommitteeSize` guard, so the whole
+    /// `_consensusBurn` path runs to the burn instead of reverting on committee size.
+    #[tokio::test]
+    async fn system_call_logs_classify_a_slash_ejection_burn_transfer() -> eyre::Result<()> {
+        use crate::system_calls::RegistryEvents as E;
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("System Call Burn Log Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        assert_eq!(committee.len(), 4, "genesis seeds four Active validators");
+        let victim = committee[0].validatorAddress;
+
+        // side-effect-free EVM at the genesis tip: the call runs, nothing is committed
+        let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
+
+        // read the outstanding stake-backed balance rather than hardcoding the genesis stake: the
+        // registry ejects only when `balances[victim] <= slash.amount`, so this is the exact
+        // threshold amount, and reading it keeps the test correct if the seeded `StakeConfig`
+        // changes
+        let (outstanding, _initial_stake, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert!(outstanding > U256::ZERO, "a genesis validator is staked");
+
+        let calldata = ConsensusRegistry::applySlashesCall {
+            slashes: vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }],
+        }
+        .abi_encode()
+        .into();
+        let res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+
+        // (a) the call succeeded, so the ejection actually ran
+        assert!(
+            res.result.is_success(),
+            "applySlashes at genesis must succeed, got {:?}",
+            res.result
+        );
+        let logs = res.result.logs();
+        assert!(
+            !logs.is_empty(),
+            "applySlashes succeeded (gas used {}) but emitted no logs",
+            res.result.gas_used()
+        );
+
+        let classified: Vec<SystemCallLog<'_>> =
+            logs.iter().map(classify_system_call_log).collect();
+
+        // (b) every log the ejection emits decodes to a named registry event: nothing falls
+        // through as an unknown topic or as a foreign contract's log
+        let unclassified: Vec<(Address, Vec<B256>)> = logs
+            .iter()
+            .zip(classified.iter())
+            .filter(|(_, c)| !matches!(c, SystemCallLog::Registry(..)))
+            .map(|(log, _)| (log.address, log.topics().to_vec()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "logs that did not decode to a registry event (address, topics): {unclassified:?}"
+        );
+
+        // (c) exactly one of them is the NFT burn: a token sent to the zero address
+        let burns: Vec<(Address, U256)> = classified
+            .iter()
+            .filter_map(|c| match c {
+                SystemCallLog::Registry(_, E::Transfer(t)) if t.to == Address::ZERO => {
+                    Some((t.from, t.tokenId))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            burns.len(),
+            1,
+            "expected exactly one ERC-721 burn Transfer(_, 0x0, _); saw {burns:?} among {} \
+             classified log(s), gas used {}",
+            logs.len(),
+            res.result.gas_used()
+        );
+        assert_eq!(burns[0].0, victim, "the burned consensus NFT was the slashed validator's");
+
+        Ok(())
     }
 }

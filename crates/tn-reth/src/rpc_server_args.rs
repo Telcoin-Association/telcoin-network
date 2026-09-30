@@ -1,6 +1,29 @@
 //! Contains RPC server args.
 //! This is a subset of args Reth's RPC (mostly taken from Reth) provides to eliminate arguments we
 //! don't support.
+//!
+//! The defaults bound what a single RPC client (or all clients together) can cost the node,
+//! since validator RPC endpoints may be publicly reachable:
+//!
+//! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), and 1024
+//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`). These cap memory held
+//!   per connection and the fan-out of websocket subscriptions.
+//! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
+//!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
+//!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
+//!   count and a historical proof window.
+//! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
+//!   in native-token units; 0 disables the cap). The default is 0: reth's 1.0 was calibrated for
+//!   ether, and 1.0 in TEL is too small a bound to separate honest fees from runaway ones, so the
+//!   cap stays off until fee data supports a value. The RPC boundary checks raw submissions
+//!   (`crate::rpc_fee_cap`); the pool validator checks transactions it treats as local, such as
+//!   `--txpool.locals` senders (`--txpool.nolocals` empties that class, which leaves only the
+//!   RPC-boundary check). Committee validators should run a uniform cap: the transaction forwarder
+//!   (`crate::forward`) treats one validator's fee-cap refusal as final for that transaction.
+//!
+//! The HTTP and WS servers are off by default and bind to localhost when enabled; the IPC
+//! server is on unless `--ipcdisable` is passed.
 
 use std::{
     ffi::OsStr,
@@ -20,6 +43,7 @@ use reth::{
     rpc::builder::{constants, RethRpcModule, RpcModuleSelection},
 };
 use reth_cli_util::parse_ether_value;
+use reth_rpc_eth_types::builder::config::PendingBlockKind;
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -65,6 +89,10 @@ pub struct RpcServerArgs {
     pub http_disable_compression: bool,
 
     /// Rpc Modules to be configured for the HTTP server
+    ///
+    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
+    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
+    /// list every module by name instead.
     #[arg(long = "http.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub http_api: Option<RpcModuleSelection>,
 
@@ -89,6 +117,10 @@ pub struct RpcServerArgs {
     pub ws_allowed_origins: Option<String>,
 
     /// Rpc Modules to be configured for the WS server
+    ///
+    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
+    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
+    /// list every module by name instead.
     #[arg(long = "ws.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub ws_api: Option<RpcModuleSelection>,
 
@@ -155,13 +187,14 @@ pub struct RpcServerArgs {
     )]
     pub rpc_gas_cap: u64,
 
-    /// Maximum eth transaction fee (in ether) that can be sent via the RPC APIs (0 = no cap)
+    /// Maximum eth transaction fee (in native-token units) that can be sent via the RPC APIs
+    /// (0 = no cap). The default is 0: the cap stays off until fee data supports a value.
     #[arg(
         long = "rpc.txfeecap",
         alias = "rpc-txfeecap",
         value_name = "TX_FEE_CAP",
         value_parser = parse_ether_value,
-        default_value = "1.0"
+        default_value = "0"
     )]
     pub rpc_tx_fee_cap: u128,
 
@@ -187,6 +220,17 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 
+    /// The pending block behavior for `pending`-tag RPC queries.
+    ///
+    /// TN defaults to `none` (reth defaults to `full`): no worker ever produces the
+    /// block a simulated pending env describes, so its values are placeholder
+    /// approximations (see [`BuildPendingEnv`] on `TNPayload`). With `none`,
+    /// pending-tag queries answer null or fall back to the latest state.
+    ///
+    /// [`BuildPendingEnv`]: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv
+    #[arg(long = "rpc.pending-block", default_value = "none", value_name = "KIND")]
+    pub rpc_pending_block: PendingBlockKind,
+
     /// State cache configuration.
     #[command(flatten)]
     pub rpc_state_cache: RpcStateCacheArgs,
@@ -207,7 +251,7 @@ impl Default for RpcServerArgs {
             ws_allowed_origins: None,
             ws_api: None,
             ipcdisable: false,
-            ipcpath: constants::DEFAULT_IPC_ENDPOINT.to_string(),
+            ipcpath: DEFAULT_IPC_ENDPOINT.to_string(),
             rpc_jwtsecret: None,
             rpc_max_request_size: RPC_DEFAULT_MAX_REQUEST_SIZE_MB.into(),
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
@@ -218,9 +262,10 @@ impl Default for RpcServerArgs {
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
             rpc_max_logs_per_response: (constants::DEFAULT_MAX_LOGS_PER_RESPONSE as u64).into(),
             rpc_gas_cap: constants::gas_oracle::RPC_DEFAULT_GAS_CAP,
-            rpc_tx_fee_cap: constants::DEFAULT_TX_FEE_CAP_WEI,
+            rpc_tx_fee_cap: 0,
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
+            rpc_pending_block: PendingBlockKind::None,
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
         }
@@ -257,6 +302,7 @@ impl From<RpcServerArgs> for reth::args::RpcServerArgs {
             rpc_max_simulate_blocks: v.rpc_max_simulate_blocks,
             rpc_eth_proof_window: v.rpc_eth_proof_window,
             rpc_proof_permits: v.rpc_proof_permits,
+            rpc_pending_block: v.rpc_pending_block,
             rpc_state_cache: v.rpc_state_cache,
             ..Default::default()
         }
@@ -292,5 +338,61 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
         Some(Box::new(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::RethCommand;
+    use clap::Parser;
+    use reth::rpc::builder::config::RethRpcServerConfig as _;
+
+    /// The manual `Default` impl and the clap CLI default must agree on TN's own
+    /// IPC endpoint, not reth's `/tmp/reth.ipc`.
+    #[test]
+    fn default_ipcpath_matches_cli_default() {
+        assert_eq!(RpcServerArgs::default().ipcpath, DEFAULT_IPC_ENDPOINT);
+    }
+
+    /// The mirror-image regression: a bare CLI parse must agree with the manual `Default`
+    /// impl on `ipcpath`, so the clap default cannot drift back to reth's constant either.
+    #[test]
+    fn cli_default_ipcpath_matches_default_impl() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.ipcpath, RpcServerArgs::default().ipcpath);
+        Ok(())
+    }
+
+    /// The manual `Default` impl must keep the fee cap disabled: reth's 1.0 default was
+    /// calibrated for ether, and 1.0 in TEL is too small a bound (PR #1176 review).
+    #[test]
+    fn default_tx_fee_cap_is_disabled() {
+        assert_eq!(RpcServerArgs::default().rpc_tx_fee_cap, 0);
+    }
+
+    /// The mirror-image regression: a bare CLI parse must agree with the manual `Default`
+    /// impl on `rpc_tx_fee_cap`, so the clap default cannot drift back to reth's 1.0 either.
+    #[test]
+    fn cli_default_tx_fee_cap_matches_default_impl() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.rpc_tx_fee_cap, RpcServerArgs::default().rpc_tx_fee_cap);
+        Ok(())
+    }
+
+    /// TN defaults the pending block kind to `none` (issue #1231): the clap default and
+    /// the manual `Default` impl agree, and an explicit `--rpc.pending-block full`
+    /// survives the parse and the TN-args-to-reth-args conversion.
+    #[test]
+    fn pending_block_defaults_none_and_explicit_full_survives() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.rpc_pending_block, PendingBlockKind::None);
+        assert_eq!(RpcServerArgs::default().rpc_pending_block, PendingBlockKind::None);
+
+        let full = RethCommand::try_parse_from(["tn-reth", "--rpc.pending-block", "full"])?;
+        assert_eq!(full.rpc.rpc_pending_block, PendingBlockKind::Full);
+        let config = reth::args::RpcServerArgs::from(full.rpc).eth_config();
+        assert_eq!(config.pending_block_kind, PendingBlockKind::Full);
+        Ok(())
     }
 }

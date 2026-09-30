@@ -1,6 +1,27 @@
 //! All types associated with execution TN EVM.
 //!
 //! Heavily inspired by alloy_evm and revm.
+//!
+//! # Module map — what TN customizes vs stock reth/revm
+//!
+//! - `config`: `TnEvmConfig`, TN's `ConfigureEvm` implementation; builds EVM/block environments
+//!   from `TNPayload` and threads the epoch-close digest between the execution context and the
+//!   header's `extra_data`.
+//! - `factory`: `TNEvmFactory`, the single construction point for EVM instances; installs the TEL
+//!   and BLS G1 precompiles on top of the spec's stock set for every EVM it creates.
+//! - `handler`: `TNEvmHandler`, post-execution overrides — the base fee is credited to the chain's
+//!   basefee address instead of burned, plus a quadratic penalty on grossly over-estimated gas
+//!   limits.
+//! - `utils`: the `calculate_gas_penalty` formula backing that penalty.
+//! - `context`: type aliases and builder plumbing for the revm `Context` TN executes against.
+//! - `block`: `TNBlockExecutor`/`TNBlockAssembler` — block-level execution, the epoch-closing
+//!   system calls (rewards, committee shuffle, `concludeEpoch`), and header assembly.
+//! - `tel_precompile` / `bls_precompile`: the TEL native-token precompile and the BLS12-381 G1
+//!   precompile (proof-of-possession verification).
+//!
+//! Anything not listed above follows stock revm mainnet semantics. [`TNEvm`] itself is the
+//! revm wrapper tying these together; its `transact_system_call` is how protocol system calls
+//! (consensus registry reads/writes, epoch closing) execute outside normal transaction rules.
 
 use alloy_evm::Database;
 use reth_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
@@ -18,19 +39,23 @@ use reth_revm::{
 use std::ops::{Deref, DerefMut};
 use tn_types::{Address, Bytes, TxKind, U256};
 mod block;
+mod bls_precompile;
 mod config;
 mod context;
 mod factory;
 mod handler;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod precompile_test_utils;
 mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
+pub use bls_precompile::{add_bls_precompile, BLS_G1_PRECOMPILE_ADDRESS};
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
-#[cfg(any(test, feature = "test-utils"))]
-pub use tel_precompile::test_utils as precompile_test_utils;
+#[cfg(feature = "faucet")]
+pub use tel_precompile::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
 pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{
@@ -38,6 +63,41 @@ pub use tel_precompile::{
     revokeMintRoleCall, totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use utils::calculate_gas_penalty;
+
+/// Gas budget for a single protocol system call.
+///
+/// System calls run at `gas_price: 0` and do not count toward the block gas limit, so this
+/// bound exists only to stop runaway execution. The 100M headroom (vs the historical 30M
+/// budget) is for the one-shot `migrateValidatorSets()` walk at the ConsensusRegistry fork
+/// boundary (see `tn-types` `forks.rs`), which touches every validator in a single call; the
+/// regular boundary calls fit far below it.
+///
+/// LOCKSTEP FLEET-UPGRADE REQUIREMENT: this value participates in consensus.
+/// `transact_system_call` swaps `block.gas_limit` to this value for the call's duration, and a
+/// binary built with the old 30M diverges from a 100M binary on any system call needing more
+/// than 30M — exactly the calls the headroom exists for. Every validator must run a binary
+/// with the same value before any close can depend on it. (Relatedly, the epoch boundary is
+/// three calls — `applyIncentives`, `applySlashes`, `concludeEpoch` — vs two on `main`;
+/// `applySlashes` is present in the deployed testnet and mainnet genesis bytecode and an
+/// empty-array call is a state-neutral no-op, so existing history replays unchanged.)
+///
+/// Read-path note: contract reads that share the system-call plumbing (including RPC reads via
+/// `read_contract_at_block`) inherit this ceiling — an accepted consequence of the raise.
+///
+/// Observability: the `tn_reth.epoch_close_*` gauges (`crate::metrics`) publish what each
+/// epoch-boundary call spends against this budget, and the budget itself, so consumption is a
+/// ratio a dashboard can watch rather than something discovered when a close halts the fleet.
+pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
+
+/// Gas budget for a single pre-genesis constructor CREATE
+/// (`TNEvm::transact_pre_genesis_create`).
+///
+/// Deliberately 30M — the chain's block gas limit — as a deploy-size ceiling for the genesis
+/// ceremony, NOT a stale copy of the old 30M system-call budget (that constant is
+/// [`SYSTEM_CALL_GAS_LIMIT`] and moved to 100M for epoch-boundary headroom). Pre-genesis
+/// creates run at `gas_price: 0` with the block gas limit raised to match, so the bound exists
+/// to stop runaway constructor execution at the same scale a live block would allow.
+pub(crate) const PRE_GENESIS_CREATE_GAS_LIMIT: u64 = 30_000_000;
 
 /// TN EVM implementation.
 ///
@@ -157,6 +217,21 @@ where
         }
     }
 
+    /// Execute a protocol system call from `caller` (normally `SYSTEM_ADDRESS`) to `contract`,
+    /// outside normal transaction rules.
+    ///
+    /// Environment for the call, restored afterwards via swaps:
+    /// - fixed [`SYSTEM_CALL_GAS_LIMIT`] gas budget, with the block gas limit temporarily raised to
+    ///   match so the call never competes with block gas accounting;
+    /// - `gas_price` 0 and the block base fee swapped to 0, so no fee is charged and the caller
+    ///   needs no balance (upfront cost is zero; `value` is zero too);
+    /// - nonce check disabled (`disable_nonce_check` swapped on; the tx nonce field is 0) and no
+    ///   chain-id check (`chain_id: None`).
+    ///
+    /// The result state is returned, NOT committed — the caller commits it, and is responsible
+    /// for removing `SYSTEM_ADDRESS` from the state first (see the NOTE below). The custom
+    /// handler skips `reward_beneficiary`/`reimburse_caller` for `SYSTEM_ADDRESS` callers so
+    /// the beneficiary and basefee accounts are never spuriously touched by system calls.
     fn transact_system_call(
         &mut self,
         caller: Address,
@@ -168,7 +243,7 @@ where
             kind: TxKind::Call(contract),
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: SYSTEM_CALL_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the
@@ -266,7 +341,13 @@ where
     I: Inspector<TNEvmContext<DB>>,
     PRECOMPILE: PrecompileProvider<TNEvmContext<DB>, Output = InterpreterResult>,
 {
-    /// Transact pre-genesis calls.
+    /// Deploy a contract during pre-genesis construction (a CREATE, not a call).
+    ///
+    /// Uses the same relaxed environment as `transact_system_call` — zero gas price and base fee,
+    /// nonce and chain-id checks disabled — under its own [`PRE_GENESIS_CREATE_GAS_LIMIT`]
+    /// budget with the block gas limit raised to match, but issues a `TxKind::Create` and
+    /// returns the full result state for the caller to commit (no `SYSTEM_ADDRESS` stripping
+    /// convention here).
     pub(crate) fn transact_pre_genesis_create(
         &mut self,
         caller: Address,
@@ -277,7 +358,7 @@ where
             kind: TxKind::Create,
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: PRE_GENESIS_CREATE_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the

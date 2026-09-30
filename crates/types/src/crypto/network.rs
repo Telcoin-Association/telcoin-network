@@ -15,7 +15,12 @@ pub type NetworkKeypair = libp2p::identity::Keypair;
 /// Signature using network key.
 pub type NetworkSignature = Vec<u8>;
 
-impl NetworkPublicKey {}
+/// Render the Base58 protobuf encoding used by human-readable node and genesis configuration.
+impl fmt::Display for NetworkPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&bs58::encode(self.encode_protobuf()).into_string())
+    }
+}
 
 impl From<libp2p::identity::PublicKey> for NetworkPublicKey {
     fn from(value: libp2p::identity::PublicKey) -> Self {
@@ -133,4 +138,21 @@ pub fn verify_proof_of_possession_network(
     msg.extend_from_slice(genesis_bytes.as_slice());
     let message = encode(&IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg));
     public_key.verify(&message, proof)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression coverage for operator-facing network public key formatting.
+
+    use super::{NetworkKeypair, NetworkPublicKey};
+
+    /// Displayed keys match YAML serialization and can be pasted back into configuration.
+    #[test]
+    fn network_public_key_display_matches_yaml() -> eyre::Result<()> {
+        let key: NetworkPublicKey = NetworkKeypair::ed25519_from_bytes([7; 32])?.public().into();
+        let displayed = key.to_string();
+        assert_eq!(serde_yaml::to_string(&key)?, serde_yaml::to_string(&displayed)?);
+        assert_eq!(serde_yaml::from_str::<NetworkPublicKey>(&displayed)?, key);
+        Ok(())
+    }
 }

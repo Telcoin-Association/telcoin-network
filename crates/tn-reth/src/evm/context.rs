@@ -1,6 +1,16 @@
 //! TN-specific context for evm.
 //!
 //! Source code in revm.
+//!
+//! Type aliases and builder plumbing for the revm `Context` TN executes against:
+//! [`TNEvmContext`] pins the generic parameters (mainnet `BlockEnv`/`TxEnv`/`CfgEnv` over a
+//! caller-supplied database), and the [`TNContext`]/[`TNContextBuilder`] traits construct the
+//! inner revm `Evm` value that `TNEvmFactory` wraps in a `TNEvm`.
+//!
+//! Note: the builders here install revm's stock precompiles as a placeholder; the factory
+//! immediately replaces that map with the TN set (stock + TEL + BLS G1), so the stock-only map
+//! never executes. TN-specific transaction semantics (`transact_system_call`,
+//! `transact_pre_genesis_create`) live on `TNEvm` in the parent module, not here.
 
 use reth_evm::precompiles::PrecompilesMap;
 use reth_revm::{

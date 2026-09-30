@@ -1,7 +1,7 @@
 //! Error types whenn validating types during consensus.
 
 use crate::{
-    crypto, BlockNumHash, BlsPublicKey, Digest, Epoch, HeaderDigest, Round, SendError,
+    crypto, BlockNumHash, BlsPublicKey, Digest, Epoch, HeaderDigest, Round, SendError, TimestampMs,
     TimestampSec, VoteDigest, WorkerId,
 };
 use thiserror::Error;
@@ -208,12 +208,18 @@ pub enum HeaderError {
     /// The author is not in the current committee.
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(String),
+    /// This node is not a member of the current committee and cannot vote.
+    #[error("This node is not a committee member and cannot vote")]
+    NotCommitteeMember,
     /// Worker's ID is not in the cache.
     #[error("Header has an unknown worker ID")]
     UnkownWorkerId,
     /// Vote request includes too many parents.
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
+    /// Header references more batch digests than the protocol permits.
+    #[error("Header references too many batches: {0} > {1}")]
+    TooManyBatches(usize, usize),
     /// Vote request includes parent(s) that were not requested.
     #[error("Got parents we did not request")]
     InvalidParents,
@@ -244,17 +250,25 @@ pub enum HeaderError {
     /// The proposed header's round is too far ahead.
     #[error("Header {digest} for round {header_round} is too new for max round {max_round}")]
     TooNew { digest: HeaderDigest, header_round: Round, max_round: Round },
+    /// The proposed header's round is zero. Round 0 is reserved for genesis certificates and is
+    /// never voted on, so a header at round 0 is malformed.
+    #[error("Header {0} has an invalid round of 0; proposed headers must be at round >= 1")]
+    InvalidRound(HeaderDigest),
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
+    /// The header's epoch-close seed signature does not verify against the author's protocol key
+    /// over the canonical seed message for the header's `(epoch, round)`.
+    #[error("Header's epoch-close seed signature is invalid")]
+    InvalidSeedSignature,
     /// A parent is not from the previous round.
     #[error("Parent not from previous round.")]
     InvalidParentRound,
     /// A parent certificate is invalid.
     #[error(
-        "Invalid parent timestamp: header created at {header:?} and parent created at {parent:?}"
+        "Invalid parent timestamp: header created at {header} ms and parent created at {parent} ms"
     )]
-    InvalidParentTimestamp { header: TimestampSec, parent: TimestampSec },
+    InvalidParentTimestamp { header: TimestampMs, parent: TimestampMs },
     /// The header's parents must be unique.
     #[error("Duplicate authors for parent headers. Authorities must be unique.")]
     DuplicateParents,
@@ -262,8 +276,11 @@ pub enum HeaderError {
     #[error("{0}")]
     SyncBatches(String),
     /// The header's timestamp is too far in the future
-    #[error("Invalid timestamp. Created at: {created}, received {received})")]
-    InvalidTimestamp { created: TimestampSec, received: TimestampSec },
+    #[error("Invalid timestamp. Created at: {created} ms, received {received} ms")]
+    InvalidTimestamp { created: TimestampMs, received: TimestampMs },
+    /// The header's sub-second creation time is outside `0..=999` milliseconds.
+    #[error("Invalid header created_at_millis {0}: must be below 1000")]
+    InvalidTimestampMillis(u16),
     /// Already voted for this header.
     #[error("Already voted for header {0} at round {1}")]
     AlreadyVoted(HeaderDigest, Round),

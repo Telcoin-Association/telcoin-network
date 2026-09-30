@@ -125,7 +125,11 @@ where
         // Build Synchronize requests to workers.
         let mut synchronize_handles = Vec::new();
         for (worker_id, digests) in missing {
-            let client = self.config.local_network().clone();
+            // `worker_id` is peer-supplied (it comes off the header payload at the top of this
+            // fn): an id outside the committee's worker set must surface as the header error
+            // the variant exists for - never a skip, a fallback instance, or a panic.
+            let client =
+                self.config.local_network(worker_id).cloned().ok_or(HeaderError::UnkownWorkerId)?;
             let retry_config = RetryConfig::default(); // 30s timeout
             let handle = retry_config.retry(move || {
                 let digests = digests.clone();

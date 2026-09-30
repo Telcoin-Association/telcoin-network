@@ -12,21 +12,24 @@ use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::{
     payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
-    RethChainSpec, RethEnv,
+    RethChainSpec, RethEnv, TxPool as _,
 };
 use tn_storage::{open_db, tables::NodeBatchesCache};
+use tn_test_utils::wait_until;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
-    CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
-    SealedBatch, TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
+    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database, Encodable2718,
+    GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
+    MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::time::timeout;
 use tracing::debug;
 
+/// Test that a validated batch is stored and its mined transactions leave the pool.
 #[tokio::test]
-async fn test_make_batch_el_to_cl() {
+async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
     let task_manager = TaskManager::default();
     //
@@ -40,7 +43,9 @@ async fn test_make_batch_el_to_cl() {
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
-    network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
+    network_client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
 
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
@@ -51,6 +56,8 @@ async fn test_make_batch_el_to_cl() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
     );
     batch_provider.spawn_batch_builder("test builder", &task_manager);
 
@@ -66,7 +73,7 @@ async fn test_make_batch_el_to_cl() {
 
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
     let address = Address::from(U160::from(333));
 
     // build execution block proposer
@@ -80,7 +87,8 @@ async fn test_make_batch_el_to_cl() {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -132,32 +140,27 @@ async fn test_make_batch_el_to_cl() {
     assert_eq!(pending_pool_len, 3);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
     //
 
-    // wait for new batch
-    let mut sealed_batch = None;
-    for _ in 0..5 {
-        let _ = tokio::time::sleep(Duration::from_secs(1)).await;
-        // Ensure the batch is stored
-        if let Some((digest, wb)) = store.iter::<NodeBatchesCache>().next() {
-            sealed_batch = Some(SealedBatch::new(wb, digest));
-            break;
-        }
-    }
-    let sealed_batch = sealed_batch.unwrap();
+    // wait for new batch to be stored
+    wait_until(Duration::from_secs(5), "batch stored", || async {
+        Ok(store.iter::<NodeBatchesCache>().next().is_some())
+    })
+    .await?;
+    // re-fetch the stored batch once the store has converged
+    let sealed_batch = store
+        .iter::<NodeBatchesCache>()
+        .next()
+        .map(|(digest, wb)| SealedBatch::new(wb, digest))
+        .expect("batch in store after wait");
 
     // ensure batch validator succeeds
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -177,42 +180,52 @@ async fn test_make_batch_el_to_cl() {
     let batch_txs = sealed_batch.batch().transactions();
     assert_eq!(batch_txs, expected_batch.batch().transactions());
 
-    // ensure enough time passes for store to pass
-    let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // ensure the batch is stored before reading it back
+    wait_until(Duration::from_secs(5), "batch stored by digest", || async {
+        Ok(store
+            .get::<NodeBatchesCache>(&expected_batch.digest())
+            .is_ok_and(|maybe| maybe.is_some()))
+    })
+    .await?;
     let first_batch = store.iter::<NodeBatchesCache>().next();
     debug!("first batch? {:?}", first_batch);
 
-    // Ensure the batch is stored
     let batch_from_store = store
         .get::<NodeBatchesCache>(&expected_batch.digest())
         .expect("store searched for batch")
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
 
+    // Await pool maintenance after verifying the mined batch's stored contents.
+    wait_until(timeout, "stored batch's mined transactions removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
+
     // txpool should be empty after mining
     // test_make_batch_no_ack_txs_in_pool_still tests for txs in pool without mining event
     let pending_pool_len = txpool.pool_size().pending;
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 0);
+
+    Ok(())
 }
 
-/// Create 5 transactions.
+/// Create 4 valid EIP-1559 transactions and 1 valid EIP-4844 (blob) transaction.
 ///
-/// First 4 mined in first batch.
-/// One of the transactions is EIP-4844 blob which is discarded.
-/// (only 3 valid txs in first batch)
-/// Before a canonical state change, mine the 5th transaction in the next batch.
+/// The pool rejects the blob transaction at admission (issue #1159), so it never reaches the
+/// batch builder. First 3 transactions mined in the first batch. Before a canonical state
+/// change, mine the 4th transaction in the next batch.
 #[tokio::test]
-async fn test_batch_builder_produces_valid_batches() {
+async fn test_batch_builder_produces_valid_batches() -> eyre::Result<()> {
     //
     //=== Execution Layer
     //
     // adiri genesis with TxFactory funded
     let genesis = test_genesis();
 
-    // create random tx factory for eip-4844 transaction reth does not allow
-    // different tx types in pool at same time from same address
-    // see Err: ExistingConflictingTransactionType
+    // fund a second random factory for the eip-4844 transaction, so its rejection below can
+    // only come from the pool's type gate, never from insufficient balance
     let mut blob_tx_factory = TransactionFactory::new_random();
     let genesis = genesis.extend_accounts([(
         blob_tx_factory.address(),
@@ -224,7 +237,7 @@ async fn test_batch_builder_produces_valid_batches() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
@@ -239,7 +252,8 @@ async fn test_batch_builder_produces_valid_batches() {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -282,19 +296,18 @@ async fn test_batch_builder_produces_valid_batches() {
     let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
     assert_matches!(added_result, hash if &hash == transaction3.hash());
 
-    // submit eip-4844 blob transaction
-    let _ = blob_tx_factory
-        .create_and_submit_eip4844(chain.clone(), None, gas_price, txpool.clone())
-        .await;
+    // submit a valid eip-4844 blob transaction: the pool must reject it at admission (#1159)
+    let blob_pooled = blob_tx_factory.create_eip4844_pooled(chain.clone(), None, gas_price);
+    let blob_result = txpool.add_transaction_local(blob_pooled).await;
+    assert!(blob_result.is_err());
 
-    // txpool size
+    // txpool size: the rejected blob left nothing behind
     let pool_size = txpool.pool_size();
-    assert_eq!(pool_size.pending, 4);
-    // ensure blob is not under valued
+    assert_eq!(pool_size.pending, 3);
     assert_eq!(pool_size.blob, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
@@ -320,7 +333,8 @@ async fn test_batch_builder_produces_valid_batches() {
         )
         .await;
 
-    // assert 4 txs in pending pool - blob should be removed while creating first batch
+    // assert 4 txs in pending pool - the 3 original txs are not mined until the ack,
+    // plus the 1 new tx submitted above
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.pending, 4);
     assert_eq!(pool_size.blob, 0);
@@ -329,13 +343,8 @@ async fn test_batch_builder_produces_valid_batches() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -350,7 +359,7 @@ async fn test_batch_builder_produces_valid_batches() {
         received_at: None,
         ..*first_batch.batch()
     };
-    // assert only 3 transactions in batch - blob should be discarded
+    // assert only the first 3 transactions in batch
     let batch_txs = first_batch.batch().transactions();
     assert_eq!(batch_txs, expected_batch.transactions());
 
@@ -375,13 +384,17 @@ async fn test_batch_builder_produces_valid_batches() {
     let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
     assert_eq!(tx.hash(), &expected_tx_hash);
 
-    // yield to try and give pool a chance to update
-    tokio::task::yield_now().await;
+    // Wait for the acknowledged batch's blocking pool update to remove the mined transactions.
+    wait_until(duration, "mined transactions removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
 
     // assert all transactions mined/removed
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.pending, 0);
     assert_eq!(pool_size.blob, 0);
+    Ok(())
 }
 
 /// Create 4 transactions.
@@ -389,7 +402,7 @@ async fn test_batch_builder_produces_valid_batches() {
 /// First 3 mined in first block.
 /// Before a canonical state change, mine the 4th transaction in the next block.
 #[tokio::test]
-async fn test_canonical_notification_updates_pool() {
+async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     //
     //=== Execution Layer
     //
@@ -400,7 +413,7 @@ async fn test_canonical_notification_updates_pool() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
     let address = Address::from(U160::from(333));
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
@@ -416,7 +429,8 @@ async fn test_canonical_notification_updates_pool() {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -456,7 +470,7 @@ async fn test_canonical_notification_updates_pool() {
     assert_eq!(pending_pool_len, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test block flow
@@ -498,9 +512,9 @@ async fn test_canonical_notification_updates_pool() {
             0,
             ReputationScores::default(),
             None,
-        )
-        .into(),
-        BlockHash::default(),
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        ),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests,
@@ -510,11 +524,22 @@ async fn test_canonical_notification_updates_pool() {
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
     let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
-    let _final_header = execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
-        .expect("output executed");
+    // spawn blocking for payload_builder::blocking_recv
+    let _final_header = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            GasAccumulator::default(),
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+        .expect("output executed")
+    });
 
-    // sleep to ensure canonical update received before ack
-    let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+    // wait for canonical update to settle the pool before ack
+    wait_until(Duration::from_secs(5), "pool pending reaches 1 after canonical update", || async {
+        Ok(txpool.pool_size().pending == 1)
+    })
+    .await?;
 
     // assert 4th transaction demoted to queued pool
     let pool_size = txpool.pool_size();
@@ -534,22 +559,161 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate batch
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
 
-    // yield to try and give pool a chance to update
-    tokio::task::yield_now().await;
+    // Wait for the acknowledged batch's blocking pool update to remove the mined transaction.
+    wait_until(duration, "final mined transaction removed from pool", || async {
+        Ok(txpool.pool_size().pending == 0)
+    })
+    .await?;
 
     // assert pool empty
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.queued, 0);
     assert_eq!(pool_size.pending, 0);
+
+    Ok(())
+}
+
+/// A transaction a validated peer batch already carries must not be packed into this node's own
+/// batch. The client can submit one signed transaction to every committee validator, so without
+/// the deferral every worker packs a copy, every copy passes peer validation and takes a vote
+/// round, and only the first executed copy pays (issue #1329).
+#[tokio::test]
+async fn test_peer_batched_tx_is_not_repacked() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let task_manager = TaskManager::default();
+
+    //
+    //=== Consensus Layer
+    //
+
+    let network_client = LocalNetwork::new_with_empty_id();
+    let db_path = tmp_dir.path().join("c-db");
+    let _ = std::fs::create_dir_all(&db_path);
+    let store = open_db(db_path);
+
+    // Mock the primary client to always succeed.
+    let mock_server = MockWorkerToPrimary();
+    network_client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
+
+    let qw = TestMakeBlockQuorumWaiter::new_test();
+    let mut batch_provider = Worker::new(
+        0,
+        Some(qw.clone()),
+        network_client,
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
+    );
+    batch_provider.spawn_batch_builder("test builder", &task_manager);
+
+    //
+    //=== Execution Layer
+    //
+
+    // adiri genesis funds the default factory; fund a second, independent sender so the two
+    // transactions below never share a nonce sequence
+    let genesis = test_genesis();
+    let mut factory_b = TransactionFactory::new_random();
+    let genesis = genesis.extend_accounts([(
+        factory_b.address(),
+        GenesisAccount::default().with_balance(U256::MAX),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
+    let txpool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
+    let address = Address::from(U160::from(333));
+
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        batch_provider.batches_tx(),
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+        0,
+        MIN_PROTOCOL_BASE_FEE,
+        0,
+    )
+    .expect("batch builder");
+
+    let gas_price = reth_env.get_gas_price().unwrap();
+    let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+    let mut factory_a = TransactionFactory::new();
+
+    // two transactions from two senders, both admitted to this node's pool
+    let tx1 = factory_a.create_eip1559(
+        chain.clone(),
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value, // 1 TEL
+        Bytes::new(),
+    );
+    let tx2 = factory_b.create_eip1559(
+        chain.clone(),
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value, // 1 TEL
+        Bytes::new(),
+    );
+
+    let added_result = factory_a.submit_tx_to_pool(tx1.clone(), txpool.clone()).await;
+    assert_matches!(added_result, hash if &hash == tx1.hash());
+    let added_result = factory_b.submit_tx_to_pool(tx2.clone(), txpool.clone()).await;
+    assert_matches!(added_result, hash if &hash == tx2.hash());
+    assert_eq!(txpool.pool_size().pending, 2);
+
+    // a peer proposes a valid batch that carries tx1: the same transaction the client also sent
+    // to this node
+    let peer_batch = Batch {
+        transactions: vec![tx1.encoded_2718()],
+        epoch: 0,
+        beneficiary: Address::ZERO,
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    }
+    .seal_slow();
+
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
+    assert!(batch_validator.validate_batch(peer_batch).is_ok());
+
+    // validating the peer batch deferred exactly its own transactions
+    assert!(txpool.is_peer_deferred(tx1.hash()));
+    assert!(!txpool.is_peer_deferred(tx2.hash()));
+
+    //
+    //=== Test batch flow
+    //
+
+    let _batch_builder = tokio::spawn(batch_builder.run());
+
+    // wait for this node's batch to be stored
+    wait_until(Duration::from_secs(5), "batch stored", || async {
+        Ok(store.iter::<NodeBatchesCache>().next().is_some())
+    })
+    .await?;
+
+    // the peer's transaction is in no batch this node produced; its own transaction is
+    let stored: Vec<Vec<u8>> = store
+        .iter::<NodeBatchesCache>()
+        .flat_map(|(_, batch)| batch.transactions().to_vec())
+        .collect();
+    assert_eq!(stored, vec![tx2.encoded_2718()]);
+
+    Ok(())
 }
