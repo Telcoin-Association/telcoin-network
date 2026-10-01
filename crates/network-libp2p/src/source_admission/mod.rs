@@ -1,14 +1,15 @@
 //! Admission using observed QUIC addresses after the authenticated transport handshake.
 
 mod core;
-pub use core::AdmissionError;
+pub use core::{AdmissionError, SourceOccupancy};
 
 use libp2p::{
     multiaddr::Protocol,
     swarm::{ConnectionId, FromSwarm},
     Multiaddr, PeerId,
 };
-use std::{collections::BTreeMap, net::IpAddr};
+use parking_lot::Mutex;
+use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tn_config::SourceAdmissionConfig;
 
 /// Process-wide established-connection accounting shared by all active swarms.
@@ -16,6 +17,8 @@ use tn_config::SourceAdmissionConfig;
 pub struct SourceAdmissionBudget {
     /// Shared bounded occupancy and validated deployment limits.
     budget: core::Budget,
+    /// Serialize snapshots and gauge publication across every swarm.
+    measurements: Arc<Mutex<()>>,
 }
 
 impl SourceAdmissionBudget {
@@ -29,7 +32,33 @@ impl SourceAdmissionBudget {
             config.max_sources(),
             config.prefix_lengths(),
         )
-        .map(|limits| Self { budget: core::Budget::new(limits) })
+        .map(|limits| {
+            let budget =
+                Self { budget: core::Budget::new(limits), measurements: Arc::new(Mutex::new(())) };
+            budget.publish_occupancy();
+            budget
+        })
+    }
+
+    /// Current process-wide occupancy across primary and worker connections.
+    pub fn snapshot(&self) -> Result<SourceOccupancy, AdmissionError> {
+        self.budget.snapshot()
+    }
+
+    fn publish_occupancy(&self) {
+        let _measurements = self.measurements.lock();
+        self.snapshot().map_or_else(
+            |_| metrics::counter!("tn_network.source_accounting_errors_total").increment(1),
+            |occupancy| {
+                metrics::gauge!("tn_network.source_connections")
+                    .set(occupancy.connections() as f64);
+                metrics::gauge!("tn_network.source_peer_rows").set(occupancy.peer_rows() as f64);
+                metrics::gauge!("tn_network.source_address_rows")
+                    .set(occupancy.address_rows() as f64);
+                metrics::gauge!("tn_network.source_prefix_rows")
+                    .set(occupancy.prefix_rows() as f64);
+            },
+        );
     }
 
     /// Acquire occupancy using the remote endpoint of a completed QUIC handshake.
@@ -58,6 +87,23 @@ impl SourceConnections {
     /// Install the budget before polling this swarm.
     pub(crate) fn set_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
         self.budget = budget;
+        self.budget.as_ref().map_or_else(
+            || {
+                metrics::gauge!("tn_network.source_accounting_enabled").set(0.0);
+                [
+                    "tn_network.source_connections",
+                    "tn_network.source_peer_rows",
+                    "tn_network.source_address_rows",
+                    "tn_network.source_prefix_rows",
+                ]
+                .into_iter()
+                .for_each(|name| metrics::gauge!(name).set(0.0));
+            },
+            |budget| {
+                metrics::gauge!("tn_network.source_accounting_enabled").set(1.0);
+                budget.publish_occupancy();
+            },
+        );
     }
 
     /// Reserve only from an established-connection callback.
@@ -73,6 +119,7 @@ impl SourceConnections {
             self.budget.as_ref().map(|budget| budget.acquire(address, peer)).transpose().map(
                 |lease| {
                     lease.map(|lease| self.leases.insert(connection, lease));
+                    self.budget.iter().for_each(SourceAdmissionBudget::publish_occupancy);
                 },
             )
         }
@@ -83,15 +130,30 @@ impl SourceConnections {
     /// A later behaviour's denial emits `ListenFailure` or `DialFailure` in the pinned
     /// libp2p swarm. Transport failures before reservation simply find no lease.
     pub(crate) fn on_swarm_event(&mut self, event: &FromSwarm<'_>) {
-        if let FromSwarm::ConnectionClosed(event) = event {
-            self.leases.remove(&event.connection_id);
+        if matches!(
+            event,
+            FromSwarm::ConnectionClosed(_)
+                | FromSwarm::ListenFailure(_)
+                | FromSwarm::DialFailure(_)
+        ) {
+            if let FromSwarm::ConnectionClosed(event) = event {
+                self.leases.remove(&event.connection_id);
+            }
+            if let FromSwarm::ListenFailure(event) = event {
+                self.leases.remove(&event.connection_id);
+            }
+            if let FromSwarm::DialFailure(event) = event {
+                self.leases.remove(&event.connection_id);
+            }
+            self.budget.iter().for_each(SourceAdmissionBudget::publish_occupancy);
         }
-        if let FromSwarm::ListenFailure(event) = event {
-            self.leases.remove(&event.connection_id);
-        }
-        if let FromSwarm::DialFailure(event) = event {
-            self.leases.remove(&event.connection_id);
-        }
+    }
+}
+
+impl Drop for SourceConnections {
+    fn drop(&mut self) {
+        self.leases.clear();
+        self.budget.iter().for_each(SourceAdmissionBudget::publish_occupancy);
     }
 }
 

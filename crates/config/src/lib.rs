@@ -27,6 +27,8 @@ mod gossip_mesh;
 pub use gossip_mesh::{GossipMeshConfig, GossipMeshError};
 mod network_budget;
 pub use network_budget::*;
+mod network_serve;
+pub use network_serve::NetworkServeConfig;
 mod source_admission;
 pub use source_admission::SourceAdmissionConfig;
 mod retry;

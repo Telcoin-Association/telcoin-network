@@ -148,6 +148,8 @@ pub(crate) struct PeerManager {
     config: PeerConfig,
     /// Optional ordinary-population ceiling independent of protected peer retention.
     public_peer_limit: Option<NonZeroUsize>,
+    /// Bounded, operator-selected observer identities, measured separately from other pins.
+    dao_observers: HashSet<BlsPublicKey>,
     /// Leases owned by this swarm using optional process-wide source accounting.
     source_connections: SourceConnections,
     /// The interval to perform maintenance.
@@ -307,6 +309,7 @@ impl PeerManager {
             local_peer_id,
             config: *config,
             public_peer_limit: None,
+            dao_observers: HashSet::new(),
             source_connections: SourceConnections::default(),
             heartbeat,
             peers,
@@ -494,6 +497,16 @@ impl PeerManager {
 
         // Emit peer metrics via tracing for OpenTelemetry export.
         let connected_count = self.peers.connected_peer_ids().count();
+        let ordinary =
+            self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count();
+        let observers = self
+            .peers
+            .connected_peer_ids()
+            .filter(|peer| {
+                self.peer_to_bls(peer).is_some_and(|key| self.dao_observers.contains(&key))
+            })
+            .count();
+        self.metrics.set_population_counts(ordinary, observers);
         let connected_or_dialing = self.connected_or_dialing_peers().len();
         let banned_count = self.temporarily_banned.len();
         tracing::info!(
@@ -656,6 +669,12 @@ impl PeerManager {
     /// Set an ordinary-peer admission ceiling while preserving aggregate connection limits.
     pub(crate) fn set_public_peer_limit(&mut self, limit: Option<NonZeroUsize>) {
         self.public_peer_limit = limit;
+    }
+
+    /// Select the prevalidated DAO identities without changing their admission or penalty policy.
+    pub(crate) fn set_dao_observers(&mut self, observers: HashSet<BlsPublicKey>) {
+        self.dao_observers = observers;
+        self.metrics.set_population_counts(0, 0);
     }
 
     /// Return an iterator of peers that are connected or dialed.

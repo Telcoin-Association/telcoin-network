@@ -15,11 +15,15 @@ use message::{PrimaryGossip, PrimaryRPCError};
 use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
     error::NetworkError,
     read_frame,
     types::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        NetworkResult, NetworkType,
     },
     write_frame, DenyReason, GossipMessage, Penalty, PrimarySyncRequest, ResponseChannel, Stream,
     StreamError, SyncFrame, SyncFrameError,
@@ -35,7 +39,7 @@ use tn_types::{
     ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
     Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, WorkerId,
 };
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
@@ -110,7 +114,7 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// stream is dropped without spawning (the requester sees a reset and retries
 /// elsewhere), so the primary's total sync-task fan-out stays bounded by
 /// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
-pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+pub const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Longest peer-supplied error text, in characters, that a vote request keeps.
 ///
@@ -278,10 +282,15 @@ fn try_admit_sync(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *sync_guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -309,10 +318,15 @@ pub(crate) fn try_admit_epoch_record(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut guard = peers.lock();
     let count = guard.get(&peer).copied().unwrap_or(0);
-    (count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
-    })
+    (count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Primary network specific handle.
@@ -1251,13 +1265,18 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             consensus_chain.clone(),
         );
-        let epoch_stream_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+        let epoch_stream_semaphore = Arc::new(Semaphore::new_for(
+            serve.epoch_stream(),
+            ServeClass::EpochStream,
+            &NetworkType::Primary,
+        ));
         Self {
             network_events,
             network_handle,
@@ -1266,8 +1285,16 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
-            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
-            epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
+            shed_task_semaphore: Arc::new(Semaphore::new_for(
+                serve.primary_shed(),
+                ServeClass::PrimaryShed,
+                &NetworkType::Primary,
+            )),
+            epoch_record_semaphore: Arc::new(Semaphore::new_for(
+                serve.epoch_record(),
+                ServeClass::EpochRecord,
+                &NetworkType::Primary,
+            )),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
         }
     }

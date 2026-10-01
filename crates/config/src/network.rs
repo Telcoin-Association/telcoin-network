@@ -2,14 +2,19 @@
 
 use crate::{
     ConfigFmt, ConfigTrait, GossipMeshConfig, NetworkBudgetError, NetworkProcessBudget,
-    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
+    NetworkServeConfig, SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::kad::K_VALUE;
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    num::NonZeroUsize,
+    time::Duration,
+};
 use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
 use tracing::warn;
 
@@ -21,8 +26,12 @@ impl ConfigTrait for NetworkConfig {}
 pub struct NetworkConfig {
     /// Operator-selected topic mesh degrees, independent of consensus authorization.
     gossip_mesh: GossipMeshConfig,
+    /// Independent finite concurrency budgets for stream, record, denial, and prefetch work.
+    serve_limits: NetworkServeConfig,
     /// Optional ceiling for ordinary peers, leaving process-budget headroom for protected peers.
     public_peer_limit: Option<NonZeroUsize>,
+    /// DAO observer identities, separately measured within the configured trusted bootstrap set.
+    dao_observers: BTreeSet<BlsPublicKey>,
     /// The configurations for libp2p library.
     ///
     /// This holds parameters for configuring gossipsub and request/response.
@@ -55,9 +64,19 @@ impl NetworkConfig {
         &self.gossip_mesh
     }
 
+    /// Per-class concurrency budgets applied to the primary and every worker.
+    pub fn serve_limits(&self) -> &NetworkServeConfig {
+        &self.serve_limits
+    }
+
     /// Return the independent ordinary-peer ceiling, when an operator has selected one.
     pub fn public_peer_limit(&self) -> Option<NonZeroUsize> {
         self.public_peer_limit
+    }
+
+    /// Observer identities whose protected connectivity must survive public traffic.
+    pub fn dao_observers(&self) -> &BTreeSet<BlsPublicKey> {
+        &self.dao_observers
     }
 
     /// Validate the process budget against the primary plus every configured worker swarm.

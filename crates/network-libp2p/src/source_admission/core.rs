@@ -113,6 +113,34 @@ struct Occupancy {
     prefixes: BTreeMap<IpAddr, usize>,
 }
 
+/// Process-wide source accounting occupancy, with no peer or address labels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceOccupancy {
+    connections: usize,
+    peer_rows: usize,
+    address_rows: usize,
+    prefix_rows: usize,
+}
+
+impl SourceOccupancy {
+    /// Reserved connections across every primary and worker swarm.
+    pub const fn connections(self) -> usize {
+        self.connections
+    }
+    /// Retained identity rows.
+    pub const fn peer_rows(self) -> usize {
+        self.peer_rows
+    }
+    /// Retained source-address rows.
+    pub const fn address_rows(self) -> usize {
+        self.address_rows
+    }
+    /// Retained network-prefix rows.
+    pub const fn prefix_rows(self) -> usize {
+        self.prefix_rows
+    }
+}
+
 /// Shared accounting instance for every primary and worker swarm.
 #[derive(Clone, Debug)]
 pub(super) struct Budget {
@@ -126,6 +154,18 @@ impl Budget {
     /// Create an empty budget from validated limits.
     pub(super) fn new(limits: Limits) -> Self {
         Self { limits, occupancy: Arc::new(Mutex::new(Occupancy::default())) }
+    }
+
+    /// Read all table counts under one lock without retaining source identities.
+    pub(super) fn snapshot(&self) -> Result<SourceOccupancy, AdmissionError> {
+        self.occupancy.lock().map_err(|_| AdmissionError::Poisoned).map(|occupancy| {
+            SourceOccupancy {
+                connections: occupancy.connections,
+                peer_rows: occupancy.peers.len(),
+                address_rows: occupancy.addresses.len(),
+                prefix_rows: occupancy.prefixes.len(),
+            }
+        })
     }
 
     /// Reserve a connection after the transport proves return reachability.
@@ -166,6 +206,43 @@ impl Budget {
             }
         }
     }
+}
+
+/// Shared addresses and prefixes retain one row until their last lease leaves.
+#[cfg(test)]
+#[test]
+fn occupancy_snapshot_tracks_shared_sources_and_release() -> Result<(), AdmissionError> {
+    let budget = Budget::new(Limits::new(8, 3, 4, 8, 8, (24, 64))?);
+    assert_eq!(budget.snapshot()?, SourceOccupancy::default());
+    let address = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    let first = budget.acquire(address, vec![1])?;
+    let shared = budget.acquire(address, vec![2])?;
+    let other = budget.acquire(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)), vec![3])?;
+    let occupied = budget.snapshot()?;
+    assert_eq!(
+        (
+            occupied.connections(),
+            occupied.peer_rows(),
+            occupied.address_rows(),
+            occupied.prefix_rows()
+        ),
+        (3, 3, 2, 1)
+    );
+    drop(shared);
+    drop(first);
+    let remaining = budget.snapshot()?;
+    assert_eq!(
+        (
+            remaining.connections(),
+            remaining.peer_rows(),
+            remaining.address_rows(),
+            remaining.prefix_rows()
+        ),
+        (1, 1, 1, 1)
+    );
+    drop(other);
+    assert_eq!(budget.snapshot()?, SourceOccupancy::default());
+    Ok(())
 }
 
 /// Sole owner of one connection's occupancy, released on drop.

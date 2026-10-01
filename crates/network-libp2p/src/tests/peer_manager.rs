@@ -78,6 +78,56 @@ async fn public_peer_limit_preserves_protected_headroom() {
     assert!(!manager.peer_limit_reached(&endpoint));
 }
 
+/// DAO connectivity follows the declared identity rather than any other protected connection.
+#[tokio::test]
+async fn dao_metrics_track_identity_and_disconnection() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        let mut manager = create_test_peer_manager(None);
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([83; 32])));
+        let public_key = keys.primary_public_key();
+        let network_key = keys.primary_network_public_key();
+        let observer: PeerId = network_key.clone().into();
+        let address = create_multiaddr(None);
+        let (reply, _receiver) = oneshot::channel();
+        manager.add_trusted_peer_and_dial(
+            public_key,
+            NetworkInfo {
+                pubkey: network_key,
+                multiaddrs: vec![address.clone()],
+                timestamp: now(),
+                rpc: None,
+            },
+            reply,
+        );
+        manager.set_dao_observers(HashSet::from([public_key]));
+        assert!(manager.register_peer_connection(
+            &observer,
+            ConnectionType::IncomingConnection { multiaddr: address }
+        ));
+        register_peer(&mut manager, None);
+        manager.heartbeat();
+        let measured = |name, expected| {
+            recorder.snapshotter().snapshot().into_vec().iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "network" && label.value() == "primary")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        assert!(measured("tn_network.dao_observers_connected", 1.0));
+        assert!(measured("tn_network.ordinary_peers_connected", 1.0));
+        manager.register_disconnected(&observer);
+        manager.heartbeat();
+        assert!(measured("tn_network.dao_observers_connected", 0.0));
+        assert!(measured("tn_network.ordinary_peers_connected", 1.0));
+    });
+}
+
 /// Committee rotation reclaims public slots even below the aggregate connection ceiling.
 #[tokio::test]
 async fn public_peer_limit_prunes_after_committee_rotation() {

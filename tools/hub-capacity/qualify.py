@@ -21,6 +21,11 @@ SCENARIOS = {
     "submit_url_lookup", "concurrent_sync", "committee_progress", "dao_connectivity",
 }
 SERVICES = {"epoch_stream", "epoch_record", "primary_shed", "batch_stream", "worker_shed", "prefetch"}
+TASK_LIMITS = {
+    "primary": {"epoch_stream": 5, "epoch_record": 5, "primary_shed": 8},
+    "worker-0": {"batch_stream": 5, "worker_shed": 8, "prefetch": 8},
+    "worker-1": {"batch_stream": 5, "worker_shed": 8, "prefetch": 8},
+}
 
 
 def read_json(path):
@@ -81,8 +86,15 @@ def validate_plan(plan):
     selected = {key: candidate_profile.get(key) for key in shipped}
     if digest(selected) != digest(shipped):
         fail("candidate configuration differs from the shipped profile")
-    if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname"}:
+    if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname", "dao_observers"}:
         fail("v1 permits deployment bootstrap/hostname settings alongside the exact profile")
+    observers = candidate_profile.get("dao_observers", [])
+    if not isinstance(observers, list) or len(observers) != 8 or any(not isinstance(key, str) or not key for key in observers) or len(set(observers)) != 8:
+        fail("declare eight distinct DAO observer identities before qualification")
+    if any(key not in candidate_profile.get("bootstrap_peers", {}) for key in observers):
+        fail("every DAO observer must be provisioned in the trusted bootstrap set")
+    if plan["baseline"]["profile"].get("dao_observers") != observers:
+        fail("baseline and candidate must measure the same DAO identities")
     envelope = plan["envelope"]
     for field in ("cpus_per_hub", "ram_bytes_per_hub", "link_mbps", "rtt_ms",
                   "public_peers", "shared_nat_peers", "dao_observers", "committee_peers", "workers_per_hub",
@@ -154,18 +166,28 @@ def validate_evidence(plan, evidence, phase):
             integer(hub["source_rows"], "source accounting occupancy", 0)
             if set(hub["swarms"]) != swarms:
                 fail("primary and all configured workers must be measured")
-            for swarm in hub["swarms"].values():
+            totals = dict.fromkeys(SERVICES, 0)
+            for network, swarm in hub["swarms"].items():
                 for field in ("connections", "connection_limit", "streams_per_connection_limit",
-                              "receive_credit_per_connection_bytes", "queue_occupancy"):
+                              "receive_credit_per_connection_bytes", "queue_occupancy",
+                              "ordinary_peers", "dao_connected"):
                     integer(swarm[field], field, 0)
                 if not isinstance(swarm["rejections"], dict):
                     fail("record rejection counts by reason, including an empty map")
                 for count in swarm["rejections"].values():
                     integer(count, "rejections", 0)
+                if set(swarm["tasks"]) != set(TASK_LIMITS[network]) or swarm["task_limits"] != TASK_LIMITS[network]:
+                    fail("every swarm must declare its independent serve-class allocations")
+                for limit in swarm["task_limits"].values():
+                    integer(limit, "per-swarm serve allocation", 1)
+                for service, count in swarm["tasks"].items():
+                    totals[service] += integer(count, "per-swarm serve occupancy", 0)
             if set(hub["tasks"]) != SERVICES:
                 fail("all serve-class task occupancies must be measured")
             for count in hub["tasks"].values():
                 integer(count, "task occupancy", 0)
+            if hub["tasks"] != totals:
+                fail("process serve occupancy must equal the measured primary and worker totals")
     samples = evidence["samples"]
     if len(samples) < 2 or samples[0]["elapsed_seconds"] != 0:
         fail("capture must start at zero and contain multiple samples")
@@ -221,6 +243,10 @@ def score(plan, evidence):
     for hub_id in plan["hubs"]:
         initial = first["hubs"][hub_id]
         final = last["hubs"][hub_id]
+        for network in TASK_LIMITS:
+            if max(sample["hubs"][hub_id]["swarms"][network]["ordinary_peers"]
+                   for sample in evidence["samples"]) < plan["envelope"]["public_peers"]:
+                failures.append(f"{hub_id}/{network}: declared public population was never measured")
         if final["progress"] <= initial["progress"]:
             failures.append(f"{hub_id}: application made no progress")
         previous_cpu = initial["cpu_seconds"]
@@ -246,6 +272,12 @@ def score(plan, evidence):
             if hub["dao_connected"] < plan["envelope"]["dao_observers"]:
                 failures.append(f"{hub_id}: DAO observer reservation lost")
             allocations = list(hub["swarms"].values())
+            if any(swarm["ordinary_peers"] > profile["public_peer_limit"] or
+                   swarm["dao_connected"] < plan["envelope"]["dao_observers"] for swarm in allocations):
+                failures.append(f"{hub_id}: public population or per-swarm DAO reservation exceeded")
+            if any(count > swarm["task_limits"][service]
+                   for swarm in allocations for service, count in swarm["tasks"].items()):
+                failures.append(f"{hub_id}: independent swarm task budget exceeded")
             if any(swarm["connection_limit"] != swarm_limit or swarm["connections"] > swarm_limit or
                    swarm["streams_per_connection_limit"] != stream_limit or
                    swarm["receive_credit_per_connection_bytes"] != credit_limit or

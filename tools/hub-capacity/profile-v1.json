@@ -1,5 +1,10 @@
 {
-  "gossip_mesh": {"target": 12, "low": 8, "high": 16, "outbound_min": 4},
+  "gossip_mesh": {
+    "target": 12,
+    "low": 8,
+    "high": 16,
+    "outbound_min": 4
+  },
   "public_peer_limit": 64,
   "peer_config": {
     "target_num_peers": 86,
@@ -26,5 +31,13 @@
     "max_sources": 258,
     "ipv4_prefix_length": 24,
     "ipv6_prefix_length": 64
+  },
+  "serve_limits": {
+    "epoch_stream": 5,
+    "epoch_record": 5,
+    "primary_shed": 8,
+    "batch_stream": 5,
+    "worker_shed": 8,
+    "prefetch": 8
   }
 }

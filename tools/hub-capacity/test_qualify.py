@@ -21,9 +21,13 @@ def declaration():
     """Build a complete synthetic declaration with deterministic identities."""
     phase = {"revision": "a" * 40, "build_command": "synthetic fixture",
              "binary_sha256": {"telcoin-network": "b" * 64}, "profile": {}}
+    observers = [f"synthetic-dao-{index}" for index in range(8)]
+    phase["profile"] = {"dao_observers": observers}
+    candidate_profile = {**QUALIFY.read_json(ROOT / "profile-v1.json"), "dao_observers": observers,
+                         "bootstrap_peers": {key: {"synthetic": True} for key in observers}}
     return {
         "version": 1, "baseline": phase,
-        "candidate": {**phase, "profile": QUALIFY.read_json(ROOT / "profile-v1.json")},
+        "candidate": {**phase, "profile": candidate_profile},
         "envelope": {"cpus_per_hub": 4, "ram_bytes_per_hub": 8 * 1024**3,
                      "link_mbps": 25, "rtt_ms": 50, "loss_percent": 0.1,
                      "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 12,
@@ -41,13 +45,17 @@ def declaration():
 
 def evidence(plan, phase="candidate"):
     """Build telemetry fixtures solely for validating the scorer."""
-    swarm = {"connections": 64, "connection_limit": 86, "streams_per_connection_limit": 16,
+    swarm = {"connections": 86, "connection_limit": 86, "streams_per_connection_limit": 16,
+             "ordinary_peers": 64, "dao_connected": 8,
              "receive_credit_per_connection_bytes": 1_073_741_824 // 258,
              "queue_occupancy": 0, "rejections": {"capacity": 0}}
     hub = {"rss_bytes": 1024**3, "cpu_seconds": 0, "progress": 1,
            "dao_connected": 8, "source_rows": 64,
            "swarms": {name: copy.deepcopy(swarm) for name in ("primary", "worker-0", "worker-1")},
            "tasks": {service: 0 for service in QUALIFY.SERVICES}}
+    for network, allocation in hub["swarms"].items():
+        allocation["tasks"] = dict.fromkeys(QUALIFY.TASK_LIMITS[network], 0)
+        allocation["task_limits"] = QUALIFY.TASK_LIMITS[network].copy()
     samples = []
     for second in range(0, 601, 5):
         observation = copy.deepcopy(hub)
@@ -107,6 +115,13 @@ class QualificationTests(unittest.TestCase):
         self.run["samples"][1]["hubs"]["hub-0"]["dao_connected"] = 7
         self.assertFalse(QUALIFY.score(self.plan, self.run)["passed"])
         self.run = evidence(self.plan)
+        self.run["samples"][1]["hubs"]["hub-0"]["swarms"]["worker-1"]["dao_connected"] = 7
+        self.assertFalse(QUALIFY.score(self.plan, self.run)["passed"])
+        self.run = evidence(self.plan)
+        for sample in self.run["samples"]:
+            sample["hubs"]["hub-0"]["swarms"]["worker-0"]["ordinary_peers"] = 63
+        self.assertFalse(QUALIFY.score(self.plan, self.run)["passed"])
+        self.run = evidence(self.plan)
         self.run["operations"]["gossip_two_hops"][0]["hops"] = 1
         with self.assertRaisesRegex(ValueError, "direct hub"):
             QUALIFY.validate_evidence(self.plan, self.run, "candidate")
@@ -120,6 +135,15 @@ class QualificationTests(unittest.TestCase):
         run = evidence(self.plan)
         run["samples"][0]["hubs"]["hub-0"]["tasks"]["batch_stream"] = 11
         self.assertFalse(QUALIFY.score(self.plan, run)["passed"])
+        run = evidence(self.plan)
+        hub = run["samples"][0]["hubs"]["hub-0"]
+        hub["tasks"]["batch_stream"] = 6
+        hub["swarms"]["worker-0"]["tasks"]["batch_stream"] = 6
+        QUALIFY.validate_evidence(self.plan, run, "candidate")
+        self.assertFalse(QUALIFY.score(self.plan, run)["passed"])
+        hub["swarms"]["worker-0"]["tasks"]["batch_stream"] = 0
+        with self.assertRaisesRegex(ValueError, "measured primary and worker totals"):
+            QUALIFY.validate_evidence(self.plan, run, "candidate")
         run = evidence(self.plan)
         run["samples"][0]["hubs"]["hub-0"]["swarms"]["primary"]["queue_occupancy"] = 101
         self.assertFalse(QUALIFY.score(self.plan, run)["passed"])

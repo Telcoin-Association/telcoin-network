@@ -562,6 +562,10 @@ where
         let record_domain = RecordDomain::new(chain_id, network_type);
 
         let mesh = network_config.gossip_mesh();
+        crate::capacity::CapacitySemaphore::initialize(
+            &network_type,
+            network_config.serve_limits(),
+        );
         mesh.validate().map_err(std::io::Error::other)?;
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .mesh_n(mesh.target())
@@ -686,6 +690,19 @@ where
         behavior.connection_limits =
             connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
         behavior.peer_manager.set_public_peer_limit(network_config.public_peer_limit());
+        if network_config.dao_observers().len() > 8
+            || network_config
+                .dao_observers()
+                .iter()
+                .any(|key| !network_config.bootstrap_peers().contains_key(key))
+        {
+            Err(std::io::Error::other(
+                "DAO observers require at most eight identities in the trusted bootstrap set",
+            ))?;
+        }
+        behavior
+            .peer_manager
+            .set_dao_observers(network_config.dao_observers().iter().copied().collect());
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -969,6 +986,11 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_queues(
+                self.commands.len(),
+                self.inbound_requests.len(),
+                self.kad_record_queries.len(),
+            );
             self.metrics.set_established_connections(
                 self.swarm.network_info().connection_counters().num_established(),
             );

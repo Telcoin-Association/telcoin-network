@@ -47,6 +47,12 @@ struct SwarmMetricHandles {
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
     outbound_requests_pending: Gauge,
+    /// Commands waiting for the swarm event loop.
+    command_queue_occupancy: Gauge,
+    /// Inbound request-response operations awaiting completion or cancellation.
+    inbound_requests_pending: Gauge,
+    /// Record queries awaiting a result.
+    record_queries_pending: Gauge,
     /// Incoming QUIC attempts answered with a Retry (source address not validated).
     quic_incoming_retried_total: Counter,
     /// Incoming QUIC attempts accepted into a handshake.
@@ -136,6 +142,12 @@ impl SwarmMetrics {
     }
 
     /// Update the in-flight request gauges (called once per event-loop iteration).
+    pub(crate) fn set_queues(&self, commands: usize, inbound: usize, records: usize) {
+        self.handles.command_queue_occupancy.set(commands as f64);
+        self.handles.inbound_requests_pending.set(inbound as f64);
+        self.handles.record_queries_pending.set(records as f64);
+    }
+
     pub(crate) fn set_pending(&self, px_disconnects: usize, outbound_requests: usize) {
         self.handles.px_disconnects_pending.set(px_disconnects as f64);
         self.handles.outbound_requests_pending.set(outbound_requests as f64);
@@ -180,6 +192,10 @@ impl SwarmMetrics {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct PeerManagerMetricHandles {
+    /// Connected peers with ordinary retention policy.
+    ordinary_peers_connected: Gauge,
+    /// Connected members of the operator-declared DAO observer set.
+    dao_observers_connected: Gauge,
     /// Currently connected peers.
     connected_peers: Gauge,
     /// Peers known with a resolved network record (BLS key -> address).
@@ -209,6 +225,11 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Observe ordinary population and the reserved observer identities independently.
+    pub(crate) fn set_population_counts(&self, ordinary: usize, observers: usize) {
+        self.handles.ordinary_peers_connected.set(ordinary as f64);
+        self.handles.dao_observers_connected.set(observers as f64);
+    }
     /// Create the peer manager metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);

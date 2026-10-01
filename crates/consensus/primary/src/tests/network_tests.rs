@@ -2761,7 +2761,9 @@ async fn test_sync_epoch_pack_unavailable_denies() {
 /// penalty-free task per request, so a non-committee peer could exhaust task/CPU capacity.
 #[test]
 fn test_epoch_record_admission_enforces_per_peer_cap() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let semaphore = Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+    ));
     let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let mut rng = StdRng::seed_from_u64(1);
     let peer = *BlsKeypair::generate(&mut rng).public();
@@ -2795,7 +2797,9 @@ fn test_epoch_record_admission_enforces_per_peer_cap() {
 /// serve's lifetime, the total in-flight certificate-wait budget as well.
 #[test]
 fn test_epoch_record_admission_enforces_global_cap() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let semaphore = Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+    ));
     let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let mut rng = StdRng::seed_from_u64(2);
 
@@ -2836,7 +2840,8 @@ fn test_epoch_record_admission_enforces_global_cap() {
 /// work rather than with the cap.
 #[test]
 fn test_shed_admit_enforces_budget_and_frees_on_drop() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+    let semaphore =
+        Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(MAX_CONCURRENT_SHED_TASKS));
 
     // fill the shed budget
     let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
