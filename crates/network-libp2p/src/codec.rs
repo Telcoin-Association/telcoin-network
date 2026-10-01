@@ -220,8 +220,8 @@ impl<Req, Res> TNCodec<Req, Res> {
 
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: Send + Sync + Serialize + DeserializeOwned + 'static,
+    Res: Send + Sync + Serialize + DeserializeOwned + 'static,
 {
     type Protocol = StreamProtocol;
     type Request = Req;

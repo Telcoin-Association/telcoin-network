@@ -9,6 +9,7 @@ use crate::{
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
+    record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -70,6 +71,8 @@ mod loop_budget_tests;
 enum LoopEvent<E, C> {
     /// The record-refresh interval ticked.
     Refresh,
+    /// Retry connected peers whose record retrieval was deferred by a budget.
+    RecordRetry,
     /// The swarm produced an event.
     Swarm(E),
     /// The command channel produced a command.
@@ -257,6 +260,7 @@ fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::
 /// - `gossipsub`: Flood publishing for certificates and batches
 /// - `req_res`: Point-to-point request-response messages
 /// - `peer_exchange`: Dedicated request-response protocol for the goodbye exchange
+/// - `record_exchange`: Bounded retrieval of a connected peer's current signed record
 /// - `kademlia`: Distributed hash table for peer discovery
 /// - `stream`: Stream-based bulk data transfer for state sync
 ///
@@ -291,6 +295,8 @@ where
     /// has not upgraded yet. The embedded variants stay on the wire until the
     /// coordinated `/0.0.2` protocol bump.
     pub(crate) peer_exchange: request_response::Behaviour<PeerExchangeCodec>,
+    /// Signed self-record retrieval, isolated from consensus RPC stream capacity.
+    pub(crate) record_exchange: request_response::Behaviour<RecordCodec>,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
     /// Stream-based sync behavior for bulk data transfer.
@@ -304,12 +310,15 @@ where
 {
     /// Create a new instance of Self.
     ///
-    /// The request-response behaviours arrive as a `(consensus, peer_exchange)`
-    /// pair: the main consensus RPC behaviour and the dedicated goodbye behaviour.
+    /// The request-response behaviours are consensus RPCs, goodbyes and record retrieval.
     pub(crate) fn new(
         local_peer_id: PeerId,
         gossipsub: gossipsub::Behaviour,
-        req_res: (request_response::Behaviour<C>, request_response::Behaviour<PeerExchangeCodec>),
+        req_res: (
+            request_response::Behaviour<C>,
+            request_response::Behaviour<PeerExchangeCodec>,
+            request_response::Behaviour<RecordCodec>,
+        ),
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
@@ -317,7 +326,7 @@ where
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
         let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
-        let (req_res, peer_exchange) = req_res;
+        let (req_res, peer_exchange, record_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
             peer_manager,
@@ -325,6 +334,7 @@ where
             gossipsub,
             req_res,
             peer_exchange,
+            record_exchange,
             kademlia,
             stream,
         }
@@ -455,6 +465,10 @@ where
     /// size at [`MAX_PUBLISHED_TO_PEERS`] and promotes actively (re)connecting peers so they are
     /// never evicted; see that constant for the full rationale.
     published_to_peers: LruCache<PeerId, ()>,
+    /// Bounded record retrievals and cooldown history, independent of push suppression.
+    record_exchange: RecordExchange,
+    /// Heartbeat cadence for retrying deferred retrievals, clamped above zero.
+    record_retry_interval: Duration,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
@@ -585,6 +599,18 @@ where
             vec![(network_type.peer_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
+        // Reuse the kad wire ceiling in both codec directions. Retrieval gets one
+        // stream per connection and the existing dial timeout, outside consensus RPCs.
+        let record_exchange = request_response::Behaviour::with_codec(
+            RecordCodec::new(MAX_KAD_PACKET_SIZE),
+            vec![(network_type.record_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
+            request_response::Config::default()
+                .with_max_concurrent_streams(1)
+                .with_request_timeout(network_config.peer_config().dial_timeout),
+        );
+        let record_retry_interval =
+            Duration::from_secs(network_config.peer_config().heartbeat_interval)
+                .max(Duration::from_secs(1));
         let peer_id: PeerId = keypair.public().into();
         let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol(chain_id)?);
         // manually add peers
@@ -652,7 +678,7 @@ where
         let mut behavior = TNBehavior::new(
             peer_id,
             gossipsub,
-            (req_res, peer_exchange),
+            (req_res, peer_exchange, record_exchange),
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
@@ -748,6 +774,12 @@ where
             external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
+            record_exchange: RecordExchange::new(
+                MAX_PUBLISHED_TO_PEERS,
+                network_config.peer_config().max_peers(),
+                record_retry_interval,
+            ),
+            record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
@@ -903,10 +935,17 @@ where
             self.config.kad_publication_interval,
         );
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut record_retry = tokio::time::interval(self.record_retry_interval);
+        record_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+            let event = tokio::select! {
+                event = next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands) => event,
+                _ = record_retry.tick() => LoopEvent::RecordRetry,
+            };
+            match event {
                 LoopEvent::Refresh => self.refresh_own_record(),
+                LoopEvent::RecordRetry => self.retry_record_requests(),
                 LoopEvent::Swarm(event) => {
                     if let Err(e) = self.process_event(event).await {
                         error!(target: "network", ?e, "network event error");
@@ -944,6 +983,9 @@ where
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerExchange(event) => self.process_peer_exchange_event(event)?,
+                TNBehaviorEvent::RecordExchange(event) => {
+                    self.process_record_exchange_event(event)?
+                }
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 // `connection_limits::Behaviour` emits no events (its `ToSwarm` is `Infallible`);
                 // this arm is uninhabited and exists only to keep the match exhaustive over the
@@ -1677,6 +1719,118 @@ where
         Ok(())
     }
 
+    /// Request the connected peer's self-record, coalescing pending and deferred work.
+    fn request_current_record(&mut self, peer: PeerId) {
+        if self.swarm.is_connected(&peer) && !self.swarm.behaviour().peer_manager.peer_banned(&peer)
+        {
+            if self.record_exchange.allow_request(peer) {
+                let request = self.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
+                self.record_exchange.track(peer, request);
+            } else {
+                self.record_exchange.defer(peer);
+            }
+        }
+    }
+
+    /// Retry only connected peers, at most one bounded batch per heartbeat.
+    fn retry_record_requests(&mut self) {
+        self.record_exchange.take_deferred().into_iter().for_each(|peer| {
+            self.request_current_record(peer);
+        });
+    }
+
+    /// Handle authenticated record retrieval without involving consensus request queues.
+    fn process_record_exchange_event(
+        &mut self,
+        event: ReqResEvent<(), RecordResponse>,
+    ) -> NetworkResult<()> {
+        match event {
+            ReqResEvent::Message { peer, message, .. } => match message {
+                request_response::Message::Request { channel, .. } => {
+                    // Rate and ban checks precede cloning or encoding the signed record.
+                    let response = (!self.swarm.behaviour().peer_manager.peer_banned(&peer)
+                        && self.record_exchange.allow_response(peer))
+                    .then(|| (self.key_config.primary_public_key(), self.node_record.clone()));
+                    let _ =
+                        self.swarm.behaviour_mut().record_exchange.send_response(channel, response);
+                    Ok(())
+                }
+                request_response::Message::Response { request_id, response } => {
+                    self.process_record_response(peer, request_id, response)
+                }
+            },
+            ReqResEvent::OutboundFailure { peer, request_id, error, .. } => {
+                if self.record_exchange.finish(peer, request_id) {
+                    match error {
+                        ReqResOutboundFailure::UnsupportedProtocols => {
+                            // Capability failure is penalty-exempt. Known legacy identities
+                            // use the existing deduplicated, bounded Kademlia query pipeline.
+                            self.request_legacy_record(peer);
+                        }
+                        ReqResOutboundFailure::DialFailure
+                        | ReqResOutboundFailure::Timeout
+                        | ReqResOutboundFailure::ConnectionClosed
+                        | ReqResOutboundFailure::Io(_) => {
+                            self.record_exchange.defer(peer);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ReqResEvent::InboundFailure { peer, error, .. } => {
+                debug!(target: "network", ?peer, ?error, "record retrieval inbound failure");
+                Ok(())
+            }
+            ReqResEvent::ResponseSent { .. } => Ok(()),
+        }
+    }
+
+    /// Apply only solicited responses, with the authenticated peer as the publisher.
+    ///
+    /// Sharing the inbound put pipeline preserves domain, BLS/network binding, rate,
+    /// publisher, freshness, committee and persistence checks. Remote expiry is not trusted.
+    fn process_record_response(
+        &mut self,
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        response: RecordResponse,
+    ) -> NetworkResult<()> {
+        if self.record_exchange.finish(peer, request_id) {
+            if response.is_none() {
+                self.record_exchange.defer(peer);
+            }
+            response
+                .map(|(key, record)| kad::Record {
+                    key: node_record_key(&key),
+                    value: encode(&record),
+                    publisher: Some(peer),
+                    expires: std::time::Instant::now().checked_add(self.config.kad_record_ttl),
+                })
+                .map(|record| self.process_kad_put_request(peer, record))
+                .transpose()
+                .map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Fall back once per allowed attempt for legacy peers with an already known BLS identity.
+    ///
+    /// A legacy peer whose identity is unknown still uses ordinary first-connect pushes and
+    /// discovery. No extra consensus RPC or unsolicited push is introduced by the fallback.
+    fn request_legacy_record(&mut self, peer: PeerId) {
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .peer_to_bls(&peer)
+            .filter(|key| self.kad_record_queries.values().all(|query| query.request != *key))
+            .into_iter()
+            .for_each(|key| {
+                let query = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
+                self.kad_record_queries.insert(query, key.into());
+            });
+    }
+
     /// Process events from the dedicated peer-exchange goodbye protocol.
     ///
     /// Mirrors the legacy embedded peer-exchange handling in
@@ -1961,6 +2115,9 @@ where
                 if self.mark_published_to_peer(peer_id) {
                     self.publish_our_data_to_peer(peer_id);
                 }
+                // Pull independently of either side's push-cache history. The response
+                // identifies the current BLS key even when it changed while disconnected.
+                self.request_current_record(peer_id);
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
