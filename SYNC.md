@@ -187,6 +187,10 @@ chains above — instead of replaying from genesis.
 
 ### Caveats
 
+- A node restored at snapshot block `B` serves no historical state below `B`. State queries such as
+  `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, and `eth_call` return an error there. State at
+  `B` and later synced blocks remains available, as do block headers in the restored `BLOCKHASH`
+  window. The same state boundary applies to enabled `debug` and `trace` methods.
 - Epoch 0: a bundle taken at the end of epoch 0 restores state and records but not an epoch-0 consensus
   pack (reconstructing it needs a pre-epoch-0 genesis descriptor the bundle does not carry), so no
   resume hint is written. Bootstrap from a later epoch.
