@@ -540,12 +540,15 @@ parallel_fetch_request_delay_interval:
 ### Checks that stop the node
 
 Beyond parsing `parameters.yaml`, the node checks the values below each time it sets up consensus for an epoch: as it starts, at every epoch boundary, and when it re-enters the current epoch after its role changes.
+The two `vote_timeout` checks are the exception: they bound the node's own votes, so they run only for an epoch the node can still vote in.
+An epoch that its committee has already closed, shown by a stored epoch record carrying that committee's certificate, is replayed without them; a node catching up from genesis or from an old snapshot passes through such epochs.
 Validators and observers run the same checks.
 When one fails, the node logs `epoch returned error` and then `Error running node:` with a message that names the field, and exits.
 Fix the file and restart.
 
 The node reads `parameters.yaml` and `network-config` only at startup, so a bad value stops the node while it starts, as it enters its first epoch.
-The only input to these checks that changes between epochs is whether the sub-second timestamp fork is active, and that only loosens the `vote_timeout` bound, so a value the node accepts at startup it accepts at every later epoch boundary.
+A node that is catching up skips the `vote_timeout` checks for every epoch whose certified record it holds; records sync ahead of execution, so a bad `vote_timeout` normally stops it at the first epoch it can still vote in.
+The only input to these checks that changes between epochs is whether the sub-second timestamp fork is active, and that only loosens the `vote_timeout` bound, so a value that passes them for one epoch passes them at every later epoch boundary.
 
 | Requirement                                                              | Why                                                                                                                                                                                                  |
 | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
