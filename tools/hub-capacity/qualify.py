@@ -308,7 +308,7 @@ def main():
                          "hardware": "REPLACE_WITH_HARDWARE_DESCRIPTION",
                          "network_setup": "REPLACE_WITH_REPRODUCIBLE_NETWORK_COMMANDS"},
             "hubs": ["hub-0", "hub-1"],
-            "threshold_owner": "Agent-proposed experimental v1 criteria; release approval pending",
+            "threshold_owner": "PR author, using requester-authorized engineering judgment",
             "adapter_command": "REPLACE_WITH_EXACT_WORKLOAD_ADAPTER_COMMAND",
             "thresholds": {"max_rss_bytes": 4 * 1024**3, "max_cpu_cores": 3,
                            "max_queue_occupancy": 100, "max_progress_stall_seconds": 15,

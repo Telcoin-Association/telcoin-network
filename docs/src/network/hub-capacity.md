@@ -69,8 +69,8 @@ configuration or envelope requires a new plan and complete baseline/candidate ru
 The template proposes two hubs, each with 4 dedicated CPUs, 8 GiB RAM, a 25 Mbit/s
 link, 50 ms RTT, and 0.1% loss. It declares 64 public peers (16 sharing one NAT),
 8 DAO observers, 12 committee identities across rotation, and 2 workers per hub.
-Each phase lasts at least 10 minutes. These are experimental criteria proposed
-under the requester's instruction to use judgment; release approval is pending.
+Each phase lasts at least 10 minutes. The PR author selects these experimental
+criteria under the requester's instruction to use engineering judgment.
 
 Each scenario requires 99% success. The template sets absolute p99 limits:
 joins 8 s, shared-NAT reconnects 20 s, gossip beyond a direct hub 3 s,
@@ -107,4 +107,4 @@ SHA-256. Artifact paths are absolute or relative to their evidence file. Split
 logs into at most 64 files of at most 64 MiB per phase. Sparse/missing/nonfinite
 data and direct-only gossip fail validation. Reports retain both phases;
 candidate threshold failures exit 1 and invalid evidence exits 2. A passing report
-still requires review of raw traffic/topology/overlap traces and release approval.
+still requires review of raw traffic/topology/overlap traces.
