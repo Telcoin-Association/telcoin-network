@@ -1337,6 +1337,62 @@ async fn test_learned_pinned_record_not_regressed_by_older_push() {
     assert_eq!(cached.rpc, Some(rpc), "older replay must not drop the advertised rpc");
 }
 
+/// A corrected self-advertisement repairs a pinned record and its live identity and RPC info.
+#[tokio::test]
+async fn test_self_advertised_future_record_repair() -> Result<(), &'static str> {
+    let mut manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([80; 32])).public();
+    manager.add_bootstrap_peer(bls, random_network_info());
+    let mut future = random_network_info();
+    future.timestamp = u64::MAX;
+    manager.add_self_advertised_peer(future.pubkey.clone().into(), bls, future);
+    let (mut corrected, rpc) = random_network_info_with_rpc();
+    corrected.timestamp = now();
+    let peer: PeerId = corrected.pubkey.clone().into();
+    manager.add_self_advertised_peer(peer, bls, corrected.clone());
+    let cached = manager.known_peers.get(&bls).ok_or("missing corrected record")?;
+    assert_eq!(cached.pubkey, corrected.pubkey);
+    assert_eq!(cached.multiaddrs, corrected.multiaddrs);
+    assert_eq!(cached.rpc, Some(rpc));
+    assert_eq!(manager.auth_to_peer(bls).map(|(peer, _)| peer), Some(peer));
+    let mut replay = random_network_info();
+    replay.timestamp = corrected.timestamp.saturating_sub(1);
+    manager.add_self_advertised_peer(replay.pubkey.clone().into(), bls, replay);
+    assert_eq!(manager.known_peers.get(&bls).map(|info| &info.pubkey), Some(&corrected.pubkey));
+    Ok(())
+}
+
+/// A query correction repairs restored metadata and updates committee and pinned copies.
+#[tokio::test]
+async fn test_discovered_future_record_repair_after_restore() -> Result<(), &'static str> {
+    let mut manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([81; 32])).public();
+    manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    let mut future = random_network_info();
+    future.timestamp = u64::MAX;
+    manager.add_restored_peer(bls, future);
+    manager
+        .restore_record_timestamp(bls, crate::freshness::RecordTimestamp::admit(u64::MAX, 1_000));
+    manager.add_bootstrap_peer(bls, random_network_info());
+    let (mut corrected, rpc) = random_network_info_with_rpc();
+    corrected.timestamp = u64::MAX - 1;
+    let timestamp = crate::freshness::RecordTimestamp::admit(corrected.timestamp, 1_000);
+    manager.add_discovered_peer_with_timestamp(bls, corrected.clone(), timestamp);
+    assert_eq!(manager.record_timestamp(&bls, corrected.timestamp), Some(timestamp));
+    let cached = manager.known_peers.get(&bls).ok_or("missing corrected record")?;
+    assert_eq!(cached.pubkey, corrected.pubkey);
+    assert_eq!(cached.multiaddrs, corrected.multiaddrs);
+    assert_eq!(cached.rpc, Some(rpc));
+    assert_eq!(
+        manager.auth_to_peer(bls).map(|(peer, _)| peer),
+        Some(corrected.pubkey.clone().into())
+    );
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(manager.known_peers.contains_key(&bls), "pinned correction survives rotation");
+    assert!(manager.known_timestamps.contains_key(&bls));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
     // Same invariant on the `get_record` result path: a single stale responder must not regress

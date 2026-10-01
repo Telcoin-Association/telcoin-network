@@ -418,7 +418,7 @@ where
     /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
-    kad_record_queries: HashMap<QueryId, KadQuery>,
+    kad_record_queries: HashMap<QueryId, PendingKadQuery>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -671,6 +671,11 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
+            kad_store.record_timestamp(&crate::kad::node_record_key(&key)).into_iter().for_each(
+                |timestamp| {
+                    behavior.peer_manager.restore_record_timestamp(key, timestamp);
+                },
+            );
             restored += 1;
         }
         if restored > 0 {
@@ -1994,7 +1999,7 @@ where
                 // filtering, so even a query whose record is dropped as stale or
                 // non-committee re-arms the key.
                 for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
+                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
@@ -2287,7 +2292,9 @@ where
                 self.peer_record_valid(&record).map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
 
-                    let freshness = self.record_freshness(&record);
+                    let observed = now();
+                    let timestamp = self.admission_timestamp(key, value.info.timestamp, observed);
+                    let freshness = self.record_freshness(&record, timestamp, observed);
                     if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
@@ -2310,14 +2317,16 @@ where
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
-                        .add_self_advertised_peer(source, key, value.info);
+                        .add_self_advertised_peer_with_timestamp(
+                            source, key, value.info, timestamp, observed,
+                        );
 
                     // Store newer records and refresh the expiry of byte-identical republishes.
                     match freshness {
                         RecordFreshness::Newer | RecordFreshness::Identical => {
                             // Capacity is remotely triggerable. Match the add-provider path instead of
                             // propagating expected rejections to the run loop's per-event error log.
-                            self.swarm.behaviour_mut().kademlia.store_mut().put(record).unwrap_or_else(
+                            self.swarm.behaviour_mut().kademlia.store_mut().put_with_timestamp(record, Some(timestamp)).unwrap_or_else(
                                 |error| match error {
                                     kad::store::Error::MaxRecords => {
                                         debug!(target: "network-kad", ?source, "dropping inbound kad record: store at capacity");
@@ -2402,28 +2411,58 @@ where
         });
     }
 
+    /// Reuse retained metadata for the same signed timestamp, or admit it exactly once.
+    fn admission_timestamp(
+        &mut self,
+        key: BlsPublicKey,
+        signed: tn_types::TimestampSec,
+        observed: tn_types::TimestampSec,
+    ) -> crate::freshness::RecordTimestamp {
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .record_timestamp(&key, signed)
+            .or_else(|| {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .record_timestamp(&crate::kad::node_record_key(&key))
+                    .filter(|timestamp| timestamp.matches(signed))
+            })
+            .unwrap_or_else(|| crate::freshness::RecordTimestamp::admit(signed, observed))
+    }
+
     /// Check the local kad store to compare record timestamps.
     ///
-    /// Compare timestamps and signed bytes so identical republishes can refresh expiry without
-    /// replacing a newer record or admitting conflicting values with the same timestamp.
+    /// Compare local admission metadata and signed bytes. Ordinary stale records cannot replace
+    /// newer records, while cached future timestamps have a bounded repair path. Identical
+    /// republishes refresh only DHT expiry, and conflicting equal signed timestamps stay stale.
     /// It is the caller's responsibility to ensure records are verified and valid.
-    fn record_freshness(&mut self, record: &kad::Record) -> RecordFreshness {
+    fn record_freshness(
+        &mut self,
+        record: &kad::Record,
+        incoming: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) -> RecordFreshness {
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
 
         store.get(&record.key).map_or(RecordFreshness::Newer, |existing| {
-            NodeRecord::try_decode_compat(&existing.value)
-                .zip(NodeRecord::try_decode_compat(&record.value))
-                .map_or(RecordFreshness::Undecodable, |(stored, incoming)| {
-                    match incoming.info.timestamp.cmp(&stored.info.timestamp) {
-                        std::cmp::Ordering::Greater => RecordFreshness::Newer,
-                        std::cmp::Ordering::Equal if existing.value == record.value => {
-                            RecordFreshness::Identical
-                        }
-                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
-                            RecordFreshness::Older
-                        }
+            NodeRecord::try_decode_compat(&existing.value).map_or(
+                RecordFreshness::Undecodable,
+                |stored| {
+                    let cached = store.record_timestamp(&record.key).unwrap_or_else(|| {
+                        crate::freshness::RecordTimestamp::legacy(stored.info.timestamp, observed)
+                    });
+                    if existing.value == record.value {
+                        RecordFreshness::Identical
+                    } else if incoming.supersedes(cached, observed) {
+                        RecordFreshness::Newer
+                    } else {
+                        RecordFreshness::Older
                     }
-                })
+                },
+            )
         })
     }
 
@@ -2442,17 +2481,13 @@ where
         is_last_step: bool,
     ) {
         // return if query id unknown - should not happen
+        let observed = now();
+        let timestamp = self.admission_timestamp(key, new_record.info.timestamp, observed);
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.request == key {
-            match &mut query.result {
-                None => query.result = Some(new_record),
-                Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
-                    *tracked = new_record
-                }
-                Some(_) => {} // keep existing record
-            }
+        if query.query.request == key {
+            query.consider_with_timestamp(new_record, timestamp, observed);
         } else {
             // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
@@ -2479,14 +2514,62 @@ where
     /// lost: peers push their own records on first connect (an inbound kad put handled by
     /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(|query| {
+                let key = query.query.request;
+                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
+            })
+            .into_iter()
+            .for_each(|(key, node_record, timestamp)| {
+                self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
+                    key,
+                    node_record.info,
+                    timestamp,
+                );
+            });
+    }
+}
+
+/// Internal query state with local ordering metadata, preserving the public [`KadQuery`] shape.
+#[derive(Debug)]
+pub(crate) struct PendingKadQuery {
+    /// Requested authority and best authenticated record.
+    query: KadQuery,
+    /// Admission ceiling of the winning result, retained until the query closes.
+    timestamp: Option<crate::freshness::RecordTimestamp>,
+}
+
+impl From<BlsPublicKey> for PendingKadQuery {
+    fn from(key: BlsPublicKey) -> Self {
+        Self { query: key.into(), timestamp: None }
+    }
+}
+
+impl PendingKadQuery {
+    /// Retain the freshest verified result under the shared local admission policy.
+    #[cfg(test)]
+    pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(record.info.timestamp, observed);
+        self.consider_with_timestamp(record, timestamp, observed);
+    }
+
+    /// Retain a verified result without renewing a timestamp already admitted elsewhere.
+    fn consider_with_timestamp(
+        &mut self,
+        record: NodeRecord,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) {
+        if self.timestamp.is_none_or(|cached| timestamp.supersedes(cached, observed)) {
+            self.query.result = Some(record);
+            self.timestamp = Some(timestamp);
         }
+    }
+
+    /// Consume the winning record together with its original admission ceiling.
+    pub(crate) fn into_result(self) -> Option<(NodeRecord, crate::freshness::RecordTimestamp)> {
+        self.query.result.zip(self.timestamp)
     }
 }
 
