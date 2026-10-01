@@ -33,7 +33,7 @@ use tn_network_libp2p::{
     WorkerSyncRequest,
 };
 use tn_storage::mem_db::MemDatabase;
-use tn_types::{decode, Batch, BlsKeypair, Epoch, TaskManager, B256};
+use tn_types::{try_decode, Batch, BlsKeypair, Epoch, TaskManager, B256};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 
 // Standalone examples acknowledge the package's other dependencies without relaxing its lints.
@@ -318,7 +318,7 @@ impl Peer {
                         }
                         NetworkType::Worker(_) => {
                             let frames = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: batch_digests.clone(), epoch }, limit).await?;
-                            let received = frames.iter().map(|data| decode::<Batch>(data).map(|batch| batch.digest())).collect::<Result<BTreeSet<_>, _>>()?;
+                            let received = frames.iter().map(|data| try_decode::<Batch>(data).map(|batch| batch.digest())).collect::<Result<BTreeSet<_>, _>>()?;
                             if received != batch_digests || frames.len() != batch_digests.len() {
                                 Err(eyre!("worker transfer did not return the requested batches"))?;
                             }
