@@ -5,7 +5,9 @@ use std::{future::Future, sync::Arc};
 
 use tn_types::{Database, DbTx, DbTxMut, Table, TableHint};
 
-use crate::layered_db::{LayeredDatabase, LayeredDbStats, LayeredDbTxMut};
+use crate::layered_db::{
+    LayeredDatabase, LayeredDbStats, LayeredDbTxMut, CACHE_ENV, EPOCH_ENV, KAD_ENV,
+};
 
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
@@ -30,9 +32,9 @@ pub struct CompositeDatabase<DB: Database> {
 
 impl<DB: Database> CompositeDatabase<DB> {
     pub fn open(epoch_db: DB, kad_db: DB, cache_db: DB) -> Self {
-        let epoch_db = LayeredDatabase::open(epoch_db, true);
-        let kad_db = LayeredDatabase::open(kad_db, true);
-        let cache_db = LayeredDatabase::open(cache_db, false);
+        let epoch_db = LayeredDatabase::open_named(epoch_db, true, EPOCH_ENV);
+        let kad_db = LayeredDatabase::open_named(kad_db, true, KAD_ENV);
+        let cache_db = LayeredDatabase::open_named(cache_db, false, CACHE_ENV);
         Self { inner: Arc::new(Inner { epoch_db, kad_db, cache_db }) }
     }
 
