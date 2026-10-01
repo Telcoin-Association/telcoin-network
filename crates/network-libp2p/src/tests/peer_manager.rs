@@ -37,6 +37,47 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     )
 }
 
+/// Protected peers do not consume the hub profile's ordinary-peer admission slots.
+#[tokio::test]
+async fn public_peer_limit_preserves_protected_headroom() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    let keys =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([81; 32])));
+    let network_key = keys.primary_network_public_key();
+    let protected: PeerId = network_key.clone().into();
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    let (reply, _receiver) = oneshot::channel();
+    manager.add_trusted_peer_and_dial(
+        keys.primary_public_key(),
+        NetworkInfo {
+            pubkey: network_key,
+            multiaddrs: vec![address.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
+        reply,
+    );
+    assert!(manager.register_peer_connection(
+        &protected,
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    assert!(manager.peer_limit_reached(&endpoint));
+    manager.set_public_peer_limit(None);
+    assert!(!manager.peer_limit_reached(&endpoint));
+}
+
 /// Helper function to extract events of a certain type
 fn extract_events<'a>(
     events: &'a [PeerEvent],
@@ -131,8 +172,9 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
+/// Trusted peers retain load privileges while authenticated protocol faults remain bannable.
 #[tokio::test]
-async fn test_add_trusted_peer() {
+async fn test_add_trusted_peer() -> eyre::Result<()> {
     let config = ScoreConfig::default();
     let mut peer_manager = create_test_peer_manager(None);
     let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
@@ -156,19 +198,22 @@ async fn test_add_trusted_peer() {
         sender,
     );
 
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
 
     // Verify a dial request was created
-    let dial_request = peer_manager.next_dial_request().unwrap();
+    let dial_request = peer_manager
+        .next_dial_request()
+        .ok_or_else(|| eyre::eyre!("trusted peer did not produce a dial request"))?;
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // assert penalty doesn't affect trusted peer
+    // Overload retains trust privileges; authenticated protocol violations do not.
+    peer_manager.process_penalty(peer_id, Penalty::Load(crate::LoadPenalty::Timeout));
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
     peer_manager.process_penalty(peer_id, Penalty::Fatal);
-    assert!(!peer_manager.peer_banned(&peer_id));
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert!(peer_manager.peer_banned(&peer_id));
+    assert!(peer_manager.peer_score(&peer_id).is_some_and(|score| score < config.max_score));
+    Ok(())
 }
 
 #[tokio::test]

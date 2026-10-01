@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    SourceAdmissionConfig, TelcoinDirs,
+    ConfigFmt, ConfigTrait, GossipMeshConfig, NetworkBudgetError, NetworkProcessBudget,
+    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::kad::K_VALUE;
 use serde::{
@@ -19,6 +19,10 @@ impl ConfigTrait for NetworkConfig {}
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(default)]
 pub struct NetworkConfig {
+    /// Operator-selected topic mesh degrees, independent of consensus authorization.
+    gossip_mesh: GossipMeshConfig,
+    /// Optional ceiling for ordinary peers, leaving process-budget headroom for protected peers.
+    public_peer_limit: Option<NonZeroUsize>,
     /// The configurations for libp2p library.
     ///
     /// This holds parameters for configuring gossipsub and request/response.
@@ -46,6 +50,16 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Return the mesh degrees used by the primary and every configured worker.
+    pub fn gossip_mesh(&self) -> &GossipMeshConfig {
+        &self.gossip_mesh
+    }
+
+    /// Return the independent ordinary-peer ceiling, when an operator has selected one.
+    pub fn public_peer_limit(&self) -> Option<NonZeroUsize> {
+        self.public_peer_limit
+    }
+
     /// Validate the process budget against the primary plus every configured worker swarm.
     pub fn validate_process_budget(&self, swarm_count: usize) -> Result<(), NetworkBudgetError> {
         self.process_budget

@@ -25,6 +25,7 @@ use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
+    num::NonZeroUsize,
     task::Context,
     time::Duration,
 };
@@ -145,6 +146,8 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Optional ordinary-population ceiling independent of protected peer retention.
+    public_peer_limit: Option<NonZeroUsize>,
     /// Leases owned by this swarm using optional process-wide source accounting.
     source_connections: SourceConnections,
     /// The interval to perform maintenance.
@@ -303,6 +306,7 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            public_peer_limit: None,
             source_connections: SourceConnections::default(),
             heartbeat,
             peers,
@@ -630,13 +634,28 @@ impl PeerManager {
     /// Process new connection and return boolean indicating if the peer limit was reached.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
         debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
-        if endpoint.is_dialer() {
-            // this node dialed peer
-            self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
-        } else {
-            // peer dialed this node
-            self.connected_or_dialing_peers().len() >= self.config.max_peers()
-        }
+        self.public_peer_limit.map_or_else(
+            || {
+                if endpoint.is_dialer() {
+                    self.peers.connected_peer_ids().count()
+                        >= self.config.max_outbound_dialing_peers()
+                } else {
+                    self.connected_or_dialing_peers().len() >= self.config.max_peers()
+                }
+            },
+            |limit| {
+                self.connected_or_dialing_peers()
+                    .iter()
+                    .filter(|peer| !self.peer_is_important(peer))
+                    .count()
+                    >= limit.get()
+            },
+        )
+    }
+
+    /// Set an ordinary-peer admission ceiling while preserving aggregate connection limits.
+    pub(crate) fn set_public_peer_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.public_peer_limit = limit;
     }
 
     /// Return an iterator of peers that are connected or dialed.

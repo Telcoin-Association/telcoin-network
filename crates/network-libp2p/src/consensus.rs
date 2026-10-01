@@ -561,7 +561,13 @@ where
         // (GHSA-cc64-wfq5-56ph).
         let record_domain = RecordDomain::new(chain_id, network_type);
 
+        let mesh = network_config.gossip_mesh();
+        mesh.validate().map_err(std::io::Error::other)?;
         let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .mesh_n(mesh.target())
+            .mesh_n_low(mesh.low())
+            .mesh_n_high(mesh.high())
+            .mesh_outbound_min(mesh.outbound_min())
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
             // explicitly set default
@@ -679,6 +685,7 @@ where
         );
         behavior.connection_limits =
             connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
+        behavior.peer_manager.set_public_peer_limit(network_config.public_peer_limit());
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage

@@ -23,6 +23,8 @@ mod traits;
 pub use traits::*;
 mod network;
 pub use network::*;
+mod gossip_mesh;
+pub use gossip_mesh::{GossipMeshConfig, GossipMeshError};
 mod network_budget;
 pub use network_budget::*;
 mod source_admission;
