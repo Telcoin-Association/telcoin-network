@@ -19,7 +19,7 @@ use crate::archive::{
 /// Provide an upper bound on a record size.
 /// This should be large enough for any record but provide
 /// an upper bound on memory allocations for a record.
-pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
+pub const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
 /// A zstd failure on a CRC-valid record is a fault in the record's bytes, not in reading them.
 fn zstd_decode_error(e: io::Error) -> FetchError {

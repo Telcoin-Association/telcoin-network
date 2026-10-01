@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use tn_types::{BlsPublicKey, Epoch, EpochCertificate, EpochDigest, EpochRecord, B256};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
-    oneshot, watch,
+    oneshot,
 };
 use tracing::{debug, error, warn};
 
@@ -40,7 +40,6 @@ use crate::{
         position_index::index::PositionIndex,
     },
     consensus_pack::fetch_error_is_absent,
-    error_latch::latch_first_error,
 };
 
 /// Current version of the epoch pack file.
@@ -49,16 +48,19 @@ const EPOCH_PACK_VERSION: u16 = 0;
 /// Interval between lookups in the bounded waits [`EpochRecordDb::cert_by_digest_with_timeout`].
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Where the actor returns its verdict on one write, to the caller that sent it.
+type WriteReply = oneshot::Sender<Result<(), EpochDbError>>;
+
 enum EpochDbMessage {
     /// Save a "dummy" epoch 0 [`EpochRecord`] without a certificate.
-    SaveDummy0Record(EpochRecord),
+    SaveDummy0Record(EpochRecord, WriteReply),
     /// Save an [`EpochRecord`] without a certificate.
-    SaveRecord(EpochRecord),
+    SaveRecord(EpochRecord, WriteReply),
     /// Save an [`EpochRecord`] and its corresponding [`EpochCertificate`].
     /// If the record is already stored, only the certificate is saved.
-    Save(EpochRecord, EpochCertificate),
+    Save(EpochRecord, EpochCertificate, WriteReply),
     /// Save an [`EpochCertificate`] keyed by its record digest.
-    SaveCertificate(EpochDigest, EpochCertificate),
+    SaveCertificate(EpochDigest, EpochCertificate, WriteReply),
     /// Retrieve an [`EpochRecord`] by epoch number.
     RecordByEpoch(Epoch, oneshot::Sender<Option<EpochRecord>>),
     /// Retrieve an [`EpochRecord`] by epoch number without collapsing storage failures into
@@ -100,21 +102,18 @@ enum EpochDbMessage {
 
 /// Handle to the epoch records database.
 ///
-/// Operations are dispatched to a background thread that owns the file handles.
-/// Errors from background writes are surfaced on the next call via `get_error`, which clears
-/// the slot as it reads, so exactly one subsequent caller observes a given failure. When more
-/// than one write fails before a read, the slot keeps the first failure (for a poisoned-pack
-/// cascade that is the root cause; every failure is logged either way). Use `peek_error` to
-/// check without consuming. `persist` is the durability barrier: it reports any earlier
-/// write failure even if that write was still queued when the flush was requested.
+/// Operations are dispatched to a background thread that owns the file handles. Every write
+/// waits for the thread's verdict on it, so each caller learns the outcome of its own write and
+/// never another's: the handle is shared (the epoch-close path, the vote collector and state-sync
+/// write through it concurrently), and a failure reported to whichever caller looked next could
+/// leave the writer believing its record saved. `persist` is the durability barrier for what has
+/// been written: it reports the flush's own failure.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
     /// Channel to send commands to the background thread.
     tx: Sender<EpochDbMessage>,
     /// Join handle for the background thread running commands.
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Track any errors that happened in the background.
-    error: watch::Sender<Option<EpochDbError>>,
     /// Vector to map epochs to the last consensus header number.
     /// Used for quickly deducing an epoch for a given consensus header number.
     final_numbers: Arc<Mutex<Vec<u64>>>,
@@ -124,11 +123,7 @@ pub struct EpochRecordDb {
     dead_logged: Arc<AtomicBool>,
 }
 
-fn run_db_loop(
-    mut inner: Inner,
-    mut rx: Receiver<EpochDbMessage>,
-    tx_error: watch::Sender<Option<EpochDbError>>,
-) {
+fn run_db_loop(mut inner: Inner, mut rx: Receiver<EpochDbMessage>) {
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
@@ -136,33 +131,35 @@ fn run_db_loop(
     // files. This is acceptable since panic should never occur in properly written Inner code.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
-            // The four save arms latch first-error-wins: two queued saves can fail with no
-            // reader between them, and a plain `send_replace` would lose the first failure
-            // (#1148). In the poisoned-pack cascade the first failure is the root cause.
-            // The log line still records every failure.
-            EpochDbMessage::SaveDummy0Record(record) => {
-                inner.save_dummy_epoch0(record).unwrap_or_else(|e| {
+            // Each write's verdict goes back to its own caller (see `EpochRecordDb`); every
+            // failure is also logged here.
+            EpochDbMessage::SaveDummy0Record(record, tx) => {
+                let res = inner.save_dummy_epoch0(record);
+                if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save dummy epoch 0 record");
-                    latch_first_error(&tx_error, e);
-                });
+                }
+                let _ = tx.send(res);
             }
-            EpochDbMessage::SaveRecord(record) => {
-                inner.save_record(record).unwrap_or_else(|e| {
+            EpochDbMessage::SaveRecord(record, tx) => {
+                let res = inner.save_record(record);
+                if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save epoch record");
-                    latch_first_error(&tx_error, e);
-                });
+                }
+                let _ = tx.send(res);
             }
-            EpochDbMessage::Save(record, cert) => {
-                inner.save(record, cert).unwrap_or_else(|e| {
+            EpochDbMessage::Save(record, cert, tx) => {
+                let res = inner.save(record, cert);
+                if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
-                    latch_first_error(&tx_error, e);
-                });
+                }
+                let _ = tx.send(res);
             }
-            EpochDbMessage::SaveCertificate(digest, cert) => {
-                inner.save_certificate(digest, cert).unwrap_or_else(|e| {
+            EpochDbMessage::SaveCertificate(digest, cert, tx) => {
+                let res = inner.save_certificate(digest, cert);
+                if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save epoch certificate");
-                    latch_first_error(&tx_error, e);
-                });
+                }
+                let _ = tx.send(res);
             }
             EpochDbMessage::RecordByEpoch(epoch, tx) => {
                 let _ = tx.send(inner.record_by_epoch(epoch));
@@ -219,13 +216,7 @@ fn run_db_loop(
                 let _ = tx.send(inner.first_missing_historical_cert(tip_epoch));
             }
             EpochDbMessage::Persist(tx) => {
-                // Fold a write that failed while this persist was queued into the reply.
-                // `persist()` samples the error slot before enqueueing, and writes are
-                // fire-and-forget, so a save that fails after that sample but before this arm
-                // would otherwise be acknowledged as a successful flush.
-                let pending = tx_error.send_replace(None);
-                let flushed = inner.persist();
-                let _ = tx.send(pending.map_or(flushed, Err));
+                let _ = tx.send(inner.persist());
             }
             EpochDbMessage::Shutdown => break,
             EpochDbMessage::AsyncShutdown(tx) => {
@@ -236,10 +227,10 @@ fn run_db_loop(
             }
         }
     }
-    // Clean-close: dropping `inner` commits/seals the epochs + certs packs. Do it before confirming
-    // an async shutdown; it also runs for the sync `Shutdown` and channel-closed paths (the sync
-    // `Drop`'s `join()` waits on this return).
-    drop(inner);
+    // Clean-close: persist, then seal the epochs + certs packs. Do it before confirming an async
+    // shutdown; it also runs for the sync `Shutdown` and channel-closed paths (the sync `Drop`'s
+    // `join()` waits on this return).
+    inner.close();
     if let Some(tx) = async_confirm {
         let _ = tx.send(());
     }
@@ -455,7 +446,6 @@ impl EpochRecordDb {
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self, EpochDbError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (error, _) = watch::channel(None);
         let inner = Inner::open_append(path, 0)?;
         // Index `final_numbers` by absolute epoch (matching `update_finals`), NOT by
         // push-per-record: an interrupted-then-retried save can leave a duplicate record in
@@ -472,12 +462,10 @@ impl EpochRecordDb {
             }
             final_numbers[epoch] = record.final_consensus.number;
         }
-        let tx_error = error.clone();
-        let handle = std::thread::spawn(move || run_db_loop(inner, rx, tx_error));
+        let handle = std::thread::spawn(move || run_db_loop(inner, rx));
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            error,
             final_numbers: Arc::new(Mutex::new(final_numbers)),
             dead_logged: Arc::new(AtomicBool::new(false)),
         })
@@ -605,34 +593,20 @@ impl EpochRecordDb {
         Ok(certs)
     }
 
-    /// Return any delayed error recorded by the background thread.
-    /// Also clears the error.
-    /// When more than one write failed since the last read, this returns the first failure.
-    pub fn get_error(&self) -> Result<(), EpochDbError> {
-        match self.error.send_replace(None) {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
-    }
-
-    /// Return any delayed error recorded by the background thread.
-    /// Does not clear the error.
-    pub fn peek_error(&self) -> Result<(), EpochDbError> {
-        match &*self.error.borrow() {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
+    /// Send one write to the background thread and wait for its verdict on it.
+    async fn write(
+        &self,
+        message: impl FnOnce(WriteReply) -> EpochDbMessage,
+    ) -> Result<(), EpochDbError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(message(tx)).await.map_err(|_| EpochDbError::SendFailed)?;
+        rx.await.map_err(|_| EpochDbError::ReceiveFailed)?
     }
 
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored.
     pub async fn save_dummy_epoch0(&self, record: EpochRecord) -> Result<(), EpochDbError> {
-        self.get_error()?;
-        self.tx
-            .send(EpochDbMessage::SaveDummy0Record(record))
-            .await
-            .map_err(|_| EpochDbError::SendFailed)?;
-        Ok(())
+        self.write(|tx| EpochDbMessage::SaveDummy0Record(record, tx)).await
     }
 
     /// Update final_numbers with record data.
@@ -655,13 +629,8 @@ impl EpochRecordDb {
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored.
     pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
-        self.get_error()?;
         self.update_finals(&record)?;
-        self.tx
-            .send(EpochDbMessage::SaveRecord(record))
-            .await
-            .map_err(|_| EpochDbError::SendFailed)?;
-        Ok(())
+        self.write(|tx| EpochDbMessage::SaveRecord(record, tx)).await
     }
 
     /// Save an [`EpochRecord`] and its [`EpochCertificate`] to the database.
@@ -671,13 +640,8 @@ impl EpochRecordDb {
         record: EpochRecord,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
-        self.get_error()?;
         self.update_finals(&record)?;
-        self.tx
-            .send(EpochDbMessage::Save(record, cert))
-            .await
-            .map_err(|_| EpochDbError::SendFailed)?;
-        Ok(())
+        self.write(|tx| EpochDbMessage::Save(record, cert, tx)).await
     }
 
     /// Save an [`EpochCertificate`] keyed by `digest` (the corresponding [`EpochRecord`]'s digest).
@@ -687,12 +651,7 @@ impl EpochRecordDb {
         digest: EpochDigest,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
-        self.get_error()?;
-        self.tx
-            .send(EpochDbMessage::SaveCertificate(digest, cert))
-            .await
-            .map_err(|_| EpochDbError::SendFailed)?;
-        Ok(())
+        self.write(|tx| EpochDbMessage::SaveCertificate(digest, cert, tx)).await
     }
 
     /// True while the background actor's command channel is open. A dead actor answers every read
@@ -961,21 +920,16 @@ impl EpochRecordDb {
         self.ask(EpochDbMessage::LatestRecord, None, "latest_record").await
     }
 
-    /// Flush all pending writes to disk.
+    /// Flush everything written so far to disk.
     ///
-    /// Returns `Err` if any background write queued before this call failed, including one that
-    /// was still queued when this call sampled the error slot: the actor drains a single FIFO
-    /// channel, so every earlier write is processed before the flush and its failure is folded
-    /// into the reply. Callers that treat a successful `persist()` as proof of durability, such
-    /// as the epoch-close path, depend on that guarantee.
+    /// Every write before this call has already returned its own verdict to its caller, so a
+    /// successful `persist()` proves durable exactly the writes that reported `Ok`. Callers that
+    /// treat it as proof of durability, such as the epoch-close path, check their write's result
+    /// first.
     pub async fn persist(&self) -> Result<(), EpochDbError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(EpochDbMessage::Persist(tx)).await;
-        rx.await.map_err(|_| match &*self.error.borrow() {
-            Some(e) => e.clone(),
-            None => EpochDbError::ReceiveFailed,
-        })?
+        self.tx.send(EpochDbMessage::Persist(tx)).await.map_err(|_| EpochDbError::SendFailed)?;
+        rx.await.map_err(|_| EpochDbError::ReceiveFailed)?
     }
 
     /// Take ownership and clean-close the DB asynchronously, so `Drop` does not block a thread on a
@@ -1089,9 +1043,6 @@ impl EpochRecordDb {
         records_path: &Path,
         certs_path: &Path,
     ) -> Result<(), EpochDbError> {
-        // Surface any pending background write error before reading.
-        self.peek_error()?;
-
         // Collect the bounded record+cert set from the actor first, so the on-disk write below sees
         // a fixed snapshot even if a later epoch is appended concurrently to the live packs.
         let mut records = Vec::with_capacity(through_epoch as usize + 1);
@@ -1147,9 +1098,6 @@ impl EpochRecordDb {
         records_path: &Path,
         certs_path: &Path,
     ) -> Result<(), EpochDbError> {
-        // Surface any pending background write error before reading (without clearing it).
-        self.peek_error()?;
-
         let incremental = self
             .try_append_previous_bundle(through_epoch, prev_bundle, records_path, certs_path)
             .await;
@@ -2244,6 +2192,16 @@ impl Inner {
         let _ = self.first_missing_historical_cert(stored_end);
     }
 
+    /// Clean-close: persist, then drop (which seals every file). Persisting first matters when the
+    /// commit fails: `persist` then pulls the digest markers back to the last committed lengths
+    /// before the indexes' drop makes them durable, so a close never attests records whose data
+    /// was not made durable. A failure is logged; the next open recovers from it.
+    fn close(mut self) {
+        if let Err(e) = self.persist() {
+            error!(target: "epoch-db", %e, "failed to persist the epoch-record logs at close");
+        }
+    }
+
     fn persist(&mut self) -> Result<(), EpochDbError> {
         if self.records.read_only() {
             return Ok(());
@@ -2647,100 +2605,44 @@ mod test {
         }
     }
 
+    /// Each write's failure goes back to the caller that made it, and to no one else. The handle is
+    /// shared by concurrent writers (the epoch-close path, the vote collector, state-sync), so a
+    /// failure handed to whichever caller looked next (#1065, #1148) could leave the writer that
+    /// failed believing its record saved, with its `persist` vouching for it.
     #[tokio::test]
-    async fn export_bundle_peeks_write_error_without_clearing_it() {
-        // Regression test for finding #6: the read-only export must surface a pending background
-        // write error WITHOUT clearing it, so the write path (the acknowledger) still learns of the
-        // failure instead of it being silently consumed by an in-flight export.
-        let temp_dir = TempDir::with_prefix("export_peek_error").expect("temp dir");
+    async fn each_write_failure_reaches_its_own_caller() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("write_failure_own_caller").expect("temp dir");
         let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
-        // Simulate a background write failure the actor recorded into the shared error slot.
-        db.error.send_replace(Some(EpochDbError::CorruptDb));
+        let other_writer = db.clone();
 
-        // The export surfaces the pending error (it returns at `peek_error()?` before any disk
-        // work).
-        let err = db
-            .export_bounded_bundle(0, &temp_dir.path().join("recs"), &temp_dir.path().join("certs"))
-            .await
-            .expect_err("export must surface the pending write error");
-        assert!(matches!(err, EpochDbError::CorruptDb), "unexpected error: {err:?}");
+        // Writes the actor rejects (epochs 5 and 7 are out of order on an empty db), sent past the
+        // handle-side ordering guard so the actor's own verdict is what reaches the caller.
+        let rejected = |epoch| {
+            let db = db.clone();
+            async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let record = EpochRecord { epoch, ..Default::default() };
+                db.tx
+                    .send(super::EpochDbMessage::SaveRecord(record, tx))
+                    .await
+                    .expect("queue save");
+                rx.await.expect("the actor replies to the write")
+            }
+        };
+        let first = rejected(5).await.expect_err("the actor rejects epoch 5");
+        assert!(matches!(first, EpochDbError::EpochOutOfOrder(0, 5)), "got {first:?}");
+        let second = rejected(7).await.expect_err("the actor rejects epoch 7");
+        assert!(matches!(second, EpochDbError::EpochOutOfOrder(0, 7)), "got {second:?}");
 
-        // ...but must NOT clear it: the write path still learns of the failure (the #6 fix).
-        let latched = db.get_error().expect_err("write path must still see the error");
-        assert!(matches!(latched, EpochDbError::CorruptDb), "unexpected error: {latched:?}");
-
-        // `get_error` is the acknowledger, so the slot is cleared only after it is read there.
-        db.get_error().expect("slot cleared after acknowledgement");
-    }
-
-    #[tokio::test]
-    async fn persist_reports_a_write_that_failed_while_the_flush_was_queued() {
-        // Regression test for #1065: `persist()` samples the error slot before it enqueues, and
-        // writes are fire-and-forget, so a save that fails while the `Persist` message is still
-        // queued behind it must be folded into the persist reply. Otherwise the epoch-close path
-        // treats `Ok(())` as proof of durability for a record that never reached disk.
-        let temp_dir = TempDir::with_prefix("persist_queued_write_error").expect("temp dir");
-        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
-
-        // Queue a save the actor will reject — epoch 5 is out of order on an empty db — and a
-        // persist behind it. Both go straight to the channel: the handle-side guards would reject
-        // this record before it ever reached the actor, and the point of the test is the actor's
-        // ordering. A single consumer draining a FIFO channel guarantees the save fails before
-        // the persist is dequeued, so this is deterministic rather than a race.
-        let record = EpochRecord { epoch: 5, ..Default::default() };
-        db.tx.send(super::EpochDbMessage::SaveRecord(record)).await.expect("queue failing save");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        db.tx.send(super::EpochDbMessage::Persist(tx)).await.expect("queue persist");
-
-        let err = rx
-            .await
-            .expect("actor replied to the persist")
-            .expect_err("persist must report the write that failed while it was queued");
-        assert!(matches!(err, EpochDbError::EpochOutOfOrder(0, 5)), "unexpected error: {err:?}");
-
-        // The flush consumed the failure, so it is not left behind to be misattributed to an
-        // unrelated later caller.
-        db.get_error().expect("persist acknowledged the error");
-    }
-
-    #[tokio::test]
-    async fn queued_save_failures_keep_the_first_error() {
-        // Regression test for #1148: two saves fail back to back with no reader between them.
-        // The latch was last-write-wins, so the second failure silently replaced the first
-        // and the root cause was lost. The latch must keep the first failure.
-        let temp_dir = TempDir::with_prefix("queued_saves_first_error").expect("temp dir");
-        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
-
-        // Queue two saves the actor will reject: epochs 5 and 7 are both out of order on an
-        // empty db and produce distinguishable errors. Both go straight to the channel so no
-        // handle-side guard or reader runs between the two failures. A single consumer
-        // draining a FIFO channel guarantees the save order, so this is deterministic rather
-        // than a race.
-        let first = EpochRecord { epoch: 5, ..Default::default() };
-        let second = EpochRecord { epoch: 7, ..Default::default() };
-        db.tx
-            .send(super::EpochDbMessage::SaveRecord(first))
-            .await
-            .expect("queue first failing save");
-        db.tx
-            .send(super::EpochDbMessage::SaveRecord(second))
-            .await
-            .expect("queue second failing save");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        db.tx.send(super::EpochDbMessage::Persist(tx)).await.expect("queue persist");
-
-        // The persist reply drains the latch, so it must carry the FIRST failure, not the
-        // one that happened to fail last.
-        let err = rx
-            .await
-            .expect("actor replied to the persist")
-            .expect_err("persist must report the queued save failures");
-        assert!(
-            matches!(err, EpochDbError::EpochOutOfOrder(0, 5)),
-            "latch must keep the first failure, got: {err:?}"
-        );
-        // The reply consumed the slot; nothing is left to misattribute to a later caller.
-        db.get_error().expect("persist acknowledged the error");
+        // Another writer is unaffected: its save and its flush report only their own outcome.
+        let (record, cert) = make_test_pair(0, &signers, EpochDigest::default());
+        other_writer.save(record.clone(), cert).await.expect("an unrelated save succeeds");
+        other_writer.persist().await.expect("an unrelated flush succeeds");
+        assert_eq!(db.record_by_epoch(0).await.map(|r| r.digest()), Some(record.digest()));
+        assert!(db.record_by_epoch(5).await.is_none(), "a rejected write is not stored");
+        db.close().await;
     }
 
     #[test]
@@ -3457,6 +3359,68 @@ mod test {
         let (dir, damaged_at) = crashed_db_with_eight_records(7);
         let damaged = damage_record(dir.path(), damaged_at);
         assert_refuses_to_drop_acked(dir.path(), &damaged);
+    }
+
+    /// Closing with saves that were never persisted must not leave the digest index attesting
+    /// them when the close's own commit fails: they were never acknowledged. Here the failed
+    /// commit is the certs log's (poisoned by a failed append), the records log is then left as a
+    /// failed data sync leaves it (unsealed), and its first unpersisted record is damaged while
+    /// the second survives. The reopen must drop the unacknowledged tail, not refuse it as
+    /// damage to acked records.
+    #[tokio::test]
+    async fn test_close_with_a_failed_commit_does_not_attest_unpersisted_records() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_close_failed_commit").expect("temp dir");
+        let damaged_at = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            let mut pairs = Vec::new();
+            for epoch in 0..4u32 {
+                let (record, cert) = make_test_pair(epoch, &signers, parent);
+                parent = record.digest();
+                pairs.push((record, cert));
+            }
+            let (record, cert) = pairs[0].clone();
+            inner.save(record, cert).expect("save epoch 0");
+            inner.persist().expect("persist epoch 0");
+            for (record, cert) in pairs[1..3].iter().cloned() {
+                inner.save(record, cert).expect("save an unpersisted record");
+            }
+            let damaged_at = inner.epoch_idx.load(1).expect("epoch 1 offset");
+            inner.certs.fail_next_append_for_test();
+            let (record, cert) = pairs[3].clone();
+            inner
+                .save_certificate(record.digest(), cert)
+                .expect_err("the injected append failure poisons the certs log");
+            inner.close();
+            damaged_at
+        };
+
+        let path = dir.path().join(RECORDS_NAME);
+        let sealed = !Pack::<EpochRecord>::open(
+            &path,
+            Inner::PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )
+        .expect("open records log")
+        .opened_unclean();
+        if sealed {
+            let f = OpenOptions::new().write(true).open(&path).expect("open records log");
+            let len = f.metadata().expect("metadata").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN).expect("strip sentinel");
+        }
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        bytes[damaged_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write records log");
+
+        let db = EpochRecordDb::open(dir.path()).expect("the unacknowledged tail is dropped");
+        assert!(db.record_by_epoch(0).await.is_some(), "the persisted record survives");
+        assert!(db.record_by_epoch(1).await.is_none(), "the damaged unpersisted record is dropped");
+        db.close().await;
     }
 
     /// A persist with no record yet leaves only the commit marker in the log's padding. After a

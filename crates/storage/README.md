@@ -100,7 +100,7 @@ type is `Send + Sync + Clone`.
 | `open_append` | writable, creates | header-only ⇒ write+fsync meta; then recover |
 | `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes) |
 | `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; **refuses** (→ `db repair`) if the data log itself is torn |
-| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2) |
+| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic |
 
 ### 5. Recovery model — four invariants
 
@@ -150,7 +150,9 @@ peer's bytes are authenticated only at the final header), and drives epoch hando
 `epoch_records` (`EpochRecordDb`) is the singleton chain of `EpochRecord`s (`epochs.pack`) and their
 `EpochCertificate`s (`epoch_certs.pack`), auto-healed on open under the same rules: `persist()` stamps
 each log's tail commit marker, a rebuild refuses to truncate below it (or below the digest index's
-synced length), and an empty position index beside a populated digest index is rebuilt, not trusted. `certificate_pack` and
+synced length), and an empty position index beside a populated digest index is rebuilt, not trusted.
+Each write returns its own result to its caller (the handle is shared by concurrent writers, so a
+failure is never reported to someone else), and closing persists before the files are sealed. `certificate_pack` and
 `exec_state_pack` are per-epoch / per-snapshot packs for certificate bundles and EVM state exports.
 
 ### 7. Key/value stores (the other family)
@@ -191,8 +193,10 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
 issues. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
-re-sync, never "fixed". `db repair` and `db migrate` refuse to run while a live node holds the
-`<datadir>/telcoin.pid` lock (intentional-design item 9).
+re-sync, never "fixed". A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
+drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. `db repair`,
+`db migrate` and `db load-state` refuse to run while a live node holds the `<datadir>/telcoin.pid`
+lock (intentional-design item 9).
 
 ---
 
@@ -233,13 +237,14 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    macOS `F_FULLFSYNC` caveat). This is a deliberate performance choice, not a durability bug.
 9. **Single-writer datadir, enforced by a `telcoin.pid` lockfile.** The node is the sole writer of
    its datadir and holds an exclusive advisory `flock` on `<datadir>/telcoin.pid` for its lifetime,
-   recording its PID in it for operators (`tn_config::pid_lock`). Node startup and the at-rest writers
-   (`db repair`, `db migrate`) refuse to run while another process holds the lock; the kernel releases
-   it when the holder exits or crashes, so a crash never blocks a restart. The file is never unlinked
-   (a release just clears the PID) — deleting it would let two processes lock two different inodes at
-   the same path. This guard is TN-owned; it does not depend on the execution engine's own database
-   lock. `db repair`/`db migrate` also take the lock for their run, so a node cannot start mid-repair.
-   They stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming
+   recording its PID in it for operators (`tn_config::pid_lock`). Node startup and the at-rest
+   writers (`db repair`, `db migrate`, `db load-state`) refuse to run while another process holds the
+   lock; the kernel releases it when the holder exits or crashes, so a crash never blocks a restart.
+   The file is never unlinked (a release just clears the PID) — deleting it would let two processes
+   lock two different inodes at the same path. This guard is TN-owned; it does not depend on the
+   execution engine's own database lock. `db repair`/`db migrate`/`db load-state` also take the lock
+   for their run, so a node cannot start mid-repair or mid-import. `db repair`/`db migrate`
+   stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming
    `--epoch N` explicitly — including the current/latest epoch — is intentionally allowed under the
    same node-stopped contract. The lock is advisory (only TN processes take it) and network
    filesystems with unreliable `flock` are out of scope, so the loud banner and the stop-the-node

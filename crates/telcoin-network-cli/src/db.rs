@@ -30,7 +30,7 @@ use tn_storage::{
     consensus::ConsensusChain,
     consensus_pack::{
         pack_unsealed_version, wal_consistent_end, ConsensusPack, EpochMigrate, EpochRepair,
-        DATA_NAME,
+        DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
@@ -167,6 +167,7 @@ impl DbValidateArgs {
                     println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
                     bail!("pack {} is corrupt (see report above)", data_file.display());
                 }
+                print_legacy_tail_note(&data_file, epoch);
             }
             if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
                 let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
@@ -209,6 +210,7 @@ impl DbValidateArgs {
                  (bytes past offset {end}); this unacked in-flight write is truncated by a node \
                  restart or `db repair --force`."
             );
+            print_legacy_tail_note(&data_file, epoch);
             eprintln!("\nValidating the complete prefix (up to byte {end})...");
             let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
                 .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
@@ -230,6 +232,20 @@ impl DbValidateArgs {
             bail!("pack {} is INVALID (see report above)", data_file.display());
         }
         Ok(())
+    }
+}
+
+/// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
+/// migration to v2 drops it, whether run by `db migrate` or by the node when it opens or reads the
+/// epoch. (A v2 pack's tail is covered by the printed corruption's recommended action.)
+fn print_legacy_tail_note(data_file: &Path, epoch: Epoch) {
+    if let Some((version, _)) = pack_unsealed_version(data_file, epoch) {
+        if version < SENTINEL_MIN_VERSION {
+            println!(
+                "note: legacy (v{version}) pack — migrating it to v2 (`db migrate --force`, or the \
+                 node when it opens or reads this epoch) drops this unacked tail."
+            );
+        }
     }
 }
 
@@ -621,6 +637,11 @@ pub struct DbLoadStateArgs {
 impl DbLoadStateArgs {
     /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // This writes chain data into the datadir: refuse to run while a live node holds the
+        // datadir PID lock, and take it for our own run so a node cannot start mid-import;
+        // released when this returns. Every config load below needs the datadir to exist.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+
         // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
         // command). Genesis is the trust root, so it must match the chain the pack came from.
         let tn_config = match self.chain {
@@ -1465,6 +1486,21 @@ mod tests {
             "repair must clear its PID on exit"
         );
         drop(PidLock::acquire(&datadir).expect("repair must release its lock on exit"));
+    }
+
+    /// `db load-state` writes chain data into the datadir, so like repair and migrate it must
+    /// refuse to run while a live node holds the datadir lock, before touching anything.
+    #[cfg(unix)]
+    #[test]
+    fn db_load_state_refuses_while_a_live_node_holds_the_datadir_lock() {
+        use tn_config::PidLock;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let _held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
+            .execute(datadir)
+            .expect_err("load-state must refuse while a node holds the lock");
+        assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
     }
 
     #[test]

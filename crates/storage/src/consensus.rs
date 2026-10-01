@@ -1238,22 +1238,23 @@ impl ConsensusChain {
     /// batches, and the unverified pre-check buffer is bounded to a single header record rather
     /// than the whole output. Errors with [`ConsensusChainError::NoCurrentEpoch`] if we have no
     /// pack for `epoch` (so cannot resolve its committee) — the caller should treat that as
-    /// "not yet decodable".
+    /// "not yet decodable". Each record must arrive within `record_timeout`.
     pub async fn stream_decode_consensus_output<R: AsyncRead + Unpin>(
         &self,
         epoch: Epoch,
         reader: R,
         expected_hash: ConsensusHeaderDigest,
+        record_timeout: Duration,
     ) -> Result<ConsensusOutput, ConsensusChainError> {
         let pack = self.current_pack();
         if epoch == pack.epoch() {
-            return Ok(pack.decode_output_stream(reader, expected_hash).await?);
+            return Ok(pack.decode_output_stream(reader, expected_hash, record_timeout).await?);
         }
         if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.decode_output_stream(reader, expected_hash).await?)
+            Ok(pack.decode_output_stream(reader, expected_hash, record_timeout).await?)
         } else if let Some(staging) = self.staging() {
             if epoch == staging.pack.epoch() {
-                Ok(staging.pack.decode_output_stream(reader, expected_hash).await?)
+                Ok(staging.pack.decode_output_stream(reader, expected_hash, record_timeout).await?)
             } else {
                 Err(ConsensusChainError::NoCurrentEpoch)
             }
@@ -1410,7 +1411,7 @@ impl ConsensusChain {
     /// Poll (up to `timeout`) until this is the sole owner of the shared pack state — i.e. no other
     /// `ConsensusChain` clone remains (notably the worker RPC server's `EngineToPrimaryRpc`, which
     /// reth's stop-less `RpcServerHandle` releases only as the jsonrpsee task winds down) — so a
-    /// following [`Self::close`] actually runs instead of no-opping through `Arc::try_unwrap`.
+    /// following [`Self::close`] seals with no other chain clone still reading or writing.
     /// `current_pack`'s strong count is the proxy: every chain clone bumps it, so `== 1` means
     /// sole. Returns whether sole ownership was reached within `timeout`.
     pub async fn wait_until_sole_owner(&self, timeout: Duration) -> bool {
@@ -1426,13 +1427,12 @@ impl ConsensusChain {
     /// sealed packs, the staging pack, the latest-consensus slot writer, and the epoch-record DB —
     /// instead of letting each object's `Drop` run a blocking thread `join()`.
     ///
-    /// When this holds the LAST `ConsensusChain` reference (per-field `Arc::try_unwrap`) each inner
-    /// `close` seals on the sole-owner path. When a clone outlived the drain (see
-    /// [`Self::wait_until_sole_owner`] — in practice a winding-down RPC connection), the component
-    /// is force-sealed via `seal_now` instead of left unsealed: sealing under that clone (whose
-    /// in-flight reads then fail — benign at shutdown) avoids a full WAL recovery on the next
-    /// start. Only called at graceful shutdown, so a still-present clone here is exactly the
-    /// timed-out case.
+    /// Every component is force-sealed via `seal_now`, whether or not this holds the last
+    /// `ConsensusChain` reference: a chain clone that outlived the drain (see
+    /// [`Self::wait_until_sole_owner`] — in practice a winding-down RPC connection), or a
+    /// transient handle to one pack, would otherwise leave that component unsealed. Sealing under
+    /// it (its in-flight reads then fail — benign at shutdown) avoids a full WAL recovery on the
+    /// next start. Only called at graceful shutdown.
     ///
     /// Force-sealing under a live clone is memory-safe: each component is an actor whose mmaps live
     /// only on its own thread and whose clones are channel-only handles, so the truncate/unmap runs
@@ -1440,56 +1440,32 @@ impl ConsensusChain {
     /// closed channel — see the safety note on `ConsensusPack::seal_now`.
     pub async fn close(self) {
         let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
-        match Arc::try_unwrap(current_pack) {
-            Ok(pack) => pack.into_inner().close().await,
-            Err(shared) => {
-                warn!(
-                    target: "consensus::store",
-                    "current pack still shared at shutdown (a clone outlived the drain); \
-                     force-sealing so the next start skips WAL recovery"
-                );
-                // Clone the handle out of the guard, then DROP the guard before the `.await`
-                // (a `parking_lot` guard must not be held across an await point).
-                let pack = shared.lock().clone();
-                pack.seal_now().await;
-            }
+        // Every component is force-sealed with `seal_now`, never the sole-owner-gated `close`:
+        // even when this is the last `ConsensusChain`, a transient handle to one of its packs (a
+        // reader mid-request holding a clone) would make `close` a no-op and leave that pack to a
+        // WAL recovery on the next start. `seal_now` is idempotent, and at shutdown its result is
+        // the same as the sole-owner path.
+        if Arc::strong_count(&current_pack) > 1 {
+            warn!(
+                target: "consensus::store",
+                "current pack still shared at shutdown (a clone outlived the drain); \
+                 force-sealing so the next start skips WAL recovery"
+            );
         }
-        match Arc::try_unwrap(recent_packs) {
-            Ok(packs) => {
-                for pack in packs.into_inner() {
-                    pack.close().await;
-                }
-            }
-            Err(shared) => {
-                let packs: Vec<_> = shared.lock().iter().cloned().collect();
-                for pack in packs {
-                    pack.seal_now().await;
-                }
-            }
+        // Clone each handle out of its guard, then DROP the guard before the `.await` (a
+        // `parking_lot` guard must not be held across an await point).
+        let pack = current_pack.lock().clone();
+        pack.seal_now().await;
+        let packs: Vec<_> = recent_packs.lock().iter().cloned().collect();
+        for pack in packs {
+            pack.seal_now().await;
         }
-        match Arc::try_unwrap(staging) {
-            Ok(staged) => {
-                if let Some(staged) = staged.into_inner() {
-                    staged.pack.close().await;
-                }
-            }
-            Err(shared) => {
-                let staged = shared.lock().clone();
-                if let Some(staged) = staged {
-                    staged.pack.seal_now().await;
-                }
-            }
+        let staged = staging.lock().clone();
+        if let Some(staged) = staged {
+            staged.pack.seal_now().await;
         }
-        // `latest_consensus` is an owned field (internally `Arc`-backed); a surviving
-        // `ConsensusChain` clone keeps a sharing clone alive, so `close`'s sole-owner gate
-        // would skip it. Force-seal unconditionally: idempotent, and at shutdown this is
-        // the same result as the sole-owner path.
         latest_consensus.seal_now().await;
-        match Arc::try_unwrap(epochs) {
-            Ok(epochs) => epochs.close().await,
-            // `seal_now` is `&self`, so call it straight through the still-shared `Arc`.
-            Err(shared) => shared.seal_now().await,
-        }
+        epochs.seal_now().await;
     }
 
     /// The logical data length (`end`) of the current epoch's pack: the number of real record
@@ -3904,7 +3880,12 @@ mod test {
 
             // Correct hash: resolves the current pack's committee, decodes, and verifies.
             let decoded = consensus_chain
-                .stream_decode_consensus_output(0, Cursor::new(bytes.clone()), original.digest())
+                .stream_decode_consensus_output(
+                    0,
+                    Cursor::new(bytes.clone()),
+                    original.digest(),
+                    Duration::from_secs(5),
+                )
                 .await
                 .expect("verified stream decode");
             compare_outputs(&decoded, original);
@@ -3915,6 +3896,7 @@ mod test {
                     0,
                     Cursor::new(bytes),
                     ConsensusHeader::default().digest(),
+                    Duration::from_secs(5),
                 )
                 .await;
             assert!(
@@ -4242,6 +4224,36 @@ mod test {
 
         // Sole owner now, so close() actually runs (does not no-op).
         consensus_chain.close().await;
+    }
+
+    /// Graceful shutdown seals the current epoch even when the chain is the sole owner but a
+    /// transient handle to its current pack is still alive (a reader mid-request): the pack's own
+    /// `close()` would no-op under that handle and leave the epoch to a WAL recovery on restart.
+    #[tokio::test]
+    async fn test_close_seals_the_current_pack_under_a_live_pack_handle() {
+        use crate::consensus_pack::{pack_unsealed_version, DATA_NAME, PACK_VERSION};
+        let temp_dir = TempDir::with_prefix("test_close_pack_handle").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        let live_handle = consensus_chain.current_pack();
+        consensus_chain.close().await;
+        let data = temp_dir.path().join("epoch-0").join(DATA_NAME);
+        assert_eq!(
+            pack_unsealed_version(&data, 0),
+            Some((PACK_VERSION, false)),
+            "the current pack is sealed at shutdown"
+        );
+        drop(live_handle);
     }
 
     #[tokio::test]

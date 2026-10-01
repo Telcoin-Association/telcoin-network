@@ -765,7 +765,12 @@ impl PrimaryNetworkHandle {
                 let reader = sync_codec::sync_pack_reader(stream);
                 match request
                     .consensus_chain
-                    .stream_decode_consensus_output(request.epoch, reader, request.expected_hash)
+                    .stream_decode_consensus_output(
+                        request.epoch,
+                        reader,
+                        request.expected_hash,
+                        sync_codec::SYNC_RECORD_TIMEOUT,
+                    )
                     .await
                 {
                     Ok(output) => Ok(output),
@@ -1119,6 +1124,9 @@ impl PrimaryNetworkHandle {
             // during rollout: classify it `Failed` (try next peer) without a penalty.
             SyncFrame::Ack => {
                 let reader = sync_codec::sync_pack_reader(stream);
+                // The reader's own per-frame timeout and throughput floor cut a stalled or
+                // dribbling peer; the per-record timeout must not cut a transfer the floor admits.
+                let record_timeout = record_timeout.max(sync_codec::SYNC_RECORD_TIMEOUT);
                 // Pick the import target on `last_consensus_number.is_some()`; both resolve to
                 // `Result<(), ConsensusChainError>`, so box to unify the future types while keeping
                 // the TYPED error (a peer-caused stream fault must be penalised before it is

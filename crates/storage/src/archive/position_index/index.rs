@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, MmapDataFile},
+    data_file::{fsync_directory, sentinel_matches, MmapDataFile, SENTINEL_LEN},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -215,7 +215,8 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// open (which would heal that tail) is not wanted: it yields the entries a writable open
     /// would keep, and none where that open would discard the file. Zero-filled padding past an
     /// unsealed index's logical end decodes as zero entries; a caller treating entries as record
-    /// offsets must ignore those (a real offset lies past the data file's header).
+    /// offsets must ignore those (a real offset lies past the data file's header). A sealed index's
+    /// trailing clean-close sentinel is not read as an entry.
     pub fn raw_entries(path: &Path, data_header: &DataHeader) -> Vec<T> {
         let Ok(bytes) = fs::read(path) else { return Vec::new() };
         let header = bytes
@@ -228,7 +229,18 @@ impl<T: PosIndexValue> PositionIndex<T> {
         }) {
             return Vec::new();
         }
-        bytes[PDX_HEADER_SIZE..]
+        // A cleanly closed index ends in its clean-close sentinel, which is not an entry.
+        let end = bytes
+            .len()
+            .checked_sub(SENTINEL_LEN as usize)
+            .filter(|&at| at >= PDX_HEADER_SIZE)
+            .filter(|&at| {
+                bytes[at..]
+                    .first_chunk::<{ SENTINEL_LEN as usize }>()
+                    .is_some_and(|tail| sentinel_matches(tail, at as u64))
+            })
+            .unwrap_or(bytes.len());
+        bytes[PDX_HEADER_SIZE..end]
             .chunks_exact(T::buffer_len())
             .filter_map(|chunk| T::decode(chunk).ok())
             .collect()
@@ -738,5 +750,24 @@ mod tests {
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
         );
+    }
+
+    /// A cleanly closed index ends in the 8-byte clean-close sentinel; the raw read must not decode
+    /// it as one more entry (for an 8-byte stride it would otherwise be a whole chunk).
+    #[test]
+    fn test_raw_entries_skip_the_clean_close_sentinel() {
+        let tmp_path = TempDir::with_prefix("test_raw_entries_sentinel").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        {
+            let mut idx: PositionIndex<u64> =
+                PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "raw.pdx", false)
+                    .expect("pdx file");
+            for i in 0..3 {
+                idx.save(i, 100 + i).expect("add to index");
+            }
+        }
+        let entries =
+            PositionIndex::<u64>::raw_entries(&tmp_path.path().join("raw.pdx"), &data_header);
+        assert_eq!(entries, vec![100, 101, 102], "the sealed tail is not an entry");
     }
 }

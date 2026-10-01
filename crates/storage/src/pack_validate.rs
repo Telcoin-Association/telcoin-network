@@ -46,9 +46,10 @@ use crate::{
         pack::{DataHeader, Pack, PackCompression, RawIter},
     },
     consensus_pack::{
-        attested_output_survives_past, check_recoverable, pack_unsealed_version,
-        read_position_entries, verify_epoch_meta, wal_consistent_end, PackError, PackRecord,
-        BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME, PACK_VERSION, SENTINEL_MIN_VERSION,
+        attested_output_survives_past, check_recoverable, legacy_migration_refusal,
+        pack_unsealed_version, read_position_entries, verify_epoch_meta, wal_consistent_end,
+        PackError, PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME, PACK_VERSION,
+        POSITION_INDEX_NAME, SENTINEL_MIN_VERSION,
     },
 };
 
@@ -573,6 +574,17 @@ fn cross_check_indexes(
 ) {
     const MAX_MISMATCHES: usize = 100;
     let Some(dir) = data_path.parent() else { return };
+    // The derived indexes are one set: a read-only open refuses a pack missing any of them, so a
+    // directory absent beside the others is reported. A bare data file, with none of them, is
+    // validated on its own.
+    let names = [POSITION_INDEX_NAME, CONSENSUS_DIGEST_NAME, BATCH_DIGEST_NAME];
+    let missing: Vec<&str> = names.into_iter().filter(|name| !dir.join(name).is_dir()).collect();
+    if !missing.is_empty() && missing.len() < names.len() {
+        report.issues.push(PackIssue::IndexUnreadable {
+            detail: format!("derived index missing beside the others: {}", missing.join(", ")),
+        });
+        report.verdict = Verdict::Invalid;
+    }
     let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
     let batch_dir = dir.join(BATCH_DIGEST_NAME);
     let open = |idx_dir: std::path::PathBuf| {
@@ -720,18 +732,16 @@ fn cross_check_indexes(
 /// tail, or `None` when it would. `db validate` reports a tear as truncatable only when this is
 /// `None`, so its verdict matches what a node restart or `db repair --force` actually does:
 /// - a legacy (pre-v2) pack has no clean-close sentinel, so it always reads as unclean; its tail is
-///   judged by the migration (`db migrate`), which refuses a length-consistent legacy log that
-///   replays short;
+///   judged by the migration to v2 (what `db migrate`, `db repair` and the node all run on it),
+///   which drops an unacked torn tail and refuses damage below the acked frontier;
 /// - a v2 pack's recovery refuses when an acked output lies past where the WAL replay stops (the
 ///   tail commit marker, or a position-index-attested output that still decodes) — see
 ///   `Inner::check_recoverable`.
 pub fn recovery_refusal(data_path: &Path, epoch: Epoch) -> Option<String> {
     let (version, _) = pack_unsealed_version(data_path, epoch)?;
     if version < SENTINEL_MIN_VERSION {
-        return Some(format!(
-            "legacy (v{version}) pack: it has no clean-close sentinel, so its tail cannot be \
-             classified here; run `db migrate` to assess and migrate it"
-        ));
+        return legacy_migration_refusal(data_path, epoch)
+            .map(|why| format!("legacy (v{version}) pack: its migration to v2 refuses: {why}"));
     }
     check_recoverable(data_path, epoch).err().map(|e| e.to_string())
 }

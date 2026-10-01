@@ -240,7 +240,7 @@ fn clean_close_sentinel(end: u64) -> [u8; 8] {
 /// that the first CRC equals `crc32(data_len)` (ties the marker to the actual file size, so a
 /// torn/padded tail that happens to be self-consistent still fails) and that the trailing CRC
 /// equals `crc32` of the first four bytes (self-consistency / zero-padding guard).
-fn sentinel_matches(tail: &[u8; 8], data_len: u64) -> bool {
+pub(crate) fn sentinel_matches(tail: &[u8; 8], data_len: u64) -> bool {
     *tail == clean_close_sentinel(data_len)
 }
 

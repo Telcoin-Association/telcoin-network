@@ -66,7 +66,7 @@ pub const PACK_VERSION: u16 = 2;
 /// shutdown; such packs are validated by the cross-file length checks and, on the writable door, by
 /// WAL replay — exactly how pre-mmap `main` treated them. Kept distinct from [`PACK_VERSION`] so a
 /// later version bump cannot silently drop the sentinel gate for v2.
-pub(crate) const SENTINEL_MIN_VERSION: u16 = 2;
+pub const SENTINEL_MIN_VERSION: u16 = 2;
 
 /// Metadata for an Epoch.  Should always be the first record in a consensus pack.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
@@ -510,7 +510,23 @@ impl ConsensusPack {
         let base_dir = path.join(format!("epoch-{epoch}"));
         let data_file = base_dir.join(Inner::DATA_NAME);
         let data_identity = file_identity(&data_file)?;
-        let kind = match pack_unsealed_version(&data_file, epoch) {
+        // An environmental failure to open the data log (descriptor or memory exhaustion,
+        // permissions) says nothing about the pack: surface it as I/O, which the heal back-off
+        // does not remember, instead of an at-rest-corruption verdict replayed to every reader.
+        let sealed_version = match Pack::<PackRecord>::open(
+            &data_file,
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        ) {
+            Ok(data) => Some((data.version(), data.opened_unclean())),
+            Err(DataFileOpen(LoadHeaderError::IO(e))) if io_error_is_environmental(&e) => {
+                return Err(PackError::IO(Arc::new(e)));
+            }
+            Err(_) => None,
+        };
+        let kind = match sealed_version {
             Some((version, _)) if version < SENTINEL_MIN_VERSION => {
                 warn!(
                     target: "consensus::pack",
@@ -947,6 +963,10 @@ impl ConsensusPack {
     /// Every open path keeps this handle-level copy faithful to the on-disk meta:
     /// `open_append` either writes it as the new meta or errors on a meta mismatch, and
     /// the reopen/import paths clone it out of the persisted record.
+    ///
+    /// For a pack imported from a peer only the committee's BLS key set is authenticated (see
+    /// [`verify_epoch_meta`]); its other fields (execution addresses, network keys, hosts, stake)
+    /// are as the peer sent them, so nothing consensus-critical may rely on them.
     pub(crate) fn committee(&self) -> &Committee {
         &self.committee
     }
@@ -992,16 +1012,18 @@ impl ConsensusPack {
     /// any batch record is buffered. Used on the requested-output receive path so an unverified
     /// peer stream cannot force buffering/decoding more than a single ≤`MAX_RECORD_SIZE` header
     /// record before the known hash is checked. Uses this pack's committee (author -> execution
-    /// address) and compression, so the pack must be for the same epoch as the stream.
+    /// address) and compression, so the pack must be for the same epoch as the stream. Each record
+    /// must arrive within `record_timeout`.
     pub async fn decode_output_stream<R: AsyncRead + Unpin>(
         &self,
         reader: R,
         expected_digest: ConsensusHeaderDigest,
+        record_timeout: Duration,
     ) -> Result<ConsensusOutput, PackError> {
         bytes_to_verified_output(
             reader,
             self.compression,
-            Duration::from_secs(5),
+            record_timeout,
             &self.committee,
             expected_digest,
         )
@@ -1273,6 +1295,8 @@ pub const DATA_NAME: &str = Inner::DATA_NAME;
 pub const CONSENSUS_DIGEST_NAME: &str = Inner::CONSENSUS_HASH_NAME;
 /// Sidecar directory name of the batch digest index (the `bhash` hdx/odx).
 pub const BATCH_DIGEST_NAME: &str = Inner::BATCH_HASH_NAME;
+/// Sidecar directory name of the position index (the `idx` pdx).
+pub const POSITION_INDEX_NAME: &str = Inner::CONSENSUS_POS_NAME;
 
 /// Whether any position-index-attested output starts after byte offset `from` and still decodes
 /// from its recorded boundary.
@@ -1350,6 +1374,30 @@ pub(crate) fn check_recoverable(data_path: &Path, epoch: Epoch) -> Result<(), Pa
         PackError::ReadError(format!("data path {} has no parent dir", data_path.display()))
     })?;
     Inner::check_recoverable(epoch_dir, data_path, epoch)
+}
+
+/// Read-only: why migrating the legacy (pre-v2) pack whose data log is `data_path` to v2 would
+/// refuse, or `None` when it would succeed. Exactly the migration's dry run (`db migrate` without
+/// `--force`): an unacked torn tail is dropped by the migration, while damage below the acked
+/// frontier is refused. A legacy pack has no clean-close sentinel, so this, not the v2 recovery
+/// check, is what decides whether its tail is truncatable.
+pub(crate) fn legacy_migration_refusal(data_path: &Path, epoch: Epoch) -> Option<String> {
+    let base_dir = data_path.parent()?;
+    let src = match Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    ) {
+        Ok(src) => src,
+        Err(e) => return Some(PackError::from(e).to_string()),
+    };
+    match Inner::migrate_copy(&src, None, src.version(), base_dir, data_path, epoch) {
+        Ok(_) => None,
+        Err(MigrateAbort::Corrupt(why)) => Some(why),
+        Err(MigrateAbort::Fatal(e)) => Some(e.to_string()),
+    }
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -3012,11 +3060,15 @@ impl Inner {
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
         // A header that does not read (transport) or is from a newer build is no fault of the
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
-        // foreign app number) is.
+        // foreign app number), or a stream that ends before its header is complete (see
+        // `next_output_record`), is.
         let mut stream_iter =
             AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
                 .await
                 .map_err(|e| match e {
+                    LoadHeaderError::IO(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                        PackError::UndecodableRecord(format!("stream header truncated: {err}"))
+                    }
                     LoadHeaderError::IO(_) | LoadHeaderError::InvalidVersion => {
                         PackError::ReadError(e.to_string())
                     }
@@ -3959,6 +4011,13 @@ fn available_space(_path: &Path) -> io::Result<u64> {
 /// from this record. A local write cannot break the equality — [`Inner::open_append`] derives the
 /// record's epoch FROM the committee — so a divergence only ever arrives over the wire (peer epoch
 /// sync) or from an imported bundle, which is precisely what this function screens.
+///
+/// Trust boundary: of the embedded committee, only its BLS key set is authenticated (against the
+/// previous record's `next_committee`). Its other fields (each member's execution address,
+/// network keys, host, stake) arrive unauthenticated from the peer, and a syncing node cannot
+/// check them (it has not executed the previous epoch's final state). Today they reach only
+/// telemetry (`CertifiedBatch::address`; fees go to each batch's own digest-covered
+/// `beneficiary`), and nothing consensus-critical may come to depend on them.
 pub(crate) fn verify_epoch_meta(
     epoch: Epoch,
     previous_epoch: &EpochRecord,
@@ -4257,6 +4316,12 @@ async fn next_output_record<R: AsyncRead + Unpin>(
             | FetchError::RequestedSizeTooLarge(..)
             | FetchError::RequestedDecompressSizeTooLarge(_)),
         ))) => Err(PackError::UndecodableRecord(e.to_string())),
+        // A stream that ENDS inside a record was cut short by whoever produced it: a peer's sync
+        // reader reports a clean end only after the peer's own `End` frame (a dropped connection
+        // is `ConnectionAborted`), and a local file is simply truncated.
+        Ok(Some(Err(FetchError::IO(e)))) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(PackError::UndecodableRecord(format!("record truncated: {e}")))
+        }
         Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
         Ok(None) => Ok(None),
         Err(_) => Err(PackError::ReadError("timeout".to_string())),
@@ -4866,16 +4931,7 @@ impl PackError {
         let OpenError::IndexFileOpen(LoadHeaderError::IO(io_error)) = open_error.as_ref() else {
             return false;
         };
-        matches!(
-            io_error.kind(),
-            io::ErrorKind::PermissionDenied
-                | io::ErrorKind::OutOfMemory
-                | io::ErrorKind::Interrupted
-                | io::ErrorKind::WouldBlock
-                | io::ErrorKind::StorageFull
-                | io::ErrorKind::QuotaExceeded
-                | io::ErrorKind::ResourceBusy
-        ) || matches!(io_error.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+        io_error_is_environmental(io_error)
     }
 
     /// True iff this is the "unwritten data file" open error: the `data` file has a physical size
@@ -4893,6 +4949,22 @@ impl PackError {
                 )
         )
     }
+}
+
+/// True for an I/O failure caused by the environment rather than by a file's contents: descriptor
+/// or memory exhaustion, a permission problem, an interrupted or would-block call, or a full
+/// disk/quota. Discarding or condemning a file cannot fix these, and they clear on their own.
+fn io_error_is_environmental(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::OutOfMemory
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::StorageFull
+            | io::ErrorKind::QuotaExceeded
+            | io::ErrorKind::ResourceBusy
+    ) || matches!(error.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
 }
 
 impl Error for PackError {}
@@ -7669,6 +7741,41 @@ pub(crate) mod test {
         ConsensusPack::open_static(temp_dir.path(), 0).expect("still consistent after the sweep");
     }
 
+    /// A data log the heal cannot open for an environmental reason (here, permissions; in
+    /// production descriptor or memory exhaustion) says nothing about the pack, so the heal must
+    /// surface the I/O error, which its back-off does not remember, not the at-rest-corruption
+    /// verdict that would be replayed to every reader of the epoch for the back-off window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_static_heal_open_failure_is_not_corruption() {
+        use std::{io, os::unix::fs::PermissionsExt as _};
+
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_heal_open_eacces").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let set_mode = |mode| {
+            std::fs::set_permissions(&data_path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod data")
+        };
+        set_mode(0o000);
+        if std::fs::File::open(&data_path).is_ok() {
+            // Permissions are not enforced (running as root): nothing to exercise here.
+            set_mode(0o644);
+            return;
+        }
+        let result = ConsensusPack::build_static_heal(temp_dir.path(), 0);
+        set_mode(0o644);
+        match result {
+            Err(PackError::IO(e)) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            other => panic!("expected the open's I/O error, got {other:?}"),
+        }
+    }
+
     /// A built heal that is never installed (its caller stopped waiting, or the epoch went live)
     /// removes its staging directory when dropped, rather than leaving a rebuilt index copy on disk
     /// until the next startup sweep.
@@ -8369,6 +8476,92 @@ pub(crate) mod test {
             ConsensusPack::open_static(temp_dir.path(), 0).is_err(),
             "dry run must leave the pack damaged"
         );
+    }
+
+    /// A legacy (pre-v2) pack has no clean-close sentinel, so `db validate` judges its torn tail by
+    /// what the migration to v2 would do, the same verdict `db repair`/`db migrate` reach: an
+    /// unacked tail past the last complete output is truncatable, damage below the pack's length
+    /// attestation is refused.
+    #[tokio::test]
+    async fn test_legacy_tail_verdict_matches_the_migration() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        use crate::pack_validate::{
+            classify_physical_corruption, recovery_refusal, CorruptionKind,
+        };
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // An unacked torn record after the last complete output.
+        let temp_dir = TempDir::with_prefix("test_legacy_torn_tail").expect("temp dir");
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let mut f = OpenOptions::new().append(true).open(&data_path).expect("open data");
+            f.write_all(&[64, 0, 0, 0, 1, 2, 3]).expect("append torn record");
+        }
+        let corruption = classify_physical_corruption(&data_path, 0)
+            .expect("classify")
+            .expect("a torn tail is detected");
+        assert_eq!(corruption.kind, CorruptionKind::TornTrailingTail);
+        assert_eq!(recovery_refusal(&data_path, 0), None, "the migration drops this tail");
+        let dry = ConsensusPack::migrate_epoch(temp_dir.path(), 0, false).await.expect("dry run");
+        assert!(matches!(dry, EpochMigrate::WouldMigrate(_)), "migration dry run: {dry:?}");
+
+        // A committed output damaged in place: the pack's indexes still attest its full length.
+        let temp_dir = TempDir::with_prefix("test_legacy_mid_log").expect("temp dir");
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary + 8)).expect("seek into output 2");
+            f.write_all(&[0xFF; 4]).expect("damage output 2");
+        }
+        assert!(recovery_refusal(&data_path, 0).is_some(), "damage below the attested length");
+    }
+
+    /// A sealed pack's derived indexes form one set: with any one of them missing the read-only
+    /// open refuses the pack, so validation must not call it `Valid`. A bare data file (no
+    /// derived indexes at all) still validates on its own.
+    #[tokio::test]
+    async fn test_validate_reports_a_partial_index_set() {
+        use crate::pack_validate::{validate_pack_file, PackIssue, Verdict};
+        let temp_dir = TempDir::with_prefix("test_validate_partial_index").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        assert_eq!(
+            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
+            Verdict::Valid
+        );
+
+        for name in Inner::INDEX_DIRS {
+            let aside = epoch_dir.join(format!("{name}.aside"));
+            std::fs::rename(epoch_dir.join(name), &aside).expect("move index aside");
+            let report = validate_pack_file(&data_path, 0, None).expect("validate");
+            assert_eq!(report.verdict, Verdict::Invalid, "{name} missing: {report}");
+            assert!(
+                report.issues.iter().any(|i| matches!(i, PackIssue::IndexUnreadable { .. })),
+                "{name} missing: {report}"
+            );
+            std::fs::rename(&aside, epoch_dir.join(name)).expect("restore index");
+        }
+
+        let bare_dir = TempDir::with_prefix("test_validate_bare_data").expect("temp dir");
+        let bare = bare_dir.path().join(Inner::DATA_NAME);
+        std::fs::copy(&data_path, &bare).expect("copy data file");
+        assert_eq!(validate_pack_file(&bare, 0, None).expect("validate").verdict, Verdict::Valid);
     }
 
     /// A clean, sealed epoch is `Healthy` and is left byte-for-byte untouched.
@@ -10686,10 +10879,25 @@ pub(crate) mod test {
     }
 
     /// At the import boundary, bytes the sender produced badly are told apart from a transport
-    /// failure: a record that frames but fails its CRC is `UndecodableRecord` (the requester
-    /// charges the peer), while a stream cut off mid-record is a `ReadError` (never charged).
+    /// failure. A record that frames but fails its CRC is `UndecodableRecord` (the requester
+    /// charges the peer), and so is a stream that ENDS cleanly in the middle of a record (or
+    /// before its header): the peer's sync reader only reports a clean end after the peer's own
+    /// `End` frame, so the short stream is the sender's. A transport failure mid-record (the
+    /// reader errors, e.g. `ConnectionAborted`) is a `ReadError`, never charged.
     #[tokio::test]
     async fn test_stream_import_classifies_bad_bytes_vs_transport_failures() {
+        /// A reader that fails the way a dropped connection does.
+        struct Aborted;
+        impl tokio::io::AsyncRead for Aborted {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()))
+            }
+        }
+
         let source = TempDir::with_prefix("test_import_fault_src").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -10720,13 +10928,20 @@ pub(crate) mod test {
         }
         // A batch record of output 2 (records: 0 meta, 1-5 output 1, 6-10 output 2).
         let batch = starts[8];
-        let import = |bytes: Vec<u8>| {
+        let import = |bytes: Vec<u8>, transport_failure: bool| {
+            use tokio::io::AsyncReadExt as _;
             let previous_epoch = previous_epoch.clone();
             async move {
                 let target = TempDir::with_prefix("test_import_fault_dst").expect("temp dir");
+                let stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> =
+                    if transport_failure {
+                        Box::pin(std::io::Cursor::new(bytes).chain(Aborted))
+                    } else {
+                        Box::pin(std::io::Cursor::new(bytes))
+                    };
                 ConsensusPack::stream_import(
                     target.path(),
-                    std::io::Cursor::new(bytes),
+                    stream,
                     0,
                     &previous_epoch,
                     3,
@@ -10739,12 +10954,25 @@ pub(crate) mod test {
 
         let mut corrupt = logical.clone();
         corrupt[batch + 8] ^= 0xFF;
-        let err = import(corrupt).await;
+        let err = import(corrupt, false).await;
         assert!(matches!(err, super::PackError::UndecodableRecord(_)), "CRC-bad record: {err:?}");
 
         let cut = logical[..batch + 6].to_vec();
-        let err = import(cut).await;
-        assert!(matches!(err, super::PackError::ReadError(_)), "stream cut mid-record: {err:?}");
+        let err = import(cut.clone(), false).await;
+        assert!(
+            matches!(err, super::PackError::UndecodableRecord(_)),
+            "stream ending mid-record: {err:?}"
+        );
+        let err = import(Vec::new(), false).await;
+        assert!(
+            matches!(err, super::PackError::UndecodableRecord(_)),
+            "stream ending before its header: {err:?}"
+        );
+        let err = import(cut, true).await;
+        assert!(
+            matches!(err, super::PackError::ReadError(_)),
+            "transport failure mid-record: {err:?}"
+        );
     }
 
     /// The import stops reading at the requested final: outputs a peer streams past it are never

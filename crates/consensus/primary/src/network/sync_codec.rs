@@ -60,6 +60,15 @@ const SYNC_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// one window.
 const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
 
+/// How long one pack record may take to arrive over a sync stream: the time the largest record a
+/// pack may hold needs at the throughput floor, plus one window of slack. A shorter per-record
+/// timeout would cut an honest transfer the floor admits (a 1 MB batch needs ~30 s at the floor),
+/// while a stalled or dribbling peer is still cut by the per-frame timeout and the floor itself.
+pub(crate) const SYNC_RECORD_TIMEOUT: Duration = Duration::from_secs(
+    ((tn_storage::archive::pack_iter::MAX_RECORD_SIZE as u64).div_ceil(SYNC_RATE_MIN_BYTES) + 1)
+        * SYNC_RATE_WINDOW.as_secs(),
+);
+
 /// A coarse throughput floor over a tumbling time window. Each completed window (≥ `window` since
 /// the last reset) must have carried at least `min_bytes`, else the transfer is below the floor.
 /// Pure so it is unit-testable with an injected clock; see [`RateWatch::record`].
@@ -708,6 +717,16 @@ mod tests {
     /// `min_bytes`; an at/above-floor window resets and does not trip, and a partial
     /// (not-yet-elapsed) window keeps accumulating. Uses a manual clock so the tumbling-window
     /// logic is deterministic.
+    /// A record of the largest size a pack may hold, delivered at exactly the throughput floor,
+    /// must arrive inside the per-record timeout: otherwise the timeout, not the floor, decides
+    /// which honest links can sync.
+    #[test]
+    fn record_timeout_admits_the_largest_record_at_the_floor() {
+        let max_record = tn_storage::archive::pack_iter::MAX_RECORD_SIZE as f64;
+        let floor_bytes_per_sec = SYNC_RATE_MIN_BYTES as f64 / SYNC_RATE_WINDOW.as_secs_f64();
+        assert!(SYNC_RECORD_TIMEOUT.as_secs_f64() > max_record / floor_bytes_per_sec);
+    }
+
     #[test]
     fn rate_watch_trips_only_below_floor_per_window() {
         let t0 = Instant::now();

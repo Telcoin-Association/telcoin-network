@@ -654,24 +654,22 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
     /// Look up `key`, reading bucket bytes zero-copy from the mappings (main bucket in the hdx,
     /// then the append-only overflow chain in the odx). Only one shared slice is live at a time.
+    ///
+    /// Every bucket read is CRC-verified before its answer is trusted, hit or miss. At-rest damage
+    /// can fabricate a miss (a flipped slot no longer matches `key`) or a wrong hit (damage to a
+    /// stored position leaves its key intact), and membership/dedup callers do not re-hash what a
+    /// hit points at. Only bucket 0 is CRC-checked at open, so this is the check for the rest.
     fn find_in_bucket(&self, bucket: u64, key: &[u8]) -> Result<Option<u64>, FetchError> {
         // Scan the in-place (main) bucket directly from the hdx mapping.
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                if let Some(pos) = Self::scan_bucket(buf, key)? {
-                    return Ok(Some(pos));
-                }
-                // A miss is the one outcome at-rest damage to this bucket could silently fabricate
-                // (a flipped slot no longer matches `key`). Only bucket 0 is CRC-checked at open
-                // and reads are otherwise CRC-free, so verify the bucket CRC before
-                // trusting the miss. A `Dirty` (all-zero-CRC) trailer is a
-                // legitimate lazy-write marker ONLY for a bucket this handle wrote
-                // since the last sync; on a clean/read-only index no bucket is
-                // legitimately `Dirty` (a clean close CRC-stamps every one), so a `Dirty` bucket
-                // NOT in `unsynced_buckets` is at-rest damage (e.g. a zeroed page)
-                // — reject it rather than trusting the fabricated miss. `check_crc`
-                // admits the ~2^-32 legacy bucket whose genuine CRC is 0.
+                let found = Self::scan_bucket(buf, key)?;
+                // A `Dirty` (all-zero-CRC) trailer is a legitimate lazy-write marker ONLY for a
+                // bucket this handle wrote since the last sync; on a clean/read-only index no
+                // bucket is legitimately `Dirty` (a clean close CRC-stamps every one), so a
+                // `Dirty` bucket NOT in `unsynced_buckets` is at-rest damage (e.g. a zeroed page).
+                // `check_crc` admits the ~2^-32 legacy bucket whose genuine CRC is 0.
                 match crc_state(buf) {
                     CrcState::Corrupt => {
                         return Err(FetchError::CorruptIndex(format!(
@@ -685,6 +683,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                         )))
                     }
                     _ => {}
+                }
+                if found.is_some() {
+                    return Ok(found);
                 }
                 Self::read_overflow_pos(buf)
             }
@@ -716,15 +717,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                     )))
                 }
             };
-            if let Some(pos) = Self::scan_bucket(buf, key)? {
-                return Ok(Some(pos));
-            }
-            // As with the main bucket, a miss here could be fabricated by at-rest damage. Overflow
-            // records are always CRC'd at write time, so any CRC failure is genuine corruption.
+            let found = Self::scan_bucket(buf, key)?;
+            // As with the main bucket, verify before trusting a hit or a miss. Overflow records are
+            // always CRC'd at write time, so any CRC failure is genuine corruption.
             if !check_crc(buf) {
                 return Err(FetchError::CorruptIndex(format!(
                     "odx record at {overflow_pos} failed its CRC"
                 )));
+            }
+            if found.is_some() {
+                return Ok(found);
             }
             upper_bound = overflow_pos;
             overflow_pos = Self::read_overflow_pos(buf);
@@ -1385,6 +1387,39 @@ mod tests {
         assert!(
             matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
             "a miss in a corrupt non-first bucket must surface as CorruptIndex, not a silent miss"
+        );
+    }
+
+    /// A hit is only as good as the bucket it comes from: at-rest damage confined to a stored
+    /// position leaves the key intact, so the lookup still finds it, and must fail its bucket CRC
+    /// rather than return the wrong position (membership and dedup callers do not re-hash).
+    #[test]
+    fn test_hit_in_a_corrupt_bucket_errors() {
+        let tmp = TempDir::with_prefix("test_hdx_corrupt_hit").expect("temp dir");
+        let mut idx = open_index(tmp.path());
+        for i in 0..256u64 {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync"); // stamp real bucket CRCs so a later mismatch is Corrupt
+        let (k, bucket) = (0..256u64)
+            .map(key)
+            .map(|k| (k, idx.hash_to_bucket(k.as_slice())))
+            .find(|(_, b)| *b >= 1)
+            .expect("some key must land in a non-first bucket");
+
+        // Flip one byte of `k`'s stored position, leaving its key bytes intact.
+        let pos = idx.bucket_pos(bucket);
+        let buf = idx.hdx_file.slice_mut(pos, Idx::BUCKET_SIZE).expect("bucket slice");
+        let elements = Idx::bucket_elements(buf).expect("element count");
+        let element = (0..elements)
+            .map(|i| 12 + i * Idx::BUCKET_ELEMENT_SIZE)
+            .find(|&at| &buf[at..at + 32] == k.as_slice())
+            .expect("key stored in its bucket");
+        buf[element + 32] ^= 0xFF;
+
+        assert!(
+            matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
+            "a hit in a bucket that fails its CRC must be CorruptIndex, not a wrong position"
         );
     }
 
