@@ -73,24 +73,33 @@ impl NetworkBehaviour for PeerManager {
         Ok(vec![])
     }
 
-    // filter connections
+    /// Reserve bounded source and aggregate slots without assigning identity privileges.
     fn handle_pending_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
         debug!(target: "network", ?remote_addr, "handle pending inbound connection");
-        self.sanitize_ip_addr(remote_addr)
+        // PeerId is unavailable here. An address cannot authorize its sender, and a collateral
+        // ban cannot discard an admitted identity's authentication opportunity. The transport's
+        // validated-address and pending-incoming budgets still apply to every handshake.
+        Self::extract_ip_from_multiaddr(remote_addr)
+            .ok_or_else(|| ConnectionDenied::new("Connection denied: no valid IP address"))
+            .and_then(|ip| {
+                self.reserve_pending_inbound(connection_id, ip).map_err(ConnectionDenied::new)
+            })
     }
 
+    /// Apply identity penalties and then the authenticated peer's collateral-ban policy.
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.release_pending_inbound(&connection_id);
         trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
@@ -104,9 +113,12 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
+        self.sanitize_ip_addr(&peer, remote_addr)?;
+
         Ok(ConnectionHandler)
     }
 
+    /// Recheck the authenticated identity and actual outbound address against live policy.
     fn handle_established_outbound_connection(
         &mut self,
         _connection_id: ConnectionId,
@@ -128,11 +140,12 @@ impl NetworkBehaviour for PeerManager {
         }
 
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
-        self.sanitize_ip_addr(addr)?;
+        self.sanitize_ip_addr(&peer, addr)?;
 
         Ok(ConnectionHandler)
     }
 
+    /// Reconcile peer lifecycle and release pre-authentication slots after listen failures.
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
@@ -155,6 +168,9 @@ impl NetworkBehaviour for PeerManager {
             FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
+            }
+            FromSwarm::ListenFailure(failure) => {
+                self.release_pending_inbound(&failure.connection_id);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
@@ -214,16 +230,15 @@ impl NetworkBehaviour for PeerManager {
 }
 
 impl PeerManager {
-    /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't
-    /// banned.
-    fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
-        // only support ipv4 and ipv6
-        if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
-            return Err(ConnectionDenied::new(
-                "Connection denied: peer has no valid unbanned IP addresses".to_string(),
-            ));
-        }
-        Ok(())
+    /// Validate an authenticated connection's address using the live admission policy.
+    fn sanitize_ip_addr(
+        &self,
+        peer_id: &PeerId,
+        remote_addr: &Multiaddr,
+    ) -> Result<(), ConnectionDenied> {
+        self.has_valid_peer_ips(peer_id, std::slice::from_ref(remote_addr))
+            .then_some(())
+            .ok_or_else(|| ConnectionDenied::new("Connection denied: no allowed IP address"))
     }
 
     /// Handle on connection established event from the swarm.

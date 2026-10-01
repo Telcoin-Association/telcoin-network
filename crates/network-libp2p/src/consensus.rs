@@ -160,7 +160,7 @@ enum RecordFreshness {
 /// not stack redundant outbound dials), and brief reconnection churn adds only a small transient
 /// overlap. Eight leaves room for that churn while bounding a hostile peer to a fixed, small number
 /// of connections instead of an unbounded fan-out.
-const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
+pub(crate) const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
 /// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
 /// established) for one swarm.
@@ -180,7 +180,7 @@ const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 ///
 /// Established connections do not count against this budget, so connected peers are not affected
 /// when it is full, and neither are this node's own outbound dials.
-const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 1024;
+pub(crate) const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 1024;
 
 /// Minimum time between two operator warnings about inbound connections that a
 /// `connection_limits` bound refuses (see [`InboundDenialWarning`]).
@@ -224,7 +224,7 @@ impl InboundDenialWarning {
 /// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
 ///   the count is below the budget. Otherwise it denies the connection with
 ///   [`connection_limits::Exceeded`] and takes no slot. A refusal by an earlier sub-behaviour (for
-///   example the banned-IP check in `peer_manager`) happens before this point, so it takes no slot
+///   example an invalid address in `peer_manager`) happens before this point, so it takes no slot
 ///   either.
 /// - release: `handle_established_inbound_connection` frees the slot before the per-peer check, and
 ///   `FromSwarm::ListenFailure` frees it on every other outcome. The swarm emits `ListenFailure`
