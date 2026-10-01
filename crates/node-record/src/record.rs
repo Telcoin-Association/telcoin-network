@@ -212,9 +212,16 @@ impl NodeRecord {
     /// Does NOT verify the signature — use [Self::decode_and_verify] when
     /// authenticity matters.
     pub fn try_decode_compat(value: &[u8]) -> Option<NodeRecord> {
-        try_decode::<NodeRecord>(value)
-            .ok()
+        Self::try_decode_current(value)
             .or_else(|| try_decode::<LegacyNodeRecord>(value).ok().map(Into::into))
+    }
+
+    /// Decode only the current wire layout, without verifying the signature.
+    ///
+    /// Authenticated readers must use this strict layout or [`Self::decode_and_verify`]. The
+    /// inspection-only legacy fallback must not reconstruct information before authentication.
+    pub fn try_decode_current(value: &[u8]) -> Option<NodeRecord> {
+        try_decode::<NodeRecord>(value).ok()
     }
 
     /// Decode a [NodeRecord] and verify its BLS signature against the local
@@ -230,7 +237,7 @@ impl NodeRecord {
         domain: RecordDomain,
         key: &BlsPublicKey,
     ) -> Option<(BlsPublicKey, NodeRecord)> {
-        let record = try_decode::<NodeRecord>(value).ok()?;
+        let record = Self::try_decode_current(value)?;
         validate_advertised_addresses(&record.info.multiaddrs, &record.info.pubkey).ok()?;
         record.verify(domain, key)
     }

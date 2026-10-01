@@ -67,9 +67,11 @@ fn dns_selection_is_bounded_and_family_specific() -> eyre::Result<()> {
 /// An unresponsive resolver reaches the deadline using a paused clock.
 #[tokio::test(start_paused = true)]
 async fn dns_resolution_has_a_deadline() {
+    let started = tokio::time::Instant::now();
     let lookup = futures::future::pending::<std::io::Result<std::vec::IntoIter<SocketAddr>>>();
     let error = resolve_dns(lookup, DnsFamily::Both).await.err();
     assert!(error.is_some_and(|error| error.to_string().contains("timed out")));
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
 }
 
 /// A mapping supports a wildcard listener, overlap, retirement and rollback without DNS work.

@@ -16,7 +16,7 @@ endpoints:
         - /dns4/worker-old.example.com/udp/49594/quic-v1
         - /dns4/worker-new.example.com/udp/49594/quic-v1
     1:
-      listen: /ip4/0.0.0.0/udp/49595/quic-v1
+      listen: /ip6/::/udp/49595/quic-v1
       advertise:
         - /ip6/2001:db8::10/udp/49595/quic-v1
 ```

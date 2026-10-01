@@ -86,7 +86,7 @@ pub(crate) fn verify_record(
         .ok_or(RejectReason::KeyMismatch)?;
 
     let decoded =
-        NodeRecord::try_decode_compat(&record.value).ok_or(RejectReason::SignatureOrDomain)?;
+        NodeRecord::try_decode_current(&record.value).ok_or(RejectReason::SignatureOrDomain)?;
     let count = decoded.info.multiaddrs.len();
     (count <= MAX_ADVERTISED_MULTIADDRS)
         .then_some(())
@@ -173,6 +173,32 @@ mod tests {
                 expires: None,
             }
         }
+    }
+
+    /// Removing the RPC tag cannot turn a valid current signature into an accepted legacy wire
+    /// value.
+    #[test]
+    fn legacy_layout_with_current_signature_is_rejected() {
+        let signer = Signer::generate();
+        let domain = worker_domain();
+        let record = signer.node_record(domain, None);
+        // BCS flattens struct fields; this is the pre-RPC layout carrying the current signature.
+        let value = encode(&(
+            &record.info.pubkey,
+            &record.info.multiaddrs,
+            record.info.timestamp,
+            &record.signature,
+        ));
+        assert!(NodeRecord::try_decode_compat(&value)
+            .and_then(|decoded| decoded.verify(domain, &signer.bls_key()))
+            .is_some());
+        assert!(NodeRecord::decode_and_verify(&value, domain, &signer.bls_key()).is_none());
+        let mut kad = signer.kad_record(&record);
+        kad.value = value;
+        assert_eq!(
+            verify_record(domain, &signer.bls_key(), &kad).err(),
+            Some(RejectReason::SignatureOrDomain)
+        );
     }
 
     fn multiaddr() -> Multiaddr {

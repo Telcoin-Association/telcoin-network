@@ -10,7 +10,10 @@ use tn_types::{
 
 /// A well-formed multiaddr for record tests; the address itself is never dialed.
 fn create_multiaddr(_ip: Option<std::net::IpAddr>) -> Multiaddr {
-    "/ip4/127.0.0.1/udp/8000/quic-v1".parse().expect("static multiaddr parses")
+    Multiaddr::empty()
+        .with(libp2p::multiaddr::Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST))
+        .with(libp2p::multiaddr::Protocol::Udp(8000))
+        .with(libp2p::multiaddr::Protocol::QuicV1)
 }
 
 /// The key material a validator signs a record with: its BLS keypair and the network identity
