@@ -47,6 +47,120 @@ async fn query_peer_counts(
     counts
 }
 
+/// Apply a mode through the public handle and process its acknowledgement under test control.
+async fn apply_network_mode(
+    network: &mut ConsensusNetworkMemoryDB<TestWorkerRequest, TestWorkerResponse>,
+    mode: tn_config::NetworkMode,
+) -> eyre::Result<()> {
+    let handle = network.network_handle();
+    let (applied, processed) = tokio::join!(handle.set_network_mode(mode), async {
+        let command = network.commands.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+        network.process_command(command).map_err(eyre::Report::from)
+    });
+    processed?;
+    applied?;
+    Ok(())
+}
+
+/// Initial configuration closes public discovery on the primary and multiple worker identities.
+#[tokio::test]
+async fn closed_policy_applies_at_startup_on_every_swarm() -> eyre::Result<()> {
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut config = NetworkConfig::default();
+    config.set_network_mode(tn_config::NetworkMode::Closed);
+    [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].into_iter().try_for_each(
+        |role| -> eyre::Result<()> {
+            let (events, _receiver) = mpsc::channel(10);
+            let mut network =
+                ConsensusNetwork::<TestWorkerRequest, TestWorkerResponse, MemDatabase, _>::new(
+                    &config,
+                    events,
+                    peer1.config.key_config().clone(),
+                    tn_types::NetworkKeypair::generate_ed25519(),
+                    MemDatabase::default(),
+                    _task_manager.get_spawner(),
+                    role,
+                    peer1.config.primary_address(),
+                    None,
+                )?;
+            assert_eq!(
+                network.swarm.behaviour().peer_manager.network_mode(),
+                tn_config::NetworkMode::Closed
+            );
+            network.process_peer_manager_event(PeerEvent::Discovery)?;
+            assert_eq!(network.swarm.behaviour().kademlia.iter_queries().count(), 0);
+            Ok(())
+        },
+    )
+}
+
+/// Runtime closure cancels public work while retaining permitted record queries through a hub.
+#[tokio::test]
+async fn closed_mode_command_preserves_committee_queries_and_reopens_discovery() -> eyre::Result<()>
+{
+    let TestTypes { mut peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let key = peer2.config.key_config().primary_public_key();
+    let info = NetworkInfo {
+        pubkey: peer2.config.key_config().primary_network_public_key(),
+        multiaddrs: vec![peer2.config.primary_address()],
+        timestamp: tn_types::now(),
+        rpc: None,
+    };
+    let peer = info.pubkey.clone().into();
+    network.swarm.behaviour_mut().peer_manager.add_bootstrap_peer(key, info.clone());
+    network.swarm.behaviour_mut().kademlia.add_address(&peer, peer2.config.primary_address());
+    network.process_peer_manager_event(PeerEvent::Discovery)?;
+    assert!(network
+        .swarm
+        .behaviour()
+        .kademlia
+        .iter_queries()
+        .any(|query| matches!(query.info(), kad::QueryInfo::GetClosestPeers { .. })));
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
+    assert_eq!(network.kad_record_queries.len(), 1);
+    let record = network
+        .kad_record_queries
+        .keys()
+        .next()
+        .copied()
+        .ok_or_else(|| eyre!("missing record query"))?;
+    let outsider = *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![outsider]))?;
+    let unauthorized = network
+        .kad_record_queries
+        .iter()
+        .find_map(|(query, authority)| (authority.request == outsider).then_some(*query))
+        .ok_or_else(|| eyre!("missing public record query"))?;
+    apply_network_mode(network, tn_config::NetworkMode::Closed).await?;
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.network_mode(),
+        tn_config::NetworkMode::Closed
+    );
+    assert!(network.swarm.behaviour().kademlia.query(&record).is_some());
+    assert!(network.swarm.behaviour().kademlia.query(&unauthorized).is_none());
+    assert!(!network.swarm.behaviour().kademlia.iter_queries().any(|query| matches!(
+        query.info(),
+        kad::QueryInfo::GetClosestPeers { .. } | kad::QueryInfo::Bootstrap { .. }
+    )));
+    network.process_peer_manager_event(PeerEvent::Discovery)?;
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key, outsider]))?;
+    assert_eq!(network.kad_record_queries.len(), 1);
+    assert_eq!(network.swarm.behaviour().kademlia.iter_queries().count(), 1);
+    apply_network_mode(network, tn_config::NetworkMode::Grace).await?;
+    network.process_peer_manager_event(PeerEvent::Discovery)?;
+    assert!(network
+        .swarm
+        .behaviour()
+        .kademlia
+        .iter_queries()
+        .any(|query| matches!(query.info(), kad::QueryInfo::GetClosestPeers { .. })));
+    assert!(network.swarm.behaviour().kademlia.query(&record).is_some());
+    Ok(())
+}
+
 /// Readiness excludes pending dials, tracks the request-routing queue after connection, and
 /// returns to zero when the established peer disconnects.
 #[tokio::test]

@@ -658,6 +658,10 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior
+            .kademlia
+            .set_public_discovery_enabled(network_config.network_mode().permits_public_discovery());
+        behavior.peer_manager.set_network_mode(network_config.network_mode());
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -1034,6 +1038,20 @@ where
     /// Process commands for the network.
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
+            NetworkCommand::SetNetworkMode { mode, reply } => {
+                let behavior = self.swarm.behaviour_mut();
+                behavior.kademlia.set_public_discovery_enabled(mode.permits_public_discovery());
+                behavior.peer_manager.set_network_mode(mode);
+                self.kad_record_queries.retain(|id, query| {
+                    if behavior.peer_manager.record_query_authorized(&query.request) {
+                        true
+                    } else {
+                        behavior.kademlia.cancel_query(id);
+                        false
+                    }
+                });
+                send_or_log_error!(reply, (), "SetNetworkMode");
+            }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
                 send_or_log_error!(reply, res, "StartListening");
@@ -1982,7 +2000,9 @@ where
                 // remove blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
-            PeerEvent::MissingAuthorities(missing) => {
+            PeerEvent::MissingAuthorities(mut missing) => {
+                missing
+                    .retain(|key| self.swarm.behaviour().peer_manager.record_query_authorized(key));
                 // Polling callers such as `current_committee_rpcs` report a member as
                 // missing on every call until its signed metadata reaches `known_peers`, so the
                 // same key arrives here repeatedly while its lookup is still in flight.
@@ -2004,8 +2024,10 @@ where
                 }
             }
             PeerEvent::Discovery => {
-                let peer_id = PeerId::random();
-                self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+                if self.swarm.behaviour().peer_manager.network_mode().permits_public_discovery() {
+                    let peer_id = PeerId::random();
+                    self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+                }
             }
         }
 

@@ -1,0 +1,4 @@
+# Preserve the published crate's formatting independently of the workspace's house style.
+edition = "2024"
+style_edition = "2024"
+use_small_heuristics = "Default"

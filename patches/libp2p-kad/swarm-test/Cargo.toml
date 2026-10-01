@@ -1,0 +1,23 @@
+[package]
+name = "libp2p-swarm-test"
+version = "0.7.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Upstream libp2p swarm integration test helpers"
+
+[dependencies]
+async-trait = "0.1"
+libp2p-core = "0.44.0"
+libp2p-identity = { version = "0.3.0", features = ["rand"] }
+libp2p-plaintext = "0.44.0"
+libp2p-swarm = "0.48.0"
+libp2p-tcp = "0.45.0"
+libp2p-yamux = "0.48.0"
+futures = "0.3"
+tracing = "0.1"
+futures-timer = "3.0"
+
+[features]
+default = ["tokio"]
+tokio = ["libp2p-swarm/tokio", "libp2p-tcp/tokio"]
