@@ -18,7 +18,7 @@ use tn_storage::{
 };
 use tn_types::{
     error::BlockSealError, test_chain_spec_arc, Batch, Database, NoopTxnForwarder, SealedBatch,
-    TaskManager, TaskSpawner,
+    ShutdownNotifier, TaskManager, TaskSpawner,
 };
 use tn_worker::{
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -88,6 +88,49 @@ async fn observer_empty_seal_is_noop() {
     assert_empty_seal_is_noop(None);
 }
 
+/// A committee validator refuses to seal once this epoch's consensus shutdown has begun.
+///
+/// The refusal comes before quorum, so no peer is asked to vote and the batch cache stays empty.
+#[tokio::test]
+async fn validator_refuses_seal_after_consensus_shutdown() {
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let quorum_waiter = RecordingQuorumWaiter::default();
+    let client = LocalNetwork::new_with_empty_id();
+    client
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
+    let shutdown = ShutdownNotifier::new();
+    let batch_provider = Worker::new(
+        0,
+        Some(quorum_waiter.clone()),
+        client,
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
+    )
+    .with_consensus_shutdown(shutdown.clone());
+    let tx = transaction(test_chain_spec_arc());
+
+    // control: the same worker seals through quorum before shutdown
+    let before = Batch { transactions: vec![tx.clone()], ..Default::default() }.seal_slow();
+    batch_provider.seal(before).await.expect("seal before consensus shutdown");
+    assert_eq!(quorum_waiter.calls.load(Ordering::SeqCst), 1);
+
+    shutdown.notify();
+    let after = Batch { transactions: vec![tx.clone(), tx], ..Default::default() }.seal_slow();
+    let digest = after.digest();
+    let res = batch_provider.seal(after).await;
+    assert!(
+        matches!(res, Err(BlockSealError::ConsensusShuttingDown)),
+        "unexpected seal result: {res:?}"
+    );
+    assert_eq!(quorum_waiter.calls.load(Ordering::SeqCst), 1, "no quorum request after shutdown");
+    assert!(store.get::<OurNodeBatchesCache>(&digest).is_ok_and(|batch| batch.is_none()));
+}
+
 #[tokio::test]
 async fn make_batch() {
     let client = LocalNetwork::new_with_empty_id();
@@ -144,6 +187,10 @@ async fn make_batch() {
 /// admitted to a forward task. The test network handle discovers no validator RPC endpoints
 /// and `NoopTxnForwarder` admits nothing, so `seal` returns `NotValidator` and never writes
 /// the batch cache. An empty batch stays a success because there is nothing to forward.
+///
+/// The worker's consensus shutdown has already fired. The result is still `NotValidator`, not
+/// `ConsensusShuttingDown`, because the shutdown refusal guards only the quorum path and must not
+/// hold up forwarding.
 #[tokio::test]
 async fn observer_seal_without_admission_returns_not_validator() {
     let client = LocalNetwork::new_with_empty_id();
@@ -160,6 +207,8 @@ async fn observer_seal_without_admission_returns_not_validator() {
     let id = 0;
     let timeout = Duration::from_secs(5);
     let task_manager = TaskManager::default();
+    let consensus_shutdown = ShutdownNotifier::new();
+    consensus_shutdown.notify();
     let batch_provider = Worker::new(
         id,
         None::<TestMakeBlockQuorumWaiter>,
@@ -169,7 +218,8 @@ async fn observer_seal_without_admission_returns_not_validator() {
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
         Arc::new(NoopTxnForwarder),
         Vec::new(),
-    );
+    )
+    .with_consensus_shutdown(consensus_shutdown);
 
     // Seal a batch with transactions.
     let chain = test_chain_spec_arc();
@@ -178,7 +228,7 @@ async fn observer_seal_without_admission_returns_not_validator() {
     let digest = new_batch.digest();
 
     let res = batch_provider.seal(new_batch.seal_slow()).await;
-    assert!(matches!(res, Err(BlockSealError::NotValidator)));
+    assert!(matches!(res, Err(BlockSealError::NotValidator)), "unexpected seal result: {res:?}");
 
     // The observer path refuses before the batch cache write.
     assert!(store.get::<NodeBatchesCache>(&digest).unwrap().is_none());

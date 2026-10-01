@@ -38,6 +38,10 @@ impl BatchBuilderMetrics {
     ///
     /// Uses the `metrics!` macro because the `reason` label is per-event; the series
     /// still lives in the same registry as the derive-backed handles.
+    ///
+    /// The `consensus_shutting_down` reason counts seals the worker refused because this epoch's
+    /// consensus shutdown had begun. It is expected a few times per worker at every healthy epoch
+    /// boundary, so alerts on this counter should exclude it.
     pub(crate) fn record_seal_failure(&self, worker_id: WorkerId, error: &BlockSealError) {
         let reason = match error {
             BlockSealError::QuorumRejected => "quorum_rejected",
@@ -47,6 +51,7 @@ impl BatchBuilderMetrics {
             BlockSealError::FailedToReport => "failed_to_report",
             BlockSealError::FailedQuorum => "failed_quorum",
             BlockSealError::FatalDBFailure => "fatal_db",
+            BlockSealError::ConsensusShuttingDown => "consensus_shutting_down",
         };
         metrics::counter!(
             "tn_batch_builder.seal_failures_total",

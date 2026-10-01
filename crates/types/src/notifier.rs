@@ -115,6 +115,15 @@ impl ShutdownNotifier {
         // Wake everyone up after all flags are set to true to avoid races in noticers.
         wakers.into_iter().for_each(Waker::wake);
     }
+
+    /// Return true once notify() has been called.
+    ///
+    /// Reads the sticky flag without subscribing. A subscribe() per check would register a
+    /// [`Noticer`] that stays in this notifier until notify(), so a frequent check would grow that
+    /// list for the rest of the notifier's life.
+    pub fn is_notified(&self) -> bool {
+        self.inner.lock().0
+    }
 }
 
 impl Default for ShutdownNotifier {
