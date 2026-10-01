@@ -211,6 +211,13 @@ pub enum HeaderError {
     /// This node is not a member of the current committee and cannot vote.
     #[error("This node is not a committee member and cannot vote")]
     NotCommitteeMember,
+    /// This node is a CVV in `CvvInactive` and does not sign votes.
+    ///
+    /// The mode is local and transient: the node rejoins as `CvvActive`. The refusal
+    /// carries no peer penalty and is reported as recoverable so the same header can
+    /// still be voted after the node rejoins (issue #1517).
+    #[error("This node is CvvInactive and does not vote")]
+    NotActiveCvv,
     /// Worker's ID is not in the cache.
     #[error("Header has an unknown worker ID")]
     UnkownWorkerId,

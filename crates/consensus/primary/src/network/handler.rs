@@ -600,6 +600,9 @@ where
         }
         if let Ok(Some(vote_info)) = self.consensus_config.node_storage().read_vote_info(&auth_id) {
             // If we have already cast a vote for this header then just recast it quickly.
+            // This recast is not gated on node mode. The signature was stored while this node
+            // was voting, and resending it does not sign a new header. `CvvInactive` still
+            // returns it (#1517). New votes are refused in `vote_inner`.
             if vote_info.vote_digest == header.digest().into() {
                 let vote = Vote::new(
                     &header,
@@ -756,6 +759,22 @@ where
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        // CvvInactive follows consensus output and does not sign votes (#1517).
+        // Round 1 would otherwise pass: its parents are the genesis certificates, so the
+        // store and certificate-manager lookups that refuse later rounds never run. Refuse
+        // every round here, before those lookups. The error carries no peer penalty and is
+        // recoverable, so `vote` does not cache it and the same header can still be voted
+        // after this node rejoins as CvvActive.
+        if self.consensus_bus.is_cvv_inactive() {
+            debug!(
+                target: "primary",
+                round = header.round(),
+                author = %header.author(),
+                "refusing vote: this node is CvvInactive"
+            );
+            return Err(HeaderError::NotActiveCvv.into());
+        }
+
         // current committee
         let committee = self.consensus_config.committee();
 
