@@ -5,7 +5,7 @@
 //!
 //! Heavily inspired by Sigma Prime Lighthouse's scoring system.
 
-use super::types::Penalty;
+use super::penalty::{Penalty, Severity};
 use serde::Serialize;
 use std::{
     fmt::Display,
@@ -86,11 +86,11 @@ impl Score {
 
         // NOTE: these use `Self::add`
         // which cannot overflow using default config min and max scores
-        let new_score = match penalty {
-            Penalty::Mild => self.add(-1.0),
-            Penalty::Medium => self.add(-5.0),
-            Penalty::Severe => self.add(-10.0),
-            Penalty::Fatal => config.min_score, // The worst possible score
+        let new_score = match penalty.severity() {
+            Severity::Mild => self.add(-1.0),
+            Severity::Medium => self.add(-5.0),
+            Severity::Severe => self.add(-10.0),
+            Severity::Fatal => config.min_score, // The worst possible score
         };
 
         // set application score
