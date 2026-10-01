@@ -10,6 +10,7 @@ use crate::{
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
+    service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
@@ -39,7 +40,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     num::NonZeroUsize,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{
     KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
@@ -54,6 +55,17 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, instrument, trace, warn};
 
+/// An inbound request that the swarm forwarded to the application and has not yet answered.
+#[derive(Debug)]
+struct PendingInbound {
+    /// The cancel notice to the handler when the request ends.
+    notify: oneshot::Sender<()>,
+    /// The class that counts this request in the pending occupancy.
+    class: ServiceClass,
+    /// The time that the swarm forwarded the request, for the service time histogram.
+    received: Instant,
+}
+
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
@@ -61,6 +73,10 @@ mod network_tests;
 #[cfg(test)]
 #[path = "tests/network_budget_tests.rs"]
 mod network_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/inbound_service_tests.rs"]
+mod inbound_service_tests;
 
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
@@ -430,7 +446,9 @@ where
     /// caller is responsible for decoding message bytes and reporting peers who return bad
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    inbound_requests: HashMap<InboundRequestId, PendingInbound>,
+    /// The pending inbound requests by service class. Changes only with `inbound_requests`.
+    inbound_pending: InboundOccupancy,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
@@ -759,6 +777,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            inbound_pending: InboundOccupancy::default(),
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
@@ -1421,6 +1440,7 @@ where
                             .try_send(accepted_gossip_event(message, relayer, author))
                         {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                            self.metrics.record_forward_failure(ServiceClass::Gossip, &e);
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1527,6 +1547,7 @@ where
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            let class = request.service_class();
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
@@ -1536,6 +1557,7 @@ where
                                 cancel,
                             }) {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
+                                self.metrics.record_forward_failure(class, &e);
                                 // ignore failures at the epoch boundary
                                 // During epoch change the event_stream reciever can be closed.
                                 return Ok(());
@@ -1545,11 +1567,14 @@ where
                             //
                             // NOTE: the request id is internally generated, so this should not
                             // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
+                            self.add_inbound(class);
+                            if let Some(duplicate) = self.inbound_requests.insert(
+                                request_id,
+                                PendingInbound { notify, class, received: Instant::now() },
+                            ) {
                                 // cancel if this is a duplicate request
                                 warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
+                                self.close_inbound(duplicate);
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
@@ -1693,20 +1718,37 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                // forward cancelation to handler and release the class occupancy
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.close_inbound(entry);
                 }
             }
 
             ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.metrics.record_service_time(entry.class, entry.received.elapsed());
+                    self.close_inbound(entry);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Count one forwarded inbound request of `class` as pending and export the occupancy.
+    fn add_inbound(&mut self, class: ServiceClass) {
+        self.inbound_pending = self.inbound_pending.added(class);
+        self.metrics.set_inbound_pending(class, self.inbound_pending.pending(class));
+    }
+
+    /// End a pending inbound request: notify the handler and release the class occupancy.
+    ///
+    /// Every removal of an `inbound_requests` entry calls this once, so the swarm releases each
+    /// added request exactly once.
+    fn close_inbound(&mut self, entry: PendingInbound) {
+        let _ = entry.notify.send(());
+        self.inbound_pending = self.inbound_pending.released(entry.class);
+        self.metrics.set_inbound_pending(entry.class, self.inbound_pending.pending(entry.class));
     }
 
     /// Process events from the dedicated peer-exchange goodbye protocol.
@@ -2063,6 +2105,7 @@ where
                         .try_send(NetworkEvent::InboundStream { peer: bls, stream })
                     {
                         error!(target: "network", ?e, "failed to forward inbound stream");
+                        self.metrics.record_forward_failure(ServiceClass::Other, &e);
                     }
                 } else {
                     warn!(target: "network", ?peer, "received inbound stream from unknown peer");

@@ -5,13 +5,16 @@
 
 use crate::{
     peers::{Penalty, PutRecordRate},
+    service_class::{ServiceClass, ShedReason},
     types::NetworkType,
 };
 use reth_metrics::{
-    metrics::{Counter, Gauge},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
+use std::time::Duration;
 use tn_config::{QuicConfig, SwarmNetworkBudget};
+use tn_types::TrySendError;
 
 /// Map a [`NetworkType`] to its metric label value.
 pub(crate) fn network_label(network_type: &NetworkType) -> String {
@@ -93,6 +96,7 @@ impl SwarmMetrics {
             .set(f64::from(quic.max_concurrent_stream_limit));
         self.handles.receive_credit_per_connection_bytes.set(f64::from(quic.max_connection_data));
         self.handles.established_connections.set(0.0);
+        self.register_service_classes();
         self
     }
 
@@ -173,6 +177,67 @@ impl SwarmMetrics {
             "reason" => reason,
         )
         .increment(1);
+    }
+
+    /// Register every class series at zero, so an absent series means "not exported".
+    fn register_service_classes(&self) {
+        ServiceClass::ALL.iter().for_each(|class| {
+            self.set_inbound_pending(*class, 0);
+            let _histogram = self.service_histogram(*class);
+            ShedReason::ALL
+                .iter()
+                .for_each(|reason| self.shed_counter(*class, *reason).increment(0));
+        });
+    }
+
+    /// Export the pending inbound requests of `class`.
+    pub(crate) fn set_inbound_pending(&self, class: ServiceClass, pending: u32) {
+        metrics::gauge!(
+            "tn_network.inbound_requests_pending",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+        )
+        .set(f64::from(pending));
+    }
+
+    /// Record the time from forwarding an inbound request to sending its response.
+    pub(crate) fn record_service_time(&self, class: ServiceClass, elapsed: Duration) {
+        self.service_histogram(class).record(elapsed.as_secs_f64());
+    }
+
+    /// Count inbound work that the swarm dropped before the application received it.
+    pub(crate) fn record_inbound_shed(&self, class: ServiceClass, reason: ShedReason) {
+        self.shed_counter(class, reason).increment(1);
+    }
+
+    /// Count a failed forward to the application as shed if the queue was full.
+    ///
+    /// A closed queue occurs at the epoch boundary, not under load, so it is not counted. A
+    /// broadcast failure is not a full queue, so it is not counted either.
+    pub(crate) fn record_forward_failure<T>(&self, class: ServiceClass, error: &TrySendError<T>) {
+        match error {
+            TrySendError::Full(_) => self.record_inbound_shed(class, ShedReason::QueueFull),
+            TrySendError::Closed(_) | TrySendError::Broadcast(_) => {}
+        }
+    }
+
+    /// The shed counter for `class` and `reason`.
+    fn shed_counter(&self, class: ServiceClass, reason: ShedReason) -> Counter {
+        metrics::counter!(
+            "tn_network.inbound_requests_shed_total",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+            "reason" => reason.label(),
+        )
+    }
+
+    /// The service time histogram for `class`.
+    fn service_histogram(&self, class: ServiceClass) -> Histogram {
+        metrics::histogram!(
+            "tn_network.inbound_request_service_seconds",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+        )
     }
 }
 

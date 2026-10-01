@@ -2,7 +2,7 @@
 
 use crate::network::error::WorkerNetworkError;
 use serde::{Deserialize, Serialize};
-use tn_network_libp2p::{PeerExchangeMap, TNMessage};
+use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
 use tn_types::{BlockHash, Epoch, SealedBatch};
 
 /// Worker messages on the gossip network.
@@ -20,6 +20,13 @@ impl TNMessage for WorkerRequest {
         match self {
             Self::PeerExchange { peers } => Some(peers.clone()),
             _ => None,
+        }
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::ReportBatch { .. } => ServiceClass::Batch,
+            Self::PeerExchange { .. } => ServiceClass::Other,
         }
     }
 }
@@ -152,7 +159,25 @@ impl From<PeerExchangeMap> for WorkerResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerNetworkError, WorkerResponse};
+    use super::{WorkerNetworkError, WorkerRequest, WorkerResponse};
+    use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
+    use tn_types::{Batch, BlockHash, SealedBatch};
+
+    /// A reported batch has the batch class.
+    #[test]
+    fn report_batch_is_batch_class() {
+        let request = WorkerRequest::ReportBatch {
+            sealed_batch: SealedBatch::new(Batch::default(), BlockHash::default()),
+        };
+        assert_eq!(request.service_class(), ServiceClass::Batch);
+    }
+
+    /// Peer exchange is answered inline and has the other class.
+    #[test]
+    fn peer_exchange_is_other_class() {
+        let request = WorkerRequest::PeerExchange { peers: PeerExchangeMap::default() };
+        assert_eq!(request.service_class(), ServiceClass::Other);
+    }
 
     /// A transient, responder-side condition is reported as recoverable so the
     /// requester retries instead of treating the peer as having rejected the
