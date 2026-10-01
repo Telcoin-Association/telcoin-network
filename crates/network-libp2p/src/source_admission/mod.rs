@@ -8,8 +8,11 @@ use libp2p::{
     swarm::{ConnectionId, FromSwarm},
     Multiaddr, PeerId,
 };
-use parking_lot::Mutex;
-use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 use tn_config::SourceAdmissionConfig;
 
 /// Process-wide established-connection accounting shared by all active swarms.
@@ -46,19 +49,24 @@ impl SourceAdmissionBudget {
     }
 
     fn publish_occupancy(&self) {
-        let _measurements = self.measurements.lock();
-        self.snapshot().map_or_else(
-            |_| metrics::counter!("tn_network.source_accounting_errors_total").increment(1),
-            |occupancy| {
-                metrics::gauge!("tn_network.source_connections")
-                    .set(occupancy.connections() as f64);
-                metrics::gauge!("tn_network.source_peer_rows").set(occupancy.peer_rows() as f64);
-                metrics::gauge!("tn_network.source_address_rows")
-                    .set(occupancy.address_rows() as f64);
-                metrics::gauge!("tn_network.source_prefix_rows")
-                    .set(occupancy.prefix_rows() as f64);
-            },
-        );
+        self.measurements
+            .lock()
+            .map_err(|_| AdmissionError::Poisoned)
+            .and_then(|_measurements| {
+                self.snapshot().map(|occupancy| {
+                    metrics::gauge!("tn_network.source_connections")
+                        .set(occupancy.connections() as f64);
+                    metrics::gauge!("tn_network.source_peer_rows")
+                        .set(occupancy.peer_rows() as f64);
+                    metrics::gauge!("tn_network.source_address_rows")
+                        .set(occupancy.address_rows() as f64);
+                    metrics::gauge!("tn_network.source_prefix_rows")
+                        .set(occupancy.prefix_rows() as f64);
+                })
+            })
+            .unwrap_or_else(|_| {
+                metrics::counter!("tn_network.source_accounting_errors_total").increment(1)
+            });
     }
 
     /// Acquire occupancy using the remote endpoint of a completed QUIC handshake.
