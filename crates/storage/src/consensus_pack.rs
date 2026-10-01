@@ -251,14 +251,29 @@ impl ConsensusPack {
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+        Self::open_append_exists_with_tail(path, epoch).map(|(pack, _)| pack)
+    }
+
+    /// Open up the files for previous epoch in append mode and also return the pack tail.
+    ///
+    /// The tail is the highest consensus number the pack holds once the open has healed any torn
+    /// write. An empty pack returns `start_consensus_number - 1`, the last number of the previous
+    /// epoch. Will fail if files do not exist.
+    pub fn open_append_exists_with_tail<P: Into<PathBuf>>(
+        path: P,
+        epoch: Epoch,
+    ) -> Result<(Self, u64), PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let inner = Inner::open_append_exists(path.clone(), epoch)?;
+        let inner = Inner::open_append_exists(path, epoch)?;
+        // start_consensus_number is at least 1, so this only saturates on a corrupt epoch meta
+        let tail = (inner.epoch_meta.start_consensus_number + inner.consensus_pos_idx.len() as u64)
+            .saturating_sub(1);
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self {
+        let pack = Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
             epoch,
@@ -266,7 +281,8 @@ impl ConsensusPack {
             compression,
             is_static: false,
             version,
-        })
+        };
+        Ok((pack, tail))
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
