@@ -398,7 +398,7 @@ Email support@telcoin.org to confirm hardware specifications before purchasing a
 ## Observer
 
 An observer is any node that is not in the current committee.
-The node picks its role at startup from committee membership [^observer-role]; the old `--observer` flag is ignored.
+The node picks its role at startup from committee membership [^observer-role]; to take a validator out of consensus, exit it on chain.
 An observer receives every consensus output, executes every block, and keeps the same archive data as a validator.
 It does not vote.
 Transactions sent to an observer's RPC are sealed into a local batch and forwarded to the JSON-RPC endpoints that validators advertise [^forward].

@@ -178,8 +178,8 @@ telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
 ```
 
 Node role is derived from committee membership, including after an import. A key outside the current
-committee runs as an observer without any role flag. `--observer` is deprecated and ignored; to take
-a validator out of consensus, exit it on chain.
+committee runs as an observer without any role flag. To take a validator out of consensus, exit it
+on chain.
 
 On startup the node reads the slot hint, opens epoch N's consensus pack, and begins syncing *forward*
 from epoch N — downloading and verifying newer epoch records and consensus output via the metadata
