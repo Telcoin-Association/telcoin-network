@@ -719,7 +719,7 @@ where
     ///
     /// This method closes all connections to the peer without waiting for handlers
     /// to complete.
-    pub(crate) async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
         res.await?.map_err(|_| NetworkError::DisconnectPeer)
@@ -804,13 +804,6 @@ where
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetNodeRecord { key, reply }).await?;
         rx.await?
-    }
-
-    /// Disconnect a known network identity, allowing qualification to reconnect the same peer.
-    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<Result<(), ()>> {
-        let (reply, rx) = oneshot::channel();
-        self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
-        rx.await.map_err(Into::into)
     }
 
     /// Snapshot of the current committee's advertised RPCs.

@@ -118,7 +118,7 @@ type Network =
 #[serde(rename_all = "snake_case")]
 enum Scenario {
     /// A peer joins the public hub with its persistent identity.
-    PublicJoins,
+    PublicJoin,
     /// The same peer reconnects through its declared shared NAT.
     SharedNatReconnect,
     /// Delivery through distinct authenticated forwarding identities.
@@ -203,10 +203,7 @@ impl Peer {
                 if peers.contains(key) {
                     let record = handle.get_node_record(*key).await?;
                     let peer: PeerId = record.info.pubkey.into();
-                    handle
-                        .disconnect_peer(peer)
-                        .await?
-                        .map_err(|()| eyre!("expected hub connection was already absent"))?;
+                    handle.disconnect_peer(peer).await?;
                     connected(handle, *key, false).await?;
                 } else if require_existing {
                     Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
@@ -302,7 +299,7 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
             Err(eyre!("operation identifier must contain 1 through 128 bytes"))
         } else {
             match request.scenario {
-                Scenario::PublicJoins => peer.reconnect(false).await,
+                Scenario::PublicJoin => peer.reconnect(false).await,
                 Scenario::SharedNatReconnect => peer.reconnect(true).await,
                 Scenario::RecordLookup => peer.records(false).await,
                 Scenario::SubmitUrlResolution => peer.records(true).await,
