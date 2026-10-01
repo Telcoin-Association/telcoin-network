@@ -100,7 +100,7 @@ type is `Send + Sync + Clone`.
 | `open_append` | writable, creates | header-only ⇒ write+fsync meta; then recover |
 | `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes) |
 | `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; **refuses** (→ `db repair`) if the data log itself is torn |
-| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic |
+| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2, from a v1/v2 source; a v0 source is refused as `InvalidVersion`, no penalty). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic |
 
 ### 5. Recovery model — four invariants
 
@@ -199,7 +199,8 @@ issues. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
 re-sync, never "fixed". A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
-drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. `db repair`,
+drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. A legacy v0
+(batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. `db repair`,
 `db migrate` and `db load-state` refuse to run while a live node holds the `<datadir>/telcoin.pid`
 lock (intentional-design item 9).
 
@@ -328,8 +329,8 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     every read is bounded to the logical length (`pos >= file_len()` ⇒ miss). Deliberate, to keep the
     rebuild a single forward pass. Not a stale-index bug.
 22. **`stream_import` replaces the entire `epoch-{N}/` directory as a unit, and always writes v2.** A
-    full-epoch import (whatever the source stream's version: v2 is the only writable format)
-    installs a fresh `epoch-{N}/` by atomic rename, replacing whatever was there (any prior per-epoch
+    full-epoch import (from a v1 or v2 source; v2 is the only writable format) installs a fresh
+    `epoch-{N}/` by atomic rename, replacing whatever was there (any prior per-epoch
     cert files included). The per-epoch `CertificatePack` (`cert_data`/`cert_hash/`) is produced only
     by the live current-epoch (CVV) writer, not carried in the import — an imported past epoch simply
     has none, which is fine (past cert packs are not read). Not a cross-component ownership bug.

@@ -29,8 +29,8 @@ use tn_reth::{
 use tn_storage::{
     consensus::ConsensusChain,
     consensus_pack::{
-        pack_unsealed_version, wal_consistent_end, ConsensusPack, EpochMigrate, EpochRepair,
-        DATA_NAME, SENTINEL_MIN_VERSION,
+        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
+        EpochMigrate, EpochRepair, DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
@@ -143,6 +143,26 @@ impl DbValidateArgs {
         // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
         // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
         warn_if_current_epoch(&data_file, epoch);
+
+        // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
+        // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
+        // run on it), not by the header-first walks below.
+        if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
+            return match legacy_migration_dry_run(&data_file, epoch) {
+                Ok(outputs) => {
+                    println!(
+                        "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
+                         output(s) cleanly; `db migrate --force`, or the node when it opens or \
+                         reads this epoch, converts it."
+                    );
+                    Ok(())
+                }
+                Err(why) => {
+                    println!("legacy v0 pack: its migration to v2 refuses: {why}");
+                    bail!("pack {} is INVALID (see report above)", data_file.display());
+                }
+            };
+        }
 
         // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
         // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
@@ -1675,6 +1695,47 @@ mod tests {
 
         let args = super::DbValidateArgs { path: epoch_dir, epoch: None };
         assert!(args.execute().is_err(), "a torn epoch meta must fail validation");
+    }
+
+    /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so `db validate`
+    /// reports a dry run of that migration: success for one that migrates, failure (exit non-zero)
+    /// for one the migration refuses.
+    #[test]
+    fn db_validate_judges_a_v0_pack_by_its_migration() {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{EpochMeta, PackRecord},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let epoch_dir = dir.path().join("epoch-0");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data_file = epoch_dir.join(super::DATA_NAME);
+        let write_v0 = |records: &[PackRecord]| {
+            let _ = fs::remove_file(&data_file);
+            let mut pack =
+                Pack::<PackRecord>::open(&data_file, 0, false, PackCompression::ZStd, 0).unwrap();
+            for record in records {
+                pack.append(record).unwrap();
+            }
+            pack.commit().unwrap();
+        };
+        let validate = || super::DbValidateArgs { path: epoch_dir.clone(), epoch: None }.execute();
+
+        // The meta's committee must decode (a real committee of more than one authority).
+        let mut committee = tn_types::CommitteeBuilder::new(0);
+        for (i, signer) in test_signers(40, 4).iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta =
+            PackRecord::EpochMeta(EpochMeta { committee: committee.build(), ..Default::default() });
+        write_v0(std::slice::from_ref(&meta));
+        assert_eq!(super::legacy_migration_dry_run(&data_file, 0), Ok(0));
+        assert!(validate().is_ok(), "a v0 pack that migrates cleanly validates");
+
+        // A batch with no consensus header after it belongs to no output: the migration refuses.
+        write_v0(&[meta, PackRecord::Batch(tn_types::Batch::default())]);
+        assert!(super::legacy_migration_dry_run(&data_file, 0).is_err());
+        assert!(validate().is_err(), "a v0 pack the migration refuses fails validation");
     }
 
     #[test]

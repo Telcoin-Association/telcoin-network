@@ -3676,6 +3676,126 @@ mod test {
         dest.clear_staging().await;
     }
 
+    /// A node upgraded from a pre-sentinel build holds its past epochs as legacy packs (v0
+    /// batches-first or v1 header-first). Serving one to a syncing peer never streams the legacy
+    /// file: `get_epoch_stream` reads through `get_static`, which migrates the epoch to the current
+    /// format on disk first, so the peer receives exactly the migrated file and imports every
+    /// output intact.
+    #[tokio::test]
+    async fn test_epoch_stream_of_legacy_epoch_serves_current_format() {
+        use crate::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{ConsensusPack, PackRecord, DATA_NAME, PACK_VERSION},
+        };
+        use tokio::io::AsyncReadExt as _;
+
+        let on_disk_version = |data: &std::path::Path| {
+            Pack::<PackRecord>::open(data, 0, true, PackCompression::ZStd, PACK_VERSION)
+                .expect("open data read-only")
+                .version()
+        };
+        for version in [0_u16, 1] {
+            let temp_dir = TempDir::with_prefix("test_legacy_epoch_stream").expect("temp dir");
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let committee = fixture.committee();
+            let epoch0 = EpochRecord {
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                ..Default::default()
+            };
+
+            // Epoch 0 runs to completion, then the node writes into epoch 1, so a restart resumes
+            // epoch 1 and epoch 0 is a past epoch, read only through `get_static`.
+            let node = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            node.new_epoch(epoch0.clone(), committee.clone()).await.unwrap();
+            let mut outputs = Vec::new();
+            let mut parent = ConsensusHeaderDigest::default();
+            for n in 1..=3u64 {
+                let output =
+                    make_test_output(&committee, (n as usize) % 4, chain.clone(), n, parent);
+                parent = output.digest();
+                outputs.push(output.clone());
+                node.save_consensus_output(output).await.unwrap();
+            }
+            let record0 = EpochRecord {
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                parent_hash: epoch0.digest(),
+                final_consensus: ConsensusNumHash::new(3, parent),
+                ..Default::default()
+            };
+            let committee1 = committee.advance_epoch_for_test(1);
+            node.persist_current().await.unwrap();
+            node.new_epoch(record0.clone(), committee1.clone()).await.unwrap();
+            node.epochs().save_record(record0.clone()).await.unwrap();
+            let output4 = make_test_output(&committee1, 0, chain.clone(), 4, parent);
+            node.save_consensus_output(output4).await.unwrap();
+            node.close().await;
+
+            // Epoch 0 as a pre-sentinel build wrote it: the same outputs in a v{version} pack with
+            // no clean-close sentinel.
+            let legacy_dir = TempDir::with_prefix("test_legacy_epoch_src").expect("temp dir");
+            let legacy = ConsensusPack::open_append_version(
+                legacy_dir.path(),
+                epoch0.clone(),
+                committee.clone(),
+                version,
+            )
+            .expect("open legacy pack");
+            for output in outputs.iter().cloned() {
+                legacy.save_consensus_output(output).await.expect("save legacy output");
+            }
+            legacy.persist().await.expect("persist legacy pack");
+            legacy.close().await;
+            let legacy_data = legacy_dir.path().join("epoch-0").join(DATA_NAME);
+            let len = std::fs::metadata(&legacy_data).expect("meta").len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&legacy_data)
+                .expect("open legacy data")
+                .set_len(len - crate::archive::data_file::SENTINEL_LEN)
+                .expect("strip the sentinel");
+            let epoch0_dir = temp_dir.path().join("epoch-0");
+            std::fs::remove_dir_all(&epoch0_dir).expect("remove epoch 0");
+            std::fs::rename(legacy_dir.path().join("epoch-0"), &epoch0_dir).expect("swap in");
+            let data = epoch0_dir.join(DATA_NAME);
+            assert_eq!(on_disk_version(&data), version, "precondition: a legacy epoch 0");
+
+            // The upgraded node restarts and a peer asks for epoch 0.
+            let node = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            let (stream, len) = node.get_epoch_stream(0).await.expect("epoch 0 is served");
+            let mut served = Vec::new();
+            stream.take(len).read_to_end(&mut served).await.expect("read the served stream");
+
+            assert_eq!(on_disk_version(&data), PACK_VERSION, "v{version}: migrated before serving");
+            let file = std::fs::read(&data).expect("read migrated data");
+            assert!(
+                served.len() as u64 == len && file.starts_with(&served),
+                "v{version}: the served bytes are the migrated file's content"
+            );
+            let peer_dir = TempDir::with_prefix("test_legacy_epoch_peer").expect("temp dir");
+            let imported = ConsensusPack::stream_import(
+                peer_dir.path(),
+                &served[..],
+                0,
+                &epoch0,
+                3,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("v{version}: the peer imports the served pack: {e:?}"));
+            for output in &outputs {
+                let got = imported.get_consensus_output(output.number()).await.expect("imported");
+                compare_outputs(&got, output);
+            }
+            imported.close().await;
+            node.close().await;
+        }
+    }
+
     /// The per-import staging directories (`staging-{epoch}-{n}`) under `base`.
     fn staging_dirs(base: &std::path::Path, epoch: Epoch) -> Vec<std::path::PathBuf> {
         let prefix = format!("staging-{epoch}-");

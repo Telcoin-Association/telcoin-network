@@ -42,7 +42,7 @@ use crate::{
         },
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
+        pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
         pack_iter::AsyncPackIter,
         position_index::index::{PosIndexValue, PositionIndex},
     },
@@ -406,7 +406,7 @@ impl ConsensusPack {
     /// Test-only: open an append pack forcing a specific on-disk data version so tests can
     /// construct genuine v0 (legacy, batches-first) pack files.
     #[cfg(test)]
-    fn open_append_version<P: Into<PathBuf>>(
+    pub(crate) fn open_append_version<P: Into<PathBuf>>(
         path: P,
         previous_epoch: EpochRecord,
         committee: Committee,
@@ -959,9 +959,10 @@ impl ConsensusPack {
         self.is_static
     }
 
-    /// Does this pack predate the v2 (sentinel-era) format? A pre-v2 pack reads correctly by
-    /// number, but its digest indexes were written under the old key-placement scheme, so its
-    /// by-digest lookups would silently miss present records until it is migrated.
+    /// Does this pack predate the v2 (sentinel-era) format? A legacy pack is migrated to v2 before
+    /// anything reads it: its digest indexes were written under the old key-placement scheme (so
+    /// by-digest lookups would silently miss present records), and a v0 pack's batches-first
+    /// outputs are not decoded at all outside the migration.
     pub fn is_legacy(&self) -> bool {
         self.version < SENTINEL_MIN_VERSION
     }
@@ -1060,7 +1061,7 @@ impl ConsensusPack {
         } else {
             Err(PackError::SendFailed)
         }?;
-        serve_output_bytes(bytes, self.version, self.compression, &self.committee).await
+        serve_output_bytes(bytes, self.version)
     }
 
     /// Return the byte offset in the data file just past the end of the consensus output for
@@ -1399,27 +1400,36 @@ pub(crate) fn check_recoverable(data_path: &Path, epoch: Epoch) -> Result<(), Pa
 }
 
 /// Read-only: why migrating the legacy (pre-v2) pack whose data log is `data_path` to v2 would
-/// refuse, or `None` when it would succeed. Exactly the migration's dry run (`db migrate` without
-/// `--force`): an unacked torn tail is dropped by the migration, while damage below the acked
-/// frontier is refused. A legacy pack has no clean-close sentinel, so this, not the v2 recovery
-/// check, is what decides whether its tail is truncatable.
+/// refuse, or `None` when it would succeed. See [`legacy_migration_dry_run`]. A legacy pack has no
+/// clean-close sentinel, so this, not the v2 recovery check, is what decides whether its tail is
+/// truncatable.
 pub(crate) fn legacy_migration_refusal(data_path: &Path, epoch: Epoch) -> Option<String> {
-    let base_dir = data_path.parent()?;
-    let src = match Pack::<PackRecord>::open(
+    legacy_migration_dry_run(data_path, epoch).err()
+}
+
+/// Read-only: a dry run of migrating the legacy (pre-v2) pack whose data log is `data_path` to v2
+/// (`db migrate` without `--force`). `Ok` with the number of outputs the migration would copy, or
+/// why it refuses: an unacked torn tail is dropped by the migration, while damage below the acked
+/// frontier is refused. This is the only check a legacy v0 pack gets, since it is only ever read
+/// by its migration.
+pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, String> {
+    let base_dir = data_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", data_path.display()))?;
+    let src = Pack::<PackRecord>::open(
         data_path,
         epoch as u64,
         true,
         PackCompression::ZStd,
         PACK_VERSION,
-    ) {
-        Ok(src) => src,
-        Err(e) => return Some(PackError::from(e).to_string()),
-    };
-    match Inner::migrate_copy(&src, None, src.version(), base_dir, data_path, epoch) {
-        Ok(_) => None,
-        Err(MigrateAbort::Corrupt(why)) => Some(why),
-        Err(MigrateAbort::Fatal(e)) => Some(e.to_string()),
-    }
+    )
+    .map_err(|e| PackError::from(e).to_string())?;
+    Inner::migrate_copy(&src, None, src.version(), base_dir, data_path, epoch).map_err(
+        |e| match e {
+            MigrateAbort::Corrupt(why) => why,
+            MigrateAbort::Fatal(e) => e.to_string(),
+        },
+    )
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -3066,12 +3076,12 @@ impl Inner {
 
     /// Create a new set of epoch static files and fill them from a peer's pack `stream`.
     ///
-    /// The imported epoch is always written in the CURRENT format (`PACK_VERSION`), whatever the
-    /// source stream's version: v2 is the only writable format, so an import never lands on disk
-    /// as a legacy pack that a later read would have to migrate. A v1/v2 (header-first) source is
-    /// streamed into the pack record by record ([`Self::import_streamed_output`]); a v0
-    /// (batches-first) source is decoded one output at a time under a tight memory cap and
-    /// re-written header-first ([`Self::import_legacy_output`]).
+    /// The imported epoch is always written in the CURRENT format (`PACK_VERSION`): v2 is the only
+    /// writable format, so an import never lands on disk as a legacy pack that a later read would
+    /// have to migrate. A v1/v2 (header-first) source is streamed into the pack record by record
+    /// ([`Self::import_streamed_output`]). A v0 (batches-first) source is refused
+    /// (`InvalidVersion`, no penalty): v0 is only ever migrated on disk, and an upgraded peer
+    /// serves its v0 epochs migrated.
     ///
     /// Nothing in the stream is authenticated until the chain reaches the certified final (checked
     /// by the caller), so an output's header is only parent-linked here. Streaming keeps the
@@ -3112,7 +3122,13 @@ impl Inner {
                     }
                     _ => PackError::UndecodableRecord(format!("stream header: {e}")),
                 })?;
-        let legacy_source = stream_iter.version() == 0;
+        // A legacy v0 (batches-first) pack is only ever migrated on disk, never imported: an
+        // upgraded peer serves its v0 epochs migrated, so refuse the source before writing
+        // anything. An older build's honest bytes are no fault of the peer's (no penalty). A v1
+        // source has v2's layout and imports like one.
+        if stream_iter.version() == 0 {
+            return Err(PackError::InvalidVersion(PACK_VERSION, 0));
+        }
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
@@ -3163,25 +3179,15 @@ impl Inner {
                 // Each output's header is checked (parent link, number, final bound, batch fan-out)
                 // BEFORE any of its batches is read; `parent_digest_expectation` then advances to
                 // this output's digest for the next one.
-                let imported = if legacy_source {
-                    pack.import_legacy_output(
+                let imported = pack
+                    .import_streamed_output(
                         &mut stream_iter,
                         timeout,
                         parent_digest_expectation,
                         final_consensus_number,
                         &mut floor,
                     )
-                    .await
-                } else {
-                    pack.import_streamed_output(
-                        &mut stream_iter,
-                        timeout,
-                        parent_digest_expectation,
-                        final_consensus_number,
-                        &mut floor,
-                    )
-                    .await
-                };
+                    .await;
                 match imported {
                     // Clean end of stream: no further output header.
                     Ok(None) => break,
@@ -3277,52 +3283,6 @@ impl Inner {
                 return Err(PackError::BatchTooLarge { size: batch_bytes, max: max_bytes });
             }
             self.append_imported_batch(got, batch)?;
-            floor.check(self.data.file_len())?;
-        }
-        self.finish_imported_output(consensus_idx, header_pos)?;
-        Ok(Some((digest, number)))
-    }
-
-    /// Import the next output of a v0 (batches-first) peer stream, re-written header-first (v2).
-    ///
-    /// v0 puts an output's batches BEFORE its header, so they cannot be checked against the header
-    /// until it arrives and must be buffered. The buffer is capped at
-    /// [`LEGACY_IMPORT_OUTPUT_BUDGET`] (below the committee-scaled [`output_buffer_budget`]):
-    /// v0 is a historical format, so a legitimate v0 output is far smaller, while an
-    /// unauthenticated peer stream could otherwise force GB-scale buffering. The buffered batches
-    /// are moved (not cloned) into the pack.
-    async fn import_legacy_output<R: AsyncRead + Unpin>(
-        &mut self,
-        stream_iter: &mut AsyncPackIter<PackRecord, R>,
-        timeout: Duration,
-        expectation: HeaderExpectation,
-        final_consensus_number: u64,
-        floor: &mut DiskFloor,
-    ) -> Result<Option<(ConsensusHeaderDigest, u64)>, PackError> {
-        let budget =
-            output_buffer_budget(&self.epoch_meta.committee).min(LEGACY_IMPORT_OUTPUT_BUDGET);
-        let (header, mut batches, _) = match read_legacy_output(
-            stream_iter,
-            timeout,
-            &self.epoch_meta.committee,
-            expectation,
-            budget,
-        )
-        .await
-        {
-            Ok(parts) => parts,
-            Err(PackError::NotConsensus) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let (consensus_idx, declared) =
-            self.check_import_header(&header, final_consensus_number)?;
-        let (header_pos, digest, number) = self.append_imported_header(header)?;
-        floor.check(self.data.file_len())?;
-        // `read_legacy_output` already proved the buffered set is exactly the declared set (no
-        // missing, no extra batches).
-        for expected in declared {
-            let batch = batches.remove(&expected).ok_or(PackError::MissingBatch)?;
-            self.append_imported_batch(expected, batch)?;
             floor.check(self.data.file_len())?;
         }
         self.finish_imported_output(consensus_idx, header_pos)?;
@@ -3447,17 +3407,13 @@ impl Inner {
     fn save_consensus_batches(
         &mut self,
         batches: BTreeMap<BlockHash, Batch>,
-    ) -> Result<Option<u64>, PackError> {
-        let mut first_batch_pos = None;
+    ) -> Result<(), PackError> {
         // Save all the required batches into the pack file.
         for (batch_digest, batch) in batches.into_iter() {
             let position = self
                 .data
                 .append(&PackRecord::Batch(batch))
                 .map_err(|e| PackError::Append(e.to_string()))?;
-            if first_batch_pos.is_none() {
-                first_batch_pos = Some(position);
-            }
             self.batch_digests
                 .save(batch_digest, position)
                 .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
@@ -3465,7 +3421,7 @@ impl Inner {
             self.consensus_digests.set_data_file_length(len);
             self.batch_digests.set_data_file_length(len);
         }
-        Ok(first_batch_pos)
+        Ok(())
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
@@ -3550,36 +3506,64 @@ impl Inner {
 
     /// Append one output's records (header + batches) and index them. Split from
     /// [`Self::save_consensus_output`] so a mid-way error can be rolled back atomically by
-    /// [`Self::rollback_output`]. v1 (header-first) writes the header, then its batches.
+    /// [`Self::rollback_output`]. The header-first layout writes the header, then its batches.
     fn append_output_records(
         &mut self,
         consensus: &ConsensusOutput,
         consensus_idx: u64,
         batches: BTreeMap<BlockHash, Batch>,
     ) -> Result<u64, PackError> {
-        // v0 (batches-first) writes the batches before the header, v1+ after it.
-        let (before_header, after_header) =
-            if self.version() == 0 { (Some(batches), None) } else { (None, Some(batches)) };
-        let first_batch_pos = match before_header {
-            Some(batches) => self.save_consensus_batches(batches)?,
-            None => None,
-        };
-        // Now save the consensus header.
+        // Tests build genuine legacy (v0) packs to migrate; a release build never writes one.
+        #[cfg(test)]
+        if self.version() == 0 {
+            return self.append_output_records_v0(consensus, consensus_idx, batches);
+        }
         let consensus_digest = consensus.consensus_header_hash();
         let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
-        if let Some(batches) = after_header {
-            self.save_consensus_batches(batches)?;
-        }
-        let batch_pos = if let Some(batch_pos) = first_batch_pos { batch_pos } else { position };
+        self.save_consensus_batches(batches)?;
+        self.index_appended_output(consensus_digest, consensus_idx, position, position)
+    }
+
+    /// Test-only: [`Self::append_output_records`] in the legacy v0 (batches-first) layout, the
+    /// output's batches before its header, so tests can build the packs a pre-v1 build left on
+    /// disk for the migration to read.
+    #[cfg(test)]
+    fn append_output_records_v0(
+        &mut self,
+        consensus: &ConsensusOutput,
+        consensus_idx: u64,
+        batches: BTreeMap<BlockHash, Batch>,
+    ) -> Result<u64, PackError> {
+        let first_batch_pos = self.data.file_len();
+        let has_batches = !batches.is_empty();
+        self.save_consensus_batches(batches)?;
+        let consensus_digest = consensus.consensus_header_hash();
+        let position = self
+            .data
+            .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
+            .map_err(|e| PackError::Append(e.to_string()))?;
+        let output_start = if has_batches { first_batch_pos } else { position };
+        self.index_appended_output(consensus_digest, consensus_idx, position, output_start)
+    }
+
+    /// Index one appended output: its header digest, and its position entry (`position` of the
+    /// header, `output_start` of its first record) ending at the current data length.
+    fn index_appended_output(
+        &mut self,
+        consensus_digest: ConsensusHeaderDigest,
+        consensus_idx: u64,
+        position: u64,
+        output_start: u64,
+    ) -> Result<u64, PackError> {
         self.consensus_digests
             .save(consensus_digest.into(), position)
             .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
         let len = self.data.file_len();
         self.consensus_pos_idx
-            .save(consensus_idx, IndexPositions::new(position, batch_pos, len))
+            .save(consensus_idx, IndexPositions::new(position, output_start, len))
             .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
         self.consensus_digests.set_data_file_length(len);
         self.batch_digests.set_data_file_length(len);
@@ -3591,7 +3575,7 @@ impl Inner {
             return Err(PackError::IndexAppend("injected mid-save failure".to_string()));
         }
 
-        Ok(len.saturating_sub(batch_pos))
+        Ok(len.saturating_sub(output_start))
     }
 
     /// Roll the data log and position index back to the snapshot captured before a failed
@@ -4154,14 +4138,6 @@ fn output_buffer_budget(committee: &Committee) -> usize {
         .saturating_mul(2)
 }
 
-/// Cap on the decoded footprint buffered for one output of a v0 (batches-first) peer import stream,
-/// applied below [`output_buffer_budget`]. v0 must buffer an output's batches before its header can
-/// be checked, and the stream is not authenticated until the import reaches the certified final, so
-/// the committee-scaled budget (GBs) would let a peer force that much allocation per attempt. v0 is
-/// a historical format (current nodes write and serve v2), so a legitimate v0 output is orders of
-/// magnitude below this.
-const LEGACY_IMPORT_OUTPUT_BUDGET: usize = 256 * 1024 * 1024;
-
 /// What the caller already knows about the consensus header of the output being decoded, used to
 /// reject a bad or forged header the instant it is read — before any `Batch` record is buffered.
 ///
@@ -4190,9 +4166,9 @@ fn check_header_expectation(
     // A sub-dag names its leader as its last header; an empty one has no leader, so every
     // `leader()`-derived accessor (`leader_epoch`, `nonce`, `commit_timestamp`, `Display`, ...)
     // would panic. A committed output always names a leader, so reject a peer-supplied empty
-    // sub-dag here -- the single decode chokepoint both `iter_to_output` and
-    // `iter_to_output_legacy` pass through before any leader access -- rather than let it reach
-    // `save_consensus_output` and panic the critical import task.
+    // sub-dag here -- the decode chokepoint `iter_to_output` and the streamed import pass through
+    // before any leader access -- rather than let it reach `save_consensus_output` and panic the
+    // critical import task.
     if header.sub_dag.is_empty() {
         return Err(PackError::EmptySubDag);
     }
@@ -4210,73 +4186,33 @@ fn check_header_expectation(
     }
 }
 
-/// Decode raw pack-file `bytes` for one consensus output into a [`ConsensusOutput`], dispatching on
-/// the pack data `version` (v0 legacy vs v1 header-first) and using the pack's `compression` and
-/// `committee`.
+/// Decode raw pack-file `bytes` for one consensus output into a [`ConsensusOutput`], using the
+/// pack's `compression` and `committee`. Only the header-first layout (v1, and v2 which differs
+/// from it only in the data-file sentinel) is decoded: a legacy v0 pack is migrated to v2 before it
+/// is ever read (`ConsensusChain::get_static`), so a v0 `version` is refused.
 pub(crate) async fn decode_output_bytes(
     bytes: Vec<u8>,
     version: u16,
     compression: PackCompression,
     committee: &Committee,
 ) -> Result<ConsensusOutput, PackError> {
-    let cursor = Cursor::new(bytes);
-    let reader = BufReader::new(cursor);
-    match version {
-        0 => bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee).await,
-        // v2 shares v1's header-first on-disk layout (it differs only in the data-file sentinel),
-        // so both decode identically here.
-        1 | 2 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
-        _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
-    }
+    check_header_first(version)?;
+    let reader = BufReader::new(Cursor::new(bytes));
+    bytes_to_output(reader, compression, Duration::from_secs(5), committee).await
 }
 
-/// Produce the v1 (header-first) pack-record bytes served to peers for one consensus output from
-/// the raw `bytes` read out of the data file: a passthrough for v1, or a re-encode of a v0 legacy
-/// output into v1 records (header first, then batches). Uses the pack's
-/// `version`/`compression`/`committee`. Shared by both pack front-ends.
-pub(crate) async fn serve_output_bytes(
-    mut bytes: Vec<u8>,
-    version: u16,
-    compression: PackCompression,
-    committee: &Committee,
-) -> Result<Vec<u8>, PackError> {
+/// The pack-record bytes served to peers for one consensus output: the raw header-first `bytes`
+/// read out of the data file, as is. A legacy v0 pack is migrated before it is ever served, so a v0
+/// `version` is refused.
+pub(crate) fn serve_output_bytes(bytes: Vec<u8>, version: u16) -> Result<Vec<u8>, PackError> {
+    check_header_first(version)?;
+    Ok(bytes)
+}
+
+/// Refuse any pack data `version` other than the header-first layout (v1/v2).
+fn check_header_first(version: u16) -> Result<(), PackError> {
     match version {
-        0 => {
-            let cursor = Cursor::new(bytes.clone());
-            let reader = BufReader::new(cursor);
-            let out =
-                bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee)
-                    .await?;
-            let batches = collect_batches(&out);
-            let header: ConsensusHeader = out.into();
-            bytes.clear();
-            let mut value_buffer = Vec::new();
-            let mut compress_buffer = Vec::new();
-            // Re-encode as PackRecord-wrapped records (header first) to match the on-disk v1
-            // format the consumer decodes; the raw v1 serve path returns these same PackRecord
-            // records straight from the pack file.
-            write_value(
-                &PackRecord::Consensus(Box::new(header)),
-                &mut bytes,
-                &mut value_buffer,
-                &mut compress_buffer,
-                PackCompression::ZStd,
-            )
-            .map_err(|e| PackError::Append(e.to_string()))?;
-            for (_, batch) in batches.into_iter() {
-                write_value(
-                    &PackRecord::Batch(batch),
-                    &mut bytes,
-                    &mut value_buffer,
-                    &mut compress_buffer,
-                    PackCompression::ZStd,
-                )
-                .map_err(|e| PackError::Append(e.to_string()))?;
-            }
-            Ok(bytes)
-        }
-        // v2 is header-first like v1, so the raw bytes are already in serve format.
-        1 | 2 => Ok(bytes),
+        1 | 2 => Ok(()),
         _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
@@ -4314,20 +4250,6 @@ pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
             .map_err(|e| PackError::ReadError(e.to_string()))?;
     iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::Digest(expected_digest))
         .await
-}
-
-/// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
-/// ConsensusOutput.
-pub async fn bytes_to_output_legacy<R: AsyncRead + Unpin>(
-    stream: R,
-    compression: PackCompression,
-    timeout: Duration,
-    committee: &Committee,
-) -> Result<ConsensusOutput, PackError> {
-    let mut stream_iter = AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, 0)
-        .await
-        .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output_legacy(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
 }
 
 /// Private helper to read the next record from a pack iterator or timeout if it takes
@@ -4409,8 +4331,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // condition.  The header is read first, so a hostile stream cannot flood batches ahead of
     // it, but the header's sub-dag (attacker-controlled, bounded only by MAX_RECORD_SIZE) can
     // still declare a huge number of payload digests.  Reject early — before reading/buffering
-    // any batches — like the legacy path does.  A legitimate ConsensusOutput references far
-    // fewer batches than this.
+    // any batches.  A legitimate ConsensusOutput references far fewer batches than this.
     let max_batches = max_batches_per_output(committee);
     if expected_digest_count > max_batches {
         return Err(PackError::TooManyBatches(max_batches));
@@ -4549,195 +4470,10 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     ))
 }
 
-/// Take an iter over PackRecords that represent a ConsensusOutput and return the ConsensusOutput.
-/// Legacy version, expects Batches then the ConsensusHeader.
-async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
-    stream_iter: &mut AsyncPackIter<PackRecord, R>,
-    timeout: Duration,
-    committee: &Committee,
-    expectation: HeaderExpectation,
-) -> Result<ConsensusOutput, PackError> {
-    let (consensus_header, mut available_batches, referenced_batches) = read_legacy_output(
-        stream_iter,
-        timeout,
-        committee,
-        expectation,
-        output_buffer_budget(committee),
-    )
-    .await?;
-    let parent_hash = consensus_header.parent_hash;
-    let deliver = consensus_header.sub_dag;
-    let num_blocks = deliver.num_primary_batches();
-    let num_certs = deliver.len();
-
-    let sub_dag = deliver;
-    if num_blocks == 0 {
-        return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, consensus_header.number));
-    }
-
-    let mut batch_digests = VecDeque::with_capacity(num_certs);
-    for header in sub_dag.headers() {
-        for (digest, _) in header.payload().iter() {
-            batch_digests.push_back(*digest);
-        }
-    }
-
-    // map all fetched batches to their respective certificates for applying block rewards
-    let mut batches = Vec::with_capacity(num_certs);
-    for header in sub_dag.headers() {
-        // create collection of batches to execute for this certificate
-        let mut cert_batches = Vec::with_capacity(header.payload().len());
-
-        // retrieve fetched batch by digest
-        for digest in header.payload().keys() {
-            if let Some(batch) = available_batches.remove(digest) {
-                cert_batches.push(batch);
-            } else if referenced_batches.contains(digest) {
-                // Handle the case with dup batches.  This should be rare to non-existant so not
-                // worried about the poor efficiency here.  This allows us
-                // to remove in the common case to avoid a batch clone.
-                if let Some(batch) = batches
-                    .iter()
-                    .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
-                    .chain(cert_batches.iter())
-                    .find(|b| b.digest() == *digest)
-                {
-                    #[cfg(not(feature = "adiri"))]
-                    cert_batches.push(batch.clone());
-
-                    #[cfg(feature = "adiri")]
-                    if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
-                        // ADIRI BUG
-                        // Epoch 74 and possibly other early epochs of adiri testnet had a bug
-                        // with duplicate batches. We have to
-                        // recreate it in order to sync testnet so we skip this push
-                        // on adiri with early epochs.
-                        cert_batches.push(batch.clone());
-                    }
-                } else {
-                    return Err(PackError::MissingBatch);
-                }
-            } else {
-                return Err(PackError::MissingBatch);
-            }
-        }
-
-        let address = committee.authority(header.author()).map(|a| a.execution_address());
-        if let Some(address) = address {
-            // main collection for execution
-            batches.push(CertifiedBatch { address, batches: cert_batches });
-        } else {
-            return Err(PackError::MissingAuthority);
-        }
-    }
-    Ok(ConsensusOutput::new(
-        sub_dag,
-        parent_hash,
-        consensus_header.number,
-        false,
-        batch_digests,
-        batches,
-    ))
-}
-
-/// Read one v0 (batches-first) output's records: buffer its batch records, then read its
-/// terminating header, check it against `expectation`, and cross-check it against the buffered
-/// batches (every referenced batch present, no extras). Returns the header, the buffered batches by
-/// digest, and the referenced digest set, or `NotConsensus` if the stream ends before a header.
-///
-/// Buffering is bounded by the batch count ([`max_batches_per_output`]), the per-batch byte cap,
-/// and `output_buffer_limit` on the decoded footprint (which also stops a tiny-transaction flood
-/// that passes the per-batch byte cap).
-async fn read_legacy_output<R: AsyncRead + Unpin>(
-    stream_iter: &mut AsyncPackIter<PackRecord, R>,
-    timeout: Duration,
-    committee: &Committee,
-    expectation: HeaderExpectation,
-    output_buffer_limit: usize,
-) -> Result<(ConsensusHeader, HashMap<BlockHash, Batch>, HashSet<BlockHash>), PackError> {
-    let mut available_batches = HashMap::new();
-    let mut referenced_batches = HashSet::new();
-    let mut batch_records = 0_usize;
-    let max_batches = max_batches_per_output(committee);
-    let mut buffered_decoded = 0usize;
-    while let Some(record) = next_output_record(stream_iter, timeout).await? {
-        match record {
-            PackRecord::EpochMeta(_epoch_meta) => {
-                return Err(PackError::UnexpectedRecord(
-                    "unexpected epoch meta data found".to_string(),
-                ))
-            }
-            PackRecord::Batch(batch) => {
-                // Bound how many batch records a (possibly hostile) stream can deliver before the
-                // terminating Consensus record arrives.  Without this an `EpochMeta`/`Consensus`
-                // -less flood of Batch records would grow `available_batches` until OOM; the
-                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  The bound
-                // is the maximum a legitimately committed output for this committee
-                // can reference (see `max_batches_per_output`), so an honest deep
-                // sub-DAG is never rejected.
-                batch_records += 1;
-                if batch_records > max_batches {
-                    return Err(PackError::TooManyBatches(max_batches));
-                }
-                // Same per-batch byte cap as the v1 path (`iter_to_output`): reject a batch whose
-                // transaction bytes exceed the epoch's `max_batch_size` before buffering it, so an
-                // oversized-batch flood cannot inflate `available_batches` toward OOM (finding
-                // #10).
-                let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
-                let max = max_batch_size(committee.epoch());
-                if batch_bytes > max {
-                    return Err(PackError::BatchTooLarge { size: batch_bytes, max });
-                }
-                // Charge this batch's decoded footprint against the per-output budget (see
-                // `iter_to_output`) before buffering.
-                let batch_decoded = batch
-                    .transactions
-                    .len()
-                    .saturating_mul(std::mem::size_of::<Vec<u8>>())
-                    .saturating_add(batch_bytes);
-                buffered_decoded = buffered_decoded.saturating_add(batch_decoded);
-                if buffered_decoded > output_buffer_limit {
-                    return Err(PackError::OutputTooLarge {
-                        size: buffered_decoded,
-                        max: output_buffer_limit,
-                    });
-                }
-                let batch_digest = batch.digest();
-                available_batches.insert(batch_digest, batch);
-            }
-            PackRecord::Consensus(consensus_header) => {
-                // v0 is header-last, so this is as early as the check can run (batches are already
-                // buffered); it keeps the parent-link/digest invariant co-located with the header
-                // read so `stream_import` need not re-check after decode.
-                check_header_expectation(&consensus_header, expectation)?;
-                for header in consensus_header.sub_dag.headers() {
-                    for (digest, _) in header.payload().iter() {
-                        if !available_batches.contains_key(digest) {
-                            return Err(PackError::MissingBatches);
-                        }
-                        referenced_batches.insert(*digest);
-                    }
-                }
-                // batches.len() will generally equal referenced_batches.len() but if it is
-                // greater than we had batches that were not accounted for.
-                // It is possible (at time of writing) for a batch to
-                // be in more than one subdag.  This is also why we don't just
-                // remove batches as we check above.
-                if available_batches.len() > referenced_batches.len() {
-                    return Err(PackError::ExtraBatches);
-                }
-                return Ok((*consensus_header, available_batches, referenced_batches));
-            }
-        }
-    }
-    // The stream ended before this output's header. Before ANY record it is a clean end of the
-    // stream; after some of the output's batches it was cut mid-output.
-    Err(if batch_records > 0 { PackError::MissingBatch } else { PackError::NotConsensus })
-}
-
 /// Values stored in the position index.
-/// Note for v1 format consensus_header and output_start will be the same value.
-/// Once v0 is gone we can remove or repurpose on of these fields.
+/// Note for the header-first layout (v1/v2) consensus_header and output_start are the same value;
+/// only a legacy v0 pack (read solely by its migration) differs. Dropping the field is an index
+/// format change.
 #[derive(Debug, Copy, Clone)]
 struct IndexPositions {
     /// The first byte of the ConsensusHeader record for position.
@@ -4889,7 +4625,8 @@ pub enum PackError {
     ConsensusNumberTooHigh,
     /// A record stream declared more batches for one output than is allowed.
     TooManyBatches(usize),
-    /// Data pack file version is too new.
+    /// A data pack version this build does not read here (`.0` is the current version, `.1` the
+    /// one found): newer than this build, or a legacy v0 pack outside its migration.
     InvalidVersion(u16, u16),
     /// A streamed consensus header's digest did not match the expected (already-verified) digest.
     /// Signals an unambiguous fork or peer misbehavior on the requested-output receive path.
@@ -5050,7 +4787,7 @@ impl Display for PackError {
                 write!(f, "Too many batches buffered for one consensus output (max {max})")
             }
             PackError::InvalidVersion(expected, got) => {
-                write!(f, "Pack file version too new: got {got}, expected {expected}")
+                write!(f, "Unsupported pack file version {got} (current version {expected})")
             }
             PackError::UnexpectedConsensusDigest { expected, got } => {
                 write!(f, "Consensus header digest mismatch: expected {expected}, got {got}")
@@ -5947,54 +5684,6 @@ pub(crate) mod test {
         );
     }
 
-    /// Finding #10 (OOM), v0 path: `iter_to_output_legacy` buffers batches (which in v0 arrive
-    /// before the header) with the same count-only bound, so the per-batch byte cap applies here
-    /// too — and fires as the oversized batch is read, before any consensus header.
-    #[tokio::test]
-    async fn test_iter_to_output_legacy_rejects_oversized_batch() {
-        use crate::{
-            archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output_legacy, PackError, PackRecord},
-        };
-        use std::io::Cursor;
-
-        let temp_dir = TempDir::with_prefix("test_cp_oversized_batch_v0").expect("temp dir");
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-
-        // One batch one byte over the epoch's limit.
-        let oversized = Batch::new_for_test(
-            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
-            ExecHeader::default(),
-            0,
-            committee.epoch(),
-        );
-
-        // v0 is batches-first, so a single batch record is enough to reach the byte check.
-        let path = temp_dir.path().join("oversized_v0");
-        {
-            let mut pack: Pack<PackRecord> =
-                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
-                    .expect("open pack");
-            pack.append(&PackRecord::Batch(oversized)).expect("append oversized batch");
-            pack.commit().expect("commit");
-        }
-        let file_bytes = std::fs::read(&path).expect("read file");
-        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
-
-        let res = bytes_to_output_legacy(
-            Cursor::new(records),
-            PackCompression::ZStd,
-            Duration::from_secs(5),
-            &committee,
-        )
-        .await;
-        assert!(
-            matches!(res, Err(PackError::BatchTooLarge { .. })),
-            "an oversized v0 batch must be rejected as BatchTooLarge, got {res:?}"
-        );
-    }
-
     /// A batch carrying a zero-byte (empty) transaction is invalid and must fail the import at
     /// decode — a peer uses a flood of empty transactions (which compress to almost nothing but
     /// decode to a huge `Vec<Vec<u8>>`) to exhaust memory. The `Batch` deserializer rejects it, so
@@ -6059,66 +5748,6 @@ pub(crate) mod test {
         assert!(
             res.is_err(),
             "a batch with a zero-byte transaction must be rejected on import, got {res:?}"
-        );
-    }
-
-    /// Even with empty transactions rejected and each batch within the per-batch byte cap, a
-    /// flood of tiny (1-byte) transactions across the batch fan-out would still exhaust memory via
-    /// the 24-byte `Vec<u8>` overhead per transaction. The aggregate per-output decoded-memory
-    /// budget rejects it. Uses a test-only small budget so the bound is exercised without
-    /// GB-scale fixtures.
-    #[tokio::test]
-    async fn test_iter_to_output_legacy_rejects_output_over_budget() {
-        use crate::{
-            archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output_legacy, PackError, PackRecord},
-        };
-        use std::io::Cursor;
-
-        let temp_dir = TempDir::with_prefix("test_cp_output_budget_v0").expect("temp dir");
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-
-        // Shrink the per-output budget so three small batches trip it (real budget is GB-scale).
-        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(Some(3 * 1024 * 1024)));
-
-        // Each batch: 50k single-byte transactions — non-empty (decodes fine) and only 50 KB of
-        // transaction bytes (within the per-batch cap), but ~1.19 MB of DECODED footprint (24 B of
-        // `Vec` overhead per tx). Three exceed the 3 MiB budget.
-        let tiny_batch = || {
-            Batch::new_for_test(
-                vec![vec![1_u8]; 50_000],
-                ExecHeader::default(),
-                0,
-                committee.epoch(),
-            )
-        };
-        let path = temp_dir.path().join("budget_v0");
-        {
-            let mut pack: Pack<PackRecord> =
-                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
-                    .expect("open pack");
-            for _ in 0..3 {
-                pack.append(&PackRecord::Batch(tiny_batch())).expect("append batch");
-            }
-            pack.commit().expect("commit");
-        }
-        let file_bytes = std::fs::read(&path).expect("read file");
-        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
-
-        let res = bytes_to_output_legacy(
-            Cursor::new(records),
-            PackCompression::ZStd,
-            Duration::from_secs(5),
-            &committee,
-        )
-        .await;
-        // Reset before asserting so a failure doesn't leak the override into other tests on this
-        // thread.
-        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(None));
-        assert!(
-            matches!(res, Err(PackError::OutputTooLarge { .. })),
-            "a tiny-transaction batch fan-out must be rejected as OutputTooLarge, got {res:?}"
         );
     }
 
@@ -6277,202 +5906,13 @@ pub(crate) mod test {
         assert_eq!(decoded.consensus_header().digest(), empty.digest());
     }
 
-    /// A v0 (legacy, batches-first) pack must serve its outputs as v1 (header-first) bytes via
-    /// `get_consensus_output_bytes`, so all peer-facing bytes are v1 regardless of on-disk format.
-    #[tokio::test]
-    async fn test_v0_output_served_as_v1_bytes() {
-        use crate::{
-            archive::pack_iter::AsyncPackIter,
-            consensus_pack::{
-                bytes_to_output, bytes_to_output_legacy, bytes_to_verified_output, PackError,
-                PackRecord,
-            },
-        };
-        use std::io::Cursor;
-        use tokio::io::BufReader;
-
-        let temp_dir = TempDir::with_prefix("test_v0_served_v1").expect("temp dir");
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let previous_epoch = test_previous_epoch(&committee);
-
-        // Force a genuine v0 pack file (header stamped version 0 -> batches-first on disk).
-        let pack = ConsensusPack::open_append_version(
-            temp_dir.path(),
-            previous_epoch,
-            committee.clone(),
-            0,
-        )
-        .expect("open v0 pack");
-        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
-
-        let num_outputs = 5;
-        let mut outputs = Vec::new();
-        let mut parent = ConsensusHeader::default().digest();
-        for i in 0..num_outputs {
-            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
-            parent = output.digest();
-            outputs.push(output.clone());
-            pack.save_consensus_output(output).await.unwrap();
-        }
-        pack.persist().await.expect("persist");
-
-        for (i, original) in outputs.iter().enumerate() {
-            let number = i as u64 + 1;
-            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
-
-            // 1. Header-first: the first record must be a Consensus header (v1 ordering). A v0 file
-            //    would have yielded a Batch first.
-            let mut iter = AsyncPackIter::<PackRecord, _>::open_partial(
-                BufReader::new(Cursor::new(bytes.clone())),
-                PackCompression::ZStd,
-                PACK_VERSION,
-            )
-            .await
-            .expect("open partial");
-            match iter.next().await {
-                Some(Ok(PackRecord::Consensus(_))) => {}
-                other => panic!("expected first record to be a Consensus header, got {other:?}"),
-            }
-
-            // 2. Decodes with the v1 decoder and matches the original output.
-            let decoded = bytes_to_output(
-                BufReader::new(Cursor::new(bytes.clone())),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-            )
-            .await
-            .expect("v1 decode");
-            compare_outputs(&decoded, original);
-
-            // 2b. The verified single-output decode accepts these served v1 bytes with the real
-            //     header digest and rejects a flipped digest with UnexpectedConsensusDigest.
-            let verified = bytes_to_verified_output(
-                BufReader::new(Cursor::new(bytes.clone())),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-                original.digest(),
-            )
-            .await
-            .expect("verified v1 decode");
-            compare_outputs(&verified, original);
-            let rejected = bytes_to_verified_output(
-                BufReader::new(Cursor::new(bytes.clone())),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-                ConsensusHeader::default().digest(),
-            )
-            .await;
-            assert!(
-                matches!(rejected, Err(PackError::UnexpectedConsensusDigest { .. })),
-                "flipped digest must be rejected, got {rejected:?}"
-            );
-
-            // 3. The bytes are truly re-ordered: the legacy (batches-first) decoder rejects them.
-            let legacy = bytes_to_output_legacy(
-                BufReader::new(Cursor::new(bytes)),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-            )
-            .await;
-            assert!(legacy.is_err(), "legacy decode of v1 bytes must fail, got {legacy:?}");
-
-            // The local read path still honors the on-disk v0 format (legacy decode).
-            compare_outputs(
-                &pack.get_consensus_output(number).await.expect("local read"),
-                original,
-            );
-        }
-        drop(pack);
-    }
-
-    /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
-    /// must serve that output as v1 (header-first) bytes that decode back to the identical output,
-    /// with the shared batch reassigned to BOTH certs. Guards the exact mixed-testnet path: a
-    /// pre-upgrade v0 file served as v1 for a duplicate-batch output. Runs at
-    /// [`SHARED_BATCH_EPOCH`], above the adiri dup-batch replay cutoff, so the expectation
-    /// holds for every feature set (#1128).
-    #[tokio::test]
-    async fn test_v0_shared_batch_served_as_v1_bytes() {
-        use crate::consensus_pack::{bytes_to_output, bytes_to_verified_output};
-        use std::io::Cursor;
-        use tokio::io::BufReader;
-
-        let temp_dir = TempDir::with_prefix("test_v0_shared_v1").expect("temp dir");
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        // Above the adiri replay cutoff: the shared batch must reach both certs on rebuild
-        // under every feature set.
-        let committee = fixture.committee().advance_epoch_for_test(SHARED_BATCH_EPOCH);
-        let previous_epoch = shared_batch_previous_epoch(&committee);
-
-        // Genuine v0 (batches-first) pack on disk.
-        let pack = ConsensusPack::open_append_version(
-            temp_dir.path(),
-            previous_epoch,
-            committee.clone(),
-            0,
-        )
-        .expect("open v0 pack");
-        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
-
-        // Output 1 shares one batch across two certs; output 2 is a normal output confirming the
-        // pack keeps serving cleanly after a duplicate.
-        let out1 = make_test_output_shared_batch(
-            &committee,
-            chain.clone(),
-            1,
-            ConsensusHeader::default().digest(),
-        );
-        let out2 = make_test_output(&committee, 2, chain.clone(), 2, out1.digest());
-        pack.save_consensus_output(out1.clone()).await.unwrap();
-        pack.save_consensus_output(out2.clone()).await.unwrap();
-        pack.persist().await.expect("persist");
-
-        for original in [&out1, &out2] {
-            let number = original.number();
-            // v0 stored -> served as v1 (header-first) bytes.
-            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
-
-            // v1 decode reconstructs the identical output, including the shared batch assigned to
-            // both certs (compare_outputs deep-checks batch_digests incl. the dup and each cert).
-            let decoded = bytes_to_output(
-                BufReader::new(Cursor::new(bytes.clone())),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-            )
-            .await
-            .expect("v1 decode");
-            compare_outputs(&decoded, original);
-
-            // The verified single-output path also round-trips a v0-origin shared-batch output.
-            let verified = bytes_to_verified_output(
-                BufReader::new(Cursor::new(bytes)),
-                PackCompression::ZStd,
-                Duration::from_secs(5),
-                &committee,
-                original.digest(),
-            )
-            .await
-            .expect("verified v1 decode");
-            compare_outputs(&verified, original);
-        }
-        drop(pack);
-    }
-
     /// Adiri replay pin: at epochs at or below `ADIRI_DUP_BATCH_EPOCH` the rebuild must DROP a
     /// shared batch from the second certificate, reproducing the historical duplicate-batch
-    /// outputs so adiri testnet can sync (the gates in `iter_to_output` and
-    /// `iter_to_output_legacy`). Exercises the skip side of both decoders from one v0 pack: the
-    /// legacy (batches-first) local read and the v1 (header-first) decode of the served bytes.
-    /// The push side above the cutoff is exercised by the two shared-batch tests at
-    /// [`SHARED_BATCH_EPOCH`] (#1128).
+    /// outputs so adiri testnet can sync (the gate in `iter_to_output`). Adiri's oldest epochs are
+    /// v0 packs, read only after their migration to v2, so this builds one, migrates it, and checks
+    /// the skip side on both the local read and the decode of the served bytes. The push side
+    /// above the cutoff is exercised by the two shared-batch tests at [`SHARED_BATCH_EPOCH`]
+    /// (#1128).
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_shared_batch_replay_below_adiri_dup_cutoff() {
@@ -6487,7 +5927,7 @@ pub(crate) mod test {
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
 
-        // v0 pack so the local read exercises the legacy (batches-first) decoder.
+        // A v0 pack, as a pre-v1 build left it on disk.
         let pack = ConsensusPack::open_append_version(
             temp_dir.path(),
             previous_epoch,
@@ -6509,6 +5949,13 @@ pub(crate) mod test {
         );
         pack.save_consensus_output(original.clone()).await.expect("save shared-batch output");
         pack.persist().await.expect("persist");
+        pack.close().await;
+        strip_sentinel(&temp_dir.path().join("epoch-0").join(Inner::DATA_NAME));
+        match ConsensusPack::migrate_epoch(temp_dir.path(), 0, true).await.expect("migrate") {
+            EpochMigrate::Migrated(_) => {}
+            other => panic!("expected the v0 pack to migrate, got {other:?}"),
+        }
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open migrated pack");
 
         // The digest both certificates reference: the one listed twice in batch_digests.
         let shared_digest = original
@@ -6549,10 +5996,10 @@ pub(crate) mod test {
             );
         };
 
-        // Legacy (batches-first) local read of the v0 pack.
-        assert_replay_shape(&pack.get_consensus_output(1).await.expect("local v0 read"));
+        // Local read of the migrated pack.
+        assert_replay_shape(&pack.get_consensus_output(1).await.expect("local read"));
 
-        // The same output served as v1 (header-first) bytes and decoded by the v1 path.
+        // The same output's served bytes, decoded as a peer decodes them.
         let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
         let decoded = bytes_to_output(
             BufReader::new(Cursor::new(bytes)),
@@ -6563,7 +6010,7 @@ pub(crate) mod test {
         .await
         .expect("v1 decode");
         assert_replay_shape(&decoded);
-        drop(pack);
+        pack.close().await;
     }
 
     /// CP2: get_consensus_output with a number below start_consensus_number must error rather
@@ -6667,7 +6114,7 @@ pub(crate) mod test {
         previous_epoch: &EpochRecord,
         n: u64,
         version: u16,
-    ) {
+    ) -> Vec<ConsensusOutput> {
         let pack = ConsensusPack::open_append_version(
             temp_dir.path(),
             previous_epoch.clone(),
@@ -6676,13 +6123,16 @@ pub(crate) mod test {
         )
         .expect("open pack");
         let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
         for i in 0..n {
             let output =
                 make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
             parent = output.digest();
+            outputs.push(output.clone());
             pack.save_consensus_output(output).await.expect("save output");
         }
         pack.persist().await.expect("persist");
+        outputs
     }
 
     /// For a current-version (v2) pack the clean-close sentinel is the *definitive* consistency
@@ -6728,11 +6178,12 @@ pub(crate) mod test {
 
     /// Migration (finding #3): a pack written before the clean-close sentinel existed (v0/v1) has
     /// no sentinel on disk, so the pre-sentinel version must be recognized and the missing
-    /// sentinel treated as normal rather than as an unclean shutdown. `open_static` — the
-    /// read-only door that serves sealed epochs to syncing peers and backs restart-time state
-    /// restore — must open such a pack instead of returning `CorruptPack`, and must not rewrite
-    /// the file. The cross-file length checks still carry the integrity guarantee (exactly the
-    /// length-only test pre-mmap `main` used).
+    /// sentinel treated as normal rather than as an unclean shutdown. `open_static` must open such
+    /// a pack instead of returning `CorruptPack` — `ConsensusChain::get_static` opens it to find it
+    /// is legacy and migrate it before anything reads it — and must not rewrite the file. The
+    /// cross-file length checks still carry the integrity guarantee (exactly the length-only test
+    /// pre-mmap `main` used). A v1 pack's outputs decode like v2's; a v0 pack's are never decoded
+    /// (only its migration reads it), so its reads are refused.
     #[tokio::test]
     async fn test_open_static_accepts_sentinelless_legacy_pack() {
         for version in [0_u16, 1] {
@@ -6761,12 +6212,19 @@ pub(crate) mod test {
             let pack = ConsensusPack::open_static(temp_dir.path(), 0).unwrap_or_else(|e| {
                 panic!("open_static must accept a sentinel-less v{version} pack, got {e:?}")
             });
+            assert!(pack.is_legacy(), "v{version} must be recognized as legacy");
             for i in 1..=3 {
-                assert!(
-                    pack.get_consensus_output(i).await.is_ok(),
-                    "v{version} output {i} must read back through the read-only door"
-                );
+                let read = pack.get_consensus_output(i).await;
+                if version == 0 {
+                    assert!(
+                        matches!(read, Err(super::PackError::InvalidVersion(_, 0))),
+                        "a v0 output is never decoded, got {read:?}"
+                    );
+                } else {
+                    assert!(read.is_ok(), "v1 output {i} must read back, got {read:?}");
+                }
             }
+            pack.close().await;
 
             // A read-only open must not have re-sealed or otherwise rewritten the data file.
             let len_after = std::fs::metadata(&data_path).expect("meta").len();
@@ -6882,20 +6340,13 @@ pub(crate) mod test {
             let fixture = CommitteeFixture::builder(MemDatabase::default).build();
             let committee = fixture.committee();
             let previous_epoch = test_previous_epoch(&committee);
-            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
-                .await;
+            // The original outputs, for a 1:1 comparison after migration.
+            let expected =
+                build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, version)
+                    .await;
             let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
             strip_sentinel(&data_path);
             assert_eq!(peek_pack_version(&data_path), version, "precondition: on-disk v{version}");
-
-            // Capture the original outputs for a 1:1 comparison after migration.
-            let before =
-                ConsensusPack::open_static(temp_dir.path(), 0).expect("open legacy static");
-            let mut expected = Vec::new();
-            for i in 1..=3 {
-                expected.push(before.get_consensus_output(i).await.expect("read legacy output"));
-            }
-            before.close().await;
 
             match ConsensusPack::migrate_epoch(temp_dir.path(), 0, true).await.expect("migrate") {
                 EpochMigrate::Migrated(_) => {}
@@ -8332,18 +7783,21 @@ pub(crate) mod test {
         let data_path = epoch_dir.join(Inner::DATA_NAME);
         let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
 
-        // Corrupt a non-first bucket so `open_static` (first-bucket-only) still succeeds but full
-        // validation fails — the corrupt-index setup.
+        // Corrupt a non-first bucket so `open_static` (first-bucket-only) still succeeds — the
+        // corrupt-index setup. A v0 pack is not walked by the validator (only its migration reads
+        // it), so the damage is judged by the repair below.
         {
             let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
             let n = bytes.len();
             bytes[n - HDX_BUCKET + 12] ^= 0xFF;
             std::fs::write(&hdx_path, &bytes).expect("write hdx");
         }
-        assert_eq!(
-            validate_pack_file(&data_path, 0, None).expect("validate").verdict,
-            Verdict::Invalid,
-            "the full validator must flag the corrupt bucket before repair"
+        assert!(
+            matches!(
+                validate_pack_file(&data_path, 0, None),
+                Err(super::PackError::InvalidVersion(_, 0))
+            ),
+            "the validator refuses to walk a v0 pack"
         );
 
         // Dry run predicts the apply: a legacy pack is actionable (would migrate), not
@@ -10759,63 +10213,6 @@ pub(crate) mod test {
         assert!(matches!(err, PackError::ConsensusNumberTooHigh), "got {err:?}");
     }
 
-    /// A v0 (batches-first) stream that ends after some of an output's batches but before its
-    /// header was cut mid-output: the import must report the output incomplete (`MissingBatch`,
-    /// as the header-first path does), not treat the cut as a clean end of the stream and hand
-    /// back a short pack.
-    #[tokio::test]
-    async fn test_stream_import_treats_a_v0_stream_cut_mid_output_as_incomplete() {
-        use crate::{
-            archive::pack::Pack,
-            consensus_pack::{read_position_entries, PackError, PackRecord},
-        };
-
-        let temp_dir = TempDir::with_prefix("test_cp_v0_cut").expect("temp dir");
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let previous_epoch = test_previous_epoch(&committee);
-        let pack = ConsensusPack::open_append_version(
-            temp_dir.path(),
-            previous_epoch.clone(),
-            committee.clone(),
-            0,
-        )
-        .expect("open v0 pack");
-        let mut parent = previous_epoch.final_consensus.hash;
-        for n in 1..=2u64 {
-            let output = make_test_output(&committee, n as usize, chain.clone(), n, parent);
-            parent = output.digest();
-            pack.save_consensus_output(output).await.expect("save");
-        }
-        pack.close().await;
-
-        // Cut the log right where output 2's header starts: its batches (which v0 writes first)
-        // are all there, its header is not.
-        let data_file = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
-        let ro = Pack::<PackRecord>::open(&data_file, 0, true, PackCompression::ZStd, PACK_VERSION)
-            .expect("open v0 pack read-only");
-        let entries = read_position_entries(&data_file, ro.header())
-            .expect("position index")
-            .expect("the pack has a position index");
-        let &(header_pos, output_start, _) = entries[1].as_ref().expect("output 2's entry");
-        assert!(output_start < header_pos, "precondition: v0 stores output 2's batches first");
-        let cut = std::fs::read(&data_file).expect("read data")[..header_pos as usize].to_vec();
-
-        let target = TempDir::with_prefix("test_cp_v0_cut_out").expect("temp dir");
-        let err = ConsensusPack::stream_import(
-            target.path(),
-            std::io::Cursor::new(cut),
-            0,
-            &previous_epoch,
-            2,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect_err("a stream cut inside an output must not import as a clean short pack");
-        assert!(matches!(err, PackError::MissingBatch), "got {err:?}");
-    }
-
     /// Stream the logical bytes (`[0, end)`, without the clean-close sentinel) of the sealed
     /// epoch-0 pack under `dir`, the way a peer serves an epoch.
     async fn epoch0_pack_stream(dir: &Path) -> impl tokio::io::AsyncRead + Unpin {
@@ -10826,18 +10223,22 @@ pub(crate) mod test {
         tokio::fs::File::open(&data_file).await.expect("open pack data").take(logical_len)
     }
 
-    /// An imported epoch is written in the current format whatever the source's version: a v0
-    /// (batches-first) or v1 (header-first) peer stream lands on disk as a v2 pack, so no read of
-    /// it later has to migrate it, and every output round-trips unchanged.
+    /// An imported epoch is written in the current format: a v1 (header-first) peer stream lands
+    /// on disk as a v2 pack, so no read of it later has to migrate it, and every output
+    /// round-trips unchanged. A v0 (batches-first) source is refused before anything is written —
+    /// v0 is only ever migrated on disk — as `InvalidVersion`, which charges the peer no penalty
+    /// (an older build's honest bytes).
     #[tokio::test]
-    async fn test_stream_import_of_legacy_source_writes_v2() {
-        for version in [0_u16, 1, PACK_VERSION] {
+    async fn test_stream_import_writes_v2_and_refuses_a_v0_source() {
+        for version in [1_u16, PACK_VERSION] {
             let source = TempDir::with_prefix("test_import_v2_src").expect("temp dir");
             let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
             let fixture = CommitteeFixture::builder(MemDatabase::default).build();
             let committee = fixture.committee();
             let previous_epoch = test_previous_epoch(&committee);
-            build_test_pack_version(&source, &committee, &chain, &previous_epoch, 4, version).await;
+            let outputs =
+                build_test_pack_version(&source, &committee, &chain, &previous_epoch, 4, version)
+                    .await;
 
             let target = TempDir::with_prefix("test_import_v2_dst").expect("temp dir");
             let imported = ConsensusPack::stream_import(
@@ -10851,14 +10252,10 @@ pub(crate) mod test {
             .await
             .unwrap_or_else(|e| panic!("v{version} source must import, got {e:?}"));
             assert_eq!(imported.version, PACK_VERSION, "v{version} source: handle not v2");
-
-            let original = ConsensusPack::open_static(source.path(), 0).expect("open source");
-            for n in 1..=4 {
-                let expected = original.get_consensus_output(n).await.expect("source output");
-                let got = imported.get_consensus_output(n).await.expect("imported output");
-                compare_outputs(&got, &expected);
+            for expected in &outputs {
+                let got = imported.get_consensus_output(expected.number()).await.expect("imported");
+                compare_outputs(&got, expected);
             }
-            original.close().await;
             imported.close().await;
 
             let data_path = target.path().join("epoch-0").join(Inner::DATA_NAME);
@@ -10877,13 +10274,36 @@ pub(crate) mod test {
             }
             reopened.close().await;
         }
+
+        let source = TempDir::with_prefix("test_import_v0_src").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&source, &committee, &chain, &previous_epoch, 4, 0).await;
+        let target = TempDir::with_prefix("test_import_v0_dst").expect("temp dir");
+        let Err(err) = ConsensusPack::stream_import(
+            target.path(),
+            epoch0_pack_stream(source.path()).await,
+            0,
+            &previous_epoch,
+            4,
+            Duration::from_secs(5),
+        )
+        .await
+        else {
+            panic!("a v0 source must be refused");
+        };
+        assert!(matches!(err, super::PackError::InvalidVersion(PACK_VERSION, 0)), "got {err:?}");
+        assert!(
+            !target.path().join("epoch-0").join(Inner::DATA_NAME).exists(),
+            "nothing is written for a refused v0 source"
+        );
     }
 
     /// The v1/v2 import streams each output's batches straight into the pack instead of buffering
     /// the whole output, so the (committee-scaled) per-output decode budget never applies to it:
-    /// with that budget forced down to a single byte, a multi-batch epoch still imports. The
-    /// same outputs from a v0 (batches-first) source, which must buffer before the header can
-    /// be checked, are still bounded by it.
+    /// with that budget forced down to a single byte, a multi-batch epoch still imports.
     #[tokio::test]
     async fn test_stream_import_does_not_buffer_whole_outputs() {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -10893,8 +10313,6 @@ pub(crate) mod test {
         let v2_source = TempDir::with_prefix("test_import_stream_v2").expect("temp dir");
         build_test_pack_version(&v2_source, &committee, &chain, &previous_epoch, 3, PACK_VERSION)
             .await;
-        let v0_source = TempDir::with_prefix("test_import_stream_v0").expect("temp dir");
-        build_test_pack_version(&v0_source, &committee, &chain, &previous_epoch, 3, 0).await;
         {
             let original = ConsensusPack::open_static(v2_source.path(), 0).expect("open source");
             let output = original.get_consensus_output(1).await.expect("source output");
@@ -10916,16 +10334,6 @@ pub(crate) mod test {
             Duration::from_secs(5),
         )
         .await;
-        let buffered = TempDir::with_prefix("test_import_stream_v0_dst").expect("temp dir");
-        let buffered_res = ConsensusPack::stream_import(
-            buffered.path(),
-            epoch0_pack_stream(v0_source.path()).await,
-            0,
-            &previous_epoch,
-            3,
-            Duration::from_secs(5),
-        )
-        .await;
         // Reset before asserting so a failure doesn't leak the override into other tests on this
         // thread.
         super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(None));
@@ -10935,10 +10343,6 @@ pub(crate) mod test {
             pack.get_consensus_output(n).await.expect("streamed output reads back");
         }
         pack.close().await;
-        assert!(
-            matches!(buffered_res, Err(super::PackError::OutputTooLarge { .. })),
-            "a v0 import buffers each output and must stay budget-bounded, got {buffered_res:?}"
-        );
     }
 
     /// At the import boundary, bytes the sender produced badly are told apart from a transport

@@ -21,11 +21,15 @@
 //!
 //! ## The cleared-set subtlety
 //!
-//! The per-header `batches` set is cleared after **every** consensus header
-//! (`consensus_pack.rs`), so a batch referenced by header *N* must appear as a `Batch` record
-//! within *N*'s group (after header *N-1*, at/before header *N*). A batch present elsewhere in the
-//! file but cleared before *N* still triggers `MissingBatches` — that is exactly the
-//! Absent-vs-Misordered distinction this validator surfaces.
+//! Each output's batches are written right after its header (the header-first layout of v1/v2), so
+//! a batch referenced by header *N* must appear as a `Batch` record within *N*'s group (after
+//! header *N*, before header *N+1*). A batch present elsewhere in the file but outside that group
+//! still triggers `MissingBatches` — that is exactly the Absent-vs-Misordered distinction this
+//! validator surfaces.
+//!
+//! A legacy v0 (batches-first) pack is not walked here: it is only ever read by its migration to
+//! v2, so it is judged by a dry run of that migration
+//! ([`legacy_migration_dry_run`](crate::consensus_pack::legacy_migration_dry_run)).
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -103,8 +107,7 @@ pub enum PackIssue {
     /// A v1 group's `Batch` records are present and correct as a set, but not in the ascending
     /// digest order the v1 importer ([`iter_to_output`](crate::consensus_pack)) requires. Only
     /// emitted when the group has no missing/extra batch, so it isolates a pure ordering defect —
-    /// distinct from [`BatchClass::Misordered`], which means a batch in the *wrong group*. (v1
-    /// only; v0 does not constrain intra-group batch order.)
+    /// distinct from [`BatchClass::Misordered`], which means a batch in the *wrong group*.
     UnsortedBatches {
         /// Consensus number of the group whose batches are out of order.
         number: u64,
@@ -433,6 +436,11 @@ fn validate_pack_file_impl(
     previous: Option<&EpochRecord>,
     bounded: bool,
 ) -> Result<PackValidationReport, PackError> {
+    // A legacy v0 (batches-first) pack is only ever read by its migration to v2: judge it with
+    // `legacy_migration_dry_run`, not this header-first walk.
+    if pack.version() == 0 {
+        return Err(PackError::InvalidVersion(PACK_VERSION, 0));
+    }
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = BoundedIssues::default();
 
@@ -477,11 +485,8 @@ fn validate_pack_file_impl(
         previous.map(|p| p.final_consensus.hash)
     };
 
-    let mut report = if pack.version() == 0 {
-        verify_v0_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
-    } else {
-        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
-    };
+    let mut report =
+        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?;
     // Best-effort: also scan the sidecar digest indexes' bucket CRCs — the one detector for a
     // lost/corrupt or zeroed bucket page, which nothing else runs (`files_consistent` only compares
     // lengths, and the data-stream walk above ignores the indexes entirely).
@@ -629,7 +634,7 @@ fn cross_check_indexes(
     };
     // Each consensus header's offset and the offset just past its record, in log order, for the
     // position-index check below; plus the log's end when the walk reaches it cleanly.
-    let mut headers: Vec<(u64, u64)> = Vec::new();
+    let mut headers: Vec<u64> = Vec::new();
     let mut walked_to_end = None;
     loop {
         let pos = iter.logical_position();
@@ -641,7 +646,7 @@ fn cross_check_indexes(
             // The epoch meta carries no index entry.
             Some(Ok(PackRecord::EpochMeta(_))) => continue,
             Some(Ok(PackRecord::Consensus(header))) => {
-                headers.push((pos, iter.logical_position()));
+                headers.push(pos);
                 // Each consensus header is unique, so its index entry must point at this exact
                 // record.
                 let stop = match digests.as_mut().map(|(c, _)| c.load(header.digest().into())) {
@@ -684,7 +689,6 @@ fn cross_check_indexes(
     // against the log so a corrupt one is reported here — and `db repair` rebuilds it — rather than
     // passing as healthy. Only when the walk reached the end cleanly, so every output is known.
     if let (Some(entries), Some(end)) = (positions, walked_to_end) {
-        let header_first = pack.version() > 0;
         if entries.len() != headers.len() {
             push(
                 report,
@@ -695,21 +699,16 @@ fn cross_check_indexes(
                 ),
             );
         }
-        for (i, (entry, &(header_pos, after_header))) in entries.iter().zip(&headers).enumerate() {
-            // Header-first (v1+): an output runs from its header to the next header (or the end of
-            // the log). v0 (batches-first): it ends right after its header.
-            let expected_end = if header_first {
-                headers.get(i + 1).map_or(end, |next| next.0)
-            } else {
-                after_header
-            };
+        for (i, (entry, &header_pos)) in entries.iter().zip(&headers).enumerate() {
+            // Header-first: an output runs from its header to the next header (or the end of the
+            // log).
+            let expected_end = headers.get(i + 1).copied().unwrap_or(end);
             let detail = match entry {
                 Err(e) => Some(format!("position entry {i} is unreadable: {e}")),
                 Ok((consensus_header, output_start, output_end))
                     if *consensus_header != header_pos
                         || *output_end != expected_end
-                        || (header_first && *output_start != header_pos)
-                        || *output_start > header_pos =>
+                        || *output_start != header_pos =>
                 {
                     Some(format!(
                         "position entry {i} is ({consensus_header}, {output_start}, {output_end}) \
@@ -905,159 +904,16 @@ fn probe_decodable_after(iter: &mut RawIter<PackRecord>) -> bool {
     }
 }
 
-fn verify_v0_data(
-    iter: &mut impl Iterator<Item = Result<PackRecord, FetchError>>,
-    epoch: Epoch,
-    mut expected_parent: Option<ConsensusHeaderDigest>,
-    start_consensus_number: u64,
-    mut issues: BoundedIssues,
-) -> Result<PackValidationReport, PackError> {
-    let mut batch_count: u64 = 0;
-    let mut consensus_count: u64 = 0;
-    // Set once if the file's own (untrusted, `previous: None`) `start_consensus_number` overflows
-    // `u64` when the position-based expected number is computed — so the sequence check is skipped
-    // for the rest of the walk and a single meta issue is reported instead of panicking (debug)
-    // / wrapping (release) into spurious `NonSequentialConsensusNumber`s.
-    let mut meta_overflow_reported = false;
-    let mut first_consensus_number: Option<u64> = None;
-    let mut last_consensus_number: Option<u64> = None;
-    // Per-group sets, cleared after every consensus header exactly like `stream_import`.
-    let mut batches: HashSet<BlockHash> = HashSet::new();
-    let mut referenced_batches: HashSet<BlockHash> = HashSet::new();
-
-    // Persistent, never-cleared set of every batch digest seen anywhere in the file. This is what
-    // lets us tell an *absent* batch (a real data gap) apart from a *misordered* one (present,
-    // wrong group). Classification is deferred until end-of-loop, when this set is complete.
-    let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
-
-    for record in iter {
-        match record? {
-            PackRecord::EpochMeta(_) => {
-                // A second EpochMeta is the same failure `stream_import` rejects.
-                issues.push(PackIssue::EpochMetaMismatch {
-                    detail: "epoch meta data found more than once".to_string(),
-                });
-            }
-            PackRecord::Batch(batch) => {
-                batch_count += 1;
-                // Compute the (re-encode + hash) digest once and record it in both the per-group
-                // set and the persistent global set.
-                let digest = batch.digest();
-                batches.insert(digest);
-                all_batch_digests.insert(digest);
-            }
-            PackRecord::Consensus(consensus_header) => {
-                consensus_count += 1;
-                let number = consensus_header.number;
-                first_consensus_number.get_or_insert(number);
-                last_consensus_number = Some(number);
-
-                // 0. Sequential numbering, mirroring `Inner::save_consensus_output`. The expected
-                // number is position-based: `start + (headers seen before this one)`. Because the
-                // header `number` is hashed into the digest, a *missing/reordered* header normally
-                // trips the `parent_hash` chain check below — but a corrupted number on the final
-                // header has no successor to catch it, and the importer rejects any non-sequential
-                // number outright, so check it explicitly here. Keeping `expected` position-based
-                // (not "previous number + 1") means one bad header doesn't cascade into spurious
-                // issues for every following header.
-                // `consensus_count - 1` cannot underflow (incremented above). `start + (count-1)`
-                // can overflow only on a corrupt/wrong meta; report it once and
-                // stop sequence-checking.
-                match start_consensus_number.checked_add(consensus_count - 1) {
-                    Some(expected_number) if !meta_overflow_reported => {
-                        if number != expected_number {
-                            issues.push(PackIssue::NonSequentialConsensusNumber {
-                                expected: expected_number,
-                                found: number,
-                            });
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        if !meta_overflow_reported {
-                            meta_overflow_reported = true;
-                            issues.push(PackIssue::EpochMetaMismatch {
-                                detail: format!(
-                                    "start_consensus_number {start_consensus_number} overflows u64 \
-                                     with {consensus_count} header(s); the epoch meta is corrupt"
-                                ),
-                            });
-                        }
-                    }
-                }
-
-                // 1. Chain continuity (skip when we have no anchor yet).
-                if let Some(parent) = expected_parent {
-                    if consensus_header.parent_hash != parent {
-                        issues.push(PackIssue::ChainBreak {
-                            number,
-                            expected_parent: parent,
-                            found_parent: consensus_header.parent_hash,
-                        });
-                    }
-                }
-
-                // A committed output always names a leader (its last header); an empty sub-dag is
-                // structural corruption that would panic every leader()-derived accessor.
-                if consensus_header.sub_dag.is_empty() {
-                    issues.push(PackIssue::EmptySubDag { number });
-                }
-
-                // 2. Every referenced batch must be present in *this* header's group. The global
-                // set is not yet complete here (a referenced batch may appear later in the file),
-                // so record the issue with a placeholder class and resolve it after the loop.
-                for header in consensus_header.sub_dag.headers() {
-                    for (digest, _) in header.payload().iter() {
-                        if batches.contains(digest) {
-                            referenced_batches.insert(*digest);
-                        } else {
-                            issues.push(PackIssue::MissingBatch {
-                                number,
-                                digest: *digest,
-                                class: BatchClass::Absent,
-                            });
-                        }
-                    }
-                }
-
-                // 3. Any present-but-unreferenced batch in this group is an extra.
-                // `referenced_batches` only ever holds digests that were also in `batches`, so the
-                // difference is exactly the orphans (mirrors stream_import's `len()` comparison).
-                for digest in batches.difference(&referenced_batches) {
-                    issues.push(PackIssue::ExtraBatch { number, digest: *digest });
-                }
-
-                // Group boundary: clear, exactly like `stream_import`.
-                batches.clear();
-                referenced_batches.clear();
-                expected_parent = Some(consensus_header.digest());
-            }
-        }
-    }
-
-    Ok(finalize_report(
-        epoch,
-        start_consensus_number,
-        batch_count,
-        consensus_count,
-        first_consensus_number,
-        last_consensus_number,
-        issues,
-        &all_batch_digests,
-    ))
-}
-
-/// Validate the `data` record stream of a **v1** pack (header-first layout).
+/// Validate the `data` record stream of a header-first (v1/v2) pack.
 ///
-/// v1 writes each `Consensus` header *before* the `Batch` records it references (the reverse of
-/// v0), and those batches arrive in ascending digest order (`collect_batches` uses a `BTreeMap`;
+/// Each `Consensus` header is written *before* the `Batch` records it references, and those batches
+/// arrive in ascending digest order (`collect_batches` uses a `BTreeMap`;
 /// [`iter_to_output`](crate::consensus_pack) rejects any out-of-order batch). So a group's batches
 /// are exactly the `Batch` records between a header and the next header. We hold the open header
 /// and the batches seen since it, resolving the group when the next header (or EOF) closes it.
 ///
-/// The per-header sequential-number and chain-continuity checks are identical to
-/// [`verify_v0_data`]; only the batch grouping differs, plus the v1-only intra-group ordering check
-/// performed in [`close_v1_group`].
+/// Each closed group's batch checks, including the intra-group ordering check, are performed in
+/// [`close_v1_group`].
 fn verify_v1_data(
     iter: &mut impl Iterator<Item = Result<PackRecord, FetchError>>,
     epoch: Epoch,
@@ -1075,9 +931,10 @@ fn verify_v1_data(
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
 
-    // Persistent, never-cleared set of every batch digest seen anywhere in the file — same role as
-    // in `verify_v0_data`: it lets the deferred `MissingBatch` classification tell an *absent*
-    // digest (a real gap) apart from a *misordered* one (present, wrong group).
+    // Persistent, never-cleared set of every batch digest seen anywhere in the file: it lets the
+    // deferred `MissingBatch` classification tell an *absent* digest (a real gap) apart from a
+    // *misordered* one (present, wrong group). Classification is deferred until the walk ends,
+    // when this set is complete.
     let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
 
     // The currently open consensus header and the batch digests seen since it, in arrival order
@@ -1113,9 +970,14 @@ fn verify_v1_data(
                 first_consensus_number.get_or_insert(number);
                 last_consensus_number = Some(number);
 
-                // Sequential numbering and chain continuity, identical to `verify_v0_data`. See the
-                // comments there for why `expected` is position-based and why the trailing header
-                // needs the explicit sequential check.
+                // Sequential numbering, mirroring `Inner::save_consensus_output`. The expected
+                // number is position-based: `start + (headers seen before this one)`. Because the
+                // header `number` is hashed into the digest, a *missing/reordered* header normally
+                // trips the `parent_hash` chain check below — but a corrupted number on the final
+                // header has no successor to catch it, and the importer rejects any non-sequential
+                // number outright, so check it explicitly here. Keeping `expected` position-based
+                // (not "previous number + 1") means one bad header doesn't cascade into spurious
+                // issues for every following header.
                 // `consensus_count - 1` cannot underflow (incremented above). `start + (count-1)`
                 // can overflow only on a corrupt/wrong meta; report it once and
                 // stop sequence-checking.
@@ -1175,9 +1037,9 @@ fn verify_v1_data(
 /// Resolve a closed v1 group: append the batch-presence, extra-batch and ordering issues for the
 /// header whose group just ended. `collected` is the group's batch digests in arrival (file) order.
 ///
-/// Mirrors the per-header batch checks `verify_v0_data` performs inline, plus the v1-only ordering
-/// check. `MissingBatch` is recorded with a placeholder [`BatchClass::Absent`]; the final class is
-/// resolved in [`finalize_report`] once every digest in the file is known.
+/// Batch presence, extra batches and intra-group ordering. `MissingBatch` is recorded with a
+/// placeholder [`BatchClass::Absent`]; the final class is resolved in [`finalize_report`] once
+/// every digest in the file is known.
 fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mut BoundedIssues) {
     let number = header.number;
     // A committed output always names a leader (its last header); an empty sub-dag is structural
@@ -1229,7 +1091,7 @@ fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mu
 /// `all_batch_digests` set — a digest present anywhere in the file is [`BatchClass::Misordered`],
 /// otherwise it is a genuine [`BatchClass::Absent`] gap — then build the final report. This is a
 /// cheap pass over `issues` (bounded by the number of missing references), not another file
-/// traversal. Shared by [`verify_v0_data`] and [`verify_v1_data`].
+/// traversal.
 #[allow(clippy::too_many_arguments)]
 fn finalize_report(
     epoch: Epoch,
@@ -1452,7 +1314,10 @@ mod test {
             digest_index::BucketCrcReport,
             pack::{Pack, PackCompression},
         },
-        consensus_pack::{test::make_test_output, EpochMeta, PackRecord},
+        consensus_pack::{
+            legacy_migration_dry_run, test::make_test_output, EpochMeta, PackError, PackRecord,
+            PACK_VERSION,
+        },
         mem_db::MemDatabase,
     };
 
@@ -1549,11 +1414,44 @@ mod test {
         (temp_dir, committee, chain)
     }
 
-    /// A well-formed pack validates clean, in both the v0 (batches-first) and v1 (header-first)
-    /// layouts.
+    /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so the validator
+    /// does not walk it; it is judged by a dry run of that migration instead: a clean one would
+    /// migrate every output, and a damaged one is refused with the migration's reason.
+    #[test]
+    fn test_validate_v0_pack_is_judged_by_its_migration() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 5);
+        let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, 0);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, 0);
+
+        let walked = validate_pack_file(&path, 0, None);
+        assert!(
+            matches!(walked, Err(PackError::InvalidVersion(_, 0))),
+            "a v0 pack is not walked, got {walked:?}"
+        );
+        assert_eq!(legacy_migration_dry_run(&path, 0), Ok(5), "a clean v0 pack migrates whole");
+
+        // A batch after the last header belongs to no output: the migration refuses.
+        let orphan = records
+            .iter()
+            .find(|r| matches!(r, PackRecord::Batch(_)))
+            .cloned()
+            .expect("fixture outputs carry batches");
+        records.push(orphan);
+        std::fs::remove_file(&path).expect("remove clean pack");
+        write_records(&path, &records, 0);
+        let refused = legacy_migration_dry_run(&path, 0);
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains("no consensus header")),
+            "a damaged v0 pack is refused, got {refused:?}"
+        );
+    }
+
+    /// A well-formed pack validates clean, as v1 and as v2 (the same header-first layout).
     #[test]
     fn test_validate_clean_pack() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1670,7 +1568,7 @@ mod test {
     /// in both layouts.
     #[test]
     fn test_validate_absent_batch() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, group_batches) =
@@ -1699,47 +1597,6 @@ mod test {
             // Must not be misclassified as misordered.
             assert_eq!(report.missing_batch_count(BatchClass::Misordered), 0, "v{version}");
         }
-    }
-
-    /// v0: moving a batch into a later group → reported Misordered where it belongs, and ExtraBatch
-    /// where it now (wrongly) sits. In the v0 (batches-first) layout the batch lands in group 5 by
-    /// being spliced just *before* consensus header 5.
-    #[test]
-    fn test_validate_misordered_batch() {
-        let (temp_dir, committee, chain) = setup();
-        let outputs = make_outputs(&committee, chain, 6);
-        let (mut records, group_batches) = build_records(epoch0_meta(&committee), &outputs, 0);
-
-        // Take the first batch of group 2 (consensus number 3) and splice it into group 4's records
-        // (just before consensus header number 5).
-        let target = group_batches[2][0];
-        let from = find_batch(&records, target);
-        let moved = records.remove(from);
-        let insert_at = records
-            .iter()
-            .position(|r| matches!(r, PackRecord::Consensus(h) if h.number == 5))
-            .expect("consensus header 5 present");
-        records.insert(insert_at, moved);
-
-        let path = temp_dir.path().join("data");
-        write_records(&path, &records, 0);
-
-        let report = validate_pack_file(&path, 0, None).expect("validate");
-        assert_eq!(report.verdict, Verdict::Invalid);
-        // Present in the file but not in group 3 → Misordered at consensus 3.
-        let misordered = report.issues.iter().any(|i| {
-            matches!(i,
-                PackIssue::MissingBatch { digest, class: BatchClass::Misordered, number }
-                if *digest == target && *number == 3)
-        });
-        assert!(misordered, "expected Misordered at consensus 3; issues: {:?}", report.issues);
-        // Now an orphan inside group 5 → ExtraBatch at consensus 5.
-        let extra = report.issues.iter().any(|i| {
-            matches!(i, PackIssue::ExtraBatch { digest, number } if *digest == target && *number == 5)
-        });
-        assert!(extra, "expected ExtraBatch at consensus 5; issues: {:?}", report.issues);
-        // Nothing should be classified Absent — the batch is still in the file.
-        assert_eq!(report.missing_batch_count(BatchClass::Absent), 0);
     }
 
     /// v1: same corruption in the header-first layout. To land the moved batch in group 5, splice
@@ -1838,7 +1695,7 @@ mod test {
     /// check, so only the explicit sequential-number check (mirroring the importer) catches it.
     #[test]
     fn test_validate_non_sequential_trailing_header() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1876,7 +1733,7 @@ mod test {
     /// header.
     #[test]
     fn test_validate_non_sequential_middle_header() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1992,7 +1849,7 @@ mod test {
     /// `EpochMetaMismatch` and the sequence check is skipped for the rest of the walk.
     #[test]
     fn test_validate_meta_start_overflow_reported_not_panicked() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 3);
             let mut meta = epoch0_meta(&committee);
