@@ -148,6 +148,19 @@ pub struct LayeredDbStats {
     /// Should be 0 whenever no write txn is outstanding; a value stuck above 0
     /// means commits have stopped firing (wedged txn count).
     pub open_txn_count: u64,
+    /// Bare inserts whose physical commit failed. Each value stays readable from the mem layer.
+    pub insert_failures: u64,
+    /// Physical write txns that could not begin. The logical txn's writes then go out as bare
+    /// writes, each counted if it fails, so they lose atomicity but no write is lost uncounted.
+    pub begin_failures: u64,
+    /// Inserts that could not be staged into the open physical txn.
+    pub txn_insert_failures: u64,
+    /// Physical txn commits that failed, discarding every write the txn carried.
+    pub commit_failures: u64,
+    /// Removes that failed, bare or staged into a txn.
+    pub remove_failures: u64,
+    /// Table clears that failed, bare or staged into a txn.
+    pub clear_failures: u64,
 }
 
 /// End one logical write txn on the background thread.
@@ -211,13 +224,19 @@ fn ack_pending_durable(
 
 /// Run the thread to manage the persistant DB in the background.
 /// If DB needs compaction this thread will compact on startup and once a day after that.
-fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMessage<DB>>) {
+fn db_run<DB: Database>(
+    db: DB,
+    mem_db: Option<MemDatabase>,
+    rx: Receiver<DBMessage<DB>>,
+    env: &'static str,
+) {
     // Sticky durability-failure latch, owned entirely by this runner thread (issue #975). Set the
     // instant any physical commit fails and never cleared: once durability is compromised, every
     // subsequent durable-barrier ack must report failure so all externalization exits fail-stop the
     // node instead of equivocating against itself on restart. Because only this thread reads and
     // writes it, in FIFO order with the commits themselves, no cross-thread race is possible.
     let mut commit_failed = false;
+    let mut failures = WriteFailures::new(env);
     let mut txn = None;
     let mut last_compact = Instant::now();
     let mut committed_inserts: Vec<Box<dyn InsertTrait<DB>>> = Vec::with_capacity(1000);
@@ -237,8 +256,11 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                 } else {
                     match db.write_txn() {
                         Ok(ntxn) => txn = Some((ntxn, 1)),
+                        // Not latched: the logical txn's writes go out as bare writes, and each of
+                        // those latches on its own if it fails.
                         Err(e) => {
-                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}")
+                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}");
+                            failures.record(WriteOp::Begin);
                         }
                     }
                 }
@@ -247,6 +269,7 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                 let outcome = end_txn(&mut txn, &mut committed_inserts, mem_db.as_ref());
                 if matches!(outcome, Some(Err(_))) {
                     commit_failed = true;
+                    failures.record(WriteOp::Commit);
                 }
                 if txn.is_none() {
                     ack_pending_durable(commit_failed, &mut pending_durable);
@@ -260,6 +283,7 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                 let outcome = end_txn(&mut txn, &mut committed_inserts, mem_db.as_ref());
                 if matches!(outcome, Some(Err(_))) {
                     commit_failed = true;
+                    failures.record(WriteOp::Commit);
                 }
                 if txn.is_none() {
                     ack_pending_durable(commit_failed, &mut pending_durable);
@@ -284,6 +308,7 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                         Err(e) => {
                             tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name());
                             commit_failed = true;
+                            failures.record(WriteOp::TxnInsert);
                         }
                     }
                 } else {
@@ -296,6 +321,7 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                     if let Err(e) = &inserted {
                         tracing::error!(target: "layered_db_runner", "DB Insert {}: {e}", ins.name());
                         commit_failed = true;
+                        failures.record(WriteOp::Insert);
                     }
                     // On failure the value is not on disk, so keep the cache-mode mirror serving it
                     // (mirrors the retention gate in `end_txn`).
@@ -311,12 +337,14 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                     if let Err(e) = rm.remove_txn(txn) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Remove {}: {e}", rm.name());
                         commit_failed = true;
+                        failures.record(WriteOp::Remove);
                     }
                 } else if let Err(e) = rm.remove(&db) {
                     // Bare remove is a self-contained physical commit; a failure is a durability
                     // gap that must trip the poison latch (issue #975).
                     tracing::error!(target: "layered_db_runner", "DB Remove {}: {e}", rm.name());
                     commit_failed = true;
+                    failures.record(WriteOp::Remove);
                 }
             }
             DBMessage::Clear(clr) => {
@@ -324,12 +352,14 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                     if let Err(e) = clr.clear_table_txn(txn) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Clear table {}: {e}", clr.name());
                         commit_failed = true;
+                        failures.record(WriteOp::Clear);
                     }
                 } else if let Err(e) = clr.clear_table(&db) {
                     // Bare clear is a self-contained physical commit; a failure is a durability
                     // gap that must trip the poison latch (issue #975).
                     tracing::error!(target: "layered_db_runner", "DB Clear {}: {e}", clr.name());
                     commit_failed = true;
+                    failures.record(WriteOp::Clear);
                 }
             }
             DBMessage::CaughtUp(tx) => {
@@ -355,6 +385,12 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                 let _ = tx.send(LayeredDbStats {
                     retained_inserts: committed_inserts.len(),
                     open_txn_count: txn.as_ref().map(|(_, count)| *count as u64).unwrap_or(0),
+                    insert_failures: failures.insert,
+                    begin_failures: failures.begin,
+                    txn_insert_failures: failures.txn_insert,
+                    commit_failures: failures.commit,
+                    remove_failures: failures.remove,
+                    clear_failures: failures.clear,
                 });
             }
             DBMessage::Shutdown => break,
@@ -408,21 +444,39 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 }
 
 impl<DB: Database> LayeredDatabase<DB> {
-    /// Open a layered database wrapping `db` with an in-memory layer and a background writer.
+    /// Open a layered DB over `db` whose write failures are counted under the `unnamed` env.
     ///
-    /// When `full_memory` is true the in-memory layer retains every insert (the backing DB is a
-    /// durable mirror); otherwise the memory layer only caches and is kept in sync with `db`.
+    /// See [`LayeredDatabase::open_named`].
     pub fn open(db: DB, full_memory: bool) -> Self {
+        Self::open_named(db, full_memory, UNNAMED_ENV)
+    }
+
+    /// Open a layered DB over `db` and start its background writer thread.
+    ///
+    /// With `full_memory` every value is kept in memory for good; otherwise a value stays in
+    /// memory only until its write reaches `db`. `env` is the `env` label of this DB's
+    /// `tn_storage_write_failures_total` series and should name one storage environment.
+    pub fn open_named(db: DB, full_memory: bool, env: &'static str) -> Self {
+        metrics::describe_counter!(
+            WRITE_FAILURES_METRIC,
+            metrics::Unit::Count,
+            WRITE_FAILURES_HELP
+        );
+        // A series first exported at its first failure hides that failure from `increase` rules,
+        // so every series starts at zero.
+        for op in WriteOp::ALL {
+            metrics::counter!(WRITE_FAILURES_METRIC, "env" => env, "op" => op.label()).increment(0);
+        }
         let (tx, rx) = mpsc::channel();
         let db_cloned = db.clone();
         let mem_db = MemDatabase::new();
         let mem_db_clone = if full_memory { None } else { Some(mem_db.clone()) };
         let thread =
-            Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
+            Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx, env))));
         Self { mem_db, db, tx, thread, full_memory }
     }
 
-    /// Snapshot the background thread's retained-insert and open-txn counters.
+    /// Snapshot the background thread's retained-insert, open-txn and write-failure counters.
     ///
     /// Processed in queue order, so it reflects all operations sent before this call.
     pub fn stats(&self) -> eyre::Result<LayeredDbStats> {
@@ -718,6 +772,113 @@ impl DurableAck {
                 "epoch DB commit failed; durable persistence barrier did not persist"
             )),
         }
+    }
+}
+
+/// Counter of failed layered-DB write operations, labeled by `env` and `op`.
+///
+/// Prometheus renders the `.` as `_`, so the series is `tn_storage_write_failures_total`. The
+/// `env` label is the name given to [`LayeredDatabase::open_named`]: [`EPOCH_ENV`], [`KAD_ENV`] or
+/// [`CACHE_ENV`] for the layers of a [`CompositeDatabase`](crate::composite_db::CompositeDatabase),
+/// and [`UNNAMED_ENV`] for [`LayeredDatabase::open`]. The `op` label is a [`WriteOp::label`].
+/// Every op except `begin` is a write that failed to reach disk. A failed `begin` loses no write:
+/// the txn's writes go out as bare writes and are counted on their own if they fail, but they are
+/// no longer atomic. Every `(env, op)` series is registered at zero when the DB opens. The same
+/// counts are reported by [`LayeredDatabase::stats`].
+const WRITE_FAILURES_METRIC: &str = "tn_storage.write_failures_total";
+
+/// HELP text of [`WRITE_FAILURES_METRIC`].
+const WRITE_FAILURES_HELP: &str =
+    "Layered-DB write operations that failed, by storage environment and operation.";
+
+/// The `env` label of the composite layer holding epoch-scoped tables.
+pub(crate) const EPOCH_ENV: &str = "epoch";
+
+/// The `env` label of the composite layer holding kademlia records.
+pub(crate) const KAD_ENV: &str = "kad";
+
+/// The `env` label of the composite layer holding cache tables, including the batch cache.
+pub(crate) const CACHE_ENV: &str = "cache";
+
+/// The `env` label of a layered DB opened with [`LayeredDatabase::open`].
+const UNNAMED_ENV: &str = "unnamed";
+
+/// A physical write whose failure is counted in [`WRITE_FAILURES_METRIC`].
+#[derive(Clone, Copy, Debug)]
+enum WriteOp {
+    /// A bare insert, which is its own physical commit.
+    Insert,
+    /// The begin of a physical txn. A failure loses atomicity but no write.
+    Begin,
+    /// An insert staged into the open physical txn.
+    TxnInsert,
+    /// The commit of a physical txn.
+    Commit,
+    /// A remove, bare or staged into a txn.
+    Remove,
+    /// A table clear, bare or staged into a txn.
+    Clear,
+}
+
+impl WriteOp {
+    /// Every variant, so each `(env, op)` series can be registered up front.
+    const ALL: [Self; 6] =
+        [Self::Insert, Self::Begin, Self::TxnInsert, Self::Commit, Self::Remove, Self::Clear];
+
+    /// The `op` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Begin => "begin",
+            Self::TxnInsert => "txn_insert",
+            Self::Commit => "commit",
+            Self::Remove => "remove",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// Write-failure counts of one layered DB, owned by its background thread.
+///
+/// Each failure is counted twice: in the global metrics recorder and in these fields, which
+/// [`LayeredDbStats`] reports. Tests read the fields because a thread-local metrics recorder
+/// cannot see the background thread.
+struct WriteFailures {
+    /// The `env` label value.
+    env: &'static str,
+    /// Failed [`WriteOp::Insert`]s.
+    insert: u64,
+    /// Failed [`WriteOp::Begin`]s.
+    begin: u64,
+    /// Failed [`WriteOp::TxnInsert`]s.
+    txn_insert: u64,
+    /// Failed [`WriteOp::Commit`]s.
+    commit: u64,
+    /// Failed [`WriteOp::Remove`]s.
+    remove: u64,
+    /// Failed [`WriteOp::Clear`]s.
+    clear: u64,
+}
+
+impl WriteFailures {
+    /// Start counting failures for `env` from zero.
+    fn new(env: &'static str) -> Self {
+        Self { env, insert: 0, begin: 0, txn_insert: 0, commit: 0, remove: 0, clear: 0 }
+    }
+
+    /// Count one failed `op`.
+    fn record(&mut self, op: WriteOp) {
+        let count = match op {
+            WriteOp::Insert => &mut self.insert,
+            WriteOp::Begin => &mut self.begin,
+            WriteOp::TxnInsert => &mut self.txn_insert,
+            WriteOp::Commit => &mut self.commit,
+            WriteOp::Remove => &mut self.remove,
+            WriteOp::Clear => &mut self.clear,
+        };
+        *count += 1;
+        metrics::counter!(WRITE_FAILURES_METRIC, "env" => self.env, "op" => op.label())
+            .increment(1);
     }
 }
 
@@ -1042,7 +1203,10 @@ mod test {
         assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
         assert_eq!(raw.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
         let stats = db.stats().expect("stats");
-        assert_eq!(stats, super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 });
+        assert_eq!(
+            stats,
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0, ..Default::default() }
+        );
     }
 
     #[test]
@@ -1072,7 +1236,7 @@ mod test {
         assert_eq!(raw.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
         assert_eq!(
             db.stats().expect("stats"),
-            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 }
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0, ..Default::default() }
         );
     }
 
@@ -1104,7 +1268,7 @@ mod test {
         assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
         assert_eq!(
             db.stats().expect("stats"),
-            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 }
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0, ..Default::default() }
         );
     }
 
@@ -1171,7 +1335,7 @@ mod test {
     ///
     /// The second field holds the fault budgets shared by every clone and txn handle. A staged put
     /// can be faulted on its own, leaving the open txn usable, which a full map cannot do because
-    /// it poisons the txn.
+    /// it poisons the txn. A write-txn begin can be faulted too.
     #[derive(Clone, Debug)]
     struct CommitFailDb<DB>(DB, Arc<Faults>);
 
@@ -1193,6 +1357,11 @@ mod test {
         fn first_staged_put(db: DB) -> Self {
             Self(db, Arc::new(Faults { staged_puts: AtomicUsize::new(1), ..Default::default() }))
         }
+
+        /// Fault only the first write-txn begin; every commit reaches the inner DB.
+        fn first_begin(db: DB) -> Self {
+            Self(db, Arc::new(Faults { begins: AtomicUsize::new(1), ..Default::default() }))
+        }
     }
 
     /// Fault budgets of a [`CommitFailDb`]. Each faulted operation takes one fault from its budget
@@ -1203,6 +1372,8 @@ mod test {
         commits: AtomicUsize,
         /// Puts staged into an open write txn.
         staged_puts: AtomicUsize,
+        /// Write-txn begins.
+        begins: AtomicUsize,
     }
 
     /// Take one fault from `budget`. Returns true when the calling operation must fail.
@@ -1272,6 +1443,9 @@ mod test {
         }
 
         fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+            if take_fault(&self.1.begins) {
+                return Err(eyre::eyre!("injected write txn begin failure"));
+            }
             Ok(CommitFailTxMut(self.0.write_txn()?, self.1.clone()))
         }
 
@@ -1575,7 +1749,12 @@ mod test {
             "a successful commit must not drop the mem copy of a put it never staged"
         );
         assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
-        assert_eq!(db.stats().expect("stats").retained_inserts, 0);
+        let stats = db.stats().expect("stats");
+        assert_eq!(
+            (stats.txn_insert_failures, stats.commit_failures, stats.retained_inserts),
+            (1, 0, 0),
+            "only the faulted put fails, and the commit retains nothing"
+        );
     }
 
     #[test]
@@ -1637,7 +1816,80 @@ mod test {
         for i in 1..=VALUES {
             assert_eq!(db.get::<TestTable>(&i).expect("get").as_ref(), Some(&big), "key {i}");
         }
-        assert_eq!(db.stats().expect("stats").retained_inserts, 0);
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats.retained_inserts, 0);
+        assert_eq!(stats.commit_failures, 1, "only txn1's physical commit fails");
+        assert!(stats.txn_insert_failures >= 1, "the overflowing put must be counted");
+        assert_eq!(stats.remove_failures, 0, "txn2's remove of an absent key succeeds");
+    }
+
+    #[tokio::test]
+    async fn test_cache_mode_overflow_counts_insert_failures() {
+        // Issue #1443: once the map is full every bare insert fails on disk. The caller still sees
+        // `Ok`, the values stay readable from the mem layer, and only `persist` and the
+        // write-failure counters reveal the overflow.
+        const VALUES: u64 = 64;
+        let big = "x".repeat(64 * 1024);
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_overflow_bare"),
+            4,
+            2 * MEGABYTE,
+            MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open_named(raw, false, "t");
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        for i in 0..VALUES {
+            db.insert::<TestTable>(&i, &big).expect("insert must not surface the disk failure");
+        }
+        db.sync_persist();
+        for i in 0..VALUES {
+            assert_eq!(db.get::<TestTable>(&i).expect("get").as_ref(), Some(&big), "key {i}");
+        }
+        assert!(db.persist::<TestTable>().await.is_err(), "persist must report the overflow");
+        let stats = db.stats().expect("stats");
+        assert!(stats.insert_failures >= 1, "failed bare inserts must be counted");
+        assert_eq!(stats.commit_failures, 0, "no txn was open");
+    }
+
+    #[tokio::test]
+    async fn test_failed_begin_is_counted_without_latching() {
+        // A failed write-txn begin loses no write: the logical txn's writes go out as bare writes,
+        // each counted if it fails. It is counted under its own op and must not trip the latch
+        // that makes `persist` fail, which is reserved for writes that did not reach disk.
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_failed_begin"),
+            4,
+            16 * MEGABYTE,
+            8 * MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open(CommitFailDb::first_begin(raw.clone()), false);
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        txn.commit().expect("logical commit send");
+        db.sync_persist();
+
+        assert_eq!(
+            raw.get::<TestTable>(&1).expect("raw get"),
+            Some("one".to_string()),
+            "the insert goes out as a bare write"
+        );
+        assert!(db.persist::<TestTable>().await.is_ok(), "a failed begin must not latch");
+        let stats = db.stats().expect("stats");
+        assert_eq!(
+            (stats.begin_failures, stats.insert_failures, stats.commit_failures),
+            (1, 0, 0),
+            "only the begin fails"
+        );
     }
 
     #[test]
@@ -1654,7 +1906,10 @@ mod test {
         // Full-memory DBs have no cache mirror to clear, so nothing may be retained after
         // commit; retention here is the unbounded leak (every insert kept forever).
         let stats = db.stats().expect("stats");
-        assert_eq!(stats, super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 });
+        assert_eq!(
+            stats,
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0, ..Default::default() }
+        );
         // all keys remain readable
         for i in 0..100_u64 {
             assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(i.to_string()));
