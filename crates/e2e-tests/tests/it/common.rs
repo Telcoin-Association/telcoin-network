@@ -439,6 +439,28 @@ pub(crate) fn start_validator_with_args(
     run: u32,
     extra_args: &[&str],
 ) -> Child {
+    start_validator_with_env(instance, bin, base_dir, rpc_port, test, run, extra_args, &[])
+}
+
+/// Start a validator node process with additional CLI arguments and extra environment
+/// variables for that child only.
+///
+/// Each `(key, value)` pair is set on the spawned command after the variables
+/// [`TestBinary::command`] forwards, so a pair overrides a forwarded variable of the same
+/// name. The harness process itself is never touched: a per-node setting such as
+/// `TN_TEST_CLOCK_OFFSET_MS` must not be exported with `std::env::set_var`, or every node
+/// spawned afterwards would inherit it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_validator_with_env(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -462,6 +484,7 @@ pub(crate) fn start_validator_with_args(
         .arg(format!("{test}-node{instance}"));
 
     command.args(extra_args);
+    command.envs(extra_env.iter().copied());
 
     setup_log_dir(&mut command, instance, test, run);
 
