@@ -29,7 +29,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::data_file::fsync_directory,
@@ -1379,6 +1379,15 @@ impl ConsensusChain {
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
         match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
             Ok(result) => result.is_some(),
+            // an incomplete pack ends before the epoch's final output, so this is the normal answer
+            Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh)) => {
+                debug!(
+                    target: "consensus-chain",
+                    epoch=?epoch_record.epoch,
+                    "epoch pack is incomplete"
+                );
+                false
+            }
             Err(e) => {
                 error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
                 false
