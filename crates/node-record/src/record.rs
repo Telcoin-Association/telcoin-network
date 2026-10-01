@@ -1,27 +1,12 @@
 //! The BLS-signed node record a validator publishes to the kademlia DHT.
 
-use crate::NetworkType;
+use crate::{validate_advertised_addresses, AddressError, NetworkType};
 use libp2p::Multiaddr;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkPublicKey, RpcInfo, TimestampSec,
     WorkerId,
 };
-
-/// Maximum number of multiaddrs a single signed [`NodeRecord`] may advertise.
-///
-/// A legitimate node advertises exactly one address per record (see [`NodeRecord::build`]). A
-/// record exceeding the cap is rejected at validation, bounding the attacker-chosen address data
-/// admitted per record before it can accumulate on the peer entry (GHSA-29v6-gvv5-45gx). The
-/// node's per-peer multiaddr set cap (`MAX_MULTIADDRS_PER_PEER`) is derived from this value, so
-/// validation and storage agree on how many addresses one peer may present: a single validated
-/// record contributes at most as many addresses as the store keeps for a peer, and the set cap is
-/// what bounds accumulation across repeated records.
-///
-/// The same cap bounds the address list of a kad provider record before it is written to the
-/// consensus database (`KadStore::add_provider`, issue #1185), and a read-only client applies it
-/// to every record it accepts from the DHT.
-pub const MAX_ADVERTISED_MULTIADDRS: usize = 1;
 
 /// List of addresses for a node, signature will be the nodes BLS signature
 /// over the addresses to verify they are from the node in question.
@@ -156,6 +141,35 @@ impl NodeRecord {
         Self { info, signature }
     }
 
+    /// Sign a nonempty, ordered endpoint list within the shared migration budget.
+    ///
+    /// Uses the existing v1 signing domain and BCS layout. Order and every endpoint byte are
+    /// authenticated; the first endpoint is the operator's preferred dial candidate.
+    pub fn build_multi<F>(
+        domain: RecordDomain,
+        pubkey: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+        rpc: Option<RpcInfo>,
+        signer: F,
+    ) -> Result<NodeRecord, AddressError>
+    where
+        F: FnOnce(&[u8]) -> BlsSignature,
+    {
+        validate_advertised_addresses(&multiaddrs, &pubkey)?;
+        let info = NetworkInfo { pubkey, multiaddrs, timestamp: now(), rpc };
+        let signature = signer(&Self::signing_bytes(domain, &info));
+        Ok(Self { info, signature })
+    }
+
+    /// Refresh the timestamp and signature while preserving configured endpoint order.
+    pub fn refresh<F>(&mut self, domain: RecordDomain, signer: F)
+    where
+        F: FnOnce(&[u8]) -> BlsSignature,
+    {
+        self.info.timestamp = now();
+        self.signature = signer(&Self::signing_bytes(domain, &self.info));
+    }
+
     /// Verify the record's signature against `domain` and `pubkey`.
     ///
     /// Fails if the record was signed for a different `(chain, role)` network,
@@ -216,7 +230,9 @@ impl NodeRecord {
         domain: RecordDomain,
         key: &BlsPublicKey,
     ) -> Option<(BlsPublicKey, NodeRecord)> {
-        try_decode::<NodeRecord>(value).ok()?.verify(domain, key)
+        let record = try_decode::<NodeRecord>(value).ok()?;
+        validate_advertised_addresses(&record.info.multiaddrs, &record.info.pubkey).ok()?;
+        record.verify(domain, key)
     }
 }
 

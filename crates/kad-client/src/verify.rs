@@ -7,7 +7,8 @@
 
 use libp2p::{kad, PeerId};
 use tn_node_record::{
-    BlsPublicKey, NetworkInfo, NodeRecord, RecordDomain, MAX_ADVERTISED_MULTIADDRS,
+    validate_advertised_addresses, BlsPublicKey, NetworkInfo, NodeRecord, RecordDomain,
+    MAX_ADVERTISED_MULTIADDRS,
 };
 
 /// A [`NodeRecord`] that passed every check the node applies to records learned from peers.
@@ -71,9 +72,8 @@ pub(crate) enum RejectReason {
 ///
 /// Checks run in the same order as the node's `peer_record_valid`:
 /// 1. the record key must decode as a BLS public key equal to `expected`;
-/// 2. the value must decode as a [`NodeRecord`] whose signature verifies for `expected` under
-///    `domain`;
-/// 3. the record must advertise at most [`MAX_ADVERTISED_MULTIADDRS`] addresses;
+/// 2. the value must decode as a [`NodeRecord`] with a nonempty, bounded IP/QUIC endpoint list;
+/// 3. its signature must verify for `expected` under `domain`;
 /// 4. the kademlia `publisher` must equal the peer id of the record's network public key.
 pub(crate) fn verify_record(
     domain: RecordDomain,
@@ -85,13 +85,15 @@ pub(crate) fn verify_record(
         .filter(|key| key == expected)
         .ok_or(RejectReason::KeyMismatch)?;
 
-    let (key, node_record) = NodeRecord::decode_and_verify(&record.value, domain, &key)
-        .ok_or(RejectReason::SignatureOrDomain)?;
-
-    let count = node_record.info.multiaddrs.len();
-    if count > MAX_ADVERTISED_MULTIADDRS {
-        return Err(RejectReason::TooManyMultiaddrs { count });
-    }
+    let decoded =
+        NodeRecord::try_decode_compat(&record.value).ok_or(RejectReason::SignatureOrDomain)?;
+    let count = decoded.info.multiaddrs.len();
+    (count <= MAX_ADVERTISED_MULTIADDRS)
+        .then_some(())
+        .ok_or(RejectReason::TooManyMultiaddrs { count })?;
+    validate_advertised_addresses(&decoded.info.multiaddrs, &decoded.info.pubkey)
+        .map_err(|_| RejectReason::SignatureOrDomain)?;
+    let (key, node_record) = decoded.verify(domain, &key).ok_or(RejectReason::SignatureOrDomain)?;
 
     let expected_publisher: PeerId = node_record.info.pubkey.clone().into();
     if record.publisher != Some(expected_publisher) {
@@ -312,7 +314,19 @@ mod tests {
         let record_with = |count: usize| {
             let info = NetworkInfo {
                 pubkey: signer.network_key(),
-                multiaddrs: vec![multiaddr(); count],
+                multiaddrs: (0..count)
+                    .map(|offset| {
+                        [
+                            libp2p::multiaddr::Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST),
+                            libp2p::multiaddr::Protocol::Udp(
+                                u16::try_from(9000 + offset).unwrap_or(u16::MAX),
+                            ),
+                            libp2p::multiaddr::Protocol::QuicV1,
+                        ]
+                        .into_iter()
+                        .collect()
+                    })
+                    .collect(),
                 timestamp: now(),
                 rpc: None,
             };
