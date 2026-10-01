@@ -105,7 +105,7 @@ impl CapacitySemaphore {
         metrics::gauge!(
             "tn_network.serve_tasks_limit", "network" => network.clone(), "class" => class.label()
         )
-        .set(permits as f64);
+        .set(permits.to_string().parse::<f64>().unwrap_or(f64::MAX));
         CapacityMetrics { active, network, class }
     }
 
@@ -155,7 +155,7 @@ impl CapacitySemaphore {
 
     /// Record a refusal by an additional per-peer or deduplication admission guard.
     pub fn record_rejection(&self, reason: ServeRejection) {
-        if let Some(metrics) = &self.metrics {
+        self.metrics.iter().for_each(|metrics| {
             metrics::counter!(
                 "tn_network.serve_rejections_total",
                 "network" => metrics.network.clone(),
@@ -163,7 +163,7 @@ impl CapacitySemaphore {
                 "reason" => reason.label()
             )
             .increment(1);
-        }
+        });
     }
 }
 
@@ -186,11 +186,11 @@ pub struct CapacityPermit {
 
 impl Drop for CapacityPermit {
     fn drop(&mut self) {
-        if let Some(active) = &self.active {
+        self.active.iter().for_each(|active| {
             // Decrement before the semaphore permit is released so a concurrent admission
             // cannot transiently count both the released task and its replacement.
             active.decrement(1.0);
-        }
+        });
     }
 }
 

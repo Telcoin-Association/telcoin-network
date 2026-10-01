@@ -251,6 +251,7 @@ jobs:
       - name: Build Linux qualification binaries
         if: steps.scope.outputs.changed == 'true'
         run: |
+          python3 -B -I tools/hub-capacity/mutate-rust.py --output target/debug/hub-capacity-mutations
           cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api
           cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer
           git rev-parse HEAD > target/debug/hub-capacity-revision.txt
@@ -269,6 +270,15 @@ jobs:
             target/debug/examples/hub-capacity-peer
             target/debug/hub-capacity-revision.txt
             target/debug/hub-capacity-binaries.sha256
+
+      - name: Retain mutation diagnostics
+        if: always() && steps.scope.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-capacity-mutations-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: target/debug/hub-capacity-mutations
 
   # Clippy - replaces cargo check, catches more issues.
   #

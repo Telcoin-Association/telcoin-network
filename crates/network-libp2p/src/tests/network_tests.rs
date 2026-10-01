@@ -2958,7 +2958,13 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
     };
     let relay = PeerId::random();
     network.process_kad_put_request(relay, unrelated_record.clone())?;
-    assert!(network.swarm.behaviour().kademlia.store().get(&unrelated_record.key).is_none());
+    assert!(network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&unrelated_record.key)
+        .is_none());
     assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
 
     let required = peer2.network.get_peer_record();
@@ -2975,9 +2981,9 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
     assert_eq!(
         network
             .swarm
-            .behaviour()
+            .behaviour_mut()
             .kademlia
-            .store()
+            .store_mut()
             .get(&required.key)
             .map(|stored| stored.value.clone()),
         Some(required.value.clone())
@@ -2992,9 +2998,9 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
         .store_mut()
         .retain_connected(source, unrelated_record.key.clone())?;
     network.process_kad_put_request(source, unrelated_record.clone())?;
-    assert_eq!(network.swarm.behaviour().kademlia.store().persisted_record_count(), 2);
+    assert_eq!(network.swarm.behaviour_mut().kademlia.store_mut().persisted_record_count(), 2);
     network.swarm.behaviour_mut().kademlia.store_mut().release_connected(&source)?;
-    let store = network.swarm.behaviour().kademlia.store();
+    let store = network.swarm.behaviour_mut().kademlia.store_mut();
     assert_eq!(
         store.persisted_record_count(),
         1,
@@ -3035,7 +3041,7 @@ async fn test_kad_capacity_does_not_block_authoritative_membership() -> eyre::Re
     network.process_kad_put_request(source, record.clone())?;
     assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(member));
     assert!(network.swarm.behaviour().peer_manager.auth_to_peer(member).is_some());
-    assert!(network.swarm.behaviour().kademlia.store().get(&record.key).is_none());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none());
     Ok(())
 }
 
@@ -3066,8 +3072,10 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     crate::consensus::configure_record_jobs(&mut config, &settings);
     let mut behaviour = kad::Behaviour::with_config(local, store, config);
     behaviour.add_address(&remote, "/ip4/192.0.2.1/tcp/1".parse()?);
+    let behaviour = std::cell::RefCell::new(behaviour);
 
     wait_until(Duration::from_secs(5), "own-record publication job", || {
+        let mut behaviour = behaviour.borrow_mut();
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         let _ = behaviour.poll(&mut context);
@@ -3091,8 +3099,9 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     .await?;
 
     // Serving a retained committee binding is independent of the publication job.
-    behaviour.get_record(third_key.clone());
+    behaviour.borrow_mut().get_record(third_key.clone());
     wait_until(Duration::from_secs(5), "retained committee record lookup", || {
+        let mut behaviour = behaviour.borrow_mut();
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         let found = matches!(behaviour.poll(&mut context), std::task::Poll::Ready(
