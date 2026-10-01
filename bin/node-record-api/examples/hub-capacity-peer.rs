@@ -446,7 +446,7 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                                     .filter(|(receipt, source)| *source != receipt.propagation_source
                                         && *source != receiver_id && receipt.propagation_source != receiver_id)
                                     .for_each(|(receipt, source)| {
-                                        gossip.send_replace(Some(json!({
+                                        let _ = gossip.send_replace(Some(json!({
                                             "receipt": receipt, "swarm": role_name(role),
                                             "route": [source.to_string(), receipt.propagation_source.to_string(), receiver_id.to_string()],
                                             "author": payload.author, "relayer": payload.relayer,
@@ -495,7 +495,7 @@ async fn run_peer(args: RunArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(peer.config.control).await?;
     let public = json!({"identity": peer.identity, "bls_key": keys.primary_public_key(), "control": listener.local_addr()?, "startup_error": startup.err(), "swarms": roles.into_iter().zip(peer.config.listen.iter()).map(|(role, address)| {
         let key = match role { NetworkType::Primary => keys.primary_network_public_key(), NetworkType::Worker(id) => keys.worker_network_public_key(id) };
-        json!({"swarm": role_name(role), "peer_id": PeerId::from(key), "listen": address})
+        json!({"swarm": role_name(role), "network_key": key, "peer_id": PeerId::from(key.clone()), "listen": address})
     }).collect::<Vec<_>>()});
     let mut ready = OpenOptions::new().create_new(true).write(true).open(args.ready)?;
     ready.write_all(&serde_json::to_vec(&public)?)?;
@@ -529,14 +529,14 @@ async fn main() -> Result<()> {
                 serde_json::to_string(&json!({
                     "identity": hex::encode(tn_types::encode(&keys.primary_public_key())),
                     "bls_key": keys.primary_public_key(),
-                    "swarms": [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
+                "swarms": ([NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
                         .into_iter().map(|role| {
                             let key = match role {
                                 NetworkType::Primary => keys.primary_network_public_key(),
                                 NetworkType::Worker(id) => keys.worker_network_public_key(id),
                             };
-                            json!({"swarm": role_name(role), "peer_id": PeerId::from(key)})
-                        }).collect::<Vec<_>>(),
+                        json!({"swarm": role_name(role), "network_key": key, "peer_id": PeerId::from(key.clone())})
+                    }).collect::<Vec<_>>()),
                 }))?
             );
             Ok(())
