@@ -21,13 +21,21 @@ Transactions are not gossiped, but are distributed as sealed batches of transact
 #### Transaction Selection
 
 Each worker selects the best transactions from their respective transaction pools to include in the next proposed batch.
-Workers only propose one batch at a time, and transactions are only removed from the pool once the batch that contains them reaches quorum (2f+1).
+Workers only propose one batch at a time. Transactions selected into a batch are removed from the pool as mined only once that batch reaches quorum (2f+1).
 
 Transactions are sorted by default based on the highest fees, although this is not a strict requirement of the protocol.
 
 The only requirement is that transactions must extend the current canonical tip.
 The canonical tip is extended once a batch is settled in a DAG commit.
 The entire collection of batches is then sent to the `tn-engine` for final execution.
+
+##### Transactions that cannot fit
+
+A yielded transaction whose own gas limit or EIP-2718 encoded byte length exceeds a whole batch's limit for the current epoch is evicted during selection. These whole-batch checks precede peer deferral and remaining-capacity checks, so a full batch cannot hide an oversized transaction. Transactions that only exceed the remaining capacity stay pending for a later build.
+
+Eviction removes the rejected transaction and its sender's later nonces before quorum, even if selection produces no batch or the proposed batch fails to reach quorum. EIP-4844 blobs and other non-allowlisted transaction types are also removed with their descendants. The sender must resubmit the removed nonce with a transaction the batch protocol can carry, then resubmit its descendants.
+
+The per-worker `unpackable_txs_total` counter records transactions rejected for whole-batch limit violations, excluding their descendants. Each rejection logs a warning with the transaction hash, offending gas limit or encoded length, and the epoch's limit. Submitters still receive no eviction receipt and may time out waiting for confirmation.
 
 #### Validation
 
@@ -108,9 +116,9 @@ A flood of peer batches cannot evict a live entry; once the window is full furth
 
 #### Quorum failure does not corrupt pool state
 
-On quorum failure (any of `QuorumRejected`, `AntiQuorum`, `Timeout`, `NotValidator`, `FailedQuorum`), the spawned task returns `MinedBatchResult` with empty `mined_transactions` and empty `changed_accounts`.
-The batch builder checks `mined_transactions.is_empty()` and skips the `update_canonical_state()` call entirely.
-Pool state is unchanged and the original transactions remain in `pending` for the next attempt.
+On quorum failure (any of `QuorumRejected`, `AntiQuorum`, `Timeout`, `NotValidator`, `FailedQuorum`), the batch builder applies no mining-related `update_canonical_state()` call.
+Transactions selected into the failed batch remain in `pending` for the next attempt.
+Transactions evicted during selection, together with their descendants, have already left the pool and are not restored by quorum failure.
 
 #### Cross-header ordering is guaranteed by Bullshark
 
@@ -120,7 +128,7 @@ Headers only include the local worker's batches.
 If Header N+1 commits, all ancestor headers (including Header N) are already committed.
 The scenario where "batch with nonces 0-7 fails but batch with nonces 8-15 succeeds" is impossible:
 
-- If quorum fails: pool is not updated, same transactions are re-included in the next batch attempt
+- If quorum fails: selected transactions are not removed as mined and can be included in the next batch attempt; selection-time evictions remain in effect
 - If quorum succeeds: the batch is in a header that will be committed before any dependent header
 
 #### No race between batch builder and canonical update
@@ -133,7 +141,7 @@ The worst case is a brief window where the pool has the optimistic values, which
 #### Fatal error causes shutdown
 
 `FatalDBFailure` from the worker propagates as `Err` through the `BatchBuilder` future, shutting down the batch builder.
-No pool update occurs.
+No mining-related pool update occurs; selection-time evictions remain in effect.
 
 ### Trust Assumptions
 
@@ -145,7 +153,8 @@ No pool update occurs.
 
 ### Critical Invariants
 
-- Transactions are only removed from the transaction pool if the batch reaches quorum
+- Transactions selected into a batch (`mined_transactions`) are removed as mined only after that batch reaches quorum
+- Transactions the batch protocol cannot carry are removed immediately, before quorum and independent of it: EIP-4844 blobs, other non-allowlisted EIP-2718 types, and transactions whose own gas limit or encoded byte length exceeds a whole batch's limit for the epoch. Each is removed with its descendants, which must also be resubmitted
 - `changed_accounts` is only applied when `mined_transactions` is non-empty (same guard)
 - The engine's `process_canon_state_update()` always runs independently and overwrites the batch builder's optimistic state
 - Transaction pool state remains consistent with canonical chain execution AND batch execution
