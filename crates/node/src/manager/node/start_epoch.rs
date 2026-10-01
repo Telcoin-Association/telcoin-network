@@ -737,7 +737,12 @@ where
             }
         }
 
-        Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
+        Self::wait_for_network_peers(
+            network_handle.inner_handle(),
+            "primary network",
+            consensus_config.network_config().peer_readiness_timeout(),
+        )
+        .await?;
 
         // re-probe each peer's epoch-pack sync capability this epoch: committees
         // rotate and binaries are upgraded at the boundary, so a peer that could
@@ -876,7 +881,12 @@ where
             );
         }
 
-        Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
+        Self::wait_for_network_peers(
+            network_handle.inner_handle(),
+            "worker network",
+            consensus_config.network_config().peer_readiness_timeout(),
+        )
+        .await?;
 
         // Decide the batch-digest gossip subscription for this epoch (issue #960). Committee
         // validators subscribe to warm the vote path's batch cache; observers unsubscribe,
@@ -1030,30 +1040,32 @@ where
     /// Give the given [`NetworkHandle`] a bounded wait for an established peer available for
     /// requests. Pending dials do not satisfy this readiness check.
     ///
-    /// Polls the peer count every 500ms, logging periodically, and continues startup after 240
-    /// attempts (~2 minutes) even if no peer has connected. A validator can start before the rest
-    /// of its committee: the live swarm keeps accepting connections, and consensus can form
-    /// once peers arrive. A readiness timeout must not terminate the node or its RPC service.
-    /// Generic over the [`TNMessage`] request/response types so it serves both the primary and
-    /// worker networks.
+    /// Polls the peer count every 500ms, logging periodically, and continues startup when the
+    /// configured budget expires, even if no peer has connected. A validator can start before the
+    /// rest of its committee: the live swarm keeps accepting connections, and consensus can
+    /// form once peers arrive. A readiness timeout must not terminate the node or its RPC
+    /// service. Generic over the [`TNMessage`] request/response types so it serves both the
+    /// primary and worker networks.
     async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         network_name: &str,
+        readiness_timeout: Duration,
     ) -> eyre::Result<()> {
-        let mut peers = handle.established_peer_count().await.unwrap_or(0);
-        let mut retries = 0;
-        while peers == 0 {
-            retries += 1;
-            if retries > 240 {
-                warn!(target: "epoch-manager", "{network_name} has no connected peers; continuing startup");
-                return Ok(());
+        let readiness = async {
+            let mut peers = handle.established_peer_count().await.unwrap_or(0);
+            let mut retries = 0;
+            while peers == 0 {
+                retries += 1;
+                if retries % 10 == 0 {
+                    error!(target: "epoch-manager", "failed to join the {network_name}!");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                peers = handle.established_peer_count().await.unwrap_or(0);
             }
-            if retries % 10 == 0 {
-                error!(target: "epoch-manager", "failed to join the {network_name}!");
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = handle.established_peer_count().await.unwrap_or(0);
-        }
+        };
+        tokio::time::timeout(readiness_timeout, readiness).await.unwrap_or_else(|_| {
+            warn!(target: "epoch-manager", "{network_name} has no connected peers; continuing startup");
+        });
         Ok(())
     }
 }
@@ -1371,8 +1383,11 @@ mod tests {
 
         let (sender, mut commands) = tokio::sync::mpsc::channel(2);
         let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
-        let readiness =
-            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network");
+        let readiness = EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(
+            &handle,
+            "test network",
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        );
         tokio::pin!(readiness);
         assert!(futures::poll!(&mut readiness).is_pending());
         let initial_probe = commands.try_recv()?;
@@ -1395,6 +1410,26 @@ mod tests {
     /// A network with no established peers exhausts its readiness wait without failing startup.
     #[tokio::test(start_paused = true)]
     async fn network_readiness_timeout_allows_startup() -> eyre::Result<()> {
+        assert_network_readiness_timeout(
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        )
+        .await
+    }
+
+    /// Configured budgets, including zero and sub-poll intervals, bound the entire readiness wait.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_uses_configured_timeout() -> eyre::Result<()> {
+        use futures::{StreamExt as _, TryStreamExt as _};
+        use std::time::Duration;
+
+        futures::stream::iter([Duration::ZERO, Duration::from_millis(125), Duration::from_secs(5)])
+            .map(Ok::<_, eyre::Report>)
+            .try_for_each(assert_network_readiness_timeout)
+            .await
+    }
+
+    /// Assert that a peerless network continues startup at the requested deadline.
+    async fn assert_network_readiness_timeout(timeout: std::time::Duration) -> eyre::Result<()> {
         use super::{EpochManager, NetworkHandle};
         use futures::{StreamExt as _, TryStreamExt as _};
         use std::{path::PathBuf, time::Duration};
@@ -1410,7 +1445,9 @@ mod tests {
             .map(Ok::<_, eyre::Report>)
             .try_for_each(|command| async move {
                 if let NetworkCommand::EstablishedPeerCount { reply } = command {
-                    reply.send(0).map_err(|count| eyre::eyre!("peer count {count} was dropped"))
+                    // Deadline expiry can cancel an in-flight probe before this reply is sent.
+                    let _ = reply.send(0);
+                    Ok(())
                 } else {
                     Err(eyre::eyre!("readiness probe must exclude pending dials"))
                 }
@@ -1420,11 +1457,15 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
-            Duration::from_secs(121),
-            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network"),
+            timeout + Duration::from_secs(1),
+            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(
+                &handle,
+                "test network",
+                timeout,
+            ),
         )
         .await??;
-        assert_eq!(started.elapsed(), Duration::from_secs(120));
+        assert_eq!(started.elapsed(), timeout);
         drop(handle);
         replies.await??;
         Ok(())

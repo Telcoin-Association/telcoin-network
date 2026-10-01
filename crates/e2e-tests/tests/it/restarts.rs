@@ -21,6 +21,7 @@ use std::{
     process::Child,
     time::{Duration, Instant},
 };
+use tn_config::NetworkConfig;
 use tn_test_utils::wait_until_blocking;
 use tn_types::{get_available_tcp_port, NodeMode};
 use tracing::{error, info};
@@ -714,9 +715,13 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let temp = tempfile::TempDir::new()?;
     let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs/cold_genesis");
-    let peer_readiness_wait = Duration::from_millis(500) * 240;
     let startup_sync_wait = Duration::from_secs(30);
     config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
+    let alone_dir = temp.path().join("validator-1");
+    let mut network_config = NetworkConfig::read_config(&alone_dir)?;
+    network_config.set_peer_readiness_timeout(Duration::from_secs(5));
+    network_config.write_config(&alone_dir)?;
+    let peer_readiness_wait = NetworkConfig::read_config(&alone_dir)?.peer_readiness_timeout();
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
         get_available_tcp_port("127.0.0.1")
@@ -761,16 +766,25 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
             },
         )?;
 
-        // Primary and worker readiness each wait 240 x 500ms. Observe beyond both waits plus the
-        // 30s startup-sync deadline, even if every stage spends its entire allowance without peers.
-        // Start this window after RPC is ready so slow process startup cannot shorten it.
+        // Observe both actual timeout continuations before introducing peers. Keep checking RPC
+        // and process liveness, with headroom derived from this node's persisted readiness budget.
         let observation = peer_readiness_wait * 2 + startup_sync_wait;
-        let started = Instant::now();
         wait_until_blocking(
             observation + Duration::from_secs(30),
             &format!("cold-genesis RPC stays available without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
+                let logs = format!(
+                    "{}\n{}",
+                    std::fs::read_to_string(log_dir.join("node0-run0.log"))?,
+                    std::fs::read_to_string(log_dir.join("node0-run0.stderr.log"))?,
+                );
+                let timed_out = [
+                    "primary network has no connected peers; continuing startup",
+                    "worker network has no connected peers; continuing startup",
+                ]
+                .iter()
+                .all(|message| logs.contains(message));
                 call_rpc::<String, _, _>(
                     alone_url,
                     "eth_blockNumber",
@@ -779,7 +793,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                     "cold-genesis liveness",
                 )
                 .wrap_err("cold-genesis RPC stopped responding while alone")?;
-                Ok(started.elapsed() >= observation)
+                Ok(timed_out)
             },
         )?;
     }
