@@ -216,7 +216,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         if: steps.scope.outputs.changed == 'true'
-        run: rustup toolchain install 1.94 --profile minimal
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
 
       - name: Install cargo-nextest
         if: steps.scope.outputs.changed == 'true'

@@ -30,7 +30,7 @@ def declaration():
         "candidate": {**phase, "profile": candidate_profile},
         "envelope": {"cpus_per_hub": 4, "ram_bytes_per_hub": 8 * 1024**3,
                      "link_mbps": 25, "rtt_ms": 50, "loss_percent": 0.1,
-                     "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 12,
+                     "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 4,
                      "workers_per_hub": 2, "duration_seconds": 600,
                      "hardware": "synthetic", "network_setup": "synthetic"},
         "hubs": ["hub-0"], "threshold_owner": "synthetic fixture",

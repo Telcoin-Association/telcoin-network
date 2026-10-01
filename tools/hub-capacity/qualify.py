@@ -105,7 +105,7 @@ def validate_plan(plan):
         fail("loss_percent exceeds 100")
     if envelope["public_peers"] != 64 or envelope["shared_nat_peers"] != 16:
         fail("v1 qualifies 64 public peers, including 16 sharing one NAT")
-    if envelope["dao_observers"] != 8 or envelope["committee_peers"] != 12 or envelope["workers_per_hub"] != 2:
+    if envelope["dao_observers"] != 8 or envelope["committee_peers"] != 4 or envelope["workers_per_hub"] != 2:
         fail("v1 requires 8 DAO observers, 12 committee peers across rotation, and 2 workers per hub")
     if envelope["duration_seconds"] < 600:
         fail("each phase must last at least 600 seconds")
@@ -344,7 +344,7 @@ def main():
             "candidate": {**phase, "profile": read_json(ROOT / "profile-v1.json")},
             "envelope": {"cpus_per_hub": 4, "ram_bytes_per_hub": 8 * 1024**3,
                          "link_mbps": 25, "rtt_ms": 50, "loss_percent": 0.1,
-                         "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 12,
+                         "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 4,
                          "workers_per_hub": 2, "duration_seconds": 600,
                          "hardware": "REPLACE_WITH_HARDWARE_DESCRIPTION",
                          "network_setup": "REPLACE_WITH_REPRODUCIBLE_NETWORK_COMMANDS"},

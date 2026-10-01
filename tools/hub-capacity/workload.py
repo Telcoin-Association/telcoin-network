@@ -27,6 +27,8 @@ def validate_manifest(plan, manifest):
     for scenario, definition in manifest["scenarios"].items():
         if QUALIFY.integer(definition["concurrency"], "driver concurrency", 1) > 16:
             raise ValueError("driver concurrency must not exceed sixteen")
+        if not 0 <= QUALIFY.number(definition.get("offset_fraction", 0), "schedule offset") < 1:
+            raise ValueError("schedule offset must be between zero and one")
         if not definition["agents"] or len(definition["agents"]) > 128:
             raise ValueError("every scenario requires a bounded peer-agent population")
         identities = set()
@@ -155,7 +157,7 @@ def run(plan, manifest, output, origin):
             with ThreadPoolExecutor(max_workers=definition["concurrency"]) as executor:
                 futures = []
                 for index in range(target):
-                    due = origin + index * duration / target
+                    due = origin + (index + definition.get("offset_fraction", 0)) * duration / target
                     time.sleep(max(0, due - time.monotonic()))
                     operation_id = f"{scenario}-{index}"
                     agent = definition["agents"][index % len(definition["agents"])]

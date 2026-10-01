@@ -2,6 +2,7 @@
 """Correlate bounded production JSON logs with real gossip and committee observations."""
 
 import argparse
+import os
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -145,6 +146,7 @@ def main():
     parser.add_argument("--source", action="append", required=True, help="public identity=production JSON log")
     parser.add_argument("--hub", action="append", required=True)
     parser.add_argument("--listen", default="127.0.0.1:9400")
+    parser.add_argument("--pid-file", type=Path, required=True)
     args = parser.parse_args()
     sources = dict(entry.split("=", 1) for entry in args.source)
     if len(sources) != len(args.source) or not set(args.hub) <= set(sources) or len(args.hub) != 2:
@@ -154,6 +156,8 @@ def main():
         threading.Thread(target=follow, args=(observations, source, Path(path)), daemon=True).start()
     host, port = args.listen.rsplit(":", 1)
     server = BoundedServer((host, int(port)), handler_for(observations))
+    with args.pid_file.open("x") as output:
+        output.write(str(os.getpid()) + "\n")
     server.serve_forever()
 
 

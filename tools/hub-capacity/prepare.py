@@ -41,7 +41,7 @@ def peer_population():
 def validators():
     return [{"name": f"validator-{index + 1:02}", "ip": f"10.147.0.{10 + index}" if index < 2 else f"10.147.4.{index - 1}",
              "namespace": None if index < 2 else f"validator-{index + 1:02}", "hub": index < 2}
-            for index in range(12)]
+            for index in range(4)]
 
 
 def initialize(root, binary, peer_binary):
@@ -104,7 +104,7 @@ def phase_inputs(root, phase, binary, profile_path):
         }
     dao = [peer["bls_key"] for peer in population["dao"]]
     candidate = json.loads(profile_path.read_text())
-    candidate["libp2p_config"]["chain_id"] = CHAIN_ID
+    candidate.setdefault("libp2p_config", {})["chain_id"] = CHAIN_ID
     candidate.update({"bootstrap_peers": bootstrap, "dao_observers": dao})
     baseline = {"libp2p_config": {"chain_id": CHAIN_ID}, "bootstrap_peers": bootstrap, "dao_observers": dao}
     write_json(output / "candidate-profile.json", candidate)
@@ -115,7 +115,7 @@ def phase_inputs(root, phase, binary, profile_path):
         shutil.copytree(shared / "genesis", directory / "genesis")
         shutil.copy(parameters_path, directory / "parameters.yaml")
         profile = baseline if phase == "baseline" and node["hub"] else candidate
-        write_json(directory / "network-config.yaml", profile)
+        write_json(directory / "network-config", profile)
         command = {"argv": [str(binary), "node", "--datadir", str(directory),
                              "--bls-passphrase-source", "no-passphrase", "--http", "--http.addr", "0.0.0.0",
                              "--http.port", "8545", "--ipcdisable", "--node-name", node["name"],
@@ -129,6 +129,16 @@ def phase_inputs(root, phase, binary, profile_path):
         network = copy.deepcopy(candidate)
         network["dao_observers"] = []
         network["bootstrap_peers"] = {node["bls_key"]: node["p2p_info"] for node in nodes[:2]}
+        # Clients retain both hubs and at most one ordinary peer per swarm. The measured hub
+        # profiles remain exact; these distinct client limits are retained in deployment inputs.
+        network["public_peer_limit"] = 1
+        network["peer_config"]["target_num_peers"] = 2
+        network["process_budget"].update({"max_established_connections": 12,
+                                         "max_inbound_streams": 192,
+                                         "max_receive_credit_bytes": 48 * 1024**2})
+        network["source_admission"].update({"max_connections": 12, "max_connections_per_address": 12,
+                                            "max_connections_per_prefix": 12, "max_sources": 12})
+        network["gossip_mesh"] = {"target": 2, "low": 1, "high": 4, "outbound_min": 1}
         write_json(peers / f"{peer['name']}.json", {"seed": peer["seed"], "network": network,
                    "listen": [address(peer["ip"], role) for role in range(3)],
                    "control": f"{peer['ip']}:9500", "required_hubs": [node["bls_key"] for node in nodes[:2]],

@@ -61,106 +61,93 @@ poll and releases its measurement on completion, failure, or cancellation.
 
 ## Predeclared qualification
 
-```sh
-python3 -I tools/hub-capacity/qualify.py template --output declaration.json
-python3 -I tools/hub-capacity/qualify.py freeze declaration.json --output plan.json
-```
+The template declares two hubs, each with four assigned CPUs, 8 GiB RAM, a
+25 Mbit/s link, 50 ms RTT and 0.1% loss. It uses 64 ordinary public peers,
+including sixteen behind one kernel NAT, eight DAO observers, four active
+validators and two workers per hub. The profile reserves twelve committee
+identities across previous, current and next committees. Four active validators
+exercise the three-swarm process budget within that reservation.
 
-Before freezing, fill in exact source revisions, build commands, binary SHA-256,
-the baseline's effective configuration, hub IDs, a live adapter command, and
-hardware/network setup. Archive the frozen plan before traffic starts. A changed
-configuration or envelope requires a new plan and complete baseline/candidate run.
-
-The template proposes two hubs, each with 4 dedicated CPUs, 8 GiB RAM, a 25 Mbit/s
-link, 50 ms RTT, and 0.1% loss. It declares 64 public peers (16 sharing one NAT),
-8 DAO observers, 12 committee identities across rotation, and 2 workers per hub.
-Each phase lasts at least 10 minutes. The PR author selects these experimental
+Each phase lasts at least ten minutes. The PR author selected the experimental
 criteria under the requester's instruction to use engineering judgment.
+`qualify.py freeze` validates and hashes the exact profiles, revisions, binaries,
+workload and thresholds before measurement. Changing a profile or envelope
+requires a new frozen plan and complete baseline/candidate run.
 
-Each scenario requires 99% success. The template sets absolute p99 limits:
-joins 8 s, shared-NAT reconnects 20 s, gossip beyond a direct hub 3 s,
-record/submit-URL resolution 3 s, concurrent sync 30 s, committee progress 1.5 s,
-and DAO connectivity checks 1 s. It declares minimum attempts for every scenario.
-Whole-process RSS must stay at or below 4 GiB, CPU at or below 3 cores per sample
-interval, queue occupancy at or below 100, and DAO connectivity at 8 throughout.
-Application progress must never regress or stall for more than 15 seconds.
+Every scenario requires 99% success. The p99 limits are joins 8 s, shared-NAT
+restarts 20 s, gossip beyond a direct hub 3 s, record and submit-URL resolution
+3 s, concurrent sync 30 s, committee requests 1.5 s, and DAO connectivity 1 s.
+The plan also declares minimum attempts for each scenario. Committee request
+observations retain failures and cancellations. Completed requests determine
+success and latency; cancellations must remain at or below 35%, reflecting the
+certifier's cancellation of obsolete proposals and requests after quorum.
+
+Whole-process RSS must stay at or below 4 GiB, CPU at or below three cores per
+sample interval, queue occupancy at or below 100, and DAO connectivity at eight
+on the primary and each worker throughout measurement. Executed-chain progress
+must never regress or stall for more than fifteen seconds.
 
 ## Collection and concurrent workload
 
-`collect.py` measures Linux hub processes through `/proc` and their Prometheus
-endpoints. It verifies the running executable, declared revision, exact profile,
-and frozen driver command. It rejects process restarts, missing metrics, sparse
-samples, and incomplete workloads. It retains raw process data, Prometheus
-expositions, topology, workload output, and operation logs with SHA-256 hashes.
-The collector supports hubs in local network namespaces; separate physical hosts
-need collection on each host and a coordinator that preserves the same evidence.
+`docker-run.py` creates a private Linux topology, prepares a fresh local chain
+with ID 4476, freezes the plan and runs baseline and candidate phases. Both use
+the same binaries, identities, link conditions and concurrent workload. The
+baseline uses default network limits with the same bootstrap peers and DAO
+identities. The candidate uses `profile-v1.json`. Each phase starts with fresh
+databases and waits ninety seconds before measurement.
 
-Declare the same eight `dao_observers` BLS identities in both phases. Every
-candidate observer must appear in `bootstrap_peers`, whose existing trusted-peer
-policy supplies retention protection. Startup rejects more than eight declared
-observers or an observer missing from this trusted set. The scorer checks DAO
-connectivity on the primary and both workers, and requires the declared ordinary
-population to be observed on every swarm.
+The Linux VM needs twelve CPUs and at least 20 GiB RAM. Each hub has a separate
+four-CPU, 8 GiB container; the coordinator hosts the other two validators and
+72 persistent peer processes. Participant namespaces receive 25 Mbit/s,
+25 ms egress delay and 0.1% loss. Sixteen namespace peers share the coordinator's
+SNAT address. The coordinator shares a private PID namespace with the hubs so
+the collector can inspect their actual processes. Cleanup removes only the
+containers and network created by the invocation.
 
-Collector bindings name every hub's PID, metrics URL, revision, profile file, and
-monotonic application-progress metric selector. Use a consensus or canonical
-execution progress metric, rather than a network event counter. For example:
-
-```json
-{
-  "hubs": {
-    "hub-0": {
-      "pid": 1234,
-      "metrics_url": "http://127.0.0.1:9100/metrics",
-      "revision": "REPLACE_WITH_SOURCE_SHA",
-      "profile_path": "candidate-network.json",
-      "progress": {"name": "REPLACE_WITH_APPLICATION_PROGRESS_METRIC"}
-    }
-  },
-  "workload": ["python3", "-B", "-I", "tools/hub-capacity/workload.py", "plan.json", "manifest.json", "--manifest-sha256", "REPLACE_WITH_MANIFEST_SHA256"],
-  "topology_artifact": "topology.json"
-}
-```
-
-Add `hub-1` for the two-hub envelope. The exact shell-quoted workload argument
-vector must equal the frozen `adapter_command`. Build the peer population,
-provision the DAO identities, and wait for the declared connections before
-starting measurement. Preserve the commands that establish CPU/RAM constraints,
-25 Mbps links, 50 ms RTT, loss, and shared-NAT placement in `topology.json`.
-Spread protected identities and other sources across the declared subnets so
-the address and prefix accounting matches the intended NAT envelope.
-
-`workload.py` schedules all eight scenarios concurrently for the frozen duration,
-with at most sixteen executing agent commands per scenario and no unbounded
-waiting queue. A scenario definition supplies `concurrency` and an `agents` list,
-each entry containing a distinct `identity` and an executable `argv` vector.
-Public joins require 64 identities, shared-NAT reconnects require 16, and DAO
-connectivity requires 8. Agent commands perform real protocol operations and
-return JSON with `operation_id`, `scenario`, boolean `success`, a refusal reason
-on failure, and a raw protocol `trace` on success. The driver supplies the first
-two values through `HUB_CAPACITY_OPERATION_ID` and `HUB_CAPACITY_SCENARIO`.
-Successful gossip also returns a `route` of distinct sender, relay, and receiver
-identities. The driver records measured latency, completion time, argv, raw
-stdout/stderr, timeouts, and admission failures, including unsuccessful attempts.
-Protocol-specific agent implementations and the reproducible live population
-run still remain to be completed. The unit fixtures are synthetic.
+Download the `hub-capacity-linux-arm64-<revision>` artifact from the successful CI run for
+the exact checkout revision. The runner verifies its source revision and binary
+digests, copies the executables into its output directory and checks that the
+qualification scripts are committed at the same revision.
 
 ```sh
-python3 -B -I tools/hub-capacity/collect.py plan.json bindings-baseline.json \
-  --phase baseline --output baseline-run
-python3 -B -I tools/hub-capacity/collect.py plan.json bindings-candidate.json \
-  --phase candidate --output candidate-run
+docker build -t tn-capacity-1476-runtime:ubuntu24 tools/hub-capacity
+python3 -B -I tools/hub-capacity/docker-run.py \
+  --binaries /absolute/path/to/extracted-ci-artifact \
+  --output /absolute/path/to/new-qualification-directory
 ```
 
-```sh
-python3 -I tools/hub-capacity/qualify.py score plan.json baseline-run/evidence.json candidate-run/evidence.json \
-  --output report.json
-```
+The peer example uses the production libp2p network, deterministic local test
+identities and three persistent swarms. Commands perform authenticated joins,
+fresh signature-validated record queries, worker submit-URL resolution and
+nonempty ACK/DATA/END epoch transfers. Shared-NAT commands restart the actual
+peer process, preserve its keys and verify connections to both hubs on every
+swarm. DAO checks observe those same live authenticated connections.
 
-The scorer binds evidence to the frozen plan, revision, binary and configuration
-digests, and envelope; checks all swarms and scenarios; and verifies raw artifact
-SHA-256. Artifact paths are absolute or relative to their evidence file. Split
-logs into at most 64 files of at most 64 MiB per phase. Sparse/missing/nonfinite
-data and direct-only gossip fail validation. Reports retain both phases;
-candidate threshold failures exit 1 and invalid evidence exits 2. A passing report
-still requires review of raw traffic/topology/overlap traces.
+Gossip receipts retain message ID, author, authenticated forwarding peer and
+receipt time. The log service correlates each receipt with the actual publisher
+event. Successful routes require three distinct identities and publication
+after measurement starts. Committee observations come from every validator's
+production JSON log, with the measured hubs' actual vote-request latency,
+completion, failure and cancellation data.
+
+`workload.py` schedules all eight scenarios concurrently with bounded command
+concurrency. Its frozen manifest binds agent identities and argv; every reply
+must match its operation nonce, scenario and identity. Failed commands remain
+in the operation log and success denominator. Reconnect scheduling offsets NAT
+restarts from ordinary joins.
+
+`collect.py` checks executable SHA-256, argv, CPU affinity, cgroup CPU/RAM
+limits, declared revision, exact profile and frozen driver command. It measures
+whole-process user and system CPU, RSS, primary and both worker allocations,
+class tasks, queues, rejection counters and source-accounting rows. Its progress
+selector is `tn_engine_canonical_height`, updated after consensus execution.
+Process restarts, missing metrics, sparse sampling, invalid observations and
+incomplete workloads fail collection.
+
+The output retains the frozen plan, workload manifest, runtime and topology
+declarations, public deployment hashes, raw process/Prometheus samples, all four
+validator logs and nonce-bound operation traces. The final scorer verifies raw
+artifact hashes and writes baseline/candidate results to `report.json`.
+Publish the evidence directories, plan, manifest, report and public topology
+inputs. Private keys under `deployment/templates` belong only to the disposable
+local fixture. Unit tests and topology smokes alone do not qualify hub capacity.

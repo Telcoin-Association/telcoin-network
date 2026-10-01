@@ -216,6 +216,23 @@ def read_operations(path):
     return result
 
 
+def validate_process(binding, envelope, proc=Path("/proc"), affinity=None):
+    """Reject a deployment whose argv, CPU assignment or cgroup limits differ from its plan."""
+    pid = QUALIFY.integer(binding["pid"], "hub pid", 1)
+    directory = proc / str(pid)
+    argv = [part.decode() for part in (directory / "cmdline").read_bytes().split(b"\0") if part]
+    if argv != binding["argv"]:
+        raise ValueError("running command does not match deployment")
+    if sorted((affinity or os.sched_getaffinity)(pid)) != binding["cpu_affinity"]:
+        raise ValueError("CPU affinity does not match deployment")
+    cgroup = directory / "root/sys/fs/cgroup"
+    if int((cgroup / "memory.max").read_text()) != envelope["ram_bytes_per_hub"]:
+        raise ValueError("container memory limit does not match envelope")
+    quota, period = (cgroup / "cpu.max").read_text().split()
+    if int(quota) / int(period) != envelope["cpus_per_hub"]:
+        raise ValueError("container CPU quota does not match envelope")
+
+
 def collect(frozen, bindings, phase, output):
     plan = frozen["plan"]
     if frozen["plan_sha256"] != QUALIFY.digest(plan):
@@ -243,6 +260,7 @@ def collect(frozen, bindings, phase, output):
         if QUALIFY.digest(QUALIFY.read_json(Path(binding["profile_path"]))) != QUALIFY.digest(plan[phase]["profile"]):
             raise ValueError(f"{hub}: deployment profile mismatch")
         pid = QUALIFY.integer(binding["pid"], "hub pid", 1)
+        validate_process(binding, plan["envelope"])
         binary = Path("/proc") / str(pid) / "exe"
         if file_hash(binary) != plan[phase]["binary_sha256"]["telcoin-network"]:
             raise ValueError(f"{hub}: running executable digest mismatch")
