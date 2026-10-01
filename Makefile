@@ -55,6 +55,13 @@ help:
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
 	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
 	@echo ;
+	@echo "make test-e2e-subsecond-fork" ;
+	@echo "    :::> Build this checkout's e2e node binary and the one at TN_PREV_REF (default ba7654d8a, the last commit before #1453)," ;
+	@echo "    :::> then run every e2e test that crosses the sub-second-timestamp fork." ;
+	@echo ;
+	@echo "make test-e2e-subsecond-fork-all-forks" ;
+	@echo "    :::> The same tests with the multi-workers and PREVRANDAO forks also active from genesis, as on adiri when that fork arms." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -171,6 +178,47 @@ build-e2e-bin-adiri:
 # Location of the binary built by build-e2e-bin-adiri. Same expression pairing as E2E_BIN above,
 # so the producing and the consuming path cannot diverge.
 E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
+
+# The commit the mixed-binary e2e tests run as the PREVIOUS node version: the old half of an
+# in-place upgrade, or a validator still on the old binary when the sub-second-timestamp fork
+# arrives. Defaults to ba7654d8a, the main commit #1453 was merged onto, so the old binary is the
+# last one built without the sub-second change. Any commit-ish works; the last release is
+#   make test-e2e-subsecond-fork TN_PREV_REF=v0.15.0-adiri
+# which also lacks the commits merged between that tag and ba7654d8a, so the two binaries then
+# differ by more than the fork.
+TN_PREV_REF ?= ba7654d8a
+
+# Source checkout and target root for the previous binary. Both are NESTED in E2E_TARGET_ROOT, like
+# E2E_TARGET_ROOT_ADIRI, so a developer's CARGO_TARGET_DIR is honored the same way and the
+# `target/` ignore rule covers them. The sources are a detached git worktree rather than a fresh
+# clone or a checkout of this tree: it shares this clone's objects (nothing to fetch), leaves this
+# checkout's branch and files alone, and builds the ref with its own Makefile, Cargo.lock and
+# .cargo/config.toml, so the binary is what that ref builds and not old sources under new build
+# settings. The target root is separate for the same reason the adiri one is: a shared root would
+# rebuild the whole graph on every switch and leave target/e2e/telcoin-network holding whichever
+# sources built last.
+E2E_PREV_SRC := $(E2E_TARGET_ROOT)/prev-src
+E2E_TARGET_ROOT_PREV := $(E2E_TARGET_ROOT)/prev-e2e
+
+# Location of the binary built by build-e2e-bin-prev, passed to the e2e tests via
+# TN_BIN_PATH_PREV. The old ref's Makefile derives its --target-dir from CARGO_TARGET_DIR, which
+# the build sets to E2E_TARGET_ROOT_PREV, so this is the same expression pairing as E2E_BIN.
+E2E_BIN_PREV := $(E2E_TARGET_ROOT_PREV)/e2e/telcoin-network
+
+# Build the node binary at TN_PREV_REF with that ref's own `make build-e2e-bin`. The script adds the
+# worktree or checks the ref out in it, initializes tn-contracts with --reference to this
+# checkout's copy (the contract history comes from local objects instead of a second download),
+# builds, and fails unless the binary's --version names the ref's commit. The steps and their edge
+# cases are described in etc/build-prev-e2e-bin.sh.
+#
+# The worktree is registered with this clone, so `git worktree list` shows it. Remove it with
+#   git worktree remove --force target/prev-src
+# (--force because it holds an initialized submodule). `cargo clean` deletes the directory but not
+# the registration, which `git worktree list` then marks prunable: `git worktree prune` clears it,
+# and the next build-e2e-bin-prev replaces it rather than registering the path a second time.
+.PHONY: build-e2e-bin-prev
+build-e2e-bin-prev:
+	./etc/build-prev-e2e-bin.sh "$(TN_PREV_REF)" "$(E2E_PREV_SRC)" "$(E2E_TARGET_ROOT_PREV)" "$(E2E_BIN_PREV)" ;
 
 # Seed-signature fork epoch for the e2e lanes (#1032). Defaults to u32::MAX so the default
 # lanes run the fork DORMANT (wire-identical to pre-fork mainnet); non-adiri builds are
@@ -323,6 +371,52 @@ test-e2e-forked:
 # other lane must not use.
 test-e2e-governance-safe: build-e2e-bin-adiri
 	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
+
+# run every e2e test that crosses the sub-second-timestamp fork, with this checkout's e2e binary
+# as TN_BIN_PATH and the TN_PREV_REF binary as TN_BIN_PATH_PREV. The set, by file:
+#   epochs.rs                 test_epoch_subsecond_timestamps_across_fork
+#                             test_epoch_sync_across_subsecond_fork
+#                             test_epoch_sync_subsecond_fork_activates_while_down
+#   restarts.rs               test_restarts_across_subsecond_fork
+#   sync.rs                   test_epoch_observer_joins_after_subsecond_fork
+#                             test_epoch_observer_follows_across_subsecond_fork
+#                             test_epoch_observer_paused_across_subsecond_fork
+#   state_export_import.rs    test_epoch_snapshot_import_across_subsecond_fork
+#                             test_epoch_snapshot_restore_validator_across_subsecond_fork
+#   subsecond_upgrade.rs      test_epoch_upgrade_in_place_before_subsecond_fork
+#                             test_epoch_late_upgrader_after_subsecond_fork
+#   subsecond_vote_window.rs  test_epoch_late_validator_vote_window_across_subsecond_fork
+#                             test_epoch_vote_window_refuses_prefork_genesis_subsecond_fork
+#   subsecond_clock_skew.rs   test_epoch_clock_skew_ahead_200ms_across_subsecond_fork
+#                             test_epoch_clock_skew_ahead_2s_across_subsecond_fork
+#                             test_epoch_clock_skew_behind_2s_across_subsecond_fork
+# A regex filterset rather than the positional substring the lanes above take: the seam tests are
+# named `*subsecond_fork*` except test_epoch_subsecond_timestamps_across_fork, which predates that
+# rule, and no single substring matches both spellings. "subsecond, then later fork" does.
+#
+# The six fork variables are forwarded as in test-epochs. On top of them each test pins the
+# seed-signature fork at 0 (the sub-second gate conjoins it fail-closed) and its own sub-second
+# fork epoch. The previous binary predates the sub-second fork and ignores that one variable.
+#
+# Every name above also starts with test_epoch_ or test_restarts_, so test-epochs and
+# test-restarts run these tests too, as does test-e2e, which takes every ignored test. Those lanes
+# do not export TN_BIN_PATH_PREV, so there the tests that need the previous binary skip with a
+# warning and the rest run in full.
+.PHONY: test-e2e-subsecond-fork
+test-e2e-subsecond-fork: build-e2e-bin build-e2e-bin-prev
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(E2E_BIN_PREV)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all -E 'test(/subsecond.*fork/)' ;
+
+# run the same set with every other fork active from genesis, the state adiri will be in when its
+# sub-second fork arms: seed-signature (383), governance-Safe (554), leader-seeded ordering (567),
+# multi-workers (570) and PREVRANDAO (574) all come first. Recursive like test-e2e-forked so the
+# two lanes cannot drift. Only the two forks the lane defaults leave dormant are armed here: the
+# tests pin the seed-signature fork at 0 themselves, leader-seeded ordering already defaults to 0,
+# and the governance-Safe fork is compiled out of the non-adiri binaries both lanes run. The
+# previous binary reads both variables, so a mixed committee agrees on every fork but the one
+# under test.
+.PHONY: test-e2e-subsecond-fork-all-forks
+test-e2e-subsecond-fork-all-forks:
+	$(MAKE) test-e2e-subsecond-fork TN_MULTI_WORKERS_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
