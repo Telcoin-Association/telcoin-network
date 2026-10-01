@@ -184,13 +184,84 @@ pub fn now() -> TimestampSec {
 }
 
 /// Returns the current time expressed as UNIX timestamp in milliseconds.
+///
+/// A build with `test-utils` shifts the reading by the signed millisecond offset in
+/// `TN_TEST_CLOCK_OFFSET_MS` so e2e tests can skew one node's clock. Without that feature this is
+/// the system clock, unshifted.
 pub fn now_ms() -> TimestampMs {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+    let now = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
         // a u64 holds epoch milliseconds for roughly 584 million years, so the cast cannot
         // truncate in practice
         Ok(n) => TimestampMs::from_millis(n.as_millis() as u64),
         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
-    }
+    };
+    #[cfg(feature = "test-utils")]
+    let now = apply_clock_offset(now, test_clock_offset_ms());
+    now
+}
+
+/// Test-only offset, in signed milliseconds, that [`now_ms`] adds to the system clock, read once
+/// from `TN_TEST_CLOCK_OFFSET_MS`.
+///
+/// It exists for e2e clock-skew tests. Every node of an e2e run reads the same host clock, so
+/// without it the voter's drift checks and the proposer's wait for its parents' timestamps never
+/// see one node's clock lead or lag another's. The value models a validator whose wall clock is
+/// off by that amount: positive runs the node's clock ahead of its peers', negative behind. The
+/// shift applies inside [`now_ms`], so [`now`], both `elapsed` implementations and every caller of
+/// those follow it. Clocks read without going through [`now_ms`] (monotonic `Instant`s, direct
+/// `SystemTime` reads, log timestamps) are not shifted.
+///
+/// The e2e harness sets it per spawned node and never exports it process-wide: a child process
+/// inherits the harness's environment, so an exported value would skew every node rather than
+/// the one under test. It is an environment variable for the same reason the fork-epoch overrides
+/// in `crate::forks` are: spawned nodes share no memory with the harness.
+///
+/// Unset means no offset. A value that does not parse as an `i64` is ignored with a warning,
+/// leaving the clock unshifted (see [`parse_clock_offset_ms`]). The shifted time saturates at 0
+/// and at `u64::MAX` (see [`apply_clock_offset`]). The first read of a valid non-zero offset logs
+/// it once at info level, so an e2e test can prove the binary it runs carries this hook. Compiled
+/// out entirely without `test-utils`; like the fork-epoch overrides, a node-scoped release build
+/// lacks it and a workspace-root build without `-p` has it.
+#[cfg(feature = "test-utils")]
+fn test_clock_offset_ms() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        // a non-unicode value is lossily converted so it is warned about rather than read as unset
+        let raw = std::env::var_os("TN_TEST_CLOCK_OFFSET_MS");
+        let offset_ms =
+            parse_clock_offset_ms(raw.as_deref().map(|raw| raw.to_string_lossy()).as_deref());
+        if offset_ms != 0 {
+            tracing::info!(target: "tn::consensus", offset_ms, "test clock offset applied");
+        }
+        offset_ms
+    })
+}
+
+/// Parses a `TN_TEST_CLOCK_OFFSET_MS` value into signed milliseconds.
+///
+/// `None` (the variable is unset) yields 0. Surrounding whitespace is trimmed and a leading `+`
+/// is accepted. A value that does not parse as an `i64` logs a warning and yields 0, so a typo
+/// leaves the clock unshifted rather than skewing it by a guess.
+#[cfg(feature = "test-utils")]
+fn parse_clock_offset_ms(raw: Option<&str>) -> i64 {
+    let Some(raw) = raw else {
+        return 0;
+    };
+    raw.trim().parse().unwrap_or_else(|err| {
+        tracing::warn!(
+            target: "tn::consensus",
+            value = ?raw,
+            %err,
+            "ignoring TN_TEST_CLOCK_OFFSET_MS: not a signed integer of milliseconds; the clock stays unshifted",
+        );
+        0
+    })
+}
+
+/// Shifts `now` by `offset_ms` milliseconds, saturating at 0 and at `u64::MAX`.
+#[cfg(feature = "test-utils")]
+fn apply_clock_offset(now: TimestampMs, offset_ms: i64) -> TimestampMs {
+    TimestampMs::from_millis(now.as_millis().saturating_add_signed(offset_ms))
 }
 
 #[cfg(test)]
@@ -254,5 +325,72 @@ mod tests {
         let past = TimestampMs::from_millis(0);
         assert!(past.elapsed() > Duration::ZERO);
         assert!(Timestamp::elapsed(&past) > Duration::ZERO);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn clock_offset_parse_unset_is_zero() {
+        assert_eq!(parse_clock_offset_ms(None), 0);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn clock_offset_parse_reads_signed_millis() {
+        for (raw, expected) in [
+            ("+250", 250),
+            ("250", 250),
+            ("-2000", -2000),
+            ("0", 0),
+            (" -2000\n", -2000),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+        ] {
+            assert_eq!(parse_clock_offset_ms(Some(raw)), expected, "raw = {raw:?}");
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn clock_offset_parse_ignores_garbage() {
+        // units, fractions, hex and out-of-range values must not shift the clock by a guess; the
+        // replacement character is what a non-unicode value becomes in the reader's lossy read
+        for raw in [
+            "garbage",
+            "",
+            "  ",
+            "250ms",
+            "2s",
+            "1.5",
+            "+-250",
+            "0x10",
+            "9223372036854775808",
+            "\u{fffd}",
+        ] {
+            assert_eq!(parse_clock_offset_ms(Some(raw)), 0, "raw = {raw:?}");
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn clock_offset_apply_shifts_both_ways() {
+        let now = TimestampMs::from_millis(10_000);
+        assert_eq!(apply_clock_offset(now, 0), now);
+        assert_eq!(apply_clock_offset(now, 250).as_millis(), 10_250);
+        assert_eq!(apply_clock_offset(now, -2000).as_millis(), 8000);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn clock_offset_apply_saturates_at_zero_and_max() {
+        assert_eq!(apply_clock_offset(TimestampMs::from_millis(1000), -2000).as_millis(), 0);
+        assert_eq!(apply_clock_offset(TimestampMs::from_millis(0), i64::MIN).as_millis(), 0);
+        assert_eq!(
+            apply_clock_offset(TimestampMs::from_millis(u64::MAX - 1), 250).as_millis(),
+            u64::MAX
+        );
+        assert_eq!(
+            apply_clock_offset(TimestampMs::from_millis(u64::MAX), i64::MAX).as_millis(),
+            u64::MAX
+        );
     }
 }
