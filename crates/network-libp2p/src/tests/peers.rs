@@ -1167,10 +1167,11 @@ fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), Netwo
 }
 
 #[test]
+/// Collateral address counters and identity reputation are separate penalty scopes.
 fn test_ip_and_peer_banned() {
     let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
-    let ip = IpAddr::V4("52.3.3.3".parse().unwrap());
+    let ip = IpAddr::V4(std::net::Ipv4Addr::new(52, 3, 3, 3));
     let addr = create_multiaddr(Some(ip));
 
     // Add a peer and ban it
@@ -1207,10 +1208,11 @@ fn test_ip_and_peer_banned() {
     let action = all_peers.update_connection_status(&new_peer, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
     let banned = all_peers.peer_banned(&new_peer);
-    assert!(banned);
+    assert!(!banned, "a status-only transition does not change identity reputation");
 
-    // Check if peer is banned
-    assert!(all_peers.peer_banned(&peer_id));
+    // The shared address is blocked without manufacturing an identity penalty.
+    assert!(all_peers.ip_banned(&ip));
+    assert!(!all_peers.peer_banned(&peer_id));
     assert!(!all_peers.peer_banned(&PeerId::random()));
 }
 
