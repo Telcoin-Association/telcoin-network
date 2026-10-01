@@ -57,6 +57,10 @@ use tracing::{debug, error, info, instrument, trace, warn};
 mod network_tests;
 
 #[cfg(test)]
+#[path = "tests/committee_seeding.rs"]
+mod committee_seeding;
+
+#[cfg(test)]
 #[path = "tests/admission_contention.rs"]
 mod admission_contention;
 
@@ -1087,6 +1091,10 @@ where
                     );
                 }
                 let _ = reply.send(Ok(()));
+            }
+            NetworkCommand::SeedCommitteePeers { peers, reply } => {
+                let result = self.swarm.behaviour_mut().peer_manager.seed_committee_peers(peers);
+                let _ = reply.send(result);
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(

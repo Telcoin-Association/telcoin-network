@@ -1,13 +1,13 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::kad::K_VALUE;
+use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
-use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tn_types::{BlsPublicKey, BootstrapServer, Committee, P2pNode, Round, WorkerId};
 use tracing::warn;
 
 impl ConfigTrait for NetworkConfig {}
@@ -35,9 +35,141 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Operator-owned launch inventory, independent of bootstrap selection.
+    ///
+    /// A nonempty map must cover every current committee member's primary and workers. Bindings
+    /// are fixed until a coordinated config update and restart. Addresses here take precedence
+    /// over matching bootstrap hints. An empty map retains discovery-based startup.
+    #[serde(deserialize_with = "deserialize_committee_peers")]
+    committee_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
+/// Deserialize an operator inventory without silently accepting duplicate BLS keys.
+fn deserialize_committee_peers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, D::Error> {
+    /// Map visitor that rejects ambiguous repeated validator entries.
+    struct InventoryVisitor;
+    impl<'de> Visitor<'de> for InventoryVisitor {
+        type Value = BTreeMap<BlsPublicKey, BootstrapServer>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a launch inventory with unique BLS keys")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            std::iter::from_fn(|| access.next_entry::<BlsPublicKey, BootstrapServer>().transpose())
+                .try_fold(BTreeMap::new(), |mut peers, entry| {
+                    let (key, peer) = entry?;
+                    if peers.insert(key, peer).is_some() {
+                        Err(de::Error::custom(format!(
+                            "committee_peers: duplicate validator {key}"
+                        )))
+                    } else {
+                        Ok(peers)
+                    }
+                })
+        }
+    }
+    deserializer.deserialize_map(InventoryVisitor)
+}
+
+/// A contradictory or incomplete operator-owned launch inventory.
+#[derive(Debug)]
+pub enum CommitteePeerError {
+    /// An actionable diagnostic including the affected validator and swarm.
+    InvalidConfiguration(String),
+}
+
+impl fmt::Display for CommitteePeerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfiguration(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CommitteePeerError {}
+
 impl NetworkConfig {
+    /// Return the local launch inventory. Membership remains derived from chain state.
+    pub fn committee_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
+        &self.committee_peers
+    }
+
+    /// Validate launch coverage and identity consistency before any swarm is spawned.
+    ///
+    /// Select bootstrap configuration first. Matching identities may carry different addresses;
+    /// committee addresses win during seeding. Conflicting bindings, reused network identities
+    /// and mismatched `/p2p` components are rejected.
+    pub fn validate_committee_peers(
+        &self,
+        committee: &Committee,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        configured_workers: usize,
+    ) -> Result<(), CommitteePeerError> {
+        if self.committee_peers.is_empty() {
+            Ok(())
+        } else {
+            let invalid = CommitteePeerError::InvalidConfiguration;
+            committee.bls_keys().iter().try_for_each(|key| {
+                let peer = self
+                    .committee_peers
+                    .get(key)
+                    .ok_or_else(|| invalid(format!("committee_peers: missing validator {key}")))?;
+                let required_workers = committee.number_of_workers().max(configured_workers);
+                (peer.num_workers() >= required_workers).then_some(()).ok_or_else(|| {
+                    invalid(format!(
+                        "committee_peers: validator {key} has {} workers, needs {}",
+                        peer.num_workers(),
+                        required_workers
+                    ))
+                })
+            })?;
+            let mut identities = BTreeMap::new();
+            let mut bindings = BTreeMap::new();
+            [bootstrap, &self.committee_peers].into_iter().try_for_each(|peers| {
+                peers.iter().try_for_each(|(key, server)| {
+                    std::iter::once((None, &server.primary))
+                        .chain(server.workers.iter().enumerate().map(|(id, peer)| (Some(id), peer)))
+                        .try_for_each(|(worker, peer)| {
+                            let role = worker.map_or_else(|| "primary".to_owned(), |id| format!("worker {id}"));
+                            let peer_id = PeerId::from(peer.network_key.clone());
+                            (!peer.network_address.is_empty() && !peer.network_address.iter().any(|protocol| {
+                                matches!(protocol, Protocol::P2p(address_id) if address_id != peer_id)
+                            })).then_some(()).ok_or_else(|| invalid(format!(
+                                "committee_peers: validator {key} {role} address is empty or disagrees with network key {peer_id}"
+                            )))?;
+                            bindings.insert((*key, worker), peer_id).is_none_or(|previous| previous == peer_id)
+                                .then_some(()).ok_or_else(|| invalid(format!(
+                                    "committee_peers: conflicting bootstrap/committee network keys for validator {key} {role}"
+                                )))?;
+                            identities.insert(peer_id, (*key, worker)).is_none_or(|previous| previous == (*key, worker))
+                                .then_some(()).ok_or_else(|| invalid(format!(
+                                    "committee_peers: network identity {peer_id} is assigned to multiple validator swarms (including {key} {role})"
+                                )))
+                        })
+                })
+            })
+        }
+    }
+
+    /// Check this node's advertised identity against its launch entry before spawning swarms.
+    pub fn validate_local_committee_peer(
+        &self,
+        key: BlsPublicKey,
+        worker: Option<WorkerId>,
+        local: &P2pNode,
+    ) -> Result<(), CommitteePeerError> {
+        self.committee_peers.get(&key).map_or(Ok(()), |server| {
+            let configured = worker.map_or(Some(&server.primary), |id| server.worker(id));
+            configured.filter(|peer| peer.network_key == local.network_key).map(|_| ())
+                .ok_or_else(|| CommitteePeerError::InvalidConfiguration(format!(
+                    "committee_peers: local validator {key}, worker {worker:?}, network key does not match node configuration"
+                )))
+        })
+    }
+
     /// Return the configured bootstrap dial hints.
     pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.bootstrap_peers
@@ -731,6 +863,136 @@ mod tests {
         serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
             .map(|committee| committee.bootstrap_servers())
             .map_err(Into::into)
+    }
+
+    /// Launch inventory round-trips and is independent of bootstrap override selection.
+    #[test]
+    fn committee_peers_round_trip_and_preserve_bootstrap_selection() -> eyre::Result<()> {
+        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let inventory = committee.bootstrap_servers();
+        let config = NetworkConfig { committee_peers: inventory.clone(), ..Default::default() };
+        let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        assert_eq!(parsed.committee_peers(), &inventory);
+        let selected = parsed.resolve_bootstrap_peers(&inventory, Some(&BTreeMap::new()));
+        assert_eq!(selected, inventory);
+        parsed.validate_committee_peers(&committee, &selected, 1)?;
+        assert!(NetworkConfig::default().committee_peers().is_empty());
+        Ok(())
+    }
+
+    /// Missing validators and worker mappings fail before networking starts.
+    #[test]
+    fn committee_peers_require_complete_launch_coverage() -> eyre::Result<()> {
+        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut config =
+            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 2).is_err());
+        config.committee_peers.pop_first().ok_or_else(|| eyre::eyre!("missing fixture peer"))?;
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        Ok(())
+    }
+
+    /// Contradictory bootstrap keys, address identities and local keys are actionable errors.
+    #[test]
+    fn committee_peers_reject_conflicting_identity_hints() -> eyre::Result<()> {
+        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let config =
+            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
+        let (key, peer) = config
+            .committee_peers
+            .iter()
+            .next()
+            .ok_or_else(|| eyre::eyre!("missing fixture peer"))?;
+        let other = config
+            .committee_peers
+            .values()
+            .nth(1)
+            .ok_or_else(|| eyre::eyre!("missing other peer"))?;
+        let mut bootstrap = config.committee_peers.clone();
+        bootstrap.get_mut(key).ok_or_else(|| eyre::eyre!("missing bootstrap peer"))?.primary =
+            other.primary.clone();
+        assert!(config.validate_committee_peers(&committee, &bootstrap, 1).is_err());
+        assert!(config.validate_local_committee_peer(*key, None, &other.primary).is_err());
+        config.validate_local_committee_peer(*key, None, &peer.primary)?;
+        let mut mismatched = config.clone();
+        mismatched
+            .committee_peers
+            .get_mut(key)
+            .ok_or_else(|| eyre::eyre!("missing fixture peer"))?
+            .primary
+            .network_address = other.primary.network_address.clone();
+        assert!(mismatched.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        Ok(())
+    }
+
+    /// One network identity cannot represent different validators or different swarms.
+    #[test]
+    fn committee_peers_reject_reused_network_identity() -> eyre::Result<()> {
+        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut config =
+            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
+        let primary = config
+            .committee_peers
+            .values()
+            .next()
+            .ok_or_else(|| eyre::eyre!("missing fixture peer"))?
+            .primary
+            .clone();
+        let peer = config
+            .committee_peers
+            .values_mut()
+            .nth(1)
+            .ok_or_else(|| eyre::eyre!("missing other peer"))?;
+        peer.primary = primary;
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        Ok(())
+    }
+
+    /// Repeated YAML validator keys fail instead of silently discarding an operator entry.
+    #[test]
+    fn committee_peers_reject_duplicate_yaml_keys() -> eyre::Result<()> {
+        let peers = bootstrap_fixture()?;
+        let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing fixture peer"))?;
+        let entry = serde_yaml::to_string(&BTreeMap::from([(*key, peer.clone())]))?
+            .trim_start_matches("---\n")
+            .to_owned();
+        let single = entry.lines().map(|line| format!("  {line}\n")).collect::<String>();
+        serde_yaml::from_str::<NetworkConfig>(&format!("committee_peers:\n{single}"))?;
+        let entries =
+            format!("{entry}{entry}").lines().map(|line| format!("  {line}\n")).collect::<String>();
+        let error = serde_yaml::from_str::<NetworkConfig>(&format!("committee_peers:\n{entries}"))
+            .err()
+            .ok_or_else(|| eyre::eyre!("duplicate validator was accepted"))?;
+        assert!(error.to_string().contains("committee_peers: duplicate validator"), "{error}");
+        Ok(())
+    }
+
+    /// Distinct worker identities round-trip and cover every configured swarm.
+    #[test]
+    fn committee_peers_support_multiple_worker_ids() -> eyre::Result<()> {
+        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let mut peers = committee.bootstrap_servers();
+        peers.values_mut().for_each(|peer| {
+            peer.workers.push(P2pNode {
+                network_key: libp2p::identity::Keypair::generate_ed25519().public().into(),
+                network_address: peer
+                    .workers
+                    .first()
+                    .map(|worker| {
+                        worker
+                            .network_address
+                            .iter()
+                            .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
+                            .collect()
+                    })
+                    .unwrap_or_else(libp2p::Multiaddr::empty),
+                rpc: None,
+            });
+        });
+        let config = NetworkConfig { committee_peers: peers.clone(), ..Default::default() };
+        let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        assert_eq!(parsed.committee_peers(), &peers);
+        parsed.validate_committee_peers(&committee, &BTreeMap::new(), 2).map_err(Into::into)
     }
 
     /// Network config round-trips every worker and peer in the current bootstrap format.
