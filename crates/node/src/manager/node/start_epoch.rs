@@ -1345,37 +1345,8 @@ mod tests {
     use super::{
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
+    use crate::manager::node::tests::reth_config_and_db;
     use std::num::NonZeroUsize;
-
-    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
-    /// there: the on-disk state an `EpochManager` is built from.
-    fn reth_config_and_db<P>(
-        config: &tn_config::Config,
-        committee: &tn_types::Committee,
-        datadir: &P,
-    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
-    where
-        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
-    {
-        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
-
-        tn_reth::init_reth_defaults();
-        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            datadir,
-            true,
-            std::sync::Arc::new(config.chain_spec()),
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
-        Ok((node_config, reth_db))
-    }
 
     /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
     /// two-to-one-to-two transitions, closing and reopening removed workers' RPC listeners.
