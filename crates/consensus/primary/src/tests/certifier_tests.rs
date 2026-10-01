@@ -1600,13 +1600,16 @@ async fn propose_header_failure() {
 }
 
 /// One peer failing its vote request with the fatal `NetworkError::RPCError` does not derail the
-/// round: the other peers' votes still form exactly the certificate they and the proposer support.
+/// round: the other peers' votes still form exactly the certificate they and the proposer support,
+/// and the fatal peer is not asked again.
 ///
 /// In a 4-authority committee the proposer and the two other peers are exactly a quorum, so the
 /// certificate needs both of their votes. Their requests are held until the fatal failure has
 /// reached `propose_header`: on the paused clock a sleep ends only once every task is idle, so
 /// after it the failed vote has been taken off the vote channel while the proposal is still short
-/// of quorum. Only then are the voters answered.
+/// of quorum. Only then are the voters answered. Once `propose_header` returns, nothing more may
+/// reach the network: a retried fatal error would ask the fatal peer again within the vote-retry
+/// backoff ceiling, inside the quiet window.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn fatal_peer_does_not_derail_round() {
     let (mut cx, certifier) = CertifierContext::unspawned(4);
@@ -1651,12 +1654,13 @@ async fn fatal_peer_does_not_derail_round() {
         );
     }
     let result = proposal_result(proposal, "one peer fails fatally").await;
+    cx.network.assert_quiet("one peer fails fatally: the fatal peer must not be asked again").await;
 
     assert!(
         same_outcome(&result, &expected),
         "expected {expected:?} over the proposer's and both voters' votes, got {result:?}"
     );
-    assert_eq!(asked, peers, "each peer is asked exactly once; the fatal error is not retried");
+    assert_eq!(asked, peers, "the first vote requests go one to each peer");
 }
 
 /// `propose_header` returns exactly the certificate the valid votes support when some peers sign
@@ -1800,20 +1804,28 @@ async fn run_bad_signature_row(row: BadSignatureRow) {
     );
 }
 
-/// Once shutdown is signalled, the running certifier stops: its task ends, and a header sent
-/// afterwards is never proposed.
+/// A running certifier, parked in its loop waiting for a header, is woken by the shutdown signal
+/// and stops: its task ends, and a header sent afterwards is never proposed.
 ///
-/// The header is sent only once every task has gone idle after the signal, so the certifier has
-/// had every chance to act on it. The certifier task holds the only handle to the mock network, so
-/// the network channel closes when the task ends. A certifier still running would keep the channel
-/// open, and would propose the header, so its vote requests would reach the network.
+/// The certifier task is spawned but not yet polled when the context is built, and the shutdown
+/// signal is sticky. Signalled at that point, the task would subscribe to an already-fired signal
+/// on its first poll and could exit before it ever waits in its loop, which shows nothing about
+/// waking a running certifier. So the test first sleeps: on the paused clock a sleep ends only
+/// once every task is idle, so the certifier has started and is parked in its `select!` when the
+/// signal fires. The header is sent only once every task has gone idle again after the signal, so
+/// the certifier has had every chance to act on it. The certifier task holds the only handle to
+/// the mock network, so the network channel closes when the task ends. A certifier still running
+/// would keep the channel open, and would propose the header, so its vote requests would reach the
+/// network.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn certifier_stops_on_shutdown() {
     let mut cx = CertifierContext::new();
     let header = cx.proposer_header();
 
+    // on the paused clock each sleep ends only once every task is idle: the certifier is parked
+    // in its loop before the signal, and has acted on the signal before the header
+    tokio::time::sleep(Duration::from_millis(100)).await;
     cx.proposer().consensus_config().shutdown().notify();
-    // on the paused clock this sleep ends only once every task is idle
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     cx.consensus_bus.headers().send(header).await.expect("send a header after shutdown");
