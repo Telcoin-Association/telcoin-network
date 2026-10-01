@@ -2,13 +2,20 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
-    get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
-    get_node_mode, get_positive_balance_with_retry, network_advancing, scrape_metrics,
-    send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
-    WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, assert_epoch_records_verify,
+    assert_nodes_agree_on_commit_times, block_commit_time, call_rpc, current_epoch,
+    fetch_verified_epoch_record, get_balance, get_balance_above_with_retry, get_block,
+    get_block_number, get_key, get_latest_consensus_header_number, get_node_info, get_node_mode,
+    get_positive_balance_with_retry, network_advancing, pin_fork_epochs, scrape_metric_value,
+    scrape_metrics, send_and_confirm, send_tel, start_observer, start_validator,
+    start_validator_with_args, wait_for_epoch_at_least, wait_for_mid_epoch, wait_for_rpc,
+    walk_block_commit_times, BlockCommitTime, EVM_TIMESTAMP_CLAMPED_SERIES, WEI_PER_TEL,
 };
-use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
+use alloy::providers::{Provider, ProviderBuilder};
+use e2e_tests::{
+    config_local_testnet, config_local_testnet_with_gc_depth,
+    config_local_testnet_with_gc_depth_and_epoch_duration, NodeEndpoints, TestBinary,
+};
 use eyre::{Report, WrapErr as _};
 use jsonrpsee::rpc_params;
 use nix::{
@@ -17,12 +24,13 @@ use nix::{
 };
 use std::{
     cell::RefCell,
+    ops::RangeInclusive,
     path::Path,
     process::Child,
     time::{Duration, Instant},
 };
 use tn_test_utils::wait_until_blocking;
-use tn_types::{get_available_tcp_port, NodeMode};
+use tn_types::{get_available_tcp_port, Epoch, NodeMode};
 use tracing::{error, info};
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -672,6 +680,353 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
+}
+
+/// The epoch the sub-second timestamp fork activates at in
+/// [`test_restarts_across_subsecond_fork`]; earlier epochs commit in whole seconds.
+const SUBSECOND_RESTART_FORK_EPOCH: Epoch = 3;
+
+/// Epoch duration (seconds) for [`test_restarts_across_subsecond_fork`], short enough that the
+/// [`RESTART_TEST_DOWNTIME_SECS`] downtime spans several whole epochs.
+const SUBSECOND_RESTART_EPOCH_SECS: u32 = 5;
+
+/// How long a node gets to serve each certified epoch record. Certificates take a fixed
+/// quorum-voting time that does not shrink with 5 s epochs, so this keeps the 60 s floor the
+/// epoch tests use.
+const SUBSECOND_RESTART_RECORD_SECS: u64 = 60;
+
+/// Restart validators on their own datadirs while the sub-second timestamp fork activates and
+/// after it has.
+///
+/// The fork is pinned at [`SUBSECOND_RESTART_FORK_EPOCH`] (F = 3), with the seed-signature fork
+/// active from genesis because the sub-second gate requires it. Four validators run 5 s epochs at
+/// the delayed restart tests' lowered gc depth, each serving `--metrics`.
+///
+/// Phase 1 stops validator-3 in the middle of epoch F - 1, checks that a live peer is still in
+/// that epoch once the process has exited, and keeps the node down until a live peer has closed
+/// epoch F and [`RESTART_TEST_DOWNTIME_SECS`] have passed. The node misses the whole first
+/// post-fork epoch and falls far enough behind to be demoted. Restarted on its own pre-fork
+/// history, it has to catch up through state sync and return to active consensus. After that, every
+/// node serves a certified record for every closed epoch, with the final block that record
+/// names. On validator-3 that block carries validator-1's commit time, in whole seconds before F
+/// and flagged sub-second from F on, and the post-fork commit times carry milliseconds. Every block
+/// validator-3 serves passes the commit-time walk and agrees with validator-1, its engine never
+/// clamped an EVM timestamp, and a transfer sent through validator-1 executes on it.
+///
+/// Phase 2 stops all four and restarts them on their own post-fork history. The cohort agrees on
+/// its head, returns to active consensus, and closes another epoch whose final block carries the
+/// same sub-second commit time on every node. Every node then serves a certified record for every
+/// closed epoch, including one whose certificate the stop may have interrupted. No node clamps an
+/// EVM timestamp since its restart, and another transfer executes.
+///
+/// F = 3 because the first epochs are short: the test can only stop the node mid-epoch once all
+/// four validators serve RPC, and by then epochs 0 and 1 may already be over. Epoch 2 is the first
+/// it can catch pre-fork. Five-second epochs put several boundaries inside the 25 s downtime, so a
+/// whole post-fork epoch opens and closes while the node is down.
+#[test]
+#[ignore = "only run independently from all other it tests"]
+fn test_restarts_across_subsecond_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // both forced rather than inherited: the claim is a restart across a known sub-second epoch,
+    // and the gate (`tn_types::forks::subsecond_timestamp_active`) conjoins the seed fork
+    // fail-closed, so a dormant seed fork would keep every epoch on whole seconds
+    pin_fork_epochs(None, Some(0), None, Some(SUBSECOND_RESTART_FORK_EPOCH));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(restarts_across_subsecond_fork())
+}
+
+/// The body of [`test_restarts_across_subsecond_fork`].
+async fn restarts_across_subsecond_fork() -> eyre::Result<()> {
+    const F: Epoch = SUBSECOND_RESTART_FORK_EPOCH;
+    // validator-1 is the reference; validator-3 (index 2) is the node that restarts alone
+    const REFERENCE: usize = 0;
+    const RESTARTED: usize = 2;
+    // short on purpose: node IPC socket paths are built under the temp dir
+    let test = "ss_restart";
+    let temp_dir = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = temp_dir.path();
+    config_local_testnet_with_gc_depth_and_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        None,
+        RESTART_TEST_GC_DEPTH,
+        SUBSECOND_RESTART_EPOCH_SECS,
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let free_port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no free local port"));
+
+    let mut guard = ProcessGuard::empty();
+    let mut rpc_ports = [0u16; 4];
+    let mut metrics_addrs: [String; 4] = Default::default();
+    for (instance, (rpc_port, metrics)) in
+        rpc_ports.iter_mut().zip(metrics_addrs.iter_mut()).enumerate()
+    {
+        *rpc_port = free_port()?;
+        *metrics = format!("127.0.0.1:{}", free_port()?);
+        guard.push(start_validator_with_args(
+            instance,
+            bin,
+            temp_path,
+            *rpc_port,
+            test,
+            0,
+            &["--metrics", metrics.as_str()],
+        ));
+    }
+    let rpc_urls: [String; 4] = rpc_ports.map(|port| format!("http://127.0.0.1:{port}"));
+    let providers = rpc_urls
+        .iter()
+        .map(|url| Ok(ProviderBuilder::new().connect_http(url.parse()?)))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
+    let endpoints: Vec<NodeEndpoints> = rpc_urls
+        .iter()
+        .map(|url| NodeEndpoints {
+            http_url: url.clone(),
+            ws_url: String::new(),
+            ipc_path: String::new(),
+        })
+        .collect();
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+
+    // phase 1: validator-3 stops in the last pre-fork epoch and stays down through the first
+    // post-fork one
+    wait_for_epoch_at_least(&providers[REFERENCE], F - 1).await?;
+    let mid = wait_for_mid_epoch(&providers[REFERENCE], &rpc_urls[REFERENCE]).await?.epoch_id;
+    eyre::ensure!(
+        mid == F - 1,
+        "the first mid-epoch window the test caught was in epoch {mid}, not {}: the run cannot \
+         stop validator-3 before the fork activates at epoch {F}",
+        F - 1
+    );
+    let mut stopped =
+        guard.take(RESTARTED).ok_or_else(|| eyre::eyre!("validator-3 is not running"))?;
+    kill_child(&mut stopped);
+    eyre::ensure!(
+        providers[RESTARTED].get_chain_id().await.is_err(),
+        "validator-3 still answers RPC after being stopped"
+    );
+    // the process has exited; if a live peer is still in the last pre-fork epoch, validator-3
+    // never ran a post-fork epoch before its restart
+    let epoch_at_kill = current_epoch(&providers[REFERENCE]).await?.epoch_id;
+    eyre::ensure!(
+        epoch_at_kill == F - 1,
+        "validator-3 took until epoch {epoch_at_kill} to exit: the run cannot show it was down \
+         when the fork activated at epoch {F}"
+    );
+    info!(target: "restart-test", epoch_at_kill, "validator-3 stopped in the last pre-fork epoch");
+
+    // the 25 s floor and the consensus-header gap push validator-3 out of the gc window, and the
+    // epoch wait makes the network close the first post-fork epoch without it
+    wait_for_downtime(&rpc_urls, RESTART_TEST_DOWNTIME_SECS)?;
+    let epoch_at_restart = wait_for_epoch_at_least(&providers[REFERENCE], F + 1).await?.epoch_id;
+    eyre::ensure!(
+        epoch_at_kill < F && F < epoch_at_restart,
+        "validator-3 was down from epoch {epoch_at_kill} to {epoch_at_restart}, which does not \
+         contain the whole fork epoch {F}"
+    );
+    info!(target: "restart-test", epoch_at_restart, "restarting validator-3 on its pre-fork history");
+
+    metrics_addrs[RESTARTED] = format!("127.0.0.1:{}", free_port()?);
+    guard.replace(
+        RESTARTED,
+        start_validator_with_args(
+            RESTARTED,
+            bin,
+            temp_path,
+            rpc_ports[RESTARTED],
+            test,
+            2,
+            &["--metrics", &metrics_addrs[RESTARTED]],
+        ),
+    );
+    let restarted =
+        guard.get_mut(RESTARTED).ok_or_else(|| eyre::eyre!("validator-3 was not restarted"))?;
+    wait_for_restarted_rpc(restarted, &rpc_urls[RESTARTED], test)?;
+    wait_for_restart_catch_up(&rpc_urls[RESTARTED], &metrics_addrs[RESTARTED])?;
+    let headers_fetched = tokio::task::block_in_place(|| {
+        scrape_metric_value(&metrics_addrs[RESTARTED], "tn_state_sync_headers_fetched_total")
+    })?;
+    info!(target: "restart-test", headers_fetched, "validator-3 caught up through state sync");
+
+    // every closed epoch, the ones validator-3 missed included, on every node
+    let last_closed = current_epoch(&providers[REFERENCE]).await?.epoch_id - 1;
+    eyre::ensure!(
+        F <= last_closed,
+        "epoch {last_closed} is the last closed one, so no post-fork epoch has a record yet"
+    );
+    assert_epoch_records_verify(&endpoints, 0..=last_closed, SUBSECOND_RESTART_RECORD_SECS).await?;
+    let closing = assert_epoch_closing_commit_times(
+        &[
+            (&providers[REFERENCE], rpc_urls[REFERENCE].as_str()),
+            (&providers[RESTARTED], rpc_urls[RESTARTED].as_str()),
+        ],
+        0..=last_closed,
+    )
+    .await?;
+    // the subSecond flag comes from the node's fork gate; the milliseconds come from the
+    // consensus headers it synced, so a post-fork commit time off a whole second shows they kept
+    // millisecond precision
+    eyre::ensure!(
+        closing.iter().any(|commit| commit.sub_second && commit.timestamp_millis % 1000 != 0),
+        "every post-fork epoch up to {last_closed} closed on a whole second: the commit times \
+         validator-3 synced carry no milliseconds"
+    );
+
+    let mut walks = Vec::with_capacity(2);
+    for index in [REFERENCE, RESTARTED] {
+        let head = get_block_number(&rpc_urls[index])?;
+        walks.push(walk_block_commit_times(&providers[index], &rpc_urls[index], 0..=head).await?);
+    }
+    assert_nodes_agree_on_commit_times(
+        &walks,
+        &[rpc_urls[REFERENCE].clone(), rpc_urls[RESTARTED].clone()],
+    )?;
+    assert_no_evm_timestamp_clamps(&metrics_addrs, &rpc_urls, test)?;
+    test_blocks_same(&rpc_urls)?;
+    send_and_confirm(&rpc_urls[REFERENCE], &rpc_urls[RESTARTED], &key, to_account, 0)?;
+
+    // phase 2: the whole cohort restarts on its own post-fork history
+    guard.kill_all();
+    for (provider, url) in providers.iter().zip(&rpc_urls) {
+        eyre::ensure!(provider.get_chain_id().await.is_err(), "{url} still answers RPC");
+    }
+    for (instance, (rpc_port, metrics)) in
+        rpc_ports.iter().zip(metrics_addrs.iter_mut()).enumerate()
+    {
+        *metrics = format!("127.0.0.1:{}", free_port()?);
+        guard.replace(
+            instance,
+            start_validator_with_args(
+                instance,
+                bin,
+                temp_path,
+                *rpc_port,
+                test,
+                3,
+                &["--metrics", metrics.as_str()],
+            ),
+        );
+    }
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
+    let epoch_at_cohort_restart = current_epoch(&providers[REFERENCE]).await?.epoch_id;
+    info!(target: "restart-test", epoch_at_cohort_restart, "restarted all four validators");
+    network_advancing(&rpc_urls)?;
+    test_blocks_same(&rpc_urls)?;
+    for url in &rpc_urls {
+        wait_for_node_mode(url, NodeMode::CvvActive)?;
+    }
+    // an epoch the restarted cohort closed itself, after the fork
+    let closed =
+        wait_for_epoch_at_least(&providers[REFERENCE], epoch_at_cohort_restart + 1).await?.epoch_id
+            - 1;
+    eyre::ensure!(
+        F <= epoch_at_cohort_restart && epoch_at_cohort_restart <= closed,
+        "the cohort restarted in epoch {epoch_at_cohort_restart} and closed epoch {closed}: not \
+         a post-fork epoch closed after the restart"
+    );
+    // every record, not only the new one: the cohort can go down between an epoch's close and its
+    // record's certificate, and must still certify that record after it restarts
+    assert_epoch_records_verify(&endpoints, 0..=closed, SUBSECOND_RESTART_RECORD_SECS).await?;
+    let nodes: Vec<_> = providers.iter().zip(rpc_urls.iter().map(String::as_str)).collect();
+    assert_epoch_closing_commit_times(&nodes, closed..=closed).await?;
+    assert_no_evm_timestamp_clamps(&metrics_addrs, &rpc_urls, test)?;
+    send_and_confirm(&rpc_urls[RESTARTED], &rpc_urls[3], &key, to_account, 1)?;
+    info!(
+        target: "restart-test",
+        epoch_at_kill,
+        epoch_at_restart,
+        epoch_at_cohort_restart,
+        closed,
+        "restarts across the sub-second fork passed"
+    );
+
+    guard.kill_all();
+    Ok(())
+}
+
+/// Check the commit time each of `nodes` (a provider and its URL) serves for the final block of
+/// every epoch in `epochs`, and return the first node's.
+///
+/// The block is the one the certified epoch record, fetched from the first node, names. Every node
+/// must serve the same commit time for it and mark it as closing an epoch. Its `subSecond` flag,
+/// which the node derives from the sub-dag leader's epoch
+/// (`BlockTimestampMillis::with_consensus` in `crates/execution/tn-rpc/src/rpc_ext.rs`), must be
+/// set exactly for epochs at or after [`SUBSECOND_RESTART_FORK_EPOCH`], and a pre-fork commit time
+/// must be whole seconds.
+async fn assert_epoch_closing_commit_times<P: Provider>(
+    nodes: &[(&P, &str)],
+    epochs: RangeInclusive<Epoch>,
+) -> eyre::Result<Vec<BlockCommitTime>> {
+    let Some(&(_, reference_url)) = nodes.first() else {
+        return Err(eyre::eyre!("no node to check epoch closing commit times on"));
+    };
+    let mut closing = Vec::new();
+    for epoch in epochs {
+        let block =
+            fetch_verified_epoch_record(reference_url, epoch, SUBSECOND_RESTART_RECORD_SECS)
+                .await?
+                .final_state
+                .number;
+        let mut served = Vec::with_capacity(nodes.len());
+        for &(provider, url) in nodes {
+            served.push(block_commit_time(provider, url, block).await?);
+        }
+        let reference = served.remove(0);
+        for (commit, (_, url)) in served.iter().zip(&nodes[1..]) {
+            eyre::ensure!(
+                *commit == reference,
+                "{url} disagrees with {reference_url} on block {block}, the final block of epoch \
+                 {epoch}: {commit:?} vs {reference:?}"
+            );
+        }
+        let post_fork = epoch >= SUBSECOND_RESTART_FORK_EPOCH;
+        eyre::ensure!(
+            reference.closes_epoch,
+            "block {block}, the final block of epoch {epoch}'s record, does not close an epoch"
+        );
+        eyre::ensure!(
+            reference.sub_second == post_fork,
+            "the final block of epoch {epoch} reports subSecond = {}, but the fork is pinned at \
+             epoch {SUBSECOND_RESTART_FORK_EPOCH}",
+            reference.sub_second
+        );
+        eyre::ensure!(
+            post_fork || reference.timestamp_millis % 1000 == 0,
+            "pre-fork epoch {epoch} closed at {} ms, not on a whole second",
+            reference.timestamp_millis
+        );
+        closing.push(reference);
+    }
+    Ok(closing)
+}
+
+/// Require the engine behind each metrics endpoint to report no EVM timestamp clamped up to its
+/// parent's since that process started. `metrics_addrs[i]` belongs to the node at `urls[i]`.
+fn assert_no_evm_timestamp_clamps(
+    metrics_addrs: &[String],
+    urls: &[String],
+    test: &str,
+) -> eyre::Result<()> {
+    for (addr, url) in metrics_addrs.iter().zip(urls) {
+        // blocking socket I/O with sleeps between retries, so it runs off the runtime worker
+        let clamped = tokio::task::block_in_place(|| {
+            scrape_metric_value(addr, EVM_TIMESTAMP_CLAMPED_SERIES)
+        })?;
+        eyre::ensure!(
+            clamped == 0.0,
+            "{url} clamped {clamped} EVM timestamps up to their parent's: consensus let commit \
+             time go backwards in a post-fork epoch (node logs under test_logs/{test}/ carry the \
+             \"evm timestamp clamped to parent\" warnings)"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
