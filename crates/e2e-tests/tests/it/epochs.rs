@@ -4,11 +4,12 @@ use crate::common::get_block;
 
 use super::common::{
     assert_blocks_match_consensus, assert_consensus_commit_times, assert_epoch_records_verify,
-    assert_nodes_agree_on_commit_times, create_genesis_for_test, drive_light_tx_load,
-    fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs, pin_fork_epochs,
-    read_consensus_headers, scrape_metric_value, start_nodes, start_validator_with_args,
-    wait_for_rpc, walk_block_commit_times, BlockCommitTime, ProcessGuard, CROSS_FORK_EPOCH,
-    EVM_TIMESTAMP_CLAMPED_SERIES, NEW_VALIDATOR, NODE_PASSWORD, RPC_REQUEST_TIMEOUT,
+    assert_nodes_agree_on_commit_times, block_commit_time, create_genesis_for_test,
+    drive_light_tx_load, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
+    pin_fork_epochs, read_consensus_headers, scrape_metric_value, start_nodes,
+    start_validator_with_args, wait_for_rpc, walk_block_commit_times, BlockCommitTime,
+    ProcessGuard, CROSS_FORK_EPOCH, EVM_TIMESTAMP_CLAMPED_SERIES, NEW_VALIDATOR, NODE_PASSWORD,
+    RPC_REQUEST_TIMEOUT,
 };
 use alloy::{
     primitives::{utils::parse_ether, Bytes},
@@ -66,6 +67,18 @@ const SUBSECOND_FORK_EPOCH: Epoch = 2;
 /// seam (1 to 2) and two post-fork seams (2 to 3 and 3 to 4), and every one of those epochs has at
 /// least its closing execution block.
 const SUBSECOND_TARGET_EPOCH: Epoch = 5;
+
+/// Sub-second fork epoch for [`test_epoch_sync_subsecond_fork_activates_while_down`], chosen so
+/// the whole fork epoch is committed while the killed node is down.
+///
+/// The kill comes once `loop_epochs` has watched three boundaries pass. That puts `epoch_at_kill`
+/// at 3, or at 4 when the network is already in epoch 1 by the time the watch starts, which is
+/// common because the first commit closes epoch 0 (see [`SUBSECOND_FORK_EPOCH`]). The restart comes
+/// three boundaries later, at `epoch_at_kill + 3` or later. A fork epoch above the kill epoch and
+/// no later than the restart epoch in both cases is 5 or 6. Only 5 also opens and closes entirely
+/// while the node is down in both cases, so every commit the node first sees under the fork is one
+/// it neither proposed nor voted in, and it learns about the fork only from packs it imports.
+const SUBSECOND_FORK_WHILE_DOWN_EPOCH: Epoch = 5;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -315,11 +328,27 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
     Ok(())
 }
 
+/// The epochs [`test_epoch_sync_inner`] observed around its kill and restart, so a caller can
+/// assert which epochs the node missed and which ones its own archive holds.
+#[derive(Debug, Clone)]
+struct SyncEpochs {
+    /// The epochs whose pack files were fingerprinted before the kill and revalidated after the
+    /// restart (see [`sealed_epochs`]).
+    sealed: Range<Epoch>,
+    /// The epoch validator-1 reported open right before the node was killed.
+    epoch_at_kill: Epoch,
+    /// The epoch validator-1 reported open right before the node was restarted.
+    epoch_at_restart: Epoch,
+    /// The last epoch for which every node, the restarted one included, served a verified
+    /// certified record and had executed the record's final block.
+    latest_epoch: Epoch,
+}
+
 /// Kill one node, advance several epochs without it, restart it against its existing datadir, and
 /// assert it back-fills everything it missed.
 ///
-/// Returns the epochs whose pack files were fingerprinted before the kill and revalidated after
-/// the restart (see [`sealed_epochs`]), so a caller can assert what those packs cover.
+/// Returns the epochs it observed (see [`SyncEpochs`]), so a caller can assert what the sealed
+/// packs cover and which epochs passed while the node was down.
 ///
 /// `test` names the log directory under `test_logs/` for the restarted node, matching the one the
 /// caller used for the initial spawn.
@@ -331,7 +360,7 @@ async fn test_epoch_sync_inner(
     temp_path: &Path,
     test: &str,
     endpoints: &mut Vec<NodeEndpoints>,
-) -> eyre::Result<Range<Epoch>> {
+) -> eyre::Result<SyncEpochs> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
@@ -375,7 +404,8 @@ async fn test_epoch_sync_inner(
         "fingerprinted sealed epoch packs of the killed node",
     );
 
-    loop_epochs(3, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    let epoch_at_restart = loop_epochs(3, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    info!(target: "epoch-test", epoch_at_restart, "restarting the killed node");
     // Restart the node
     let (mut new_children, mut new_endpoints) = start_nodes(temp_path, nodes_to_start, test, 2)?;
     let new_child = new_children.pop().expect("child");
@@ -427,7 +457,7 @@ async fn test_epoch_sync_inner(
     // the restart must not have rewritten history it already had.
     assert_sealed_packs_unchanged(&killed_datadir, &sealed_before, &killed_epoch_records)?;
 
-    Ok(sealed)
+    Ok(SyncEpochs { sealed, epoch_at_kill, epoch_at_restart, latest_epoch })
 }
 
 /// The epochs whose pack files must survive a kill and restart byte-for-byte, given the epoch
@@ -535,12 +565,37 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Spin up the epoch-sync network and run [`test_epoch_sync_inner`] against it.
+/// Index in the epoch-sync network of the node [`run_epoch_sync_scenario`] kills and restarts
+/// (validator-3).
+const SYNC_RESTARTED_NODE: usize = 2;
+
+/// A finished [`run_epoch_sync_scenario`] whose network is still running, so the caller can query
+/// the nodes after the scenario's own checks passed.
+///
+/// Dropping it stops every node and then deletes their datadirs: fields drop in declaration order,
+/// so `guard` goes before `_temp_dir`.
+struct EpochSyncRun {
+    /// The epochs the scenario observed around the kill and restart.
+    epochs: SyncEpochs,
+    /// Index into `committee` and `endpoints` of the node that was killed and restarted.
+    restarted: usize,
+    /// Every node's endpoints in `committee` order, with the restarted node's new ports.
+    endpoints: Vec<NodeEndpoints>,
+    /// Every node's datadir name and execution address; validator-1 is first.
+    committee: Vec<(&'static str, Address)>,
+    /// Owns the node processes, the restarted node's new one included.
+    guard: ProcessGuard,
+    /// Holds every node's datadir until the run is dropped.
+    _temp_dir: tempfile::TempDir,
+}
+
+/// Spin up the epoch-sync network, run [`test_epoch_sync_inner`] against it, and hand the still
+/// running network back (see [`EpochSyncRun`]).
 ///
 /// `test` names both the temp-dir prefix and the `test_logs/` directory, so callers running the
 /// same scenario under different fork epochs keep separate node logs. Keep it short: every node's
 /// IPC socket path is built under the temp dir, and a unix socket path is capped at ~104 bytes.
-async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
+async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<EpochSyncRun> {
     // create validator and governance wallets for adding new validator later
     let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut committee = vec![
@@ -571,16 +626,25 @@ async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
     // Guard ensures processes are killed on drop (normal return, error, or panic).
     let mut guard = ProcessGuard::new(procs);
 
-    test_epoch_sync_inner(
+    let epochs = test_epoch_sync_inner(
         &mut guard,
-        2,
-        &[("validator-3", Address::from_slice(&[0x33; 20]))],
+        SYNC_RESTARTED_NODE,
+        &[committee[SYNC_RESTARTED_NODE]],
         &committee[..],
         temp_path,
         test,
         &mut endpoints,
     )
-    .await
+    .await?;
+
+    Ok(EpochSyncRun {
+        epochs,
+        restarted: SYNC_RESTARTED_NODE,
+        endpoints,
+        committee,
+        guard,
+        _temp_dir: temp_dir,
+    })
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -941,7 +1005,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
     // about any fork, but the harness still decodes pack bytes and must agree with the nodes
     pin_fork_epochs(None, None, None, None);
 
-    run_epoch_sync_scenario("epoch_sync").await.map(|_sealed| ())
+    run_epoch_sync_scenario("epoch_sync").await.map(|_run| ())
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -961,7 +1025,7 @@ async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
     // other pins still follow the lane - this test makes no claim about them.
     pin_fork_epochs(Some(CROSS_FORK_EPOCH), None, None, None);
 
-    let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?;
+    let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?.epochs.sealed;
 
     // The revalidated packs span both layouts only if the fork epoch sits strictly inside them.
     // Assert it rather than trusting the arithmetic in `CROSS_FORK_EPOCH`: a shorter run, or a
@@ -1004,7 +1068,7 @@ async fn test_epoch_sync_across_leader_seeded_ordering_fork() -> eyre::Result<()
     // layout or timestamp precision.
     pin_fork_epochs(None, Some(0), Some(CROSS_FORK_EPOCH), None);
 
-    let sealed = run_epoch_sync_scenario("epoch_sync_seeded").await?;
+    let sealed = run_epoch_sync_scenario("epoch_sync_seeded").await?.epochs.sealed;
 
     // The revalidated packs span both commit orders only if the fork epoch sits strictly inside
     // them. Assert it rather than trusting the arithmetic in `CROSS_FORK_EPOCH`: a shorter run,
@@ -1016,6 +1080,233 @@ async fn test_epoch_sync_across_leader_seeded_ordering_fork() -> eyre::Result<()
          {CROSS_FORK_EPOCH}: the restart proved only one commit order"
     );
 
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Test that a node restarted on a consensus archive spanning the sub-second timestamp fork reads
+/// commit times on both sides of it the way a node that never stopped does.
+///
+/// The same kill/restart scenario as [`test_epoch_sync`], with the sub-second fork pinned at
+/// [`CROSS_FORK_EPOCH`] and the seed-signature fork active from genesis, because the gate
+/// (`tn_types::forks::subsecond_timestamp_active`) conjoins it fail-closed. The killed node's
+/// sealed packs then hold epoch 0 in the whole-second layout and epoch 1 onward in the millisecond
+/// one. The restart re-reads that archive across the layout change to decide which epochs it still
+/// needs, imports the post-fork packs of the epochs it slept through from its peers, and step 8
+/// decodes both layouts again from the harness.
+///
+/// With the network still up, [`assert_restarted_node_reads_both_layouts`] then compares the
+/// restarted node with validator-1 on every epoch's final block and on every block both hold. Its
+/// per-epoch `subSecond` check rests on two facts. `tn_getBlockTimestampMillis` computes the flag
+/// from the leader epoch of the consensus header the block was executed from
+/// (`BlockTimestampMillis::with_consensus` and `ConsensusCommitTime::from` in
+/// `crates/execution/tn-rpc/src/rpc_ext.rs`). And a record's final block is executed from that
+/// epoch's own closing commit: `build_epoch_record` (`crates/node/src/manager/node/close_epoch.rs`)
+/// commits the epoch-closing block as `final_state`, and that block's nonce carries the concluding
+/// epoch (`deconstruct_nonce(ctx.nonce).0` in `crates/tn-reth/src/evm/block.rs`), which is the
+/// leader's epoch (`TNPayload::nonce` in `crates/tn-reth/src/payload.rs`).
+async fn test_epoch_sync_across_subsecond_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // both forced rather than inherited: the claim is a crossing at a known sub-second epoch with
+    // the seed fork active beneath it (the conjunct above), so it states both fork points even
+    // when the lane exported different ones. the multi-workers and leader-seeded pins follow the
+    // lane
+    pin_fork_epochs(None, Some(0), None, Some(CROSS_FORK_EPOCH));
+
+    let mut run = run_epoch_sync_scenario("epoch_sync_ms").await?;
+
+    // The revalidated packs span both layouts only if the fork epoch sits strictly inside them.
+    // Assert it rather than trusting the arithmetic in `CROSS_FORK_EPOCH`: a shorter run, or a
+    // wider safety margin in `sealed_epochs`, would otherwise quietly reduce this to a
+    // single-layout restart.
+    let sealed = &run.epochs.sealed;
+    assert!(
+        sealed.start < CROSS_FORK_EPOCH && CROSS_FORK_EPOCH < sealed.end,
+        "sealed epochs {sealed:?} do not straddle the sub-second fork at {CROSS_FORK_EPOCH}: the \
+         restart proved only one commit-time layout"
+    );
+
+    assert_restarted_node_reads_both_layouts(&run, CROSS_FORK_EPOCH).await?;
+
+    run.guard.kill_all();
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Test that a node down while the sub-second timestamp fork activates comes back on the
+/// millisecond layout from its peers' packs alone.
+///
+/// The same kill/restart scenario as [`test_epoch_sync_across_subsecond_fork`], with the fork
+/// pinned at [`SUBSECOND_FORK_WHILE_DOWN_EPOCH`], above the epoch the node is killed in and no
+/// later than the one it restarts in. Its own archive is then entirely pre-fork: every post-fork
+/// pack it holds was imported from peers, and the first post-fork commits it executes are ones it
+/// did not vote in. Both epochs are asserted from what the scenario observed rather than assumed
+/// from the constant.
+///
+/// With the network still up, [`assert_restarted_node_reads_both_layouts`] runs the same
+/// comparison with validator-1 as the test above (see its doc for why `subSecond` follows the
+/// epoch of the record's final block).
+async fn test_epoch_sync_subsecond_fork_activates_while_down() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // both forced rather than inherited, for the reasons given in
+    // `test_epoch_sync_across_subsecond_fork`
+    pin_fork_epochs(None, Some(0), None, Some(SUBSECOND_FORK_WHILE_DOWN_EPOCH));
+
+    let mut run = run_epoch_sync_scenario("epoch_sync_ms_down").await?;
+
+    let restarted = run.committee[run.restarted].0;
+    let SyncEpochs { epoch_at_kill, epoch_at_restart, .. } = run.epochs;
+    assert!(
+        epoch_at_kill < SUBSECOND_FORK_WHILE_DOWN_EPOCH,
+        "{restarted} was killed in epoch {epoch_at_kill}, not before the sub-second fork at \
+         {SUBSECOND_FORK_WHILE_DOWN_EPOCH}: its own archive may hold post-fork packs, so the run \
+         did not prove a node picking the fork up from its peers"
+    );
+    assert!(
+        SUBSECOND_FORK_WHILE_DOWN_EPOCH <= epoch_at_restart,
+        "{restarted} was restarted in epoch {epoch_at_restart}, before the sub-second fork at \
+         {SUBSECOND_FORK_WHILE_DOWN_EPOCH}: the fork did not activate while it was down, so the \
+         run did not prove a node picking the fork up from its peers"
+    );
+
+    assert_restarted_node_reads_both_layouts(&run, SUBSECOND_FORK_WHILE_DOWN_EPOCH).await?;
+
+    run.guard.kill_all();
+    Ok(())
+}
+
+/// Assert the node `run` restarted reads commit times on both sides of the sub-second fork at
+/// leader epoch `fork_epoch` the way validator-1 does.
+///
+/// For every epoch the scenario verified, both nodes must serve the same certified record, and the
+/// record's final block must report the same commit time on both, close the epoch, carry the hash
+/// the record commits to, and report `subSecond` exactly when the epoch is at or past
+/// `fork_epoch`. Then each node's blocks from genesis to its head are walked with
+/// [`walk_block_commit_times`] and compared height by height. On the restarted node every block up
+/// to the final block of epoch `fork_epoch - 1` must commit in whole seconds and report `subSecond`
+/// false, every later block must report it true, and at least one later block must commit off a
+/// whole second, so the millisecond layout is actually read back rather than truncated.
+///
+/// The scenario sends no transactions, so a node builds one block per epoch, for the epoch's
+/// closing commit, and skips every other empty commit; the walk is short.
+async fn assert_restarted_node_reads_both_layouts(
+    run: &EpochSyncRun,
+    fork_epoch: Epoch,
+) -> eyre::Result<()> {
+    let latest_epoch = run.epochs.latest_epoch;
+    eyre::ensure!(
+        0 < fork_epoch && fork_epoch <= latest_epoch,
+        "the sub-second fork at {fork_epoch} is not inside the verified epochs 0..={latest_epoch}: \
+         the run certified epochs on one side of it only"
+    );
+    let reference_url = &run.endpoints[0].http_url;
+    let restarted_url = &run.endpoints[run.restarted].http_url;
+    let reference_name = run.committee[0].0;
+    let restarted_name = run.committee[run.restarted].0;
+    let reference = ProviderBuilder::new().connect_http(reference_url.parse()?);
+    let restarted = ProviderBuilder::new().connect_http(restarted_url.parse()?);
+
+    // the final block of every verified epoch, which also places each walked block in its epoch
+    let mut final_blocks = BTreeMap::new();
+    for epoch in 0..=latest_epoch {
+        // already fetched and verified by the scenario, so these answer at once
+        let record_timeout = (EPOCH_DURATION * 6).max(60);
+        let record = fetch_verified_epoch_record(reference_url, epoch, record_timeout).await?;
+        let restarted_record =
+            fetch_verified_epoch_record(restarted_url, epoch, record_timeout).await?;
+        eyre::ensure!(
+            restarted_record == record,
+            "{restarted_name} serves a different certified record for epoch {epoch} than \
+             {reference_name}: {restarted_record:?} vs {record:?}"
+        );
+        let block = record.final_state.number;
+        let expected = block_commit_time(&reference, reference_name, block).await?;
+        let actual = block_commit_time(&restarted, restarted_name, block).await?;
+        eyre::ensure!(
+            actual == expected,
+            "{restarted_name} reports {actual:?} for block {block}, the final block of epoch \
+             {epoch}, and {reference_name} reports {expected:?}"
+        );
+        eyre::ensure!(
+            actual.block_hash == record.final_state.hash && actual.closes_epoch,
+            "block {block} on {restarted_name} is not the epoch-closing block the epoch {epoch} \
+             record commits to: {actual:?} vs {:?}",
+            record.final_state
+        );
+        eyre::ensure!(
+            actual.sub_second == (epoch >= fork_epoch),
+            "the final block of epoch {epoch} on {restarted_name} reports subSecond {} with the \
+             sub-second fork at {fork_epoch}",
+            actual.sub_second
+        );
+        info!(
+            target: "epoch-test",
+            epoch,
+            block,
+            timestamp_millis = actual.timestamp_millis,
+            sub_second = actual.sub_second,
+            "restarted node agrees on the epoch's final commit time",
+        );
+        final_blocks.insert(epoch, block);
+    }
+
+    let mut walks = Vec::with_capacity(2);
+    for (provider, name) in [(&reference, reference_name), (&restarted, restarted_name)] {
+        let head =
+            timeout(RPC_REQUEST_TIMEOUT, provider.get_block_number()).await.map_err(|_| {
+                eyre::eyre!("{name} did not answer eth_blockNumber within {RPC_REQUEST_TIMEOUT:?}")
+            })??;
+        walks.push(walk_block_commit_times(provider, name, 0..=head).await?);
+    }
+    assert_nodes_agree_on_commit_times(
+        &walks,
+        &[reference_name.to_string(), restarted_name.to_string()],
+    )?;
+
+    let last_pre_fork_block = final_blocks[&(fork_epoch - 1)];
+    let mut pre_fork_blocks = 0usize;
+    let mut post_fork_blocks = 0usize;
+    let mut off_second_blocks = 0usize;
+    for commit in &walks[1] {
+        let post_fork = commit.block_number > last_pre_fork_block;
+        eyre::ensure!(
+            commit.sub_second == post_fork,
+            "block {} on {restarted_name} reports subSecond {}, but the last block before the \
+             sub-second fork at {fork_epoch} is {last_pre_fork_block}",
+            commit.block_number,
+            commit.sub_second
+        );
+        if post_fork {
+            post_fork_blocks += 1;
+            if commit.timestamp_millis % 1000 != 0 {
+                off_second_blocks += 1;
+            }
+        } else {
+            pre_fork_blocks += 1;
+            eyre::ensure!(
+                commit.timestamp_millis % 1000 == 0,
+                "pre-fork block {} on {restarted_name} commits at {} ms, off a whole second",
+                commit.block_number,
+                commit.timestamp_millis
+            );
+        }
+    }
+    info!(
+        target: "epoch-test",
+        node = restarted_name,
+        last_pre_fork_block,
+        pre_fork_blocks,
+        post_fork_blocks,
+        off_second_blocks,
+        "restarted node's commit times on both sides of the sub-second fork",
+    );
+    eyre::ensure!(
+        off_second_blocks > 0,
+        "none of the {post_fork_blocks} post-fork blocks {restarted_name} served commits off a \
+         whole second: it never read a millisecond commit time back"
+    );
     Ok(())
 }
 
