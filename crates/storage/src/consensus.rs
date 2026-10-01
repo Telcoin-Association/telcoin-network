@@ -2027,6 +2027,85 @@ mod test {
         assert_eq!(latest.number, k + 1);
     }
 
+    /// Persisting an epoch's first output syncs the position index before the digest indexes,
+    /// and only the digest indexes record the data file length. A hard kill between those syncs
+    /// lets the heal cut the data back to the epoch meta while the one position entry survives.
+    /// Opening must drop that entry and clamp the marker to the previous epoch's last output, as
+    /// it does for an empty epoch pack, so the output can be saved again.
+    #[tokio::test]
+    async fn test_new_clamps_marker_when_heal_drops_first_epoch_output() {
+        use crate::consensus_pack::DATA_NAME;
+
+        let temp_dir = TempDir::with_prefix("test_marker_torn_first_output").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let committee1 = committee.advance_epoch_for_test(1);
+        let data_path = temp_dir.path().join("epoch-1").join(DATA_NAME);
+
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let meta_end = {
+            let consensus_chain =
+                ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+            for i in 0..k {
+                let output =
+                    make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+                parent = output.digest();
+                consensus_chain.save_consensus_output(output).await.unwrap();
+            }
+            consensus_chain.persist_current().await.expect("persist");
+            let epoch0_record = EpochRecord {
+                final_consensus: ConsensusNumHash::new(k, parent),
+                ..previous_epoch.clone()
+            };
+            // opens and persists the epoch 1 pack with only its epoch meta
+            consensus_chain.new_epoch(epoch0_record, committee1.clone()).await.unwrap();
+            let meta_end = std::fs::metadata(&data_path).expect("metadata").len();
+            let first =
+                make_test_output(&committee1, (k % 4) as usize, chain.clone(), k + 1, parent);
+            consensus_chain.save_consensus_output(first).await.unwrap();
+            consensus_chain.persist_current().await.expect("persist");
+            meta_end
+        };
+        // the data the heal keeps ends at the epoch meta, and the marker names the lost output
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&data_path).expect("open data");
+            f.set_len(meta_end).expect("truncate");
+        }
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 1, k + 1).expect("write hint");
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("first reopen");
+        assert_eq!(reopened.latest_consensus_epoch(), 1, "marker keeps the new epoch");
+        assert_eq!(reopened.latest_consensus_number(), k, "marker clamped to the previous final");
+        assert!(
+            reopened.consensus_header_latest().await.expect("no read error").is_none(),
+            "the healed epoch 1 pack holds no output"
+        );
+        let next = make_test_output(&committee1, (k % 4) as usize, chain.clone(), k + 1, parent);
+        reopened
+            .save_consensus_output(next)
+            .await
+            .expect("the dropped output must be accepted again");
+        reopened.persist_current().await.expect("persist");
+        drop(reopened);
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("second reopen");
+        assert_eq!(reopened.latest_consensus_epoch(), 1);
+        assert_eq!(reopened.latest_consensus_number(), k + 1);
+        let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
+        assert_eq!(latest.number, k + 1);
+    }
+
     /// #1075: `PackError::is_missing_static_files` must be true ONLY when epoch files are
     /// absent on disk (io `NotFound` from the data-file or an index-file open), and false for
     /// files that are present but unreadable - the distinction `get_static_if_present` uses to

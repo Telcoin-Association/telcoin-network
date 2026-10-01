@@ -719,9 +719,9 @@ impl Inner {
                     }
                 }
                 if idx == 0 {
-                    if idx != start_idx {
-                        consensus_pos_idx.truncate_all()?;
-                    }
+                    // entry 0 failed to load or ends past the data, so it goes too, even when it
+                    // is the only entry
+                    consensus_pos_idx.truncate_all()?;
                     break;
                 }
                 idx -= 1;
@@ -3546,6 +3546,69 @@ pub(crate) mod test {
         );
         let len_after = std::fs::metadata(&data_path).expect("metadata").len();
         assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// A kill while persisting an epoch's first output can leave the position index with that
+    /// one entry while the heal cuts the data file back to the epoch meta. The heal must drop the
+    /// lone entry, as it already does when more entries sit in front of it, both for that cut and
+    /// for a data file that ends inside the output. The pack then reports `start - 1` as its
+    /// tail, has no latest header, and takes the output again.
+    #[tokio::test]
+    async fn test_open_append_exists_drops_lone_torn_index_entry() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let output =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+
+        // cut back to the end of the epoch meta, then to one byte short of the output's end
+        for cut_to_meta_end in [true, false] {
+            let temp_dir = TempDir::with_prefix("test_cp_lone_torn_entry").expect("temp dir");
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            let meta_end = {
+                let pack = ConsensusPack::open_append(
+                    temp_dir.path(),
+                    previous_epoch.clone(),
+                    committee.clone(),
+                )
+                .expect("open pack");
+                pack.persist().await.expect("persist meta");
+                let meta_end = std::fs::metadata(&data_path).expect("metadata").len();
+                pack.save_consensus_output(output.clone()).await.expect("save output");
+                pack.persist().await.expect("persist output");
+                meta_end
+            };
+            let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+            let cut_len = if cut_to_meta_end { meta_end } else { full_len - 1 };
+            {
+                let f =
+                    OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+                f.set_len(cut_len).expect("truncate");
+            }
+
+            // epoch 0 starts at number 1, so an empty pack has tail 0
+            let (pack, tail) = ConsensusPack::open_append_exists_with_tail(temp_dir.path(), 0)
+                .expect("open heals the torn output");
+            assert_eq!(tail, 0, "data cut to {cut_len}: the lone torn index entry must be dropped");
+            let latest = pack.latest_consensus_header().await;
+            assert!(
+                matches!(latest, Ok(None)),
+                "data cut to {cut_len}: expected Ok(None), got {latest:?}"
+            );
+            pack.save_consensus_output(output.clone())
+                .await
+                .expect("the dropped output must be accepted again");
+            pack.persist().await.expect("persist after heal");
+            drop(pack);
+
+            let (pack, tail) = ConsensusPack::open_append_exists_with_tail(temp_dir.path(), 0)
+                .expect("reopen after the save");
+            assert_eq!(tail, 1, "data cut to {cut_len}: the saved output is the new tail");
+            let latest =
+                pack.latest_consensus_header().await.expect("read latest").expect("latest header");
+            assert_eq!(latest.number, 1);
+        }
     }
 
     /// The heal rebuilds the pack from its data header, so the digest indexes must be
