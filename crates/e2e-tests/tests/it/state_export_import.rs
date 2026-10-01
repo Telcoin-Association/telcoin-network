@@ -61,9 +61,11 @@ use alloy::{
 };
 use e2e_tests::{
     config_local_testnet_with_epoch_duration, config_local_testnet_with_worker_fee_configs,
+    NodeEndpoints, TestBinary,
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -83,10 +85,12 @@ use tn_types::{
 use tracing::info;
 
 use crate::common::{
-    address_from_word, current_epoch, fetch_verified_epoch_record, get_balance, get_block, get_key,
-    get_positive_balance_with_retry, get_tx_receipt_block, network_advancing, read_base_fee,
-    send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
-    wait_for_epoch_at_least, wait_for_mid_epoch, ProcessGuard,
+    address_from_word, assert_epoch_records_verify, assert_nodes_agree_on_commit_times,
+    current_epoch, fetch_verified_epoch_record, get_balance, get_block, get_key,
+    get_positive_balance_with_retry, get_tx_receipt_block, network_advancing, pin_fork_epochs,
+    read_base_fee, send_and_confirm, send_tel, start_observer, start_validator,
+    start_validator_with_args, wait_for_epoch_at_least, wait_for_head_at_least, wait_for_mid_epoch,
+    walk_block_commit_times, ProcessGuard,
 };
 
 /// Epoch duration (seconds) for this test. 6s sits a second above the 5s epoch tests' consensus
@@ -127,12 +131,40 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    wait_node(
+        guard,
+        obs_idx,
+        "observer",
+        "state_export_import/node4-run0",
+        deadline_secs,
+        what,
+        cond,
+    )
+    .await
+}
+
+/// [`wait_observer`] for any node process in `guard`: `role` names it in the failure, and `log`
+/// is its log path under `crates/e2e-tests/test_logs/` without the extension
+/// (`<test>/node<instance>-run<run>`).
+async fn wait_node<F, Fut>(
+    guard: &mut ProcessGuard,
+    idx: usize,
+    role: &str,
+    log: &str,
+    deadline_secs: u64,
+    what: &str,
+    cond: F,
+) -> eyre::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let deadline = Instant::now() + Duration::from_secs(deadline_secs);
     loop {
-        if let Some(status) = guard.get_mut(obs_idx).and_then(|c| c.try_wait().ok().flatten()) {
+        if let Some(status) = guard.get_mut(idx).and_then(|c| c.try_wait().ok().flatten()) {
             eyre::bail!(
-                "observer process exited ({status}) while waiting for {what}; see \
-                 crates/e2e-tests/test_logs/state_export_import/node4-run0.stderr.log"
+                "{role} process exited ({status}) while waiting for {what}; see \
+                 crates/e2e-tests/test_logs/{log}.stderr.log"
             );
         }
         if cond().await {
@@ -141,7 +173,7 @@ where
         if Instant::now() >= deadline {
             eyre::bail!(
                 "timed out after {deadline_secs}s waiting for {what}; see \
-                 crates/e2e-tests/test_logs/state_export_import/node4-run0.log"
+                 crates/e2e-tests/test_logs/{log}.log"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1124,6 +1156,338 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
         "observer entered the post-import epoch on the RECORDED fee"
     );
 
+    guard.kill_all();
+    Ok(())
+}
+
+/// The sub-second timestamp fork epoch for the tests that restore across that fork: the epoch
+/// right after [`IMPORT_EPOCH`]. The bundle and its snapshot block `B` (the imported epoch's
+/// final block) are then in the legacy whole-second layout, and the block after `B` is the first
+/// commit of the first post-fork epoch, which the committee floors on `B`'s whole-second
+/// timestamp (the closing timestamp of the epoch before, the only floor a restored node has).
+const SNAPSHOT_FORK_EPOCH: u32 = IMPORT_EPOCH + 1;
+
+/// How many blocks past the fork epoch's final block a restored node must hold before its commit
+/// times are compared, so the comparison covers the epoch after the seam as well as the seam.
+const BLOCKS_PAST_FORK_EPOCH: u64 = 5;
+
+/// Configure a four-validator network under `temp_path` with `funded` in genesis and
+/// [`EXPORT_EPOCH_DURATION`] epochs, start it with `validator-1` (index 0) as the only
+/// `--enable-state-export` node, logging under `test`, and wait until every validator serves
+/// RPC. Returns the guard (validator `i` at index `i`) and the validators' RPC URLs.
+fn start_exporting_committee(
+    temp_path: &Path,
+    test: &str,
+    funded: Vec<(Address, GenesisAccount)>,
+) -> eyre::Result<(ProcessGuard, [String; 4])> {
+    config_local_testnet_with_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        Some(funded),
+        Some(EXPORT_EPOCH_DURATION as u32),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut guard = ProcessGuard::empty();
+    let mut client_urls: [String; 4] = Default::default();
+    for (i, url) in client_urls.iter_mut().enumerate() {
+        let rpc_port = get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no ephemeral rpc port for validator {i}"))?;
+        *url = format!("http://127.0.0.1:{rpc_port}");
+        let export: &[&str] = if i == 0 { &["--enable-state-export"] } else { &[] };
+        guard.push(start_validator_with_args(i, bin, temp_path, rpc_port, test, 0, export));
+    }
+    network_advancing(&client_urls)?;
+    Ok((guard, client_urls))
+}
+
+/// Send a small transfer from `factory` to `sink` through the node at `url` every 1.5 s until
+/// `stop` is set, so every epoch holds genuine worker blocks (see the module docs). The chain spec
+/// comes from the genesis the ceremony wrote under `temp_path`.
+fn spawn_tx_stream(
+    temp_path: &Path,
+    url: &str,
+    mut factory: TransactionFactory,
+    sink: Address,
+    stop: Arc<AtomicBool>,
+) -> eyre::Result<tokio::task::JoinHandle<()>> {
+    let genesis: Genesis = Config::load_from_path(
+        temp_path.join("validator-1").join("genesis").join("genesis.yaml"),
+        ConfigFmt::YAML,
+    )?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let provider = ProviderBuilder::new().connect_http(url.parse()?);
+    Ok(tokio::spawn(async move {
+        while !stop.load(Ordering::Relaxed) {
+            let raw = factory.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(sink),
+                U256::from(1_000u64),
+                Bytes::default(),
+            );
+            let _ = provider.send_raw_transaction(&raw).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }))
+}
+
+/// Wait for `validator-1` to write its epoch-`epoch` bundle, check the bundle holds its four
+/// files, and return its directory.
+async fn wait_for_bundle(temp_path: &Path, epoch: u32) -> eyre::Result<PathBuf> {
+    let bundle_dir = temp_path
+        .join("validator-1")
+        .join("consensus-db")
+        .join("state_exports")
+        .join(format!("epoch-{epoch}"));
+    wait_until(
+        // the 100 s floor covers the certificate window that gates the export (see
+        // `test_state_export_import_bootstrap`)
+        Duration::from_secs((EXPORT_EPOCH_DURATION * 4).max(100)),
+        &format!("exporter to write the epoch-{epoch} bundle"),
+        || async { Ok(bundle_dir.is_dir()) },
+    )
+    .await?;
+    for file in ["state_data", "consensus_data", "epoch_records", "epoch_certs"] {
+        eyre::ensure!(
+            bundle_dir.join(file).is_file(),
+            "export bundle {bundle_dir:?} is missing `{file}`"
+        );
+    }
+    Ok(bundle_dir)
+}
+
+/// Run `db load-state` to import `bundle_dir` into `datadir`, and check it wrote the resume hint
+/// that makes the node sync forward from `epoch` rather than from genesis. Returns its stdout.
+fn load_bundle(
+    bin: &TestBinary,
+    datadir: &Path,
+    bundle_dir: &Path,
+    epoch: u32,
+) -> eyre::Result<String> {
+    // one-shot process; `block_in_place` keeps the blocking wait off the async scheduler
+    let output = tokio::task::block_in_place(|| {
+        bin.command()
+            .arg("--datadir")
+            .arg(datadir)
+            .arg("db")
+            .arg("load-state")
+            .arg(bundle_dir)
+            .output()
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eyre::ensure!(
+        output.status.success(),
+        "db load-state into {datadir:?} failed (status {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    eyre::ensure!(
+        stdout.contains(&format!("resume syncing from epoch {epoch}")),
+        "db load-state did not write a resume hint for epoch {epoch}:\n{stdout}"
+    );
+    Ok(stdout)
+}
+
+/// Test an observer bootstrapped from a pre-fork snapshot syncing across the sub-second timestamp
+/// fork, and agreeing with the network on every commit time from the snapshot block on.
+///
+/// The fork is pinned at [`SNAPSHOT_FORK_EPOCH`], the epoch after [`IMPORT_EPOCH`], with the
+/// seed-signature fork active from genesis because the sub-second gate conjoins it. The bundle and
+/// its snapshot block `B` are therefore in the legacy whole-second layout, and the block after `B`
+/// is the first commit of the first post-fork epoch, which the committee floors on `B`'s
+/// whole-second timestamp. The network is at [`MIN_LEAD_EPOCH`] or later before the import, so
+/// the fork epoch has closed by then: the observer syncs it from peers, from a datadir holding
+/// nothing older than the bundle, and then follows live output.
+///
+/// `tn_getBlockTimestampMillis` reports `subSecond` from the serving node's own fork gate,
+/// evaluated on the epoch of the block's consensus leader (`BlockTimestampMillis::with_consensus`
+/// in `crates/execution/tn-rpc/src/rpc_ext.rs`), not on the node's current epoch, so the flag has
+/// to change exactly between `B` and the block after it. On the observer:
+///
+/// - `B` carries the hash the epoch record commits to, `subSecond` false, and a commit time equal
+///   to its timestamp in whole seconds;
+/// - the block after `B` has `subSecond` true and commits strictly after `B`'s second;
+/// - every later block has `subSecond` true, and at least one commit time has a non-zero
+///   millisecond part, so the observer decoded the millisecond layout rather than only reporting
+///   the flag;
+/// - from `B` to its head, at least [`BLOCKS_PAST_FORK_EPOCH`] blocks past the fork epoch's final
+///   block, every block hash, commit time, consensus number and consensus digest equals
+///   validator-1's. A consensus header's digest covers its parent, so equal digests also mean both
+///   nodes hold the same first consensus header of the fork epoch;
+/// - the certified records for [`IMPORT_EPOCH`] through the fork epoch verify, and their final
+///   blocks carry the recorded hashes;
+/// - a transaction sent to a validator after the observer joined lands on the observer.
+#[test]
+#[ignore = "only run independently from all other it tests"]
+fn test_epoch_snapshot_import_across_subsecond_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // forced rather than inherited: the claim is a crossing one epoch past the snapshot, and the
+    // sub-second gate conjoins the seed fork fail-closed, so a dormant seed fork would leave every
+    // epoch on whole seconds. pinned before anything reads a gate or spawns a node
+    pin_fork_epochs(None, Some(0), None, Some(SNAPSHOT_FORK_EPOCH));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(test_epoch_snapshot_import_across_subsecond_fork_inner())
+}
+
+async fn test_epoch_snapshot_import_across_subsecond_fork_inner() -> eyre::Result<()> {
+    // short on purpose: node IPC socket paths are built under the temp dir
+    let test = "ss_snap_obs";
+    let tmp_guard = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let bin = e2e_tests::get_telcoin_network_binary();
+
+    let tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(1234));
+    let funded = vec![(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    let (mut guard, client_urls) = start_exporting_committee(&temp_path, test, funded)?;
+    let tx_sink = address_from_word("ss-snap-obs-tx-sink");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stream = spawn_tx_stream(&temp_path, &client_urls[1], tx_factory, tx_sink, stop.clone())?;
+
+    // the fork epoch closes before the import, so the observer syncs the seam from peers
+    let provider = ProviderBuilder::new().connect_http(client_urls[0].parse()?);
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    wait_until(
+        Duration::from_secs(EXPORT_EPOCH_DURATION * 4 * MIN_LEAD_EPOCH as u64),
+        &format!("network to reach epoch {MIN_LEAD_EPOCH}"),
+        || async { Ok(registry.getCurrentEpochInfo().call().await?.epochId >= MIN_LEAD_EPOCH) },
+    )
+    .await?;
+    let sink_balance = get_positive_balance_with_retry(&client_urls[0], &tx_sink.to_string())?;
+    eyre::ensure!(sink_balance > 0, "transaction stream produced no executed transfers");
+
+    let bundle_dir = wait_for_bundle(&temp_path, IMPORT_EPOCH).await?;
+    let record_wait = (EXPORT_EPOCH_DURATION * 4).max(60);
+    let import_record =
+        fetch_verified_epoch_record(&client_urls[0], IMPORT_EPOCH, record_wait).await?;
+    let fork_record =
+        fetch_verified_epoch_record(&client_urls[0], SNAPSHOT_FORK_EPOCH, record_wait).await?;
+    let snapshot_block = import_record.final_state.number;
+    let fork_final = fork_record.final_state.number;
+    info!(target: "restart-test", snapshot_block, fork_final, ?bundle_dir, "anchored the snapshot");
+
+    let stdout = load_bundle(bin, &temp_path.join("observer"), &bundle_dir, IMPORT_EPOCH)?;
+    info!(target: "restart-test", %stdout, "db load-state completed");
+
+    // the observer climbs at least to the validator's current height and past the fork epoch
+    let target = provider.get_block_number().await?.max(fork_final + BLOCKS_PAST_FORK_EPOCH);
+    let obs_rpc_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no ephemeral rpc port for the observer"))?;
+    let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
+    let obs_idx = guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, test, 0));
+    let obs_provider = ProviderBuilder::new().connect_http(obs_url.parse()?);
+    let obs_log = format!("{test}/node4-run0");
+    wait_node(&mut guard, obs_idx, "observer", &obs_log, 60, "observer RPC to answer", || async {
+        obs_provider.get_block_number().await.is_ok()
+    })
+    .await?;
+    let obs_start_block = obs_provider.get_block_number().await?;
+    eyre::ensure!(
+        obs_start_block >= snapshot_block,
+        "observer started at block {obs_start_block}, below the snapshot block {snapshot_block}: \
+         it did not bootstrap from the bundle"
+    );
+    wait_node(
+        &mut guard,
+        obs_idx,
+        "observer",
+        &obs_log,
+        (EXPORT_EPOCH_DURATION * 8).max(90),
+        &format!("observer to sync forward to block {target}"),
+        || async { obs_provider.get_block_number().await.is_ok_and(|h| h >= target) },
+    )
+    .await?;
+    wait_node(
+        &mut guard,
+        obs_idx,
+        "observer",
+        &obs_log,
+        (EXPORT_EPOCH_DURATION * 4).max(60),
+        &format!("observer epoch to advance past {SNAPSHOT_FORK_EPOCH}"),
+        || async {
+            obs_provider
+                .raw_request::<_, u32>("tn_getCurrentEpoch".into(), ())
+                .await
+                .is_ok_and(|epoch| epoch > SNAPSHOT_FORK_EPOCH)
+        },
+    )
+    .await?;
+
+    // the observer serves nothing below its restore floor, so both walks start at `B`
+    let head = obs_provider.get_block_number().await?;
+    wait_for_head_at_least(&client_urls[0], head, 60).await?;
+    let walked = snapshot_block..=head;
+    let served = [
+        walk_block_commit_times(&provider, &client_urls[0], walked.clone()).await?,
+        walk_block_commit_times(&obs_provider, &obs_url, walked).await?,
+    ];
+    assert_nodes_agree_on_commit_times(&served, &[client_urls[0].clone(), obs_url.clone()])?;
+    info!(target: "restart-test", snapshot_block, head, "observer agrees with validator-1");
+
+    let [_, observed] = &served;
+    let (snapshot, after) = observed
+        .split_first()
+        .ok_or_else(|| eyre::eyre!("the walk from {snapshot_block} is empty"))?;
+    let fork_close =
+        observed.iter().find(|commit| commit.block_number == fork_final).ok_or_else(|| {
+            eyre::eyre!("the walk {snapshot_block}..={head} misses block {fork_final}")
+        })?;
+    eyre::ensure!(
+        !snapshot.sub_second && fork_close.sub_second,
+        "the snapshot block {snapshot_block} (epoch {IMPORT_EPOCH}) and the final block {fork_final} \
+         of epoch {SNAPSHOT_FORK_EPOCH} do not straddle the sub-second fork, so the run proved only \
+         one timestamp layout: {snapshot:?} / {fork_close:?}"
+    );
+    eyre::ensure!(
+        snapshot.block_hash == import_record.final_state.hash
+            && snapshot.timestamp_millis == snapshot.timestamp * 1000,
+        "the snapshot block is not the recorded whole-second block {}: {snapshot:?}",
+        import_record.final_state.hash
+    );
+    let first_post_fork = after
+        .first()
+        .ok_or_else(|| eyre::eyre!("the walk {snapshot_block}..={head} ends at the snapshot"))?;
+    eyre::ensure!(
+        first_post_fork.sub_second && first_post_fork.timestamp_millis > snapshot.timestamp * 1000,
+        "the first post-fork commit is not a sub-second commit after the snapshot's second {}: \
+         {first_post_fork:?}",
+        snapshot.timestamp
+    );
+    if let Some(whole) = after.iter().find(|commit| !commit.sub_second) {
+        eyre::bail!("a block after the snapshot reports a whole-second commit: {whole:?}");
+    }
+    eyre::ensure!(
+        after.iter().any(|commit| commit.timestamp_millis % 1000 != 0),
+        "no commit time in blocks {}..={head} has a millisecond part",
+        snapshot_block + 1
+    );
+    info!(
+        target: "restart-test",
+        snapshot_block,
+        snapshot_ms = snapshot.timestamp_millis,
+        first_post_fork = first_post_fork.block_number,
+        first_post_fork_ms = first_post_fork.timestamp_millis,
+        "the observer crossed the sub-second fork from a pre-fork snapshot"
+    );
+
+    let observer =
+        NodeEndpoints { http_url: obs_url.clone(), ws_url: String::new(), ipc_path: String::new() };
+    assert_epoch_records_verify(&[observer], IMPORT_EPOCH..=SNAPSHOT_FORK_EPOCH, record_wait)
+        .await?;
+
+    // the dev-funded `test-source` account (nonce 0) is not the stream's sender
+    let key = get_key("test-source");
+    send_and_confirm(&client_urls[1], &obs_url, &key, address_from_word("ss-snap-obs-target"), 0)?;
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = stream.await;
     guard.kill_all();
     Ok(())
 }
