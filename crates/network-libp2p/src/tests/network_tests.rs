@@ -22,6 +22,185 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Recover a stale signed mapping through a real remote Kademlia query and replacement dial.
+async fn stale_committee_live_recovery(
+    network_type: NetworkType,
+    observer_key: tn_config::KeyConfig,
+    publisher_key: tn_config::KeyConfig,
+    observer_db: MemDatabase,
+    publisher_db: MemDatabase,
+) -> eyre::Result<()> {
+    use libp2p::{
+        core::transport::TransportError,
+        swarm::{ConnectionId, DialError, DialFailure, FromSwarm, NetworkBehaviour as _},
+    };
+    use tn_types::NetworkKeypair;
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let task_manager = TaskManager::default();
+    let (observer_events, _observer_rx) = mpsc::channel(10);
+    let (target_events, _target_rx) = mpsc::channel(10);
+    let target_address = peer2.config.primary_address();
+    let observer_address = peer1.config.primary_address();
+    let advertised_rpc = match network_type {
+        NetworkType::Primary => None,
+        NetworkType::Worker(id) => Some(RpcInfo {
+            http: format!("https://worker-{id}.replacement.example/").parse()?,
+            ws: None,
+        }),
+    };
+    let local_key = match network_type {
+        NetworkType::Primary => observer_key.primary_network_keypair().clone(),
+        NetworkType::Worker(id) => observer_key.worker_network_keypair(id),
+    };
+    let mut observer = ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+        peer1.config.network_config(),
+        observer_events,
+        observer_key,
+        local_key,
+        observer_db,
+        task_manager.get_spawner(),
+        network_type,
+        observer_address.clone(),
+        None,
+    )?;
+    let mut target = ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+        peer2.config.network_config(),
+        target_events,
+        publisher_key.clone(),
+        NetworkKeypair::generate_ed25519(),
+        publisher_db,
+        task_manager.get_spawner(),
+        network_type,
+        target_address.clone(),
+        advertised_rpc.clone(),
+    )?;
+    let key = publisher_key.primary_public_key();
+    let old_address: Multiaddr = "/ip4/127.0.0.1/udp/1/quic-v1".parse()?;
+    let old_info = NetworkInfo {
+        pubkey: NetworkKeypair::generate_ed25519().public().into(),
+        multiaddrs: vec![old_address.clone()],
+        timestamp: 0,
+        rpc: None,
+    };
+    let old_peer = old_info.pubkey.clone().into();
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+    let (role, worker_id) = match network_type {
+        NetworkType::Primary => (0u8, 0u16),
+        NetworkType::Worker(id) => (1u8, id),
+    };
+    let signing_bytes = encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        chain_id,
+        role,
+        worker_id,
+        &old_info,
+    ));
+    let old_record = kad::Record {
+        key: node_record_key(&key),
+        value: encode(&NodeRecord {
+            info: old_info.clone(),
+            signature: publisher_key.request_signature_direct(&signing_bytes),
+        }),
+        publisher: Some(old_peer),
+        expires: None,
+    };
+    assert!(observer.peer_record_valid(&old_record).is_some());
+    observer.swarm.behaviour_mut().peer_manager.update_committees(
+        HashSet::new(),
+        HashSet::from([key]),
+        HashSet::new(),
+    );
+    observer.swarm.behaviour_mut().peer_manager.add_discovered_peer(key, old_info);
+    observer.swarm.behaviour_mut().kademlia.store_mut().put(old_record)?;
+    // Drain the committee seed's missing-record notification before exercising dial failures.
+    observer.swarm.behaviour_mut().peer_manager.take_test_events();
+
+    let target_peer = *target.swarm.local_peer_id();
+    observer.swarm.behaviour_mut().kademlia.add_address(&target_peer, target_address.clone());
+    target.provide_our_data();
+    let error = DialError::Transport(vec![(
+        old_address,
+        TransportError::Other(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+    )]);
+    (0..3).for_each(|attempt| {
+        observer.swarm.behaviour_mut().peer_manager.on_swarm_event(FromSwarm::DialFailure(
+            DialFailure {
+                peer_id: Some(old_peer),
+                error: &error,
+                connection_id: ConnectionId::new_unchecked(attempt),
+            },
+        ));
+    });
+    let refresh = observer
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .take_test_events()
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("repeated failures must request verified rediscovery"))?;
+    assert_matches!(&refresh, PeerEvent::RefreshAuthorities(keys) if keys == &[key]);
+    observer.process_peer_manager_event(refresh)?;
+    assert!(observer
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&node_record_key(&key))
+        .is_none());
+    assert_eq!(observer.swarm.behaviour().peer_manager.peer_to_bls(&old_peer), Some(key));
+    observer.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+    observer.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
+    assert_eq!(observer.kad_record_queries.len(), 1, "all refresh sources share one live query");
+
+    let observer_handle = observer.network_handle();
+    let target_handle = target.network_handle();
+    let target_task = tokio::spawn(target.run());
+    target_handle.start_listening(target_address).await?;
+    let observer_task = tokio::spawn(observer.run());
+    observer_handle.start_listening(observer_address).await?;
+    let converged =
+        wait_until(Duration::from_secs(10), "stale committee binding recovers", || async {
+            Ok(observer_handle.connected_peers().await?.contains(&key)
+                && observer_handle.get_validator_rpc(key).await? == advertised_rpc)
+        })
+        .await;
+    observer_task.abort();
+    target_task.abort();
+    converged?;
+    Ok(())
+}
+
+/// The primary and two worker swarms independently discover, verify and dial a re-keyed member.
+#[tokio::test]
+async fn stale_committee_live_primary_and_worker_recovery() -> eyre::Result<()> {
+    let observer_key = tn_config::KeyConfig::new_with_testing_key(BlsKeypair::generate(
+        &mut StdRng::from_seed([151; 32]),
+    ));
+    let publisher_key = tn_config::KeyConfig::new_with_testing_key(BlsKeypair::generate(
+        &mut StdRng::from_seed([153; 32]),
+    ));
+    let observer_db = MemDatabase::default();
+    let publisher_db = MemDatabase::default();
+    futures::future::try_join_all(
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].into_iter().map(
+            |network_type| {
+                stale_committee_live_recovery(
+                    network_type,
+                    observer_key.clone(),
+                    publisher_key.clone(),
+                    observer_db.clone(),
+                    publisher_db.clone(),
+                )
+            },
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(

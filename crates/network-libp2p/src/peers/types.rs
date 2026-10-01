@@ -69,6 +69,17 @@ pub(crate) enum PeerEvent {
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers kad queries.
     MissingAuthorities(Vec<BlsPublicKey>),
+    /// Failed committee endpoints need a fresh remote record, bypassing stale local DHT data.
+    RefreshAuthorities(Vec<BlsPublicKey>),
+    /// A newer verified committee record replaced transport addresses or the network key.
+    CommitteeRecordUpdated {
+        /// Transport identity whose routing hints must be removed.
+        previous: PeerId,
+        /// Transport identity in the newer verified record.
+        peer: PeerId,
+        /// Verified replacement addresses for dialing and record consumers.
+        addresses: Vec<Multiaddr>,
+    },
     /// Initiate a discovery attempt because discovery peer counts are low.
     Discovery,
 }
