@@ -9,7 +9,7 @@ use libp2p::{
         dial_opts::{DialOpts, PeerCondition},
         dummy::ConnectionHandler,
         ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
-        NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
+        ListenFailure, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
@@ -22,7 +22,7 @@ impl NetworkBehaviour for PeerManager {
 
     fn handle_pending_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         maybe_peer: Option<PeerId>,
         addresses: &[Multiaddr], // kad may dial by PeerId only
         _effective_role: Endpoint,
@@ -49,6 +49,7 @@ impl NetworkBehaviour for PeerManager {
                     ));
                 }
                 // peer manager has already approved this dial attempt
+                self.reserve_connection(connection_id, peer_id, Endpoint::Dialer)?;
                 return Ok(vec![]);
             }
 
@@ -57,6 +58,7 @@ impl NetworkBehaviour for PeerManager {
             if self.can_dial(&peer_id) {
                 trace!(target: "peer-manager", ?peer_id, "can_dial success");
                 self.register_dial_attempt(peer_id, None);
+                self.reserve_connection(connection_id, peer_id, Endpoint::Dialer)?;
             } else {
                 debug!(target: "peer-manager", ?peer_id, "can_dial failed");
                 return Err(ConnectionDenied::new(
@@ -65,8 +67,7 @@ impl NetworkBehaviour for PeerManager {
             }
         }
 
-        // do not check peer connection limits since kad may try to find better peers for routing
-        // excess peers are pruned next heartbeat
+        // Known outbound identities reserve capacity before dialing, including kad-initiated dials.
         //
         // NOTE: kademlia extends addresses by default
         // See swarm `WithPeerId::build` -> DialOpts
@@ -86,7 +87,7 @@ impl NetworkBehaviour for PeerManager {
 
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
@@ -104,12 +105,13 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
+        self.reserve_connection(connection_id, peer, Endpoint::Listener)?;
         Ok(ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         addr: &Multiaddr,
         _role_override: Endpoint,
@@ -130,13 +132,17 @@ impl NetworkBehaviour for PeerManager {
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
 
+        self.reserve_connection(connection_id, peer, Endpoint::Dialer)?;
         Ok(ConnectionHandler)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
             }) => {
                 // NOTE: The ConnectionEstablished event must be handled because
                 // NetworkBehaviour::handle_established_inbound_connection and
@@ -144,17 +150,26 @@ impl NetworkBehaviour for PeerManager {
                 //
                 // Another behaviour can terminate the connection early, making it unsafe to
                 // assume a peer is connected until this event is received.
+                self.commit_connection(connection_id, peer_id);
                 self.on_connection_established(peer_id, endpoint)
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
                 endpoint,
                 remaining_established,
+                connection_id,
                 ..
-            }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
-            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
+            }) => {
+                self.release_connection(connection_id);
+                self.on_connection_closed(peer_id, endpoint, remaining_established);
+            }
+            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id }) => {
+                self.release_connection(connection_id);
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
+            }
+            FromSwarm::ListenFailure(ListenFailure { connection_id, .. }) => {
+                self.release_connection(connection_id);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
@@ -262,14 +277,6 @@ impl PeerManager {
                 address.clone()
             }
         };
-
-        // check connection limits
-        if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
-            debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
-            // gracefully disconnect and indicate excess peers
-            self.disconnect_peer(peer_id, true);
-            return;
-        }
 
         self.push_event(PeerEvent::PeerConnected(peer_id, multiaddr));
 
