@@ -78,6 +78,52 @@ async fn public_peer_limit_preserves_protected_headroom() {
     assert!(!manager.peer_limit_reached(&endpoint));
 }
 
+/// Committee rotation reclaims public slots even below the aggregate connection ceiling.
+#[tokio::test]
+async fn public_peer_limit_prunes_after_committee_rotation() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    let keys =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([82; 32])));
+    let protocol_key = keys.primary_public_key();
+    let network_key = keys.primary_network_public_key();
+    let protected: PeerId = network_key.clone().into();
+    let address = create_multiaddr(None);
+    manager.add_known_peer(
+        protocol_key,
+        NetworkInfo {
+            pubkey: network_key,
+            multiaddrs: vec![address.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
+    );
+    manager.update_committees(HashSet::new(), HashSet::from([protocol_key]), HashSet::new());
+    assert!(manager.register_peer_connection(
+        &protected,
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    register_peer(&mut manager, None);
+    register_peer(&mut manager, None);
+    manager.heartbeat();
+    let initial_events = collect_all_events(&mut manager);
+    assert!(!initial_events.iter().any(|event| {
+        matches!(event, PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _))
+    }));
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(!manager.peer_is_important(&protected));
+    let rotated_events = collect_all_events(&mut manager);
+    assert_eq!(
+        rotated_events
+            .iter()
+            .filter(|event| {
+                matches!(event, PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _))
+            })
+            .count(),
+        1,
+    );
+}
+
 /// Helper function to extract events of a certain type
 fn extract_events<'a>(
     events: &'a [PeerEvent],

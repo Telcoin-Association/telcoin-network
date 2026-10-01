@@ -152,6 +152,9 @@ class QualificationTests(unittest.TestCase):
                     QUALIFY.read_json(path)
         with self.assertRaisesRegex(ValueError, "phase"):
             QUALIFY.validate_evidence(self.plan, evidence(self.plan, "baseline"), "candidate")
+        self.plan["candidate"]["profile"]["public_peer_limit"] = 64.0
+        with self.assertRaisesRegex(ValueError, "candidate configuration"):
+            QUALIFY.validate_plan(self.plan)
 
 
 if __name__ == "__main__":

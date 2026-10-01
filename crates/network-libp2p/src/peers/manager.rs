@@ -837,8 +837,15 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
+        let public_excess = self.public_peer_limit.map_or(0, |limit| {
+            connected_peers
+                .iter()
+                .filter(|(peer_id, _)| !self.peer_is_important(peer_id))
+                .count()
+                .saturating_sub(limit.get())
+        });
         let mut excess_peer_count =
-            connected_peers.len().saturating_sub(self.config.target_num_peers);
+            connected_peers.len().saturating_sub(self.config.target_num_peers).max(public_excess);
         if excess_peer_count == 0 {
             // no excess peers
             return;
@@ -983,6 +990,9 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        if self.public_peer_limit.is_some() {
+            self.prune_connected_peers();
+        }
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,

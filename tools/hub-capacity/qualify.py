@@ -78,7 +78,8 @@ def validate_plan(plan):
                 fail("binary digest must be SHA-256")
     shipped = read_json(ROOT / "profile-v1.json")
     candidate_profile = plan["candidate"]["profile"]
-    if any(candidate_profile.get(key) != value for key, value in shipped.items()):
+    selected = {key: candidate_profile.get(key) for key in shipped}
+    if digest(selected) != digest(shipped):
         fail("candidate configuration differs from the shipped profile")
     if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname"}:
         fail("v1 permits deployment bootstrap/hostname settings alongside the exact profile")
