@@ -727,7 +727,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn records(&self) -> Self::RecordsIter<'_> {
         RecordIter {
-            iter: Box::new(self.owned_records().filter(|(_, record)| self.retains(&record.key))),
+            // libp2p's publication job also replicates every enumerated remote record, even
+            // with replication_interval=None. Production exposes only our own publication;
+            // retained remote rows remain available through get() for on-demand responses.
+            iter: Box::new(self.owned_records().filter(|(_, record)| {
+                self.retains(&record.key)
+                    && (self.retention.is_none() || record.publisher == Some(self.local_peer_id))
+            })),
         }
     }
 

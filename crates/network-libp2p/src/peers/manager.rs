@@ -779,7 +779,13 @@ impl PeerManager {
         );
 
         debug!(target: "peer-manager", ?action, "disconnect peer results in:");
-        self.apply_peer_action(peer_id, action);
+        match action {
+            // The explicit disconnect above already includes the selected peer-exchange policy.
+            PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.temporarily_ban(peer_id),
+            PeerAction::Ban(_) | PeerAction::Unban(_) | PeerAction::NoAction => {
+                self.apply_peer_action(peer_id, action);
+            }
+        }
     }
 
     /// Register a connected peer if their reputation is sufficient.

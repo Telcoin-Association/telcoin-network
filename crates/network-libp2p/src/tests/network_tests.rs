@@ -3052,7 +3052,8 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
 
     let local = PeerId::random();
     let remote = PeerId::random();
-    let own_key = kad::RecordKey::new(&b"own");
+    let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let own_key = kad::RecordKey::new(&keys.primary_public_key());
     // The remote is strictly closest to this key, so a re-enabled replication job must
     // create an observable query instead of terminating with no eligible destination.
     let third_key = kad::RecordKey::new(&remote.to_bytes());
@@ -3060,9 +3061,12 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     own.publisher = Some(local);
     let mut third = kad::Record::new(third_key.clone(), vec![2]);
     third.publisher = Some(remote);
-    let mut store = kad::store::MemoryStore::new(local);
+    let mut store = KadStore::new(MemDatabase::default(), local, &keys, NetworkType::Primary);
+    store.enable_retention()?;
+    store.retain_connected(remote, third_key.clone())?;
     store.put(own)?;
     store.put(third)?;
+    assert!(store.get(&third_key).is_some(), "retained remote records must remain queryable");
     let settings = tn_config::LibP2pConfig {
         kad_publication_interval: Duration::from_millis(100),
         kad_replication_interval: Duration::from_millis(20),
@@ -3496,6 +3500,12 @@ async fn test_kad_put_shed_is_unscored_and_flood_is_penalized() -> eyre::Result<
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_committees([peer2.config.key_config().primary_public_key()])?;
     let source = register_untrusted_put_record_source(&mut network)?;
     // Relay another node's valid signed record. The source remains an ordinary connected peer.
     let record = peer2.network.get_peer_record();
@@ -3539,6 +3549,12 @@ async fn test_trusted_kad_flood_remains_bounded_and_protocol_bannable() -> eyre:
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_committees([peer2.config.key_config().primary_public_key()])?;
     let record = peer2.network.get_peer_record();
     let source = record.publisher.ok_or_else(|| eyre::eyre!("fixture record has no publisher"))?;
     let (reply, _ack) = tokio::sync::oneshot::channel();
@@ -4199,6 +4215,7 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
 
     // owner is a committee member so the gated discovery path (#827) retains its record;
     // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([owner_bls])?;
     network.swarm.behaviour_mut().peer_manager.update_committees(
         Default::default(),
         std::iter::once(owner_bls).collect(),
@@ -4424,11 +4441,9 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
         worker_0_address,
         None,
     )?;
-    assert_eq!(db.iter::<KadWorkerRecords>().collect::<Vec<_>>(), persisted);
-    assert_eq!(
-        store_0.get(&key).map(|record| record.value.clone()),
-        Some(encode(&worker_0_record))
-    );
+    // Startup applies ownership only to worker-0; worker-1's persisted row remains intact.
+    assert_eq!(db.iter::<KadWorkerRecords>().count(), 1);
+    assert_eq!(store_0.get(&key).map(|record| record.value.clone()), None);
     assert_eq!(
         store_1.get(&key).map(|record| record.value.clone()),
         Some(encode(&worker_1_record))

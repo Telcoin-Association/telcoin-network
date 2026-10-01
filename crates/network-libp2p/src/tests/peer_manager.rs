@@ -109,8 +109,15 @@ async fn dao_metrics_track_identity_and_disconnection() {
         ));
         register_peer(&mut manager, None);
         manager.heartbeat();
-        let measured = |name, expected| {
-            recorder.snapshotter().snapshot().into_vec().iter().any(|(key, _, _, value)| {
+        let measured = |snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+                        name,
+                        expected| {
+            snapshot.iter().any(|(key, _, _, value)| {
                 key.key().name() == name
                     && key
                         .key()
@@ -119,12 +126,14 @@ async fn dao_metrics_track_identity_and_disconnection() {
                     && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
             })
         };
-        assert!(measured("tn_network.dao_observers_connected", 1.0));
-        assert!(measured("tn_network.ordinary_peers_connected", 1.0));
+        let snapshot = recorder.snapshotter().snapshot().into_vec();
+        assert!(measured(&snapshot, "tn_network.dao_observers_connected", 1.0));
+        assert!(measured(&snapshot, "tn_network.ordinary_peers_connected", 1.0));
         manager.register_disconnected(&observer);
         manager.heartbeat();
-        assert!(measured("tn_network.dao_observers_connected", 0.0));
-        assert!(measured("tn_network.ordinary_peers_connected", 1.0));
+        let snapshot = recorder.snapshotter().snapshot().into_vec();
+        assert!(measured(&snapshot, "tn_network.dao_observers_connected", 0.0));
+        assert!(measured(&snapshot, "tn_network.ordinary_peers_connected", 1.0));
     });
 }
 

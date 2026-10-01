@@ -238,7 +238,6 @@ mod tests {
                 std::future::pending::<()>().await;
             };
             assert_eq!(budget.available_permits(), 0);
-            assert_eq!(gauge(&recorder, "worker-0", "tn_network.serve_tasks_active"), Some(1.0));
             assert!(budget.try_acquire_owned().is_err());
             drop(unpolled);
             assert_eq!(budget.available_permits(), 1);
@@ -253,6 +252,7 @@ mod tests {
                     && matches!(value, DebugValue::Counter(1))
             }));
             let _replacement = budget.try_acquire_owned()?;
+            assert_eq!(gauge(&recorder, "worker-0", "tn_network.serve_tasks_active"), Some(1.0));
             Ok(())
         })
     }

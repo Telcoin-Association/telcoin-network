@@ -26,6 +26,13 @@ CASES = [
      "usize::from(self.prefetch.get())", "usize::from(self.worker_shed.get())", "operator_limits_are_finite_and_independent"),
     ("mesh_degree_order", "crates/config/src/gossip_mesh.rs",
      "self.low > self.target", "self.low > self.high", "rejects_invalid_mesh_relationships"),
+    ("remote_periodic_replication", "crates/network-libp2p/src/kad.rs",
+     "(self.retention.is_none() || record.publisher == Some(self.local_peer_id))", "true",
+     "test_kad_record_jobs_publish_own_record_only"),
+    ("duplicate_rotation_disconnect", "crates/network-libp2p/src/peers/manager.rs",
+     "PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.temporarily_ban(peer_id),",
+     "PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.apply_peer_action(peer_id, action),",
+     "public_peer_limit_prunes_after_committee_rotation"),
 ]
 
 

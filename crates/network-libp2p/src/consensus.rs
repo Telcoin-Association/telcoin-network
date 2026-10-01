@@ -2751,8 +2751,8 @@ where
 
 /// Enable own-record republication independently of third-party replication.
 ///
-/// On libp2p-kad 0.49, publication selects locally authored records while replication selects
-/// third-party records. Retained committee, pin, and connection bindings are served on demand.
+/// libp2p-kad 0.49 shares a job between publication and replication. The production store's
+/// iterator exposes only locally authored records; retained remote bindings are served on demand.
 pub(crate) fn configure_record_jobs(config: &mut kad::Config, libp2p: &LibP2pConfig) {
     config
         .set_publication_interval(Some(libp2p.kad_publication_interval))
