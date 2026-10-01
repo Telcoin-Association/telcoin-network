@@ -1597,7 +1597,8 @@ fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
 ///
 /// Opens the node's consensus chain under `datadir` directly, so the node must not be running
 /// and must not be restarted on this datadir afterwards without care: opening heals the open
-/// epoch's pack in place and clears leftover staging directories, which would race a live node.
+/// epoch's pack and the epoch-record files in place and deletes leftover `staging-*` and
+/// `import-*` directories, which would race a live node.
 /// The walk ends at the last header the open epoch's pack holds (read from the pack itself rather
 /// than the "latest" slot hint, which can run one ahead of a pack cut short by a hard kill) and
 /// starts at number 1, since the genesis header (number 0) is never stored. Any number in between

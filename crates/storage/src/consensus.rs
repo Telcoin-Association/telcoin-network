@@ -393,7 +393,11 @@ impl ConsensusChain {
         let pack_install = Arc::new(tokio::sync::Mutex::new(()));
         // Any staging dirs left from a previous run are stale; start clean. The staging pack only
         // ever holds transient, re-fetchable catch-up data.
-        Self::remove_all_staging_dirs(&base_path);
+        Self::remove_dirs_with_prefix(&base_path, "staging-");
+        // import dirs left by a previous run are stale too, and a leftover pid sentinel would
+        // turn every later import of that epoch into a silent no-op once the pid repeats. this
+        // runs after the pack open so a failed open leaves an interrupted install's copy in place.
+        Self::remove_dirs_with_prefix(&base_path, "import-");
         let staging = Arc::new(Mutex::new(None));
         Ok(Self {
             base_path,
@@ -667,11 +671,12 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
-    /// Remove any leftover `staging-*` directories under `base_path` (stale from a prior run).
-    fn remove_all_staging_dirs(base_path: &Path) {
+    /// Remove any leftover directories under `base_path` whose name starts with `prefix` (stale
+    /// from a prior run).
+    fn remove_dirs_with_prefix(base_path: &Path, prefix: &str) {
         if let Ok(entries) = std::fs::read_dir(base_path) {
             for entry in entries.flatten() {
-                if entry.file_name().to_str().is_some_and(|n| n.starts_with("staging-")) {
+                if entry.file_name().to_str().is_some_and(|n| n.starts_with(prefix)) {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -2459,6 +2464,61 @@ mod test {
             )
             .await
             .expect("exact full import of data we already hold must be Ok");
+    }
+
+    /// A process killed during an import leaves `import-{epoch}/{pid}.inproc` behind. When the
+    /// next process gets the same pid (pid 1 in a container), that sentinel made every later
+    /// import of the epoch a silent no-op. Opening the chain must clear stale import dirs.
+    #[tokio::test]
+    async fn test_new_clears_stale_import_dirs() {
+        let source_dir = TempDir::with_prefix("test_stale_import_src").expect("temp dir");
+        let target_dir = TempDir::with_prefix("test_stale_import_dst").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        // a complete epoch 0 pack to import from
+        let source = ConsensusChain::new(source_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            source.save_consensus_output(output).await.unwrap();
+        }
+        source.persist_current().await.expect("persist");
+        let epoch_record = EpochRecord {
+            final_consensus: ConsensusNumHash::new(5, parent),
+            ..previous_epoch.clone()
+        };
+        source.epochs().save_record(epoch_record.clone()).await.expect("save record");
+
+        // the sentinel a killed import of epoch 0 leaves when this process had its pid
+        let import_dir = target_dir.path().join("import-0");
+        std::fs::create_dir_all(&import_dir).expect("create import dir");
+        std::fs::File::create(import_dir.join(format!("{}.inproc", std::process::id())))
+            .expect("create sentinel");
+
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        assert!(
+            !target.already_streaming_epoch(0),
+            "a stale import sentinel must not survive open"
+        );
+        target.epochs().save_record(epoch_record.clone()).await.expect("save record");
+        assert!(!target.is_epoch_complete(&epoch_record).await);
+        let stream = source.get_epoch_stream(0).await.expect("epoch stream");
+        target
+            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import");
+        assert!(target.is_epoch_complete(&epoch_record).await, "the import must install the pack");
     }
 
     #[tokio::test]
