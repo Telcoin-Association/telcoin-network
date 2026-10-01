@@ -12370,6 +12370,7 @@ dependencies = [
  "reth-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-prune-types",
  "reth-revm",
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
