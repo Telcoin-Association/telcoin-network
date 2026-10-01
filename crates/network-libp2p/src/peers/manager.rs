@@ -292,7 +292,8 @@ impl PeerManager {
 
     /// Explicitly add a "trusted" peer and dial it.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain connections under population pressure and bypass load scoring.
+    /// Protocol and cryptographic violations remain eligible for penalties and bans.
     /// This does not unban ips and should only be called during initialization.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
@@ -561,11 +562,8 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
-    /// Returns a boolean if the peer is a known validator.
-    ///
-    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
-    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
-    /// work.)
+    /// Whether a peer belongs to any tracked committee slot, for membership regression tests.
+    #[cfg(test)]
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
@@ -798,15 +796,11 @@ impl PeerManager {
             return;
         }
 
-        // filter peers that are validators
+        // Retention protection does not exempt any peer from protocol bans or resource budgets.
         let ready_to_prune = connected_peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
-                    Some(*peer_id)
-                } else {
-                    None
-                }
+            .filter_map(|(peer_id, _)| {
+                (!self.peer_policy(peer_id).protects_retention()).then_some(*peer_id)
             })
             .collect::<Vec<_>>();
 
@@ -890,10 +884,22 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is operator-allowlisted or a validator.
+    /// Derive independent privileges from live committee membership and operator configuration.
+    ///
+    /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
+        let policy = self.peers.peer_policy(peer_id);
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.pinned_peers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap))
+    }
+
+    /// Whether retention policy protects this peer from population pruning and mesh treatment.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+        let policy = self.peer_policy(peer_id);
+        trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
+        policy.protects_retention()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
