@@ -39,6 +39,7 @@ mod metrics;
 pub mod test_utils;
 
 use crate::metrics::BatchBuilderMetrics;
+pub use crate::metrics::{record_base_fee, record_pending_pool_transactions};
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]

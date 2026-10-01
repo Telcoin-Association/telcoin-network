@@ -229,6 +229,15 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.id
     }
 
+    /// True if this worker seals batches by collecting a committee quorum.
+    ///
+    /// A quorum-sealed batch must then be reported to this node's proposer, so the batch builder
+    /// feeding this worker is only useful while that proposer runs. A worker without a quorum
+    /// waiter forwards its transactions to committee validators instead.
+    pub fn seals_via_quorum(&self) -> bool {
+        self.quorum_waiter.is_some()
+    }
+
     /// Return the network handle for this worker.
     pub fn network_handle(&self) -> WorkerNetworkHandle {
         self.network_handle.clone()
