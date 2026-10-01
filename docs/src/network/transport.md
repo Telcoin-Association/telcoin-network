@@ -97,15 +97,16 @@ Higher worker ids always bind their configured address, because one variable can
 These variables change only what the node binds.
 The external address advertised to peers still comes from the node's info file, so an override that does not match what was generated makes the node reachable at one address and discoverable at another.
 
-## There are no p2p command-line flags
+## Listener settings and bootstrap peers
 
-Operators arriving from other clients go looking for `--p2p-port`, `--bootstrap-peers`, or `--listen-addr`.
-None of them exist.
-The node command's flags cover the named chain, a consensus-metrics socket, an instance number, observer mode, state export, the re-pack monitor, unused-port mode, a healthcheck port, a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
-Nothing on that list touches the p2p transport.
+Operators arriving from other clients go looking for `--p2p-port` or `--listen-addr`.
+Neither flag exists; `--bootstrap-peers` is available to override bootstrap dial hints for the current process.
+The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck port, a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
 
 Listener addresses come from the generated node info and the two override variables above.
-Bootstrap peers come from the genesis committee file in the data directory, not from a flag.
+Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the genesis committee when the map is empty.
+The `--bootstrap-peers` flag replaces that map for the current process; an explicit `{}` selects the genesis fallback.
+See [Bootstrap peers](../getting-started/bootstrap-peers.md) for the map format and examples.
 The transport settings in the table above are read from the network config file in the data directory, where any field may be omitted to take its default.
 The chain id is not an operator tunable at all: it is stamped onto the network config from genesis at startup and is deliberately never written to the config file.
 
