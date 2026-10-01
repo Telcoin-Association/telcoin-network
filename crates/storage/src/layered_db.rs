@@ -155,8 +155,10 @@ pub struct LayeredDbStats {
 ///
 /// Returns `Some(result)` with the physical commit outcome when this call ended the last logical
 /// txn (a commit was attempted), or `None` when it only decremented the overlap count or there was
-/// no open txn (no commit attempted). The cache-mode mirror is cleared only on a successful commit:
-/// on a failed commit the values are not on disk, so the mem layer must keep serving them.
+/// no open txn (no commit attempted). The cache-mode mirror is cleared only on a successful commit.
+/// On a failed commit the values are not on disk, so the mem layer keeps serving them until the
+/// caller removes them or clears their table. The retained inserts of a failed commit are dropped,
+/// so a later successful commit cannot clear the mirror for values that commit never wrote.
 fn end_txn<'a, DB: Database>(
     txn: &mut Option<(DB::TXMut<'a>, u32)>,
     committed_inserts: &mut Vec<Box<dyn InsertTrait<DB>>>,
@@ -165,12 +167,17 @@ fn end_txn<'a, DB: Database>(
     let (current_txn, count) = txn.take()?;
     if count <= 1 {
         let committed = current_txn.commit();
-        if let Err(e) = &committed {
-            tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}");
-        }
-        if committed.is_ok() {
-            if let Some(mem_db) = mem_db {
-                committed_inserts.drain(..).for_each(|insert| insert.clear_insert_mem(mem_db));
+        match &committed {
+            Ok(()) => {
+                if let Some(mem_db) = mem_db {
+                    committed_inserts.drain(..).for_each(|insert| insert.clear_insert_mem(mem_db));
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}");
+                // The aborted txn discarded these writes, so the mem copies are now the only
+                // copies. Keeping the list would let the next successful commit drain them.
+                committed_inserts.clear();
             }
         }
         Some(committed)
@@ -256,17 +263,24 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
             }
             DBMessage::Insert(ins) => {
                 if let Some((txn, _)) = &mut txn {
-                    // A failed staged write is dropped from the physical txn while the value stays
-                    // in the authoritative mem layer, so it is a durability gap: latch it (#975).
-                    if let Err(e) = ins.insert_txn(txn) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name());
-                        commit_failed = true;
-                    }
-                    // The retained insert exists only to clear the cache-mode mirror once the
-                    // txn commits. A full-memory DB (mem_db == None) keeps everything in memory
-                    // forever, so retaining here would leak a clone of every value ever written.
-                    if mem_db.is_some() {
-                        committed_inserts.push(ins);
+                    match ins.insert_txn(txn) {
+                        // The retained insert exists only to clear the cache-mode mirror once the
+                        // txn commits. A full-memory DB (mem_db == None) keeps everything in
+                        // memory forever, so retaining here would leak a clone of every value ever
+                        // written.
+                        Ok(()) => {
+                            if mem_db.is_some() {
+                                committed_inserts.push(ins);
+                            }
+                        }
+                        // A failed staged write is dropped from the physical txn while the value
+                        // stays in the authoritative mem layer, so it is a durability gap: latch
+                        // it (#975). It is not retained, because the commit cannot write it and
+                        // must not clear the mem copy that is now its only copy.
+                        Err(e) => {
+                            tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name());
+                            commit_failed = true;
+                        }
                     }
                 } else {
                     // A bare insert is itself a self-contained physical commit (see
@@ -749,7 +763,14 @@ mod test {
         mdbx::{database::MEGABYTE, MdbxDatabase},
         test::*,
     };
-    use std::{path::Path, time::Duration};
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tempfile::tempdir;
     use tn_types::Database as _;
 
@@ -1137,16 +1158,54 @@ mod test {
     /// A [`Database`] wrapper that fault-injects a physical commit error (disk full / `EIO` /
     /// checksum) into the layered runner. Both physical-commit paths fail: a write-txn `commit()`,
     /// and a bare [`Database::insert`] (which is itself a self-contained physical commit, the path
-    /// the guard writes `write_last_proposed` / `write_vote` take). Every read and the staging of a
-    /// write into an open txn delegate to the inner DB, so only the physical commit is faulted. See
-    /// issue #975.
+    /// the guard writes `write_last_proposed` / `write_vote` take). Every read delegates to the
+    /// inner DB. See issue #975.
+    ///
+    /// The second field holds the fault budgets shared by every clone and txn handle. A staged put
+    /// can be faulted on its own, leaving the open txn usable, which a full map cannot do because
+    /// it poisons the txn.
     #[derive(Clone, Debug)]
-    struct CommitFailDb<DB>(DB);
+    struct CommitFailDb<DB>(DB, Arc<Faults>);
+
+    impl<DB> CommitFailDb<DB> {
+        /// Fault every physical commit.
+        fn always(db: DB) -> Self {
+            Self(
+                db,
+                Arc::new(Faults { commits: AtomicUsize::new(usize::MAX), ..Default::default() }),
+            )
+        }
+
+        /// Fault only the first physical commit; later commits reach the inner DB.
+        fn first_only(db: DB) -> Self {
+            Self(db, Arc::new(Faults { commits: AtomicUsize::new(1), ..Default::default() }))
+        }
+
+        /// Fault only the first put staged into a write txn; every commit reaches the inner DB.
+        fn first_staged_put(db: DB) -> Self {
+            Self(db, Arc::new(Faults { staged_puts: AtomicUsize::new(1), ..Default::default() }))
+        }
+    }
+
+    /// Fault budgets of a [`CommitFailDb`]. Each faulted operation takes one fault from its budget
+    /// while any remain and delegates to the inner DB once the budget is spent.
+    #[derive(Debug, Default)]
+    struct Faults {
+        /// Physical commits: a write-txn `commit` and a bare insert.
+        commits: AtomicUsize,
+        /// Puts staged into an open write txn.
+        staged_puts: AtomicUsize,
+    }
+
+    /// Take one fault from `budget`. Returns true when the calling operation must fail.
+    fn take_fault(budget: &AtomicUsize) -> bool {
+        budget.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    }
 
     /// Write-txn handle for [`CommitFailDb`]: delegates reads and writes to the inner txn but
-    /// returns an error from `commit`, simulating a failed physical commit.
+    /// fails a staged put or the `commit` while the matching shared fault budget lasts.
     #[derive(Debug)]
-    struct CommitFailTxMut<Inner>(Inner);
+    struct CommitFailTxMut<Inner>(Inner, Arc<Faults>);
 
     impl<Inner: tn_types::DbTx> tn_types::DbTx for CommitFailTxMut<Inner> {
         fn get<T: tn_types::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
@@ -1160,7 +1219,12 @@ mod test {
             key: &T::Key,
             value: &T::Value,
         ) -> eyre::Result<()> {
-            self.0.insert::<T>(key, value)
+            // The put is refused before it reaches the inner txn, so the txn stays usable.
+            if take_fault(&self.1.staged_puts) {
+                Err(eyre::eyre!("injected staged put failure"))
+            } else {
+                self.0.insert::<T>(key, value)
+            }
         }
 
         fn remove<T: tn_types::Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
@@ -1172,7 +1236,11 @@ mod test {
         }
 
         fn commit(self) -> eyre::Result<()> {
-            Err(eyre::eyre!("injected physical commit failure"))
+            if take_fault(&self.1.commits) {
+                Err(eyre::eyre!("injected physical commit failure"))
+            } else {
+                self.0.commit()
+            }
         }
     }
 
@@ -1196,7 +1264,7 @@ mod test {
         }
 
         fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
-            Ok(CommitFailTxMut(self.0.write_txn()?))
+            Ok(CommitFailTxMut(self.0.write_txn()?, self.1.clone()))
         }
 
         fn contains_key<T: tn_types::Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -1207,10 +1275,14 @@ mod test {
             self.0.get::<T>(key)
         }
 
-        fn insert<T: tn_types::Table>(&self, _key: &T::Key, _value: &T::Value) -> eyre::Result<()> {
+        fn insert<T: tn_types::Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
             // A bare insert is a self-contained physical commit; fault it so the runner's no-txn
             // `Insert` arm exercises a real direct-insert commit failure (the guard-write path).
-            Err(eyre::eyre!("injected physical commit failure"))
+            if take_fault(&self.1.commits) {
+                Err(eyre::eyre!("injected physical commit failure"))
+            } else {
+                self.0.insert::<T>(key, value)
+            }
         }
 
         fn remove<T: tn_types::Table>(&self, key: &T::Key) -> eyre::Result<()> {
@@ -1265,7 +1337,7 @@ mod test {
         )
         .expect("Cannot open database");
         raw.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), true);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         // Hold a write txn open so the barrier defers until the (faulted) physical commit runs.
@@ -1308,7 +1380,7 @@ mod test {
         raw.open_table::<TestTable>().expect("failed to open table!");
         // full_memory=true mirrors the epoch DB, where the recast reads the authoritative mem
         // layer.
-        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), true);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         // Drive a failed physical commit through the runner so the latch trips.
@@ -1355,7 +1427,7 @@ mod test {
         raw.open_table::<TestTable>().expect("failed to open table!");
         // full_memory=true mirrors the epoch DB, where the recast reads the authoritative mem
         // layer.
-        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), true);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         // Mirror the guard write exactly: a bare insert with NO surrounding txn. The layered write
@@ -1377,11 +1449,12 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_mode_retains_mem_on_failed_commit() {
-        // LOW-severity companion (issue #975): in cache mode (full_memory=false) a FAILED physical
-        // commit must NOT clear the mem mirror. The values never reached disk, so the mem layer
-        // must keep serving them; draining on failure would silently lose reads. Confirmed
-        // non-vacuous by mutation: reverting `end_txn` to drain unconditionally makes both
-        // assertions below fail.
+        // Companion to issue #975: in cache mode (full_memory=false) a FAILED physical commit must
+        // NOT clear the mem mirror. The values never reached disk, so the mem layer must keep
+        // serving them; draining on failure would silently lose reads. The failed commit must also
+        // drop its retained inserts, because nothing retries them: a retained insert only clears
+        // the mirror at the next successful commit, which would then drop values that never
+        // reached disk (issue #1443).
         use tn_types::DbTxMut as _;
         let temp_dir = tempdir().expect("failed to create temp dir");
         let raw = MdbxDatabase::open(
@@ -1392,7 +1465,7 @@ mod test {
         )
         .expect("Cannot open database");
         raw.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(CommitFailDb(raw), false);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), false);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         let concurrent = db.write_txn().expect("write txn");
@@ -1405,18 +1478,158 @@ mod test {
             .expect("barrier must resolve after the commit is attempted");
         assert!(result.is_err(), "faulted commit must surface as Err");
 
-        // The failed commit leaves the value off disk; the retained insert must survive (not drain)
-        // and the mem mirror must keep serving the value.
+        // The failed commit leaves the value off disk: its retained insert is dropped without
+        // touching the mem layer, which keeps serving the value.
         let stats = db.stats().expect("stats");
-        assert!(
-            stats.retained_inserts > 0,
-            "cache-mode retained inserts must survive a failed commit, not be drained"
+        assert_eq!(
+            stats.retained_inserts, 0,
+            "a failed commit must drop its retained inserts so a later commit cannot clear them"
         );
         assert_eq!(
             db.get::<TestTable>(&7).expect("get"),
             Some("seven".to_string()),
             "cache-mode mem mirror must keep serving a value whose commit failed"
         );
+    }
+
+    #[test]
+    fn test_cache_mode_failed_txn_survives_later_commit() {
+        // Issue #1443: in cache mode a value whose physical commit failed lives only in the mem
+        // layer. A later successful commit in the same env must not clear that copy. Before the
+        // fix the failed txn's retained inserts stayed queued, and the next successful commit
+        // drained them, so the value vanished from both layers.
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_cache_failed_txn_survives"),
+            4,
+            16 * MEGABYTE,
+            8 * MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open(CommitFailDb::first_only(raw.clone()), false);
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        // txn1: its physical commit is the faulted one.
+        let mut txn1 = db.write_txn().expect("write txn");
+        txn1.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        txn1.commit().expect("logical commit send");
+        db.sync_persist();
+        assert_eq!(raw.get::<TestTable>(&1).expect("raw get"), None, "txn1 must not reach disk");
+
+        // txn2: commits for real.
+        let mut txn2 = db.write_txn().expect("write txn");
+        txn2.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn2.commit().expect("logical commit send");
+        db.sync_persist();
+        assert_eq!(raw.get::<TestTable>(&2).expect("raw get"), Some("two".to_string()));
+
+        assert_eq!(
+            db.get::<TestTable>(&1).expect("get"),
+            Some("one".to_string()),
+            "a later successful commit must not drop the mem copy of a failed txn's insert"
+        );
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        assert_eq!(db.stats().expect("stats").retained_inserts, 0);
+    }
+
+    #[test]
+    fn test_cache_mode_failed_staged_put_survives_commit() {
+        // Issue #1443: a staged put can fail without poisoning the physical txn, so the commit
+        // still succeeds. The failed put never reached disk and its mem copy is the only copy, so
+        // only staged puts may be retained for the commit to clear from the mem layer.
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_cache_failed_staged_put"),
+            4,
+            16 * MEGABYTE,
+            8 * MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open(CommitFailDb::first_staged_put(raw.clone()), false);
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        // The put of key 1 is the faulted one; key 2 is staged and the commit succeeds.
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn.commit().expect("logical commit send");
+        db.sync_persist();
+
+        assert_eq!(raw.get::<TestTable>(&1).expect("raw get"), None, "the faulted put is off disk");
+        assert_eq!(raw.get::<TestTable>(&2).expect("raw get"), Some("two".to_string()));
+        assert_eq!(
+            db.get::<TestTable>(&1).expect("get"),
+            Some("one".to_string()),
+            "a successful commit must not drop the mem copy of a put it never staged"
+        );
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        assert_eq!(db.stats().expect("stats").retained_inserts, 0);
+    }
+
+    #[test]
+    fn test_cache_mode_map_full_txn_keeps_mem_copies() {
+        // Real-MDBX check for issue #1443. A full map inside a write txn poisons the txn, so the
+        // physical commit fails with `BotchedTransaction` and writes nothing. The mem copies are
+        // then the only copies, and a later remove-only commit that succeeds must not drain them.
+        use tn_types::DbTxMut as _;
+        const VALUES: u64 = 64;
+        let big = "x".repeat(64 * 1024);
+        let temp_dir = tempdir().expect("failed to create temp dir");
+
+        // The raw env first: the put that overflows the map fails and so does the commit.
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_raw_map_full"),
+            4,
+            2 * MEGABYTE,
+            MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let mut txn = raw.write_txn().expect("write txn");
+        let failed_puts = (0..VALUES).filter(|i| txn.insert::<TestTable>(i, &big).is_err()).count();
+        assert!(failed_puts > 0, "4 MiB of values must overflow a 2 MiB map");
+        assert!(txn.commit().is_err(), "a txn that hit MAP_FULL must fail to commit");
+
+        // The same overflow through the layered cache-mode runner.
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_layered_map_full"),
+            4,
+            2 * MEGABYTE,
+            MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open(raw.clone(), false);
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        let mut txn1 = db.write_txn().expect("write txn");
+        txn1.insert::<TestTable>(&0, &"first".to_string()).expect("insert");
+        for i in 1..=VALUES {
+            txn1.insert::<TestTable>(&i, &big).expect("insert");
+        }
+        txn1.commit().expect("logical commit send");
+        db.sync_persist();
+        assert_eq!(raw.get::<TestTable>(&0).expect("raw get"), None, "txn1 must not reach disk");
+
+        // A remove-only txn: the aborted txn freed the map, so this physical commit succeeds.
+        let mut txn2 = db.write_txn().expect("write txn");
+        txn2.remove::<TestTable>(&(VALUES + 1)).expect("remove");
+        txn2.commit().expect("logical commit send");
+        db.sync_persist();
+
+        assert_eq!(
+            db.get::<TestTable>(&0).expect("get"),
+            Some("first".to_string()),
+            "a later successful commit must not drop the mem copy of a value MAP_FULL kept off disk"
+        );
+        for i in 1..=VALUES {
+            assert_eq!(db.get::<TestTable>(&i).expect("get").as_ref(), Some(&big), "key {i}");
+        }
+        assert_eq!(db.stats().expect("stats").retained_inserts, 0);
     }
 
     #[test]
