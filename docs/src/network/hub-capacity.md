@@ -123,6 +123,22 @@ nonempty ACK/DATA/END epoch transfers. Shared-NAT commands restart the actual
 peer process, preserve its keys and verify connections to both hubs on every
 swarm. DAO checks observe those same live authenticated connections.
 
+
+Transaction traffic uses 512 offline-signed chain-4476 transactions from the
+public Anvil test account funded in the local genesis. `cast` must be installed.
+Each transaction carries 32 KiB of deterministic calldata. The signed fixture
+is hashed into the workload manifest before freezing: 128 transactions seed
+the warmup, and 384 are submitted at a fixed cadence during measurement.
+Every RPC acknowledgement and canonical batch-selection observation is retained.
+
+Bulk commands run in bursts of eight, divided between the two hubs. Each command
+simultaneously transfers a completed primary epoch pack and four executed batches
+on worker-0 and worker-1. The coordinator selects the first completed epoch with
+four distinct nonempty executed batches, using retained canonical block responses.
+Peers decode each returned batch and verify its digest against those observations.
+Successful worker transfers require at least 128 KiB each. Missing workers,
+empty transfers, incomplete frame sequences and mismatched digests fail the command.
+
 Gossip receipts retain message ID, author, authenticated forwarding peer and
 receipt time. The log service correlates each receipt with the actual publisher
 event. Successful routes require three distinct identities and publication

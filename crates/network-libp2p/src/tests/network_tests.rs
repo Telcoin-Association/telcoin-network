@@ -3423,6 +3423,7 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     peer2.network.node_record = old_record;
     let old_kad_record = peer2.network.get_peer_record();
     // put old record in store
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([peer2_pubkey])?;
     network.swarm.behaviour_mut().kademlia.store_mut().put(old_kad_record.clone())?;
     // assert kad store is old
     let store_record = network

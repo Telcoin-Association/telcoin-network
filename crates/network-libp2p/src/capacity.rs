@@ -241,8 +241,15 @@ mod tests {
             assert!(budget.try_acquire_owned().is_err());
             drop(unpolled);
             assert_eq!(budget.available_permits(), 1);
-            assert_eq!(gauge(&recorder, "worker-0", "tn_network.serve_tasks_active"), Some(0.0));
             let snapshot = recorder.snapshotter().snapshot().into_vec();
+            assert!(snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == "tn_network.serve_tasks_active"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "network" && label.value() == "worker-0")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == 0.0)
+            }));
             assert!(snapshot.iter().any(|(key, _, _, value)| {
                 key.key().name() == "tn_network.serve_rejections_total"
                     && key

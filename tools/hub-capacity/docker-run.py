@@ -10,6 +10,7 @@ import shutil
 import shlex
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
@@ -103,12 +104,13 @@ def wait_file(path, processes=(), timeout=120):
 
 def workload_manifest(population):
     """Bind each operation class to actual process identities and private control endpoints."""
-    def agents(peers, gossip=False):
+    def agents(peers, gossip=False, bulk=False):
         return [{"identity": peer["identity"], "argv": ["python3", "-B", "-I", "/tools/control.py",
                  "--url", f"http://10.147.0.20:9401/peer/{peer['name']}",
-                 *(["--observations", "http://127.0.0.1:9400"] if gossip else [])]} for peer in peers]
+                 *(["--observations", "http://127.0.0.1:9400"] if gossip else []),
+                 *(["--bulk-root", "/qualification/deployment"] if bulk else [])]} for peer in peers]
     ordinary, dao = population["ordinary"], population["dao"]
-    scenarios = {name: {"concurrency": concurrency, "agents": agents(peers, name == "gossip_two_hops")}
+    scenarios = {name: {"concurrency": concurrency, "agents": agents(peers, name == "gossip_two_hops", name == "concurrent_sync")}
                  for name, concurrency, peers in [
                      ("public_join", 2, ordinary),
                      ("shared_nat_reconnect", 2, [peer for peer in ordinary if peer["nat"]]),
@@ -116,6 +118,7 @@ def workload_manifest(population):
                      ("submit_url_lookup", 4, ordinary), ("concurrent_sync", 8, ordinary),
                      ("dao_connectivity", 4, dao) ]}
     scenarios["shared_nat_reconnect"]["offset_fraction"] = 0.5
+    scenarios["concurrent_sync"]["burst_size"] = 8
     scenarios["committee_progress"] = {"concurrency": 4, "agents": [
         {"identity": node["bls_key"], "argv": ["python3", "-B", "-I", "/tools/control.py",
          "--identity", node["bls_key"], "--observations", "http://127.0.0.1:9400"]}
@@ -186,6 +189,8 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             wait_file(phase_dir / f"{node['name']}.pid", processes)
             wait_file(phase_dir / f"{node['name']}.jsonl", processes)
             stops.append((container, f"{container_dir}/{node['name']}.pid", "/binaries/telcoin-network"))
+        docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "initial",
+                       "--fixture", "/qualification/transactions.json", "--output", f"{container_dir}/initial-transactions.jsonl")
         processes.append(docker.background_execute(coordinator, f"{phase}-peers", "python3", "-B", "-I",
             "/tools/supervise.py", "/qualification/deployment", phase, "/binaries/examples/hub-capacity-peer",
             "--ready", f"{container_dir}/peers-ready.json", "--pid-file", f"{container_dir}/supervisor.pid"))
@@ -201,6 +206,8 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
         wait_file(phase_dir / "observations.pid", processes)
         stops.append((coordinator, f"{container_dir}/observations.pid", "/tools/observations.py"))
         warmup(docker, coordinator, processes)
+        docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "targets",
+                       "--output", f"{container_dir}/bulk-targets.json", "--observations", f"{container_dir}/canonical-batch-observations.json")
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/netns.py", "snapshot",
                        "--output", f"{container_dir}/links-before.json")
         topology = {"population": population, "network": json.loads((phase_dir / "links-before.json").read_text()),
@@ -210,6 +217,9 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                         for pattern in ("*-profile.json", "*-command.json", "peers/*.json", "*/node-info.yaml", "*/network-config", "ceremony/parameters.yaml", "ceremony/genesis/validators/*.yaml")
                         for path in phase_dir.glob(pattern)},
                     "peer_readiness": json.loads((phase_dir / "peers-ready.json").read_text()),
+                    "transaction_fixture_sha256": digest(docker.output / "transactions.json"),
+                    "bulk_targets": json.loads((phase_dir / "bulk-targets.json").read_text()),
+                    "canonical_batch_observations_sha256": digest(phase_dir / "canonical-batch-observations.json"),
                     "linux_cpuinfo": docker.execute(coordinator, "cat", "/proc/cpuinfo"),
                     "linux_version": docker.execute(coordinator, "uname", "-a")}
         write_json(phase_dir / "topology.json", topology)
@@ -224,8 +234,17 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                 "profile_path": f"{container_dir}/{node['name']}/network-config",
                 "metrics_url": f"http://{node['ip']}:9000", "progress": {"name": "tn_engine_canonical_height"}}
         write_json(phase_dir / "bindings.json", bindings)
+        processes.append(docker.background_execute(coordinator, f"{phase}-transactions", "python3", "-B", "-I",
+            "/tools/traffic.py", "stream", "--fixture", "/qualification/transactions.json",
+            "--output", f"{container_dir}/stream-transactions.jsonl", "--pid-file", f"{container_dir}/transactions.pid"))
+        wait_file(phase_dir / "transactions.pid", processes)
+        stops.append((coordinator, f"{container_dir}/transactions.pid", "/tools/traffic.py"))
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/collect.py", "/qualification/plan.json",
                        f"{container_dir}/bindings.json", "--phase", phase, "--output", f"/qualification/{phase}-evidence")
+        if any(process.poll() not in (None, 0) for process in processes):
+            raise ValueError("qualification traffic process failed during measurement")
+        if len((phase_dir / "stream-transactions.jsonl").read_text().splitlines()) != 384:
+            raise ValueError("qualification did not submit all declared measurement transactions")
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/netns.py", "snapshot",
                        "--output", f"{container_dir}/links-after.json")
     finally:
@@ -284,7 +303,14 @@ def execute_qualification(args):
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/prepare.py", "phase", "/qualification/deployment", "baseline",
                        "/binaries/telcoin-network", "/tools/profile-v1.json")
         population = json.loads((output / "deployment/population.json").read_text())
-        write_json(output / "manifest.json", workload_manifest(population))
+        cast = shutil.which("cast")
+        if not cast:
+            raise ValueError("qualification requires cast for offline chain-4476 transaction signing")
+        subprocess.run([sys.executable, "-B", "-I", str(ROOT / "traffic.py"), "create", "--cast", cast,
+                        "--output", str(output / "transactions.json")], check=True, timeout=300)
+        manifest = workload_manifest(population)
+        manifest["transaction_fixture_sha256"] = digest(output / "transactions.json")
+        write_json(output / "manifest.json", manifest)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/qualify.py", "template", "--output", "/qualification/declaration-template.json")
         plan = json.loads((output / "declaration-template.json").read_text())
         for phase in ("baseline", "candidate"):

@@ -85,7 +85,7 @@ def phase_inputs(root, phase, binary, profile_path):
     subprocess.run([str(binary), "--datadir", str(shared), "--bls-passphrase-source", "no-passphrase", "genesis",
                     "--basefee-address", "0x9999999999999999999999999999999999999999",
                     "--consensus-registry-owner", "0x00000000000000000000000000000000000007a0",
-                    "--dev-funded-account", "capacity-fixture", "--chain-id", str(CHAIN_ID),
+                    "--dev-funded-account", "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "--chain-id", str(CHAIN_ID),
                     "--max-header-delay-ms", "500", "--min-header-delay-ms", "250",
                     "--max-batch-delay-ms", "250", "--epoch-duration-in-secs", "20",
                     "--worker-fee-config", "0:0:18446744073709551615",

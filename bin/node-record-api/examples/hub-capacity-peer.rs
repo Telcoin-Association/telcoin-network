@@ -16,6 +16,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
@@ -29,9 +30,10 @@ use tn_network_libp2p::{
     read_frame,
     types::{NetworkEvent, NetworkHandle},
     write_frame, ConsensusNetwork, PeerExchangeMap, PrimarySyncRequest, SyncFrame, TNMessage,
+    WorkerSyncRequest,
 };
 use tn_storage::mem_db::MemDatabase;
-use tn_types::{BlsKeypair, Epoch, TaskManager};
+use tn_types::{decode, Batch, BlsKeypair, Epoch, TaskManager, B256};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 
 // Standalone examples acknowledge the package's other dependencies without relaxing its lints.
@@ -174,6 +176,11 @@ struct Command {
     scenario: Scenario,
     /// The measurement window's system-clock origin, excluding warmup observations.
     not_before_unix_us: u128,
+    /// Executed epoch batch digests, supplied by the coordinator's retained RPC observations.
+    #[serde(default)]
+    batch_digests: BTreeSet<B256>,
+    /// Completed epoch selected by the coordinator's declared executed-batch selection rule.
+    sync_epoch: Option<Epoch>,
 }
 
 /// One persistent peer, with separate swarm handles and bounded control concurrency.
@@ -293,62 +300,93 @@ impl Peer {
         Ok(json!({"connections": observations}))
     }
 
-    /// Transfer a nonempty completed epoch, accepting only the production ACK/DATA/END sequence.
-    async fn sync(&self) -> Result<Value> {
-        let handle = self
-            .handles
-            .iter()
-            .find(|(role, _)| *role == NetworkType::Primary)
-            .map(|(_, handle)| handle)
-            .ok_or_else(|| eyre!("primary swarm missing"))?;
-        let mut stream = handle.open_stream(self.config.target).await??;
+    /// Transfer a completed primary epoch and verify the same real batches on both worker swarms.
+    async fn sync(&self, batch_digests: &BTreeSet<B256>, epoch: Epoch) -> Result<Value> {
+        if batch_digests.len() != 4 {
+            Err(eyre!("bulk qualification requires four executed batch digests"))?;
+        }
+        let target = self.config.target;
         let limit = self.config.network.libp2p_config().max_rpc_message_size;
-        let request =
-            SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch: self.config.sync_epoch });
-        write_frame(&mut stream, &request, &mut Vec::new(), &mut Vec::new(), limit).await?;
-        let frames = futures::stream::try_unfold(
-            (stream, Vec::new(), Vec::new(), false, false),
-            move |(mut stream, mut plain, mut compressed, admitted, ended)| async move {
-                if ended {
-                    Ok(None)
-                } else {
-                    let frame: SyncFrame<PrimarySyncRequest> =
-                        read_frame(&mut stream, &mut plain, &mut compressed, limit).await?;
-                    match frame {
-                        SyncFrame::Ack if !admitted => {
-                            Ok(Some((0, (stream, plain, compressed, true, false))))
+        let transfers = futures::future::try_join_all(self.handles.clone().into_iter().map(
+            |(role, handle)| {
+                let batch_digests = batch_digests.clone();
+                async move {
+                    match role {
+                        NetworkType::Primary => {
+                            let frames = transfer(handle, target, PrimarySyncRequest::EpochPack { epoch }, limit).await?;
+                            Ok::<_, eyre::Report>(json!({"swarm": role_name(role), "bytes": frames.iter().map(Vec::len).sum::<usize>(), "completed": true}))
                         }
-                        SyncFrame::Data(data) if admitted => {
-                            Ok(Some((data.len(), (stream, plain, compressed, true, false))))
+                        NetworkType::Worker(_) => {
+                            let frames = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: batch_digests.clone(), epoch }, limit).await?;
+                            let received = frames.iter().map(|data| decode::<Batch>(data).map(|batch| batch.digest())).collect::<Result<BTreeSet<_>, _>>()?;
+                            if received != batch_digests || frames.len() != batch_digests.len() {
+                                Err(eyre!("worker transfer did not return the requested batches"))?;
+                            }
+                            Ok(json!({"swarm": role_name(role), "bytes": frames.iter().map(Vec::len).sum::<usize>(), "batch_digests": received, "completed": true}))
                         }
-                        SyncFrame::End if admitted => {
-                            Ok(Some((0, (stream, plain, compressed, true, true))))
-                        }
-                        SyncFrame::Deny(reason) => Err(eyre!("sync denied: {reason:?}")),
-                        SyncFrame::Err(reason) => Err(eyre!("sync aborted: {reason:?}")),
-                        SyncFrame::Req(_)
-                        | SyncFrame::Ack
-                        | SyncFrame::Data(_)
-                        | SyncFrame::End => Err(eyre!("invalid sync frame order")),
                     }
                 }
             },
-        );
-        let total = frames
-            .try_fold(0usize, |total, count| async move {
-                total
-                    .checked_add(count)
-                    .filter(|bytes| *bytes <= 64 * 1024 * 1024)
-                    .ok_or_else(|| eyre!("sync exceeded the declared 64 MiB transfer bound"))
-            })
-            .await?;
-        if total == 0 {
-            Err(eyre!("empty epoch transfer"))
-        } else {
-            Ok(
-                json!({"epoch": self.config.sync_epoch, "bytes": total, "target": self.config.target, "completed": true}),
-            )
-        }
+        )).await?;
+        Ok(json!({"epoch": epoch, "target": target, "transfers": transfers, "completed": true}))
+    }
+}
+
+/// Read a finite nonempty production sync exchange, rejecting invalid ordering and oversized data.
+async fn transfer<Request>(
+    handle: Handle,
+    target: BlsPublicKey,
+    request: Request,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>>
+where
+    Request: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    let mut stream = handle.open_stream(target).await??;
+    let request = SyncFrame::Req(request);
+    write_frame(&mut stream, &request, &mut Vec::new(), &mut Vec::new(), limit).await?;
+    let frames = futures::stream::try_unfold(
+        (stream, Vec::new(), Vec::new(), false, false),
+        move |(mut stream, mut plain, mut compressed, admitted, ended)| async move {
+            if ended {
+                Ok(None)
+            } else {
+                let frame: SyncFrame<Request> =
+                    read_frame(&mut stream, &mut plain, &mut compressed, limit).await?;
+                match frame {
+                    SyncFrame::Ack if !admitted => {
+                        Ok(Some((None, (stream, plain, compressed, true, false))))
+                    }
+                    SyncFrame::Data(data) if admitted => {
+                        Ok(Some((Some(data), (stream, plain, compressed, true, false))))
+                    }
+                    SyncFrame::End if admitted => {
+                        Ok(Some((None, (stream, plain, compressed, true, true))))
+                    }
+                    SyncFrame::Deny(reason) => Err(eyre!("sync denied: {reason:?}")),
+                    SyncFrame::Err(reason) => Err(eyre!("sync aborted: {reason:?}")),
+                    SyncFrame::Req(_) | SyncFrame::Ack | SyncFrame::Data(_) | SyncFrame::End => {
+                        Err(eyre!("invalid sync frame order"))
+                    }
+                }
+            }
+        },
+    );
+    let (total, data) = frames
+        .try_fold((0usize, Vec::new()), |(total, mut data), frame| async move {
+            let count = frame.as_ref().map_or(0, Vec::len);
+            let total = total
+                .checked_add(count)
+                .filter(|bytes| *bytes <= 64 * 1024 * 1024 && data.len() < 1024)
+                .ok_or_else(|| eyre!("sync exceeded its 64 MiB or 1024-frame transfer bound"))?;
+            data.extend(frame);
+            Ok((total, data))
+        })
+        .await?;
+    if total == 0 {
+        Err(eyre!("empty sync transfer"))
+    } else {
+        Ok(data)
     }
 }
 
@@ -364,7 +402,13 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
                 Scenario::SharedNatReconnect => peer.reconnect(true).await,
                 Scenario::RecordLookup => peer.records(false).await,
                 Scenario::SubmitUrlLookup => peer.records(true).await,
-                Scenario::ConcurrentSync => peer.sync().await,
+                Scenario::ConcurrentSync => {
+                    peer.sync(
+                        &request.batch_digests,
+                        request.sync_epoch.unwrap_or(peer.config.sync_epoch),
+                    )
+                    .await
+                }
                 Scenario::DaoConnectivity => peer.connectivity().await,
                 Scenario::GossipTwoHops => peer.gossip(request.not_before_unix_us).await,
                 Scenario::CommitteeProgress => {

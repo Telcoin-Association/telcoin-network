@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import urllib.request
 
 
@@ -22,12 +23,21 @@ def main():
     parser.add_argument("--url")
     parser.add_argument("--identity", help="measured hub identity for committee log observations")
     parser.add_argument("--observations", help="local production-log correlation service")
+    parser.add_argument("--bulk-root", help="retained completed-epoch and executed-batch observations")
     args = parser.parse_args()
     payload = {
         "operation_id": os.environ["HUB_CAPACITY_OPERATION_ID"],
         "scenario": os.environ["HUB_CAPACITY_SCENARIO"],
         "not_before_unix_us": int(os.environ["HUB_CAPACITY_MEASUREMENT_UNIX_US"]),
     }
+    if payload["scenario"] == "concurrent_sync":
+        if not args.bulk_root:
+            raise ValueError("bulk sync requires retained executed-batch observations")
+        fixture = Path(args.bulk_root) / os.environ["HUB_CAPACITY_PHASE"] / "bulk-targets.json"
+        if fixture.stat().st_size > 8192:
+            raise ValueError("bulk target observations exceed 8 KiB")
+        targets = json.loads(fixture.read_text())
+        payload.update({key: targets[key] for key in ("sync_epoch", "batch_digests")})
     if payload["scenario"] == "committee_progress":
         if not args.identity or not args.observations:
             raise ValueError("committee observations require a declared hub and production-log service")

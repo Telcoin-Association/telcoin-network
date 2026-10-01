@@ -29,6 +29,8 @@ def validate_manifest(plan, manifest):
             raise ValueError("driver concurrency must not exceed sixteen")
         if not 0 <= QUALIFY.number(definition.get("offset_fraction", 0), "schedule offset") < 1:
             raise ValueError("schedule offset must be between zero and one")
+        if QUALIFY.integer(definition.get("burst_size", 1), "burst size", 1) > definition["concurrency"]:
+            raise ValueError("burst size must not exceed bounded driver concurrency")
         if not definition["agents"] or len(definition["agents"]) > 128:
             raise ValueError("every scenario requires a bounded peer-agent population")
         identities = set()
@@ -94,6 +96,8 @@ def execute(agent, scenario, operation_id, origin, timeout):
                 if result["success"] and not response.get("trace"):
                     raise ValueError("successful agent observations require a raw protocol trace")
                 result["trace"] = response.get("trace")
+                if result["success"] and scenario == "concurrent_sync":
+                    validate_bulk_trace(result["trace"])
                 if result["success"] and scenario == "gossip_two_hops":
                     receipt = result["trace"]["receipt"]
                     publication = result["trace"]["publication"]["record"]["fields"]
@@ -135,6 +139,30 @@ def execute(agent, scenario, operation_id, origin, timeout):
     return result
 
 
+def validate_bulk_trace(trace):
+    """Require completed primary and independent worker transfers with four matching real batches."""
+    transfers = trace["transfers"]
+    if trace.get("completed") is not True or len(transfers) != 3:
+        raise ValueError("bulk sync must complete on all three swarms")
+    roles = {transfer["swarm"] for transfer in transfers}
+    if roles != {"primary", "worker-0", "worker-1"}:
+        raise ValueError("bulk sync is missing an independent worker swarm")
+    expected = None
+    for transfer in transfers:
+        if transfer.get("completed") is not True or not 0 < QUALIFY.integer(transfer["bytes"], "transfer bytes", 1) <= 64 * 1024**2:
+            raise ValueError("bulk sync requires bounded nonempty completed transfers")
+        if transfer["swarm"] != "primary":
+            digests = transfer["batch_digests"]
+            if len(digests) != 4 or len(set(digests)) != 4 or transfer["bytes"] < 4 * 32768:
+                raise ValueError("worker sync requires four distinct fixture batches and real transaction bytes")
+            if any(not isinstance(digest, str) or len(digest) != 66 or not digest.startswith("0x")
+                   or any(character not in "0123456789abcdef" for character in digest[2:]) for digest in digests):
+                raise ValueError("worker sync batch digest is malformed")
+            if expected is not None and set(digests) != expected:
+                raise ValueError("worker sync digest observations disagree")
+            expected = set(digests)
+
+
 def run(plan, manifest, output, origin):
     validate_manifest(plan, manifest)
     duration = plan["envelope"]["duration_seconds"]
@@ -157,7 +185,8 @@ def run(plan, manifest, output, origin):
             with ThreadPoolExecutor(max_workers=definition["concurrency"]) as executor:
                 futures = []
                 for index in range(target):
-                    due = origin + (index + definition.get("offset_fraction", 0)) * duration / target
+                    burst = definition.get("burst_size", 1)
+                    due = origin + (index - index % burst + definition.get("offset_fraction", 0)) * duration / target
                     time.sleep(max(0, due - time.monotonic()))
                     operation_id = f"{scenario}-{index}"
                     agent = definition["agents"][index % len(definition["agents"])]
