@@ -145,7 +145,11 @@ fn run_restart_tests1(
 ///
 /// Use the same startup bound as `network_advancing`, and fail immediately if the child exits.
 /// RPC readiness does not imply catch-up; the caller still checks balances and canonical blocks.
-fn wait_for_restarted_rpc(child: &mut Child, node: &str, test: &str) -> eyre::Result<()> {
+pub(crate) fn wait_for_restarted_rpc(
+    child: &mut Child,
+    node: &str,
+    test: &str,
+) -> eyre::Result<()> {
     let child = RefCell::new(child);
     let description = format!(
         "restarted validator RPC at {node} (logs: test_logs/{test}/node2-run2.log and \
@@ -323,7 +327,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// does not make the required progress. The short rejoin test
 /// (`min_secs = 2`) uses `min_round_gap = 1` and intentionally stays inside the GC window (live
 /// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
-fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
+pub(crate) fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
     // Nodes 0/1/3 stay live (index 2 is the killed one).
     let peer_height = || {
         [&client_urls[0], &client_urls[1], &client_urls[3]]
@@ -389,7 +393,7 @@ const RESTART_TEST_DOWNTIME_SECS: u64 = 25;
 /// The metrics endpoint belongs to the fresh process, so its cumulative applied-header counter
 /// proves this restart exercised the follow/catch-up path. Unlike the transient CvvInactive mode,
 /// that evidence remains available after catch-up finishes, including before the first RPC poll.
-fn wait_for_restart_catch_up(node: &str, metrics_addr: &str) -> eyre::Result<()> {
+pub(crate) fn wait_for_restart_catch_up(node: &str, metrics_addr: &str) -> eyre::Result<()> {
     wait_until_blocking(
         Duration::from_secs(30),
         &format!("restarted node {node} to apply state-sync headers and return to CvvActive"),
@@ -453,7 +457,7 @@ fn test_restart_catch_up_requires_active_cvv() {
 }
 
 /// Wait for a stable membership-derived role, with the URL and expected role in timeout errors.
-fn wait_for_node_mode(node: &str, expected: NodeMode) -> eyre::Result<()> {
+pub(crate) fn wait_for_node_mode(node: &str, expected: NodeMode) -> eyre::Result<()> {
     wait_until_blocking(
         Duration::from_secs(30),
         &format!("node {node} entered {expected:?}"),
@@ -561,7 +565,7 @@ fn test_restartstt() -> eyre::Result<()> {
 }
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
-fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
+pub(crate) fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
     for _ in 0..60 {
         if let Ok(n) = get_block_number(node) {
             if n >= target_block {
@@ -574,7 +578,7 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
 }
 
 /// Run some test to make sure an observer is participating in the network.
-fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
+pub(crate) fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
     // The observer may still be syncing startup epoch records after the validators are ready.
     wait_until_blocking(Duration::from_secs(45), "observer RPC ready", || {
@@ -670,7 +674,7 @@ fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
 }
 
-fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
+pub(crate) fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
     let block0 = get_block(&client_urls[0], None)?;
     let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;

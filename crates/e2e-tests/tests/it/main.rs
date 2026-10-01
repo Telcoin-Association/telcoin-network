@@ -15,6 +15,9 @@ mod metrics;
 mod restarts;
 mod staking;
 mod state_export_import;
+mod subsecond_clock_skew;
+mod subsecond_upgrade;
+mod subsecond_vote_window;
 mod sync;
 
 fn main() {}
