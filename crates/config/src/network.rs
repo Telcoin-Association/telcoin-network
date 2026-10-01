@@ -1,6 +1,6 @@
 //! Configuration for network variables.
 
-use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
+use crate::{ConfigFmt, ConfigTrait, SourceAdmissionConfig, TelcoinDirs};
 use libp2p::kad::K_VALUE;
 use serde::{
     de::{self, Visitor},
@@ -26,6 +26,9 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// The hostname for the validator.
     hostname: String,
     /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
@@ -38,6 +41,11 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
+    }
+
     /// Return the configured bootstrap dial hints.
     pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.bootstrap_peers

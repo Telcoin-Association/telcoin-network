@@ -23,5 +23,7 @@ mod traits;
 pub use traits::*;
 mod network;
 pub use network::*;
+mod source_admission;
+pub use source_admission::SourceAdmissionConfig;
 mod retry;
 pub use retry::*;
