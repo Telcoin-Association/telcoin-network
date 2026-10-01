@@ -23,6 +23,7 @@ mod error;
 mod health;
 mod manager;
 mod metrics;
+mod network_readiness;
 pub mod primary;
 pub mod worker;
 pub use manager::{
