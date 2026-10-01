@@ -126,8 +126,9 @@ pub async fn save_consensus(
     metrics: &PrimaryMetrics,
 ) -> eyre::Result<u64> {
     let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
-    // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
-    // cleared). Make sure we have persisted the consensus output before we execute.
+    // Make sure we have persisted the consensus output before we execute. Forwarding it to
+    // execution evicts its batches from NodeBatchesCache, which is only safe once the pack holds
+    // them.
     consensus_chain.persist_current().await?;
     // A zero byte count means this output already resides in a static (imported) pack and
     // nothing was written; recording it as the "most recent" output size would be misleading.
