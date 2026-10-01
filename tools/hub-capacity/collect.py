@@ -165,11 +165,12 @@ def retain_file(source, destination):
 class RawLog:
     """Retain bounded raw JSONL segments, with hashes generated only after close."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, maximum_segments=60):
         self.directory = directory
         self.paths = []
         self.stream = None
         self.size = 0
+        self.maximum_segments = maximum_segments
 
     def append(self, entry):
         data = (json.dumps(entry, allow_nan=False, separators=(",", ":")) + "\n").encode()
@@ -177,7 +178,7 @@ class RawLog:
             raise ValueError("raw entry exceeds 8 MiB")
         if self.stream is None or self.size + len(data) > 32 * 1024**2:
             self.close()
-            if len(self.paths) >= 60:
+            if len(self.paths) >= self.maximum_segments:
                 raise ValueError("raw telemetry exceeds artifact budget")
             path = self.directory / f"telemetry-{len(self.paths):03}.jsonl"
             self.stream = path.open("xb")
@@ -208,7 +209,10 @@ def read_operations(path):
             scenario = entry.pop("scenario")
             if scenario not in result:
                 raise ValueError("unknown workload scenario")
-            result[scenario].append(entry)
+            # Full command output and protocol traces remain in the hashed operations artifact.
+            result[scenario].append({key: value for key, value in entry.items() if key in {
+                "id", "success", "rejection_reason", "latency_ms", "elapsed_seconds", "hops", "cancelled",
+            }})
     return result
 
 
@@ -226,7 +230,10 @@ def collect(frozen, bindings, phase, output):
     output.mkdir(parents=True, exist_ok=False)
     topology = output / "topology.json"
     retain_file(bindings["topology_artifact"], topology)
-    raw = RawLog(output)
+    protocol_logs = bindings.get("protocol_logs", [])
+    if not isinstance(protocol_logs, list) or len(protocol_logs) != plan["envelope"]["committee_peers"] or len(set(protocol_logs)) != len(protocol_logs):
+        raise ValueError("retain a distinct production log for every declared committee validator")
+    raw = RawLog(output, maximum_segments=64 - 3 - len(protocol_logs))
     operations = output / "operations.jsonl"
     workload_log = output / "workload.log"
     identities = {}
@@ -277,12 +284,17 @@ def collect(frozen, bindings, phase, output):
                 time.sleep(max(0, 2 - (time.monotonic() - started - elapsed)))
             if child.wait(timeout=30) != 0:
                 raise ValueError("workload driver failed")
+        protocol_artifacts = []
+        for index, path in enumerate(protocol_logs):
+            retained = output / f"protocol-{index:02}.jsonl"
+            retain_file(path, retained)
+            protocol_artifacts.append({"path": retained.name, "sha256": file_hash(retained)})
         result = {
             "phase": phase, "plan_sha256": QUALIFY.digest(plan), "revision": plan[phase]["revision"],
             "profile_sha256": QUALIFY.digest(plan[phase]["profile"]),
             "binary_sha256": plan[phase]["binary_sha256"], "envelope": plan["envelope"],
             "samples": samples, "operations": read_operations(operations),
-            "artifacts": raw.artifacts() + [
+            "artifacts": raw.artifacts() + protocol_artifacts + [
                 {"path": path.name, "sha256": file_hash(path)} for path in (operations, workload_log, topology)
             ],
         }

@@ -12,9 +12,9 @@ use crate::{
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
-        GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
-        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        GossipPayload, GossipReceipt, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
+        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
+        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -1241,9 +1241,14 @@ where
                 } else {
                     self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg)
                 };
-                if res.is_ok() {
+                res.as_ref().ok().into_iter().for_each(|message_id| {
                     self.metrics.record_gossip_published();
-                }
+                    // Opt-in fixed-target observations have no peer-valued metric labels.
+                    tracing::debug!(target: "network::capacity", event = "gossip_publish",
+                        %message_id, source = %self.swarm.local_peer_id(),
+                        unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |time| time.as_micros()), "capacity observation");
+                });
                 send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, publishers, reply } => {
@@ -1571,10 +1576,18 @@ where
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
                         // forward gossip to handler
-                        if let Err(e) = self
-                            .event_stream
-                            .try_send(accepted_gossip_event(message, relayer, author))
-                        {
+                        if let Err(e) = self.event_stream.try_send(accepted_gossip_event(
+                            message,
+                            relayer,
+                            author,
+                            Some(GossipReceipt {
+                                message_id: message_id.to_string(),
+                                propagation_source,
+                                received_unix_us: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |time| time.as_micros()),
+                            }),
+                        )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
@@ -2890,6 +2903,7 @@ fn accepted_gossip_event<Req, Res>(
     message: GossipMessage,
     relayer: Option<BlsPublicKey>,
     author: Option<BlsPublicKey>,
+    receipt: Option<GossipReceipt>,
 ) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
+    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author, receipt }))
 }

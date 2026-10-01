@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{KeyConfig, NetworkConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig};
 use tn_kad_client::{BlsPublicKey, Multiaddr, NetworkType, PeerId};
 use tn_network_libp2p::{
     read_frame,
@@ -32,7 +32,7 @@ use tn_network_libp2p::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_types::{BlsKeypair, Epoch, TaskManager};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 
 // Standalone examples acknowledge the package's other dependencies without relaxing its lints.
 use humantime as _;
@@ -58,6 +58,27 @@ use url as _;
 /// Command-line input paths, frozen into the workload manifest.
 #[derive(Parser)]
 struct Args {
+    /// Export a public test identity or start a persistent protocol peer.
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+/// Public identity generation is separate from deployment, allowing the DAO set to be frozen first.
+#[derive(clap::Subcommand)]
+enum Mode {
+    /// Print only public identities derived from a deterministic qualification seed.
+    Identity {
+        /// Public deterministic seed, never an operational key.
+        #[arg(long)]
+        seed: u64,
+    },
+    /// Start three persistent production swarms and the bounded private control server.
+    Run(RunArgs),
+}
+
+/// Exact deployment inputs for one isolated qualification peer.
+#[derive(clap::Args)]
+struct RunArgs {
     /// Peer configuration on the isolated network.
     #[arg(long)]
     config: PathBuf,
@@ -113,6 +134,14 @@ type Handle = NetworkHandle<Message, Message>;
 type Network =
     ConsensusNetwork<Message, Message, MemDatabase, mpsc::Sender<NetworkEvent<Message, Message>>>;
 
+/// Stable telemetry names, shared with the frozen three-swarm bindings.
+fn role_name(role: NetworkType) -> String {
+    match role {
+        NetworkType::Primary => "primary".to_owned(),
+        NetworkType::Worker(id) => format!("worker-{id}"),
+    }
+}
+
 /// Required workload classes; unsupported classes fail explicitly until their adapters exist.
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,11 +155,11 @@ enum Scenario {
     /// Signature-validated record queries on all three DHTs.
     RecordLookup,
     /// Signature-validated worker RPC endpoint resolution.
-    SubmitUrlResolution,
+    SubmitUrlLookup,
     /// A completed epoch is transferred through the production stream protocol.
     ConcurrentSync,
     /// Concurrent committee request completion.
-    CommitteeTraffic,
+    CommitteeProgress,
     /// Both hub connections remain established on every swarm.
     DaoConnectivity,
 }
@@ -143,6 +172,8 @@ struct Command {
     operation_id: String,
     /// Required workload class.
     scenario: Scenario,
+    /// The measurement window's system-clock origin, excluding warmup observations.
+    not_before_unix_us: u128,
 }
 
 /// One persistent peer, with separate swarm handles and bounded control concurrency.
@@ -155,6 +186,8 @@ struct Peer {
     handles: Vec<(NetworkType, Handle)>,
     /// No waiting tasks are admitted by the control handler.
     slots: Arc<Semaphore>,
+    /// Latest accepted two-hop receipt, with one retained value and one serialized consumer.
+    gossip: Mutex<watch::Receiver<Option<Value>>>,
 }
 
 /// Wait for the existing peer manager to report the authenticated target as connected.
@@ -176,6 +209,28 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
 }
 
 impl Peer {
+    /// Observe the next accepted delivery through a distinct authenticated forwarding peer.
+    async fn gossip(&self, not_before_unix_us: u128) -> Result<Value> {
+        let receiver = self.gossip.lock().await;
+        let observations = futures::stream::try_unfold(receiver, |mut receiver| async move {
+            receiver.changed().await?;
+            let observation = receiver
+                .borrow_and_update()
+                .clone()
+                .ok_or_else(|| eyre!("gossip receipt missing"))?;
+            Ok::<_, eyre::Report>(Some((observation, receiver)))
+        })
+        .try_filter(move |observation| {
+            futures::future::ready(
+                observation
+                    .pointer("/receipt/received_unix_us")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|received| u128::from(received) >= not_before_unix_us),
+            )
+        });
+        futures::pin_mut!(observations);
+        observations.try_next().await?.ok_or_else(|| eyre!("gossip receipt stream ended"))
+    }
     /// Obtain fresh, signature-validated records instead of cached RPC metadata.
     async fn records(&self, require_rpc: bool) -> Result<Value> {
         let records =
@@ -189,7 +244,7 @@ impl Peer {
                         .ok_or_else(|| eyre!("worker record has no submit URL"))?
                         .validate()?;
                 }
-                Ok::<_, eyre::Report>(json!({"swarm": role, "record": record}))
+                Ok::<_, eyre::Report>(json!({"swarm": role_name(*role), "record": record}))
             }))
             .await?;
         Ok(json!({"signed_records": records}))
@@ -225,7 +280,7 @@ impl Peer {
                 if !self.config.required_hubs.iter().all(|key| peers.contains(key)) {
                     Err(eyre!("required hub identity disconnected on {role:?}"))
                 } else {
-                    Ok(json!({"swarm": role, "connected": peers}))
+                    Ok(json!({"swarm": role_name(*role), "connected": peers}))
                 }
             }))
             .await?;
@@ -302,10 +357,11 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
                 Scenario::PublicJoin => peer.reconnect(false).await,
                 Scenario::SharedNatReconnect => peer.reconnect(true).await,
                 Scenario::RecordLookup => peer.records(false).await,
-                Scenario::SubmitUrlResolution => peer.records(true).await,
+                Scenario::SubmitUrlLookup => peer.records(true).await,
                 Scenario::ConcurrentSync => peer.sync().await,
                 Scenario::DaoConnectivity => peer.connectivity().await,
-                Scenario::GossipTwoHops | Scenario::CommitteeTraffic => {
+                Scenario::GossipTwoHops => peer.gossip(request.not_before_unix_us).await,
+                Scenario::CommitteeProgress => {
                     Err(eyre!("protocol adapter for this scenario is not implemented"))
                 }
             }
@@ -316,15 +372,13 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
     .and_then(|result| result);
     let response = result.map_or_else(
         |error| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": false, "rejection_reason": error.to_string()}),
-        |trace| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": true, "trace": trace}),
+        |trace| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": true, "route": trace.get("route"), "trace": trace}),
     );
     Json(response)
 }
 
 /// Start three persistent production swarms and the bounded private control server.
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+async fn run_peer(args: RunArgs) -> Result<()> {
     if std::fs::metadata(&args.config)?.len() > 128 * 1024 {
         Err(eyre!("peer configuration exceeds 128 KiB"))?;
     }
@@ -345,12 +399,14 @@ async fn main() -> Result<()> {
         config.seed,
     )));
     let manager = TaskManager::default();
+    let (gossip, gossip_rx) = watch::channel(None);
     let roles = [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)];
     let networks = futures::future::try_join_all(roles.into_iter().zip(config.listen.iter()).map(
         |(role, address)| {
             let keys = keys.clone();
             let network_config = &config.network;
             let manager = &manager;
+            let gossip = gossip.clone();
             async move {
                 let (events, received) = mpsc::channel(100);
                 let network = match role {
@@ -375,13 +431,41 @@ async fn main() -> Result<()> {
                 };
                 let handle = network.network_handle();
                 let task = tokio::spawn(network.run());
+                let receiver_id = PeerId::from(match role {
+                    NetworkType::Primary => keys.primary_network_public_key(),
+                    NetworkType::Worker(id) => keys.worker_network_public_key(id),
+                });
                 let drain = tokio::spawn(
                     futures::stream::unfold(received, |mut receiver| async {
                         receiver.recv().await.map(|event| (event, receiver))
                     })
-                    .for_each(|event| futures::future::ready(drop(event))),
+                    .for_each(move |event| {
+                        match event {
+                            NetworkEvent::Gossip(payload) => {
+                                payload.receipt.zip(payload.message.source).into_iter()
+                                    .filter(|(receipt, source)| *source != receipt.propagation_source
+                                        && *source != receiver_id && receipt.propagation_source != receiver_id)
+                                    .for_each(|(receipt, source)| {
+                                        gossip.send_replace(Some(json!({
+                                            "receipt": receipt, "swarm": role_name(role),
+                                            "route": [source.to_string(), receipt.propagation_source.to_string(), receiver_id.to_string()],
+                                            "author": payload.author, "relayer": payload.relayer,
+                                        })));
+                                    });
+                            }
+                            NetworkEvent::Request { .. } | NetworkEvent::Error(..)
+                            | NetworkEvent::InboundStream { .. } => {}
+                        }
+                        futures::future::ready(())
+                    }),
                 );
                 handle.start_listening(address.clone()).await?;
+                let chain = network_config.libp2p_config().chain_id;
+                let topic = match role {
+                    NetworkType::Primary => LibP2pConfig::primary_topic(chain),
+                    NetworkType::Worker(id) => LibP2pConfig::worker_batch_topic(chain, id),
+                };
+                handle.subscribe(topic).await?;
                 Ok::<_, eyre::Report>((role, handle, task, drain))
             }
         },
@@ -396,6 +480,7 @@ async fn main() -> Result<()> {
         config,
         handles,
         slots: Arc::new(Semaphore::new(16)),
+        gossip: Mutex::new(gossip_rx),
     });
     let startup = futures::future::try_join_all(peer.handles.iter().map(|(_, handle)| async {
         futures::future::try_join_all(peer.config.required_hubs.iter().map(|key| async {
@@ -410,7 +495,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(peer.config.control).await?;
     let public = json!({"identity": peer.identity, "bls_key": keys.primary_public_key(), "control": listener.local_addr()?, "startup_error": startup.err(), "swarms": roles.into_iter().zip(peer.config.listen.iter()).map(|(role, address)| {
         let key = match role { NetworkType::Primary => keys.primary_network_public_key(), NetworkType::Worker(id) => keys.worker_network_public_key(id) };
-        json!({"swarm": role, "peer_id": PeerId::from(key), "listen": address})
+        json!({"swarm": role_name(role), "peer_id": PeerId::from(key), "listen": address})
     }).collect::<Vec<_>>()});
     let mut ready = OpenOptions::new().create_new(true).write(true).open(args.ready)?;
     ready.write_all(&serde_json::to_vec(&public)?)?;
@@ -429,4 +514,33 @@ async fn main() -> Result<()> {
     });
     served?;
     Ok(())
+}
+
+/// Export public qualification identities or run the peer with its frozen deployment file.
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Args::parse().mode {
+        Mode::Identity { seed } => {
+            let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(
+                &mut StdRng::seed_from_u64(seed),
+            ));
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "identity": hex::encode(tn_types::encode(&keys.primary_public_key())),
+                    "bls_key": keys.primary_public_key(),
+                    "swarms": [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
+                        .into_iter().map(|role| {
+                            let key = match role {
+                                NetworkType::Primary => keys.primary_network_public_key(),
+                                NetworkType::Worker(id) => keys.worker_network_public_key(id),
+                            };
+                            json!({"swarm": role_name(role), "peer_id": PeerId::from(key)})
+                        }).collect::<Vec<_>>(),
+                }))?
+            );
+            Ok(())
+        }
+        Mode::Run(args) => run_peer(args).await,
+    }
 }

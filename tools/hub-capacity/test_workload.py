@@ -18,16 +18,21 @@ SPEC.loader.exec_module(WORKLOAD)
 class WorkloadTests(unittest.TestCase):
     def test_agent_nonce_route_and_refusals(self):
         script = (
-            "import json, os; print(json.dumps({'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'],"
+            "import json, os, time; published = time.time_ns() // 1000; print(json.dumps({'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'],"
             "'scenario': os.environ['HUB_CAPACITY_SCENARIO'], 'success': True, 'identity': 'synthetic',"
-            "'route': ['sender', 'relay', 'receiver'], 'trace': 'synthetic trace'}))"
+            "'route': ['sender', 'relay', 'receiver'], 'trace': {"
+            "'receipt': {'message_id': 'synthetic', 'propagation_source': 'relay', 'received_unix_us': published + 1000},"
+            "'publication': {'record': {'fields': {'event': 'gossip_publish', 'message_id': 'synthetic', 'source': 'sender', 'unix_us': str(published)}}}}}))"
         )
         agent = {"identity": "synthetic", "argv": [sys.executable, "-B", "-I", "-c", script]}
         result = WORKLOAD.execute(agent, "gossip_two_hops", "nonce", time.monotonic(), 2)
         self.assertTrue(result["success"])
         self.assertEqual(result["hops"], 2)
         self.assertGreater(result["latency_ms"], 0)
-        agent["argv"][-1] = script.replace("'relay', ", "")
+        self.assertEqual(result["latency_ms"], 1)
+        agent["argv"][-1] = script.replace("'message_id': 'synthetic', 'source': 'sender'", "'message_id': 'other', 'source': 'sender'")
+        self.assertFalse(WORKLOAD.execute(agent, "gossip_two_hops", "nonce", time.monotonic(), 2)["success"])
+        agent["argv"][-1] = script.replace("['sender', 'relay', 'receiver']", "['sender', 'receiver']").replace("'propagation_source': 'relay'", "'propagation_source': 'receiver'")
         self.assertFalse(WORKLOAD.execute(agent, "gossip_two_hops", "nonce", time.monotonic(), 2)["success"])
         agent["argv"][-1] = script.replace("os.environ['HUB_CAPACITY_OPERATION_ID']", "'wrong'")
         self.assertIn("acknowledgement", WORKLOAD.execute(agent, "record_lookup", "nonce", time.monotonic(), 2)["rejection_reason"])
@@ -37,6 +42,25 @@ class WorkloadTests(unittest.TestCase):
         self.assertIn("declared peer", wrong_peer["rejection_reason"])
         agent["argv"][-1] = "import time; time.sleep(2)"
         self.assertEqual(WORKLOAD.execute(agent, "record_lookup", "nonce", time.monotonic(), 0.01)["rejection_reason"], "timeout")
+
+    def test_committee_batch_preserves_failure_and_cancellation(self):
+        script = (
+            "import json, os, time; now = time.time_ns() // 1000; print(json.dumps({"
+            "'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'], 'scenario': os.environ['HUB_CAPACITY_SCENARIO'],"
+            "'identity': 'synthetic', 'success': True, 'trace': {'observations': ["
+            "{'source': 'synthetic', 'record': {'fields': {'event': 'committee_request', 'unix_us': str(now),"
+            "'latency_us': '1000', 'completed': completed, 'success': success}}}"
+            "for completed, success in [(True, True), (True, False), (False, False)]]}}))"
+        )
+        agent = {"identity": "synthetic", "argv": [sys.executable, "-B", "-I", "-c", script]}
+        result = WORKLOAD.execute(agent, "committee_progress", "nonce", time.monotonic(), 2)
+        self.assertTrue(result["success"], result["rejection_reason"])
+        measured = result["committee_observations"]
+        self.assertEqual([entry["success"] for entry in measured], [True, False, False])
+        self.assertEqual([entry["cancelled"] for entry in measured], [False, False, True])
+        self.assertEqual([entry["latency_ms"] for entry in measured], [1, 1, 1])
+        agent["argv"][-1] = script.replace("'source': 'synthetic'", "'source': 'wrong-hub'")
+        self.assertFalse(WORKLOAD.execute(agent, "committee_progress", "nonce", time.monotonic(), 2)["success"])
 
     def test_concurrent_scenarios_have_complete_attempt_populations(self):
         script = "import json, os; print(json.dumps({'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'], 'scenario': os.environ['HUB_CAPACITY_SCENARIO'], 'success': False, 'rejection_reason': 'synthetic refusal'}))"
@@ -54,7 +78,8 @@ class WorkloadTests(unittest.TestCase):
             output = Path(directory) / "operations.jsonl"
             WORKLOAD.run(plan, manifest, output, time.monotonic())
             operations = [json.loads(line) for line in output.read_text().splitlines()]
-            self.assertEqual(len(operations), 16)
+            self.assertEqual(len(operations), 17)
+            self.assertEqual(sum(entry["scenario"] == "committee_progress" for entry in operations), 3)
             self.assertEqual({entry["scenario"] for entry in operations}, WORKLOAD.QUALIFY.SCENARIOS)
             self.assertTrue(all(not entry["success"] and entry["rejection_reason"] for entry in operations))
             plan["envelope"]["public_peers"] = 64

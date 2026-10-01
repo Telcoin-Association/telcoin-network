@@ -128,6 +128,8 @@ def validate_plan(plan):
         rate = number(bounds["minimum_success_rate"], scenario)
         if not 0 < rate <= 1:
             fail(f"invalid success rate for {scenario}")
+        if scenario == "committee_progress" and not 0 <= number(bounds["max_cancelled_fraction"], "committee cancellation bound") < 1:
+            fail("invalid committee cancellation bound")
     if not plan["threshold_owner"] or not plan["adapter_command"]:
         fail("record the threshold decision and exact workload adapter command")
 
@@ -208,6 +210,8 @@ def validate_evidence(plan, evidence, phase):
             reason = operation["rejection_reason"]
             if not operation["success"] and (not isinstance(reason, str) or not reason):
                 fail("rejected operations require a reason")
+            if type(operation.get("cancelled", False)) is not bool or (operation.get("cancelled", False) and (scenario != "committee_progress" or operation["success"])):
+                fail("only unsuccessful committee requests may be classified as cancelled")
             number(operation["latency_ms"], "operation latency")
             at = number(operation["elapsed_seconds"], "operation timestamp")
             if at > samples[-1]["elapsed_seconds"]:
@@ -230,11 +234,15 @@ def score(plan, evidence):
     credit_limit = process_budget["max_receive_credit_bytes"] // total_connections
     for scenario, operations in evidence["operations"].items():
         rule = bounds["scenarios"][scenario]
-        latencies = sorted(operation["latency_ms"] for operation in operations)
-        p99 = latencies[math.ceil(len(latencies) * 0.99) - 1]
-        rate = sum(operation["success"] for operation in operations) / len(operations)
-        summary[scenario] = {"attempts": len(operations), "success_rate": rate, "p99_ms": p99}
-        if len(operations) < rule["minimum_attempts"] or rate < rule["minimum_success_rate"] or p99 > rule["max_p99_ms"]:
+        completed = [operation for operation in operations if not operation.get("cancelled", False)]
+        cancellations = len(operations) - len(completed)
+        latencies = sorted(operation["latency_ms"] for operation in completed)
+        p99 = latencies[math.ceil(len(latencies) * 0.99) - 1] if latencies else 0
+        rate = sum(operation["success"] for operation in completed) / len(completed) if completed else 0
+        summary[scenario] = {"attempts": len(completed), "cancelled": cancellations, "success_rate": rate, "p99_ms": p99}
+        if scenario == "committee_progress" and cancellations / len(operations) > rule["max_cancelled_fraction"]:
+            failures.append("committee_progress: cancellation threshold exceeded")
+        if len(completed) < rule["minimum_attempts"] or rate < rule["minimum_success_rate"] or p99 > rule["max_p99_ms"]:
             failures.append(f"{scenario}: workload threshold exceeded")
     task_limits = {"epoch_stream": 5, "epoch_record": 5, "primary_shed": 8,
                    "batch_stream": 10, "worker_shed": 16, "prefetch": 16}
@@ -346,7 +354,8 @@ def main():
             "thresholds": {"max_rss_bytes": 4 * 1024**3, "max_cpu_cores": 3,
                            "max_queue_occupancy": 100, "max_progress_stall_seconds": 15,
                            "scenarios": {scenario: {"minimum_attempts": attempts,
-                               "minimum_success_rate": 0.99, "max_p99_ms": latency}
+                               "minimum_success_rate": 0.99, "max_p99_ms": latency,
+                               **({"max_cancelled_fraction": 0.35} if scenario == "committee_progress" else {})}
                                for scenario, (attempts, latency) in scenario_bounds.items()}},
         }
         with args.output.open("x") as output:

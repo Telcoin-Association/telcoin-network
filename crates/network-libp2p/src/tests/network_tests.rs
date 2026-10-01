@@ -4671,7 +4671,7 @@ fn test_gossip_message() -> GossipMessage {
 fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message.clone(), None, None);
+        accepted_gossip_event(message.clone(), None, None, None);
     assert_matches!(
         event,
         NetworkEvent::Gossip(payload)
@@ -4688,7 +4688,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, Some(bls), None);
+        accepted_gossip_event(message, Some(bls), None, None);
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
@@ -4772,7 +4772,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let author = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, None, Some(author));
+        accepted_gossip_event(message, None, Some(author), None);
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }

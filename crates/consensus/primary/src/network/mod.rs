@@ -45,6 +45,31 @@ pub mod handler;
 mod message;
 mod sync_codec;
 
+/// Observe a real vote request, including errors and cancellation, when capacity tracing is
+/// enabled.
+struct VoteObservation {
+    /// Monotonic request start for its complete duration, including retries.
+    started: std::time::Instant,
+    /// Signed header being voted on.
+    header: HeaderDigest,
+    /// Authenticated committee destination.
+    peer: BlsPublicKey,
+    /// Whether the request reached a final response rather than cancellation or an early error.
+    completed: bool,
+    /// Whether that final response was a vote or a missing-parent response.
+    success: bool,
+}
+
+impl Drop for VoteObservation {
+    fn drop(&mut self) {
+        debug!(target: "network::capacity", event = "committee_request",
+            header = %self.header, peer = %self.peer, completed = self.completed,
+            success = self.success, latency_us = %self.started.elapsed().as_micros(),
+            unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_micros()), "capacity observation");
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
@@ -434,47 +459,61 @@ impl PrimaryNetworkHandle {
         header: Header,
         parents: Vec<Certificate>,
     ) -> NetworkResult<RequestVoteResult> {
-        let header = Arc::new(header);
-        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-        let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??.result;
-        let mut tries = 0;
-        while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            debug!(
-                target: "primary::network",
-                %peer,
-                error = %clip_peer_error(s),
-                "recoverable vote error, retrying"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut observation = VoteObservation {
+            started: std::time::Instant::now(),
+            header: header.digest(),
+            peer,
+            completed: false,
+            success: false,
+        };
+        let result = async {
+            let header = Arc::new(header);
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-            let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??.result;
-            tries += 1;
-            if tries > 5 {
-                break;
+            let res = self.handle.send_request(request, peer).await?;
+            let mut res = res.await??.result;
+            let mut tries = 0;
+            while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    error = %clip_peer_error(s),
+                    "recoverable vote error, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let request =
+                    PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+                let res_raw = self.handle.send_request(request, peer).await?;
+                res = res_raw.await??.result;
+                tries += 1;
+                if tries > 5 {
+                    break;
+                }
+            }
+            match res {
+                PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
+                // still recoverable after the retries above: report it as retryable so the caller
+                // backs off and asks again rather than giving up on this peer for the header
+                PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCRetryable(clip_peer_error(s)))
+                }
+                PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCError(clip_peer_error(s)))
+                }
+                PrimaryResponse::MissingParents(parents) => {
+                    Ok(RequestVoteResult::MissingParents(parents))
+                }
+                PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is epoch record!".to_string(),
+                )),
+                PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is peer exchange!".to_string(),
+                )),
             }
         }
-        match res {
-            PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            // still recoverable after the retries above: report it as retryable so the caller
-            // backs off and asks again rather than giving up on this peer for the header
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(clip_peer_error(s)))
-            }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCError(clip_peer_error(s)))
-            }
-            PrimaryResponse::MissingParents(parents) => {
-                Ok(RequestVoteResult::MissingParents(parents))
-            }
-            PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is epoch record!".to_string(),
-            )),
-            PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is peer exchange!".to_string(),
-            )),
-        }
+        .await;
+        observation.completed = true;
+        observation.success = result.is_ok();
+        result
     }
 
     /// Fetch missing certificates from `peer` over the typed sync protocol.

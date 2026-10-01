@@ -211,6 +211,19 @@ pub struct GossipPayload {
     pub relayer: Option<BlsPublicKey>,
     /// BLS identity of the message author (`GossipMessage::source`), when resolved.
     pub author: Option<BlsPublicKey>,
+    /// Transport receipt metadata, present for messages received from the live swarm.
+    pub receipt: Option<GossipReceipt>,
+}
+
+/// Transport identities and arrival time for an accepted, authenticated gossip message.
+#[derive(Debug, serde::Serialize)]
+pub struct GossipReceipt {
+    /// The production gossipsub message identifier, matching the publisher's observation.
+    pub message_id: String,
+    /// The immediate authenticated QUIC peer that forwarded the message.
+    pub propagation_source: PeerId,
+    /// System-clock microseconds at acceptance, for isolated hosts sharing the same clock.
+    pub received_unix_us: u128,
 }
 
 // ============================================================================

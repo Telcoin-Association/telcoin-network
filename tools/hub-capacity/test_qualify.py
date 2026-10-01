@@ -38,7 +38,8 @@ def declaration():
         "thresholds": {"max_rss_bytes": 4 * 1024**3, "max_cpu_cores": 3,
                        "max_queue_occupancy": 100, "max_progress_stall_seconds": 15,
                        "scenarios": {scenario: {"minimum_attempts": 10,
-                           "minimum_success_rate": 0.99, "max_p99_ms": 1000}
+                           "minimum_success_rate": 0.99, "max_p99_ms": 1000,
+                           **({"max_cancelled_fraction": 0.35} if scenario == "committee_progress" else {})}
                            for scenario in QUALIFY.SCENARIOS}},
     }
 
@@ -77,6 +78,19 @@ class QualificationTests(unittest.TestCase):
     def setUp(self):
         self.plan = declaration()
         self.run = evidence(self.plan)
+
+    def test_cancelled_votes_have_a_separate_finite_budget(self):
+        operations = self.run["operations"]["committee_progress"]
+        operations.extend({"id": f"cancel-{index}", "success": False, "cancelled": True,
+                           "latency_ms": 100, "elapsed_seconds": 100,
+                           "rejection_reason": "proposal cancelled"} for index in range(4))
+        QUALIFY.validate_evidence(self.plan, self.run, "candidate")
+        self.assertTrue(QUALIFY.score(self.plan, self.run)["passed"])
+        operations.extend({**operations[-1], "id": f"extra-{index}"} for index in range(2))
+        self.assertFalse(QUALIFY.score(self.plan, self.run)["passed"])
+        operations[-1]["cancelled"] = "false"
+        with self.assertRaisesRegex(ValueError, "classified as cancelled"):
+            QUALIFY.validate_evidence(self.plan, self.run, "candidate")
 
     def test_complete_fixture_and_cli(self):
         QUALIFY.validate_plan(self.plan)

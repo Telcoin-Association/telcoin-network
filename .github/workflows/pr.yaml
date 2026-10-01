@@ -178,7 +178,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install pinned toolchain
-        run: rustup toolchain install 1.94 --profile minimal
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -243,6 +243,10 @@ jobs:
       - name: Test capacity integration and cancellation
         if: steps.scope.outputs.changed == 'true'
         run: cargo +1.94 nextest run --locked --workspace --exclude tn-faucet
+
+      - name: Check the pinned workspace with Clippy
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Build Linux qualification binaries
         if: steps.scope.outputs.changed == 'true'

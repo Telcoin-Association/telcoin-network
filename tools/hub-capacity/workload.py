@@ -51,7 +51,8 @@ def execute(agent, scenario, operation_id, origin, timeout):
     result = {"scenario": scenario, "id": operation_id, "success": False,
               "rejection_reason": None, "agent": agent["identity"], "argv": agent["argv"]}
     environment = {**os.environ, "HUB_CAPACITY_OPERATION_ID": operation_id,
-                   "HUB_CAPACITY_SCENARIO": scenario}
+                   "HUB_CAPACITY_SCENARIO": scenario,
+                   "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(time.time_ns() // 1000 - int((started - origin) * 1_000_000))}
     child = None
     try:
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
@@ -91,6 +92,34 @@ def execute(agent, scenario, operation_id, origin, timeout):
                 if result["success"] and not response.get("trace"):
                     raise ValueError("successful agent observations require a raw protocol trace")
                 result["trace"] = response.get("trace")
+                if result["success"] and scenario == "gossip_two_hops":
+                    receipt = result["trace"]["receipt"]
+                    publication = result["trace"]["publication"]["record"]["fields"]
+                    published = int(publication["unix_us"])
+                    received = int(receipt["received_unix_us"])
+                    if publication["event"] != "gossip_publish" or publication["message_id"] != receipt["message_id"] or publication["source"] != result["route"][0] or receipt["propagation_source"] != result["route"][1] or published < int(environment["HUB_CAPACITY_MEASUREMENT_UNIX_US"]) or received < published:
+                        raise ValueError("gossip receipt does not match its measured production publication")
+                    result["latency_ms"] = (received - published) / 1000
+                if scenario == "committee_progress" and result["trace"]:
+                    entries = result["trace"]["observations"]
+                    if not isinstance(entries, list) or not 1 <= len(entries) <= 1024:
+                        raise ValueError("committee observation batches must be bounded and nonempty")
+                    measured = []
+                    for index, observation in enumerate(entries):
+                        fields = observation["record"]["fields"]
+                        latency = int(fields["latency_us"])
+                        ended = int(fields["unix_us"])
+                        measurement = int(environment["HUB_CAPACITY_MEASUREMENT_UNIX_US"])
+                        if fields["event"] != "committee_request" or observation["source"] != agent["identity"] or type(fields["success"]) is not bool or type(fields["completed"]) is not bool or (fields["success"] and not fields["completed"]) or latency < 0 or ended - latency < measurement or ended > time.time_ns() // 1000:
+                            raise ValueError("committee observation does not belong to the measured request population")
+                        measured.append({"scenario": scenario, "id": f"{operation_id}-{index}",
+                                         "agent": agent["identity"], "argv": agent["argv"],
+                                         "success": fields["success"], "latency_ms": latency / 1000,
+                                         "cancelled": not fields["completed"],
+                                         "rejection_reason": None if fields["success"] else "committee request failed or was cancelled",
+                                         "elapsed_seconds": (ended - measurement) / 1_000_000,
+                                         "trace": {"observation": observation}})
+                    result["committee_observations"] = measured
     except (OSError, ValueError, KeyError, TypeError) as error:
         result["success"] = False
         result["rejection_reason"] = f"driver_validation: {error}"
@@ -98,7 +127,8 @@ def execute(agent, scenario, operation_id, origin, timeout):
         if child is not None and child.poll() is None:
             child.kill()
             child.wait()
-    result["latency_ms"] = (time.monotonic() - started) * 1000
+    result["command_latency_ms"] = (time.monotonic() - started) * 1000
+    result.setdefault("latency_ms", result["command_latency_ms"])
     result["elapsed_seconds"] = time.monotonic() - origin
     return result
 
@@ -110,12 +140,16 @@ def run(plan, manifest, output, origin):
     with output.open("x") as stream:
         def record(entry):
             with write_lock:
-                stream.write(json.dumps(entry, allow_nan=False, separators=(",", ":")) + "\n")
+                entries = entry.pop("committee_observations", None) if entry["success"] else None
+                for measured in entries or [entry]:
+                    stream.write(json.dumps(measured, allow_nan=False, separators=(",", ":")) + "\n")
                 stream.flush()
 
         def scenario_run(scenario):
             definition = manifest["scenarios"][scenario]
             target = plan["thresholds"]["scenarios"][scenario]["minimum_attempts"]
+            if scenario == "committee_progress":
+                target = max(target, duration * 4)
             # Commands are not queued when their bounded execution slots are all occupied.
             slots = threading.BoundedSemaphore(definition["concurrency"])
             with ThreadPoolExecutor(max_workers=definition["concurrency"]) as executor:
@@ -140,6 +174,10 @@ def run(plan, manifest, output, origin):
                     futures.append(executor.submit(attempt))
                 for future in futures:
                     future.result()
+                if scenario == "committee_progress":
+                    time.sleep(max(0, origin + duration - time.monotonic()))
+                    for index, agent in enumerate(definition["agents"]):
+                        record(execute(agent, scenario, f"committee_progress-final-{index}", origin, 30))
 
         with ThreadPoolExecutor(max_workers=len(QUALIFY.SCENARIOS)) as executor:
             list(executor.map(scenario_run, sorted(QUALIFY.SCENARIOS)))

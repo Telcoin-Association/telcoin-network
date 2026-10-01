@@ -1314,6 +1314,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_a, chain_id),
             relayer: None,
             author: None,
+            receipt: None,
         })))
         .await
         .expect("inject epoch-A event");
@@ -1340,6 +1341,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_gap, chain_id),
             relayer: None,
             author: None,
+            receipt: None,
         })))
         .await
         .expect("inject gap event");
