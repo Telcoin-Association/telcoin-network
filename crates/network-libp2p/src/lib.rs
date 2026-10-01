@@ -24,6 +24,7 @@ mod metrics;
 mod peers;
 mod quic_incoming;
 pub mod source_admission;
+mod retention;
 pub mod stream;
 mod sync;
 pub mod types;
