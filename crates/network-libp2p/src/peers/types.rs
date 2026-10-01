@@ -65,7 +65,10 @@ pub(crate) enum PeerEvent {
     DisconnectPeerX(PeerId, PeerExchangeMap),
     /// Peer manager has identified a peer and associated ip addresses to ban.
     Banned(PeerId),
-    /// Peer manager has unbanned a peer and associated ip addresses.
+    /// Both identity-ban owners (reputation and reconnect cache) now permit the peer.
+    /// Ordinary table eviction never emits this event. Capacity eviction or expiry of one
+    /// ban cache emits it only when the other no longer owns an identity ban; IP admission
+    /// restrictions remain independently enforced even when an identity is forgiven.
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers kad queries.
     MissingAuthorities(Vec<BlsPublicKey>),
