@@ -28,7 +28,9 @@ use std::{
     sync::Arc,
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
-use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
+use tn_network_libp2p::{
+    source_admission::SourceAdmissionBudget, types::NetworkEvent, ConsensusNetwork,
+};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
@@ -1359,6 +1361,11 @@ where
         // Include inactive configured workers: their swarms also live for the whole process.
         network_config.validate_process_budget(workers.len().saturating_add(1))?;
 
+        // Validate once before constructing any swarm. All workers and the primary
+        // share this process-lifetime accounting instance, including across epochs.
+        let source_budget =
+            network_config.source_admission().map(SourceAdmissionBudget::new).transpose()?;
+
         //
         //=== PRIMARY
         //
@@ -1371,7 +1378,8 @@ where
             self.consensus_db.clone(),
             node_task_spawner.clone(),
             self.builder.tn_config.node_info.primary_network_address().clone(),
-        )?;
+        )?
+        .with_source_admission_budget(source_budget.clone());
         let primary_network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
 
@@ -1411,7 +1419,8 @@ where
                     node_task_spawner.clone(),
                     p2p.network_address,
                     p2p.rpc,
-                )?;
+                )?
+                .with_source_admission_budget(source_budget.clone());
                 let worker_network_handle = worker_network.network_handle();
                 let node_shutdown = self.node_shutdown.subscribe();
 

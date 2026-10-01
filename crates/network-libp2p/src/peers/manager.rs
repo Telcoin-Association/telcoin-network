@@ -14,9 +14,13 @@ use crate::{
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
+    source_admission::{SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
-use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
+    PeerId,
+};
 use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -141,6 +145,8 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Leases owned by this swarm using optional process-wide source accounting.
+    source_connections: SourceConnections,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
@@ -250,6 +256,28 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Install a shared budget before any swarm is polled.
+    pub(crate) fn set_source_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
+        self.source_connections.set_budget(budget);
+    }
+
+    /// Forward swarm lifecycle events to the connection lease owner.
+    pub(crate) fn on_source_swarm_event(&mut self, event: &libp2p::swarm::FromSwarm<'_>) {
+        self.source_connections.on_swarm_event(event);
+    }
+
+    /// Reserve source occupancy at the authenticated established-connection boundary.
+    pub(crate) fn reserve_source(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        address: &Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.source_connections
+            .reserve(connection, peer, address)
+            .map_err(libp2p::swarm::ConnectionDenied::new)
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -275,6 +303,7 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            source_connections: SourceConnections::default(),
             heartbeat,
             peers,
             known_peers: Default::default(),

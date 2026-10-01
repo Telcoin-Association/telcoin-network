@@ -25,5 +25,7 @@ mod network;
 pub use network::*;
 mod network_budget;
 pub use network_budget::*;
+mod source_admission;
+pub use source_admission::SourceAdmissionConfig;
 mod retry;
 pub use retry::*;

@@ -2,7 +2,7 @@
 
 use crate::{
     ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    TelcoinDirs,
+    SourceAdmissionConfig, TelcoinDirs,
 };
 use libp2p::kad::K_VALUE;
 use serde::{
@@ -31,6 +31,9 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// The hostname for the validator.
     hostname: String,
     /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
@@ -53,6 +56,11 @@ impl NetworkConfig {
     /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
     pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
     }
 
     /// Return the configured bootstrap dial hints.
