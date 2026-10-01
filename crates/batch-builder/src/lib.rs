@@ -213,7 +213,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred } =
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable } =
                 match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
                     Ok(output) => output,
                     Err(e) => {
@@ -230,14 +230,17 @@ impl BatchBuilder {
             metrics
                 .peer_deferred_txs_total
                 .increment(u64::try_from(peer_deferred).unwrap_or(u64::MAX));
+            // Evictions happen during selection, even if the batch is empty or quorum fails.
+            metrics.unpackable_txs_total.increment(u64::try_from(unpackable).unwrap_or(u64::MAX));
             // Canonical updates can drain the pending pool after the run loop's build gate.
             // Selection can also skip every candidate, including peer-deferred transactions
-            // (issue #1329). Peers reject empty batches, so record the deferral metric above
+            // (issue #1329). Peers reject empty batches, so record the selection metrics above
             // but send nothing to the worker in every empty-build case.
             if batch.transactions().is_empty() {
                 debug!(
                     target: "worker::batch_builder",
                     peer_deferred,
+                    unpackable,
                     "transaction selection produced an empty batch; sealing nothing"
                 );
                 result.send(Ok(BuildOutcome::Empty)).err().into_iter().for_each(|e| {
