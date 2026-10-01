@@ -14,7 +14,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{error, warn};
+use tracing::{debug, error};
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
