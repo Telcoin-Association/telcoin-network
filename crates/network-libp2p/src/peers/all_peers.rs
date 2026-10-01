@@ -209,6 +209,20 @@ impl AllPeers {
         self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
     }
 
+    /// Retain an operator hub while preserving existing reputation and connection accounting.
+    pub(super) fn retain_operator_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        self.upsert_peer(bls_public_key, network_key, addrs);
+        self.peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .into_iter()
+            .for_each(|peer| peer.retain_for_operator());
+    }
+
     /// Create a peer.
     pub(super) fn upsert_peer(
         &mut self,
@@ -348,9 +362,8 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
-            let exemption = self.trust_basis(peer_id);
             if let Some(peer) = self.peers.get_mut(&id) {
-                peer.ensure_banned(peer_id, exemption);
+                peer.ensure_banned(peer_id);
             } else {
                 // unreachable
                 error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
@@ -875,9 +888,10 @@ impl AllPeers {
         }
     }
 
-    /// The [TrustBasis] exempting the peer identified by `peer_id`, if it is known and exempt.
+    /// Inspect the load exemption for a peer by transport identity in policy tests.
     ///
-    /// `None` means the peer is subject to the normal score model.
+    /// `None` means the peer is subject to ordinary load scoring.
+    #[cfg(test)]
     fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
         let id = self.identity_for(peer_id);
         self.trust_basis_for(&id)
@@ -1002,6 +1016,8 @@ impl AllPeers {
     /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
     /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
     /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
+    /// Operator entries are bounded by configuration and retained with their reputation, so
+    /// reconnect scheduling cannot recreate a pruned hub and erase its protocol ban.
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
@@ -1015,7 +1031,9 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) = filter(peer.connection_status()) {
+            if let Some(instant) =
+                filter(peer.connection_status()).filter(|_| !peer.is_operator_allowlisted())
+            {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 
@@ -1200,7 +1218,12 @@ impl AllPeers {
             let identity = PeerIdentity::Confirmed(bls_key);
             // only members whose network identity is already known have a confirmed record and a
             // recoverable peer id; others are trusted lazily on discovery
-            let Some(peer_id) = self.peers.get(&identity).and_then(|peer| peer.peer_id()) else {
+            let Some(peer_id) = self
+                .peers
+                .get(&identity)
+                .filter(|peer| !peer.has_protocol_penalty())
+                .and_then(|peer| peer.peer_id())
+            else {
                 continue;
             };
 

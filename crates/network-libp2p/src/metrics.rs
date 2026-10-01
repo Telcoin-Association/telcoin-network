@@ -222,9 +222,9 @@ impl PeerManagerMetrics {
     /// Record an application-layer penalty by severity.
     pub(crate) fn record_penalty(&self, penalty: &Penalty) {
         let severity = match penalty {
-            Penalty::Mild => "mild",
-            Penalty::Medium => "medium",
-            Penalty::Severe => "severe",
+            Penalty::Mild | Penalty::LoadMild => "mild",
+            Penalty::Medium | Penalty::LoadMedium => "medium",
+            Penalty::Severe | Penalty::LoadSevere => "severe",
             Penalty::Fatal => "fatal",
         };
         metrics::counter!(

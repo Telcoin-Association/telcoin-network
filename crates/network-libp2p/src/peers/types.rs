@@ -33,15 +33,15 @@ pub(super) enum PeerIdentity {
     Unidentified(PeerId),
 }
 
-/// Why a peer is exempt from the score model and penalties for the current epoch.
+/// Why a peer is exempt from load-induced penalties for the current epoch.
 ///
 /// A peer subject to normal scoring has no basis (`None`). The two provenances are kept
 /// distinct on purpose (issue #715): operator allowlisting is sticky - set at construction
 /// and never altered by epoch rotation - whereas validator status is derived live from the
 /// tracked committee slots, so a validator rotating out of committee can never strip operator
 /// trust.
-/// Only the exemption *decision* (presence) drives behaviour; the variant is carried for
-/// observability (it names which provenance suppressed a penalty in logs).
+/// Retention and admission are evaluated separately. Neither provenance excuses a protocol or
+/// cryptographic violation, and all peers remain subject to finite resource budgets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TrustBasis {
     /// Explicitly allowlisted by the node operator.
@@ -107,6 +107,12 @@ impl PeerAction {
 /// Too many variations or specific penalties would result in more complexity.
 #[derive(Debug, Clone, Copy)]
 pub enum Penalty {
+    /// Mild transient overload, such as a slow gossip consumer.
+    LoadMild,
+    /// Medium transient overload, such as exceeding an inbound Kademlia rate budget.
+    LoadMedium,
+    /// Severe transient overload, without evidence of a protocol violation.
+    LoadSevere,
     /// The penalty assessed for actions that result in an error and are likely not malicious.
     ///
     /// Peers have a high tolerance for this type of error and will be banned ~50 occurances.
@@ -123,6 +129,16 @@ pub enum Penalty {
     ///
     /// This type of action results in disconnecting from a peer and banning them.
     Fatal,
+}
+
+impl Penalty {
+    /// Whether this penalty establishes only transient load rather than a protocol violation.
+    pub(super) fn is_load(self) -> bool {
+        match self {
+            Self::LoadMild | Self::LoadMedium | Self::LoadSevere => true,
+            Self::Mild | Self::Medium | Self::Severe | Self::Fatal => false,
+        }
+    }
 }
 
 /// Request for dialing peers.

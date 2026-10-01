@@ -87,9 +87,9 @@ impl Score {
         // NOTE: these use `Self::add`
         // which cannot overflow using default config min and max scores
         let new_score = match penalty {
-            Penalty::Mild => self.add(-1.0),
-            Penalty::Medium => self.add(-5.0),
-            Penalty::Severe => self.add(-10.0),
+            Penalty::Mild | Penalty::LoadMild => self.add(-1.0),
+            Penalty::Medium | Penalty::LoadMedium => self.add(-5.0),
+            Penalty::Severe | Penalty::LoadSevere => self.add(-10.0),
             Penalty::Fatal => config.min_score, // The worst possible score
         };
 

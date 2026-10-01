@@ -12,7 +12,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{error, warn};
+use tracing::error;
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -84,6 +84,18 @@ pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = tn_node_record::MAX_ADVERTISED
 /// roaming) while bounding both the per-peer memory and the per-ban fan-out.
 pub(crate) const MAX_OBSERVED_IPS_PER_PEER: usize = 16;
 
+/// Whether a peer's score includes attributable protocol violations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PenaltyHistory {
+    /// No applied penalties.
+    #[default]
+    Unpenalized,
+    /// Only load-related penalties, which may be forgiven on committee admission.
+    LoadOnly,
+    /// At least one protocol violation, which rotation and reconnect cannot forgive.
+    Protocol,
+}
+
 /// Information about a given connected peer.
 /// Note that bls_public_key and network_key are Optional.
 /// It is possible we need to track a peer before we have network settings.
@@ -97,6 +109,8 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
+    /// Keeps protocol evidence separate from load-related score changes.
+    penalty_history: PenaltyHistory,
     /// The multiaddrs associated with this peer: addresses observed on real connections plus any
     /// self-advertised addresses folded in via [`Self::update_net`].
     ///
@@ -145,6 +159,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
+            penalty_history: PenaltyHistory::Unpenalized,
             operator_allowlisted: true,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -164,6 +179,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::default(),
+            penalty_history: PenaltyHistory::Unpenalized,
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
             observed_ip_addresses: Default::default(),
@@ -184,6 +200,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
+            penalty_history: PenaltyHistory::Unpenalized,
             operator_allowlisted: false,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -287,47 +304,46 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Exempt peers
-    /// (operator allowlist or committee validators) bypass the score model entirely.
+    /// `exemption` suppresses only load penalties. Authenticated protocol violations apply to
+    /// operator-provisioned peers and committee members, independently of retention policy.
     pub(super) fn apply_penalty(
         &mut self,
         penalty: Penalty,
         exemption: Option<TrustBasis>,
     ) -> Reputation {
-        if let Some(basis) = exemption {
-            // Exempt peers bypass the score model entirely. Severe/Fatal suppressions are
-            // operationally significant: they hint that an exempt peer (committee member or
-            // operator allowlist) is misbehaving in ways that would normally ban an untrusted
-            // peer. Surface as a warn! so ops can correlate downstream issues with the signal.
-            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
-                warn!(
-                    target: "peer-manager",
-                    ?penalty,
-                    ?basis,
-                    "skipping severe/fatal penalty for exempt peer"
-                );
-            }
-        } else {
+        if exemption.is_none() || !penalty.is_load() {
             self.score.apply_penalty(penalty);
+            self.penalty_history = if !penalty.is_load() {
+                PenaltyHistory::Protocol
+            } else if self.penalty_history == PenaltyHistory::Unpenalized {
+                PenaltyHistory::LoadOnly
+            } else {
+                self.penalty_history
+            };
         }
 
         // return new reputation
         self.reputation()
     }
 
+    /// Whether rotation must preserve this peer's protocol penalties and bans.
+    pub(super) fn has_protocol_penalty(&self) -> bool {
+        self.penalty_history == PenaltyHistory::Protocol
+    }
+
+    /// Retain an operator-provisioned peer without resetting its score or connection state.
+    pub(super) fn retain_for_operator(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
     /// Ensure the peer's status is banned.
     ///
-    /// `exemption` is forwarded to [Self::apply_penalty]: an exempt peer (operator allowlist or
-    /// committee validator) bypasses the score model, so the `Fatal` here is suppressed and the
-    /// peer is not banned - the same protection exempt peers had before.
-    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId, exemption: Option<TrustBasis>) {
-        match self.reputation() {
-            Reputation::Banned => {}
-            _ => {
-                // if the score isn't low enough to ban, this function has been called incorrectly.
-                error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
-                self.apply_penalty(Penalty::Fatal, exemption);
-            }
+    /// Normalizing connection state preserves the original penalty cause. A load-induced ban
+    /// must not acquire protocol evidence merely because its score is forced to the ban floor.
+    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId) {
+        if self.reputation() != Reputation::Banned {
+            error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
+            self.score.apply_penalty(Penalty::Fatal);
         }
     }
 
@@ -360,6 +376,9 @@ impl Peer {
     /// worse (or equal) of the two, so a genuinely better-behaved displaced record never drags
     /// the promoted record down.
     pub(super) fn retain_worse_reputation(&mut self, other: &Peer) {
+        if other.has_protocol_penalty() {
+            self.penalty_history = PenaltyHistory::Protocol;
+        }
         if other.score < self.score {
             self.score = other.score.clone();
         }
@@ -452,13 +471,12 @@ impl Peer {
         self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
-    /// Heartbeat maintenance applies decaying penalty rates to a non-exempt peer's score.
+    /// Heartbeat maintains ordinary scores and attributable protocol penalties.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any; exempt peers skip
-    /// score decay. The peer's reputation could change. This returns the reputation update for
-    /// the manager to react to.
+    /// Load-exempt peers with protocol evidence follow the same score recovery and ban lockout
+    /// as ordinary peers. Retention policy remains independent of that recovery.
     pub(super) fn heartbeat(&mut self, exemption: Option<TrustBasis>) -> ReputationUpdate {
-        if exemption.is_none() {
+        if exemption.is_none() || self.has_protocol_penalty() {
             let prev_reputation = self.reputation();
             self.score.update();
             let new_reputation = self.reputation();
