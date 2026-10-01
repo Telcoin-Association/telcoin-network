@@ -332,7 +332,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                 match res {
                     Ok(()) => {
                         // batch reached quorum!
-                        // Metric: batch_sealed - tracks successfully sealed batches
+                        // logged for every seal that reaches quorum; the batch metrics wait for
+                        // the report below, so a seal whose store or report fails is not counted
                         info!(
                             target: "consensus::metrics",
                             worker_id = self.id,
@@ -340,7 +341,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             num_txs = batch.transactions.len(),
                             "batch sealed"
                         );
-                        self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
                         // Publish the digest for the nodes subscribed to this gossip, i.e. the
                         // committee validators that consume individual current-epoch batches.
                         // Note, ignore error- this should not
@@ -396,6 +396,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             Err(BlockSealError::FailedToReport)
         } else {
+            // recorded only after a successful report: a failed report leaves the transactions
+            // in the pool for the builder to seal again, and an earlier record would count them
+            // once per attempt (issue #1444)
+            self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
             Ok(())
         }
     }
