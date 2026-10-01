@@ -578,6 +578,37 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
     })
 }
 
+/// The older node binary from `TN_BIN_PATH_PREV`, resolved once for the whole test process;
+/// `None` when the variable is unset.
+static PREVIOUS_TELCOIN_BINARY: OnceLock<Option<TestBinary>> = OnceLock::new();
+
+/// Retrieve the node binary built from an older ref (a release, or the last commit before a
+/// fork landed), for the tests that upgrade a running network's binary in place
+/// (`tests/it/subsecond_upgrade.rs`).
+///
+/// Honors `TN_BIN_PATH_PREV`, a prebuilt binary only: unlike [`get_telcoin_network_binary`] there
+/// is no escargot fallback, because cargo can only build the tree in front of it, not an older
+/// ref. `make test-e2e-subsecond-fork` (and its `-all-forks` variant) builds that binary with
+/// `make build-e2e-bin-prev` and exports the variable; on every other lane it is unset, this
+/// returns `None`, and the upgrade tests skip. A variable that is set but names no file panics,
+/// so a mistyped path cannot pass as a skipped run. The binary must come from `make
+/// build-e2e-bin` at the older ref, so it honors the same `TN_*_FORK_EPOCH` variables that
+/// [`TestBinary::command`] forwards (except any fork that ref does not know, which it ignores).
+pub fn get_previous_telcoin_network_binary() -> Option<&'static TestBinary> {
+    PREVIOUS_TELCOIN_BINARY
+        .get_or_init(|| {
+            let prebuilt = std::env::var("TN_BIN_PATH_PREV").ok()?;
+            let path = PathBuf::from(&prebuilt);
+            assert!(
+                path.is_file(),
+                "TN_BIN_PATH_PREV is set to {prebuilt:?} but no file exists there"
+            );
+            info!("using previous telcoin-network binary from TN_BIN_PATH_PREV: {prebuilt}");
+            Some(TestBinary::Prebuilt(path))
+        })
+        .as_ref()
+}
+
 // imports for traits used in faucet tests only
 #[cfg(feature = "faucet")]
 use jsonrpsee::core::client::ClientT;
