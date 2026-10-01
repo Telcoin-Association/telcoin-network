@@ -193,14 +193,14 @@ struct Peer {
 /// Wait for the existing peer manager to report the authenticated target as connected.
 async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Result<()> {
     let polls = futures::stream::unfold(
-        tokio::time::interval(Duration::from_millis(20)),
-        |mut interval| async move {
+        (handle.clone(), tokio::time::interval(Duration::from_millis(20))),
+        |(handle, mut interval)| async move {
             interval.tick().await;
-            Some(((), interval))
+            let peers = handle.connected_peers().await;
+            Some((peers, (handle, interval)))
         },
     )
-    .then(|()| handle.connected_peers())
-    .try_filter(|peers| futures::future::ready(peers.contains(&target) == expected));
+    .try_filter(move |peers| futures::future::ready(peers.contains(&target) == expected));
     let mut polls = Box::pin(polls);
     tokio::time::timeout(Duration::from_secs(8), polls.try_next())
         .await??
@@ -211,31 +211,27 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
 impl Peer {
     /// Observe the next accepted delivery through a distinct authenticated forwarding peer.
     async fn gossip(&self, not_before_unix_us: u128) -> Result<Value> {
-        let receiver = self.gossip.lock().await;
-        let observations = futures::stream::try_unfold(receiver, |mut receiver| async move {
-            receiver.changed().await?;
-            let observation = receiver
-                .borrow_and_update()
-                .clone()
-                .ok_or_else(|| eyre!("gossip receipt missing"))?;
-            Ok::<_, eyre::Report>(Some((observation, receiver)))
-        })
-        .try_filter(move |observation| {
-            futures::future::ready(
-                observation
-                    .pointer("/receipt/received_unix_us")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|received| u128::from(received) >= not_before_unix_us),
-            )
-        });
-        futures::pin_mut!(observations);
-        observations.try_next().await?.ok_or_else(|| eyre!("gossip receipt stream ended"))
+        let mut receiver = self.gossip.lock().await;
+        receiver.changed().await?;
+        let observation = receiver
+            .wait_for(|observation| {
+                observation.as_ref().is_some_and(|observation| {
+                    observation
+                        .pointer("/receipt/received_unix_us")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|received| u128::from(received) >= not_before_unix_us)
+                })
+            })
+            .await?
+            .clone();
+        observation.ok_or_else(|| eyre!("gossip receipt missing"))
     }
     /// Obtain fresh, signature-validated records instead of cached RPC metadata.
     async fn records(&self, require_rpc: bool) -> Result<Value> {
-        let records =
-            futures::future::try_join_all(self.handles.iter().map(|(role, handle)| async move {
-                let record = handle.get_node_record(self.config.target).await?;
+        let target = self.config.target;
+        let records = futures::future::try_join_all(self.handles.clone().into_iter().map(
+            |(role, handle)| async move {
+                let record = handle.get_node_record(target).await?;
                 if require_rpc && matches!(role, NetworkType::Worker(_)) {
                     record
                         .info
@@ -244,29 +240,34 @@ impl Peer {
                         .ok_or_else(|| eyre!("worker record has no submit URL"))?
                         .validate()?;
                 }
-                Ok::<_, eyre::Report>(json!({"swarm": role_name(*role), "record": record}))
-            }))
-            .await?;
+                Ok::<_, eyre::Report>(json!({"swarm": role_name(role), "record": record}))
+            },
+        ))
+        .await?;
         Ok(json!({"signed_records": records}))
     }
 
     /// Disconnect and re-dial the same validated identities, preserving this peer's keys.
     async fn reconnect(&self, require_existing: bool) -> Result<Value> {
-        futures::future::try_join_all(self.handles.iter().map(|(_, handle)| async move {
-            futures::future::try_join_all(self.config.required_hubs.iter().map(|key| async move {
-                let peers = handle.connected_peers().await?;
-                if peers.contains(key) {
-                    let record = handle.get_node_record(*key).await?;
-                    let peer: PeerId = record.info.pubkey.into();
-                    handle.disconnect_peer(peer).await?;
-                    connected(handle, *key, false).await?;
-                } else if require_existing {
-                    Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
-                }
-                handle.dial_by_bls(*key).await?;
-                connected(handle, *key, true).await
-            }))
-            .await
+        let targets = self
+            .handles
+            .iter()
+            .flat_map(|(_, handle)| {
+                self.config.required_hubs.iter().map(move |key| (handle.clone(), *key))
+            })
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(targets.into_iter().map(|(handle, key)| async move {
+            let peers = handle.connected_peers().await?;
+            if peers.contains(&key) {
+                let record = handle.get_node_record(key).await?;
+                let peer: PeerId = record.info.pubkey.into();
+                handle.disconnect_peer(peer).await?;
+                connected(&handle, key, false).await?;
+            } else if require_existing {
+                Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
+            }
+            handle.dial_by_bls(key).await?;
+            connected(&handle, key, true).await
         }))
         .await?;
         self.connectivity().await
@@ -274,16 +275,21 @@ impl Peer {
 
     /// Observe both required hub identities, independently on every live swarm.
     async fn connectivity(&self) -> Result<Value> {
-        let observations =
-            futures::future::try_join_all(self.handles.iter().map(|(role, handle)| async move {
-                let peers = handle.connected_peers().await?;
-                if !self.config.required_hubs.iter().all(|key| peers.contains(key)) {
-                    Err(eyre!("required hub identity disconnected on {role:?}"))
-                } else {
-                    Ok(json!({"swarm": role_name(*role), "connected": peers}))
+        let required_hubs = self.config.required_hubs.clone();
+        let observations = futures::future::try_join_all(self.handles.clone().into_iter().map(
+            |(role, handle)| {
+                let required_hubs = required_hubs.clone();
+                async move {
+                    let peers = handle.connected_peers().await?;
+                    if !required_hubs.iter().all(|key| peers.contains(key)) {
+                        Err(eyre!("required hub identity disconnected on {role:?}"))
+                    } else {
+                        Ok(json!({"swarm": role_name(role), "connected": peers}))
+                    }
                 }
-            }))
-            .await?;
+            },
+        ))
+        .await?;
         Ok(json!({"connections": observations}))
     }
 
@@ -302,7 +308,7 @@ impl Peer {
         write_frame(&mut stream, &request, &mut Vec::new(), &mut Vec::new(), limit).await?;
         let frames = futures::stream::try_unfold(
             (stream, Vec::new(), Vec::new(), false, false),
-            |(mut stream, mut plain, mut compressed, admitted, ended)| async move {
+            move |(mut stream, mut plain, mut compressed, admitted, ended)| async move {
                 if ended {
                     Ok(None)
                 } else {
