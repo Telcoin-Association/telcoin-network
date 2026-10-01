@@ -11788,6 +11788,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "const-str 0.5.7",
+ "crc32fast",
  "dirs-next",
  "eyre",
  "fdlimit",

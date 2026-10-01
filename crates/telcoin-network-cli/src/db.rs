@@ -235,22 +235,32 @@ impl DbValidateArgs {
     }
 }
 
-/// A truncatable tail heals only where the node opens the epoch for append: in the current epoch.
-/// The node only reads a past epoch (a later epoch exists beside it) and never truncates it, so
-/// there the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since
-/// the node migrates it to v2 when it reads the epoch, which drops the tail.
+/// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
+/// (or one it has yet to reach). The node only reads a past epoch and never truncates it, so there
+/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since the
+/// node migrates it to v2 when it reads the epoch, which drops the tail.
 fn require_current_epoch_for_tail(data_file: &Path, epoch: Epoch) -> eyre::Result<()> {
     let legacy = pack_unsealed_version(data_file, epoch)
         .is_some_and(|(version, _)| version < SENTINEL_MIN_VERSION);
-    if !legacy && later_epoch_exists(data_file, epoch) {
+    if !legacy && is_past_epoch(data_file, epoch) {
         println!(
-            "ACTION NEEDED: epoch {epoch} is a past epoch (a later epoch exists beside it), which the \
-             node only reads and never truncates: stop the node and run `telcoin-network db repair \
-             --epoch {epoch} --force`."
+            "ACTION NEEDED: epoch {epoch} is a past epoch, which the node only reads and never \
+             truncates: stop the node and run `telcoin-network db repair --epoch {epoch} --force`."
         );
         bail!("pack {} needs `db repair` (see report above)", data_file.display());
     }
     Ok(())
+}
+
+/// Whether `epoch` is before the epoch the node resumes from, read from the latest-consensus hint
+/// in the epochs directory holding `data_file`'s `epoch-N` directory (what the node itself opens
+/// for append). Falls back to the directory listing when there is no hint.
+fn is_past_epoch(data_file: &Path, epoch: Epoch) -> bool {
+    let resume = data_file.parent().and_then(Path::parent).and_then(ConsensusChain::resume_epoch);
+    match resume {
+        Some(resume) => epoch < resume,
+        None => later_epoch_exists(data_file, epoch),
+    }
 }
 
 /// Whether the epochs directory holding `data_file`'s `epoch-N` directory also holds a later
@@ -667,7 +677,11 @@ impl DbLoadStateArgs {
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         // This writes chain data into the datadir: refuse to run while a live node holds the
         // datadir PID lock, and take it for our own run so a node cannot start mid-import;
-        // released when this returns. Every config load below needs the datadir to exist.
+        // released when this returns. Every config load below needs the datadir to exist, and so
+        // does the lockfile: say so directly rather than through the lockfile's open error.
+        if !datadir.is_dir() {
+            bail!("datadir {} does not exist", datadir.display());
+        }
         let _pid_lock = PidLock::acquire(&datadir)?;
 
         // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
@@ -1123,13 +1137,17 @@ fn restore_consensus_and_records(
         })?;
         // Landing directly at `epochs_dir` (not a temp) is safe here: this is an offline, single
         // writer restore into a fresh datadir, so the online rename/install-lock dance is unneeded.
-        let pack = ConsensusPack::stream_import(
+        // No free-space floor: the floor guards the node's live stores against peer-supplied
+        // bytes, and this is the operator's own bundle into a datadir nothing else is using; a
+        // real shortage surfaces as the write error.
+        let pack = ConsensusPack::stream_import_with_floor(
             epochs_dir,
             file,
             n,
             previous,
             final_record.final_consensus.number,
             STREAM_IMPORT_TIMEOUT,
+            0,
         )
         .await
         .map_err(|e| {
@@ -1532,6 +1550,39 @@ mod tests {
             !super::later_epoch_exists(&bare.path().join(super::DATA_NAME), 0),
             "a bare data file has no epochs beside it"
         );
+    }
+
+    /// Whether a pack is a past epoch comes from the latest-consensus hint the node resumes from,
+    /// not the directory listing: a later `epoch-{N}` can exist before the node switches to it (an
+    /// epoch handoff interrupted after creating the next epoch's directory, or an epoch imported
+    /// ahead while catching up), and the node still opens the hinted epoch for append, healing its
+    /// tail.
+    #[test]
+    fn past_epoch_follows_the_latest_consensus_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        for epoch in [3, 4] {
+            fs::create_dir_all(dir.path().join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let data = |epoch: u32| dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        // The slot format: epoch (u32 LE), number (u64 LE), crc32 (LE) over the two. The other
+        // slot is empty, which reads as (0, 0).
+        let write_hint = |epoch: u32| {
+            let mut slot = Vec::with_capacity(16);
+            slot.extend_from_slice(&epoch.to_le_bytes());
+            slot.extend_from_slice(&100u64.to_le_bytes());
+            let crc = crc32fast::hash(&slot);
+            slot.extend_from_slice(&crc.to_le_bytes());
+            fs::write(dir.path().join("consensus_slot1"), &slot).unwrap();
+            fs::write(dir.path().join("consensus_slot2"), []).unwrap();
+        };
+        let past = |epoch: u32| super::require_current_epoch_for_tail(&data(epoch), epoch).is_err();
+
+        assert!(past(3), "without a hint the directory listing decides: epoch 4 follows epoch 3");
+        write_hint(3);
+        assert!(!past(3), "the node resumes epoch 3 for append");
+        assert!(!past(4), "epoch 4 is ahead of the node, opened for append when it gets there");
+        write_hint(4);
+        assert!(past(3), "the node resumes epoch 4, so epoch 3 is past");
     }
 
     /// `db load-state` writes chain data into the datadir, so like repair and migrate it must

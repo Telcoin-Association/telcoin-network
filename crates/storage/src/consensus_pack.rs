@@ -890,7 +890,8 @@ impl ConsensusPack {
             .map_err(|e| PackError::PersistError(format!("migrate task join error: {e}")))?
     }
 
-    /// Create a new set of epoch static files to write consensus output into.
+    /// Create a new set of epoch static files to write consensus output into, from a peer's
+    /// `stream`, leaving at least [`IMPORT_MIN_FREE_BYTES`] free on the filesystem.
     pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
@@ -898,6 +899,31 @@ impl ConsensusPack {
         previous_epoch: &EpochRecord,
         final_consensus_number: u64,
         timeout: Duration,
+    ) -> Result<ConsensusPack, PackError> {
+        Self::stream_import_with_floor(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus_number,
+            timeout,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+    }
+
+    /// [`Self::stream_import`] with an explicit free-space floor: the import stops before the
+    /// filesystem's free space drops below `min_free`. A restore from a local bundle the operator
+    /// chose (`db load-state`) passes `0`, so a real shortage surfaces as the write error rather
+    /// than a margin meant for peer-supplied bytes.
+    pub async fn stream_import_with_floor<P: Into<PathBuf>, R: AsyncRead + Unpin>(
+        path: P,
+        stream: R,
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
+        min_free: u64,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
@@ -908,7 +934,7 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus_number,
             timeout,
-            IMPORT_MIN_FREE_BYTES,
+            min_free,
         )
         .await?;
         let version = inner.version();
@@ -3939,7 +3965,7 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
 /// whole epoch of peer-supplied bytes before its only authentication (the final header against the
 /// certified epoch record), and it shares that filesystem with the live pack and the node's other
 /// stores, so it stops here rather than filling the disk under them.
-const IMPORT_MIN_FREE_BYTES: u64 = 2 << 30;
+pub const IMPORT_MIN_FREE_BYTES: u64 = 2 << 30;
 
 /// How far an import's data log may grow between free-space checks.
 const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
@@ -10559,7 +10585,7 @@ pub(crate) mod test {
         let previous_epoch = test_previous_epoch(&fixture.committee());
         let is_storage_full = |e: &PackError| matches!(e, PackError::IO(io_err) if io_err.kind() == io::ErrorKind::StorageFull);
 
-        let err = Inner::stream_import(
+        let Err(err) = Inner::stream_import(
             temp_dir.path(),
             &[][..],
             0,
@@ -10569,8 +10595,9 @@ pub(crate) mod test {
             u64::MAX,
         )
         .await
-        .err()
-        .expect("an import with no room must stop");
+        else {
+            panic!("an import with no room must stop");
+        };
         assert!(is_storage_full(&err), "got {err:?}");
 
         let mut floor =

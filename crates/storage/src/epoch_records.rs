@@ -452,7 +452,7 @@ impl EpochRecordDb {
         // Build `final_numbers` from the records the actor serves: the position index's
         // (first-write-wins) record for each epoch, not a raw walk of the log, where a duplicate
         // left by an interrupted save may differ from the indexed record. Index it by absolute
-        // epoch (matching `update_finals`). (Epochs are contiguous from the first stored one by
+        // epoch (matching `reserve_finals`). (Epochs are contiguous from the first stored one by
         // construction, so there are no gaps to leave as zero.)
         let mut final_numbers: Vec<u64> = Vec::with_capacity(inner.epoch_idx.len());
         for slot in 0..inner.epoch_idx.len() as u64 {
@@ -612,39 +612,65 @@ impl EpochRecordDb {
         self.write(|tx| EpochDbMessage::SaveDummy0Record(record, tx)).await
     }
 
-    /// Update final_numbers with record data.
-    fn update_finals(&self, record: &EpochRecord) -> Result<(), EpochDbError> {
+    /// Reserve `record`'s by-number routing entry before it is written: the next epoch's final
+    /// number is pushed (so consecutive saves keep their order checks), while an epoch that already
+    /// has an entry keeps it (first-write-wins, the record the database serves). Returns whether an
+    /// entry was pushed, for [`Self::release_finals`] to undo if the write is then refused.
+    fn reserve_finals(&self, record: &EpochRecord) -> Result<bool, EpochDbError> {
         let epoch = record.epoch as usize;
-        let number = record.final_consensus.number;
         let mut finals = self.final_numbers.lock();
         let finals_len = finals.len();
         if epoch > finals_len {
             return Err(EpochDbError::EpochOutOfOrder(finals_len as u32, epoch as u32));
         }
-        if epoch < finals_len {
-            finals[epoch] = number;
-        } else {
-            finals.push(number);
+        if epoch == finals_len {
+            finals.push(record.final_consensus.number);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Undo a [`Self::reserve_finals`] push for `record` whose write was refused, while it is still
+    /// the last entry, so a refused write leaves no routing behind.
+    fn release_finals(&self, record: &EpochRecord) {
+        let mut finals = self.final_numbers.lock();
+        if finals.len() == record.epoch as usize + 1 {
+            finals.pop();
+        }
+    }
+
+    /// Write `record` (with `cert`, if any), keeping the by-number routing in step with what the
+    /// database actually stores.
+    async fn write_record(
+        &self,
+        record: EpochRecord,
+        message: impl FnOnce(EpochRecord, WriteReply) -> EpochDbMessage,
+    ) -> Result<(), EpochDbError> {
+        let pushed = self.reserve_finals(&record)?;
+        let reserved = pushed.then(|| record.clone());
+        let res = self.write(|tx| message(record, tx)).await;
+        if let (Err(_), Some(reserved)) = (&res, reserved) {
+            self.release_finals(&reserved);
+        }
+        res
     }
 
     /// Save an [`EpochRecord`] without a certificate.
-    /// Returns `Ok(())` idempotently if the record is already stored.
+    /// Returns `Ok(())` idempotently if the record is already stored; a different record for an
+    /// already-stored epoch is refused ([`EpochDbError::ConflictingRecord`]).
     pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
-        self.update_finals(&record)?;
-        self.write(|tx| EpochDbMessage::SaveRecord(record, tx)).await
+        self.write_record(record, EpochDbMessage::SaveRecord).await
     }
 
     /// Save an [`EpochRecord`] and its [`EpochCertificate`] to the database.
-    /// If the record is already stored, only the certificate is saved.
+    /// If the record is already stored, only the certificate is saved; a different record for an
+    /// already-stored epoch is refused ([`EpochDbError::ConflictingRecord`]) with nothing saved.
     pub async fn save(
         &self,
         record: EpochRecord,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
-        self.update_finals(&record)?;
-        self.write(|tx| EpochDbMessage::Save(record, cert, tx)).await
+        self.write_record(record, |record, tx| EpochDbMessage::Save(record, cert, tx)).await
     }
 
     /// Save an [`EpochCertificate`] keyed by `digest` (the corresponding [`EpochRecord`]'s digest).
@@ -925,10 +951,11 @@ impl EpochRecordDb {
 
     /// Flush everything written so far to disk.
     ///
-    /// Every write before this call has already returned its own verdict to its caller, so a
-    /// successful `persist()` proves durable exactly the writes that reported `Ok`. Callers that
-    /// treat it as proof of durability, such as the epoch-close path, check their write's result
-    /// first.
+    /// This flushes every write the actor has processed so far: the caller's own, and any other
+    /// caller's queued before it (including a write whose caller stopped waiting for its verdict).
+    /// Durability of a particular write is that write's own `Ok` followed by a successful
+    /// `persist()`: callers that treat it as proof of durability, such as the epoch-close path,
+    /// check their write's result first.
     pub async fn persist(&self) -> Result<(), EpochDbError> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(EpochDbMessage::Persist(tx)).await.map_err(|_| EpochDbError::SendFailed)?;
@@ -1162,7 +1189,7 @@ impl EpochRecordDb {
     /// Find the epoch for a consensus header number.
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
-    /// lookup. The vector is guaranteed sorted because `update_finals` enforces
+    /// lookup. The vector is guaranteed sorted because `reserve_finals` enforces
     /// sequential epoch insertion. If `number` is beyond the last stored epoch,
     /// returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
@@ -1954,7 +1981,20 @@ impl Inner {
         let idx = epoch.saturating_sub(self.start_epoch) as u64;
 
         if (idx as usize) < self.epoch_idx.len() {
-            // Already stored — idempotent success.
+            // Already stored: idempotent success for the same record. Epoch records are identical
+            // on every node, so a different one is divergence, refused rather than silently
+            // dropped. (An epoch before the first stored one has nothing to compare against.)
+            if epoch >= self.start_epoch {
+                let pos = self
+                    .epoch_idx
+                    .load(idx)
+                    .map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+                let stored = self.records.fetch(pos)?.digest();
+                let offered = record.digest();
+                if stored != offered {
+                    return Err(EpochDbError::ConflictingRecord { epoch, stored, offered });
+                }
+            }
             return Ok(());
         } else if idx as usize != self.epoch_idx.len() {
             return Err(EpochDbError::EpochOutOfOrder(
@@ -2300,6 +2340,16 @@ pub enum EpochDbError {
     CorruptLog(String),
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
+    /// A different record was offered for an epoch whose record is already stored. Epoch records
+    /// are identical on every node, so this is divergence, never a routine re-save.
+    ConflictingRecord {
+        /// The epoch both records claim.
+        epoch: Epoch,
+        /// Digest of the record already stored.
+        stored: EpochDigest,
+        /// Digest of the record offered.
+        offered: EpochDigest,
+    },
     /// A certificate was saved with a record it does not certify: its `epoch_hash` is the digest
     /// of another record.
     CertificateMismatch {
@@ -2340,6 +2390,10 @@ impl Display for EpochDbError {
             EpochDbError::BundleValidation(e) => {
                 write!(f, "Export bundle validation failed: {e}")
             }
+            EpochDbError::ConflictingRecord { epoch, stored, offered } => write!(
+                f,
+                "epoch {epoch} already holds record {stored}; refusing the different record {offered}"
+            ),
             EpochDbError::CertificateMismatch { record, certified } => write!(
                 f,
                 "certificate certifies record {certified}, not the record {record} it was saved with"
@@ -3654,6 +3708,78 @@ mod test {
         assert_eq!(first.final_consensus.number, 20, "the first copy is the one served");
         // finals [10, 20, 30, 40]: number 22 is in epoch 2 (the later copy would say epoch 1).
         assert_eq!(db.number_to_epoch(22), 2, "routing follows the served record");
+        db.close().await;
+    }
+
+    /// Epoch records are identical on every node, so a different record offered for an epoch
+    /// already stored is divergence: refused (`ConflictingRecord`), leaving the stored record, its
+    /// certificate and the by-number routing as they were. The identical record stays idempotent.
+    #[tokio::test]
+    async fn test_conflicting_record_for_a_stored_epoch_is_refused() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_conflicting_record").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        let mut epoch1 = None;
+        for epoch in 0..3u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            if epoch == 1 {
+                epoch1 = Some((record.clone(), cert.clone(), parent));
+            }
+            parent = record.digest();
+            db.save(record, cert).await.expect("save");
+        }
+        let (stored, stored_cert, epoch1_parent) = epoch1.expect("epoch 1 saved");
+        let (mut different, _) = make_test_pair(1, &signers, epoch1_parent);
+        different.final_consensus = ConsensusNumHash::new(25, ConsensusHeaderDigest::default());
+
+        let err = db.save_record(different.clone()).await.expect_err("a conflicting record");
+        assert!(matches!(err, EpochDbError::ConflictingRecord { epoch: 1, .. }), "got {err:?}");
+        assert_eq!(db.record_by_epoch(1).await.map(|r| r.digest()), Some(stored.digest()));
+        // finals [10, 20, 30]: number 22 is in epoch 2 (the refused record would make it epoch 1).
+        assert_eq!(db.number_to_epoch(22), 2, "routing follows the stored record");
+        // With its own certificate, through `save`: refused before the certificate is filed.
+        let different_cert = EpochCertificate { epoch_hash: different.digest(), ..stored_cert };
+        let err = db.save(different.clone(), different_cert).await.expect_err("conflicting");
+        assert!(matches!(err, EpochDbError::ConflictingRecord { epoch: 1, .. }), "got {err:?}");
+        assert!(db.cert_by_digest(different.digest()).await.is_none(), "no certificate filed");
+        assert_eq!(db.number_to_epoch(22), 2);
+
+        db.save_record(stored).await.expect("re-saving the stored record is idempotent");
+        db.close().await;
+    }
+
+    /// A write the actor refuses must not move the by-number routing either.
+    #[tokio::test]
+    async fn test_refused_write_leaves_routing_unchanged() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_refused_routing").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut parent = EpochDigest::default();
+        let mut pairs = Vec::new();
+        for epoch in 0..4u32 {
+            let pair = make_test_pair(epoch, &signers, parent);
+            parent = pair.0.digest();
+            pairs.push(pair);
+        }
+        for (record, cert) in pairs[..3].iter().cloned() {
+            db.save(record, cert).await.expect("save");
+        }
+        // Epoch 3's record with epoch 2's certificate: refused before anything is written.
+        let err = db
+            .save(pairs[3].0.clone(), pairs[2].1.clone())
+            .await
+            .expect_err("a certificate for another record");
+        assert!(matches!(err, EpochDbError::CertificateMismatch { .. }), "got {err:?}");
+        // finals [10, 20, 30]: number 45 routes past the last stored epoch, to 3 (a leftover entry
+        // for the refused epoch 3, final 40, would route it to 4).
+        assert_eq!(db.number_to_epoch(45), 3, "the refused write left no routing entry");
+
+        let (record, cert) = pairs[3].clone();
+        db.save(record, cert).await.expect("the matching pair still saves");
+        assert_eq!(db.number_to_epoch(45), 4);
         db.close().await;
     }
 

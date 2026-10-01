@@ -142,9 +142,10 @@ read-only via `open_static` (behind a small `recent_packs` cache; a legacy or in
 is healed read-side first — built off the async runtime and outside `pack_install` into a side directory,
 data log opened read-only, then swapped in by rename), imports a full epoch from peers with
 `stream_import` (into an `import-{N}/` dir, then an install-locked rename to `epoch-{N}/`; a read-only
-partial-prefix pack instead stages under `staging-{N}/` and is never renamed; either import stops with
-a local `StorageFull` error, not charged to the peer, before free space drops below a floor, since the
-peer's bytes are authenticated only at the final header), and drives epoch handoff.
+partial-prefix pack instead stages under its own `staging-{N}-{n}/` and is never renamed; either import
+stops with a local `StorageFull` error, not charged to the peer, before free space drops below a floor,
+since the peer's bytes are authenticated only at the final header; `db load-state`'s restore of a local
+bundle has no floor), and drives epoch handoff.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
@@ -153,8 +154,11 @@ peer's bytes are authenticated only at the final header), and drives epoch hando
 each log's tail commit marker, a rebuild refuses to truncate below it (or below the digest index's
 synced length), and an empty position index beside a populated digest index is rebuilt, not trusted.
 Each write returns its own result to its caller (the handle is shared by concurrent writers, so a
-failure is never reported to someone else), and closing persists before the files are sealed. `certificate_pack` and
-`exec_state_pack` are per-epoch / per-snapshot packs for certificate bundles and EVM state exports.
+failure is never reported to someone else), and closing persists before the files are sealed. A stored
+epoch's record is never replaced: re-saving the same record is a no-op, and a different one is refused
+(`ConflictingRecord`), since epoch records are identical on every node. The by-number routing follows
+only what is stored. `certificate_pack` and `exec_state_pack` are per-epoch / per-snapshot packs for
+certificate bundles and EVM state exports.
 
 ### 7. Key/value stores (the other family)
 
@@ -184,7 +188,7 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
       epochs.pack / epoch_certs.pack + sidecars   the EpochRecordDb chain
       consensus_slot{1,2}      latest-consensus hint (double-buffered)
       import-{N}/              full-epoch import target (renamed to epoch-{N}/ on install)
-      staging-{N}/             read-only partial-prefix import pack (never renamed)
+      staging-{N}-{n}/         read-only partial-prefix import pack, one dir per import (never renamed)
     state_exports/             EVM state-export bundles
 ```
 

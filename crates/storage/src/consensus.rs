@@ -160,6 +160,21 @@ impl LatestConsensus {
         buffer
     }
 
+    /// The epoch [`Self::new`] would resume from under `base_path`, read without creating or
+    /// writing the slot files: the higher of the two slots' epochs, an unreadable slot counting as
+    /// `(0, 0)` exactly as `new` treats it. `None` when neither slot file exists.
+    fn read_epoch(base_path: &Path) -> Option<Epoch> {
+        let mut found = false;
+        let mut epoch = 0;
+        for name in ["consensus_slot1", "consensus_slot2"] {
+            if let Ok(mut slot) = File::open(base_path.join(name)) {
+                found = true;
+                epoch = epoch.max(Self::read_slot(&mut slot).map_or(0, |(e, _)| e));
+            }
+        }
+        found.then_some(epoch)
+    }
+
     /// Create a new latest consensus that saves files into base_path.
     fn new(base_path: &Path) -> Result<Self, ConsensusChainError> {
         let slot1_path = base_path.join("consensus_slot1");
@@ -360,6 +375,10 @@ impl LatestConsensus {
 struct StagingPack {
     pack: ConsensusPack,
     final_number: u64,
+    /// The directory this import staged into (its own, see
+    /// [`ConsensusChain::import_partial_to_staging`]); removed when the pack is cleared or
+    /// replaced.
+    dir: PathBuf,
 }
 
 /// Implement a databse for consensus data.
@@ -389,7 +408,7 @@ pub struct ConsensusChain {
     /// `current_pack`/`recent_packs` to keep a single lock order and avoid deadlock.
     pack_install: Arc<tokio::sync::Mutex<()>>,
     /// Read-only "staging" pack holding a verified PREFIX of an (in-progress) epoch streamed from
-    /// a peer for catch-up. Unlike `current_pack`, this lives in its own `staging-{epoch}`
+    /// a peer for catch-up. Unlike `current_pack`, this lives in its own `staging-{epoch}-{n}`
     /// directory and is NEVER renamed over the live `epoch-{N}` dir, so importing it cannot
     /// race the in-order build of the main pack. Outputs are read from here during catch-up,
     /// then written to the main pack in order through the normal save path; cleared once
@@ -405,10 +424,11 @@ pub struct ConsensusChain {
     /// failures (a full disk, descriptor exhaustion) are not remembered: they say nothing
     /// about the epoch and clear on their own.
     heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
-    /// Serializes [`Self::import_partial_to_staging`]: each import starts by clearing the
-    /// `staging-{N}` directory, which would otherwise delete the files of an import of the same
-    /// epoch still streaming into it. There is a single staging slot, so imports never need to
-    /// run side by side.
+    /// Serializes [`Self::import_partial_to_staging`], so two downloads of a staging prefix never
+    /// run side by side (there is a single staging slot). Chain-wide and held across the whole
+    /// transfer, which the sync reader's per-frame timeout and throughput floor bound. Each import
+    /// also stages into a directory of its own, so clearing the installed pack never touches an
+    /// import still streaming.
     staging_import: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -827,6 +847,15 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
+    /// The epoch a node opens for append when it starts on the epochs directory `base_path`: the
+    /// latest-consensus hint (the `consensus_slot1`/`consensus_slot2` files), read without creating
+    /// or writing them. Every epoch below it is a past epoch the node only reads; the directory
+    /// listing is not authoritative (a later `epoch-{N}` can exist before the node switches to it).
+    /// `None` when there are no slot files.
+    pub fn resume_epoch(base_path: &Path) -> Option<Epoch> {
+        LatestConsensus::read_epoch(base_path)
+    }
+
     /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.migrating` directories under
     /// `base_path` (stale from a prior run — `*.migrating` is a half-built pack from an interrupted
     /// v1/v0→v2 migration; both are always re-fetchable/re-derivable so deleting them is safe).
@@ -922,7 +951,8 @@ impl ConsensusChain {
     /// a side "staging" directory and keep it open for reading.
     ///
     /// This intentionally does NOT use [`Self::stream_import`] (which removes+renames the live
-    /// `epoch-{N}` dir): the staged pack lives in `staging-{epoch}` and is only ever read, so a
+    /// `epoch-{N}` dir): the staged pack lives in its own `staging-{epoch}-{n}` directory and is
+    /// only ever read, so a
     /// node that is concurrently building the same epoch in order (via
     /// [`Self::save_consensus_output`]) cannot race it. Verifies the streamed prefix ends
     /// exactly at `epoch_record.final_consensus`. Concurrent calls run one after another (each
@@ -936,12 +966,15 @@ impl ConsensusChain {
     ) -> Result<(), ConsensusChainError> {
         let _serial = self.staging_import.lock().await;
         let epoch = epoch_record.epoch;
-        let staging_base = self.base_path.join(format!("staging-{epoch}"));
-        // Start from a clean staging dir; previous attempts (if any) are stale.
-        let _ = std::fs::remove_dir_all(&staging_base);
+        // A directory of its own (never another import's, never the installed pack's), so neither
+        // clearing the installed pack nor a stale attempt can remove files this import is writing.
+        // The startup sweep removes every `staging-*` directory left behind.
+        static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let staging_base = self.base_path.join(format!("staging-{epoch}-{seq}"));
         std::fs::create_dir_all(&staging_base)?;
         let final_number = epoch_record.final_consensus.number;
-        let pack = ConsensusPack::stream_import(
+        let pack = match ConsensusPack::stream_import(
             &staging_base,
             stream,
             epoch,
@@ -949,7 +982,14 @@ impl ConsensusChain {
             final_number,
             timeout,
         )
-        .await?;
+        .await
+        {
+            Ok(pack) => pack,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging_base);
+                return Err(e.into());
+            }
+        };
         // Validate the streamed prefix; on ANY failure async-close the pack (the only handle)
         // instead of the blocking `Drop` join on this tokio worker, then drop the staging
         // dir. The chain was verified link-by-link as it streamed; confirm the prefix ends
@@ -976,11 +1016,13 @@ impl ConsensusChain {
             let _ = std::fs::remove_dir_all(&staging_base);
             return Err(e);
         }
-        // Install the new staging pack; if one was somehow still installed, async-close it outside
-        // the lock rather than dropping it (blocking-join) under the guard.
-        let previous = self.staging.lock().replace(StagingPack { pack, final_number });
+        // Install the new staging pack; if one was still installed, async-close it outside the
+        // lock rather than dropping it (blocking-join) under the guard, then remove its directory.
+        let previous =
+            self.staging.lock().replace(StagingPack { pack, final_number, dir: staging_base });
         if let Some(previous) = previous {
             previous.pack.close().await;
+            let _ = std::fs::remove_dir_all(&previous.dir);
         }
         Ok(())
     }
@@ -1010,9 +1052,8 @@ impl ConsensusChain {
     pub async fn clear_staging(&self) {
         let staged = self.staging.lock().take();
         if let Some(staged) = staged {
-            let epoch = staged.pack.epoch();
             staged.pack.close().await;
-            let _ = std::fs::remove_dir_all(self.base_path.join(format!("staging-{epoch}")));
+            let _ = std::fs::remove_dir_all(&staged.dir);
         }
     }
 
@@ -1629,8 +1670,8 @@ impl ConsensusChain {
         // the deque when a dead entry is actually present, and drop the
         // dead packs OUTSIDE the lock — a last-handle `Drop` must not run under the cache
         // lock (same rule as the eviction below; mirrors the pop-front-into-kept pattern in
-        // `save`). A dead pack's actor has already exited, so its `Drop` detaches
-        // immediately without a blocking join.
+        // `save`). A dead pack's actor has exited (or is finishing its unwind), so its `Drop`
+        // only reaps the thread: the join returns at once and nothing is sealed.
         let dead = {
             let mut recents = self.recent_packs.lock();
             if recents.iter().all(|p| p.is_alive()) {
@@ -3516,8 +3557,9 @@ mod test {
             dest.get_consensus_output_current(1).await.is_err(),
             "staging import must not write into the live epoch dir"
         );
-        let staging_path = dst_dir.path().join("staging-0");
-        assert!(std::fs::exists(&staging_path).unwrap_or(false), "staging dir should exist");
+        let staged = staging_dirs(dst_dir.path(), 0);
+        assert_eq!(staged.len(), 1, "one staging dir should exist");
+        let staging_path = staged[0].clone();
 
         // clear_staging closes the pack and removes the dir.
         dest.clear_staging().await;
@@ -3594,15 +3636,18 @@ mod test {
                 .await
             })
         };
-        let first_data =
-            dst_dir.path().join("staging-0").join("epoch-0").join(crate::consensus_pack::DATA_NAME);
+        let first_streaming = || {
+            staging_dirs(dst_dir.path(), 0)
+                .iter()
+                .any(|d| d.join("epoch-0").join(crate::consensus_pack::DATA_NAME).exists())
+        };
         for _ in 0..200 {
-            if first_data.exists() {
+            if first_streaming() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(first_data.exists(), "the first import is streaming into staging");
+        assert!(first_streaming(), "the first import is streaming into staging");
 
         let second = {
             let (dest, record, previous_epoch) =
@@ -3620,7 +3665,7 @@ mod test {
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!second.is_finished(), "the second import waits for the first");
-        assert!(first_data.exists(), "the first import's files are left alone");
+        assert!(first_streaming(), "the first import's files are left alone");
 
         release_tx.send(()).expect("release the first import");
         feed.await.expect("feeder");
@@ -3628,6 +3673,110 @@ mod test {
         second.await.expect("second task").expect("second import");
         assert_eq!(dest.staging_final(), Some(8));
         assert!(dest.staging_consensus_output(8).await.is_some(), "the staged prefix is readable");
+        dest.clear_staging().await;
+    }
+
+    /// The per-import staging directories (`staging-{epoch}-{n}`) under `base`.
+    fn staging_dirs(base: &std::path::Path, epoch: Epoch) -> Vec<std::path::PathBuf> {
+        let prefix = format!("staging-{epoch}-");
+        std::fs::read_dir(base)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clearing the staged pack (the subscriber caught up past it) while another import of the same
+    /// epoch is streaming must remove only the cleared pack's files, never the in-flight import's:
+    /// that import completes and its staged pack is still on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_clear_staging_spares_an_in_flight_import() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let src_dir = TempDir::with_prefix("test_staging_clear_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(src_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        let mut last = None;
+        for i in 0..8u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            last = Some(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+        let last = last.expect("outputs saved");
+        let (stream, len) = source.get_partial_epoch_stream(0, 8).await.expect("partial stream");
+        let mut bytes = Vec::new();
+        stream.take(len).read_to_end(&mut bytes).await.expect("read partial stream");
+        let mut record = previous_epoch.clone();
+        record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
+
+        let dst_dir = TempDir::with_prefix("test_staging_clear_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        // A first import is staged and installed.
+        dest.import_partial_to_staging(
+            std::io::Cursor::new(bytes.clone()),
+            &record,
+            &previous_epoch,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("first import");
+
+        // A second import of the same epoch streams half its bytes, then stalls.
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let half = bytes.len() / 2;
+        let feed = {
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                writer.write_all(&bytes[..half]).await.expect("write first half");
+                let _ = release_rx.await;
+                writer.write_all(&bytes[half..]).await.expect("write second half");
+                writer.shutdown().await.expect("end stream");
+            })
+        };
+        let second = {
+            let (dest, record, previous_epoch) =
+                (dest.clone(), record.clone(), previous_epoch.clone());
+            tokio::spawn(async move {
+                dest.import_partial_to_staging(
+                    reader,
+                    &record,
+                    &previous_epoch,
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!second.is_finished(), "the second import is mid-stream");
+
+        // The subscriber clears the installed (first) staged pack meanwhile.
+        dest.clear_staging().await;
+        release_tx.send(()).expect("release the second import");
+        feed.await.expect("feeder");
+        second.await.expect("second task").expect("second import");
+        assert_eq!(dest.staging_final(), Some(8));
+        let staged_on_disk = staging_dirs(dst_dir.path(), 0)
+            .iter()
+            .any(|d| d.join("epoch-0").join(crate::consensus_pack::DATA_NAME).exists());
+        assert!(staged_on_disk, "the second import's staged pack is still on disk");
         dest.clear_staging().await;
     }
 
@@ -3691,7 +3840,7 @@ mod test {
         // Nothing staged, and the staging dir was cleaned up after the pack was closed.
         assert_eq!(dest.staging_final(), None, "a rejected import must not leave a staged pack");
         assert!(
-            !std::fs::exists(dst_dir.path().join("staging-0")).unwrap_or(true),
+            staging_dirs(dst_dir.path(), 0).is_empty(),
             "rejected import must remove its staging dir"
         );
         // The chain is still usable (the error path did not poison a lock or leave the dest
