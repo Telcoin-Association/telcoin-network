@@ -68,6 +68,13 @@ pub(crate) struct SwarmMetrics {
 }
 
 impl SwarmMetrics {
+    /// Observe bounded lookup work and verified record convergence for each swarm role.
+    pub(crate) fn record_committee_refresh(&self, outcome: &'static str) {
+        metrics::counter!("tn_network.committee_record_refresh_total",
+            "network" => self.network.clone(), "outcome" => outcome)
+        .increment(1);
+    }
+
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);

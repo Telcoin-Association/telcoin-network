@@ -660,13 +660,16 @@ where
         // non-public hosts unless the operator opted in for a single-host deployment. The
         // worker's own pool rides along so a forward that gets no verdict returns its
         // transactions there instead of losing them (issue #1145).
-        let forwarder = Arc::new(WorkerRpcForwarder::new(
-            network_handle.get_task_spawner().clone(),
-            ForwardTargetPolicy::from_allow_private(
-                consensus_config.parameters().allow_private_forward_targets,
-            ),
-            Some(engine.get_worker_transaction_pool(&worker_id).await?),
-        ));
+        let forwarder = Arc::new(
+            WorkerRpcForwarder::new(
+                network_handle.get_task_spawner().clone(),
+                ForwardTargetPolicy::from_allow_private(
+                    consensus_config.parameters().allow_private_forward_targets,
+                ),
+                Some(engine.get_worker_transaction_pool(&worker_id).await?),
+            )
+            .with_record_refresher(network_handle.inner_handle().clone()),
+        );
 
         let worker = WorkerNode::new(
             worker_id,
