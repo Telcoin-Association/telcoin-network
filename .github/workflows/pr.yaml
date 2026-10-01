@@ -208,7 +208,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          if git diff --quiet "${BASE_SHA}" HEAD -- tools/hub-capacity crates/config/src crates/network-libp2p/src crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
+          if git diff --quiet "${BASE_SHA}" HEAD -- tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -248,8 +248,9 @@ jobs:
         if: steps.scope.outputs.changed == 'true'
         run: |
           cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api
+          cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer
           git rev-parse HEAD > target/debug/hub-capacity-revision.txt
-          sha256sum target/debug/telcoin-network target/debug/node-record-api > target/debug/hub-capacity-binaries.sha256
+          sha256sum target/debug/telcoin-network target/debug/node-record-api target/debug/examples/hub-capacity-peer > target/debug/hub-capacity-binaries.sha256
 
       - name: Retain Linux qualification binaries
         if: steps.scope.outputs.changed == 'true'
@@ -261,6 +262,7 @@ jobs:
           path: |
             target/debug/telcoin-network
             target/debug/node-record-api
+            target/debug/examples/hub-capacity-peer
             target/debug/hub-capacity-revision.txt
             target/debug/hub-capacity-binaries.sha256
 

@@ -305,6 +305,60 @@ where
     TestTypes { peer1, peer2, _task_manager: task_manager }
 }
 
+/// Local record callers have finite admission and receive completion on both empty and valid
+/// queries.
+#[tokio::test]
+async fn application_record_queries_are_bounded_and_complete(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+    let key = network.key_config.primary_public_key();
+    let receivers = (0..100)
+        .map(|_| {
+            let (reply, receiver) = oneshot::channel();
+            network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+            Ok(receiver)
+        })
+        .collect::<crate::types::NetworkResult<Vec<_>>>()?;
+    let (reply, mut rejected) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    assert!(
+        rejected.try_recv().is_ok_and(|result| result.is_err()),
+        "allocation overflow must fail immediately"
+    );
+    let ids = network
+        .kad_record_queries
+        .iter()
+        .filter(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 100);
+    ids.iter().for_each(|id| network.close_kad_query(id));
+    receivers.into_iter().try_for_each(|mut receiver| {
+        assert!(receiver.try_recv()?.is_err(), "an empty query must report failure");
+        Ok::<_, tokio::sync::oneshot::error::TryRecvError>(())
+    })?;
+    assert!(network.kad_record_queries.values().all(|query| query.reply.is_none()));
+
+    let record = network.node_record.clone();
+    let (reply, mut complete) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    let id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .ok_or("application query was not retained")?;
+    network
+        .kad_record_queries
+        .get_mut(&id)
+        .map(|query| query.result = Some(record.clone()))
+        .ok_or("application query disappeared")?;
+    network.close_kad_query(&id);
+    assert_eq!(encode(&complete.try_recv()??), encode(&record));
+    Ok(())
+}
+
 /// Wait for a peer's BLS key to be discovered via kademlia.
 ///
 /// Polls `connected_peers()` until the expected BLS key appears,

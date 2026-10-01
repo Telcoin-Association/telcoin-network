@@ -63,6 +63,7 @@ tn-types = { workspace = true }
 socket2 = { workspace = true }
 
 [dev-dependencies]
+rand = { workspace = true }
 tempfile = { workspace = true }
 # `ServiceExt::oneshot` for driving the router in-process
 tower = { workspace = true, features = ["util"] }

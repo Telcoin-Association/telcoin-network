@@ -9,7 +9,7 @@ pub use crate::metrics::WorkerMetrics;
 pub use network::{
     WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
     MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS, MAX_CONCURRENT_GOSSIP_PREFETCHES,
-    MAX_PENDING_REQUESTS_PER_PEER,
+    MAX_CONCURRENT_SHED_TASKS, MAX_PENDING_REQUESTS_PER_PEER,
 };
 pub mod quorum_waiter;
 

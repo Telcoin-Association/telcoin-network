@@ -116,9 +116,13 @@ struct Occupancy {
 /// Process-wide source accounting occupancy, with no peer or address labels.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SourceOccupancy {
+    /// Total connection leases across all swarms.
     connections: usize,
+    /// Distinct authenticated peer rows.
     peer_rows: usize,
+    /// Distinct validated source addresses.
     address_rows: usize,
+    /// Distinct configured network prefixes.
     prefix_rows: usize,
 }
 

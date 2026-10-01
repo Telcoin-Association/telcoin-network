@@ -1409,6 +1409,28 @@ where
                 let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
                 send_or_log_error!(reply, rpc, "GetValidatorRpc");
             }
+            NetworkCommand::GetNodeRecord { key, reply } => {
+                // Local application queries have their own finite allocation. Committee discovery
+                // remains independent so a full application allocation cannot block rotation.
+                if self.kad_record_queries.values().filter(|query| query.reply.is_some()).count()
+                    >= 100
+                {
+                    let _ = reply.send(Err(std::io::Error::other(
+                        "application node-record query allocation exhausted",
+                    )
+                    .into()));
+                } else {
+                    let query_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .get_record(libp2p::kad::RecordKey::new(&encode(&key)));
+                    self.kad_record_queries.insert(
+                        query_id,
+                        KadQuery { request: key, result: None, reply: Some(reply) },
+                    );
+                }
+            }
             NetworkCommand::GetAllValidatorRpcs { reply } => {
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
@@ -2693,11 +2715,16 @@ where
     /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
     /// periodic replication is disabled by [`configure_record_jobs`].
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        self.kad_record_queries
-            .remove(query_id)
-            .and_then(|query| query.result.map(|record| (query.request, record)))
-            .into_iter()
-            .for_each(|(request, node_record)| {
+        self.kad_record_queries.remove(query_id).into_iter().for_each(|query| {
+            let KadQuery { request, result, reply } = query;
+            reply.into_iter().for_each(|reply| {
+                let outcome = result.clone().ok_or_else(|| {
+                    std::io::Error::other("node-record query ended without a valid signed record")
+                        .into()
+                });
+                let _ = reply.send(outcome);
+            });
+            result.into_iter().for_each(|node_record| {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm
                     .behaviour_mut()
@@ -2705,6 +2732,7 @@ where
                     .add_discovered_peer(request, node_record.info);
                 self.refresh_explicit_peer(&peer);
             });
+        });
     }
 }
 

@@ -78,6 +78,8 @@ def execute(agent, scenario, operation_id, origin, timeout):
                     raise ValueError("agent acknowledgement does not identify the requested operation")
                 if type(response["success"]) is not bool:
                     raise ValueError("agent success must be boolean")
+                if response["success"] and response.get("identity") != agent["identity"]:
+                    raise ValueError("agent acknowledgement does not identify the declared peer")
                 result["success"] = status == 0 and response["success"]
                 result["rejection_reason"] = None if result["success"] else response.get("rejection_reason") or f"agent_exit_{status}"
                 if scenario == "gossip_two_hops" and result["success"]:

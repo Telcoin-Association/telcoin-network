@@ -19,7 +19,7 @@ class WorkloadTests(unittest.TestCase):
     def test_agent_nonce_route_and_refusals(self):
         script = (
             "import json, os; print(json.dumps({'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'],"
-            "'scenario': os.environ['HUB_CAPACITY_SCENARIO'], 'success': True,"
+            "'scenario': os.environ['HUB_CAPACITY_SCENARIO'], 'success': True, 'identity': 'synthetic',"
             "'route': ['sender', 'relay', 'receiver'], 'trace': 'synthetic trace'}))"
         )
         agent = {"identity": "synthetic", "argv": [sys.executable, "-B", "-I", "-c", script]}
@@ -31,6 +31,10 @@ class WorkloadTests(unittest.TestCase):
         self.assertFalse(WORKLOAD.execute(agent, "gossip_two_hops", "nonce", time.monotonic(), 2)["success"])
         agent["argv"][-1] = script.replace("os.environ['HUB_CAPACITY_OPERATION_ID']", "'wrong'")
         self.assertIn("acknowledgement", WORKLOAD.execute(agent, "record_lookup", "nonce", time.monotonic(), 2)["rejection_reason"])
+        agent["argv"][-1] = script.replace("'identity': 'synthetic'", "'identity': 'different-peer'")
+        wrong_peer = WORKLOAD.execute(agent, "record_lookup", "nonce", time.monotonic(), 2)
+        self.assertFalse(wrong_peer["success"])
+        self.assertIn("declared peer", wrong_peer["rejection_reason"])
         agent["argv"][-1] = "import time; time.sleep(2)"
         self.assertEqual(WORKLOAD.execute(agent, "record_lookup", "nonce", time.monotonic(), 0.01)["rejection_reason"], "timeout")
 
