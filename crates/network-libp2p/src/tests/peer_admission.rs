@@ -1,6 +1,8 @@
 //! Regression coverage for population admission and independent ban owners (issue #1475).
 
 use super::*;
+use crate::types::NetworkType;
+use futures::TryStreamExt as _;
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint},
     swarm::{
@@ -8,6 +10,249 @@ use libp2p::{
         FromSwarm, ListenError, ListenFailure,
     },
 };
+use std::collections::BTreeMap;
+use tn_config::{DaoObserverProfile, TrustedNode};
+use tn_types::P2pNode;
+
+/// Build a deployment inventory with primary and sparse worker identities.
+fn dao_entry(keys: &KeyConfig) -> TrustedNode {
+    let primary = P2pNode {
+        network_key: keys.primary_network_public_key(),
+        network_address: create_multiaddr(None),
+        rpc: None,
+    };
+    let workers = [0, 7]
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                P2pNode {
+                    network_key: keys.worker_network_public_key(id),
+                    network_address: create_multiaddr(None),
+                    rpc: None,
+                },
+            )
+        })
+        .collect();
+    TrustedNode::new(primary, workers)
+}
+
+/// A hub with two DAO reservations and one independent trusted connection.
+fn dao_config(observers: &[KeyConfig], trusted: &KeyConfig) -> NetworkConfig {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().target_num_peers = 1;
+    config.peer_config_mut().peer_excess_factor = 0.0;
+    config.peer_config_mut().priority_peer_excess = 0.0;
+    config.set_trusted_nodes(BTreeMap::from([(trusted.primary_public_key(), dao_entry(trusted))]));
+    config.set_dao_observers(Some(DaoObserverProfile::new(
+        observers.iter().map(|keys| (keys.primary_public_key(), dao_entry(keys))).collect(),
+        4,
+    )));
+    config
+}
+
+/// Ordinary and unrelated trusted connections cannot consume either observer's finite allowance.
+#[tokio::test]
+async fn dao_observers_connect_at_capacity_and_remain_bounded() -> NetworkResult<()> {
+    let keys: Vec<_> = (0..3)
+        .map(|_| KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng())))
+        .collect();
+    let trusted = keys.first().ok_or(NetworkError::PeerMissing)?;
+    let observers = keys.get(1..).ok_or(NetworkError::PeerMissing)?;
+    let config = dao_config(observers, trusted);
+    config
+        .validate_operator_inventory(&BTreeMap::new(), [0, 7])
+        .map_err(|error| NetworkError::ProtocolError(error.to_string()))?;
+    [Endpoint::Listener, Endpoint::Dialer].into_iter().try_for_each(|direction| {
+        let mut manager = create_test_peer_manager(Some(config.clone()));
+        manager.configure_operator_peers(&config, NetworkType::Primary)?;
+        let ordinary = PeerId::random();
+        admit(&mut manager, ConnectionId::new_unchecked(1), ordinary, direction)
+            .map_err(|error| NetworkError::ProtocolError(error.to_string()))?;
+        establish(&mut manager, ConnectionId::new_unchecked(1), ordinary);
+        assert!(admit(&mut manager, ConnectionId::new_unchecked(2), PeerId::random(), direction)
+            .is_err());
+        let trusted_peer: PeerId = trusted.primary_network_public_key().into();
+        // Fill all remaining non-observer capacity with authenticated privileged identities.
+        // Use distinct identities so the composed per-peer limit remains respected.
+        let extra =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let extra_peer: PeerId = extra.primary_network_public_key().into();
+        manager
+            .peers
+            .add_trusted_peer(extra.primary_public_key(), extra.primary_network_public_key());
+        (2..=16).try_for_each(|id| {
+            let peer = if id <= 9 { trusted_peer } else { ordinary };
+            admit(&mut manager, ConnectionId::new_unchecked(id), peer, direction)
+                .map_err(|error| NetworkError::ProtocolError(error.to_string()))
+        })?;
+        assert!(
+            admit(&mut manager, ConnectionId::new_unchecked(17), extra_peer, direction).is_err()
+        );
+        observers.iter().enumerate().try_for_each(|(index, observer)| {
+            let peer: PeerId = observer.primary_network_public_key().into();
+            let start = 100 + index * 10;
+            (start..start + 8).try_for_each(|id| {
+                admit(&mut manager, ConnectionId::new_unchecked(id), peer, direction)
+                    .map_err(|error| NetworkError::ProtocolError(error.to_string()))
+            })?;
+            assert!(admit(&mut manager, ConnectionId::new_unchecked(start + 8), peer, direction)
+                .is_err());
+            close(&mut manager, ConnectionId::new_unchecked(start), peer, 0);
+            admit(&mut manager, ConnectionId::new_unchecked(start + 9), peer, direction)
+                .map_err(|error| NetworkError::ProtocolError(error.to_string()))?;
+            manager.process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
+            assert!(!manager.peer_banned(&peer));
+            manager.process_penalty(peer, Penalty::Fatal);
+            assert!(manager.peer_banned(&peer));
+            assert!(admit(&mut manager, ConnectionId::new_unchecked(start + 10), peer, direction)
+                .is_err());
+            Ok::<_, NetworkError>(())
+        })?;
+        Ok::<_, NetworkError>(())
+    })
+}
+
+/// A long outage and committee rotation cannot stop retries or cross worker identities.
+#[tokio::test(start_paused = true)]
+async fn dao_observer_retries_survive_outage_rotation_and_worker_selection() -> NetworkResult<()> {
+    let observer =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let trusted = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = dao_config(std::slice::from_ref(&observer), &trusted);
+    let config_ref = &config;
+    let observer_ref = &observer;
+    futures::stream::iter(
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(7)]
+            .into_iter()
+            .map(Ok::<_, NetworkError>),
+    )
+    .try_for_each(|network| async move {
+        let config = config_ref;
+        let observer = observer_ref;
+        let mut manager = create_test_peer_manager(Some(config.clone()));
+        manager.configure_operator_peers(config, network)?;
+        let expected: PeerId = match network {
+            NetworkType::Primary => observer.primary_network_public_key(),
+            NetworkType::Worker(id) => observer.worker_network_public_key(id),
+        }
+        .into();
+        let dials: Vec<_> = std::iter::from_fn(|| manager.next_dial_request()).collect();
+        assert!(dials.iter().any(|dial| dial.peer_id == expected));
+        let configured_addrs = dials
+            .iter()
+            .find(|dial| dial.peer_id == expected)
+            .map(|dial| dial.multiaddrs.clone())
+            .ok_or(NetworkError::PeerMissing)?;
+        let mut learned = manager
+            .known_peers
+            .get(&observer.primary_public_key())
+            .cloned()
+            .ok_or(NetworkError::PeerMissing)?;
+        learned.multiaddrs.clear();
+        manager.cache_known_peer(observer.primary_public_key(), learned);
+        manager.retry_operator_peers();
+        assert!(manager.next_dial_request().is_none());
+        manager.register_disconnected(&expected);
+        manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+        let ordinary = PeerId::random();
+        establish(&mut manager, ConnectionId::new_unchecked(1000), ordinary);
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        manager.heartbeat();
+        let dials: Vec<_> = std::iter::from_fn(|| manager.next_dial_request()).collect();
+        assert_eq!(dials.iter().filter(|dial| dial.peer_id == expected).count(), 1);
+        assert_eq!(
+            dials.iter().find(|dial| dial.peer_id == expected).map(|dial| &dial.multiaddrs),
+            Some(&configured_addrs)
+        );
+        manager.heartbeat();
+        assert!(manager.next_dial_request().is_none());
+        assert_eq!(manager.operator_retries.len(), 2);
+        Ok(())
+    })
+    .await
+}
+
+/// Inventory replacement revokes only DAO-derived retention and reservation ownership.
+#[tokio::test]
+async fn dao_profile_replacement_preserves_unrelated_trust() -> NetworkResult<()> {
+    let old = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let replacement =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let trusted = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let mut config = dao_config(std::slice::from_ref(&old), &trusted);
+    config.set_dao_observers(Some(DaoObserverProfile::new(
+        BTreeMap::from([(replacement.primary_public_key(), dao_entry(&replacement))]),
+        4,
+    )));
+    let mut restarted = create_test_peer_manager(Some(config.clone()));
+    restarted.configure_operator_peers(&config, NetworkType::Primary)?;
+    assert!(!restarted.dao_peer_ids.contains(&old.primary_network_public_key().into()));
+    assert!(restarted.dao_peer_ids.contains(&replacement.primary_network_public_key().into()));
+    assert!(restarted.peer_is_important(&trusted.primary_network_public_key().into()));
+    restarted.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(restarted.peer_is_important(&replacement.primary_network_public_key().into()));
+    config.set_dao_observers(None);
+    let mut revoked = create_test_peer_manager(Some(config.clone()));
+    revoked.configure_operator_peers(&config, NetworkType::Primary)?;
+    assert!(revoked.dao_peer_ids.is_empty());
+    assert!(!revoked.peer_is_important(&replacement.primary_network_public_key().into()));
+    assert!(revoked.peer_is_important(&trusted.primary_network_public_key().into()));
+    // Independent operator membership survives removal from the DAO inventory.
+    config.set_trusted_nodes(BTreeMap::from([
+        (trusted.primary_public_key(), dao_entry(&trusted)),
+        (replacement.primary_public_key(), dao_entry(&replacement)),
+    ]));
+    let mut overlapping = create_test_peer_manager(Some(config.clone()));
+    overlapping.configure_operator_peers(&config, NetworkType::Primary)?;
+    assert!(overlapping.dao_peer_ids.is_empty());
+    assert!(overlapping.peer_is_important(&replacement.primary_network_public_key().into()));
+    Ok(())
+}
+
+/// Learned records cannot rotate a configured identity or erase its protocol ban.
+#[tokio::test]
+async fn dao_observer_identity_pin_and_protocol_history_survive_records() -> NetworkResult<()> {
+    let observer =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let trusted = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = dao_config(std::slice::from_ref(&observer), &trusted);
+    let mut manager = create_test_peer_manager(Some(config.clone()));
+    manager.configure_operator_peers(&config, NetworkType::Primary)?;
+    let key = observer.primary_public_key();
+    manager.cache_known_peer(
+        key,
+        NetworkInfo {
+            pubkey: trusted.primary_network_public_key(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        },
+    );
+    assert_eq!(
+        manager.known_peers.get(&key).map(|info| info.pubkey.clone()),
+        Some(observer.primary_network_public_key())
+    );
+    let peer: PeerId = observer.primary_network_public_key().into();
+    let unrelated =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    manager.cache_known_peer(
+        unrelated.primary_public_key(),
+        NetworkInfo {
+            pubkey: observer.primary_network_public_key(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        },
+    );
+    assert_eq!(manager.peer_to_bls(&peer), Some(key));
+    manager.process_penalty(peer, Penalty::Fatal);
+    manager.configure_operator_peers(&config, NetworkType::Primary)?;
+    assert!(manager.peer_banned(&peer));
+    manager.retry_operator_peers();
+    assert!(manager.peer_banned(&peer));
+    Ok(())
+}
 
 /// A small ordinary population with additional outbound discovery headroom.
 fn manager_with_capacity() -> PeerManager {

@@ -1,6 +1,8 @@
 //! Configuration for network variables.
 
-use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
+use crate::{
+    ConfigFmt, ConfigTrait, DaoObserverProfile, ObserverConfigError, TelcoinDirs, TrustedNode,
+};
 use libp2p::kad::K_VALUE;
 use serde::{
     de::{self, Visitor},
@@ -35,12 +37,58 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Operator-provisioned peers maintained for the lifetime of each swarm.
+    trusted_nodes: BTreeMap<BlsPublicKey, TrustedNode>,
+    /// Optional finite hub reservation profile for DAO public RPC observers.
+    dao_observers: Option<DaoObserverProfile>,
 }
 
 impl NetworkConfig {
+    /// Explicit operator inventory independent of committee and DAO membership.
+    pub fn trusted_nodes(&self) -> &BTreeMap<BlsPublicKey, TrustedNode> {
+        &self.trusted_nodes
+    }
+    /// Install the operator inventory before startup validation.
+    pub fn set_trusted_nodes(&mut self, nodes: BTreeMap<BlsPublicKey, TrustedNode>) {
+        self.trusted_nodes = nodes;
+    }
+    /// The optional hub deployment profile.
+    pub fn dao_observers(&self) -> Option<&DaoObserverProfile> {
+        self.dao_observers.as_ref()
+    }
+    /// Replace or revoke the DAO profile without changing unrelated operator trust.
+    pub fn set_dao_observers(&mut self, profile: Option<DaoObserverProfile>) {
+        self.dao_observers = profile;
+    }
+    /// Validate all identities, applicable workers, and finite reserved capacity.
+    pub fn validate_operator_inventory(
+        &self,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        workers: impl IntoIterator<Item = WorkerId>,
+    ) -> Result<(), ObserverConfigError> {
+        crate::observers::validate_inventory(
+            &self.trusted_nodes,
+            self.dao_observers.as_ref(),
+            bootstrap,
+            workers,
+            self.peer_config.max_priority_peers(),
+        )
+    }
+
     /// Return the configured bootstrap dial hints.
     pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.bootstrap_peers
+    }
+
+    /// Select and install the effective bootstrap hints for all startup validation and swarms.
+    pub fn configure_bootstrap_peers(
+        &mut self,
+        genesis: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
+    ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        let effective = self.resolve_bootstrap_peers(genesis, cli_override);
+        self.bootstrap_peers = effective.clone();
+        effective
     }
 
     /// Select bootstrap dial hints: CLI override, then network config, then genesis.

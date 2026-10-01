@@ -42,6 +42,8 @@ mod peer_manager;
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "operator.rs"]
+mod operator;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -141,6 +143,12 @@ struct AddProviderWindow {
 
 /// The type to manage peers.
 pub(crate) struct PeerManager {
+    /// Process-lifetime retry state for the finite operator inventory.
+    operator_retries: HashMap<BlsPublicKey, operator::OperatorRetry>,
+    /// Authenticated DAO identities with separate reserved connection allowances.
+    dao_peer_ids: HashSet<PeerId>,
+    /// Absolute connections allowed by the optional hub deployment profile.
+    dao_connection_budget: Option<u32>,
     /// This swarm's own peer id.
     ///
     /// Used to recognise and ignore the node's own identity on the dial,
@@ -286,6 +294,9 @@ impl PeerManager {
         init_peer_score_config(config.score_config);
 
         Self {
+            operator_retries: Default::default(),
+            dao_peer_ids: Default::default(),
+            dao_connection_budget: None,
             local_peer_id,
             config: *config,
             heartbeat,
@@ -331,7 +342,10 @@ impl PeerManager {
         self.stub_records.insert(bls_key);
         self.known_peers.insert(bls_key, info);
 
-        forgiven.into_iter().for_each(|peer| self.push_event(PeerEvent::Unbanned(peer)));
+        forgiven
+            .filter(|_| !self.peers.peer_banned(&peer_id))
+            .into_iter()
+            .for_each(|peer| self.push_event(PeerEvent::Unbanned(peer)));
         self.dial_peer(peer_id, multiaddr, Some(reply));
     }
 
@@ -525,6 +539,7 @@ impl PeerManager {
         self.prune_rate_windows();
 
         // manage discovery peers
+        self.retry_operator_peers();
         self.discovery_heartbeat();
     }
 
@@ -818,8 +833,11 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
-        let mut excess_peer_count =
-            connected_peers.len().saturating_sub(self.config.target_num_peers);
+        let mut excess_peer_count = connected_peers
+            .iter()
+            .filter(|(peer, _)| !self.dao_peer_ids.contains(peer))
+            .count()
+            .saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
             // no excess peers
             return;
@@ -1266,33 +1284,38 @@ impl PeerManager {
     /// (kad discovery, a self-advertised push, or a restore from persistence), so any stub mark
     /// for the key is cleared; the operator-provisioned callers re-mark their entry afterwards.
     fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
-        // signature verification proves authenticity but not scheme correctness; drop a
-        // malformed advertised endpoint so only well-formed RPC info is ever cached in
-        // `known_peers`. the rest of the (signed, authentic) record is still usable.
-        if let Some(rpc) = &info.rpc {
-            if let Err(err) = rpc.validate() {
-                warn!(
-                    target: "peer-manager",
-                    ?err,
-                    ?bls_key,
-                    "dropping malformed advertised RPC endpoint from peer record"
-                );
-                info.rpc = None;
+        // Configured transport bindings change only through a reviewed inventory rollout.
+        if self.configured_binding_conflicts(&bls_key, &info) {
+            warn!(target: "peer-manager", ?bls_key, "rejecting record that changes configured transport identity");
+        } else {
+            // signature verification proves authenticity but not scheme correctness; drop a
+            // malformed advertised endpoint so only well-formed RPC info is ever cached in
+            // `known_peers`. the rest of the (signed, authentic) record is still usable.
+            if let Some(rpc) = &info.rpc {
+                if let Err(err) = rpc.validate() {
+                    warn!(
+                        target: "peer-manager",
+                        ?err,
+                        ?bls_key,
+                        "dropping malformed advertised RPC endpoint from peer record"
+                    );
+                    info.rpc = None;
+                }
             }
+            trace!(target: "peer-manager", ?bls_key, "adding known peer");
+            self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+            self.known_peers.insert(bls_key, info);
+            self.stub_records.remove(&bls_key);
+            // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
+            // (closing the trust window) instead of waiting for the next epoch's
+            // `update_committees`. `upsert_peer` just re-keyed it onto its `Confirmed`
+            // identity, so the trust pass can resolve its peer id immediately.
+            let unban_actions = self.peers.apply_membership_if_committee(bls_key);
+            if self.peers.is_committee_member(&bls_key) {
+                self.forgive_temporarily_banned(&HashSet::from([bls_key]));
+            }
+            self.apply_unban_actions(unban_actions);
         }
-        trace!(target: "peer-manager", ?bls_key, "adding known peer");
-        self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
-        self.known_peers.insert(bls_key, info);
-        self.stub_records.remove(&bls_key);
-        // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
-        // (closing the trust window) instead of waiting for the next epoch's `update_committees`.
-        // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can
-        // resolve its peer id immediately.
-        let unban_actions = self.peers.apply_membership_if_committee(bls_key);
-        if self.peers.is_committee_member(&bls_key) {
-            self.forgive_temporarily_banned(&HashSet::from([bls_key]));
-        }
-        self.apply_unban_actions(unban_actions);
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
@@ -1452,7 +1475,11 @@ impl PeerManager {
         });
 
         // calculate dial attempts needed for target connection limits
-        let connected_or_dialing = self.connected_or_dialing_peers().len();
+        let connected_or_dialing = self
+            .connected_or_dialing_peers()
+            .into_iter()
+            .filter(|peer| !self.dao_peer_ids.contains(peer))
+            .count();
         let peers_needed = self.config.target_num_peers.saturating_sub(connected_or_dialing);
 
         // used for random selections

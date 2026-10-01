@@ -12,12 +12,183 @@ use assert_matches::assert_matches;
 use eyre::eyre;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
-use tn_config::{ConsensusConfig, NetworkConfig};
+use tn_config::{ConsensusConfig, DaoObserverProfile, NetworkConfig, TrustedNode};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{wait_until, CommitteeFixture};
 use tn_types::{BlsKeypair, Certificate, Header, TaskManager, DEFAULT_WORKER_ID};
 use tokio::{sync::mpsc, time::timeout};
+
+/// A real QUIC swarm and its event receiver for DAO profile regressions.
+type DaoSocketNode = (
+    ConsensusNetwork<
+        TestPrimaryRequest,
+        TestPrimaryResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestPrimaryRequest, TestPrimaryResponse>>,
+    >,
+    mpsc::Receiver<NetworkEvent<TestPrimaryRequest, TestPrimaryResponse>>,
+);
+
+/// Construct a swarm using a specific primary or worker transport identity.
+fn dao_socket_network(
+    config: &ConsensusConfig<MemDatabase>,
+    network_config: &NetworkConfig,
+    role: NetworkType,
+    tasks: &TaskManager,
+) -> NetworkResult<DaoSocketNode> {
+    let (events, receiver) = mpsc::channel(10);
+    let keypair = match role {
+        NetworkType::Primary => config.key_config().primary_network_keypair().clone(),
+        NetworkType::Worker(id) => config.key_config().worker_network_keypair(id),
+    };
+    ConsensusNetwork::new(
+        network_config,
+        events,
+        config.key_config().clone(),
+        keypair,
+        MemDatabase::default(),
+        tasks.get_spawner(),
+        role,
+        config.primary_address(),
+        None,
+    )
+    .map(|network| (network, receiver))
+}
+
+/// Startup retries establish and reestablish actual QUIC connections at ordinary capacity.
+#[tokio::test]
+async fn dao_observer_socket_reconnects_on_every_swarm() -> eyre::Result<()> {
+    use futures::TryStreamExt as _;
+    futures::stream::iter(
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(7)]
+            .into_iter()
+            .map(Ok::<_, eyre::Report>),
+    )
+    .try_for_each(|role| async move {
+        // Each role owns its transport tasks and fresh listener addresses.
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let configs: Vec<_> =
+            fixture.authorities().take(3).map(|node| node.consensus_config()).collect();
+        let hub = configs.first().ok_or_else(|| eyre!("missing hub fixture"))?;
+        let ordinary = configs.get(1).ok_or_else(|| eyre!("missing ordinary fixture"))?;
+        let observer = configs.get(2).ok_or_else(|| eyre!("missing observer fixture"))?;
+        let tasks = TaskManager::default();
+        let tasks_ref = &tasks;
+        let keys = observer.key_config();
+        let node = TrustedNode::new(
+            tn_types::P2pNode {
+                network_key: keys.primary_network_public_key(),
+                network_address: observer.primary_address(),
+                rpc: None,
+            },
+            [0, 7]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        tn_types::P2pNode {
+                            network_key: keys.worker_network_public_key(id),
+                            network_address: observer.primary_address(),
+                            rpc: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut hub_config = NetworkConfig::default();
+        hub_config.peer_config_mut().target_num_peers = 1;
+        hub_config.peer_config_mut().peer_excess_factor = 0.0;
+        hub_config.peer_config_mut().priority_peer_excess = 0.0;
+        hub_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+        hub_config.set_dao_observers(Some(DaoObserverProfile::new(
+            std::collections::BTreeMap::from([(keys.primary_public_key(), node)]),
+            2,
+        )));
+        let (hub_network, _hub_events) = dao_socket_network(hub, &hub_config, role, tasks_ref)?;
+        let hub_handle = hub_network.network_handle();
+        let hub_task = tokio::spawn(hub_network.run());
+        hub_handle.start_listening(hub.primary_address()).await?;
+        let (ordinary_network, _ordinary_events) =
+            dao_socket_network(ordinary, &NetworkConfig::default(), role, tasks_ref)?;
+        let ordinary_handle = ordinary_network.network_handle();
+        let ordinary_task = tokio::spawn(ordinary_network.run());
+        ordinary_handle.start_listening(ordinary.primary_address()).await?;
+        let hub_key = match role {
+            NetworkType::Primary => hub.key_config().primary_network_public_key(),
+            NetworkType::Worker(id) => hub.key_config().worker_network_public_key(id),
+        };
+        ordinary_handle
+            .add_explicit_peer(
+                hub.key_config().primary_public_key(),
+                hub_key,
+                hub.primary_address(),
+            )
+            .await?;
+        ordinary_handle.dial_by_bls(hub.key_config().primary_public_key()).await?;
+        wait_for_peer_discovery(
+            &hub_handle,
+            ordinary.key_config().primary_public_key(),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let observer_peer: PeerId = match role {
+            NetworkType::Primary => keys.primary_network_public_key(),
+            NetworkType::Worker(id) => keys.worker_network_public_key(id),
+        }
+        .into();
+        let start_observer = || -> NetworkResult<_> {
+            dao_socket_network(observer, &NetworkConfig::default(), role, tasks_ref).map(
+                |(network, events)| (network.network_handle(), tokio::spawn(network.run()), events),
+            )
+        };
+        let (observer_handle, observer_task, _observer_events) = start_observer()?;
+        observer_handle.start_listening(observer.primary_address()).await?;
+        wait_until(
+            Duration::from_secs(90),
+            "reserved observer attaches at full ordinary capacity",
+            || async {
+                hub_handle.connected_peers().await.map_err(eyre::Report::from).map(|peers| {
+                    peers.contains(&keys.primary_public_key())
+                        && peers.contains(&ordinary.key_config().primary_public_key())
+                })
+            },
+        )
+        .await?;
+        observer_task.abort();
+        let _ = observer_task.await;
+        wait_until(Duration::from_secs(15), "observer outage releases its connection", || async {
+            hub_handle
+                .connected_peer_ids()
+                .await
+                .map_err(eyre::Report::from)
+                .map(|peers| !peers.contains(&observer_peer))
+        })
+        .await?;
+        hub_handle
+            .update_committees(Default::default(), Default::default(), Default::default())
+            .await?;
+        let (observer_handle, observer_task, _restarted_events) = start_observer()?;
+        observer_handle.start_listening(observer.primary_address()).await?;
+        wait_until(
+            Duration::from_secs(90),
+            "reserved observer reconnects after rotation",
+            || async {
+                hub_handle.connected_peers().await.map_err(eyre::Report::from).map(|peers| {
+                    peers.contains(&keys.primary_public_key())
+                        && peers.contains(&ordinary.key_config().primary_public_key())
+                })
+            },
+        )
+        .await?;
+        futures::future::join_all(
+            [observer_task, ordinary_task, hub_task].into_iter().inspect(|task| task.abort()),
+        )
+        .await;
+        Ok(())
+    })
+    .await
+}
 
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";

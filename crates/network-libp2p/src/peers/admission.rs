@@ -30,7 +30,7 @@ pub(super) enum ConnectionAdmission {
 
 impl ConnectionAdmission {
     /// The identity whose population slot this connection shares.
-    fn peer_id(&self) -> PeerId {
+    pub(super) fn peer_id(&self) -> PeerId {
         match self {
             Self::Reserved(peer_id) => *peer_id,
             Self::Established(peer_id) => *peer_id,
@@ -55,13 +55,16 @@ impl PeerManager {
             .peers
             .connected_peer_ids()
             .chain(self.connection_admissions.values().map(ConnectionAdmission::peer_id))
+            .filter(|peer| !self.dao_peer_ids.contains(peer))
             .collect();
         let limit = if direction == Endpoint::Dialer {
             self.config.max_outbound_dialing_peers()
         } else {
             self.config.max_peers()
         };
-        if !population.contains(&peer_id)
+        if !self.dao_capacity_available(&peer_id) {
+            Err(ConnectionDenied::new("hub connection budget reserved for DAO observers"))
+        } else if !population.contains(&peer_id)
             && !self.peer_is_important(&peer_id)
             && population.len() >= limit
         {
