@@ -33,6 +33,9 @@ pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_re
 const STREAM_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// Upper bound on the consensus stream retry delay.
 const STREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+/// How long the follower waits for execution to reach an output's base block before it warns,
+/// and how often it warns again while the wait goes on.
+const EXECUTION_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
@@ -517,7 +520,25 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // through a long empty stretch the leaders keep referencing a block that is already
         // executed and this returns at once. There the bounded `sync_output` queue below is the
         // only thing that keeps this loop from outrunning the subscriber.
-        if consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
+        // the wait is pinned once and polled across ticks so its watch subscription is never
+        // rebuilt, and a stalled engine shows up in the log instead of parking this task silently.
+        let wait_started = std::time::Instant::now();
+        let wait = consensus_bus.wait_for_execution(base_execution_block);
+        tokio::pin!(wait);
+        let wait_result = loop {
+            match tokio::time::timeout(EXECUTION_WAIT_WARN_INTERVAL, wait.as_mut()).await {
+                Ok(result) => break result,
+                Err(_) => warn!(
+                    target: "tn::observer",
+                    block_number = number,
+                    target_block = base_execution_block.number,
+                    executed_block = consensus_bus.latest_execution_block_num_hash().number,
+                    waited_secs = wait_started.elapsed().as_secs(),
+                    "still waiting for execution to reach the output's base block"
+                ),
+            }
+        };
+        if wait_result.is_err() {
             // We seem to have forked, so die.
             error!(
                 target: "tn::observer",
