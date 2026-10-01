@@ -612,24 +612,20 @@ impl MmapDataFile {
     }
 
     /// Apply the configured [`MmapAccess`] `madvise` hint to the current mapping. Best-effort: a
-    /// failed hint is logged and ignored, and it is a no-op for `Normal`, an empty mapping, or a
-    /// non-unix target.
+    /// failed hint is logged and ignored, and it is a no-op for `Normal` or an empty mapping.
     fn advise_backing(&self) {
-        #[cfg(unix)]
-        {
-            let advice = match self.opts.access {
-                MmapAccess::Normal => return,
-                MmapAccess::Sequential => memmap2::Advice::Sequential,
-                MmapAccess::Random => memmap2::Advice::Random,
-            };
-            let res = match &self.backing {
-                Backing::Rw(map) => map.advise(advice),
-                Backing::Ro(map) => map.advise(advice),
-                Backing::Empty => return,
-            };
-            if let Err(e) = res {
-                tracing::trace!("MmapDataFile: madvise failed (non-fatal): {e}");
-            }
+        let advice = match self.opts.access {
+            MmapAccess::Normal => return,
+            MmapAccess::Sequential => memmap2::Advice::Sequential,
+            MmapAccess::Random => memmap2::Advice::Random,
+        };
+        let res = match &self.backing {
+            Backing::Rw(map) => map.advise(advice),
+            Backing::Ro(map) => map.advise(advice),
+            Backing::Empty => return,
+        };
+        if let Err(e) = res {
+            tracing::trace!("MmapDataFile: madvise failed (non-fatal): {e}");
         }
     }
 
@@ -676,6 +672,8 @@ impl MmapDataFile {
         }
         // fallocate(2) mode 0: allocate blocks for [from, from+len) and extend the size to cover
         // it.
+        // SAFETY: a plain syscall on a file descriptor this handle owns and keeps open for the
+        // call; it touches no Rust memory, and the offsets are range-checked by the kernel.
         let rc = unsafe {
             libc::fallocate(self.file.as_raw_fd(), 0, from as libc::off_t, len as libc::off_t)
         };
@@ -711,9 +709,13 @@ impl MmapDataFile {
             fst_bytesalloc: 0,
         };
         let fd = self.file.as_raw_fd();
+        // SAFETY: `fd` belongs to a file this handle owns and keeps open for the call, and `store`
+        // is a live, properly initialized `fstore_t` that `F_PREALLOCATE` reads and updates
+        // (`fst_bytesalloc`) for the duration of the call only.
         let mut rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
         if rc == -1 {
             store.fst_flags = libc::F_ALLOCATEALL;
+            // SAFETY: as above.
             rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
         }
         if rc == -1 {

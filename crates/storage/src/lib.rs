@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
+// The pack files are mmap-backed and read with positional I/O (`std::os::unix::fs::FileExt`), and
+// the heal/import paths identify files by inode: this crate builds for unix targets only.
+#[cfg(not(unix))]
+compile_error!("tn-storage requires a unix target (mmap-backed pack files, positional file I/O)");
+
 mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;

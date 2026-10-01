@@ -190,7 +190,7 @@ impl DbValidateArgs {
             if !corruption.kind.is_truncatable() || prefix_invalid {
                 bail!("pack {} is corrupt (see report above)", data_file.display());
             }
-            return Ok(());
+            return require_current_epoch_for_tail(&data_file, epoch);
         }
 
         // Every record frames, but an unclean pack can still end in an incomplete output whose
@@ -218,7 +218,7 @@ impl DbValidateArgs {
             if report.verdict == Verdict::Invalid {
                 bail!("pack {} is INVALID (see report above)", data_file.display());
             }
-            return Ok(());
+            return require_current_epoch_for_tail(&data_file, epoch);
         }
 
         let report = validate_pack_file(&data_file, epoch, None)
@@ -233,6 +233,34 @@ impl DbValidateArgs {
         }
         Ok(())
     }
+}
+
+/// A truncatable tail heals only where the node opens the epoch for append: in the current epoch.
+/// The node only reads a past epoch (a later epoch exists beside it) and never truncates it, so
+/// there the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since
+/// the node migrates it to v2 when it reads the epoch, which drops the tail.
+fn require_current_epoch_for_tail(data_file: &Path, epoch: Epoch) -> eyre::Result<()> {
+    let legacy = pack_unsealed_version(data_file, epoch)
+        .is_some_and(|(version, _)| version < SENTINEL_MIN_VERSION);
+    if !legacy && later_epoch_exists(data_file, epoch) {
+        println!(
+            "ACTION NEEDED: epoch {epoch} is a past epoch (a later epoch exists beside it), which the \
+             node only reads and never truncates: stop the node and run `telcoin-network db repair \
+             --epoch {epoch} --force`."
+        );
+        bail!("pack {} needs `db repair` (see report above)", data_file.display());
+    }
+    Ok(())
+}
+
+/// Whether the epochs directory holding `data_file`'s `epoch-N` directory also holds a later
+/// epoch. `false` when the layout cannot be read (e.g. a bare data file outside an epochs dir).
+fn later_epoch_exists(data_file: &Path, epoch: Epoch) -> bool {
+    data_file
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
+        .is_some_and(|epochs| epochs.last().is_some_and(|&last| last > epoch))
 }
 
 /// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
@@ -1486,6 +1514,24 @@ mod tests {
             "repair must clear its PID on exit"
         );
         drop(PidLock::acquire(&datadir).expect("repair must release its lock on exit"));
+    }
+
+    /// A torn tail is only self-healing in the current epoch; whether a pack is a past epoch is
+    /// read from the epochs directory beside it.
+    #[test]
+    fn later_epoch_exists_reads_the_epochs_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for epoch in [3, 4] {
+            fs::create_dir_all(dir.path().join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let data = |epoch: u32| dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        assert!(super::later_epoch_exists(&data(3), 3), "epoch 4 follows epoch 3");
+        assert!(!super::later_epoch_exists(&data(4), 4), "epoch 4 is the latest");
+        let bare = tempfile::tempdir().unwrap();
+        assert!(
+            !super::later_epoch_exists(&bare.path().join(super::DATA_NAME), 0),
+            "a bare data file has no epochs beside it"
+        );
     }
 
     /// `db load-state` writes chain data into the datadir, so like repair and migrate it must

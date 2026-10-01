@@ -15,8 +15,8 @@
 //! ## Columns
 //! - `pack` — the memory-mapped (`msync`) pack KV: append-only data log keyed by the mmap
 //!   `HdxIndex`.
-//! - `mdbx-durable` — MDBX with real fsync-on-commit (via `TN_TEST_MDBX_SYNC=durable`, set by the
-//!   bench). This is the apples-to-apples durability comparison.
+//! - `mdbx-durable` — MDBX with real fsync-on-commit (`SyncMode::Durable`, chosen by the bench at
+//!   open). This is the apples-to-apples durability comparison.
 //! - `mdbx-nosync` — MDBX in `SafeNoSync` (the `#[cfg(test)]` default): commits without fsync, for
 //!   context (its delta vs `mdbx-durable` is MDBX's own fsync cost).
 //!
@@ -183,13 +183,15 @@ struct MdbxKv {
 #[cfg(feature = "reth-libmdbx")]
 impl MdbxKv {
     fn open(dir: &Path, durable: bool) -> Self {
-        // Select the env sync mode (test builds default to SafeNoSync), read by
-        // `MdbxDatabase::open`. Set it only around the open and clear it immediately after
-        // (the value is consumed at open time), so the override never leaks into the rest
-        // of the process rather than relying on `--test-threads 1` for isolation.
-        std::env::set_var("TN_TEST_MDBX_SYNC", if durable { "durable" } else { "safe-no-sync" });
-        let db = MdbxDatabase::open(dir, 4, 512 * MEGABYTE, 8 * MEGABYTE).expect("open mdbx");
-        std::env::remove_var("TN_TEST_MDBX_SYNC");
+        // Pick the env sync mode at the open itself (test builds default to SafeNoSync), never
+        // through the process environment, which other test threads read concurrently.
+        let sync_mode = if durable {
+            reth_libmdbx::SyncMode::Durable
+        } else {
+            reth_libmdbx::SyncMode::SafeNoSync
+        };
+        let db = MdbxDatabase::open_with_sync_mode(dir, 4, 512 * MEGABYTE, 8 * MEGABYTE, sync_mode)
+            .expect("open mdbx");
         db.open_table::<KvTable>().expect("open table");
         Self { db }
     }

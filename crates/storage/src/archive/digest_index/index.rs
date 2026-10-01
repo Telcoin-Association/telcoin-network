@@ -273,6 +273,9 @@ pub struct HdxIndex<
     hasher_builder: S,
     read_only: bool,
     synced: bool,
+    /// Set by [`Self::set_remove_on_drop`]: the files are deleted on drop, so `Drop` skips the
+    /// `ordered_sync` it would otherwise run.
+    remove_on_drop: bool,
     bloom: Bloom,
     /// Bucket indices this handle has written (or split-cleared) since the last `ordered_sync`.
     /// Their all-zero CRC trailer is a legitimate lazy-write marker, not corruption; a `Dirty`
@@ -309,7 +312,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// across Rust compiler versions. The vendored `FxHasher`'s `write`/`finish` are pinned
     /// in-repo, so an on-disk bucket never moves merely because the toolchain was upgraded.
     /// Used for both bucket placement (`hash_to_bucket`) and the salt/pepper drift marker, so
-    /// the marker check exercises the exact primitive that places keys.
+    /// the marker check exercises the hasher that places keys. It cannot detect a change in how key
+    /// bytes are fed to that hasher (the 8-byte salt hashes identically either way); pre-v2
+    /// indexes built that way are retired by the legacy migration and the no-sentinel rebuild.
     fn stable_hash(hasher_builder: &S, bytes: &[u8]) -> u64 {
         let mut hasher = hasher_builder.build_hasher();
         hasher.write(bytes);
@@ -430,10 +435,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.load_factor == 0 || header.buckets > (u32::MAX >> 1) {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Check the salt/pepper to confirm the same (stable) hasher AND placement scheme is in
-            // use. This recomputes with `stable_hash` — the exact primitive `hash_to_bucket` uses —
-            // so a change to bucket placement (not just the hasher) is detected here and routes the
-            // index to a rebuild instead of silently relocating every key.
+            // Check the salt/pepper to confirm the same (stable) hasher is in use. This recomputes
+            // with `stable_hash`, the primitive `hash_to_bucket` uses, so a different hasher routes
+            // the index to a rebuild instead of silently relocating every key. (It does not detect
+            // a change in how key bytes are fed to the hasher; see `stable_hash`.)
             if header.pepper() != Self::stable_hash(&hasher_builder, &header.salt().to_le_bytes()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
@@ -471,6 +476,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Don't want buckets and modulus to be the same, so +1.
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets as u64 * header.bucket_elements() as u64;
+        // Splitting keeps `values` below the split threshold, which is at most `capacity`, so no
+        // writer leaves a larger count. A CRC-valid but absurd one would make the first save split
+        // until the disk fills: treat it as a broken index (the writable doors rebuild it).
+        if header.values > capacity {
+            return Err(LoadHeaderError::InvalidIndexGeometry);
+        }
         let expand_at_capacity = Self::expand_threshold(capacity, header.load_factor);
         Ok(Self {
             header,
@@ -482,6 +493,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             hasher_builder,
             read_only,
             synced: true,
+            remove_on_drop: false,
             bloom,
             unsynced_buckets: HashSet::new(),
             _index_dir: dir.to_owned(),
@@ -541,6 +553,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Mark both index files to be removed (not synced) when this handle drops. Used to abandon a
     /// partial/failed build cheaply, skipping the drop-time `ordered_sync`.
     pub fn set_remove_on_drop(&mut self) {
+        self.remove_on_drop = true;
         self.hdx_file.set_remove_on_drop();
         self.odx_file.set_remove_on_drop();
     }
@@ -1214,7 +1227,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
-        if !self.read_only && !self.synced {
+        if !self.read_only && !self.synced && !self.remove_on_drop {
             // The WAL model never syncs the index on the hot path, so a clean close is the expected
             // place it is made durable — not a misuse to warn about. Use the same ordered flush as
             // `sync` (which also sequences the odx before the hdx buckets that reference it) so a
@@ -1420,6 +1433,31 @@ mod tests {
         assert!(
             matches!(idx.load(k), Err(FetchError::CorruptIndex(_))),
             "a hit in a bucket that fails its CRC must be CorruptIndex, not a wrong position"
+        );
+    }
+
+    /// A header whose CRC is valid but whose element count is beyond anything a writer leaves
+    /// (more than the buckets can hold) must not open: its first save would split buckets until
+    /// the disk filled.
+    #[test]
+    fn test_open_rejects_an_absurd_element_count() {
+        let tmp = TempDir::with_prefix("test_hdx_absurd_values").expect("temp dir");
+        {
+            let mut idx = open_index(tmp.path());
+            idx.save(key(1), 1).expect("save");
+            idx.header.values = u64::MAX / 2;
+            idx.sync().expect("sync the CRC-valid header");
+        }
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let res: Result<HdxIndex, _> = HdxIndex::open_hdx_file(
+            tmp.path().join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        );
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
+            "an absurd element count must not open, got {res:?}"
         );
     }
 

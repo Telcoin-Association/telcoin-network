@@ -53,8 +53,9 @@ rand = { workspace = true }
 roaring = { workspace = true }
 # Async barrier tests for the durable `persist` need a runtime + timers. `test-util` is for the
 # paused-clock tests of the bounded waits in `epoch_records`, which would otherwise depend on
-# another workspace member happening to enable it for the whole build.
-tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util" ] }
+# another workspace member happening to enable it for the whole build. `io-util` is for the
+# stream-import tests' composed and gated readers (`chain`, `duplex`).
+tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util", "io-util" ] }
 
 [features]
 redb = []

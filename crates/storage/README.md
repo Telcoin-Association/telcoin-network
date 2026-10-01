@@ -116,7 +116,8 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   capacity tail) catches at-rest corruption of the last committed output.
 - **INV2 — headers & meta are clean-or-error.** The `DataHeader` and the leading `EpochMeta` are
   expected present and correct; a corrupt/torn one is an **error** surfaced to the operator, **never
-  repaired**. The meta is fsync'd the instant it is written, so a torn meta is not a normal state.
+  repaired**. The meta is committed the instant it is written (`Pack::commit`: msync'd, its size
+  extension fsync'd), so a torn meta is not a normal state.
 - **INV3 — indexes are rebuildable.** Any index anomaly (corrupt/torn/missing index, stale marker,
   unclean seal) triggers a full rebuild from the WAL — including a corrupt index *header* that won't
   open (the writable doors discard and recreate the index that failed, then rebuild all of them; an
@@ -244,9 +245,10 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    lock two different inodes at the same path. This guard is TN-owned; it does not depend on the
    execution engine's own database lock. `db repair`/`db migrate`/`db load-state` also take the lock
    for their run, so a node cannot start mid-repair or mid-import. `db repair`/`db migrate`
-   stay dry-run by default (`--force` to apply, current epoch skipped in all-mode); naming
-   `--epoch N` explicitly — including the current/latest epoch — is intentionally allowed under the
-   same node-stopped contract. The lock is advisory (only TN processes take it) and network
+   stay dry-run by default (`--force` to apply). In all-mode `db repair` skips the current epoch
+   (naming `--epoch N` explicitly — including the current/latest epoch — is intentionally allowed
+   under the same node-stopped contract), while `db migrate` migrates every legacy epoch, the
+   current one included: the same rewrite the node's own open of that epoch runs. The lock is advisory (only TN processes take it) and network
    filesystems with unreliable `flock` are out of scope, so the loud banner and the stop-the-node
    contract remain. Do not flag "`--epoch` bypasses the current-epoch skip".
 10. **`db repair` / `open_append_exists` mutate pack files on open; a past-epoch read may rebuild
@@ -309,9 +311,13 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     the raw key bytes straight to the vendored `FxHasher` (`HdxIndex::stable_hash` → `Hasher::write`),
     deliberately bypassing `impl Hash for [u8]`, whose length-prefix encoding is not stable across Rust
     versions. The salt/pepper marker is derived with the same primitive, so the open-time drift check
-    exercises the exact placement hash and routes any mismatch to a WAL rebuild (INV3). Do not
-    "simplify" this back to `hash_one`/`Hash for [u8]` — that would reintroduce toolchain-dependent
-    placement and force an index rebuild on every compiler upgrade.
+    catches a change of hasher and routes it to a WAL rebuild (INV3). It cannot see a change in how
+    key bytes are fed to the same hasher: hashing the 8-byte salt is identical either way, so an
+    index built by `main` (placement via `Hash for [u8]`) passes it. What retires those indexes is
+    the version-gated migration of every pre-v2 pack and the rebuild of any index file without a
+    clean-close sentinel (which no `main`-built file has). Do not "simplify" this back to
+    `hash_one`/`Hash for [u8]` — that would reintroduce toolchain-dependent placement and force an
+    index rebuild on every compiler upgrade.
 21. **Index rebuild adds an output's digests before it confirms the output is complete.** Recovery
     pass 2 indexes a header and its batch digests, then the completeness check trims a torn final
     output; the stale entries then point at or past the trimmed `end` and are never returned, because

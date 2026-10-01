@@ -88,7 +88,9 @@ impl Drop for LatestConsensus {
                     return;
                 }
                 let join = move || {
-                    let _ = handle.join();
+                    if let Err(e) = handle.join() {
+                        error!(target: "consensus_chain", ?e, "Failed to join latest-consensus thread");
+                    }
                 };
                 // Never block a multi-threaded runtime worker on the slot fsyncs: offload the join
                 // to the blocking pool. On a current-thread runtime (nothing else
@@ -403,6 +405,11 @@ pub struct ConsensusChain {
     /// failures (a full disk, descriptor exhaustion) are not remembered: they say nothing
     /// about the epoch and clear on their own.
     heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
+    /// Serializes [`Self::import_partial_to_staging`]: each import starts by clearing the
+    /// `staging-{N}` directory, which would otherwise delete the files of an import of the same
+    /// epoch still streaming into it. There is a single staging slot, so imports never need to
+    /// run side by side.
+    staging_import: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConsensusChain {
@@ -467,6 +474,7 @@ impl ConsensusChain {
             staging,
             heal_locks: Arc::new(Mutex::new(HashMap::new())),
             heal_failures: Arc::new(Mutex::new(HashMap::new())),
+            staging_import: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -917,8 +925,8 @@ impl ConsensusChain {
     /// `epoch-{N}` dir): the staged pack lives in `staging-{epoch}` and is only ever read, so a
     /// node that is concurrently building the same epoch in order (via
     /// [`Self::save_consensus_output`]) cannot race it. Verifies the streamed prefix ends
-    /// exactly at `epoch_record.final_consensus`.
-    /// NOTE: This is intended to be called ONCE and is currently not tolerant of multiple calls.
+    /// exactly at `epoch_record.final_consensus`. Concurrent calls run one after another (each
+    /// replaces what the previous one staged), never interleaved in the staging directory.
     pub async fn import_partial_to_staging<R: AsyncRead + Unpin>(
         &self,
         stream: R,
@@ -926,6 +934,7 @@ impl ConsensusChain {
         previous_epoch: &EpochRecord,
         timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
+        let _serial = self.staging_import.lock().await;
         let epoch = epoch_record.epoch;
         let staging_base = self.base_path.join(format!("staging-{epoch}"));
         // Start from a clean staging dir; previous attempts (if any) are stale.
@@ -3518,6 +3527,108 @@ mod test {
             !std::fs::exists(&staging_path).unwrap_or(true),
             "staging dir should be removed after clear_staging"
         );
+    }
+
+    /// Two partial imports of the same epoch must not interleave in its staging directory: the
+    /// second waits for the first, instead of clearing the directory under the first's open files
+    /// while it is still streaming.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_staging_imports_run_one_at_a_time() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let src_dir = TempDir::with_prefix("test_staging_serial_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(src_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        let mut last = None;
+        for i in 0..8u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            last = Some(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+        let last = last.expect("outputs saved");
+        let (stream, len) = source.get_partial_epoch_stream(0, 8).await.expect("partial stream");
+        let mut bytes = Vec::new();
+        stream.take(len).read_to_end(&mut bytes).await.expect("read partial stream");
+        let mut record = previous_epoch.clone();
+        record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
+
+        let dst_dir = TempDir::with_prefix("test_staging_serial_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // The first import streams half its bytes, then stalls until released.
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let half = bytes.len() / 2;
+        let feed = {
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                writer.write_all(&bytes[..half]).await.expect("write first half");
+                let _ = release_rx.await;
+                writer.write_all(&bytes[half..]).await.expect("write second half");
+                writer.shutdown().await.expect("end stream");
+            })
+        };
+        let first = {
+            let (dest, record, previous_epoch) =
+                (dest.clone(), record.clone(), previous_epoch.clone());
+            tokio::spawn(async move {
+                dest.import_partial_to_staging(
+                    reader,
+                    &record,
+                    &previous_epoch,
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        let first_data =
+            dst_dir.path().join("staging-0").join("epoch-0").join(crate::consensus_pack::DATA_NAME);
+        for _ in 0..200 {
+            if first_data.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(first_data.exists(), "the first import is streaming into staging");
+
+        let second = {
+            let (dest, record, previous_epoch) =
+                (dest.clone(), record.clone(), previous_epoch.clone());
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                dest.import_partial_to_staging(
+                    std::io::Cursor::new(bytes),
+                    &record,
+                    &previous_epoch,
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!second.is_finished(), "the second import waits for the first");
+        assert!(first_data.exists(), "the first import's files are left alone");
+
+        release_tx.send(()).expect("release the first import");
+        feed.await.expect("feeder");
+        first.await.expect("first task").expect("first import");
+        second.await.expect("second task").expect("second import");
+        assert_eq!(dest.staging_final(), Some(8));
+        assert!(dest.staging_consensus_output(8).await.is_some(), "the staged prefix is readable");
+        dest.clear_staging().await;
     }
 
     /// A partial import whose streamed prefix does not end at the expected `final_consensus` must

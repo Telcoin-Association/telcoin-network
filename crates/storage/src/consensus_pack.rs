@@ -248,6 +248,15 @@ impl Drop for ConsensusPack {
             // close().await already took the handle, so the block below is skipped. Drop is the
             // safety net; the proper async path is close().await.
             if let Some(handle) = self.handle.lock().take() {
+                if self.tx.is_closed() {
+                    // The actor already exited (only a panic ends it while a handle still holds
+                    // its join handle): there is nothing left to seal, and `close()` could not have
+                    // done better. Reap the finished thread and report why it ended.
+                    if let Err(e) = handle.join() {
+                        error!(target: "consensus_pack", ?e, epoch = self.epoch, "consensus pack thread had panicked");
+                    }
+                    return;
+                }
                 warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(); sealing as a fallback");
                 if self.tx.try_send(PackMessage::Shutdown).is_err() {
                     // Full bounded channel — detach. The actor clean-closes when the last Sender
@@ -352,29 +361,16 @@ enum StaticHealKind {
     Migration(PathBuf),
 }
 
-/// A stable identity for a data log at one moment: (device, inode, length) on unix, so a replaced
+/// A stable identity for a data log at one moment: (device, inode, length), so a replaced
 /// file (a new inode renamed into place) and a file appended to and re-sealed since (same inode,
 /// new length) are both told apart from the one a heal was built from.
 type FileIdentity = (u64, u64, u64);
 
 /// The [`FileIdentity`] of the file at `path`.
-#[cfg(unix)]
 fn file_identity(path: &Path) -> Result<FileIdentity, PackError> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path)?;
     Ok((meta.dev(), meta.ino(), meta.len()))
-}
-
-/// Non-unix fallback: modification time stands in for the inode.
-#[cfg(not(unix))]
-fn file_identity(path: &Path) -> Result<FileIdentity, PackError> {
-    let meta = std::fs::metadata(path)?;
-    let modified = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or_default();
-    Ok((0, modified, meta.len()))
 }
 
 /// Internal outcome of a migration copy/build step: either the source pack is damaged (reported to
@@ -2165,7 +2161,7 @@ impl Inner {
             PACK_VERSION,
         )
         .map_err(|e| MigrateAbort::Fatal(e.into()))?;
-        Self::migrate_copy(src, Some(&mut dst), version, base_dir, data_file, epoch)?;
+        let copied = Self::migrate_copy(src, Some(&mut dst), version, base_dir, data_file, epoch)?;
         dst.commit().map_err(|e| MigrateAbort::Fatal(PackError::PersistError(e.to_string())))?;
         // Load the freshly-written epoch meta (the first record) for the `Inner` we build to
         // rebuild the indexes and seal.
@@ -2183,6 +2179,14 @@ impl Inner {
         let (pos, cd, bd) =
             Self::recover_pack(&mut dst, migrate_dir, pos, cd, bd).map_err(MigrateAbort::Fatal)?;
         let count = pos.len() as u64;
+        // The rebuilt v2 pack must index exactly the outputs copied from the source: anything else
+        // means the copy and the rebuild disagree, and the result must not replace the source.
+        if count != copied {
+            return Err(MigrateAbort::Fatal(PackError::CorruptPack(format!(
+                "epoch {epoch}: migration copied {copied} output(s) but the rebuilt v2 pack indexes \
+                 {count}; nothing was installed and the legacy pack is unchanged"
+            ))));
+        }
         let mut inner = Inner {
             data: dst,
             consensus_pos_idx: pos,
@@ -2726,8 +2730,9 @@ impl Inner {
     ///
     /// A data file holding record bytes must begin with a readable [`EpochMeta`] matching this
     /// epoch.  An unreadable first record fails the open (an invalid pack) rather than repairing
-    /// it: the meta is fsync'd the instant it is written, so a valid pack always has a durable
-    /// meta and a torn/missing meta is not a recoverable state. A header-only file (no meta
+    /// it: the meta is committed the instant it is written (msync'd, its size extension fsync'd),
+    /// so a valid pack always has a durable meta and a torn/missing meta is not a recoverable
+    /// state. A header-only file (no meta
     /// yet) is initialized by writing and committing the meta.
     fn open_append<P: AsRef<Path>>(
         path: P,
@@ -2786,7 +2791,7 @@ impl Inner {
                     // A data file holding record bytes must begin with a readable meta. An
                     // unreadable first record is an invalid pack: recovery (`recover_pack`) only
                     // trims the torn tail, and any records behind the meta stay addressable through
-                    // the indexes, so nothing here can safely repair it. The meta is fsync'd the
+                    // the indexes, so nothing here can safely repair it. The meta is committed the
                     // moment it is written (below and in `stream_import`), so a torn meta is not a
                     // normal state -- fail rather than rewrite it.
                     return Err(PackError::EpochLoad(format!(
@@ -2999,7 +3004,14 @@ impl Inner {
             &batch_digests,
         ) {
             // Corrupt static file is bad (damaged at rest?), produce an error. Read-only opens do
-            // not heal, so this is terminal — surface the same remediation as the recovery path.
+            // not heal, so this is terminal. When it is the position index's own last entry that
+            // fails its CRC, the index is what is damaged: give its remediation (rebuild it from
+            // the log); otherwise the same remediation as the recovery path.
+            if let Some(last) = consensus_pos_idx.len().checked_sub(1) {
+                if let Err(e) = consensus_pos_idx.load(last as u64) {
+                    return Err(Self::corrupt_static_index(&base_dir, epoch, &e.into()));
+                }
+            }
             return Err(Self::corrupt_pack(&base_dir));
         }
         // Clamp the read-only data handle's read bound to the index-attested committed length.
@@ -3967,7 +3979,6 @@ impl DiskFloor {
 }
 
 /// Bytes available to an unprivileged writer on the filesystem holding `path`.
-#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // the `statvfs` field widths differ by platform
 fn available_space(path: &Path) -> io::Result<u64> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -3984,12 +3995,6 @@ fn available_space(path: &Path) -> io::Result<u64> {
         stat.assume_init()
     };
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
-}
-
-/// No portable free-space query on this target: never stops an import.
-#[cfg(not(unix))]
-fn available_space(_path: &Path) -> io::Result<u64> {
-    Ok(u64::MAX)
 }
 
 /// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
@@ -7805,6 +7810,37 @@ pub(crate) mod test {
         assert_eq!(staging(), 0, "an uninstalled heal removes its staging");
     }
 
+    /// When what fails the read-only open's consistency check is the position index's own last
+    /// entry (its CRC), the remediation is the index one (rebuild it from the intact log), not the
+    /// data log's.
+    #[tokio::test]
+    async fn test_open_static_damaged_last_position_entry_reports_the_index() {
+        let temp_dir = TempDir::with_prefix("test_static_bad_last_pdx").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let pdx = temp_dir
+            .path()
+            .join("epoch-0")
+            .join(Inner::CONSENSUS_POS_NAME)
+            .join(Inner::CONSENSUS_POS_FILE);
+        let mut bytes = std::fs::read(&pdx).expect("read pdx");
+        let last_entry = bytes.len()
+            - crate::archive::data_file::SENTINEL_LEN as usize
+            - <super::IndexPositions as crate::archive::position_index::index::PosIndexValue>::buffer_len();
+        bytes[last_entry + 3] ^= 0xFF;
+        std::fs::write(&pdx, &bytes).expect("write pdx");
+
+        let err = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect_err("a damaged position entry must fail a read-only open");
+        assert!(
+            err.to_string().contains("a derived index is damaged"),
+            "expected the index remediation, got {err}"
+        );
+    }
+
     /// A read-only `open_static` of a sealed epoch whose position index is damaged at rest must
     /// surface the actionable `corrupt_static_index` remediation (a real error, not a clean miss) —
     /// the read-only door cannot rebuild the index, but the operator must not see the bare
@@ -9534,7 +9570,7 @@ pub(crate) mod test {
 
     /// A pack whose first record is torn (a crash mid meta append left only part of the size
     /// prefix), even with nothing indexed behind it, is an invalid pack: `open_append` rejects it
-    /// rather than truncating and rewriting the meta.  The meta is fsync'd the instant it is
+    /// rather than truncating and rewriting the meta.  The meta is committed the instant it is
     /// written, so a torn meta is not a normal state; the operator removes the epoch dir and it
     /// rebuilds.
     #[tokio::test]

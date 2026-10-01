@@ -212,7 +212,9 @@ pub fn max_batch_gas(_epoch: Epoch) -> u64 {
 /// Currently always 1,000,000 but can change in the future at a fork.
 ///
 /// Fork changes that lower this limit must also lower [`min_batch_size`] and extend
-/// `min_batch_size_bounds_every_epoch` with the fork boundary and its adjacent epochs.
+/// `min_batch_size_bounds_every_epoch` with the fork boundary and its adjacent epochs. Fork changes
+/// that raise it must also raise [`MAX_TXS_PER_BATCH`] (or a valid batch would fail to decode) and
+/// extend `max_txs_per_batch_bounds_every_epoch` the same way.
 /// The transaction pool checks its admission byte limit against that floor only once
 /// at node startup: the pool and its validator persist across epoch changes.
 pub const fn max_batch_size(_epoch: Epoch) -> usize {
@@ -310,12 +312,18 @@ mod transaction_bounds_tests {
     use super::{max_batch_size, Batch, MAX_TXS_PER_BATCH};
     use crate::{encode, try_decode, ExecHeader};
 
-    /// The count cap can never reject a legitimate batch: a valid transaction is non-empty (>= 1
-    /// byte) and a batch's transaction bytes are capped at `max_batch_size`, so a valid batch holds
-    /// at most `max_batch_size` transactions.
+    /// The count cap can never reject a legitimate batch in any epoch: a valid transaction is
+    /// non-empty (>= 1 byte) and a batch's transaction bytes are capped at that epoch's
+    /// `max_batch_size`, so a valid batch holds at most that many transactions.
     #[test]
-    fn max_txs_per_batch_matches_byte_ceiling() {
-        assert_eq!(MAX_TXS_PER_BATCH, max_batch_size(0));
+    fn max_txs_per_batch_bounds_every_epoch() {
+        // Add each batch-size fork boundary and its adjacent epochs when the schedule changes.
+        for epoch in [0, 1, crate::Epoch::MAX] {
+            assert!(
+                MAX_TXS_PER_BATCH >= max_batch_size(epoch),
+                "a valid epoch-{epoch} batch could exceed the decode count cap"
+            );
+        }
     }
 
     /// A zero-byte (empty) transaction is invalid and must fail to decode (encode does not

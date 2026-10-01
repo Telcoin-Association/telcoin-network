@@ -252,7 +252,9 @@ impl Drop for EpochRecordDb {
                     return;
                 }
                 let join = move || {
-                    let _ = handle.join();
+                    if let Err(e) = handle.join() {
+                        error!(target: "epoch-db", ?e, "Failed to join epoch records thread");
+                    }
                 };
                 // Never block a multi-threaded runtime worker on the clean-close fsyncs: offload
                 // the join to the blocking pool. On a current-thread runtime
@@ -446,16 +448,15 @@ impl EpochRecordDb {
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self, EpochDbError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let inner = Inner::open_append(path, 0)?;
-        // Index `final_numbers` by absolute epoch (matching `update_finals`), NOT by
-        // push-per-record: an interrupted-then-retried save can leave a duplicate record in
-        // the log, and a `push` would then shift every later epoch's number and misroute
-        // `number_to_epoch`. Overwriting the epoch's own slot is idempotent under a
-        // duplicate. (Epochs are contiguous from 0 by construction, so there are no gaps to
-        // leave as zero.)
+        let mut inner = Inner::open_append(path, 0)?;
+        // Build `final_numbers` from the records the actor serves: the position index's
+        // (first-write-wins) record for each epoch, not a raw walk of the log, where a duplicate
+        // left by an interrupted save may differ from the indexed record. Index it by absolute
+        // epoch (matching `update_finals`). (Epochs are contiguous from the first stored one by
+        // construction, so there are no gaps to leave as zero.)
         let mut final_numbers: Vec<u64> = Vec::with_capacity(inner.epoch_idx.len());
-        for record in inner.records.raw_iter().map_err(|_e| EpochDbError::CorruptDb)? {
-            let record = record?;
+        for slot in 0..inner.epoch_idx.len() as u64 {
+            let record = inner.records.fetch(inner.epoch_idx.load(slot)?)?;
             let epoch = record.epoch as usize;
             if epoch >= final_numbers.len() {
                 final_numbers.resize(epoch + 1, 0);
@@ -561,11 +562,12 @@ impl EpochRecordDb {
             true,
             PackCompression::ZStd,
             EPOCH_PACK_VERSION,
-        )
-        .map_err(|_| EpochDbError::CorruptDb)?;
+        )?;
         let mut records = Vec::new();
-        for record in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
-            records.push(record.map_err(|_| EpochDbError::CorruptDb)?);
+        for record in pack.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))? {
+            records.push(record.map_err(|e| {
+                EpochDbError::CorruptLog(format!("records pack record {}: {e}", records.len()))
+            })?);
         }
         Ok(records)
     }
@@ -584,11 +586,12 @@ impl EpochRecordDb {
             true,
             PackCompression::ZStd,
             EPOCH_PACK_VERSION,
-        )
-        .map_err(|_| EpochDbError::CorruptDb)?;
+        )?;
         let mut certs = Vec::new();
-        for cert in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
-            certs.push(cert.map_err(|_| EpochDbError::CorruptDb)?);
+        for cert in pack.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))? {
+            certs.push(cert.map_err(|e| {
+                EpochDbError::CorruptLog(format!("certs pack record {}: {e}", certs.len()))
+            })?);
         }
         Ok(certs)
     }
@@ -1465,18 +1468,37 @@ impl Inner {
                 None => break,
                 Some(Ok(record)) => {
                     let base = *base_epoch.get_or_insert(record.epoch);
-                    let slot = (record.epoch as u64)
-                        .checked_sub(base as u64)
-                        .ok_or(EpochDbError::CorruptDb)?; // non-ascending epoch → corrupt
+                    let slot = (record.epoch as u64).checked_sub(base as u64).ok_or_else(|| {
+                        EpochDbError::CorruptLog(format!(
+                            "records log: epoch {} at offset {pos} precedes the first stored \
+                             epoch {base}",
+                            record.epoch
+                        ))
+                    })?;
                     if slot < expected_slot {
                         // Duplicate of an already-indexed epoch: first-write-wins, skip it. It
-                        // stays as dead bytes in the log but no index references it.
+                        // stays as dead bytes in the log but no index references it. One that is
+                        // not the indexed record itself is worth an operator's attention.
+                        if record_digests.load(record.digest().into()).is_err() {
+                            warn!(
+                                target: "epoch-db",
+                                epoch = record.epoch,
+                                offset = pos,
+                                "records log holds a second, different record for an already \
+                                 stored epoch; keeping the first"
+                            );
+                        }
                         consistent_end = iter.logical_position();
                         continue;
                     }
                     if slot > expected_slot {
                         // A missing epoch in a contiguous chain is corruption; fail closed.
-                        return Err(EpochDbError::CorruptDb);
+                        return Err(EpochDbError::CorruptLog(format!(
+                            "records log: epoch {} at offset {pos} follows epoch {}, skipping \
+                             the epochs between",
+                            record.epoch,
+                            base as u64 + expected_slot - 1
+                        )));
                     }
                     epoch_idx
                         .save(expected_slot, pos)
@@ -1993,6 +2015,14 @@ impl Inner {
     /// The certificate save is idempotent: a duplicate cert is silently skipped.
     fn save(&mut self, record: EpochRecord, cert: EpochCertificate) -> Result<(), EpochDbError> {
         let record_digest = record.digest();
+        // The cert is filed under the record's digest: refuse one that certifies another record
+        // before anything is written.
+        if cert.epoch_hash != record_digest {
+            return Err(EpochDbError::CertificateMismatch {
+                record: record_digest,
+                certified: cert.epoch_hash,
+            });
+        }
 
         // Save the record (idempotent, atomic).
         self.save_record(record)?;
@@ -2011,6 +2041,12 @@ impl Inner {
         digest: EpochDigest,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
+        if cert.epoch_hash != digest {
+            return Err(EpochDbError::CertificateMismatch {
+                record: digest,
+                certified: cert.epoch_hash,
+            });
+        }
         if self.cert_digests.load(digest.into()).is_ok() {
             return Ok(());
         }
@@ -2257,12 +2293,21 @@ pub enum EpochDbError {
     PersistError(String),
     /// The epoch-records database is corrupt.
     CorruptDb,
-    /// A cleanly-sealed data log stopped decoding partway through a rebuild — at-rest corruption
-    /// of complete (acked) data, which must be surfaced rather than silently truncated (INV4).
-    /// Carries a human-readable location.
+    /// A data log does not decode, or is out of order, where it must: a cleanly-sealed log that
+    /// stops decoding, damage below the acked frontier, a gap in the record chain, or a damaged
+    /// bundle pack. Corruption to surface rather than silently truncate (INV4). Carries a
+    /// human-readable location and cause.
     CorruptLog(String),
     /// An export bundle failed validation on the incremental append path.
     BundleValidation(String),
+    /// A certificate was saved with a record it does not certify: its `epoch_hash` is the digest
+    /// of another record.
+    CertificateMismatch {
+        /// Digest of the record the certificate was saved with.
+        record: EpochDigest,
+        /// Digest of the record the certificate actually certifies.
+        certified: EpochDigest,
+    },
     /// Failed to join a background thread for the database.
     JoinError,
 }
@@ -2291,10 +2336,14 @@ impl Display for EpochDbError {
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             EpochDbError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             EpochDbError::CorruptDb => write!(f, "Epoch records database is corrupt"),
-            EpochDbError::CorruptLog(e) => write!(f, "Sealed data log is corrupt: {e}"),
+            EpochDbError::CorruptLog(e) => write!(f, "Data log is corrupt: {e}"),
             EpochDbError::BundleValidation(e) => {
                 write!(f, "Export bundle validation failed: {e}")
             }
+            EpochDbError::CertificateMismatch { record, certified } => write!(
+                f,
+                "certificate certifies record {certified}, not the record {record} it was saved with"
+            ),
             EpochDbError::JoinError => write!(f, "Failed to join a background thread for DB"),
         }
     }
@@ -3571,6 +3620,81 @@ mod test {
         // here).
         assert_eq!(db.number_to_epoch(35), 3, "numbering not shifted by the duplicate");
         assert_eq!(db.number_to_epoch(45), 4, "past-end epoch correct");
+    }
+
+    /// A duplicate that DIFFERS from the record first stored for its epoch must not change what
+    /// the database serves: the index keeps the first copy, and by-number routing must follow that
+    /// same copy rather than whichever came last in the log.
+    #[tokio::test]
+    async fn test_differing_duplicate_keeps_the_first_record_everywhere() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_differing_dup").expect("temp dir");
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let mut parent = EpochDigest::default();
+            let mut epoch1_parent = parent;
+            for epoch in 0..4u32 {
+                let (record, _cert) = make_test_pair(epoch, &signers, parent);
+                if epoch == 0 {
+                    epoch1_parent = record.digest();
+                }
+                parent = record.digest();
+                inner.save_record(record).expect("save");
+            }
+            // A second, different record for epoch 1 (final number 25, not 20) past the end.
+            let (mut different, _) = make_test_pair(1, &signers, epoch1_parent);
+            different.final_consensus = ConsensusNumHash::new(25, ConsensusHeaderDigest::default());
+            inner.records.append(&different).expect("raw append");
+            inner.persist().expect("persist");
+            std::mem::forget(inner); // crash: unclean -> reopen rebuilds
+        }
+        let db = EpochRecordDb::open(dir.path()).expect("reopen");
+        let first = db.record_by_epoch(1).await.expect("epoch 1");
+        assert_eq!(first.final_consensus.number, 20, "the first copy is the one served");
+        // finals [10, 20, 30, 40]: number 22 is in epoch 2 (the later copy would say epoch 1).
+        assert_eq!(db.number_to_epoch(22), 2, "routing follows the served record");
+        db.close().await;
+    }
+
+    /// A certificate is stored keyed by the digest of the record it certifies; one that certifies
+    /// a different record must be refused rather than filed under the wrong key.
+    #[test]
+    fn test_certificate_for_another_record_is_refused() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_cert_mismatch").expect("temp dir");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        let (record0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (record1, cert1) = make_test_pair(1, &signers, record0.digest());
+        let certs_len = inner.certs.file_len();
+
+        let err = inner.save(record0.clone(), cert1).expect_err("a mismatched pair is refused");
+        assert!(matches!(err, EpochDbError::CertificateMismatch { .. }), "got {err:?}");
+        let err = inner
+            .save_certificate(record1.digest(), cert0.clone())
+            .expect_err("a cert for another record is refused");
+        assert!(matches!(err, EpochDbError::CertificateMismatch { .. }), "got {err:?}");
+        assert_eq!(inner.certs.file_len(), certs_len, "nothing was appended");
+        assert!(inner.epoch_idx.is_empty(), "the mismatched pair saved no record either");
+
+        inner.save(record0, cert0).expect("the matching pair saves");
+    }
+
+    /// Reading a damaged bundle pack reports why, not just that the database is corrupt.
+    #[test]
+    fn test_reading_a_damaged_pack_reports_the_cause() {
+        let dir = TempDir::with_prefix("epoch_read_cause").expect("temp dir");
+        let path = dir.path().join("epoch_records");
+        let records: Vec<EpochRecord> =
+            (0..3).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+        super::write_bounded_pack(&path, Inner::PACK_EPOCH, &records).expect("write pack");
+        let mut bytes = std::fs::read(&path).expect("read pack");
+        bytes[DATA_HEADER_BYTES + 8] ^= 0xFF; // inside the first record's payload
+        std::fs::write(&path, &bytes).expect("write pack");
+
+        let err = EpochRecordDb::read_records_from_pack(&path).expect_err("damaged pack");
+        assert!(err.to_string().contains("crc32 mismatch"), "the cause is reported: {err}");
     }
 
     /// If a position-index slot is ever mis-keyed (points at another epoch's record), the
