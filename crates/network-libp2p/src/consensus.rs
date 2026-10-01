@@ -41,7 +41,9 @@ use std::{
     num::NonZeroUsize,
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
+use tn_config::{
+    KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
+};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
     TnSender, WorkerId,
@@ -55,6 +57,10 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/network_budget_tests.rs"]
+mod network_budget_tests;
 
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
@@ -214,11 +220,15 @@ impl InboundDenialWarning {
 
 /// Build the [`connection_limits::Behaviour`] for one swarm.
 ///
-/// It sets two bounds:
-/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
-///   (issue #1010);
+/// It sets the following bounds:
+/// - at most the process allocation's per-peer ceiling, or [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]
+///   without an allocation, concurrent established connections per peer (issue #1010);
+/// - at most the process allocation's established connections in total, when configured;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Both directions and all peer classes consume the process allocation: this behaviour must never
+/// install bypass peer IDs.
 ///
 /// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
 /// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
@@ -236,16 +246,24 @@ impl InboundDenialWarning {
 /// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
 /// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
 ///
-/// The budget applies to each swarm separately. Each primary and worker network builds its own
-/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+/// The pending inbound ceiling applies to each swarm separately. Each primary and worker network
+/// builds its own [`TNBehavior`], so the host total is this ceiling times the number of swarms.
 ///
-/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
-/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
-/// exercise the identical limits.
-fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
+/// Pending outgoing and per-direction established caps stay unbounded. Established totals are
+/// unbounded without a process allocation. Shared by [`TNBehavior::new`] and the regression tests
+/// so all of them exercise the identical limits.
+fn connection_limits_behaviour(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_established_per_peer(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                    budget.connections_per_peer()
+                }),
+            ))
+            .with_max_established(budget.map(|budget| budget.connections()))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
@@ -272,8 +290,9 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
-    /// inbound connections (see [`connection_limits_behaviour`]).
+    /// Per-peer established connection ceiling (issue #1010), optional per-swarm process
+    /// allocation, and memory-only ceiling on pending inbound connections (see
+    /// [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
     /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
@@ -316,7 +335,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None);
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -534,6 +553,8 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -658,6 +679,8 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior.connection_limits =
+            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -691,13 +714,12 @@ where
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
+                config.handshake_timeout = quic_config.handshake_timeout;
+                config.max_idle_timeout = quic_config.max_idle_timeout;
+                config.keep_alive_interval = quic_config.keep_alive_interval;
+                config.max_concurrent_stream_limit = quic_config.max_concurrent_stream_limit;
+                config.max_stream_data = quic_config.max_stream_data;
+                config.max_connection_data = quic_config.max_connection_data;
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -748,7 +770,7 @@ where
             external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
-            metrics: SwarmMetrics::new_for(&network_type),
+            metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
@@ -929,6 +951,9 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_established_connections(
+                self.swarm.network_info().connection_counters().num_established(),
+            );
             self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
@@ -939,6 +964,13 @@ where
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
+        if matches!(&event,
+            SwarmEvent::IncomingConnectionError { error: libp2p::swarm::ListenError::Denied { cause }, .. }
+            | SwarmEvent::OutgoingConnectionError { error: libp2p::swarm::DialError::Denied { cause }, .. }
+            if cause.downcast_ref::<connection_limits::Exceeded>().is_some()
+        ) {
+            self.metrics.record_connection_limit_rejection();
+        }
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,

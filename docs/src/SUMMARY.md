@@ -9,6 +9,7 @@
   * [Peer-to-peer Network](architecture/network.md)
 * [P2P Network](network/README.md)
   * [Transport](network/transport.md)
+  * [Established connection calibration](network/resource-budget.md)
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)

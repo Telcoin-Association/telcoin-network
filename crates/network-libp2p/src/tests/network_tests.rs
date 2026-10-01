@@ -4544,7 +4544,7 @@ fn connection_limit_caps_established_connections_per_peer() {
     };
 
     // the behaviour installed in production; the pending inbound budget is not under test here
-    let mut limits = super::connection_limits_behaviour(u32::MAX);
+    let mut limits = super::connection_limits_behaviour(u32::MAX, None);
     let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
 
     let peer = PeerId::random();
@@ -4641,7 +4641,7 @@ fn connection_limit_bounds_pending_incoming_connections() {
     };
 
     const CAP: u32 = 3;
-    let mut limits = super::connection_limits_behaviour(CAP);
+    let mut limits = super::connection_limits_behaviour(CAP, None);
     let addr = create_multiaddr(None);
 
     // the swarm asks for a pending inbound slot for connection `id`
@@ -4725,16 +4725,16 @@ fn connection_limit_bounds_pending_incoming_connections() {
 /// How long the swarm-level pending slot test waits for one listener event.
 const SWARM_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1)`,
-/// so it holds at most one pending inbound connection, and `connection_timeout` bounds every
-/// handshake.
+/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1,
+/// None)`, so it holds at most one pending inbound connection, and `connection_timeout` bounds
+/// every handshake.
 fn quic_connection_limits_swarm(
     connection_timeout: Duration,
 ) -> Swarm<connection_limits::Behaviour> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| super::connection_limits_behaviour(1))
+        .with_behaviour(|_| super::connection_limits_behaviour(1, None))
         .expect("the behaviour constructor is infallible")
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
         .with_connection_timeout(connection_timeout)
