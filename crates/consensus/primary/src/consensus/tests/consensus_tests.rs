@@ -8,10 +8,16 @@ use crate::{
     test_utils::{make_optimal_certificates, mock_certificate, mock_certificate_with_epoch},
     ConsensusBus,
 };
-use std::{collections::BTreeSet, ops::RangeInclusive, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ops::RangeInclusive,
+    time::Duration,
+};
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, PriorEpoch};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
+use tn_storage::{
+    consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, ROUNDS_TO_KEEP,
+};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
@@ -19,7 +25,7 @@ use tn_types::{
     ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochSeedChainError, EpochSeedChainValue,
     ExecHeader, Hash as _, Header, HeaderBuilder, HeaderDigest, ReputationScores, Round,
     SealedHeader, TaskManager, TimestampMs, TimestampSec, TnReceiver, TnSender, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MAX_GC_DEPTH,
 };
 use tokio::fs::create_dir_all;
 
@@ -1208,4 +1214,229 @@ async fn spawn_before_subsecond_fork_ignores_prior_epoch_close() {
         "the pre-fork first commit is the leader's whole seconds, not floored"
     );
     assert!(first.commit_timestamp() < PRIOR_EPOCH_CLOSE);
+}
+
+/// Shared setup for #1518 store-vs-rebuild GC window checks.
+///
+/// Writes certificates for rounds `1..=H`, then GCs the store by commit round `C`
+/// (production recovery / post-commit GC), and rebuilds the in-memory DAG as if the
+/// last committed round were `C`.
+fn rebuild_dag_after_store_write(h: Round, c: Round, gc_depth: Round) -> crate::consensus::Dag {
+    assert!(h > c, "H must be ahead of C");
+    assert!(h > ROUNDS_TO_KEEP, "H must exceed ROUNDS_TO_KEEP so commit-keyed GC actually deletes");
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=h, &genesis, &ids);
+    let store = MemDatabase::default();
+    store.write_all(certificates.iter()).expect("write certificates into store");
+    // Mirror recovery / post-commit GC: prune by C, not by newest written round H.
+    store.gc_to_commit_round(c).expect("gc_to_commit_round");
+
+    // Empty last_committed: try_insert_in_dag still inserts every cert above gc_round;
+    // the bool return only affects the restore log count.
+    let last_committed = HashMap::new();
+    let gc_round = c.saturating_sub(gc_depth);
+    ConsensusState::construct_dag_from_cert_store(&store, &last_committed, gc_round)
+        .expect("DAG rebuild from store")
+}
+
+/// Assert the rebuilt DAG contains every round in `[first_expected, h]` (inclusive).
+fn assert_dag_has_rounds(
+    dag: &crate::consensus::Dag,
+    first_expected: Round,
+    h: Round,
+    label: &str,
+) {
+    let present: Vec<Round> = dag.keys().copied().collect();
+    let mut missing = Vec::new();
+    for round in first_expected..=h {
+        if !dag.contains_key(&round) {
+            missing.push(round);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{label}: DAG missing rounds {missing:?} in expected window [{first_expected}, {h}]; present rounds={present:?} (store ROUNDS_TO_KEEP={ROUNDS_TO_KEEP}, issue #1518)"
+    );
+}
+
+/// Boundary case from #1518: `H - C = 65 - gc_depth`.
+/// With commit-keyed store GC the stall size no longer truncates the rebuild window.
+#[test]
+fn dag_rebuild_store_gc_boundary_retains_full_window() {
+    let gc_depth = MAX_GC_DEPTH;
+    let stall = (ROUNDS_TO_KEEP + 1).saturating_sub(gc_depth); // 65 - gc_depth
+    let c: Round = 100;
+    let h = c + stall;
+    let first_expected = c - gc_depth + 1;
+
+    let dag = rebuild_dag_after_store_write(h, c, gc_depth);
+    assert_dag_has_rounds(&dag, first_expected, h, "boundary H-C = 65-gc_depth");
+}
+
+/// Gap case from #1518: `H - C = 66 - gc_depth`.
+/// Under the old write-keyed GC this deleted the rebuild floor; commit-keyed GC retains it.
+#[test]
+fn dag_rebuild_after_commit_stall_retains_full_gc_window() {
+    let gc_depth = MAX_GC_DEPTH;
+    let stall = (ROUNDS_TO_KEEP + 2).saturating_sub(gc_depth); // 66 - gc_depth
+    let c: Round = 100;
+    let h = c + stall;
+    let first_expected = c - gc_depth + 1;
+
+    let dag = rebuild_dag_after_store_write(h, c, gc_depth);
+    assert_dag_has_rounds(&dag, first_expected, h, "gap H-C = 66-gc_depth");
+}
+
+/// First in-memory jump that deletes the rebuild floor of a durable commit.
+///
+/// Store GC drops rounds `< C_memory - ROUNDS_TO_KEEP`. Rebuild needs
+/// `>= C_durable - gc_depth + 1`. Those cross when the jump reaches
+/// `ROUNDS_TO_KEEP - gc_depth + 2` (16 with the production cap of 50).
+fn jump_that_drops_rebuild_floor(gc_depth: Round) -> Round {
+    ROUNDS_TO_KEEP - gc_depth + 2
+}
+
+fn store_min_round(store: &MemDatabase) -> Option<Round> {
+    store.after_round(1).expect("read store").iter().map(|c| c.round()).min()
+}
+
+/// A store whose lowest round is above the rebuild floor fails startup with
+/// [`ConsensusError::IncompleteCertificateStore`] instead of building a partial DAG.
+#[test]
+fn new_from_store_rejects_incomplete_certificate_store() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=80, &genesis, &ids);
+    let store = MemDatabase::default();
+    store.write_all(certificates.iter()).expect("write");
+    // Retain rounds >= 16, above the rebuild floor of commit 0.
+    store.gc_to_commit_round(80).expect("gc");
+
+    let err = ConsensusState::new_from_store(
+        0,
+        MAX_GC_DEPTH,
+        HashMap::new(),
+        None,
+        EpochSeedChainValue::epoch_root(0),
+        None,
+        store,
+    )
+    .expect_err("a gapped store must fail recovery");
+    assert!(
+        matches!(err, ConsensusError::IncompleteCertificateStore { expected_min_round: 1, .. }),
+        "got {err:?}"
+    );
+}
+
+/// Issue #1518, on the production commit path.
+///
+/// Headers through `durable_target` are written to the chain and the store is pruned to
+/// that durable round, which is what `save_consensus` does. Later commits are only received
+/// on the sequence channel. A restart from the chain must still find every round from
+/// `C - gc_depth + 1` up. Pruning to the in-memory round first deletes that floor.
+#[tokio::test]
+async fn durable_commit_keeps_its_rebuild_floor_while_consensus_runs_ahead() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let gc_depth = config.parameters().gc_depth;
+    assert_eq!(gc_depth, MAX_GC_DEPTH, "this pins the production margin the review used");
+    let certificate_store = config.node_storage().clone();
+
+    let durable_target: Round = 80;
+    let jump = jump_that_drops_rebuild_floor(gc_depth);
+    let memory_target = durable_target + jump;
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) =
+        make_optimal_certificates(&committee, 1..=memory_target + 1, &genesis, &ids);
+    certificate_store.write_all(certificates.iter()).expect("write certificates");
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let leader_schedule = LeaderSchedule::from_store(
+        committee.clone(),
+        &mut consensus_chain,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    )
+    .await
+    .unwrap();
+    // Keep one schedule for the whole run so a reputation rotation cannot stall the commits.
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        10_000,
+        leader_schedule,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    let cb = ConsensusBus::new();
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
+    let mut rx_output = cb.subscribe_sequence();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    for certificate in certificates.iter() {
+        cb.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    let mut pack_number = 1u64;
+    let mut highest_leader = 0;
+    loop {
+        let sub_dag = tokio::time::timeout(Duration::from_secs(20), rx_output.recv())
+            .await
+            .expect("timed out waiting for a commit")
+            .expect("sequence channel closed");
+        let leader_round = sub_dag.leader().round();
+        highest_leader = highest_leader.max(leader_round);
+        if leader_round <= durable_target {
+            consensus_chain.write_subdag_for_test(pack_number, sub_dag).await;
+            // Same order as save_consensus: the header is durable, then the store
+            // may drop rounds behind this commit.
+            certificate_store.gc_to_commit_round(leader_round).expect("gc to durable commit");
+            pack_number += 1;
+        }
+        if leader_round >= memory_target {
+            break;
+        }
+    }
+    task_manager.abort();
+
+    let recovered = consensus_chain.read_last_committed(config.epoch()).await.unwrap();
+    let durable = recovered.values().copied().max().unwrap_or(0);
+    assert_eq!(durable, durable_target, "chain stopped at the last header this test persisted");
+    assert!(highest_leader >= memory_target, "consensus did not run ahead of the persisted commit");
+
+    let expected_min = durable - gc_depth + 1;
+    let min_stored =
+        store_min_round(&certificate_store).expect("store should still hold certificates");
+    assert_eq!(
+        min_stored,
+        durable - ROUNDS_TO_KEEP,
+        "store GC must stop at the persisted commit {durable}, not the in-memory leader {highest_leader}"
+    );
+    assert!(
+        min_stored <= expected_min,
+        "restart from commit {durable} needs round {expected_min}; store starts at {min_stored} \
+         after consensus ran ahead to {highest_leader} (jump {jump})"
+    );
 }

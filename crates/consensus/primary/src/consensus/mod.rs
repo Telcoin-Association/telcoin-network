@@ -44,6 +44,22 @@ pub enum ConsensusError {
     #[error("Epoch seed chain recovery failed: {0}")]
     SeedChain(#[from] EpochSeedChainError),
 
+    /// Certificate store does not contain a contiguous window from the rebuild floor.
+    ///
+    /// Raised by [`ConsensusState::construct_dag_from_cert_store`] when the store has
+    /// certificates but the lowest retained round is strictly above `gc_round + 1`.
+    /// Building a partial DAG over that hole (with `check_parents = false`) would risk
+    /// diverging commit output after a restart (issue #1518). Fail closed instead.
+    #[error(
+        "certificate store incomplete for DAG rebuild: expected certificates from round {expected_min_round}, but lowest stored round above GC is {actual_min_round}"
+    )]
+    IncompleteCertificateStore {
+        /// First round the rebuild needs (`gc_round + 1`).
+        expected_min_round: Round,
+        /// Lowest round actually present in the store above the GC floor.
+        actual_min_round: Round,
+    },
+
     /// A Bullshark construction invariant (or a startup-recovery self-consistency
     /// invariant) did not hold. None of these conditions is reachable under the `< f`
     /// fault assumption on current `main`; converting the former always-active
