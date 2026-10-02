@@ -186,7 +186,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, EPOCH_MAX, GROWTH)
         .expect("Cannot open database (epoch)");
     // before the full-memory load below, which panics on a row this binary cannot decode
-    epoch_db_recovery::discard_undecodable_header_tables(&epoch_db)
+    epoch_db_recovery::discard_seconds_only_proposal(&epoch_db)
         .expect("Cannot check database (epoch)");
     let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, KAD_MAX, GROWTH)
         .expect("Cannot open database (kad)");
@@ -222,7 +222,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     let store_path = store_path.as_ref();
     let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
     // before the full-memory load below, which panics on a row this binary cannot decode
-    epoch_db_recovery::discard_undecodable_header_tables(&epoch_db)
+    epoch_db_recovery::discard_seconds_only_proposal(&epoch_db)
         .expect("Cannot check database (epoch)");
     let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
     let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
