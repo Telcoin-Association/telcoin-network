@@ -86,8 +86,15 @@ def validate_plan(plan):
     selected = {key: candidate_profile.get(key) for key in shipped}
     if digest(selected) != digest(shipped):
         fail("candidate configuration differs from the shipped profile")
-    if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname", "dao_observers"}:
-        fail("v1 permits deployment bootstrap/hostname settings alongside the exact profile")
+    if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname", "dao_observers", "libp2p_config"}:
+        fail("v1 permits bootstrap, hostname, DAO, and chain deployment settings alongside the exact profile")
+    if "libp2p_config" in candidate_profile:
+        deployment = candidate_profile["libp2p_config"]
+        if not isinstance(deployment, dict) or set(deployment) != {"chain_id"}:
+            fail("libp2p deployment settings may contain only chain_id")
+        integer(deployment["chain_id"], "chain_id")
+    if plan["baseline"]["profile"].get("libp2p_config") != candidate_profile.get("libp2p_config"):
+        fail("baseline and candidate must declare the same chain settings")
     observers = candidate_profile.get("dao_observers", [])
     if not isinstance(observers, list) or len(observers) != 8 or any(not isinstance(key, str) or not key for key in observers) or len(set(observers)) != 8:
         fail("declare eight distinct DAO observer identities before qualification")

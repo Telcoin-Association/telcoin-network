@@ -1,6 +1,7 @@
 """Exercise binary reuse against real, isolated Git histories."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -77,6 +78,17 @@ class SourceProvenanceTests(unittest.TestCase):
         (self.repository / "Cargo.toml").write_text("uncommitted input\n")
         with self.assertRaisesRegex(ValueError, "clean committed worktree"):
             self.verify()
+
+    def test_failed_docker_command_retained(self):
+        result = subprocess.CompletedProcess(["docker"], 2, "fixture stdout", "fixture stderr")
+        docker = RUNNER.Docker(self.repository, None, "fixture-image")
+        with patch.object(RUNNER.subprocess, "run", return_value=result):
+            with self.assertRaises(subprocess.CalledProcessError):
+                docker.run("exec", "fixture-container", "fixture-command")
+        failure = json.loads((self.repository / "command-failure-1.json").read_text())
+        self.assertEqual(failure["exit_code"], 2)
+        self.assertEqual(failure["stdout"], "fixture stdout")
+        self.assertEqual(failure["stderr"], "fixture stderr")
 
     def test_unrelated_history_rejected(self):
         alternative = self.git("commit-tree", self.git("write-tree"), "-m", "unrelated history")

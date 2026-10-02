@@ -44,9 +44,14 @@ class Docker:
 
     def run(self, *arguments):
         self.commands.append(["docker", *arguments])
-        result = subprocess.run(["docker", *arguments], check=True, capture_output=True, text=True)
+        result = subprocess.run(["docker", *arguments], check=False, capture_output=True, text=True)
         if len(result.stdout.encode()) + len(result.stderr.encode()) > 8 * 1024**2:
             raise ValueError("Docker command exceeds the finite result budget")
+        if result.returncode:
+            write_json(self.output / f"command-failure-{len(self.commands)}.json", {
+                "argv": ["docker", *arguments], "exit_code": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr})
+        result.check_returncode()
         return result.stdout.strip()
 
     def container(self, name, ip, cpus, anchor=None, coordinator=False):

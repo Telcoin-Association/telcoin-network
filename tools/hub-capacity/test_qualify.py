@@ -92,6 +92,23 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "classified as cancelled"):
             QUALIFY.validate_evidence(self.plan, self.run, "candidate")
 
+    def test_matching_chain_deployment(self):
+        for phase in ("baseline", "candidate"):
+            self.plan[phase]["profile"]["libp2p_config"] = {"chain_id": 4476}
+        QUALIFY.validate_plan(self.plan)
+
+    def test_chain_deployment_rejects_capacity_overrides(self):
+        for phase in ("baseline", "candidate"):
+            self.plan[phase]["profile"]["libp2p_config"] = {"chain_id": 4476, "max_connections": 1000}
+        with self.assertRaisesRegex(ValueError, "only chain_id"):
+            QUALIFY.validate_plan(self.plan)
+
+    def test_mismatched_chain_deployment(self):
+        self.plan["baseline"]["profile"]["libp2p_config"] = {"chain_id": 4477}
+        self.plan["candidate"]["profile"]["libp2p_config"] = {"chain_id": 4476}
+        with self.assertRaisesRegex(ValueError, "same chain settings"):
+            QUALIFY.validate_plan(self.plan)
+
     def test_complete_fixture_and_cli(self):
         QUALIFY.validate_plan(self.plan)
         QUALIFY.validate_evidence(self.plan, self.run, "candidate")
