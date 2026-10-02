@@ -44,6 +44,13 @@ class ObservationTests(unittest.TestCase):
             observations.query(request, timeout=0)
         for _ in range(1024):
             observations.ingest("hub-2", entry(200, True))
+        observations.ingest("hub-2", entry(300, False))
+        self.assertEqual(len(observations.committee["hub-2"]), 1024)
+        self.assertFalse(observations.committee["hub-2"][-1]["record"]["fields"]["success"])
+        observations.query({"scenario": "committee_progress", "identity": "hub-2",
+                            "not_before_unix_us": 150})
+        for _ in range(32):
+            observations.ingest("hub-2", entry(400, True))
         with self.assertRaisesRegex(ValueError, "allocation exhausted"):
             observations.ingest("hub-2", entry(200, True))
         self.assertEqual(len(observations.committee["hub-2"]), 1024)
