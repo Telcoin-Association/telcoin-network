@@ -908,9 +908,8 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
     // ---- 1) Warm-up: one transfer per epoch until worker 0's fee clears `FEE_WARMUP_FLOOR`.
     // `test-source` sends every transfer, so its nonce must stay monotonic.
     let funded_key = get_key("test-source");
-    let mut nonce: u128 = 0;
     let mut last_gas_epoch: Option<(u32, u64)> = None;
-    for i in 0..FEE_WARMUP_MAX_EPOCHS {
+    for (i, nonce) in (0..FEE_WARMUP_MAX_EPOCHS).zip(0_u128..) {
         let next_epoch = last_gas_epoch.map_or(1, |(epoch, _)| epoch + 1);
         wait_for_epoch_at_least(&provider, next_epoch).await?;
         // Land on a MEASURED mid-epoch phase so the transaction clears both boundaries and the
@@ -925,7 +924,6 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
                     snap.epoch_id
                 )
             })?;
-        nonce += 1;
         info!(target: "restart-test", epoch = snap.epoch_id, block, fee, "fee warm-up epoch");
         last_gas_epoch = Some((snap.epoch_id, fee));
         if fee >= FEE_WARMUP_FLOOR {

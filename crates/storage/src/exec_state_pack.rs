@@ -24,7 +24,7 @@
 //! `Header` and `GenesisAccount` cannot survive it — their serde derives use
 //! `skip_serializing_if` and `alloy_serde::quantity`, which only round-trip through
 //! self-describing formats. So headers are stored in their canonical **RLP** form and
-//! accounts in a small primitive wire struct ([`AccountRecord`]); the public API still
+//! accounts in a small primitive wire struct (`AccountRecord`); the public API still
 //! speaks in [`ExecHeader`] / [`GenesisAccount`], converting at the boundary.
 //!
 //! ## Verification scope
@@ -36,7 +36,7 @@
 //! performed at import time, not here — `tn-storage` deliberately takes no reth/trie
 //! dependency.
 
-use std::{collections::BTreeMap, error::Error, fmt, fs::File, io, path::Path};
+use std::{collections::BTreeMap, error::Error, fmt, io, path::Path};
 
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
@@ -44,8 +44,7 @@ use tn_types::{Address, Bytes, ExecHeader, GenesisAccount, B256, U256};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
-    pack::{Pack, PackCompression},
-    pack_iter::PackIter,
+    pack::{Pack, PackCompression, RawIter},
 };
 
 /// Schema version stamped into the pack file's `DataHeader` (via [`Pack::open`]) and
@@ -110,8 +109,8 @@ pub struct ExecStateMeta {
 
 /// A single account plus its storage and code, mirroring the genesis-account shape so
 /// the import side can feed reth's genesis machinery directly. This is the public
-/// account type; on disk it is stored as a BCS-safe [`AccountRecord`] header followed by
-/// [`ExecStateRecord::Storage`] chunks, so storage of any size round-trips.
+/// account type; on disk it is stored as a BCS-safe `AccountRecord` header followed by
+/// `ExecStateRecord::Storage` chunks, so storage of any size round-trips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecStateAccount {
     /// Account address.
@@ -134,7 +133,7 @@ pub struct ExecStateStats {
 
 /// On-disk wire form of an account *header* — only primitive types that round-trip through the
 /// container's BCS codec. Balance is the account's [`U256`] as 32 big-endian bytes. Storage is NOT
-/// inline: it follows as zero or more [`ExecStateRecord::Storage`] chunks, so an account with
+/// inline: it follows as zero or more `ExecStateRecord::Storage` chunks, so an account with
 /// arbitrarily large storage never exceeds the container's per-record limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AccountRecord {
@@ -273,13 +272,18 @@ impl ExecStatePackWriter {
 
         let base = path.as_ref();
         std::fs::create_dir_all(base)?;
-        let mut data: Pack<ExecStateRecord> = Pack::open(
-            base.join(DATA_NAME),
-            0,
-            false,
-            PackCompression::ZStd,
-            EXEC_STATE_PACK_VERSION,
-        )?;
+        let data_path = base.join(DATA_NAME);
+        // `Pack::open` appends to an existing data file, so creating over a leftover pack (from an
+        // earlier or interrupted export) would publish a doubled bundle. Refuse it; an empty file
+        // (a crash before the first write) holds nothing and is reused.
+        if std::fs::metadata(&data_path).is_ok_and(|meta| meta.len() > 0) {
+            return Err(ExecStatePackError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("exec state pack already exists at {}", data_path.display()),
+            )));
+        }
+        let mut data: Pack<ExecStateRecord> =
+            Pack::open(&data_path, 0, false, PackCompression::ZStd, EXEC_STATE_PACK_VERSION)?;
 
         let meta = ExecStateMeta {
             state_root,
@@ -298,7 +302,7 @@ impl ExecStatePackWriter {
     /// Append one account (header + storage chunks) to the pack, updating the running tallies.
     ///
     /// The account's storage is split into [`STORAGE_CHUNK_SLOTS`]-sized
-    /// [`ExecStateRecord::Storage`] records so an account with arbitrarily large storage always
+    /// `ExecStateRecord::Storage` records so an account with arbitrarily large storage always
     /// stays under the container's per-record limit. Callers that must also bound *write*
     /// memory can drive [`append_account_header`](Self::append_account_header) +
     /// [`append_storage_chunk`](Self::append_storage_chunk) directly.
@@ -386,6 +390,11 @@ impl ExecStatePackWriter {
     pub fn finish(mut self) -> Result<ExecStateStats, ExecStatePackError> {
         Self::append(&mut self.data, &ExecStateRecord::End(self.stats))?;
         self.data.commit().map_err(|e| ExecStatePackError::Persist(e.to_string()))?;
+        // The write-once export is complete and committed; mark it consistent so the clean `Drop`
+        // seals it. `create` only ever starts from an absent or empty data file, which opens
+        // clean, so this is defensive. A failed commit returns early above, and a `write_failed`
+        // poison would still block the seal, so a torn export is never sealed.
+        self.data.mark_consistent();
         Ok(self.stats)
     }
 
@@ -406,7 +415,7 @@ impl ExecStatePackWriter {
 pub struct ExecStatePackReader {
     meta: ExecStateMeta,
     headers: Vec<ExecHeader>,
-    iter: PackIter<ExecStateRecord, File>,
+    iter: RawIter<ExecStateRecord>,
     /// One-record lookahead: the record that terminated the previous account's storage run.
     pending: Option<ExecStateRecord>,
     done: bool,
@@ -703,7 +712,7 @@ pub enum ExecStatePackError {
     TooManyHeaders {
         /// Header count declared by the pack meta.
         declared: u32,
-        /// Maximum accepted count ([`MAX_HEADER_COUNT`]).
+        /// Maximum accepted count (`MAX_HEADER_COUNT`).
         max: u32,
     },
     /// The pack declares fewer headers than the `BLOCKHASH` lookback floor for its tip block. A
@@ -1096,12 +1105,34 @@ mod test {
     }
 
     #[test]
+    fn create_refuses_an_existing_pack() {
+        let dir = TempDir::with_prefix("exec_state_create_twice").expect("temp dir");
+        let root = B256::from([1u8; 32]);
+        let mut writer =
+            ExecStatePackWriter::create(dir.path(), root, &[header(1, root)]).expect("create");
+        writer.append_account(&account(0xAA, 1, false)).expect("append");
+        writer.finish().expect("finish");
+        let before = std::fs::read(dir.path().join(DATA_NAME)).expect("read pack");
+
+        let err = ExecStatePackWriter::create(dir.path(), root, &[header(1, root)])
+            .expect_err("a second create over a finished pack must be refused");
+        assert!(
+            matches!(&err, ExecStatePackError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists),
+            "expected AlreadyExists, got {err}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(DATA_NAME)).expect("reread pack"),
+            before,
+            "a refused create must leave the existing pack untouched"
+        );
+    }
+
+    #[test]
     fn reader_stops_at_first_footer_ignoring_appended_bytes() {
-        // Safety net for findings #13/#14: `ExecStatePackWriter::create` opens the data file in
-        // APPEND mode, so writing into a dirty dir would produce a "doubled" pack (a full second
-        // pack after the first's `End` footer). The reader must terminate at the FIRST footer, so
-        // trailing prior-attempt bytes are inert and can never contribute wrong state to a
-        // recomputed root.
+        // Safety net behind `create`'s refusal to write over an existing pack: bytes appended
+        // after a pack's `End` footer (here a whole second pack, the "doubled" shape an
+        // append-mode writer over a dirty dir would leave) must be inert. The reader terminates at
+        // the FIRST footer, so they can never contribute wrong state to a recomputed root.
         let dir = TempDir::with_prefix("exec_state_doubled").expect("temp dir");
 
         // First (real) pack: meta + one header + account A + footer.
@@ -1112,11 +1143,25 @@ mod test {
         w1.append_account(&acct_a).expect("append A");
         w1.finish().expect("finish 1");
 
-        // Second `create` on the same dir APPENDS a whole second pack after the first's footer.
+        // A whole second pack appended after the first's footer, written through a raw
+        // append-mode handle (`create` itself refuses to write over an existing pack).
         let root2 = B256::from([2u8; 32]);
         let acct_b = account(0xBB, 1, false);
+        let snapshot2 = header(1, root2);
         let mut w2 =
-            ExecStatePackWriter::create(dir.path(), root2, &[header(1, root2)]).expect("create 2");
+            ExecStatePackWriter { data: open_raw(dir.path()), stats: ExecStateStats::default() };
+        let meta2 = ExecStateMeta {
+            state_root: root2,
+            block_number: snapshot2.number,
+            block_hash: snapshot2.hash_slow(),
+            header_count: 1,
+        };
+        ExecStatePackWriter::append(&mut w2.data, &ExecStateRecord::Meta(meta2)).expect("meta 2");
+        ExecStatePackWriter::append(
+            &mut w2.data,
+            &ExecStateRecord::Header(encode_header(&snapshot2)),
+        )
+        .expect("header 2");
         w2.append_account(&acct_b).expect("append B");
         w2.finish().expect("finish 2");
 

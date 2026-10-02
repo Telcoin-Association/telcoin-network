@@ -32,9 +32,6 @@ pub struct Config {
     /// The [Genesis] for the node.
     pub genesis: Genesis,
 
-    /// Deprecated compatibility flag with no effect. Node role follows committee membership.
-    pub observer: bool,
-
     /// Spawn ExEx tasks (and the ExEx manager) as critical tasks.
     ///
     /// Default `false`: ExExes run isolated and non-critical, so a stuck,
@@ -65,7 +62,6 @@ impl Config {
             node_info: Default::default(),
             parameters: Default::default(),
             genesis,
-            observer: false,
             exex_critical: false,
             version: "UNKNOWN",
         }
@@ -75,7 +71,6 @@ impl Config {
     /// Fallback to defaults if files are missing.
     pub fn load_or_default<P: TelcoinDirs>(
         tn_datadir: &P,
-        observer: bool,
         version: &'static str,
     ) -> eyre::Result<Self> {
         let node_info: NodeInfo =
@@ -87,15 +82,11 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info, parameters, genesis, observer, exex_critical: false, version })
+        Ok(Config { node_info, parameters, genesis, exex_critical: false, version })
     }
 
     /// Load a config from it's component parts.
-    pub fn load<P: TelcoinDirs>(
-        tn_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
+    pub fn load<P: TelcoinDirs>(tn_datadir: &P, version: &'static str) -> eyre::Result<Self> {
         let validator_info: NodeInfo =
             Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
         let parameters: Parameters =
@@ -103,22 +94,11 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config {
-            node_info: validator_info,
-            parameters,
-            genesis,
-            observer,
-            exex_critical: false,
-            version,
-        })
+        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
     /// Load a config from it's component parts.
-    pub fn load_adiri<P: TelcoinDirs>(
-        tn_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
+    pub fn load_adiri<P: TelcoinDirs>(tn_datadir: &P, version: &'static str) -> eyre::Result<Self> {
         let validator_info: NodeInfo =
             Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
         let parameters: Parameters =
@@ -132,20 +112,12 @@ impl Config {
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config {
-            node_info: validator_info,
-            parameters,
-            genesis,
-            observer,
-            exex_critical: false,
-            version,
-        })
+        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
     /// Load a config from it's component parts.
     pub fn load_mainnet<P: TelcoinDirs>(
         tn_datadir: &P,
-        observer: bool,
         version: &'static str,
     ) -> eyre::Result<Self> {
         let validator_info: NodeInfo =
@@ -161,14 +133,7 @@ impl Config {
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config {
-            node_info: validator_info,
-            parameters,
-            genesis,
-            observer,
-            exex_critical: false,
-            version,
-        })
+        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
     /// Update the authority protocol key.
@@ -280,8 +245,10 @@ pub struct Parameters {
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`; while the sub-second gate is dormant for the epoch
     /// it is rounded up to whole seconds, matching the voter) and below the 10 s libp2p request
-    /// timeout. The production `ConsensusConfig` constructors reject other values, so a node
-    /// refuses to start an epoch with one. Defaults to 5 s.
+    /// timeout. `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
+    /// it on entering any epoch it can still vote in, so it refuses to start such an epoch with
+    /// one. An epoch its committee has already closed is replayed without the check. Defaults to
+    /// 5 s.
     #[serde(with = "humantime_serde", default = "Parameters::default_vote_timeout")]
     pub vote_timeout: Duration,
 

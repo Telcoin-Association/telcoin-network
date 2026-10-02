@@ -41,7 +41,8 @@ use tn_reth::{
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use tn_rpc::{
-    EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
+    ConsensusStorageError, EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt,
+    TelcoinNetworkRpcExtApiServer as _,
 };
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
@@ -265,7 +266,7 @@ impl EngineToPrimary for NoopEngineToPrimary {
         &self,
         _epoch: Epoch,
         _digest: ConsensusHeaderDigest,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusStorageError> {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
 
@@ -279,7 +280,7 @@ impl EngineToPrimary for NoopEngineToPrimary {
 }
 
 /// `EngineToPrimaryRpc::consensus_header_by_digest` finds a stored header by (epoch, digest) and
-/// answers `None` for a digest the epoch never stored or an epoch whose pack this node lacks.
+/// answers `Ok(None)` for a digest the epoch never stored or an epoch whose pack this node lacks.
 #[tokio::test]
 async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("test_consensus_header_by_digest")?;
@@ -316,17 +317,17 @@ async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()>
 
     let found = rpc
         .consensus_header_by_digest(epoch, stored.digest())
-        .await
+        .await?
         .expect("stored header is found by its epoch and digest");
     assert_eq!(found.digest(), stored.digest());
     assert_eq!(found, stored);
 
     // the digest of the next header, which this chain has not stored
     let unknown = ConsensusHeader::digest_from_parts(stored.digest(), &stored.sub_dag, number + 1);
-    assert!(rpc.consensus_header_by_digest(epoch, unknown).await.is_none());
+    assert!(rpc.consensus_header_by_digest(epoch, unknown).await?.is_none());
 
     // a known digest routed to an epoch with no pack on disk is a miss, not a panic or a hit
-    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await.is_none());
+    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await?.is_none());
 
     Ok(())
 }
