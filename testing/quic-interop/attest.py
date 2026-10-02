@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,25 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASES = ("0.13.1", "0.14.0", "candidate")
+# Candidate source whose Retry argument the mutation step forces off.
+MUTATION_SOURCE = "testing/quic-interop/src/candidate.rs"
+# The listener's limit call, matched through any whitespace because rustfmt splits it across lines.
+RETRY_ANCHOR = re.compile(r"(\.apply\(\s*config,\s*)retry(,\s*Arc::clone\(&stats\),?\s*\);)")
+# One libtest summary line per test binary; the count is the number of tests that passed.
+PASSED = re.compile(r"^test result: ok\. (\d+) passed", re.MULTILINE)
+
+
+def disable_retry(source):
+    """Force the listener's Retry argument off, or fail if the anchor no longer matches once."""
+    mutated, count = RETRY_ANCHOR.subn(r"\1false\2", source)
+    if count != 1:
+        raise RuntimeError("mutation anchor changed; review the experiment")
+    return mutated
+
+
+def passed_tests(text):
+    """Total the passing tests in a libtest log, so a filter that selects nothing counts zero."""
+    return sum(int(count) for count in PASSED.findall(text))
 
 
 def load_module(name):
@@ -36,12 +56,18 @@ def run(args):
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     if dirty:
         raise ValueError("release qualification requires a clean committed candidate")
+    # Check the anchor before the long build and matrix steps, so drift fails in seconds.
+    mutated = disable_retry((ROOT / MUTATION_SOURCE).read_text())
     toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
     result = {"candidate": commit, "status": "running", "steps": [],
               "toolchain": toolchain, "cadence": "before feature release and on transport changes"}
 
-    def step(name, command, timeout=3600, success=True):
-        """Capture a finite command once, preserving failures and exact argv."""
+    def step(name, command, timeout=3600, success=True, tests=0):
+        """Capture a finite command once, preserving failures and exact argv.
+
+        A nonzero `tests` is the fewest libtest cases the command must pass, so a filter that
+        selects nothing fails instead of becoming a successful receipt.
+        """
         started = time.monotonic()
         log = output / f"{name}.log"
         failure = None
@@ -57,12 +83,16 @@ def run(args):
                    "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
         if failure is not None:
             receipt["error"] = repr(failure)
+        if tests:
+            receipt["tests_passed"] = passed_tests(log.read_text(errors="replace"))
         result["steps"].append(receipt)
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         if failure is not None:
             raise failure
         if success and code != 0:
             raise RuntimeError(f"{name} failed; see {log}")
+        if tests and receipt["tests_passed"] < tests:
+            raise RuntimeError(f"{name} passed {receipt['tests_passed']} tests, expected at least {tests}; see {log}")
         return code, log
 
     try:
@@ -87,13 +117,15 @@ def run(args):
                      "--dialer", str(binaries[dialer]), "--listener-release", listener,
                      "--dialer-release", dialer, "--output", str(output / f"matrix-{dialer}-{listener}")],
                      timeout=600)
+        # The test files sit under src/tests/ but are `#[path]` modules of `consensus`, so
+        # libtest names them `consensus::<module>::<test>`.
         step("node-scheduling", ["cargo", f"+{toolchain}", "test", "--locked", "-p",
              "tn-network-libp2p", "--target-dir", str(output / "builds/node"),
-             "--lib", "tests::loop_budget_tests", "-j", "2"])
+             "--lib", "consensus::loop_budget_tests::", "-j", "2"], tests=4)
         step("node-reconnect", ["cargo", f"+{toolchain}", "test", "--locked", "-p",
              "tn-network-libp2p", "--target-dir", str(output / "builds/node"),
-             "--lib", "tests::network_tests::test_score_decay_and_reconnection",
-             "-j", "2"])
+             "--lib", "-j", "2", "--", "--exact",
+             "consensus::network_tests::test_score_decay_and_reconnection"], tests=1)
         privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
         step("isolated-source", [*privileged, sys.executable, "-I",
              str(Path(__file__).with_name("isolated.py")), "run",
@@ -110,12 +142,7 @@ def run(args):
                 destination = copy / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, destination)
-            source = copy / "testing/quic-interop/src/candidate.rs"
-            original = source.read_text()
-            before = ".apply(config, retry, Arc::clone(&stats));"
-            if original.count(before) != 1:
-                raise RuntimeError("mutation anchor changed; review the experiment")
-            source.write_text(original.replace(before, ".apply(config, false, Arc::clone(&stats));"))
+            (copy / MUTATION_SOURCE).write_text(mutated)
             code, log = step("mutation-no-retry", ["cargo", f"+{toolchain}", "test", "--locked",
                  "--manifest-path", str(copy / "testing/quic-interop/releases/candidate/Cargo.toml"),
                  "--target-dir", str(output / "builds/mutation"), "--lib", "-j", "2"], success=False)

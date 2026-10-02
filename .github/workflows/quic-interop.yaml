@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Reject incomplete and failed release evidence
         run: python3 -I -m unittest discover -s testing/quic-interop -p 'test_*.py' -v
 
@@ -40,15 +40,17 @@ jobs:
       matrix:
         release: ["0.13.1", "0.14.0", "candidate"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the repository toolchain and Clippy
         run: |
           rustup show active-toolchain
           rustup component add clippy
-      - uses: Swatinem/rust-cache@v2
+      # Saves only on main (the weekly schedule or a dispatch); PR and queue runs restore.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: testing/quic-interop/releases/${{ matrix.release }}
           key: quic-${{ matrix.release }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check configuration mapping
         run: cargo test --locked --manifest-path testing/quic-interop/releases/${{ matrix.release }}/Cargo.toml
       - name: Lint fixture and configuration source
@@ -64,12 +66,12 @@ jobs:
           cargo tree --locked --manifest-path "testing/quic-interop/releases/$RELEASE/Cargo.toml" > evidence/dependencies.txt
           cp "testing/quic-interop/releases/$RELEASE/Cargo.lock" evidence/Cargo.lock
           git rev-parse HEAD > evidence/candidate.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quic-binary-${{ matrix.release }}
           path: testing/quic-interop/releases/${{ matrix.release }}/target/debug/quic-interop
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: quic-build-evidence-${{ matrix.release }}
@@ -87,11 +89,11 @@ jobs:
         dialer: ["0.13.1", "0.14.0", "candidate"]
         listener: ["0.13.1", "0.14.0", "candidate"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: quic-binary-*
           path: binaries
@@ -106,7 +108,7 @@ jobs:
             --dialer "$PWD/binaries/quic-binary-$DIALER/quic-interop" \
             --listener-release "$LISTENER" --dialer-release "$DIALER" \
             --output evidence
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: quic-results-${{ matrix.dialer }}-to-${{ matrix.listener }}
@@ -117,7 +119,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read nightly version
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
+      - name: Install nightly toolchain
+        run: rustup toolchain install $RUST_NIGHTLY -c rustfmt --profile minimal
       - name: Check the independent fixture sources
-        run: cargo +nightly fmt --manifest-path testing/quic-interop/releases/0.14.0/Cargo.toml -- --check
+        run: cargo +$RUST_NIGHTLY fmt --manifest-path testing/quic-interop/releases/0.14.0/Cargo.toml -- --check
