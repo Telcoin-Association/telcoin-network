@@ -19,6 +19,9 @@ SPEC = importlib.util.spec_from_file_location("hub_qualify", ROOT / "qualify.py"
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
 
+# Leave eight control-server slots for handlers finishing timed-out commands.
+MAX_ACTIVE_COMMANDS = 24
+
 
 def validate_manifest(plan, manifest):
     """Bind scenario commands and peer populations before launching any workload."""
@@ -167,6 +170,7 @@ def run(plan, manifest, output, origin):
     validate_manifest(plan, manifest)
     duration = plan["envelope"]["duration_seconds"]
     write_lock = threading.Lock()
+    command_slots = threading.BoundedSemaphore(MAX_ACTIVE_COMMANDS)
     with output.open("x") as stream:
         def record(entry):
             with write_lock:
@@ -195,11 +199,18 @@ def run(plan, manifest, output, origin):
                                 "rejection_reason": "driver_concurrency", "latency_ms": 0,
                                 "elapsed_seconds": time.monotonic() - origin})
                         continue
+                    if not command_slots.acquire(blocking=False):
+                        slots.release()
+                        record({"scenario": scenario, "id": operation_id, "success": False,
+                                "rejection_reason": "driver_capacity", "latency_ms": 0,
+                                "elapsed_seconds": time.monotonic() - origin})
+                        continue
 
                     def attempt(agent=agent, operation_id=operation_id):
                         try:
                             record(execute(agent, scenario, operation_id, origin, 30))
                         finally:
+                            command_slots.release()
                             slots.release()
 
                     futures.append(executor.submit(attempt))

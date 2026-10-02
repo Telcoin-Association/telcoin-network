@@ -644,7 +644,9 @@ impl PeerManager {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
-    /// Process new connection and return boolean indicating if the peer limit was reached.
+    /// Check whether a newly registered connection exceeds the ordinary population ceiling.
+    ///
+    /// The established count includes this connection. Pending dials use transport budgets.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
         debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
         self.public_peer_limit.map_or_else(
@@ -657,11 +659,8 @@ impl PeerManager {
                 }
             },
             |limit| {
-                self.connected_or_dialing_peers()
-                    .iter()
-                    .filter(|peer| !self.peer_is_important(peer))
-                    .count()
-                    >= limit.get()
+                self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count()
+                    > limit.get()
             },
         )
     }
@@ -681,6 +680,11 @@ impl PeerManager {
     pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         trace!(target: "peer-manager", "all peers:\n{:?}", self.peers);
         self.peers.connected_or_dialing_peers()
+    }
+
+    /// Return authenticated peers with an established connection, excluding pending dials.
+    pub(crate) fn connected_peers(&self) -> Vec<PeerId> {
+        self.peers.connected_peer_ids().collect()
     }
 
     /// Record an inbound `AddProvider` from `provider` and report whether it

@@ -676,7 +676,7 @@ where
         count.await.map_err(Into::into)
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Retrieve authenticated peers with established connections, excluding pending dials.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;

@@ -71,11 +71,37 @@ async fn public_peer_limit_preserves_protected_headroom() {
     assert!(!manager.peer_limit_reached(&endpoint));
     assert!(manager.register_peer_connection(
         &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
         ConnectionType::IncomingConnection { multiaddr: address },
     ));
     assert!(manager.peer_limit_reached(&endpoint));
     manager.set_public_peer_limit(None);
     assert!(!manager.peer_limit_reached(&endpoint));
+}
+
+/// Pending dials do not consume established public slots or appear as live connections.
+#[tokio::test]
+async fn public_peer_limit_excludes_pending_dials() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    manager.register_dial_attempt(PeerId::random(), None);
+    manager.register_dial_attempt(PeerId::random(), None);
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.connected_peers().is_empty());
+    let established = PeerId::random();
+    assert!(manager.register_peer_connection(
+        &established,
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert_eq!(manager.connected_peers(), vec![established]);
 }
 
 /// DAO connectivity follows the declared identity rather than any other protected connection.

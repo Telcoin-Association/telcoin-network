@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,6 +18,43 @@ SPEC.loader.exec_module(WORKLOAD)
 
 
 class WorkloadTests(unittest.TestCase):
+    def test_total_driver_capacity_preserves_refused_attempts(self):
+        active = peak = 0
+        lock = threading.Lock()
+
+        def execute(_agent, scenario, operation_id, origin, _timeout):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.1)
+            with lock:
+                active -= 1
+            return {"scenario": scenario, "id": operation_id, "success": False,
+                    "rejection_reason": "synthetic refusal", "latency_ms": 100,
+                    "elapsed_seconds": time.monotonic() - origin}
+
+        with tempfile.TemporaryDirectory() as directory:
+            topology = Path(directory) / "topology.json"
+            topology.write_text('{"synthetic":true}')
+            manifest = {"topology_artifact": str(topology), "scenarios": {
+                scenario: {"concurrency": 16, "burst_size": 16, "agents": [
+                    {"identity": "synthetic", "argv": ["synthetic"]}
+                ]} for scenario in WORKLOAD.QUALIFY.SCENARIOS}}
+            plan = {"envelope": {"duration_seconds": 0.03, "public_peers": 1,
+                                 "shared_nat_peers": 1, "dao_observers": 1},
+                    "thresholds": {"scenarios": {scenario: {"minimum_attempts": 16}
+                                                  for scenario in WORKLOAD.QUALIFY.SCENARIOS}}}
+            output = Path(directory) / "operations.jsonl"
+            with patch.object(WORKLOAD, "MAX_ACTIVE_COMMANDS", 4), patch.object(WORKLOAD, "execute", execute):
+                WORKLOAD.run(plan, manifest, output, time.monotonic())
+            operations = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertLessEqual(peak, 4)
+            self.assertGreater(peak, 1)
+            self.assertEqual(len(operations), 129)
+            self.assertEqual(len({(entry["scenario"], entry["id"]) for entry in operations}), 129)
+            self.assertTrue(any(entry["rejection_reason"] == "driver_capacity" for entry in operations))
+
     def test_agent_nonce_route_and_refusals(self):
         script = (
             "import json, os, time; published = time.time_ns() // 1000; print(json.dumps({'operation_id': os.environ['HUB_CAPACITY_OPERATION_ID'],"

@@ -1281,7 +1281,7 @@ where
                     .swarm
                     .behaviour()
                     .peer_manager
-                    .connected_or_dialing_peers()
+                    .connected_peers()
                     .iter()
                     .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
                     .collect();
