@@ -3,6 +3,7 @@
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
+    mesh::{ConfiguredPeerKind, MeshPeerChange, MeshPeerIdentity, MeshPolicy},
     peer::MAX_MULTIADDRS_PER_PEER,
     score::init_peer_score_config,
     status::NewConnectionStatus,
@@ -180,6 +181,8 @@ pub(crate) struct PeerManager {
     /// [`Self::prune_known_peers`] can drop rotated-out members without touching
     /// operator-provisioned peers.
     pinned_peers: HashSet<BlsPublicKey>,
+    /// Independent configured mesh reasons and the explicit-peer set last applied to gossipsub.
+    mesh_policy: MeshPolicy<BlsPublicKey, PeerId>,
     /// BLS keys whose `known_peers` entry is a config-derived dial hint, not a network-learned
     /// advertisement record.
     ///
@@ -279,6 +282,7 @@ impl PeerManager {
             peers,
             known_peers: Default::default(),
             pinned_peers: Default::default(),
+            mesh_policy: Default::default(),
             stub_records: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
@@ -293,7 +297,8 @@ impl PeerManager {
     /// Explicitly add a "trusted" peer and dial it.
     ///
     /// These peers are considered "trusted" and do not receive penalties.
-    /// This does not unban ips and should only be called during initialization.
+    /// Reloading the same mapping preserves its verified record and live connection. A new
+    /// configuration hint receives no gossip pin until its signed record is learned.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
         bls_key: BlsPublicKey,
@@ -311,8 +316,8 @@ impl PeerManager {
         // trusted peers are operator-provisioned; pin so committee rotation never evicts them.
         // the entry is a config stub until the peer's own signed record replaces it
         self.pinned_peers.insert(bls_key);
-        self.stub_records.insert(bls_key);
-        self.known_peers.insert(bls_key, info);
+        self.mesh_policy.configure(bls_key, ConfiguredPeerKind::Trusted);
+        self.cache_configured_peer(bls_key, info);
 
         self.dial_peer(peer_id, multiaddr, Some(reply));
     }
@@ -929,6 +934,7 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        self.queue_mesh_reconciliation();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -1011,8 +1017,8 @@ impl PeerManager {
     /// signed record.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
-        self.cache_known_peer(bls_key, info);
-        self.stub_records.insert(bls_key);
+        self.mesh_policy.configure(bls_key, ConfiguredPeerKind::Explicit);
+        self.cache_configured_peer(bls_key, info);
     }
 
     /// Add a peer record restored from the persisted kad store at startup, WITHOUT pinning it.
@@ -1041,10 +1047,72 @@ impl PeerManager {
     /// learned.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
+        self.mesh_policy.configure(bls_key, ConfiguredPeerKind::Bootstrap);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
             self.stub_records.insert(bls_key);
         }
+        self.queue_mesh_reconciliation();
+    }
+
+    /// Remove one configured reason, preserving other reasons and committee membership.
+    pub(crate) fn remove_configured_peer(
+        &mut self,
+        bls_key: BlsPublicKey,
+        kind: ConfiguredPeerKind,
+    ) {
+        self.mesh_policy.remove_configured(&bls_key, kind);
+        if kind == ConfiguredPeerKind::Trusted {
+            self.peers.remove_operator_trust(bls_key);
+        }
+        if !self.mesh_policy.is_configured(&bls_key) {
+            self.pinned_peers.remove(&bls_key);
+        }
+        self.prune_known_peers();
+        self.queue_mesh_reconciliation();
+    }
+
+    /// Cache a configuration hint without downgrading the same identity's verified record.
+    fn cache_configured_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        let already_verified = !self.stub_records.contains(&bls_key)
+            && self.known_peers.get(&bls_key).is_some_and(|known| known.pubkey == info.pubkey);
+        if !already_verified {
+            self.cache_known_peer(bls_key, info);
+            self.stub_records.insert(bls_key);
+        }
+        self.queue_mesh_reconciliation();
+    }
+
+    /// Coalesce notifications, resolving the desired set when the swarm consumes the event.
+    fn queue_mesh_reconciliation(&mut self) {
+        if !self.events.iter().any(|event| matches!(event, PeerEvent::ReconcileExplicitPeers)) {
+            self.events.push_back(PeerEvent::ReconcileExplicitPeers);
+        }
+    }
+
+    /// Recompute gossip pins from verified records and the full current retention union.
+    ///
+    /// Config stubs and unresolved live connections never receive a pin. Disconnected required
+    /// peers keep theirs so gossipsub can reconnect them. The previous committee retains its pin
+    /// only while its key remains in the previous slot.
+    pub(crate) fn reconcile_explicit_peers(&mut self) -> Vec<MeshPeerChange<PeerId>> {
+        let mappings = self.known_peers.iter().map(|(key, info)| {
+            let peer_id = info.pubkey.clone().into();
+            let identity = if self.stub_records.contains(key) {
+                MeshPeerIdentity::Unverified(peer_id)
+            } else {
+                MeshPeerIdentity::Verified(peer_id)
+            };
+            (*key, identity)
+        });
+        let peers = &self.peers;
+        self.mesh_policy.reconcile(mappings, |key| peers.is_committee_member(key))
+    }
+
+    /// Read the applied mesh-pin set for swarm-level regression tests.
+    #[cfg(test)]
+    pub(crate) fn explicit_peer_ids(&self) -> HashSet<PeerId> {
+        self.mesh_policy.explicit_peer_ids()
     }
 
     /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
@@ -1246,6 +1314,9 @@ impl PeerManager {
         }
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+        if self.mesh_policy.has_kind(&bls_key, ConfiguredPeerKind::Trusted) {
+            self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
+        }
         self.known_peers.insert(bls_key, info);
         self.stub_records.remove(&bls_key);
         // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
@@ -1254,6 +1325,7 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        self.queue_mesh_reconciliation();
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.

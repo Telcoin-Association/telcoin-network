@@ -186,7 +186,8 @@ impl AllPeers {
 
     /// Create a peer that is "trusted".
     ///
-    /// This overwrites peer records and unbans ips.
+    /// Preserve live connection state for an unchanged mapping. A replacement mapping displaces
+    /// the old record and releases its status bookkeeping.
     pub(super) fn add_trusted_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -195,18 +196,35 @@ impl AllPeers {
         let peer_id: PeerId = network_key.clone().into();
         let confirmed = PeerIdentity::Confirmed(bls_public_key);
         let current = self.identity_for(&peer_id);
-        // overwrite any prior record: anonymous under this peer id, confirmed under a different
-        // bls key that previously presented this network key, or confirmed under a previous
-        // network key; each displaced record is removed through `evict` / released so no
-        // `bls_by_peer_id` entry or status counter goes stale
-        if let Some(displaced) = (current != confirmed).then(|| self.evict(&current)).flatten() {
-            self.release_displaced_record(&displaced);
+        if current == confirmed
+            && self.peers.get(&confirmed).is_some_and(|peer| !peer.reputation().banned())
+        {
+            // A trust reload for the same mapping preserves the already-live connection.
+            let _ = self.peers.get_mut(&confirmed).map(Peer::grant_operator_trust);
+        } else {
+            // overwrite any prior record: anonymous under this peer id, confirmed under a different
+            // bls key that previously presented this network key, or confirmed under a previous
+            // network key; each displaced record is removed through `evict` / released so no
+            // `bls_by_peer_id` entry or status counter goes stale
+            (current != confirmed)
+                .then(|| self.evict(&current))
+                .flatten()
+                .into_iter()
+                .for_each(|displaced| self.release_displaced_record(&displaced));
+            self.evict(&confirmed)
+                .into_iter()
+                .for_each(|displaced| self.release_displaced_record(&displaced));
+            self.bls_by_peer_id.insert(peer_id, bls_public_key);
+            self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
         }
-        if let Some(displaced) = self.evict(&confirmed) {
-            self.release_displaced_record(&displaced);
-        }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
+    }
+
+    /// Revoke operator trust without removing the peer or its committee reasons.
+    pub(super) fn remove_operator_trust(&mut self, bls_public_key: BlsPublicKey) {
+        let _ = self
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .map(Peer::revoke_operator_trust);
     }
 
     /// Create a peer.
