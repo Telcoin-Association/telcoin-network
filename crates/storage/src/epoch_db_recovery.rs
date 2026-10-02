@@ -3,123 +3,99 @@
 //! The epoch database holds the working consensus state of the epoch in progress (the
 //! `TableHint::Epoch` tables in [`crate::tables`]), and the node clears it at every epoch
 //! boundary. Opening it loads every row into memory through the panicking `decode` that all typed
-//! read paths use, so a row this binary cannot decode crash-loops the node at startup. `Header` is
-//! the only fork-gated type these tables store, directly in `LastProposed` and inside a
-//! `Certificate` in `Certificates` and `ProposedCertificates`. A binary with a different header
-//! layout for an epoch writes rows this binary cannot decode, for example a validator that ran
-//! past a fork epoch on the old binary and was upgraded afterwards. The check here finds such rows
-//! with a fallible decode before that load and discards the tables that hold them.
+//! read paths use. `Header` is the only fork-gated type these tables store, directly in
+//! `LastProposed` and inside a `Certificate` in `Certificates` and `ProposedCertificates`, so the
+//! check here decodes those three tables with a fallible decode before that load.
+//!
+//! Exactly one kind of undecodable row is removed: the header a validator proposed for a
+//! sub-second fork epoch while it still ran a binary without the sub-second layout, found when it
+//! restarts on the upgraded binary. Any other undecodable row stops the open with an error that
+//! names it, because `LastProposed` and `ProposedCertificates` are records the proposer and the
+//! certifier stop the node for rather than run without.
 
 use tn_types::{
-    encoded_size, try_decode, try_decode_key, AuthorityIdentifier, Database, DbTxMut as _, Epoch,
-    Round, Table,
+    encoded_size, forks::subsecond_timestamp_active, try_decode, try_decode_key,
+    AuthorityIdentifier, Database, DbTxMut as _, Epoch, Header, Round, Table,
 };
 
-use crate::tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-    ProposedCertificates,
-};
+use crate::tables::{Certificates, LastProposed, ProposedCertificates};
 
-/// Clear each header-bearing epoch table of `epoch_db` that holds a row this binary cannot
-/// decode.
+/// Remove the seconds-only header this node proposed for a sub-second fork epoch from
+/// `LastProposed`, and fail on any other row of a header-bearing epoch table that this binary
+/// cannot decode.
 ///
 /// Must run on the raw backend before it is wrapped in a
 /// [`LayeredDatabase`](crate::layered_db::LayeredDatabase), whose full-memory load panics on the
-/// first such row. Each table holding undecodable rows is logged at error level and returned; an
-/// empty list means nothing was cleared.
+/// first undecodable row. All three tables are checked before anything is removed, so an error
+/// leaves the database as it was. Returns the removed rows, logged at error level, or `None` when
+/// nothing was removed.
 ///
-/// `Certificates` is cleared together with its two digest indexes, which keeps the certificate
-/// store consistent and causally complete. `Votes` is never cleared: it is the node's durable
-/// record of the votes it signed, peers cannot rebuild it, and its layout is not fork-gated.
-pub(crate) fn discard_undecodable_header_tables<DB: RawRows>(
+/// # Errors
+///
+/// Returns an error naming the table, key, epoch and decode error of the first undecodable row
+/// that is not such a header, for example after disk corruption or a serialization bug.
+pub(crate) fn discard_seconds_only_proposal<DB: RawRows>(
     epoch_db: &DB,
-) -> eyre::Result<Vec<UndecodableTable>> {
-    let last_proposed = scan_table::<LastProposed, _>(epoch_db)?;
-    let certificates = scan_table::<Certificates, _>(epoch_db)?;
-    let proposed_certificates = scan_table::<ProposedCertificates, _>(epoch_db)?;
-    let (clear_last_proposed, clear_certificates, clear_proposed_certificates) =
-        (last_proposed.is_some(), certificates.is_some(), proposed_certificates.is_some());
-    let reports: Vec<UndecodableTable> =
-        [last_proposed, certificates, proposed_certificates].into_iter().flatten().collect();
-    if reports.is_empty() {
-        return Ok(reports);
-    }
+) -> eyre::Result<Option<UndecodableTable>> {
+    let stale = scan_table::<LastProposed, _>(epoch_db, is_seconds_only_fork_header)?;
+    // a stale binary never stores a fork-epoch certificate (its own needs votes from peers that
+    // cannot decode its header, and theirs do not decode on it), so nothing here is removed. an
+    // undecodable row here would stop the full-memory load as well; checking first names the row
+    // in the error and keeps the `LastProposed` removal from happening before that stop
+    scan_table::<Certificates, _>(epoch_db, |_| false)?;
+    scan_table::<ProposedCertificates, _>(epoch_db, |_| false)?;
+    let Some(Discard { report, keys }) = stale else {
+        return Ok(None);
+    };
 
-    for report in &reports {
-        tracing::error!(
-            target: "tn::storage",
-            table = %report.table,
-            epoch = ?report.epoch,
-            key = %report.key,
-            rows = report.rows,
-            error = %report.error,
-            "epoch table holds headers this binary cannot decode, likely written by a binary \
-             with a different header layout for this epoch (a validator that ran past a fork \
-             epoch before upgrading)"
-        );
-    }
+    tracing::error!(
+        target: "tn::storage",
+        table = %report.table,
+        epoch = ?report.epoch,
+        key = %report.key,
+        rows = report.rows,
+        error = %report.error,
+        "epoch table holds headers this binary cannot decode, likely written by a binary with a \
+         different header layout for this epoch (a validator that ran past a fork epoch before \
+         upgrading)"
+    );
 
-    // discarding these rows cannot make the node equivocate:
-    // - `LastProposed`: when the row is a header from a binary with a different layout for its
-    //   epoch, it was never certified. a header digest hashes the epoch's wire layout and no peer
-    //   on this binary's layout can decode the row, so none voted for it, and a header this binary
-    //   proposes for that round is the only one those peers see. the proposer also runs only once
-    //   the node is an active committee member again, by which time catch-up has normally moved
-    //   `primary_round` past that round. for any other cause, a second header for the round is no
-    //   worse than an equivocating author: two certificates for one author and round need two
-    //   quorums, which share an honest voter whose `Votes` guard refuses the second vote.
-    // - `Certificates`, its indexes and `ProposedCertificates`: certificates are quorum-signed
-    //   public data. the node fetches missing ones from its peers, and the certifier re-requests
-    //   votes for its own header, which voters answer with the vote they already signed.
-    //
-    // the unscanned index tables must exist to be cleared, and opening a table takes a write
-    // transaction of its own, so this happens before the clearing one begins
-    epoch_db.open_table::<CertificateDigestByRound>()?;
-    epoch_db.open_table::<CertificateDigestByOrigin>()?;
-    let mut cleared = Vec::new();
+    // removing the row cannot make the node equivocate. it holds the header this node proposed
+    // for a fork-epoch round before it upgraded, and that header's digest hashes the
+    // seconds-only bytes. no peer on the sub-second layout can decode it, so none of them voted
+    // for it. a peer still on the older binary may have, and once upgraded that peer's `Votes`
+    // guard refuses any other header from this author for the round, so at most one header for
+    // the round is ever certified, at worst costing this author the round. the proposer also
+    // runs only once the node is an active committee member again, by which time catch-up has
+    // normally moved `primary_round` past that round.
     let mut txn = epoch_db.write_txn()?;
-    if clear_last_proposed {
-        txn.clear_table::<LastProposed>()?;
-        cleared.push(LastProposed::NAME);
-    }
-    if clear_certificates {
-        txn.clear_table::<Certificates>()?;
-        txn.clear_table::<CertificateDigestByRound>()?;
-        txn.clear_table::<CertificateDigestByOrigin>()?;
-        cleared.extend([
-            Certificates::NAME,
-            CertificateDigestByRound::NAME,
-            CertificateDigestByOrigin::NAME,
-        ]);
-    }
-    if clear_proposed_certificates {
-        txn.clear_table::<ProposedCertificates>()?;
-        cleared.push(ProposedCertificates::NAME);
+    for key in &keys {
+        txn.remove::<LastProposed>(key)?;
     }
     txn.commit()?;
 
     tracing::warn!(
         target: "tn::storage",
-        tables = ?cleared,
-        "discarded undecodable epoch state: cleared these epoch tables, the node fetches the \
-         epoch's certificates from its peers"
+        table = LastProposed::NAME,
+        rows = keys.len(),
+        "discarded undecodable epoch state: removed the header this node proposed for a \
+         sub-second fork epoch before upgrading, which no peer on this binary's layout can decode"
     );
-    Ok(reports)
+    Ok(Some(report))
 }
 
-/// An epoch table that holds rows this binary cannot decode.
+/// Undecodable rows of an epoch table, described by the first of them.
 #[derive(Debug)]
 pub(crate) struct UndecodableTable {
     /// The table's name.
     pub(crate) table: &'static str,
-    /// The key of the first undecodable row, decoded if possible, else its raw bytes.
+    /// The key of the first row, decoded if possible, else its raw bytes.
     pub(crate) key: String,
-    /// The epoch of the header the first undecodable row starts with, if its leading fields
-    /// decode.
+    /// The epoch of the header the first row starts with, if its leading fields decode.
     pub(crate) epoch: Option<Epoch>,
-    /// The decode error of the first undecodable row.
+    /// The decode error of the first row.
     pub(crate) error: String,
-    /// The number of undecodable rows in the table.
+    /// The number of rows.
     pub(crate) rows: usize,
 }
 
@@ -133,13 +109,27 @@ pub(crate) trait RawRows: Database {
     fn insert_raw_row<T: Table>(&self, key: &[u8], value: &[u8]) -> eyre::Result<()>;
 }
 
+/// Undecodable rows of a table that may be removed.
+struct Discard<K> {
+    /// The rows, for the log.
+    report: UndecodableTable,
+    /// The keys of the rows.
+    keys: Vec<K>,
+}
+
 /// Open `T` in `db` and scan its rows with a fallible decode.
 ///
-/// `T`'s values must start with a header, which is where the reported epoch is read from.
-fn scan_table<T: Table, DB: RawRows>(db: &DB) -> eyre::Result<Option<UndecodableTable>> {
+/// An undecodable row whose key decodes and whose value bytes satisfy `discardable` is returned
+/// for removal; any other undecodable row is an error. `T`'s values must start with a header,
+/// which is where the reported epoch is read from.
+fn scan_table<T: Table, DB: RawRows>(
+    db: &DB,
+    discardable: impl Fn(&[u8]) -> bool,
+) -> eyre::Result<Option<Discard<T::Key>>> {
     // a fresh database has no tables yet and the raw scan needs them
     db.open_table::<T>()?;
-    let mut report: Option<UndecodableTable> = None;
+    let mut discard: Option<Discard<T::Key>> = None;
+    let mut refused: Option<UndecodableTable> = None;
     db.for_each_raw_row::<T>(|key, value| {
         let decoded_key = try_decode_key::<T::Key>(key);
         let error = match (&decoded_key, try_decode::<T::Value>(value)) {
@@ -147,19 +137,59 @@ fn scan_table<T: Table, DB: RawRows>(db: &DB) -> eyre::Result<Option<Undecodable
             (Err(e), _) => e.to_string(),
             (Ok(_), Err(e)) => e.to_string(),
         };
-        if let Some(first) = report.as_mut() {
-            first.rows += 1;
-            return;
-        }
-        report = Some(UndecodableTable {
+        let row = || UndecodableTable {
             table: T::NAME,
-            key: decoded_key.map_or_else(|_| format!("{key:02x?}"), |k| format!("{k:?}")),
+            key: decoded_key
+                .as_ref()
+                .map_or_else(|_| format!("{key:02x?}"), |decoded| format!("{decoded:?}")),
             epoch: leading_header_epoch(value),
             error,
             rows: 1,
-        });
+        };
+        match &decoded_key {
+            Ok(decoded) if discardable(value) => match discard.as_mut() {
+                Some(found) => {
+                    found.report.rows += 1;
+                    found.keys.push(decoded.clone());
+                }
+                None => discard = Some(Discard { report: row(), keys: vec![decoded.clone()] }),
+            },
+            _ => match refused.as_mut() {
+                Some(first) => first.rows += 1,
+                None => refused = Some(row()),
+            },
+        }
     })?;
-    Ok(report)
+
+    if let Some(row) = refused {
+        let epoch = row.epoch.map_or_else(|| "unknown".to_owned(), |epoch| epoch.to_string());
+        eyre::bail!(
+            "epoch table {} holds {} row(s) this binary cannot decode, the first at key {} with \
+             header epoch {} ({}); only a header this node proposed for a sub-second fork epoch \
+             on a binary without that layout is discarded at startup and this row is not one, so \
+             the node stops instead of running without it (the epoch database may be corrupt)",
+            row.table,
+            row.rows,
+            row.key,
+            epoch,
+            row.error
+        );
+    }
+    Ok(discard)
+}
+
+/// Whether `value` is a header of a sub-second fork epoch in the seconds-only layout, as a binary
+/// from before that fork stores it.
+///
+/// The sub-second layout is the seconds-only one plus a trailing two-byte `created_at_millis`,
+/// written and read only when [`subsecond_timestamp_active`] holds for the header's own epoch
+/// (`HeaderRef::serialize` and the `Header` decoder in `tn_types::primary::header`). Such a
+/// header therefore decodes once two bytes are appended. The epoch check is what separates it
+/// from a header of an earlier epoch that lost two trailing zero bytes, which decodes the same
+/// way because that epoch's decoder never reads the field.
+fn is_seconds_only_fork_header(value: &[u8]) -> bool {
+    leading_header_epoch(value).is_some_and(subsecond_timestamp_active)
+        && try_decode::<Header>(&[value, [0; 2].as_slice()].concat()).is_ok()
 }
 
 /// The epoch of the header `value` starts with, read from the leading author, round and epoch
@@ -178,12 +208,15 @@ fn leading_header_epoch(value: &[u8]) -> Option<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{tables::Votes, ReDB, LAST_PROPOSAL_KEY};
+    use crate::{
+        tables::{CertificateDigestByOrigin, CertificateDigestByRound, Votes},
+        ReDB, LAST_PROPOSAL_KEY,
+    };
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        encode, encode_key, forks::subsecond_timestamp_active, BlsKeypair, Certificate, Header,
-        HeaderBuilder, Signer as _, TimestampMs, VoteDigest, VoteInfo,
+        encode, encode_key, BlsKeypair, Certificate, HeaderBuilder, HeaderDigest, Signer as _,
+        TimestampMs, VoteDigest, VoteInfo,
     };
 
     /// An epoch whose headers carry the sub-second layout in this build: 10 where the fork is
@@ -224,17 +257,40 @@ mod tests {
         bytes
     }
 
+    /// The leading author, round and epoch fields of a sub-second fork-epoch header followed by
+    /// bytes that do not decode as the rest of a header in any layout.
+    ///
+    /// Its epoch passes the fork check, so only the layout check stands between it and removal.
+    fn fork_epoch_garbage() -> Vec<u8> {
+        let header = header(subsecond_epoch());
+        let prefix = encoded_size(&(header.author().clone(), header.round(), header.epoch()))
+            .expect("prefix size");
+        let mut bytes = encode(&header);
+        bytes.truncate(prefix);
+        bytes.extend([0xff; 24]);
+        assert_eq!(leading_header_epoch(&bytes), Some(subsecond_epoch()));
+        assert!(try_decode::<Header>(&[bytes.as_slice(), [0; 2].as_slice()].concat()).is_err());
+        bytes
+    }
+
     fn vote_info(epoch: Epoch) -> VoteInfo {
         VoteInfo { epoch, round: 1, vote_digest: VoteDigest::new([5; 32]) }
     }
 
-    fn row_count<T: Table, DB: RawRows>(db: &DB) -> usize {
-        let mut rows = 0;
-        db.for_each_raw_row::<T>(|_, _| rows += 1).unwrap();
+    fn raw_rows<T: Table, DB: RawRows>(db: &DB) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut rows = Vec::new();
+        db.for_each_raw_row::<T>(|key, value| rows.push((key.to_vec(), value.to_vec()))).unwrap();
         rows
     }
 
-    /// A pre-fork `LastProposed` header is reported with its table and epoch and cleared, while
+    /// The error the check returns for `db`, as text.
+    fn refusal<DB: RawRows>(db: &DB) -> String {
+        discard_seconds_only_proposal(db)
+            .expect_err("an undecodable row other than a seconds-only fork-epoch proposal")
+            .to_string()
+    }
+
+    /// A pre-fork `LastProposed` header is reported with its table and epoch and removed, while
     /// `Votes` and the decodable `Certificates` row are kept.
     fn assert_discards_pre_fork_header<DB: RawRows>(db: &DB) {
         let epoch = subsecond_epoch();
@@ -250,21 +306,25 @@ mod tests {
         db.insert::<Certificates>(&header.digest(), &certificate).unwrap();
         db.insert_raw_row::<LastProposed>(&encode_key(&LAST_PROPOSAL_KEY), &bytes).unwrap();
 
-        let reports = discard_undecodable_header_tables(db).unwrap();
+        let report = discard_seconds_only_proposal(db).unwrap().expect("the header is removed");
 
-        assert_eq!(reports.len(), 1, "{reports:?}");
-        assert_eq!(reports[0].table, LastProposed::NAME);
-        assert_eq!(reports[0].epoch, Some(epoch));
-        assert_eq!(reports[0].rows, 1);
-        assert_eq!(reports[0].key, format!("{LAST_PROPOSAL_KEY:?}"));
-        assert_eq!(row_count::<LastProposed, _>(db), 0);
+        assert_eq!(report.table, LastProposed::NAME);
+        assert_eq!(report.epoch, Some(epoch));
+        assert_eq!(report.rows, 1);
+        assert_eq!(report.key, format!("{LAST_PROPOSAL_KEY:?}"));
+        assert!(raw_rows::<LastProposed, _>(db).is_empty());
         assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
         assert_eq!(db.get::<Certificates>(&header.digest()).unwrap(), Some(certificate));
+        assert!(discard_seconds_only_proposal(db).unwrap().is_none());
     }
 
-    /// A pre-fork certificate clears `Certificates` and both digest indexes, and keeps the
-    /// decodable `LastProposed` header.
-    fn assert_discards_pre_fork_certificate<DB: RawRows>(db: &DB) {
+    /// A pre-fork certificate in `T` is refused with its table, key and epoch, and nothing is
+    /// removed: not the row, the digest indexes or the decodable `LastProposed` header.
+    fn assert_refuses_pre_fork_certificate<T, DB>(db: &DB)
+    where
+        T: Table<Key = HeaderDigest, Value = Certificate>,
+        DB: RawRows,
+    {
         let epoch = subsecond_epoch();
         let header = header(epoch);
         let bytes = pre_fork_bytes(&certificate(header.clone()), &header);
@@ -272,24 +332,66 @@ mod tests {
         let digest = header.digest();
         let author = header.author().clone();
         db.open_table::<LastProposed>().unwrap();
-        db.open_table::<Certificates>().unwrap();
         db.open_table::<CertificateDigestByRound>().unwrap();
         db.open_table::<CertificateDigestByOrigin>().unwrap();
+        db.open_table::<T>().unwrap();
         db.insert::<LastProposed>(&LAST_PROPOSAL_KEY, &header).unwrap();
         db.insert::<CertificateDigestByRound>(&(1, author.clone()), &digest).unwrap();
         db.insert::<CertificateDigestByOrigin>(&(author, 1), &digest).unwrap();
-        db.insert_raw_row::<Certificates>(&encode_key(&digest), &bytes).unwrap();
+        db.insert_raw_row::<T>(&encode_key(&digest), &bytes).unwrap();
 
-        let reports = discard_undecodable_header_tables(db).unwrap();
+        let error = refusal(db);
 
-        assert_eq!(reports.len(), 1, "{reports:?}");
-        assert_eq!(reports[0].table, Certificates::NAME);
-        assert_eq!(reports[0].epoch, Some(epoch));
-        assert_eq!(reports[0].key, format!("{digest:?}"));
-        assert_eq!(row_count::<Certificates, _>(db), 0);
-        assert_eq!(row_count::<CertificateDigestByRound, _>(db), 0);
-        assert_eq!(row_count::<CertificateDigestByOrigin, _>(db), 0);
+        let expected = format!("epoch table {} holds 1 row(s) this binary cannot decode", T::NAME);
+        assert!(error.starts_with(&expected), "{error}");
+        assert!(error.contains(&format!("key {digest:?} with header epoch {epoch} (")), "{error}");
+        assert_eq!(raw_rows::<T, _>(db), vec![(encode_key(&digest), bytes)]);
+        assert_eq!(raw_rows::<CertificateDigestByRound, _>(db).len(), 1);
+        assert_eq!(raw_rows::<CertificateDigestByOrigin, _>(db).len(), 1);
         assert_eq!(db.get::<LastProposed>(&LAST_PROPOSAL_KEY).unwrap(), Some(header));
+    }
+
+    /// Undecodable `LastProposed` rows that are not a seconds-only fork-epoch header are refused
+    /// and kept: a fork-epoch header prefix followed by junk, and bytes too short to hold a
+    /// header prefix at all.
+    fn assert_refuses_undecodable_last_proposed<DB: RawRows>(db: &DB) {
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        db.open_table::<LastProposed>().unwrap();
+        for (bytes, epoch) in [
+            (fork_epoch_garbage(), subsecond_epoch().to_string()),
+            (vec![0x5a; 7], "unknown".to_owned()),
+        ] {
+            db.insert_raw_row::<LastProposed>(&key, &bytes).unwrap();
+
+            let error = refusal(db);
+
+            assert!(
+                error.starts_with("epoch table last_proposed holds 1 row(s)"),
+                "{epoch}: {error}"
+            );
+            let expected = format!("key {LAST_PROPOSAL_KEY:?} with header epoch {epoch} (");
+            assert!(error.contains(&expected), "{error}");
+            assert_eq!(raw_rows::<LastProposed, _>(db), vec![(key.clone(), bytes)]);
+        }
+    }
+
+    /// A removable `LastProposed` header stays when another table holds a row the check refuses,
+    /// because every table is checked before anything is removed.
+    fn assert_refuses_before_removing<DB: RawRows>(db: &DB) {
+        let header = header(subsecond_epoch());
+        let proposal = pre_fork_bytes(&header, &header);
+        let certified = pre_fork_bytes(&certificate(header.clone()), &header);
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        db.open_table::<LastProposed>().unwrap();
+        db.open_table::<ProposedCertificates>().unwrap();
+        db.insert_raw_row::<LastProposed>(&key, &proposal).unwrap();
+        db.insert_raw_row::<ProposedCertificates>(&encode_key(&header.digest()), &certified)
+            .unwrap();
+
+        let error = refusal(db);
+
+        assert!(error.starts_with("epoch table proposed_certificates holds 1 row(s)"), "{error}");
+        assert_eq!(raw_rows::<LastProposed, _>(db), vec![(key, proposal)]);
     }
 
     /// Decodable rows in every scanned table are kept.
@@ -304,11 +406,49 @@ mod tests {
         db.insert::<Certificates>(&digest, &certificate).unwrap();
         db.insert::<ProposedCertificates>(&digest, &certificate).unwrap();
 
-        assert!(discard_undecodable_header_tables(db).unwrap().is_empty());
+        assert!(discard_seconds_only_proposal(db).unwrap().is_none());
 
         assert_eq!(db.get::<LastProposed>(&LAST_PROPOSAL_KEY).unwrap(), Some(header));
         assert_eq!(db.get::<Certificates>(&digest).unwrap(), Some(certificate.clone()));
         assert_eq!(db.get::<ProposedCertificates>(&digest).unwrap(), Some(certificate));
+    }
+
+    /// A header of an epoch before the sub-second fork that lost two trailing zero bytes is
+    /// refused, although it decodes once two bytes are appended, the way a seconds-only
+    /// fork-epoch header does.
+    ///
+    /// Only builds with epochs before the sub-second fork can hold one. Under adiri, epoch 10
+    /// also predates the seed-signature fork, so its header ends with the execution block hash.
+    #[cfg(feature = "adiri")]
+    fn assert_refuses_truncated_pre_fork_epoch_header<DB: RawRows>(db: &DB) {
+        use tn_types::{BlockNumHash, B256};
+
+        let epoch = 10;
+        assert!(!subsecond_timestamp_active(epoch), "epoch {epoch} must predate the fork");
+        let mut hash = [0x11; 32];
+        hash[30..].fill(0);
+        let header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::from_bytes([3; 32]))
+            .round(1)
+            .epoch(epoch)
+            .latest_execution_block(BlockNumHash::new(5, B256::from(hash)))
+            .build();
+        let mut bytes = encode(&header);
+        assert_eq!(bytes.split_off(bytes.len() - 2), [0, 0], "the header must end in zeros");
+        assert!(try_decode::<Header>(&bytes).is_err(), "truncated bytes must not decode");
+        assert!(
+            try_decode::<Header>(&[bytes.as_slice(), [0; 2].as_slice()].concat()).is_ok(),
+            "the truncated header must pass the layout check, leaving the epoch check to refuse it"
+        );
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        db.open_table::<LastProposed>().unwrap();
+        db.insert_raw_row::<LastProposed>(&key, &bytes).unwrap();
+
+        let error = refusal(db);
+
+        assert!(error.starts_with("epoch table last_proposed holds 1 row(s)"), "{error}");
+        assert!(error.contains(&format!("with header epoch {epoch} (")), "{error}");
+        assert_eq!(raw_rows::<LastProposed, _>(db), vec![(key, bytes)]);
     }
 
     #[cfg(feature = "reth-libmdbx")]
@@ -316,6 +456,10 @@ mod tests {
         use crate::mdbx::database::MEGABYTE;
 
         crate::mdbx::MdbxDatabase::open(path, 8, 16 * MEGABYTE, 4 * MEGABYTE).unwrap()
+    }
+
+    fn open_raw_redb(dir: &TempDir) -> ReDB {
+        ReDB::open(dir.path().join("epoch")).unwrap()
     }
 
     #[cfg(feature = "reth-libmdbx")]
@@ -327,9 +471,30 @@ mod tests {
 
     #[cfg(feature = "reth-libmdbx")]
     #[test]
-    fn test_mdbx_discards_pre_fork_certificate() {
+    fn test_mdbx_refuses_pre_fork_certificate() {
         let dir = TempDir::new().unwrap();
-        assert_discards_pre_fork_certificate(&open_raw_mdbx(dir.path()));
+        assert_refuses_pre_fork_certificate::<Certificates, _>(&open_raw_mdbx(dir.path()));
+    }
+
+    #[cfg(feature = "reth-libmdbx")]
+    #[test]
+    fn test_mdbx_refuses_pre_fork_proposed_certificate() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_pre_fork_certificate::<ProposedCertificates, _>(&open_raw_mdbx(dir.path()));
+    }
+
+    #[cfg(feature = "reth-libmdbx")]
+    #[test]
+    fn test_mdbx_refuses_undecodable_last_proposed() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_undecodable_last_proposed(&open_raw_mdbx(dir.path()));
+    }
+
+    #[cfg(feature = "reth-libmdbx")]
+    #[test]
+    fn test_mdbx_refuses_before_removing() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_before_removing(&open_raw_mdbx(dir.path()));
     }
 
     #[cfg(feature = "reth-libmdbx")]
@@ -339,27 +504,71 @@ mod tests {
         assert_keeps_decodable_rows(&open_raw_mdbx(dir.path()));
     }
 
+    #[cfg(all(feature = "reth-libmdbx", feature = "adiri"))]
     #[test]
-    fn test_redb_discards_pre_fork_header() {
+    fn test_mdbx_refuses_truncated_pre_fork_epoch_header() {
         let dir = TempDir::new().unwrap();
-        assert_discards_pre_fork_header(&ReDB::open(dir.path().join("epoch")).unwrap());
+        assert_refuses_truncated_pre_fork_epoch_header(&open_raw_mdbx(dir.path()));
     }
 
     #[test]
-    fn test_redb_discards_pre_fork_certificate() {
+    fn test_redb_discards_pre_fork_header() {
         let dir = TempDir::new().unwrap();
-        assert_discards_pre_fork_certificate(&ReDB::open(dir.path().join("epoch")).unwrap());
+        assert_discards_pre_fork_header(&open_raw_redb(&dir));
+    }
+
+    #[test]
+    fn test_redb_refuses_pre_fork_certificate() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_pre_fork_certificate::<Certificates, _>(&open_raw_redb(&dir));
+    }
+
+    #[test]
+    fn test_redb_refuses_pre_fork_proposed_certificate() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_pre_fork_certificate::<ProposedCertificates, _>(&open_raw_redb(&dir));
+    }
+
+    #[test]
+    fn test_redb_refuses_undecodable_last_proposed() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_undecodable_last_proposed(&open_raw_redb(&dir));
+    }
+
+    #[test]
+    fn test_redb_refuses_before_removing() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_before_removing(&open_raw_redb(&dir));
     }
 
     #[test]
     fn test_redb_keeps_decodable_rows() {
         let dir = TempDir::new().unwrap();
-        assert_keeps_decodable_rows(&ReDB::open(dir.path().join("epoch")).unwrap());
+        assert_keeps_decodable_rows(&open_raw_redb(&dir));
+    }
+
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_redb_refuses_truncated_pre_fork_epoch_header() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_truncated_pre_fork_epoch_header(&open_raw_redb(&dir));
+    }
+
+    /// The raw epoch database [`crate::open_db`] opens in this build.
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+    fn open_raw_epoch_db(store: &std::path::Path) -> crate::mdbx::MdbxDatabase {
+        open_raw_mdbx(&store.join("epoch"))
+    }
+
+    /// The raw epoch database [`crate::open_db`] opens in this build.
+    #[cfg(feature = "redb")]
+    fn open_raw_epoch_db(store: &std::path::Path) -> ReDB {
+        ReDB::open(store.join("epoch")).unwrap()
     }
 
     /// The node's startup path: a pre-fork `LastProposed` header in the epoch database opens
     /// without a panic, the header is gone, and the `Votes` guards survive.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+    #[cfg(any(feature = "reth-libmdbx", feature = "redb"))]
     #[test]
     fn test_open_db_discards_pre_fork_last_proposed() {
         let dir = TempDir::new().unwrap();
@@ -367,7 +576,7 @@ mod tests {
         let header = header(epoch);
         let author = AuthorityIdentifier::from_bytes([4; 32]);
         {
-            let raw = open_raw_mdbx(&dir.path().join("epoch"));
+            let raw = open_raw_epoch_db(dir.path());
             raw.open_table::<LastProposed>().unwrap();
             raw.open_table::<Votes>().unwrap();
             raw.insert::<Votes>(&author, &vote_info(epoch)).unwrap();
@@ -382,10 +591,35 @@ mod tests {
 
         assert!(db.is_empty::<LastProposed>());
         assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
-        // the clear is durable, so the next start finds nothing to discard
+        // the removal is durable, so the next start finds nothing to discard
         drop(db);
-        let raw = open_raw_mdbx(&dir.path().join("epoch"));
-        assert!(discard_undecodable_header_tables(&raw).unwrap().is_empty());
-        assert_eq!(row_count::<LastProposed, _>(&raw), 0);
+        let raw = open_raw_epoch_db(dir.path());
+        assert!(discard_seconds_only_proposal(&raw).unwrap().is_none());
+        assert!(raw_rows::<LastProposed, _>(&raw).is_empty());
+    }
+
+    /// The node's startup path stops on an undecodable `LastProposed` row that is not a
+    /// seconds-only fork-epoch header, names the table, and leaves the row in place.
+    #[cfg(any(feature = "reth-libmdbx", feature = "redb"))]
+    #[test]
+    fn test_open_db_refuses_undecodable_last_proposed() {
+        let dir = TempDir::new().unwrap();
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        let bytes = fork_epoch_garbage();
+        {
+            let raw = open_raw_epoch_db(dir.path());
+            raw.open_table::<LastProposed>().unwrap();
+            raw.insert_raw_row::<LastProposed>(&key, &bytes).unwrap();
+        }
+
+        let store = dir.path();
+        let panic =
+            std::panic::catch_unwind(|| crate::open_db(store)).expect_err("open_db must stop");
+
+        let message = panic.downcast_ref::<String>().expect("a formatted panic message");
+        assert!(message.starts_with("Cannot check database (epoch)"), "{message}");
+        assert!(message.contains("epoch table last_proposed holds 1 row(s)"), "{message}");
+        let raw = open_raw_epoch_db(dir.path());
+        assert_eq!(raw_rows::<LastProposed, _>(&raw), vec![(key, bytes)]);
     }
 }
