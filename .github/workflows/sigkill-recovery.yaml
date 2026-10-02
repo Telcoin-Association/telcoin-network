@@ -24,9 +24,10 @@ on:
         description: "MDBX sync regime inherited by every node"
         type: choice
         options:
+          - both
           - durable
           - safe-no-sync
-        default: durable
+        default: both
 
 permissions:
   contents: read
@@ -38,7 +39,8 @@ env:
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
+  TN_TEST_MDBX_SYNC: durable
+  TN_SIGKILL_SYNC_MODE: ${{ inputs.sync_mode || 'both' }}
   TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '30' }}
   TN_SIGKILL_BEFORE_CLOSE_SECS: ${{ inputs.before_close_secs || '2' }}
   TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '45' }}
@@ -74,12 +76,18 @@ jobs:
           cargo +"$RUST_NIGHTLY" fmt --all -- --check
           cargo +"$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
 
-      - name: Build and run both captured SIGKILL scenarios
+      - name: Build and run captured SIGKILL scenarios in both sync regimes
         run: |
           cargo fetch --locked
-          make test-sigkill
-          mkdir -p validation-logs/baseline
-          cp -R crates/e2e-tests/test_logs/sigkill* validation-logs/baseline/
+          sync_modes="$TN_SIGKILL_SYNC_MODE"
+          if [ "$sync_modes" = both ]; then
+            sync_modes="durable safe-no-sync"
+          fi
+          for sync_mode in $sync_modes; do
+            TN_TEST_MDBX_SYNC="$sync_mode" make test-sigkill
+            mkdir -p "validation-logs/$sync_mode"
+            cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/$sync_mode/"
+          done
 
       - name: Confirm recovery assertion detects an omitted restart
         env:
