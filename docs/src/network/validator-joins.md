@@ -17,7 +17,9 @@ must advance and the direct committee connections must survive.
 
 These limits qualify the accelerated loopback fixture. They are not measurements of a
 provider's propagation delay or of a production WAN. The fixture uses 15-second epochs,
-a one-second transition grace, a 300-second snapshot lease, and two workers charging fee 7.
+a one-second peer heartbeat and transition grace, a 300-second snapshot lease, and two
+workers charging fee 7. The heartbeat is scaled with the accelerated epochs so admission
+reconciliation can observe grace expiry before the next transition.
 Each invocation runs five independent samples per healthy/unavailable hub condition without
 retrying a failed qualification. In the unavailable governance case, the fresh process has
 no QUIC access for a complete 15-second epoch. Every swarm must remain below resolution

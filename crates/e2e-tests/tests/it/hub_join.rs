@@ -25,6 +25,8 @@ const CONSENSUS_BUDGET: Duration = Duration::from_secs(120);
 const JOIN_UID: &str = "59599";
 /// Allow all five validators a full leader cycle within each accelerated epoch.
 const JOIN_EPOCH_DURATION: u64 = 15;
+/// Reconcile the accelerated fixture before another epoch can reset its transition grace.
+const JOIN_PEER_HEARTBEAT: u64 = 1;
 
 /// Availability of the fresh validator's sole hub during governance admission.
 #[derive(Clone, Copy)]
@@ -389,6 +391,10 @@ fn start_qualification_node(
         .as_object_mut()
         .ok_or_else(|| eyre::eyre!("network configuration object"))?
         .insert("admission".to_owned(), serde_json::to_value(admission)?);
+    *settings
+        .pointer_mut("/peer_config/heartbeat_interval")
+        .ok_or_else(|| eyre::eyre!("peer heartbeat configuration"))? =
+        serde_json::Value::from(JOIN_PEER_HEARTBEAT);
     let settings: NetworkConfig = serde_json::from_value(settings)?;
     Config::write_to_path(dir.join("network-config"), &settings, ConfigFmt::YAML)?;
     let bootstrap_json = serde_json::to_string(bootstraps)?;
@@ -738,6 +744,7 @@ async fn qualify_governance_join(condition: HubCondition) -> eyre::Result<()> {
                 HubCondition::Unavailable => JOIN_EPOCH_DURATION,
             },
             "epoch_duration_seconds": JOIN_EPOCH_DURATION,
+            "peer_heartbeat_seconds": JOIN_PEER_HEARTBEAT,
             "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
                 "transition_grace_seconds": 1, "snapshot_lease_seconds": 300,
             }, "publication_ms": published.as_millis(),
