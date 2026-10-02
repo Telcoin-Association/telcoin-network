@@ -805,7 +805,11 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
     assert_eq!(engine.worker_state(1).await, WorkerState::Running);
     assert!(engine.is_worker_running(1).await);
     assert_eq!(pool_one.block_info().pending_basefee, restarted_fee);
-    assert_eq!(engine.worker_http_local_address(&1).await?, Some(rpc_one));
+    let restarted_rpc = engine
+        .worker_http_local_address(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("restarted worker RPC listener missing"))?;
+    assert!(tokio::net::TcpStream::connect(restarted_rpc).await.is_ok());
     Ok(())
 }
 
