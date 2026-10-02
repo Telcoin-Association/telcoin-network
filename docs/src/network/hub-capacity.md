@@ -104,10 +104,14 @@ SNAT address. The coordinator shares a private PID namespace with the hubs so
 the collector can inspect their actual processes. Cleanup removes only the
 containers and network created by the invocation.
 
-Download the `hub-capacity-linux-arm64-<revision>` artifact from the successful CI run for
-the exact checkout revision. The runner verifies its source revision and binary
-digests, copies the executables into its output directory and checks that the
-qualification scripts are committed at the same revision.
+Download the `hub-capacity-linux-arm64-<revision>` artifact from the CI run for the
+recorded binary revision. The runner verifies the revision and binary digests and
+requires a clean, committed worktree. It permits an ancestor artifact when only
+the Python qualification scripts or this document have changed, and rejects changed
+code, dependency, profile, workflow, or other inputs. `source-provenance.json` and
+the frozen plan record both the binary and qualification revisions. A live run can
+start once CI retains the binaries; acceptance also requires the workspace tests,
+Clippy, and compiling mutation checks to pass.
 
 ```sh
 docker build -t tn-capacity-1476-runtime:ubuntu24 tools/hub-capacity

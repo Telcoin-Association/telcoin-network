@@ -161,6 +161,36 @@ def stage_binaries(source, destination):
     return revision, hashes
 
 
+def verify_source_provenance(binary_revision):
+    """Record separate committed revisions and reject changes outside the qualification harness."""
+    repository = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=ROOT,
+        check=True, capture_output=True, text=True).stdout.strip())
+
+    def git(*arguments):
+        return subprocess.run(["git", *arguments], cwd=repository, check=True,
+                              capture_output=True, text=True).stdout
+
+    current = git("rev-parse", "HEAD").strip()
+    if git("status", "--porcelain").strip():
+        raise ValueError("qualification requires a clean committed worktree")
+    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", binary_revision, current],
+                              cwd=repository, capture_output=True)
+    if ancestor.returncode:
+        raise ValueError("CI binary revision must be an ancestor of the qualification revision")
+    changed = sorted(filter(None, git("diff", "--name-only", "-z", binary_revision, current).split("\0")))
+
+    def harness_only(name):
+        path = Path(name)
+        return (path.parent == Path("tools/hub-capacity") and path.suffix == ".py"
+                or name == "docs/src/network/hub-capacity.md")
+
+    incompatible = [name for name in changed if not harness_only(name)]
+    if incompatible:
+        raise ValueError("CI binaries have different source inputs: " + ", ".join(incompatible))
+    return {"binary_revision": binary_revision, "qualification_revision": current,
+            "qualification_only_changes": changed}
+
+
 def warmup(docker, coordinator, processes):
     """Allow completed epochs to become available, retaining failures in the owned logs."""
     deadline = time.monotonic() + 90
@@ -213,6 +243,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
         topology = {"population": population, "network": json.loads((phase_dir / "links-before.json").read_text()),
                     "docker": [json.loads(docker.run("inspect", container))[0] for container in [coordinator, *hubs]],
                     "image": docker.image, "source": json.loads((docker.output / "source-hashes.json").read_text()),
+                    "source_provenance": json.loads((docker.output / "source-provenance.json").read_text()),
                     "deployment_hashes": {str(path.relative_to(phase_dir)): digest(path)
                         for pattern in ("*-profile.json", "*-command.json", "peers/*.json", "*/node-info.yaml", "*/network-config", "ceremony/parameters.yaml", "ceremony/genesis/validators/*.yaml")
                         for path in phase_dir.glob(pattern)},
@@ -271,10 +302,8 @@ def execute_qualification(args):
             shutil.copyfile(path, source / path.name)
     write_json(output / "source-hashes.json", {path.name: digest(path) for path in source.iterdir()})
     revision, hashes = stage_binaries(args.binaries, output / "bin")
-    actual_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain", "--", "."], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
-    if revision != actual_revision or dirty:
-        raise ValueError("qualification sources must be committed at the CI binary revision")
+    provenance = verify_source_provenance(revision)
+    write_json(output / "source-provenance.json", provenance)
     docker = Docker(output, output / "bin", args.image)
     try:
         information = json.loads(docker.run("info", "--format", "{{json .}}"))
@@ -309,12 +338,14 @@ def execute_qualification(args):
         subprocess.run([sys.executable, "-B", "-I", str(ROOT / "traffic.py"), "create", "--cast", cast,
                         "--output", str(output / "transactions.json")], check=True, timeout=300)
         manifest = workload_manifest(population)
+        manifest["qualification_revision"] = provenance["qualification_revision"]
         manifest["transaction_fixture_sha256"] = digest(output / "transactions.json")
         write_json(output / "manifest.json", manifest)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/qualify.py", "template", "--output", "/qualification/declaration-template.json")
         plan = json.loads((output / "declaration-template.json").read_text())
         for phase in ("baseline", "candidate"):
             plan[phase].update({"revision": revision, "binary_sha256": hashes,
+                "qualification_revision": provenance["qualification_revision"],
                 "build_command": "cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api; cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer",
                 "profile": json.loads((output / f"deployment/baseline/{phase}-profile.json").read_text())})
         plan["envelope"]["hardware"] = f"Docker Linux arm64, {information['NCPU']} CPUs, {information['MemTotal']} bytes RAM; image {docker.image}; hubs on CPUs 0-3 and 4-7, coordinator on 8-11"
