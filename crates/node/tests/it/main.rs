@@ -657,10 +657,11 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
 }
 
 /// Independent workers keep separate RPC listeners and fees across epoch rollover and regrowth.
+/// Existing and skipped worker ids are rejected before construction, including while stopped.
 #[tokio::test]
 async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
     use futures::{StreamExt as _, TryStreamExt as _};
-    use tn_node::engine::{ExecutionNode, TnBuilder};
+    use tn_node::engine::{ExecutionNode, TnBuilder, WorkerState};
     use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
 
     tn_reth::init_reth_defaults();
@@ -684,6 +685,31 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         RethEnv::new(&node_config, &task_manager, reth_db.clone(), None, accumulator.clone())?;
     let builder = TnBuilder::new(node_config, config, reth_db);
     let engine = ExecutionNode::new(&builder, reth_env)?;
+    let assert_initialization_rejected = |worker_id, next_worker| {
+        let engine = &engine;
+        let accumulator = &accumulator;
+        async move {
+            let error = engine
+                .initialize_worker_components(
+                    worker_id,
+                    NoopEngineToPrimary,
+                    accumulator.base_fee(worker_id),
+                    accumulator.worker_base_fee(worker_id),
+                )
+                .await
+                .err()
+                .ok_or_else(|| eyre::eyre!("invalid worker initialization succeeded"))?;
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "cannot initialize worker {worker_id}: next uninitialized worker is {next_worker}"
+                ),
+            );
+            eyre::Ok(())
+        }
+    };
+    assert_initialization_rejected(1, 0).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Uninitialized);
     futures::stream::iter(0..2)
         .then(|worker_id| {
             let engine = &engine;
@@ -691,7 +717,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
             async move {
                 let fee = MIN_PROTOCOL_BASE_FEE + 1000 * (u64::from(worker_id) + 1);
                 accumulator.base_fee(worker_id).set_base_fee(fee);
-                assert!(!engine.is_worker_initialized(worker_id).await);
+                assert_eq!(engine.worker_state(worker_id).await, WorkerState::Uninitialized);
+                assert!(!engine.is_worker_running(worker_id).await);
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -700,7 +727,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
                         accumulator.worker_base_fee(worker_id),
                     )
                     .await?;
-                assert!(engine.is_worker_initialized(worker_id).await);
+                assert_eq!(engine.worker_state(worker_id).await, WorkerState::Running);
+                assert!(engine.is_worker_running(worker_id).await);
                 assert_eq!(
                     engine
                         .get_worker_transaction_pool(&worker_id)
@@ -714,6 +742,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         })
         .try_collect::<()>()
         .await?;
+    assert_initialization_rejected(0, 2).await?;
+    assert_initialization_rejected(1, 2).await?;
 
     let pool_zero = engine.get_worker_transaction_pool(&0).await?;
     let pool_one = engine.get_worker_transaction_pool(&1).await?;
@@ -756,6 +786,26 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         )
         .await
         .is_err());
+
+    engine.deactivate_workers_above(1).await;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+    assert!(!engine.is_worker_running(1).await);
+    assert!(engine.is_worker_running(0).await);
+    tn_test_utils::wait_until(
+        Duration::from_secs(5),
+        "worker one RPC listener to close",
+        || async { Ok(tokio::net::TcpStream::connect(rpc_one).await.is_err()) },
+    )
+    .await?;
+    assert_initialization_rejected(1, 2).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+    assert!(tokio::net::TcpStream::connect(rpc_one).await.is_err());
+    let restarted_fee = next_fee + 1;
+    engine.restart_worker_rpc(1, restarted_fee).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Running);
+    assert!(engine.is_worker_running(1).await);
+    assert_eq!(pool_one.block_info().pending_basefee, restarted_fee);
+    assert_eq!(engine.worker_http_local_address(&1).await?, Some(rpc_one));
     Ok(())
 }
 
