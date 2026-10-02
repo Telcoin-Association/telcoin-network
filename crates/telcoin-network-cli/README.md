@@ -143,7 +143,7 @@ The command requires existing keys and a `node-info.yaml` under `--datadir`; it 
 After rotating, re-export the staking arguments for the new address (see [Staking registration](#staking-registration)):
 
 ```bash
-telcoin-network keytool export-staking-args \
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args \
     --node-info /var/lib/telcoin/node-info.yaml
 ```
 
@@ -777,11 +777,11 @@ Validators are accessible on host ports 8545-8542 (mapped from container port 85
 After key generation, export the staking arguments needed to call `ConsensusRegistry.stake()` on-chain.
 
 ```bash
-telcoin-network keytool export-staking-args \
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args \
     --node-info /var/lib/telcoin/node-info.yaml
 ```
 
-This command reads only public data from `node-info.yaml`. No private key, passphrase, or data directory is needed.
+This command reads only public data from `node-info.yaml` and never reads the BLS private key or the data directory. The binary still resolves a passphrase source before every keytool command except `set-rpc`, and with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required", so pass `--bls-passphrase-source no-passphrase` as above.
 
 ### Output formats
 
@@ -801,6 +801,13 @@ JSON (`--json`):
 Raw calldata (`--calldata`):
 
 Single `0x`-prefixed hex string containing ABI-encoded calldata ready to submit as transaction data to `ConsensusRegistry.stake()`.
+
+`keytool` writes log lines to stdout, so a script that captures the `--json` or `--calldata` output must add the global `-q` flag, or the capture also holds a log line:
+
+```bash
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase \
+    keytool export-staking-args --node-info /var/lib/telcoin/node-info.yaml --calldata)
+```
 
 ### Contract function signature
 

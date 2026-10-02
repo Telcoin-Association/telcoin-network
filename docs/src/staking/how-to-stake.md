@@ -108,7 +108,7 @@ bls_public_key: <compressed-96-byte-key>
 proof_of_possession: <signature>
 ```
 
-The file stores both values in base58. `keytool export-staking-args` reads them and prints the two `stake()` arguments in hex, or the complete transaction calldata with `--calldata`. It needs only `node-info.yaml`: no BLS key, passphrase, or datadir.
+The file stores both values in base58. `keytool export-staking-args` reads them and prints the two `stake()` arguments in hex, or the complete transaction calldata with `--calldata`. It reads only `node-info.yaml` and never the BLS key, but the binary still requires a passphrase source for every keytool command except `set-rpc`: with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required". Pass `--bls-passphrase-source no-passphrase`. `keytool` also writes log lines to stdout, so add the global `-q` flag when capturing its output in a variable.
 
 #### Example Using Cast
 
@@ -125,7 +125,8 @@ cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
   --rpc-url <RPC_URL>
 
 # Build the stake(bytes,(bytes)) calldata from node-info.yaml
-CALLDATA=$(telcoin-network keytool export-staking-args \
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase \
+  keytool export-staking-args \
   --node-info /path/to/node/data/node-info.yaml \
   --calldata)
 
@@ -293,7 +294,7 @@ This returns your initial stake plus any accrued rewards to either:
 
 If the recipient rejects the transfer, the amount is credited instead, and the recipient withdraws it with `claimRefund()`.
 
-The second argument is `acceptRewardShortfall`. With `false`, the call reverts if the Issuance contract cannot cover the accrued rewards. With `true`, the stake is still returned in full, rewards are paid up to the Issuance balance, and the unpaid rewards are forfeited.
+The second argument is `acceptRewardShortfall`. With `false`, the call reverts if the Issuance contract cannot cover the accrued rewards. With `true`, rewards are paid up to the Issuance balance and the unpaid rewards are forfeited; the stake portion is not reduced by the reward shortfall. (A validator slashed below its stake amount gets back only its remaining balance either way.)
 
 Unstaking retires the validator address for good: governance cannot issue it a ConsensusNFT again.
 
@@ -334,11 +335,11 @@ cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
 
 | Error                      | Cause                               | Solution                                            |
 | -------------------------- | ----------------------------------- | --------------------------------------------------- |
-| `RequiresConsensusNFT`     | Address not whitelisted             | Request governance approval first                   |
+| `InvalidTokenId`           | Address holds no ConsensusNFT: not whitelisted yet, or already retired | Request governance approval first; a retired address cannot be whitelisted again |
 | `InvalidStatus`            | Wrong validator state for operation | Check current status with `getValidator()`          |
 | `InvalidStakeAmount`       | Incorrect stake value sent          | Send `stakeAmount` from `stakeConfig(getCurrentStakeVersion())` |
 | `InvalidProofOfPossession` | BLS signature verification failed   | The proof was usually signed for a different address. Re-sign it for the staking address with `keytool generate pop --address <ADDRESS>`, then export the staking arguments again |
-| `DuplicateBLSPubkey`       | BLS key already registered          | A registered key is never released, not even after unstaking. Generate a new validator's keys in a new datadir, and never overwrite the keys of a validator that has staked |
+| `DuplicateBLSPubkey`       | BLS key already registered          | If this address already staked with this key, the earlier stake succeeded; check `getValidator()`. Otherwise: a registered key is never released, not even after unstaking. Generate a new validator's keys in a new datadir, and never overwrite the keys of a validator that has staked |
 
 #### Key Management
 

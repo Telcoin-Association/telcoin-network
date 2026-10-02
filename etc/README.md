@@ -110,14 +110,18 @@ This creates `./new-validator/node-info.yaml` containing the BLS public key and 
 
 ```bash
 # Human-readable output (inspect the values)
-target/release/telcoin-network keytool export-staking-args \
+target/release/telcoin-network --bls-passphrase-source no-passphrase \
+    keytool export-staking-args \
     --node-info ./new-validator/node-info.yaml
 
-# Raw calldata for use with cast
-STAKE_CALLDATA=$(target/release/telcoin-network keytool export-staking-args \
+# Raw calldata for use with cast (-q keeps log lines out of the capture)
+STAKE_CALLDATA=$(target/release/telcoin-network -q --bls-passphrase-source no-passphrase \
+    keytool export-staking-args \
     --node-info ./new-validator/node-info.yaml \
     --calldata)
 ```
+
+`export-staking-args` never reads the BLS key, but the binary requires a passphrase source for every keytool command except `set-rpc`, hence `--bls-passphrase-source no-passphrase`.
 
 ### Step 3: Query the required stake amount
 
@@ -170,7 +174,7 @@ The validator calls `stake()` with BLS key arguments and sends the exact stake a
 ```bash
 # NEW_VAL_KEY is the private key for $NEW_VALIDATOR
 cast send $REGISTRY \
-    $STAKE_CALLDATA \
+    "$STAKE_CALLDATA" \
     --value $STAKE_AMOUNT \
     --private-key $NEW_VAL_KEY \
     --rpc-url $RPC
