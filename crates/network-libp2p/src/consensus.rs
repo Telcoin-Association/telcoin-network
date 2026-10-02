@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::{node_record_key, KadStore},
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
@@ -1055,6 +1055,7 @@ where
                     },
                     reply,
                 );
+                self.refresh_explicit_peers();
             }
             NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
@@ -1270,6 +1271,7 @@ where
                 // any peer that exits the three-slot window is demoted.
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                self.refresh_explicit_peers();
             }
             NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next } => {
                 self.swarm
@@ -1340,6 +1342,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconcile gossip mesh privileges for connected peers after committee rotation.
+    ///
+    /// Operator trust survives rotation; committee protection ends when the final slot expires.
+    fn refresh_explicit_peers(&mut self) {
+        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    fn refresh_explicit_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let protected = self.swarm.is_connected(peer)
+            && manager.peer_is_important(peer)
+            && !manager.peer_banned(peer);
+        if protected {
+            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+        } else {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
     }
 
     /// Process gossip events.
@@ -1472,7 +1495,10 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(peer_id, Penalty::Load(LoadPenalty::SlowPeer));
             }
         }
 
@@ -1614,7 +1640,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -1984,6 +2010,7 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table
@@ -2290,7 +2317,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
             }
             PutRecordRate::Shed => {
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
@@ -2398,7 +2428,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
@@ -2491,14 +2521,18 @@ where
     /// lost: peers push their own records on first connect (an inbound kad put handled by
     /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(|query| query.result.map(|record| (query.request, record)))
+            .into_iter()
+            .for_each(|(request, node_record)| {
+                let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
-        }
+                    .add_discovered_peer(request, node_record.info);
+                self.refresh_explicit_peer(&peer);
+            });
     }
 }
 
