@@ -1,0 +1,123 @@
+# Captured reproductions for #1510. This lane records a recovery result; the historical
+# fleet freeze still requires a failing reproduction before its root cause can be fixed.
+name: SIGKILL recovery
+
+on:
+  push:
+    branches:
+      - "ci/sigkill-*"
+  workflow_dispatch:
+    inputs:
+      epoch_secs:
+        description: "Epoch duration: 30 for a short run, 1200 for fleet B"
+        default: "30"
+      before_close_secs:
+        description: "Late-kill offset before the boundary: 2 locally, 59 for fleet B"
+        default: "2"
+      downtime_secs:
+        description: "Minimum downtime across the boundary: 45 locally, 240 for fleet B"
+        default: "45"
+      recovery_secs:
+        description: "Catch-up deadline after restart, with capture every minute"
+        default: "180"
+      sync_mode:
+        description: "MDBX sync regime inherited by every node"
+        type: choice
+        options:
+          - durable
+          - safe-no-sync
+        default: durable
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: target
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
+  TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '30' }}
+  TN_SIGKILL_BEFORE_CLOSE_SECS: ${{ inputs.before_close_secs || '2' }}
+  TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '45' }}
+  TN_SIGKILL_RECOVERY_SECS: ${{ inputs.recovery_secs || '180' }}
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install pinned toolchains
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          nightly="$(cat rust-nightly)"
+          rustup toolchain install "$nightly" -c rustfmt,clippy --profile minimal
+          echo "RUST_NIGHTLY=$nightly" >> "$GITHUB_ENV"
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: durable-e2e-cache
+          cache-on-failure: "true"
+
+      - name: Validate formatting and the full workspace lint plan
+        run: |
+          cargo +"$RUST_NIGHTLY" fmt --all -- --check
+          cargo +"$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
+
+      - name: Build and run both captured SIGKILL scenarios
+        run: |
+          cargo fetch --locked
+          make test-sigkill
+          mkdir -p validation-logs/baseline
+          cp -R crates/e2e-tests/test_logs/sigkill* validation-logs/baseline/
+
+      - name: Confirm recovery assertion detects an omitted restart
+        env:
+          TN_SIGKILL_EPOCH_SECS: "10"
+          TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
+          TN_SIGKILL_DOWNTIME_SECS: "15"
+          TN_SIGKILL_RECOVERY_SECS: "10"
+        run: |
+          sigkill_source=crates/e2e-tests/tests/it/sigkill.rs
+          sigkill_original="$(mktemp)"
+          cp "$sigkill_source" "$sigkill_original"
+          trap 'cp "$sigkill_original" "$sigkill_source"; rm -f "$sigkill_original"' EXIT
+          python3 -I - <<'PY'
+          from pathlib import Path
+          source = Path("crates/e2e-tests/tests/it/sigkill.rs")
+          text = source.read_text()
+          restart = "guard.replace(2, start(2, victim, data, test, 1));"
+          if text.count(restart) != 1:
+              raise SystemExit("expected exactly one restart to mutate")
+          source.write_text(text.replace(restart, "// Mutation: the killed validator is never restarted."))
+          PY
+          if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --locked -p e2e-tests --test it --run-ignored all -E 'test(=sigkill::test_sigkill_before_epoch_close_recovers)' > mutation.log 2>&1; then
+            echo "::error::The recovery test passed without restarting the killed validator"
+            exit 1
+          fi
+          rg -q 'timed out waiting for condition: restarted validator catches up and becomes active' mutation.log
+
+      - name: Assert committed source and lockfile restored
+        run: git diff --exit-code
+
+      - name: Preserve successful and failed recovery capture
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sigkill-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            crates/e2e-tests/test_logs/sigkill*
+            validation-logs
+            mutation.log
+          if-no-files-found: warn
+          retention-days: 15
