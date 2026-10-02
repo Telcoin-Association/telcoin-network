@@ -435,6 +435,20 @@ where
                 )
                 .await?;
 
+                // e2e fault injection, always false without `tn-types/test-utils`: the closing
+                // block is executed and canonical, the record and the tables clear are not done
+                if tn_types::test_hooks::exit_before_epoch_record(current_epoch) {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = current_epoch,
+                        "test hook: exiting before the epoch record is written",
+                    );
+                    // stop where a SIGTERM inside this window stops: `run` sees the shutdown and
+                    // drops this future while it is parked, then runs the graceful exit path
+                    self.node_shutdown.notify();
+                    std::future::pending::<()>().await;
+                }
+
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(current_epoch, engine).await?;
 
