@@ -1,10 +1,10 @@
-//! Admission matrices and deterministic fallback, renewal, and rotation regressions.
+//! Admission matrices and deterministic fallback, renewal, rotation, and live sweep regressions.
 
 use super::*;
 use crate::{common::create_multiaddr, types::NetworkType, AdmissionFallback};
 use libp2p::{
     core::{transport::PortUse, Endpoint},
-    swarm::{ConnectionId, NetworkBehaviour as _},
+    swarm::{behaviour::ConnectionClosed, ConnectionId, FromSwarm, NetworkBehaviour as _},
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use tn_types::{now, BlsKeypair, NetworkKeypair};
@@ -99,6 +99,23 @@ impl AdmissionFixture {
             HashSet::from([self.local, self.current.bls]),
             HashSet::from([self.next.bls]),
         );
+    }
+}
+
+/// Poll a sweep directly without advancing the maintenance heartbeat.
+fn poll_reconciliation(manager: &mut PeerManager) -> Option<PeerEvent> {
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    manager.poll_admission_revocation(&mut cx)
+}
+
+/// Count wakeups that guarantee a partially consumed sweep will be polled again.
+#[derive(Default)]
+struct AdmissionWake(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for AdmissionWake {
+    /// Record a wake without scheduling a separate task.
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -304,11 +321,10 @@ async fn admission_live_rotation_and_discovery_pressure() {
         fixture.local,
     );
     fixture.renew(7);
-    assert!(fixture
-        .manager
-        .events
-        .iter()
-        .any(|event| matches!(event, PeerEvent::DisconnectPeer(peer) if *peer == ordinary)));
+    assert!(matches!(
+        poll_reconciliation(&mut fixture.manager),
+        Some(PeerEvent::DisconnectPeer(peer)) if peer == ordinary
+    ));
     assert!(!fixture.manager.peer_banned(&ordinary));
     fixture.manager.prune_connected_peers();
     assert!(fixture.manager.is_connected(&fixture.bootstrap.id()));
@@ -346,6 +362,215 @@ async fn admission_compatibility_modes_and_zero_lease() {
     );
     assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Open);
     assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
+}
+
+/// Primary and independent workers retain the complete window until authoritative Grace closes.
+#[tokio::test(start_paused = true)]
+async fn admission_reconciliation_rotation_every_swarm() {
+    let interval = Duration::from_secs(30);
+    let mut fixtures: Vec<_> =
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(3)]
+            .into_iter()
+            .map(|network| AdmissionFixture::with_grace(network, AdmissionMode::Open, interval))
+            .collect();
+    fixtures.iter_mut().for_each(|fixture| {
+        [
+            &fixture.previous,
+            &fixture.current,
+            &fixture.next,
+            &fixture.bootstrap,
+            &fixture.trusted,
+            &fixture.ordinary,
+        ]
+        .into_iter()
+        .for_each(|peer| {
+            fixture.manager.register_peer_connection(
+                &peer.id(),
+                ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+            );
+        });
+        fixture.manager.configure_admission(
+            AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+                .with_transition_grace(interval),
+            fixture.local,
+        );
+        assert!(poll_reconciliation(&mut fixture.manager).is_none());
+        assert!(fixture.manager.is_connected(&fixture.ordinary.id()));
+    });
+    tokio::time::advance(interval).await;
+    fixtures.iter_mut().for_each(|fixture| {
+        fixture.manager.heartbeat();
+        assert!(matches!(poll_reconciliation(&mut fixture.manager),
+            Some(PeerEvent::DisconnectPeer(peer)) if peer == fixture.ordinary.id()));
+        assert!(poll_reconciliation(&mut fixture.manager).is_none());
+        [&fixture.previous, &fixture.current, &fixture.next, &fixture.bootstrap, &fixture.trusted]
+            .into_iter()
+            .for_each(|peer| assert!(fixture.manager.is_connected(&peer.id())));
+        fixture.manager.update_committees_at(
+            8,
+            HashSet::from([fixture.current.bls]),
+            HashSet::from([fixture.local, fixture.next.bls]),
+            HashSet::new(),
+        );
+        assert!(poll_reconciliation(&mut fixture.manager).is_none());
+        assert!(fixture.manager.is_connected(&fixture.previous.id()));
+    });
+    tokio::time::advance(interval).await;
+    fixtures.iter_mut().for_each(|fixture| {
+        fixture.manager.heartbeat();
+        assert!(matches!(poll_reconciliation(&mut fixture.manager),
+            Some(PeerEvent::DisconnectPeer(peer)) if peer == fixture.previous.id()));
+        fixture.manager.config.target_num_peers = 0;
+        fixture.manager.prune_connected_peers();
+        [&fixture.current, &fixture.next, &fixture.bootstrap, &fixture.trusted]
+            .into_iter()
+            .for_each(|peer| assert!(fixture.manager.is_connected(&peer.id())));
+        assert_eq!(fixture.manager.admission_status().epoch(), Some(8));
+        assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+        fixture.manager.heartbeat();
+        assert!(poll_reconciliation(&mut fixture.manager).is_none());
+        assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+        assert!(!fixture.manager.peer_banned(&fixture.previous.id()));
+        assert!(!fixture.manager.peer_banned(&fixture.ordinary.id()));
+    });
+}
+
+/// A lease expiring after scheduling, invalid inputs, and newly resolved grants cancel closures.
+#[tokio::test(start_paused = true)]
+async fn admission_reconciliation_rechecks_pending_policy() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let ordinary = fixture.ordinary.id();
+    fixture.manager.register_peer_connection(
+        &ordinary,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    fixture.manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::ZERO),
+        fixture.local,
+    );
+    assert_eq!(fixture.manager.admission_reconciliation.len(), 1);
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(fixture.manager.is_connected(&ordinary));
+    assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
+
+    fixture.renew(7);
+    fixture.manager.known_peers.remove(&fixture.current.bls);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(fixture.manager.is_connected(&ordinary));
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Grace);
+    fixture.manager.cache_known_peer(fixture.current.bls, fixture.current.info.clone());
+    assert_eq!(fixture.manager.admission_reconciliation.len(), 1);
+    fixture.manager.update_committees_at(
+        7,
+        HashSet::new(),
+        HashSet::from([fixture.local, fixture.current.bls]),
+        HashSet::from([fixture.next.bls]),
+    );
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert_eq!(
+        fixture.manager.admission_status().fallback(),
+        Some(AdmissionFallback::Contradictory)
+    );
+    assert!(fixture.manager.is_connected(&ordinary));
+    fixture.renew(7);
+    fixture.renew(6);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert_eq!(fixture.manager.admission_status().epoch(), Some(7));
+    assert!(fixture.manager.is_connected(&ordinary));
+    fixture.renew(7);
+    fixture.manager.invalidate_admission();
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(fixture.manager.is_connected(&ordinary));
+    fixture.renew(7);
+    fixture.manager.add_bootstrap_peer(fixture.ordinary.bls, fixture.ordinary.info.clone());
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(fixture.manager.is_connected(&ordinary));
+    assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+}
+
+/// Eligible peers still consume the fixed poll budget, with a wake to finish the remaining work.
+#[tokio::test]
+async fn admission_reconciliation_bounds_each_poll() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Worker(2), AdmissionMode::Closed);
+    (0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 2 + 1).for_each(|_| {
+        let peer = AdmissionPeer::new();
+        let id = peer.id();
+        fixture.manager.add_bootstrap_peer(peer.bls, peer.info);
+        fixture.manager.register_peer_connection(
+            &id,
+            ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+        );
+    });
+    fixture.manager.reconcile_admission();
+    let before = fixture.manager.admission_reconciliation.len();
+    assert_eq!(before, MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 2 + 1);
+    let wake = std::sync::Arc::new(AdmissionWake::default());
+    let waker = std::task::Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(fixture.manager.poll_admission_revocation(&mut cx).is_none());
+    assert_eq!(
+        fixture.manager.admission_reconciliation.len(),
+        before.saturating_sub(MAX_ADMISSION_RECONCILIATIONS_PER_POLL)
+    );
+    assert_eq!(wake.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert_eq!(fixture.manager.admission_reconciliation.len(), 1);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(fixture.manager.admission_reconciliation.is_empty());
+    assert_eq!(fixture.manager.peers.connected_peer_ids().count(), before);
+}
+
+/// Revocation is dispatched by the swarm, and only the last transport closure removes the peer.
+#[tokio::test]
+async fn admission_reconciliation_closure_bookkeeping_once() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let peer = fixture.ordinary.id();
+    fixture.manager.register_peer_connection(
+        &peer,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    fixture.manager.events.clear();
+    fixture.manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::ZERO),
+        fixture.local,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(matches!(fixture.manager.poll(&mut cx),
+        Poll::Ready(libp2p::swarm::ToSwarm::GenerateEvent(PeerEvent::DisconnectPeer(id))) if id == peer));
+    assert!(fixture.manager.is_peer_connected_or_disconnecting(&peer));
+    assert!(!fixture.manager.peer_banned(&peer));
+    assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+    let endpoint = ConnectedPoint::Listener {
+        local_addr: create_multiaddr(None),
+        send_back_addr: create_multiaddr(None),
+    };
+    [1, 0, 0].into_iter().for_each(|remaining| {
+        fixture.manager.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: peer,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: &endpoint,
+            cause: None,
+            remaining_established: remaining,
+        }));
+        assert_eq!(fixture.manager.is_peer_connected_or_disconnecting(&peer), remaining > 0);
+    });
+    assert_eq!(
+        fixture
+            .manager
+            .events
+            .iter()
+            .filter(|event| matches!(event, PeerEvent::PeerDisconnected(id) if *id == peer))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.manager.peers.connected_peer_ids().count(), 0);
+    assert!(!fixture.manager.peer_banned(&peer));
+    assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+    fixture.renew(7);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
 }
 
 /// Every swarm enters Grace even with resolved records; renewals do not restart its clock.

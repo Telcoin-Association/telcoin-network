@@ -192,7 +192,8 @@ impl NetworkBehaviour for PeerManager {
         }
 
         // pass the next event to the swarm if the manager's events aren't empty
-        if let Some(next_event) = self.poll_events() {
+        if let Some(next_event) = self.poll_admission_revocation(cx).or_else(|| self.poll_events())
+        {
             return Poll::Ready(ToSwarm::GenerateEvent(next_event));
         }
 
