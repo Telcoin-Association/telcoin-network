@@ -227,8 +227,23 @@ async fn qualify_hub_join(network_type: NetworkType, delayed_hub: bool) -> eyre:
     let started = Instant::now();
     let joining = joining.start().await?;
     if delayed_hub {
+        // Dial the actual unavailable endpoint, then observe the entire minimum Grace interval.
+        joining.handle.dial(hub.peer, hub.address.clone()).await?;
         first.handle.find_authorities(vec![joining.bls]).await?;
         joining.handle.find_authorities(current.iter().copied().collect()).await?;
+        wait_until(
+            STAGE_BUDGET,
+            "Grace interval elapsed while hub remains unavailable",
+            || async {
+                first
+                    .handle
+                    .admission_status()
+                    .await
+                    .map(|state| state.transition_remaining().is_zero())
+                    .map_err(Into::into)
+            },
+        )
+        .await?;
         // Observe the public path before any hub starts listening.
         let missing = first.handle.admission_status().await?;
         assert_eq!(missing.resolved_window(), 2);

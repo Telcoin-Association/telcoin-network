@@ -2,7 +2,12 @@
 
 use super::*;
 use futures::{StreamExt as _, TryStreamExt as _};
-use std::{net::TcpListener, process::Child, time::Instant};
+use std::{
+    net::TcpListener,
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    process::Child,
+    time::Instant,
+};
 use tn_config::{AdmissionConfig, AdmissionMode};
 use tn_types::AuthorityIdentifier;
 
@@ -16,6 +21,203 @@ const RESOLUTION_BUDGET: Duration = Duration::from_secs(60);
 const CONNECTION_BUDGET: Duration = Duration::from_secs(60);
 /// Maximum time to observe the joining primary committing a consensus leader.
 const CONSENSUS_BUDGET: Duration = Duration::from_secs(120);
+/// Disposable numeric identity used only by the joining child on the Linux runner.
+const JOIN_UID: &str = "59599";
+
+/// State of the fixture's UDP provider ACL, restored before the runner is reused.
+enum PathAclState {
+    /// Only the open hub can receive UDP from the joining validator's process identity.
+    Restricted {
+        /// Unique chain owned by this fixture.
+        chain: String,
+    },
+    /// The normal direct-validator path has been restored.
+    Released,
+}
+
+/// Prevent genesis dial hints from bypassing the hub while records are being resolved.
+struct PathAcl {
+    /// Current ownership of the temporary packet rules.
+    state: PathAclState,
+}
+
+impl Drop for PathAcl {
+    fn drop(&mut self) {
+        let _restored = self.release();
+    }
+}
+
+impl PathAcl {
+    /// Execute a narrowly scoped rule operation on the disposable Linux qualification runner.
+    fn iptables(args: &[&str]) -> eyre::Result<()> {
+        let output =
+            std::process::Command::new("sudo").args(["-n", "iptables"]).args(args).output()?;
+        eyre::ensure!(
+            output.status.success(),
+            "iptables {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    /// Extract the already validated QUIC endpoint's UDP port.
+    fn ports(info: &BootstrapServer) -> eyre::Result<Vec<u16>> {
+        std::iter::once(&info.primary)
+            .chain(&info.workers)
+            .map(|node| {
+                node.network_address
+                    .to_string()
+                    .split("/udp/")
+                    .nth(1)
+                    .and_then(|tail| tail.split('/').next())
+                    .ok_or_else(|| eyre::eyre!("QUIC UDP port"))
+                    .and_then(|port| port.parse().map_err(Into::into))
+            })
+            .collect()
+    }
+
+    /// Restrict this validator alone to hub UDP ports until authenticated resolution completes.
+    fn install(hub: &BootstrapServer) -> eyre::Result<Self> {
+        let chain = format!("TN_JOIN_{}", std::process::id());
+        let guard = Self { state: PathAclState::Restricted { chain: chain.clone() } };
+        Self::iptables(&["-N", &chain])?;
+        Self::ports(hub)?.into_iter().try_for_each(|port| {
+            Self::iptables(&[
+                "-A",
+                &chain,
+                "-p",
+                "udp",
+                "--dport",
+                &port.to_string(),
+                "-j",
+                "ACCEPT",
+            ])
+        })?;
+        Self::iptables(&["-A", &chain, "-j", "DROP"])?;
+        Self::iptables(&[
+            "-I",
+            "OUTPUT",
+            "-p",
+            "udp",
+            "-m",
+            "owner",
+            "--uid-owner",
+            JOIN_UID,
+            "-j",
+            &chain,
+        ])?;
+        Ok(guard)
+    }
+
+    /// Restore every source-port rule, including when qualification fails.
+    fn release(&mut self) -> eyre::Result<()> {
+        match std::mem::replace(&mut self.state, PathAclState::Released) {
+            PathAclState::Released => Ok(()),
+            PathAclState::Restricted { chain } => {
+                // Evaluate every cleanup operation before returning any failure.
+                let removed = Self::iptables(&[
+                    "-D",
+                    "OUTPUT",
+                    "-p",
+                    "udp",
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    JOIN_UID,
+                    "-j",
+                    &chain,
+                ]);
+                let flushed = Self::iptables(&["-F", &chain]);
+                let deleted = Self::iptables(&["-X", &chain]);
+                [removed, flushed, deleted]
+                    .into_iter()
+                    .collect::<eyre::Result<Vec<_>>>()
+                    .map(|_| ())
+            }
+        }
+    }
+}
+
+/// Restore the joining fixture's temporary directory ownership after its child exits.
+struct NodeOwnership {
+    /// Directory delegated to the unprivileged child.
+    dir: PathBuf,
+    /// Fixture parent whose traversal permission was temporarily opened.
+    parent: PathBuf,
+    /// Parent permissions to restore on cleanup.
+    parent_permissions: std::fs::Permissions,
+    /// Original fixture owner's numeric user id.
+    uid: u32,
+    /// Original fixture owner's numeric group id.
+    gid: u32,
+}
+
+impl Drop for NodeOwnership {
+    fn drop(&mut self) {
+        let _restored = std::process::Command::new("sudo")
+            .args(["-n", "chown", "-R", &format!("{}:{}", self.uid, self.gid)])
+            .arg(&self.dir)
+            .status();
+        let _permissions = std::fs::set_permissions(&self.parent, self.parent_permissions.clone());
+    }
+}
+
+impl NodeOwnership {
+    /// Delegate only this temporary node directory to the disposable numeric child identity.
+    fn acquire(parent: &Path, dir: &Path) -> eyre::Result<Self> {
+        let metadata = std::fs::metadata(dir)?;
+        let guard = Self {
+            dir: dir.to_owned(),
+            parent: parent.to_owned(),
+            parent_permissions: std::fs::metadata(parent)?.permissions(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))?;
+        let changed = std::process::Command::new("sudo")
+            .args(["-n", "chown", "-R", &format!("{JOIN_UID}:{JOIN_UID}")])
+            .arg(dir)
+            .output()?;
+        eyre::ensure!(
+            changed.status.success(),
+            "fixture chown: {}",
+            String::from_utf8_lossy(&changed.stderr)
+        );
+        Ok(guard)
+    }
+}
+
+/// Preserve explicit fork overrides while launching the child without root privileges.
+fn restricted_command(original: std::process::Command) -> std::process::Command {
+    let mut command = std::process::Command::new("sudo");
+    command.args([
+        "-n",
+        "setpriv",
+        &format!("--reuid={JOIN_UID}"),
+        &format!("--regid={JOIN_UID}"),
+        "--clear-groups",
+        "env",
+    ]);
+    command.args(
+        original
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .flat_map(|(key, _)| [std::ffi::OsString::from("-u"), key.to_os_string()]),
+    );
+    command.args(original.get_envs().filter_map(|(key, value)| {
+        value.map(|value| {
+            let mut assignment = key.to_os_string();
+            assignment.push("=");
+            assignment.push(value);
+            assignment
+        })
+    }));
+    command.arg(original.get_program()).args(original.get_args());
+    original.get_current_dir().into_iter().for_each(|dir| {
+        command.current_dir(dir);
+    });
+    command
+}
 
 /// A full node with independently advertised worker RPCs and per-swarm metrics.
 struct QualificationNode {
@@ -27,6 +229,10 @@ struct QualificationNode {
     metrics: String,
     /// Governance and transport bindings provisioned for this node.
     info: NodeInfo,
+    /// Restore the temporary ownership after this child has stopped.
+    _ownership: Option<NodeOwnership>,
+    /// Sole-hub restriction until this validator's authenticated record resolution completes.
+    path_acl: Option<PathAcl>,
 }
 
 impl Drop for QualificationNode {
@@ -37,6 +243,10 @@ impl Drop for QualificationNode {
 }
 
 impl QualificationNode {
+    /// Permit direct validator UDP traffic after the sole-hub resolution proof.
+    fn release_paths(&mut self) -> eyre::Result<()> {
+        self.path_acl.as_mut().map(PathAcl::release).transpose().map(|_| ())
+    }
     /// Stop the hub without stopping any validator.
     fn stop(&mut self) -> eyre::Result<()> {
         self.process.kill()?;
@@ -118,11 +328,27 @@ fn start_qualification_node(
         .arg(&metrics)
         .arg("--bootstrap-peers")
         .arg(bootstrap_json);
+    let (ownership, path_acl) = if name == NEW_VALIDATOR {
+        let ownership = NodeOwnership::acquire(base, &dir)?;
+        let hub = bootstraps.values().next().ok_or_else(|| eyre::eyre!("sole open hub"))?;
+        let path_acl = PathAcl::install(hub)?;
+        command = restricted_command(command);
+        (Some(ownership), Some(path_acl))
+    } else {
+        (None, None)
+    };
     e2e_tests::setup_log_dir(&mut command, name, "hub_join", 1);
     drop((first, second, metric));
     command
         .spawn()
-        .map(|process| QualificationNode { process, rpcs, metrics, info })
+        .map(|process| QualificationNode {
+            process,
+            rpcs,
+            metrics,
+            info,
+            _ownership: ownership,
+            path_acl,
+        })
         .map_err(Into::into)
 }
 
@@ -185,7 +411,8 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
         .iter()
         .map(|(name, _)| start_qualification_node(base, name, AdmissionMode::Closed, &bootstrap))
         .collect::<eyre::Result<Vec<_>>>()?;
-    let joining = start_qualification_node(base, NEW_VALIDATOR, AdmissionMode::Closed, &bootstrap)?;
+    let mut joining =
+        start_qualification_node(base, NEW_VALIDATOR, AdmissionMode::Closed, &bootstrap)?;
     let existing = nodes.first().ok_or_else(|| eyre::eyre!("existing committee"))?;
     let provider = ProviderBuilder::new().connect_http(existing.rpc()?.parse()?);
     wait_until(PUBLICATION_BUDGET, "initial direct committee RPC", || async {
@@ -222,6 +449,7 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
     })
     .await?;
     let resolved = started.elapsed();
+    joining.release_paths()?;
     wait_until(
         CONNECTION_BUDGET,
         "direct current-validator connections on every swarm",
@@ -239,6 +467,10 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
             .await
             .map(|info| info.committee.contains(&new_validator.address()))
             .map_err(Into::into)
+    })
+    .await?;
+    wait_until(CONSENSUS_BUDGET, "closed admission active on every joining swarm", || async {
+        joining.all_swarms("tn_network_admission_mode", 2.0).or(Ok(false))
     })
     .await?;
     let author = AuthorityIdentifier::from(joining.info.bls_public_key);
@@ -272,7 +504,8 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 "existing_validators": 4, "joining_validators": 1, "open_hubs": 1,
                 "swarms": REQUIRED_SWARMS,
             }, "conditions": {
-                "transport": "loopback QUIC", "worker_fees": [7, 7],
+            "transport": "loopback QUIC", "worker_fees": [7, 7],
+            "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
                 "transition_grace_seconds": 1, "snapshot_lease_seconds": 300,
             }, "publication_ms": published.as_millis(),
             "publication_to_resolution_ms": resolved.saturating_sub(published).as_millis(),
