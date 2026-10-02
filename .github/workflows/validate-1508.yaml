@@ -1,0 +1,150 @@
+name: Issue 1508 validation
+
+on:
+  push:
+    branches: [ci/1508-worker-state-validation]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: clippy
+            cache: clippy-cache
+          - lane: test-default
+            cache: test-cache
+          - lane: test-adiri
+            cache: test-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NEXTEST_PROFILE: ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - name: Read nightly pin
+        if: matrix.lane == 'clippy'
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
+      - name: Install pinned nightly
+        if: matrix.lane == 'clippy'
+        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
+      - uses: taiki-e/install-action@v2
+        if: matrix.lane != 'clippy'
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: ${{ matrix.cache }}
+          save-if: "false"
+      - name: Run workspace lane
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          if [[ "$LANE" == clippy ]]; then
+            cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps -- -D warnings
+            cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
+          else
+            ./etc/ci-lanes.sh "$LANE"
+          fi
+
+  regression-and-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+      - name: Verify fixed worker lifecycle
+        run: |
+          cargo nextest run --locked -p tn-node --no-tests=fail \
+            -E 'test(test_multi_worker_components_across_epochs) | test(epoch_starts_all_workers_and_reuses_components)' 2>&1 | tee fixed.log
+      - name: Remove the initialization guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("crates/node/src/engine/inner.rs")
+          source = path.read_text()
+          guard = '''        eyre::ensure!(
+                      usize::from(worker_id) == self.workers.len(),
+                      "cannot initialize worker {worker_id}: next uninitialized worker is {}",
+                      self.workers.len()
+                  );
+          '''
+          import textwrap
+          guard = textwrap.dedent(guard)
+          guard = textwrap.indent(guard, "        ")
+          assert source.count(guard) == 1, "mutation must remove exactly one guard"
+          path.write_text(source.replace(guard, ""))
+          PY
+      - name: Require guard mutation to fail at the new assertion
+        run: |
+          set +e
+          cargo nextest run --locked -p tn-node --test it --no-tests=fail \
+            -E 'test(test_multi_worker_components_across_epochs)' > guard-mutant.log 2>&1
+          status=$?
+          set -e
+          cat guard-mutant.log
+          test "$status" -eq 100
+          rg -F 'invalid worker initialization succeeded' guard-mutant.log
+          git restore --source=HEAD -- crates/node/src/engine/inner.rs
+      - name: Make retained components count as running
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("crates/node/src/engine/mod.rs")
+          source = path.read_text()
+          target = "self.worker_state(worker_id).await == WorkerState::Running"
+          assert source.count(target) == 1, "mutation must target the running predicate"
+          path.write_text(source.replace(target, "self.worker_state(worker_id).await != WorkerState::Uninitialized"))
+          PY
+      - name: Require running mutation to fail at the stopped worker assertion
+        run: |
+          set +e
+          cargo nextest run --locked -p tn-node --test it --no-tests=fail \
+            -E 'test(test_multi_worker_components_across_epochs)' > running-mutant.log 2>&1
+          status=$?
+          set -e
+          cat running-mutant.log
+          test "$status" -eq 100
+          rg -F 'assertion failed: !engine.is_worker_running(1).await' running-mutant.log
+          git restore --source=HEAD -- crates/node/src/engine/mod.rs
+      - name: Restore and verify the fix
+        run: |
+          cargo nextest run --locked -p tn-node --no-tests=fail \
+            -E 'test(test_multi_worker_components_across_epochs) | test(epoch_starts_all_workers_and_reuses_components)' 2>&1 | tee restored.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-1508-regression-and-mutation
+          path: |
+            fixed.log
+            guard-mutant.log
+            running-mutant.log
+            restored.log
+          retention-days: 7
