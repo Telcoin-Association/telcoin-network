@@ -1,6 +1,5 @@
 //! Test the epoch boundary and validator shuffles.
 
-#[cfg(not(feature = "adiri"))]
 #[path = "hub_join.rs"]
 mod hub_join;
 
