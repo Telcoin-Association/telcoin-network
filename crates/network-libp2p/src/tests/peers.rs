@@ -1089,7 +1089,7 @@ fn test_is_validator() {
 /// membership, so rotating out of the committee revokes the load exemption
 /// (and, because operator trust is separate, never touches an operator allowlist).
 #[test]
-fn test_committee_rotation_revokes_validator_exemption() {
+fn test_committee_rotation_revokes_validator_exemption() -> eyre::Result<()> {
     ensure_score_config(None);
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
 
@@ -1105,7 +1105,9 @@ fn test_committee_rotation_revokes_validator_exemption() {
     let load = Penalty::Load(crate::LoadPenalty::KademliaFlood);
     let action = all_peers.process_penalty(&peer_id, load);
     assert!(matches!(action, PeerAction::NoAction));
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
+    let reputation =
+        all_peers.get_peer(&peer_id).ok_or_else(|| eyre::eyre!("missing validator"))?;
+    assert_eq!(reputation.reputation(), Reputation::Trusted);
 
     // rotate the validator out of the committee
     all_peers.current_committee.clear();

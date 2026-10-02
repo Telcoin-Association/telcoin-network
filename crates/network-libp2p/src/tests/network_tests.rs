@@ -22,6 +22,119 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Build a real transport using the supplied identity, including when restarting an offline hub.
+fn trusted_hub_network(
+    config: ConsensusConfig<MemDatabase>,
+    tasks: &TaskManager,
+) -> crate::types::NetworkResult<NetworkPeer<TestWorkerRequest, TestWorkerResponse>> {
+    let (events, network_events) = mpsc::channel(10);
+    let network = ConsensusNetwork::new(
+        config.network_config(),
+        events,
+        config.key_config().clone(),
+        config.key_config().primary_network_keypair().clone(),
+        MemDatabase::default(),
+        tasks.get_spawner(),
+        NetworkType::Primary,
+        config.primary_address(),
+        None,
+    )?;
+    let network_handle = network.network_handle();
+    Ok(NetworkPeer { config, network_events, network_handle, network })
+}
+
+/// A hub reconnects over authenticated QUIC with the population target already satisfied.
+#[tokio::test]
+async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::Result<()> {
+    let mut settings = NetworkConfig::default();
+    settings.peer_config_mut().target_num_peers = 1;
+    settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(settings).build();
+    let mut configs = fixture.authorities().take(3).map(|authority| authority.consensus_config());
+    let tasks = TaskManager::default();
+    let NetworkPeer {
+        config: local_config,
+        network_handle: local,
+        network: local_network,
+        network_events: _local_events,
+    } = trusted_hub_network(configs.next().ok_or_else(|| eyre!("local config"))?, &tasks)?;
+    let NetworkPeer {
+        config: hub_config,
+        network_handle: hub,
+        network: hub_network,
+        network_events: _hub_events,
+    } = trusted_hub_network(configs.next().ok_or_else(|| eyre!("hub config"))?, &tasks)?;
+    let NetworkPeer {
+        config: other_config,
+        network_handle: other,
+        network: other_network,
+        network_events: _other_events,
+    } = trusted_hub_network(configs.next().ok_or_else(|| eyre!("unrelated config"))?, &tasks)?;
+    let local_task = tokio::spawn(local_network.run());
+    let hub_task = tokio::spawn(hub_network.run());
+    let other_task = tokio::spawn(other_network.run());
+    local.start_listening(local_config.primary_address()).await?;
+    hub.start_listening(hub_config.primary_address()).await?;
+    other.start_listening(other_config.primary_address()).await?;
+    let hub_bls = hub_config.key_config().primary_public_key();
+    let other_bls = other_config.key_config().primary_public_key();
+    let endpoint = |config: &ConsensusConfig<MemDatabase>| tn_types::P2pNode {
+        network_key: config.key_config().primary_network_public_key(),
+        network_address: config.primary_address(),
+        rpc: None,
+    };
+    local.add_bootstrap_peers([(other_bls, endpoint(&other_config))].into_iter().collect()).await?;
+    local.dial_by_bls(other_bls).await?;
+    local.add_trusted_peers([(hub_bls, endpoint(&hub_config))].into_iter().collect()).await?;
+    wait_until(
+        Duration::from_secs(15),
+        "trusted hub connects alongside unrelated peer",
+        || async { Ok(local.connected_peer_count().await? == 2) },
+    )
+    .await?;
+    hub_task.abort();
+    assert!(hub_task.await.err().is_some_and(|error| error.is_cancelled()));
+    wait_until(
+        Duration::from_secs(15),
+        "hub disconnect leaves unrelated peer connected",
+        || async { Ok(local.connected_peer_count().await? == 1) },
+    )
+    .await?;
+    local
+        .update_committees(
+            std::collections::HashSet::from([hub_bls]),
+            std::collections::HashSet::from([other_bls]),
+            std::collections::HashSet::new(),
+        )
+        .await?;
+    let NetworkPeer {
+        network_handle: restarted_hub,
+        network,
+        network_events: _restarted_events,
+        ..
+    } = trusted_hub_network(hub_config.clone(), &tasks)?;
+    let restarted_task = tokio::spawn(network.run());
+    restarted_hub.start_listening(hub_config.primary_address()).await?;
+    wait_until(
+        Duration::from_secs(15),
+        "trusted hub reconnects after outage and rotation",
+        || async { Ok(local.connected_peer_count().await? == 2) },
+    )
+    .await?;
+    local_task.abort();
+    assert!(local_task.await.err().is_some_and(|error| error.is_cancelled()));
+    assert!(
+        local.connected_peer_count().await.is_err(),
+        "shutdown closes the retry owner's command receiver"
+    );
+    restarted_task.abort();
+    other_task.abort();
+    let _ = restarted_task.await;
+    let _ = other_task.await;
+    Ok(())
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
@@ -1250,6 +1363,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     Ok(())
 }
 
+/// Peer exchange propagates authenticated gossip after losing a direct connection to its author.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
@@ -1263,10 +1377,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     network_config.libp2p_config_mut().k_bucket_size = target;
 
     // Set up peers with the custom config
-    let (mut target_peer, mut other_peers, _) = create_test_peers::<
-        TestWorkerRequest,
-        TestWorkerResponse,
-    >(target, Some(network_config.clone()));
+    let (mut target_peer, mut other_peers, _target_tasks) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            target,
+            Some(network_config.clone()),
+        );
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
@@ -1344,7 +1459,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     );
 
     // create a new non-validator peer
-    let TestTypes { peer1: nvv_peer, peer2, .. } =
+    let TestTypes { peer1: nvv_peer, peer2, _task_manager: _nvv_tasks } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
 
     let NetworkPeer {
@@ -1423,6 +1538,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let connected = nvv.connected_peer_ids().await?;
     error!(target: "network", ?connected, "nvv connected peers");
     assert!(!connected.contains(&target_peer_id));
+
+    // Configuration is a dial hint, so wait for the author proof obtained through peer exchange.
+    wait_until(Duration::from_secs(120), "nvv verifies disconnected gossip author", || async {
+        Ok(nvv.verified_peer_bls(target_peer_id).await? == Some(target_peer_bls))
+    })
+    .await?;
 
     // publish from target
     let random_block = fixture_batch_with_transactions(10);
@@ -1958,26 +2079,23 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
 
 /// Committee promotion forgives load-induced bans while protocol bans remain attributable.
 #[tokio::test]
-async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
+async fn test_new_epoch_preserves_protocol_bans() -> eyre::Result<()> {
     // Start with two peers
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    tokio::spawn(network.run());
 
     let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    tokio::spawn(network.run());
 
     // Start swarm listening
     peer1.start_listening(config_1.primary_address()).await?;
     peer2.start_listening(config_2.primary_address()).await?;
 
     let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+    let peer2_addr =
+        peer2.listeners().await?.first().ok_or_else(|| eyre!("peer2 listen address"))?.clone();
 
     // Connect peers
     peer1
@@ -2008,55 +2126,32 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     }))
     .await;
 
-    // Wait for ban to take effect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // Wait for ban to take effect.
+    wait_until(Duration::from_secs(5), "peer2 disconnects after protocol ban", || async {
+        Ok(!peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     // Verify peer2 is disconnected and banned
     let connected_peers = peer1.connected_peer_ids().await?;
     assert!(!connected_peers.contains(&peer2_id), "Peer2 should be disconnected after ban");
 
-    let score = peer1.peer_score(peer2_id).await?.unwrap();
+    let score = peer1.peer_score(peer2_id).await?.ok_or_else(|| eyre!("peer2 score"))?;
     let min_score = config_1.network_config().peer_config().score_config.min_score;
     assert_eq!(score, min_score, "Peer2 should have ban-level score");
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
-        .into_iter()
-        .collect();
+    let committee = [config_2.key_config().primary_public_key()].into_iter().collect();
 
     // Seed peer1's committee with peer2
-    let handle = peer1.clone();
-    tokio::spawn(async move {
-        handle
-            .update_committees(Default::default(), committee, Default::default())
-            .await
-            .expect("Failed to send UpdateCommittees command");
-    })
-    .await?;
+    peer1.update_committees(Default::default(), committee, Default::default()).await?;
 
-    // Wait for unban to take effect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // The following command observes the preceding epoch update in the swarm's command queue.
+    let score_after_epoch =
+        peer1.peer_score(peer2_id).await?.ok_or_else(|| eyre!("peer2 score"))?;
+    assert_eq!(score_after_epoch, min_score, "epoch admission must preserve the protocol ban");
 
-    // Verify peer2's score has improved and is no longer banned
-    let score_after_epoch = peer1.peer_score(peer2_id).await?.unwrap();
-    assert_eq!(
-        score_after_epoch,
-        config_1.network_config().peer_config().score_config.max_score,
-        "Peer2 should have improved score after new epoch"
-    );
-
-    // peer2 should dial peer1 - but try dial to reconnecting peer2 and ignore `AlreadyConnectedErr`
-    let _ = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
-
-    // Wait for the connection to reestablish
-    wait_until(Duration::from_secs(5), "peer2 reconnects after unban", || async {
-        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
-    })
-    .await?;
-
-    // Verify connection reestablished
-    let connected_peers_after = peer1.connected_peer_ids().await?;
-    assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be reconnected after unban");
+    assert!(peer1.dial_by_bls(config_2.key_config().primary_public_key()).await.is_err());
 
     Ok(())
 }
@@ -2183,19 +2278,15 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
 
 /// Committee admission forgives a load ban while its connection is still closing.
 #[tokio::test]
-async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> {
+async fn test_new_epoch_handles_load_disconnect() -> eyre::Result<()> {
     // Start with two peers
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    tokio::spawn(network.run());
 
     let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    tokio::spawn(network.run());
 
     // Start swarm listening
     peer1.start_listening(config_1.primary_address()).await?;
@@ -2235,23 +2326,16 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Then apply a severe penalty - should trigger disconnect pending ban
     peer1.report_penalty(peer2_bls, Penalty::Load(crate::LoadPenalty::KademliaFlood)).await;
 
-    // Wait for disconnect to begin but not complete
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
-        .into_iter()
-        .collect();
-
-    // Seed peer1's committee with peer2
-    let handle = peer1.clone();
-    tokio::spawn(async move {
-        handle
-            .update_committees(Default::default(), committee, Default::default())
-            .await
-            .expect("Failed to send UpdateCommittees command");
+    wait_until(Duration::from_secs(5), "peer2 receives load penalties", || async {
+        Ok(peer1.peer_score(peer2_id).await?.is_some_and(|score| score < 0.0))
     })
     .await?;
+
+    // Now simulate a new epoch where peer2 is in the committee
+    let committee = [peer2_bls].into_iter().collect();
+
+    // Seed peer1's committee with peer2
+    peer1.update_committees(Default::default(), committee, Default::default()).await?;
 
     // Wait for epoch processing to lift peer2's score above zero.
     wait_until(
@@ -2262,7 +2346,8 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     .await?;
 
     // Verify peer2's score has improved and is trusted
-    let score_after_epoch = peer1.peer_score(peer2_id).await?.unwrap();
+    let score_after_epoch =
+        peer1.peer_score(peer2_id).await?.ok_or_else(|| eyre!("peer2 score"))?;
     assert!(score_after_epoch > 0.0, "Peer2 should have a positive score after new epoch");
 
     // Try reconnecting peer2 if it was disconnected during the process

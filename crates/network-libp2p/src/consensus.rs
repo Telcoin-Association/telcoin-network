@@ -1070,6 +1070,10 @@ where
                 );
                 let _ = reply.send(Ok(()));
             }
+            NetworkCommand::AddTrustedPeers { peers, reply } => {
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peers(peers);
+                send_or_log_error!(reply, Ok(()), "AddTrustedPeers");
+            }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
                 // exists, e.g. restored unpinned from persistence), but never overwrite an
@@ -1154,6 +1158,11 @@ where
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
+            }
+            #[cfg(test)]
+            NetworkCommand::VerifiedPeerBls { peer, reply } => {
+                let binding = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                send_or_log_error!(reply, binding, "VerifiedPeerBls");
             }
             NetworkCommand::EstablishedPeerCount { reply } => {
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");

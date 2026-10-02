@@ -308,6 +308,16 @@ impl Peer {
         self.reputation()
     }
 
+    /// Whether rotation must preserve this peer's protocol penalties and bans.
+    pub(super) fn has_protocol_penalty(&self) -> bool {
+        self.penalty_history == PenaltyHistory::Protocol
+    }
+
+    /// Retain an operator-provisioned peer without resetting its score or connection state.
+    pub(super) fn retain_for_operator(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
     /// Ensure the peer's status is banned.
     ///
     /// A ban is never suppressed by admission, retention, or load-scoring privileges.
