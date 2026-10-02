@@ -26,6 +26,25 @@ const JOIN_UID: &str = "59599";
 /// Allow all five validators a full leader cycle within each accelerated epoch.
 const JOIN_EPOCH_DURATION: u64 = 15;
 
+/// Availability of the fresh validator's sole hub during governance admission.
+#[derive(Clone, Copy)]
+enum HubCondition {
+    /// The sole hub is reachable throughout discovery.
+    Healthy,
+    /// The fresh process cannot reach any QUIC endpoint for one complete fixture epoch.
+    Unavailable,
+}
+
+impl HubCondition {
+    /// Stable evidence and log-directory label for each independent condition.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// State of the fixture's UDP provider ACL, restored before the runner is reused.
 enum PathAclState {
     /// Only the open hub can receive UDP from the joining validator's process identity.
@@ -109,6 +128,22 @@ impl PathAcl {
             &chain,
         ])?;
         Ok(guard)
+    }
+
+    /// Make the sole hub unavailable while preserving the prohibition on direct discovery.
+    fn block_hub(&self) -> eyre::Result<()> {
+        match &self.state {
+            PathAclState::Restricted { chain } => Self::iptables(&["-I", chain, "1", "-j", "DROP"]),
+            PathAclState::Released => Err(eyre::eyre!("hub restriction already released")),
+        }
+    }
+
+    /// Recover hub access by removing only the leading outage rule.
+    fn recover_hub(&self) -> eyre::Result<()> {
+        match &self.state {
+            PathAclState::Restricted { chain } => Self::iptables(&["-D", chain, "1"]),
+            PathAclState::Released => Err(eyre::eyre!("hub restriction already released")),
+        }
     }
 
     /// Restore every source-port rule, including when qualification fails.
@@ -295,6 +330,16 @@ impl QualificationNode {
 
     /// Require an independently observed metric for primary and every configured worker.
     fn all_swarms(&self, metric: &str, minimum: f64) -> eyre::Result<bool> {
+        self.check_swarms(metric, |value| value >= minimum)
+    }
+
+    /// Require every swarm to remain below a readiness threshold during an outage.
+    fn all_swarms_below(&self, metric: &str, maximum: f64) -> eyre::Result<bool> {
+        self.check_swarms(metric, |value| value < maximum)
+    }
+
+    /// Compare an actual labeled metric on each required swarm, rejecting missing observations.
+    fn check_swarms(&self, metric: &str, predicate: impl Fn(f64) -> bool) -> eyre::Result<bool> {
         let body = super::super::common::scrape_metrics(&self.metrics)?;
         REQUIRED_SWARMS.into_iter().try_fold(true, |ready, network| {
             let prefix = format!("{metric}{{");
@@ -304,7 +349,7 @@ impl QualificationNode {
                 .and_then(|line| line.split_ascii_whitespace().last())
                 .ok_or_else(|| eyre::eyre!("missing {metric} for {network}"))
                 .and_then(|value| value.parse::<f64>().map_err(Into::into))
-                .map(|value| ready && value >= minimum)
+                .map(|value| ready && predicate(value))
         })
     }
 }
@@ -315,6 +360,7 @@ fn start_qualification_node(
     name: &str,
     mode: AdmissionMode,
     bootstraps: &BTreeMap<tn_types::BlsPublicKey, BootstrapServer>,
+    condition: HubCondition,
 ) -> eyre::Result<QualificationNode> {
     let dir = base.join(name);
     let mut info: NodeInfo =
@@ -374,6 +420,9 @@ fn start_qualification_node(
         let ownership = NodeOwnership::acquire(base, &dir)?;
         let hub = bootstraps.values().next().ok_or_else(|| eyre::eyre!("sole open hub"))?;
         let path_acl = PathAcl::install(hub)?;
+        if matches!(condition, HubCondition::Unavailable) {
+            path_acl.block_hub()?;
+        }
         let pid_file = dir.join("qualification.pid");
         command = restricted_command(command, &pid_file, &executable);
         (Some(ownership), Some(path_acl), Some(pid_file))
@@ -384,7 +433,12 @@ fn start_qualification_node(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
-    e2e_tests::setup_log_dir(&mut command, name, "hub_join", attempt);
+    e2e_tests::setup_log_dir(
+        &mut command,
+        name,
+        &format!("hub_join/{}", condition.label()),
+        attempt,
+    );
     drop((first, second, metric));
     command
         .spawn()
@@ -441,6 +495,18 @@ fn qualification_header(rpc: &str) -> eyre::Result<(u64, QualificationLeader)> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the built full-node binary; run in the hub-join qualification lane"]
 async fn hub_join_governance_two_workers() -> eyre::Result<()> {
+    qualify_governance_join(HubCondition::Healthy).await
+}
+
+/// A hub outage must delay fresh discovery while existing consensus continues, then recover fully.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the built full-node binary; run in the hub-join qualification lane"]
+async fn hub_join_governance_unavailable_two_workers() -> eyre::Result<()> {
+    qualify_governance_join(HubCondition::Unavailable).await
+}
+
+/// Measure the full governance path under one independently repeated hub condition.
+async fn qualify_governance_join(condition: HubCondition) -> eyre::Result<()> {
     let _permit = super::super::common::acquire_test_permit();
     pin_fork_epochs(Some(0), None, None, None);
     let temp = tempfile::TempDir::with_prefix("hub_join_governance")?;
@@ -476,8 +542,13 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 .map(|_| ())
                 .map_err(eyre::Report::from)
         })?;
-    let mut hub =
-        start_qualification_node(base, "open-hub", AdmissionMode::Open, &BTreeMap::new())?;
+    let mut hub = start_qualification_node(
+        base,
+        "open-hub",
+        AdmissionMode::Open,
+        &BTreeMap::new(),
+        condition,
+    )?;
     let bootstrap = BTreeMap::from([(
         hub.info.bls_public_key,
         BootstrapServer {
@@ -487,10 +558,17 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
     )]);
     let nodes = committee
         .iter()
-        .map(|(name, _)| start_qualification_node(base, name, AdmissionMode::Closed, &bootstrap))
+        .map(|(name, _)| {
+            start_qualification_node(base, name, AdmissionMode::Closed, &bootstrap, condition)
+        })
         .collect::<eyre::Result<Vec<_>>>()?;
-    let mut joining =
-        start_qualification_node(base, NEW_VALIDATOR, AdmissionMode::Closed, &bootstrap)?;
+    let mut joining = start_qualification_node(
+        base,
+        NEW_VALIDATOR,
+        AdmissionMode::Closed,
+        &bootstrap,
+        condition,
+    )?;
     let existing = nodes.first().ok_or_else(|| eyre::eyre!("existing committee"))?;
     let provider = ProviderBuilder::new().connect_http(existing.rpc()?.parse()?);
     wait_until(PUBLICATION_BUDGET, "initial direct committee RPC", || async {
@@ -515,12 +593,46 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
         })
         .await?;
     let started = Instant::now();
-    wait_until(
-        PUBLICATION_BUDGET,
-        "governance-noticed record publication on every hub swarm",
-        || async { hub.all_swarms("tn_network_admission_resolved_window", 5.0).or(Ok(false)) },
-    )
-    .await?;
+    tokio::time::timeout(PUBLICATION_BUDGET, async {
+        if matches!(condition, HubCondition::Unavailable) {
+            wait_until(PUBLICATION_BUDGET, "fresh node starts all unavailable swarms", || async {
+                joining.all_swarms("tn_network_admission_mode", 0.0).or(Ok(false))
+            })
+            .await?;
+            let unavailable_started = Instant::now();
+            let height = provider.get_block_number().await?;
+            wait_until(
+                Duration::from_secs(30),
+                "existing consensus during the hub outage",
+                || async {
+                    eyre::ensure!(
+                        joining.all_swarms_below("tn_network_admission_resolved_window", 5.0)?,
+                        "unavailable hub falsely resolved the fresh validator's window"
+                    );
+                    eyre::ensure!(
+                        joining.all_swarms_below("tn_network_admission_connected_current", 3.0)?,
+                        "unavailable fresh validator falsely reported direct readiness"
+                    );
+                    Ok(unavailable_started.elapsed() >= Duration::from_secs(JOIN_EPOCH_DURATION)
+                        && provider.get_block_number().await? > height)
+                },
+            )
+            .await?;
+            joining
+                .path_acl
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("fresh-node hub ACL"))?
+                .recover_hub()?;
+        }
+        wait_until(
+            PUBLICATION_BUDGET,
+            "governance-noticed record publication on every hub swarm",
+            || async { hub.all_swarms("tn_network_admission_resolved_window", 5.0).or(Ok(false)) },
+        )
+        .await
+    })
+    .await
+    .map_err(|_| eyre::eyre!("publication exceeded its predeclared budget"))??;
     let published = started.elapsed();
     wait_until(RESOLUTION_BUDGET, "cold committee record resolution on every swarm", || async {
         let fresh =
@@ -620,6 +732,11 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 "swarms": REQUIRED_SWARMS,
             }, "conditions": {
             "transport": "loopback QUIC", "worker_fees": [7, 7],
+            "hub_condition": condition.label(),
+            "hub_unavailable_seconds": match condition {
+                HubCondition::Healthy => 0,
+                HubCondition::Unavailable => JOIN_EPOCH_DURATION,
+            },
             "epoch_duration_seconds": JOIN_EPOCH_DURATION,
             "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
                 "transition_grace_seconds": 1, "snapshot_lease_seconds": 300,

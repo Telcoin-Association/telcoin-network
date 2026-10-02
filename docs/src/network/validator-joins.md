@@ -18,12 +18,16 @@ must advance and the direct committee connections must survive.
 These limits qualify the accelerated loopback fixture. They are not measurements of a
 provider's propagation delay or of a production WAN. The fixture uses 15-second epochs,
 a one-second transition grace, a 300-second snapshot lease, and two workers charging fee 7.
-Each invocation runs five independent samples without retrying a failed qualification.
+Each invocation runs five independent samples per healthy/unavailable hub condition without
+retrying a failed qualification. In the unavailable governance case, the fresh process has
+no QUIC access for a complete 15-second epoch. Every swarm must remain below resolution
+and direct-readiness thresholds while existing consensus advances. Only hub access is then
+restored; direct validator access remains blocked until authenticated window resolution.
 
 | Observation | Maximum wait per sample | Required evidence |
 | --- | --- | --- |
 | Publication after governance transactions | 120 seconds | Hub has authenticated records for the entire five-validator window on every swarm |
-| Publication to resolution | 60 seconds | Fresh node resolves the entire window on every swarm |
+| Publication to resolution | 60 seconds | Fresh and existing nodes resolve the entire window on every swarm |
 | Resolution to direct connection | 60 seconds | Fresh node connects directly to at least three current validators on every swarm |
 | Connection to consensus readiness | 120 seconds | Registry activates the validator, every swarm reaches Closed, and the fresh validator leads a committed header |
 | Consensus after hub loss | 120 seconds | Block height increases and every swarm retains direct current-validator connections |
@@ -70,11 +74,11 @@ numeric UID 59599 and restores directory ownership and the process-specific ACL 
 The qualification workflow runs the same command and uploads its logs even on failure.
 
 After successful baseline samples, the lane mutates the new full-window resolution getter.
-All seven swarm qualifications and the governance qualification must fail as tests, then
+All seven swarm qualifications and both governance qualifications must fail as tests, then
 the exact original source is restored. Compilation failure cannot satisfy this check.
 
 The evidence directory records the exact checkout and submodule revisions, toolchain,
-kernel, five timing samples per role and hub condition, five governance samples, and
+kernel, five timing samples per role and hub condition, five governance samples per hub condition, and
 per-stage p50, p95, and maximum values. Node logs preserve each attempt independently.
 The signed-record swarm fixture reports policy activation separately from the governance
 fixture's actual consensus participation. Preserve both: one cannot substitute for the other.

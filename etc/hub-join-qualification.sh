@@ -25,7 +25,7 @@ TN_BIN_PATH="$(realpath "$CARGO_TARGET_DIR/e2e/telcoin-network")"
 for attempt in 1 2 3 4 5; do
   export HUB_JOIN_QUALIFICATION_ATTEMPT="$attempt"
   echo "qualification_attempt=$attempt"
-  cargo nextest run --locked -p e2e-tests -E 'test(hub_join_governance_two_workers)' \
+  cargo nextest run --locked -p e2e-tests -E 'test(hub_join_governance_)' \
     --run-ignored only --success-output immediate --failure-output immediate
 done 2>&1 | tee "$evidence_dir/governance.log"
 python3 etc/hub-join-summary.py "$evidence_dir" > "$evidence_dir/summary.json"

@@ -38,13 +38,17 @@ def qualify_mutation():
             raise RuntimeError(f"every new swarm qualification must reject the mutant; see {swarm_log}")
         subprocess.run(["make", "build-e2e-bin"], check=True)
         os.environ["HUB_JOIN_QUALIFICATION_ATTEMPT"] = "6"
+        governance_log = evidence / "mutation-governance.log"
         rejected(["cargo", "nextest", "run", "--locked", "-p", "e2e-tests", "-E",
-                  "test(hub_join_governance_two_workers)", "--run-ignored", "only",
+                  "test(hub_join_governance_)", "--run-ignored", "only",
                   "--success-output", "immediate", "--failure-output", "immediate"],
-                 evidence / "mutation-governance.log")
+                 governance_log)
+        clean_log = re.sub(r"\x1b\[[0-9;]*m", "", governance_log.read_text())
+        if not re.search(r"2 tests run: 0 passed, 2 failed", clean_log):
+            raise RuntimeError(f"both governance qualifications must reject the mutant; see {governance_log}")
     finally:
         source.write_text(original)
-    print("All seven swarm qualifications and the governance qualification rejected the mutation.")
+    print("All seven swarm qualifications and both governance qualifications rejected the mutation.")
 
 
 if __name__ == "__main__":

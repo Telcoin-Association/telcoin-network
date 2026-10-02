@@ -37,8 +37,13 @@ def summarize(directory):
     governance = [json.loads(line.split("hub_join_governance_evidence=", 1)[1])
                   for line in (directory / "governance.log").read_text().splitlines()
                   if "hub_join_governance_evidence=" in line]
-    if len(governance) != 5:
-        raise ValueError("expected five governance activation samples")
+    governance_by_condition = {}
+    for sample in governance:
+        governance_by_condition.setdefault(sample["conditions"]["hub_condition"], []).append(sample)
+    if set(governance_by_condition) != {"healthy", "unavailable"} or any(
+        len(samples) != 5 for samples in governance_by_condition.values()
+    ):
+        raise ValueError("expected five governance activation samples for each hub condition")
     stages = ("publication_ms", "publication_to_resolution_ms", "resolution_to_connection_ms",
               "connection_to_consensus_readiness_ms")
     return {
@@ -47,8 +52,10 @@ def summarize(directory):
         "swarm_distributions": {role: {stage: distribution([sample[stage] for sample in samples])
                                       for stage in samples[0]} for role, samples in swarms.items()},
         "governance_samples": governance,
-        "governance_distributions": {stage: distribution([sample[stage] for sample in governance])
-                                     for stage in stages},
+        "governance_distributions": {
+            condition: {stage: distribution([sample[stage] for sample in samples]) for stage in stages}
+            for condition, samples in governance_by_condition.items()
+        },
     }
 
 
