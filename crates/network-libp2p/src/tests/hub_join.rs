@@ -345,3 +345,123 @@ async fn hub_join_worker_zero_unavailable_hub() -> eyre::Result<()> {
 async fn hub_join_worker_one_unavailable_hub() -> eyre::Result<()> {
     qualify_hub_join(NetworkType::Worker(1), true).await
 }
+
+/// Sign a replacement record under the exact primary or worker record domain.
+fn replacement_record(draft: &JoinDraft, info: NetworkInfo) -> kad::Record {
+    let domain = draft.network.record_domain;
+    let (role, worker) = match domain.network_type() {
+        NetworkType::Primary => (0_u8, 0_u16),
+        NetworkType::Worker(worker) => (1_u8, worker),
+    };
+    let signature = draft.network.key_config.request_signature_direct(&encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        domain.chain_id(),
+        role,
+        worker,
+        &info,
+    )));
+    let publisher = Some(PeerId::from(info.pubkey.clone()));
+    kad::Record {
+        value: encode(&NodeRecord { info, signature }),
+        publisher,
+        ..draft.network.get_peer_record()
+    }
+}
+
+/// Reject wrong bindings, retain newer addresses, and distinguish stubs from signed records.
+#[tokio::test(start_paused = true)]
+async fn hub_join_record_faults_every_swarm() -> eyre::Result<()> {
+    [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].into_iter().try_for_each(
+        |network_type| -> eyre::Result<()> {
+            let tasks = TaskManager::default();
+            let mut drafts = join_drafts(network_type, tasks.get_spawner())?.into_iter();
+            let mut observer = drafts.next().ok_or_else(|| eyre::eyre!("observer"))?;
+            let publisher = drafts.next().ok_or_else(|| eyre::eyre!("publisher"))?;
+            let later = drafts.next().ok_or_else(|| eyre::eyre!("later committee"))?;
+            let spare = drafts.next().ok_or_else(|| eyre::eyre!("replacement transport key"))?;
+            observer.window(8, &HashSet::from([observer.bls]), &HashSet::from([publisher.bls]));
+            let initial = observer.network.swarm.behaviour().peer_manager.admission_status();
+            assert_eq!(initial.resolved_window(), 1);
+            assert_eq!(initial.required_window(), 2);
+            let mut wrong_binding = publisher.network.get_peer_record();
+            wrong_binding.publisher = Some(observer.peer);
+            let _rejection =
+                observer.network.process_kad_put_request(publisher.peer, wrong_binding);
+            assert_eq!(
+                observer
+                    .network
+                    .swarm
+                    .behaviour()
+                    .peer_manager
+                    .admission_status()
+                    .resolved_window(),
+                1
+            );
+            let valid = publisher.network.get_peer_record();
+            observer.network.process_kad_put_request(publisher.peer, valid.clone())?;
+            assert_eq!(
+                observer
+                    .network
+                    .swarm
+                    .behaviour()
+                    .peer_manager
+                    .admission_status()
+                    .resolved_window(),
+                2
+            );
+            let mut replaced = publisher.network.node_record.info.clone();
+            replaced.timestamp = replaced.timestamp.saturating_add(1);
+            replaced.multiaddrs = HashSet::from(["/ip4/127.0.0.1/udp/19099/quic-v1".parse()?]);
+            let record = replacement_record(&publisher, replaced.clone());
+            observer.network.process_kad_put_request(publisher.peer, record)?;
+            // An older signed record cannot undo a replacement.
+            observer.network.process_kad_put_request(publisher.peer, valid)?;
+            let cached =
+                observer.network.swarm.behaviour().peer_manager.known_record(&publisher.bls);
+            assert_eq!(cached.map(|info| &info.multiaddrs), Some(&replaced.multiaddrs));
+            assert_eq!(cached.map(|info| info.timestamp), Some(replaced.timestamp));
+            // A newer signed binding replaces the transport key without changing governance
+            // identity.
+            let mut rekeyed = replaced.clone();
+            rekeyed.pubkey = spare.network.node_record.info.pubkey.clone();
+            rekeyed.timestamp = rekeyed.timestamp.saturating_add(1);
+            let rekey_record = replacement_record(&publisher, rekeyed.clone());
+            observer.network.process_kad_put_request(spare.peer, rekey_record)?;
+            observer.network.process_kad_put_request(
+                publisher.peer,
+                replacement_record(&publisher, replaced),
+            )?;
+            let binding =
+                observer.network.swarm.behaviour().peer_manager.known_record(&publisher.bls);
+            assert_eq!(binding.map(|info| &info.pubkey), Some(&rekeyed.pubkey));
+            // An overlapping newer notice must retain the unresolved later identity.
+            observer.window(
+                9,
+                &HashSet::from([observer.bls]),
+                &HashSet::from([publisher.bls, later.bls]),
+            );
+            let overlap = observer.network.swarm.behaviour().peer_manager.admission_status();
+            assert_eq!(overlap.epoch(), Some(9));
+            assert_eq!(overlap.resolved_window(), 2);
+            assert_eq!(overlap.required_window(), 3);
+            assert_eq!(overlap.effective(), AdmissionMode::Grace);
+            // A contradictory renewal falls back without replacing the accepted revision.
+            observer.window(9, &HashSet::from([observer.bls]), &HashSet::from([later.bls]));
+            let conflicting = observer.network.swarm.behaviour().peer_manager.admission_status();
+            assert_eq!(conflicting.epoch(), Some(9));
+            assert_eq!(conflicting.effective(), AdmissionMode::Open);
+            observer.window(
+                9,
+                &HashSet::from([observer.bls]),
+                &HashSet::from([publisher.bls, later.bls]),
+            );
+            observer
+                .network
+                .process_kad_put_request(later.peer, later.network.get_peer_record())?;
+            let recovered = observer.network.swarm.behaviour().peer_manager.admission_status();
+            assert_eq!(recovered.resolved_window(), 3);
+            assert_eq!(recovered.connected_current(), 0);
+            Ok(())
+        },
+    )
+}
