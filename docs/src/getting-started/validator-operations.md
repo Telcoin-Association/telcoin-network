@@ -33,6 +33,29 @@ Treat DHT records, peer exchange messages, and advertised RPC endpoints as untru
 
 Distribute validator and sentry addresses through an authenticated operator channel. A production address manifest should include the network, epoch or activation time, peer identity, IP addresses, ports, expiry, and signer set. Stage additions before removals, verify connectivity from every validator, and retain the previous manifest for rollback.
 
+## Advertising an RPC endpoint
+
+Validators should advertise a JSON-RPC endpoint. Observers do not gossip the transactions they accept. They forward each one over JSON-RPC to the endpoint advertised by the committee validator whose slot owns the sender's account, and fall back to another validator's endpoint when that one has none or cannot be reached (see [Observer](../architecture/network.md#observer)). A validator without an endpoint receives no forwarded transactions, and if no committee validator advertises one, observers cannot forward at all.
+
+Keep the node's own RPC server on loopback (`--http.addr 127.0.0.1`, the default) and publish it through a TLS reverse proxy on the same host, so the raw RPC port stays private as [Network topology](#network-topology) requires. If the proxy runs on a separate gateway instead, bind the RPC server to a private interface that only the gateway can reach. Either way, advertise the proxy's `https://` URL, never the node's RPC port:
+
+```bash
+telcoin-network keytool set-rpc \
+    --datadir /var/lib/telcoin \
+    --http https://rpc.validator.example.com/
+```
+
+`keytool generate validator --rpc-http <URL>` records the same field at key generation. The node reads the endpoint at startup, so restart it after a change.
+
+Choose the URL with these rules:
+
+- use `https://`: the node also accepts `http://`, but observers then send signed transactions in cleartext;
+- use a public hostname or address: observers refuse loopback, private-use (RFC 1918), link-local, unique-local, shared-address-space and unspecified addresses, and the `localhost` and `.local` names, so an endpoint on one of them receives no forwarded transactions;
+- make sure the hostname resolves to a public address, because that check reads the host as written and does not resolve DNS;
+- rate-limit the proxy, because the endpoint is published in the validator's node record and anyone can find it.
+
+Networks where one operator runs every validator, such as a single-host test network that advertises `127.0.0.1`, can let observers dial private addresses with [`allow_private_forward_targets`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/telcoin-network-cli/README.md#allow_private_forward_targets). Production networks leave it off.
+
 ## BLS key custody
 
 The current CLI stores the BLS12-381 key in `node-keys/bls.kw` when a passphrase is used. The file uses AES-256-GCM-SIV with PBKDF2-HMAC-SHA256. The node decrypts the key into process memory to sign consensus messages.

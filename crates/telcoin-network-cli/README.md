@@ -170,6 +170,8 @@ telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
 
 `--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
 
+Validators should set this endpoint, because observers forward the transactions they accept to it. Advertise an `https://` URL served by a TLS reverse proxy, keep the node's RPC server on loopback, and never advertise a private address: observers refuse to dial one. [Validator production operations](../../docs/src/getting-started/validator-operations.md#advertising-an-rpc-endpoint) has the full rules.
+
 ## Genesis ceremony
 
 The genesis ceremony runs once per network. One coordinator collects all validators' `node-info.yaml` files, runs the `genesis` command, and distributes the output to every participant.
@@ -871,7 +873,7 @@ chmod 600 /var/lib/telcoin/node-keys/*
 
 ### Network security
 
-- RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting.
+- RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting. The endpoint a validator advertises is the exception: observers call it without credentials, so serve it over HTTPS with rate limiting only (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint)).
 - Health check: The `--healthcheck` endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)). Keep it behind a firewall.
 - Metrics: Restrict Prometheus metrics to your monitoring infrastructure. Do not expose port 9101 publicly.
 - P2P ports: the primary and worker UDP ports from `node-info.yaml` (49590 and 49594 by convention) must be reachable by other validators. All other ports should be firewalled.
