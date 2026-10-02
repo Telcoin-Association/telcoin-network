@@ -20,7 +20,7 @@ def qualify_mutation():
     original = source.read_text()
     mutant, count = re.subn(
         r"(pub fn resolved_window\(&self\) -> usize \{\s*)self\.resolved_window",
-        r"\g<1>0",
+        r"\g<1>self.resolved_window.saturating_sub(self.resolved_window)",
         original,
     )
     if count != 1:
