@@ -11,6 +11,7 @@
   * [Transport](network/transport.md)
   * [Established connection calibration](network/resource-budget.md)
   * [Public hub capacity profile](network/hub-capacity.md)
+  * [Handshake-start accounting](network/handshake-starts.md)
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
