@@ -23,6 +23,10 @@ on:
     - cron: "17 8 * * *"
   workflow_dispatch:
     inputs:
+      grace_validation:
+        description: "Validate #1484 and prove the new regressions by mutation"
+        type: boolean
+        default: false
       sync_mode:
         description: "TN_TEST_MDBX_SYNC value for the spawned nodes"
         type: choice
@@ -53,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
@@ -79,16 +83,50 @@ jobs:
       - name: Build node binary and test binaries (untimed)
         run: |
           cargo fetch --locked
-          make build-e2e-bin
+          if [[ '${{ inputs.grace_validation }}' != 'true' ]]; then make build-e2e-bin; fi
           cargo nextest run --no-run --locked --workspace
 
+      - name: Admission regressions and transition-guard mutation
+        if: inputs.grace_validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
+          source_file=crates/network-libp2p/src/peers/admission.rs
+          python3 -I - <<'PY'
+          from pathlib import Path
+          path = Path('crates/network-libp2p/src/peers/admission.rs')
+          original = path.read_text()
+          guard = '() if !transition_remaining.is_zero() => Some(AdmissionFallback::Transition),'
+          assert original.count(guard) == 1
+          path.write_text(original.replace(guard, '() if false => Some(AdmissionFallback::Transition),'))
+          PY
+          for regression in \
+            admission_transition_grace_uses_snapshot_clock_every_swarm \
+            admission_transition_grace_waits_for_records_and_bounds_work \
+            admission_transition_grace_overlap_recovery_and_restart; do
+            set +e
+            cargo nextest run --locked -p tn-network-libp2p -E "test($regression)"
+            result=$?
+            set -e
+            if [[ "$result" != 100 ]]; then
+              echo "::error::Mutation must fail the regression test (exit 100), got $result for $regression"
+              exit 1
+            fi
+          done
+          git restore "$source_file"
+          cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
+          git diff --exit-code
+
       - name: Run restart e2e tests
+        if: ${{ !inputs.grace_validation }}
         env:
           # Scheduled runs get `durable`; a manual dispatch may select either side of the A/B.
           TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-restarts
 
       - name: Run epoch e2e tests
+        if: ${{ !inputs.grace_validation }}
         env:
           TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-epochs
