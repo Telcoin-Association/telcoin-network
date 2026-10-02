@@ -29,7 +29,7 @@ use tokio::{
     },
     time::error::Elapsed,
 };
-use tracing::error;
+use tracing::{error, info};
 
 /// Capacity for the `sync_output` broadcast.
 ///
@@ -859,19 +859,35 @@ impl ConsensusBusApp {
         } else {
             consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
         };
-        if let Some(previous_epoch_record) = maybe_previous {
-            if let Some(epoch_record) =
-                consensus_chain.epochs().record_by_epoch(current_epoch).await
-            {
-                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
-                // If the pack file is missing or incomplete request it.
-                // Note since we have an epoch record this is a past epoch
-                // not the current epoch.
-                if !contains_final_header {
-                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
-                }
-            }
+        let Some(previous_epoch_record) = maybe_previous else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: previous epoch record is missing"
+            );
+            return;
+        };
+        let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_epoch).await
+        else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch record is missing"
+            );
+            return;
+        };
+        // If the pack file is missing or incomplete request it.
+        // Note since we have an epoch record this is a past epoch
+        // not the current epoch.
+        if consensus_chain.is_epoch_complete(&epoch_record).await {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch pack is already complete"
+            );
+            return;
         }
+        self.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
     }
 
     /// Retrieve the next request to down load an epoch pack file.
