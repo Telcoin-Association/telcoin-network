@@ -57,15 +57,23 @@ struct AdmissionFixture {
 }
 
 impl AdmissionFixture {
-    /// Build the same policy on a primary or any worker ID.
+    /// Build the policy with no minimum interval for the admission-contract regressions.
     fn new(network: NetworkType, mode: AdmissionMode) -> Self {
+        Self::with_grace(network, mode, Duration::ZERO)
+    }
+
+    /// Build a primary or worker policy with an explicit transition interval.
+    fn with_grace(network: NetworkType, mode: AdmissionMode, interval: Duration) -> Self {
         let local = *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
         let mut manager = PeerManager::new(
             PeerId::random(),
             &PeerConfig::default(),
             PeerManagerMetrics::new_for(&network),
         );
-        manager.configure_admission(AdmissionConfig::new(mode, Duration::from_secs(300)), local);
+        manager.configure_admission(
+            AdmissionConfig::new(mode, Duration::from_secs(300)).with_transition_grace(interval),
+            local,
+        );
         let previous = AdmissionPeer::new();
         let current = AdmissionPeer::new();
         let next = AdmissionPeer::new();
@@ -183,7 +191,8 @@ async fn admission_inflight_and_resumed_dials_recheck_latest_policy() {
     let ordinary = fixture.ordinary.id();
     fixture.manager.register_dial_attempt(ordinary, None);
     fixture.manager.configure_admission(
-        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300)),
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::ZERO),
         fixture.local,
     );
     assert_admission_hooks(&mut fixture.manager, ordinary, false);
@@ -290,7 +299,8 @@ async fn admission_live_rotation_and_discovery_pressure() {
     );
     fixture.manager.config.target_num_peers = 0;
     fixture.manager.configure_admission(
-        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300)),
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::ZERO),
         fixture.local,
     );
     fixture.renew(7);
@@ -336,4 +346,157 @@ async fn admission_compatibility_modes_and_zero_lease() {
     );
     assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Open);
     assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
+}
+
+/// Every swarm enters Grace even with resolved records; renewals do not restart its clock.
+#[tokio::test(start_paused = true)]
+async fn admission_transition_grace_uses_snapshot_clock_every_swarm() {
+    let interval = AdmissionConfig::default().transition_grace();
+    assert_eq!(interval, Duration::from_secs(30));
+    let mut fixtures: Vec<_> =
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(3)]
+            .into_iter()
+            .map(|network| AdmissionFixture::with_grace(network, AdmissionMode::Closed, interval))
+            .collect();
+    fixtures.iter_mut().for_each(|fixture| {
+        let status = fixture.manager.admission_status();
+        assert_eq!(status.effective(), AdmissionMode::Grace);
+        assert_eq!(status.fallback(), Some(AdmissionFallback::Transition));
+        assert_eq!(status.transition_remaining(), interval);
+        assert_eq!(status.resolved_current(), status.required_current());
+        assert_eq!(status.connected_current(), 0);
+        assert_admission_hooks(&mut fixture.manager, fixture.ordinary.id(), true);
+    });
+    tokio::time::advance(Duration::from_secs(15)).await;
+    fixtures.iter_mut().for_each(|fixture| {
+        fixture.renew(7);
+        assert_eq!(
+            fixture.manager.admission_status().transition_remaining(),
+            Duration::from_secs(15)
+        );
+    });
+    tokio::time::advance(Duration::from_secs(15)).await;
+    fixtures.iter_mut().for_each(|fixture| {
+        assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+        fixture.renew(7);
+        assert_eq!(fixture.manager.admission_status().transition_remaining(), Duration::ZERO);
+        assert_admission_hooks(&mut fixture.manager, fixture.ordinary.id(), false);
+    });
+}
+
+/// Missing records keep Grace open beyond its interval without granting unknown peers privileges.
+#[tokio::test(start_paused = true)]
+async fn admission_transition_grace_waits_for_records_and_bounds_work() {
+    let mut fixture = AdmissionFixture::with_grace(
+        NetworkType::Worker(1),
+        AdmissionMode::Closed,
+        Duration::from_secs(10),
+    );
+    let ordinary = fixture.ordinary.id();
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Grace);
+    assert_admission_hooks(&mut fixture.manager, ordinary, true);
+    assert!(!fixture.manager.admission_is_privileged(&ordinary));
+    assert!(!fixture.manager.peer_is_important(&ordinary));
+    assert!(!fixture.manager.pinned_peers.contains(&fixture.ordinary.bls));
+    assert!(!fixture.manager.admission_operator_peers.contains_key(&fixture.ordinary.bls));
+    std::iter::repeat_n((), MAX_ADD_PROVIDERS_PER_WINDOW).for_each(|()| {
+        assert!(!fixture.manager.add_provider_rate_limited(ordinary));
+    });
+    assert!(fixture.manager.add_provider_rate_limited(ordinary));
+    std::iter::repeat_n((), MAX_PUT_RECORDS_PER_WINDOW).for_each(|()| {
+        assert!(matches!(
+            fixture.manager.put_record_rate_limited(ordinary),
+            PutRecordRate::Allowed
+        ));
+    });
+    assert!(matches!(fixture.manager.put_record_rate_limited(ordinary), PutRecordRate::Shed));
+    fixture.manager.temporarily_banned.insert(ordinary);
+    assert_admission_hooks(&mut fixture.manager, ordinary, false);
+    fixture.manager.stub_records.insert(fixture.current.bls);
+    fixture.manager.register_peer_connection(
+        &fixture.current.id(),
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    tokio::time::advance(Duration::from_secs(10)).await;
+    fixture.manager.events.clear();
+    fixture.renew(7);
+    let status = fixture.manager.admission_status();
+    assert_eq!(status.transition_remaining(), Duration::ZERO);
+    assert_eq!(status.resolved_current(), 1);
+    assert_eq!(status.required_current(), 2);
+    assert_eq!(status.connected_current(), 1);
+    assert_eq!(status.effective(), AdmissionMode::Grace);
+    assert_eq!(status.fallback(), Some(AdmissionFallback::Unresolved));
+    assert!(fixture.manager.events.iter().any(|event| matches!(event,
+        PeerEvent::MissingAuthorities(keys) if keys.contains(&fixture.current.bls))));
+    fixture.manager.cache_known_peer(fixture.current.bls, fixture.current.info.clone());
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+}
+
+/// Overlapping epochs replace the timer; rejected inputs preserve it, and restart begins Grace.
+#[tokio::test(start_paused = true)]
+async fn admission_transition_grace_overlap_recovery_and_restart() {
+    let mut fixture = AdmissionFixture::with_grace(
+        NetworkType::Primary,
+        AdmissionMode::Closed,
+        Duration::from_secs(10),
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    fixture.manager.update_committees_at(
+        8,
+        HashSet::from([fixture.current.bls]),
+        HashSet::from([fixture.local, fixture.next.bls]),
+        HashSet::new(),
+    );
+    tokio::time::advance(Duration::from_secs(4)).await;
+    let previous_key = fixture.current.bls;
+    let current_keys = HashSet::from([fixture.local, fixture.next.bls]);
+    let renew_current = |manager: &mut PeerManager| {
+        manager.update_committees_at(
+            8,
+            HashSet::from([previous_key]),
+            current_keys.clone(),
+            HashSet::new(),
+        );
+    };
+    let status = fixture.manager.admission_status();
+    assert_eq!(status.epoch(), Some(8));
+    assert_eq!(status.effective(), AdmissionMode::Grace);
+    assert_eq!(status.transition_remaining(), Duration::from_secs(6));
+    fixture.renew(7);
+    assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
+    renew_current(&mut fixture.manager);
+    fixture.manager.update_committees_at(
+        8,
+        HashSet::new(),
+        HashSet::from([fixture.local]),
+        HashSet::new(),
+    );
+    assert_eq!(
+        fixture.manager.admission_status().fallback(),
+        Some(AdmissionFallback::Contradictory)
+    );
+    renew_current(&mut fixture.manager);
+    assert_eq!(fixture.manager.admission_status().required_current(), 2);
+    assert_eq!(fixture.manager.admission_status().transition_remaining(), Duration::from_secs(6));
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    renew_current(&mut fixture.manager);
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    // A fresh policy models process restart. Cached records cannot restore a spent timer.
+    fixture.manager.admission_policy = AdmissionPolicy::default();
+    fixture.manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::from_secs(10)),
+        fixture.local,
+    );
+    assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Missing));
+    renew_current(&mut fixture.manager);
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Grace);
+    assert_eq!(fixture.manager.admission_status().transition_remaining(), Duration::from_secs(10));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    fixture.manager.invalidate_admission();
+    renew_current(&mut fixture.manager);
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Grace);
+    assert_eq!(fixture.manager.admission_status().transition_remaining(), Duration::from_secs(10));
 }

@@ -2,7 +2,10 @@
 
 use crate::types::NetworkInfo;
 use libp2p::PeerId;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tn_config::{AdmissionConfig, AdmissionMode};
 use tn_types::BlsPublicKey;
 use tokio::time::Instant;
@@ -18,6 +21,8 @@ pub enum AdmissionFallback {
     Contradictory,
     /// Committee records or identity mappings are still unresolved.
     Unresolved,
+    /// The accepted epoch's minimum transition interval has not elapsed.
+    Transition,
 }
 
 /// Observations for one swarm. These counts do not imply consensus readiness.
@@ -37,6 +42,8 @@ pub struct AdmissionStatus {
     required_current: usize,
     /// Connected current peers, excluding the local identity.
     connected_current: usize,
+    /// Remaining minimum interval; zero alone does not authorize Closed.
+    transition_remaining: Duration,
 }
 
 impl AdmissionStatus {
@@ -68,6 +75,11 @@ impl AdmissionStatus {
     pub fn connected_current(&self) -> usize {
         self.connected_current
     }
+
+    /// Return the remaining minimum interval, separately from record-resolution readiness.
+    pub fn transition_remaining(&self) -> Duration {
+        self.transition_remaining
+    }
 }
 
 /// Immutable committee window at one epoch revision.
@@ -92,6 +104,8 @@ pub(super) struct AdmissionPolicy {
     snapshot: Option<CommitteeSnapshot>,
     /// Last renewal by the epoch owner.
     renewed: Option<Instant>,
+    /// Start of the accepted epoch's Grace interval. Identical renewals do not extend it.
+    transition_started: Option<Instant>,
     /// Rejected update, cleared by a consistent authoritative renewal.
     fault: Option<AdmissionFallback>,
 }
@@ -104,6 +118,7 @@ impl AdmissionPolicy {
     /// Prevent unversioned compatibility updates from enabling Closed.
     pub(super) fn invalidate(&mut self) {
         self.fault = Some(AdmissionFallback::Missing);
+        self.transition_started = None;
     }
     /// Accept increasing revisions or identical renewals. Rejected updates preserve the window.
     pub(super) fn update(
@@ -129,6 +144,11 @@ impl AdmissionPolicy {
         };
         self.fault = fault;
         if fault.is_none() {
+            if self.transition_started.is_none()
+                || self.snapshot.as_ref().is_none_or(|old| epoch > old.epoch)
+            {
+                self.transition_started = Some(Instant::now());
+            }
             self.snapshot = Some(candidate);
             self.renewed = Some(Instant::now());
             true
@@ -138,7 +158,7 @@ impl AdmissionPolicy {
     }
 
     /// Resolve grants from verified records and explicit operator identities only.
-    /// Incomplete identities use Grace; missing, stale, and conflicting inputs use Open.
+    /// Transitions and incomplete identities use Grace; invalid policy inputs use Open.
     pub(super) fn evaluate(
         &self,
         known: &HashMap<BlsPublicKey, NetworkInfo>,
@@ -195,6 +215,9 @@ impl AdmissionPolicy {
                 (resolved, n.saturating_sub(n.saturating_sub(1) / 3), connected_count)
             })
             .unwrap_or_default();
+        let transition_remaining = self.transition_started.map_or(Duration::ZERO, |at| {
+            self.config.transition_grace().saturating_sub(at.elapsed())
+        });
         let fallback = self.fault.or_else(|| match () {
             () if self.snapshot.is_none() => Some(AdmissionFallback::Missing),
             () if self.renewed.is_none_or(|at| at.elapsed() >= self.config.snapshot_max_age()) => {
@@ -204,6 +227,7 @@ impl AdmissionPolicy {
             () if unresolved || resolved_current < required_current => {
                 Some(AdmissionFallback::Unresolved)
             }
+            () if !transition_remaining.is_zero() => Some(AdmissionFallback::Transition),
             () => None,
         });
         let effective = match self.config.mode() {
@@ -211,7 +235,9 @@ impl AdmissionPolicy {
             AdmissionMode::Grace => AdmissionMode::Grace,
             AdmissionMode::Closed => {
                 fallback.map_or(AdmissionMode::Closed, |reason| match reason {
-                    AdmissionFallback::Unresolved => AdmissionMode::Grace,
+                    AdmissionFallback::Unresolved | AdmissionFallback::Transition => {
+                        AdmissionMode::Grace
+                    }
                     AdmissionFallback::Missing
                     | AdmissionFallback::Stale
                     | AdmissionFallback::Contradictory => AdmissionMode::Open,
@@ -227,6 +253,7 @@ impl AdmissionPolicy {
                 resolved_current,
                 required_current,
                 connected_current,
+                transition_remaining,
             },
             authorized,
         )

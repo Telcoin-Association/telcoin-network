@@ -150,8 +150,11 @@ struct PeerManagerMetricHandles {
     admission_required_current: Gauge,
     /// Connected current peers, excluding the local identity.
     admission_connected_current: Gauge,
-    /// Fallback: healthy = 0, missing = 1, stale = 2, contradictory = 3, unresolved = 4.
+    /// Fallback: healthy = 0, missing = 1, stale = 2, contradictory = 3, unresolved = 4,
+    /// transition = 5.
     admission_fallback: Gauge,
+    /// Seconds left in the minimum transition interval; zero alone does not authorize Closed.
+    admission_transition_remaining_seconds: Gauge,
     /// Currently connected peers.
     connected_peers: Gauge,
     /// Peers known with a resolved network record (BLS key -> address).
@@ -190,6 +193,9 @@ impl PeerManagerMetrics {
         };
         self.handles.admission_mode.set(mode);
         self.handles
+            .admission_transition_remaining_seconds
+            .set(status.transition_remaining().as_secs_f64());
+        self.handles
             .admission_resolved_current
             .set(u32::try_from(status.resolved_current()).map_or(f64::MAX, f64::from));
         self.handles
@@ -203,6 +209,7 @@ impl PeerManagerMetrics {
             crate::AdmissionFallback::Stale => 2.0,
             crate::AdmissionFallback::Contradictory => 3.0,
             crate::AdmissionFallback::Unresolved => 4.0,
+            crate::AdmissionFallback::Transition => 5.0,
         }));
     }
 
