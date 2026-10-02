@@ -63,6 +63,28 @@ pub const MAX_GC_DEPTH: Round = 50;
 /// coupled to the buffer so the two can never drift apart.
 pub const GC_ACTIVITY_BUFFER: Round = 10;
 
+/// The activity window for a configured `gc_depth`: `gc_depth - GC_ACTIVITY_BUFFER`, saturating.
+///
+/// An active CVV whose executed round trails an incoming round by more than this many rounds steps
+/// back to `CvvInactive` (the consensus network handler's `behind_consensus`).  The subtraction
+/// saturates so a test fixture with a `gc_depth` at or below the buffer gets a zero window instead
+/// of an underflow; production startup rejects that configuration.
+pub const fn gc_activity_window(gc_depth: Round) -> Round {
+    gc_depth.saturating_sub(GC_ACTIVITY_BUFFER)
+}
+
+/// The rejoin window for a configured `gc_depth`: half of [`gc_activity_window`].
+///
+/// A catching-up CVV may rejoin consensus once the output it just handled trails the newest known
+/// consensus header by at most this many rounds.  Promotion sits at half the activity window, not
+/// at its edge, so the rounds the committee advances while the node restarts its epoch tasks stay
+/// inside the window and the rejoined node is not demoted again at once.  With a `gc_depth` of 50
+/// this is 20 rounds.  A zero activity window gives a zero rejoin window, which only promotes a
+/// node that has reached the round of the newest known header.
+pub const fn rejoin_round_window(gc_depth: Round) -> Round {
+    gc_activity_window(gc_depth) / 2
+}
+
 /// Maximum number of batch digests a single primary `Header` may reference.
 ///
 /// The proposer caps its own headers at the configured `max_header_num_of_batches`, and
