@@ -3224,3 +3224,99 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
 
     Ok(())
 }
+
+// ============================================================================
+// #1516 Inactive CVV certificate gossip
+// ============================================================================
+
+/// Build the same [`TestTypes`] as [`create_test_types`], but do **not** spawn the
+/// certificate manager (so `QueChannel` for `certificate_manager` stays unsubscribed).
+///
+/// Mirrors an inactive CVV in production: the primary (and its certificate manager)
+/// is not started while the node is demoted, so gossip that still calls
+/// `process_peer_certificate` can only fail with `CertificateManagerOneshot`.
+async fn create_test_types_without_cert_manager(path: &Path) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // Do NOT call synchronizer.spawn — leaves certificate_manager unsubscribed.
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// #1516: on an inactive CVV with no certificate-manager subscriber, gossip of a
+/// verified new certificate must:
+/// 1. return `Ok` (no `CertificateManagerOneshot` / error spam);
+/// 2. **not** write the certificate to the store (store must stay causally complete);
+/// 3. notify ExEx if a subscriber is present.
+///
+/// This encodes the *desired* post-fix contract and is therefore RED on the buggy
+/// handler that still gates on `is_cvv()` and returns early from
+/// `process_peer_certificate` before the ExEx notify / inactive write.
+#[tokio::test]
+async fn test_inactive_cvv_cert_gossip_ok_no_store_write_notifies_exex() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _tm, .. } =
+        create_test_types_without_cert_manager(temp_dir.path()).await;
+
+    // Inactive CVV, no certificate manager subscribed (setup above).
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    assert!(consensus_bus.is_cvv_inactive());
+    assert!(!consensus_bus.is_active_cvv());
+    assert!(consensus_bus.is_cvv());
+
+    // Subscribe ExEx before gossip so a successful path must deliver the cert.
+    let mut exex_rx = consensus_bus.subscribe_exex_certificates();
+
+    // Valid, new certificate for the current epoch (not already in the store).
+    let cert = committee.unverified_cert_from_last_authority();
+    let digest = cert.digest();
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    assert!(
+        !store.contains(&digest).expect("store contains"),
+        "precondition: cert must be absent from the store"
+    );
+
+    let gossip = PrimaryGossip::Certificate(Box::new(cert.clone()));
+    let data = encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(
+        committee.first_authority().consensus_config().chain_id(),
+    ));
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+
+    let res = handler.process_gossip(&msg).await;
+    assert!(
+        res.is_ok(),
+        "inactive CVV must accept verified certificate gossip without CertificateManagerOneshot; got {res:?}"
+    );
+
+    assert!(
+        !store.contains(&digest).expect("store contains after gossip"),
+        "inactive CVV must not write a new certificate (store must stay causally complete)"
+    );
+
+    let notified = tokio::time::timeout(Duration::from_secs(1), exex_rx.recv())
+        .await
+        .expect("ExEx must be notified within 1s on inactive CVV")
+        .expect("ExEx broadcast must deliver the certificate");
+    assert_eq!(notified.digest(), digest, "ExEx notification must carry the gossiped certificate");
+}
