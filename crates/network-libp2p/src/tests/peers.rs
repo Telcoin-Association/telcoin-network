@@ -1120,18 +1120,23 @@ fn test_committee_rotation_revokes_validator_exemption() {
 /// Trusted and committee peers retain load privileges while protocol bans survive rotation.
 #[test]
 fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), NetworkError> {
+    // This regression exercises the two policies with load exemptions.
+    enum LoadExemptBasis {
+        Operator,
+        Validator,
+    }
+
     ensure_score_config(None);
-    [TrustBasis::Operator, TrustBasis::Validator].into_iter().try_for_each(|basis| {
+    [LoadExemptBasis::Operator, LoadExemptBasis::Validator].into_iter().try_for_each(|basis| {
         let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
         let mut rng = StdRng::from_seed([46; 32]);
         let (bls, net, peer_id) = committee_member(&mut rng);
         match basis {
-            TrustBasis::Operator => all_peers.add_trusted_peer(bls, net.clone()),
-            TrustBasis::Validator => {
+            LoadExemptBasis::Operator => all_peers.add_trusted_peer(bls, net.clone()),
+            LoadExemptBasis::Validator => {
                 all_peers.upsert_peer(bls, net.clone(), vec![]);
                 all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
             }
-            TrustBasis::Bootstrap => all_peers.upsert_peer(bls, net.clone(), vec![]),
         }
         let before = all_peers
             .get_peer(&peer_id)
