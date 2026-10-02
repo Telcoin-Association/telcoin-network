@@ -227,13 +227,13 @@ Every `uses:` in `.github/workflows/` names the action by a full 40-character co
 A tag such as `v4` is a pointer the action's owner can move at any time.
 A moved tag runs new code in the gate on the next run, with no change in this repository and nothing for a reviewer to see.
 A SHA cannot be moved, so the code that runs is the code that was reviewed when the pin was set.
-Three positions made this worth doing:
+Two positions made this worth doing:
 
 - `taiki-e/install-action` runs in `cache-deps.yaml`'s `warm-test-cache` job, which writes
   the `main`-scope cache entry that every PR and queue run restores.
-- `foundry-rs/foundry-toolchain` supplies the `cast` binary whose answer decides
-  `verify-on-chain`; that binary is pinned too, by release and digest (below).
 - `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
+
+Foundry, whose `cast` decides `verify-on-chain`, is not installed by an action at all: the `attest` job in `pr.yaml` downloads the release archive itself and pins it by digest, as "What a pin does not cover" below describes.
 
 The pinned actions and the runtime each one uses (each pin's SHA, and the release it stands for in the `# vX.Y.Z` comment beside it, are in the workflows, and only there):
 
@@ -241,7 +241,6 @@ The pinned actions and the runtime each one uses (each pin's SHA, and the releas
 |---|---|
 | `actions/checkout` | node24 |
 | `taiki-e/install-action` | composite (shell steps only) |
-| `foundry-rs/foundry-toolchain` | node24 |
 | `actions/upload-pages-artifact` | composite (runs `actions/upload-artifact`, node24, itself pinned by SHA) |
 | `actions/deploy-pages` | node24 |
 
@@ -285,33 +284,56 @@ For a lightweight tag it prints one line, and that is the commit.
 ### What a pin does not cover
 
 A pin fixes the action's own code, not what that code downloads when it runs.
-For `foundry-rs/foundry-toolchain` the download is pinned separately, in the `attest` job in `pr.yaml`: the install step's `version` input names a Foundry release, and the step after it fails the job unless the `cast` on `PATH` has the SHA-256 digest in `CAST_SHA256`.
-A release asset swapped under the same tag therefore fails `verify-on-chain` instead of deciding it.
-The digest is that of the `linux_amd64` build, because `ubuntu-latest` is x64; a runner of another architecture needs a new one.
-The action takes no digest itself, and Dependabot moves an action's SHA but never its inputs, so the release and the digest stay where they are until someone moves them, together and by hand:
+That is why Foundry is not installed by an action: `foundry-rs/foundry-toolchain` downloaded and ran `foundryup`, itself unpinned, which unpacked the release and ran every binary in it before any later step could check one.
+A digest check placed after the install gated the registry call and nothing that ran before it.
+The `Install Foundry` step in the `attest` job in `pr.yaml` does the download itself instead.
+Two `env:` values on that step are the pin: `FOUNDRY_VERSION`, a Foundry release tag, and `FOUNDRY_SHA256`, the SHA-256 digest of that release's `foundry_<version>_linux_amd64.tar.gz`.
+The step downloads the archive with `curl` into `$RUNNER_TEMP` and checks it against `FOUNDRY_SHA256` with `sha256sum --check --strict` before it extracts anything; a mismatch fails the job.
+Only then does it extract `cast` and `forge` into a directory under `$RUNNER_TEMP`, write that directory to `$GITHUB_PATH` so the steps after it find both on `PATH`, and print `cast --version`, the first time anything from the archive runs.
+So nothing from upstream runs or is unpacked before the digest check: there is no `foundryup` and no action code between the download and the check.
+A release asset replaced under the same tag, or the tag re-pointed, therefore fails this step instead of deciding `verify-on-chain`.
+The digest is that of the `linux_amd64` archive, because `ubuntu-latest` is x64; a runner of another architecture needs another archive and a new digest.
+`forge` comes out of the same verified archive although nothing in `pr.yaml` runs it today, so that a step that needs it later inherits this pin instead of installing a Foundry of its own.
+Dependabot has no part in this pin: there is no action for it to bump, so the release and the digest stay where they are until someone moves them, together and by hand:
 
-1. Download the new release's `linux_amd64` tarball, check it against the release's own
-   `.sha256` file, and hash the `cast` inside it. The commands are for Linux; on macOS,
-   `shasum -a 256` stands in for `sha256sum`.
+1. Download the new release's `linux_amd64` archive, check it against the release's own
+   `.sha256` asset, against the digest GitHub reports for that asset and against the
+   build provenance Foundry's release workflow signs, and print its digest. The commands
+   are for Linux; on macOS, `shasum -a 256` stands in for `sha256sum`.
 
    ```sh
    v=vX.Y.Z   # the release to move to
+   f="foundry_${v}_linux_amd64.tar.gz"
    base="https://github.com/foundry-rs/foundry/releases/download/$v"
-   curl -fsSLO "$base/foundry_${v}_linux_amd64.tar.gz"
+   curl -fsSLO "$base/$f"
    curl -fsSL "$base/foundry_${v}_linux_amd64.sha256" | sha256sum --check -
-   tar -xzf "foundry_${v}_linux_amd64.tar.gz" cast
-   sha256sum cast
+   gh api "repos/foundry-rs/foundry/releases/tags/$v" \
+     --jq '.assets[] | select(.name=="'"$f"'") | .digest'
+   gh attestation verify "$f" --repo foundry-rs/foundry \
+     --signer-workflow foundry-rs/foundry/.github/workflows/release.yml \
+     --source-ref "refs/tags/$v"
+   sha256sum "$f"
    ```
 
-   The binary is hashed, never run.
-2. In `pr.yaml`, set `version` to the release and `CAST_SHA256` to the digest the last
-   command printed, in the same pull request.
-3. That pull request's own `verify-on-chain` run is the test that `foundryup` installs the
-   tarball's `cast` unchanged on the runner. If it does not, the check step fails there,
-   before anything lands.
+   The `gh api` command prints `sha256:<hex>`, and that hex must be the digest the last
+   command prints. `gh attestation verify` must exit 0; it prints nothing when its output
+   is not a terminal. The archive is hashed, never unpacked or run.
+2. In `pr.yaml`, set `FOUNDRY_VERSION` to the release and `FOUNDRY_SHA256` to that digest,
+   in the same pull request.
+3. That pull request's own `verify-on-chain` run tests the new pin end to end: the step
+   downloads the archive, checks it against the new digest, and the registry call runs
+   with the `cast` from it. If the runner gets anything other than the archive that was
+   hashed, the step fails there, before anything lands.
 
-What is still not pinned: `foundryup`, the program the action downloads to perform the install, which runs in the job before the check and so is trusted by it.
-The runner image (`ubuntu-latest`) is not pinned either, and with it everything preinstalled on it.
+The `.sha256` asset and the digest GitHub reports come from the same place as the archive, so they are only as trustworthy as the release itself.
+They catch a corrupted download, and a file that differs from what the release published.
+The provenance check goes one step further: it passes only for an archive that Foundry's `release.yml` built in a run at that tag, so an asset put on the release by any other route fails it.
+None of the three would catch a release built from a source tree or a workflow that was already compromised.
+What the pin adds is that the archive checked when the pin was set is the archive every later run gets.
+The provenance check is part of moving the pin and not of the `attest` job: it needs GitHub's attestation API and a token on every run, and a timeout there would fail `verify-on-chain`, while the digest already holds each run to the archive that passed it.
+
+Both values are part of the `attest` job definition, which comes from the PR's merge commit, so they guard against a change upstream, not against a PR that edits them; "Who can put a PR in the queue" above says what stops such a PR.
+What is still not pinned: the runner image (`ubuntu-latest`), and with it everything preinstalled on it, including the `curl`, `tar` and `sha256sum` the step runs, which it has to trust because they fetch, check and unpack the archive.
 The local `make attest` run uses whatever `cast` the maintainer has installed, which this pin does not reach.
 
 One thing a pin does newly fix: `taiki-e/install-action` resolves a tool requested without a version (`tool: cargo-nextest`) from the manifest in the pinned commit, with a checksum, so the cargo-nextest version stays the same until the pin moves.

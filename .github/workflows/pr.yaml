@@ -177,31 +177,46 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      # cast, for the read-only registry call. The SHA pins this action's code and
-      # `version` the Foundry release it installs; the next step pins the `cast` binary
-      # itself by its SHA-256 digest, since the action takes no digest. A release asset
-      # swapped under the same tag therefore fails there instead of answering the registry
-      # call. The digest is that of the linux_amd64 build, because ubuntu-latest is x64,
-      # so moving this job to another runner architecture needs a new digest.
-      # Dependabot moves the SHA but never an action's inputs: `version` and CAST_SHA256
-      # move together, by hand, as .github/ACTIONS.md ("What a pin does not cover")
-      # describes. Both are part of this job definition, which the PR supplies, so they
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which the PR supplies, so they
       # guard against a change upstream and not against a PR that edits them; the comment
       # above the checkout says what stops that.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
-        with:
-          version: v1.8.3
-
-      # `command -v`, so the digest covers whichever `cast` the next step will resolve on
-      # PATH, wherever the install put it. sha256sum by its full path, so nothing the
-      # install put first on PATH can stand in for it.
-      - name: Check the cast binary
         env:
-          CAST_SHA256: 1412cb2374f68032ce2c73a3fcb04e0e02a8d2b1744c160456ce513bdb2416da
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
         run: |
           set -euo pipefail
-          echo "${CAST_SHA256}  $(command -v cast)" | /usr/bin/sha256sum --check --strict -
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
 
       - name: Verify attestation on adiri
         env:
