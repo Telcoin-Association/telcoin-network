@@ -1383,6 +1383,53 @@ mod test {
         );
     }
 
+    /// Queue order, not table identity, decides what a durable barrier covers (issue #1530).
+    ///
+    /// `persist` queues its barrier when it is called, not when its future is first polled, and the
+    /// runner handles barriers and writes in FIFO order. So a barrier queued before a bare insert
+    /// acks success even though that insert's physical commit then fails, and only a barrier queued
+    /// after the insert sees the poison latch. The first barrier is created before the insert and
+    /// awaited only after the insert is queued, which pins this order: if `persist` queued its
+    /// barrier on first poll, the barrier would queue behind the faulted insert, see the latch, and
+    /// this test would fail.
+    #[tokio::test]
+    async fn test_barrier_covers_only_writes_queued_before_it() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let raw = MdbxDatabase::open(
+            temp_dir.path().join("mdbx_barrier_queue_order"),
+            4,
+            16 * MEGABYTE,
+            8 * MEGABYTE,
+        )
+        .expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        // full_memory=true mirrors the epoch DB.
+        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        db.open_table::<TestTable>().expect("failed to open table!");
+
+        // The call alone puts the barrier on the runner queue; it is not polled yet.
+        let earlier = db.persist::<TestTable>();
+        // Queued after the barrier: a bare insert whose physical commit is faulted, which trips
+        // the poison latch.
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("layered insert returns Ok");
+
+        let earlier = tokio::time::timeout(Duration::from_secs(5), earlier)
+            .await
+            .expect("earlier barrier must resolve");
+        assert!(
+            earlier.is_ok(),
+            "a barrier queued before the faulted insert covers only the writes queued before it, so it must ack success: {earlier:?}"
+        );
+
+        let later = tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>())
+            .await
+            .expect("later barrier must resolve");
+        assert!(
+            later.is_err(),
+            "a barrier queued after the faulted insert must see the poison latch and fail"
+        );
+    }
+
     #[tokio::test]
     async fn test_cache_mode_retains_mem_on_failed_commit() {
         // LOW-severity companion (issue #975): in cache mode (full_memory=false) a FAILED physical

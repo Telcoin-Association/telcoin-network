@@ -396,12 +396,16 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// The round test is `>=`, not `>`, and the equality case is load-bearing: reproposing the
     /// identical header for the *same* round must still take the write branch, because that is what
-    /// keeps the reproposal behind the durability barrier below. The certifier depends on this. It
-    /// releases its proposal lock before its own barrier, which is only safe because a reproposed
-    /// header cannot reach the certifier until this barrier acks - and since the barrier is
-    /// whole-DB and FIFO, that ack implies the certifier's earlier `ProposedCertificates` insert is
-    /// durable too. Narrowing this to `>` would let a reproposal skip the barrier and overtake that
-    /// insert, so a certificate could be re-gossiped from a record that is still memory-only.
+    /// keeps the reproposal behind the durability barrier below. After any failed epoch-DB commit
+    /// that barrier fails, so a reproposal fail-stops the proposer before its header reaches the
+    /// certifier. Narrowing this to `>` would let a reproposal skip the barrier and reach the
+    /// certifier on an epoch DB that can no longer make records durable.
+    ///
+    /// The barrier does not make the certifier's `ProposedCertificates` record durable. `persist`
+    /// queues its barrier when called and the runner acks in FIFO order, so the barrier covers only
+    /// the writes queued before it, and the certifier can insert that record after this barrier is
+    /// queued. The certifier's already-certified check therefore awaits its own
+    /// `ProposedCertificates` barrier before it re-gossips a stored certificate (issue #1530).
     async fn store_and_send_header(
         header: &Header,
         proposer_store: DB,
