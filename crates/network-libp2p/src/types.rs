@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, GossipMessage,
+    PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -11,7 +12,7 @@ use libp2p::{
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{BlsPublicKey, NetworkPublicKey, P2pNode};
+use tn_types::{BlsPublicKey, CommitteeRecordRefresher, NetworkPublicKey, P2pNode};
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
 pub use tn_types::RpcInfo;
@@ -430,6 +431,22 @@ where
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
     },
+    /// Set or renew a complete authoritative admission window at an epoch revision.
+    UpdateAdmissionCommittees {
+        /// Epoch owning the immutable committee window.
+        epoch: u64,
+        /// Previous committee.
+        previous: HashSet<BlsPublicKey>,
+        /// Current committee.
+        current: HashSet<BlsPublicKey>,
+        /// Next committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Observe admission inputs without conflating records, connections, and consensus readiness.
+    AdmissionStatus {
+        /// Admission observations from this handle's swarm.
+        reply: oneshot::Sender<AdmissionStatus>,
+    },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
     PrepareCommitteeDial {
@@ -465,6 +482,11 @@ where
     GetAllValidatorRpcs {
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
+    },
+    /// Re-resolve a committee record even when a verified mapping is already cached.
+    RefreshCommitteeRecord {
+        /// Committee authority whose endpoint needs recovery.
+        authority: BlsPublicKey,
     },
     /// Read a single record from the local kad store by BLS key.
     ///
@@ -741,6 +763,29 @@ where
         Ok(())
     }
 
+    /// Set or renew an authoritative admission window. Identical revisions renew its lease.
+    /// Older or contradictory revisions trigger fallback without replacing accepted membership.
+    pub async fn update_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next })
+            .await?;
+        Ok(())
+    }
+
+    /// Observe this swarm's policy, resolved-record quorum, and connected current peers.
+    /// Consensus readiness remains a separate node-level observation.
+    pub async fn admission_status(&self) -> NetworkResult<AdmissionStatus> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionStatus { reply }).await?;
+        res.await.map_err(Into::into)
+    }
+
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
     ///
     /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
@@ -807,6 +852,13 @@ where
     }
 }
 
+impl<Req: TNMessage, Res: TNMessage> CommitteeRecordRefresher for NetworkHandle<Req, Res> {
+    fn refresh_record(&self, authority: BlsPublicKey) {
+        // A full command channel leaves periodic refresh responsible for recovery.
+        let _ = self.sender.try_send(NetworkCommand::RefreshCommitteeRecord { authority });
+    }
+}
+
 pub use tn_node_record::{NetworkInfo, NodeRecord, RecordDomain};
 
 /// Outbound kad query from this node.
@@ -816,11 +868,28 @@ pub struct KadQuery {
     pub request: BlsPublicKey,
     /// The best result so far.
     pub result: Option<NodeRecord>,
+    /// Original verified wire record, preserving publisher and remaining TTL for retention.
+    record: Option<libp2p::kad::Record>,
+}
+
+impl KadQuery {
+    /// Replace the winning wire record, returning any previous result.
+    pub(crate) fn replace_record(
+        &mut self,
+        record: libp2p::kad::Record,
+    ) -> Option<libp2p::kad::Record> {
+        self.record.replace(record)
+    }
+
+    /// Take the winning record when the query terminates.
+    pub(crate) fn take_record(&mut self) -> Option<libp2p::kad::Record> {
+        self.record.take()
+    }
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None }
+        Self { request, result: None, record: None }
     }
 }
 

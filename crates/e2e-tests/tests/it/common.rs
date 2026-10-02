@@ -8,7 +8,7 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
+use e2e_tests::{setup_log_dir, NodeEndpoints, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -765,13 +765,37 @@ pub(crate) fn create_genesis_for_test(
     committee: &Vec<(&str, Address)>,
     epoch_duration: u64,
 ) -> eyre::Result<Genesis> {
+    create_genesis_for_test_with_workers(
+        temp_path,
+        extra_node,
+        governance_wallet,
+        committee,
+        epoch_duration,
+        &[],
+    )
+}
+
+/// Create a governance-admission fixture with the requested primary and worker topology.
+pub(crate) fn create_genesis_for_test_with_workers(
+    temp_path: &Path,
+    extra_node: (&str, Address),
+    governance_wallet: Address,
+    committee: &Vec<(&str, Address)>,
+    epoch_duration: u64,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<Genesis> {
     let (extra_name, extra_address) = extra_node;
     // use same passphrase for all nodes
     let passphrase = Some(NODE_PASSWORD.to_string());
 
     // create validator info for the extra validator to join later
     let extra_node_path = temp_path.join(extra_name);
-    create_validator_info(&extra_node_path, &extra_address.to_string(), passphrase.clone())?;
+    e2e_tests::create_validator_info_with_workers(
+        &extra_node_path,
+        &extra_address.to_string(),
+        passphrase.clone(),
+        worker_fee_configs.len().max(1),
+    )?;
 
     // fund governance to issue NFT and the extra validator to stake
     let accounts = vec![
@@ -788,7 +812,7 @@ pub(crate) fn create_genesis_for_test(
     let shared_genesis_dir = temp_path.join("shared-genesis");
 
     // create the initial committee of validators and create genesis
-    let genesis = config_committee(
+    let genesis = config_committee_with_workers(
         temp_path,
         &shared_genesis_dir,
         passphrase,
@@ -797,6 +821,7 @@ pub(crate) fn create_genesis_for_test(
         committee,
         epoch_duration,
         None,
+        worker_fee_configs,
     )?;
 
     // copy genesis for the extra validator
@@ -836,6 +861,32 @@ pub(crate) fn config_committee(
     epoch_duration: u64,
     chain_id: Option<u64>,
 ) -> eyre::Result<Genesis> {
+    config_committee_with_workers(
+        temp_path,
+        shared_genesis_dir,
+        passphrase,
+        consensus_registry_owner,
+        accounts,
+        validators,
+        epoch_duration,
+        chain_id,
+        &[],
+    )
+}
+
+/// Generate committee keys and registry state for every configured worker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn config_committee_with_workers(
+    temp_path: &Path,
+    shared_genesis_dir: &Path,
+    passphrase: Option<String>,
+    consensus_registry_owner: Address,
+    accounts: Vec<(Address, GenesisAccount)>,
+    validators: &Vec<(&str, Address)>,
+    epoch_duration: u64,
+    chain_id: Option<u64>,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<Genesis> {
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
@@ -843,7 +894,12 @@ pub(crate) fn config_committee(
     for (v, addr) in validators.iter() {
         let dir = temp_path.join(v);
         // init genesis ceremony to create committee files
-        create_validator_info(&dir, &addr.to_string(), passphrase.clone())?;
+        e2e_tests::create_validator_info_with_workers(
+            &dir,
+            &addr.to_string(),
+            passphrase.clone(),
+            worker_fee_configs.len().max(1),
+        )?;
 
         // copy to shared genesis dir
         std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
@@ -879,6 +935,11 @@ pub(crate) fn config_committee(
         "--max-batch-delay-ms".into(),
         "250".into(),
     ];
+    genesis_args.extend(
+        worker_fee_configs
+            .iter()
+            .flat_map(|config| ["--worker-fee-config".to_owned(), (*config).to_owned()]),
+    );
     if let Some(chain_id) = chain_id {
         genesis_args.push("--chain-id".into());
         genesis_args.push(chain_id.to_string());

@@ -1,5 +1,8 @@
 //! Test the epoch boundary and validator shuffles.
 
+#[path = "hub_join.rs"]
+mod hub_join;
+
 use crate::common::get_block;
 
 use super::common::{
