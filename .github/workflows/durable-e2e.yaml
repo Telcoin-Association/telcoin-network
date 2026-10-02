@@ -101,23 +101,29 @@ jobs:
           set -euo pipefail
           cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
           source_file=crates/network-libp2p/src/peers/manager.rs
-          for mutation in authority revocation budget; do
+          for mutation in authority revocation budget physical cleanup; do
             python3 -I - "$mutation" <<'PY'
           from pathlib import Path
           import sys
-          path = Path('crates/network-libp2p/src/peers/manager.rs')
+          name = sys.argv[1]
+          path = Path('crates/network-libp2p/src/peers/' +
+                      ('behavior.rs' if name == 'cleanup' else 'manager.rs'))
           original = path.read_text()
-          begin = original.index('pub(super) fn poll_admission_revocation(')
+          begin = 0 if name in ('physical', 'cleanup') else original.index('pub(super) fn poll_admission_revocation(')
           prefix, body = original[:begin], original[begin:]
           replacements = {
               'authority': ('if status.effective() == AdmissionMode::Closed {',
                             'if status.configured() == AdmissionMode::Closed {'),
-              'revocation': ('self.is_connected(peer) && !authorized.contains(peer)',
-                             'self.is_connected(peer) && authorized.contains(peer) && false'),
+              'revocation': ('!authorized.contains(peer)',
+                             'authorized.contains(peer) && false'),
               'budget': ('0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL',
                          '0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 8'),
+              'physical': ('(*state == LiveAdmissionState::Connected).then_some(*peer)',
+                           '(*state == LiveAdmissionState::Connected && self.is_connected(peer)).then_some(*peer)'),
+              'cleanup': ('was_live || self.is_peer_connected_or_disconnecting(&peer_id)',
+                          'was_live && false || self.is_peer_connected_or_disconnecting(&peer_id)'),
           }
-          old, new = replacements[sys.argv[1]]
+          old, new = replacements[name]
           assert body.count(old) == 1
           path.write_text(prefix + body.replace(old, new))
           PY
@@ -125,6 +131,7 @@ jobs:
               authority) regressions='admission_reconciliation_rechecks_pending_policy' ;;
               revocation) regressions='admission_reconciliation_rotation_every_swarm admission_reconciliation_closure_bookkeeping_once' ;;
               budget) regressions='admission_reconciliation_bounds_each_poll' ;;
+              physical|cleanup) regressions='admission_reconciliation_survives_record_key_replacement' ;;
             esac
             for regression in $regressions; do
               set +e
@@ -136,7 +143,7 @@ jobs:
                 exit 1
               fi
             done
-            git restore "$source_file"
+            git restore "$source_file" crates/network-libp2p/src/peers/behavior.rs
           done
           cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
           git diff --exit-code
