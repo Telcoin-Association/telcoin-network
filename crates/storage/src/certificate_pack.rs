@@ -19,7 +19,7 @@ use crate::{
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        pack::{Pack, PackCompression},
     },
     consensus_pack::PACK_VERSION,
     error_latch::latch_first_error,
@@ -292,11 +292,18 @@ impl CertificatePack {
 
 /// Base filename of the certificate pack's data file (`"cert_data"`) within an epoch directory.
 pub const DATA_NAME: &str = Inner::DATA_NAME;
+/// Directory name of the certificate pack's digest index (`"cert_hash"`) within an epoch directory.
+pub const HASH_NAME: &str = Inner::HASH_NAME;
 
 #[derive(Debug)]
 struct Inner {
     data: Pack<Certificate>,
     digest_idx: HdxIndex,
+    /// Test-only: when set, the next digest-index save fails right after the data append so tests
+    /// can exercise the atomic rollback in [`Self::save`]. Consumed once. (Mirrors
+    /// `EpochRecordDb`'s `fail_index_save_after_append`.)
+    #[cfg(test)]
+    fail_index_save_after_append: bool,
 }
 
 impl Inner {
@@ -321,7 +328,8 @@ impl Inner {
     }
 
     /// Discard the digest index sidecar directory and reopen a fresh (empty) copy for rebuild. A
-    /// missing directory is tolerated. Mirrors `ConsensusPack::reset_all_indexes`.
+    /// missing directory is tolerated. Mirrors `ConsensusPack`'s index reset
+    /// (`open_indexes_for_append`).
     fn reset_index(base_dir: &Path, data: &Pack<Certificate>) -> Result<HdxIndex, PackError> {
         match std::fs::remove_dir_all(base_dir.join(Self::HASH_NAME)) {
             Ok(()) => {}
@@ -341,8 +349,15 @@ impl Inner {
         data: &mut Pack<Certificate>,
         digest_idx: &mut HdxIndex,
     ) -> Result<(), PackError> {
+        // A cleanly-SEALED log is complete by construction (the clean-close sentinel is written
+        // only after the tail is msync'd and truncated to `end`), so any tear in it is
+        // at-rest corruption of committed certificates, not a truncatable unacked tail.
+        // Only an unclean log can have a truncatable tail. (Mirrors the ConsensusPack /
+        // EpochRecordDb sealed-log discipline.)
+        let sealed = !data.opened_unclean();
         let mut iter = data.raw_iter().map_err(OpenError::DataFileOpen)?;
         let mut consistent_end = iter.logical_position();
+        let mut torn = false;
         loop {
             let pos = iter.logical_position();
             match iter.next() {
@@ -354,12 +369,33 @@ impl Inner {
                         .map_err(|e| PackError::IndexAppend(e.to_string()))?;
                     consistent_end = iter.logical_position();
                 }
-                Some(Err(_)) => break,
+                Some(Err(_)) => {
+                    torn = true;
+                    break;
+                }
             }
         }
         // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
         drop(iter);
-        if consistent_end < data.file_len() {
+        let file_len = data.file_len();
+        if torn && consistent_end < file_len {
+            let dropped = file_len - consistent_end;
+            if sealed {
+                // Fail closed rather than zeroing committed, durably-acked certificates (INV4).
+                return Err(PackError::CorruptLog(format!(
+                    "a record at offset {consistent_end} failed to decode in a cleanly-sealed \
+                     certificate log; {dropped} committed byte(s) follow it. This is at-rest \
+                     corruption, not a torn tail — refusing to truncate."
+                )));
+            }
+            // An unclean log's torn tail is an unacked partial write: drop it, but say so (INV1).
+            warn!(
+                target: "cert-pack",
+                consistent_end,
+                file_len,
+                dropped_bytes = dropped,
+                "certificate log has a torn tail; truncating the unacked bytes and rebuilding the index"
+            );
             data.rewind_to(consistent_end);
         }
         digest_idx.set_data_file_length(data.file_len());
@@ -371,6 +407,7 @@ impl Inner {
         if !read_only {
             let _ = std::fs::create_dir_all(base_dir);
         }
+        let fresh = !base_dir.join(Self::DATA_NAME).exists();
         let mut data: Pack<Certificate> = Pack::open(
             base_dir.join(Self::DATA_NAME),
             0,
@@ -397,9 +434,11 @@ impl Inner {
         };
 
         if !read_only {
-            // On a brand-new file the index's tracked length starts below the pack-header size;
-            // initialise it so the consistency check below does not treat a fresh pack as unclean.
-            if digest_idx.data_file_length() < DATA_HEADER_BYTES as u64 {
+            // On a brand-new pack, initialise the index's tracked length so the consistency check
+            // below does not treat it as unclean. Gate on the data file being new, not on the
+            // marker's value: a failed save deliberately leaves the marker at `0` to force a
+            // rebuild on the next open, and that must not be mistaken for a fresh index.
+            if fresh {
                 digest_idx.set_data_file_length(data.file_len());
             }
             // If the pack or index was not cleanly sealed, or the index's tracked data length
@@ -414,9 +453,20 @@ impl Inner {
             if unclean {
                 digest_idx = Self::reset_index(base_dir, &data)?;
                 Self::rebuild_index(&mut data, &mut digest_idx)?;
+                // Recovery made the log + rebuilt index self-consistent; clear their unclean flags
+                // so the clean `Drop` re-seals them and the next open skips this
+                // rebuild (rather than rebuilding on every restart). A durability
+                // failure still blocks the seal.
+                data.mark_consistent();
+                digest_idx.mark_consistent();
             }
         }
-        Ok(Self { data, digest_idx })
+        Ok(Self {
+            data,
+            digest_idx,
+            #[cfg(test)]
+            fail_index_save_after_append: false,
+        })
     }
 
     fn save(&mut self, cert: &Certificate) -> Result<(), PackError> {
@@ -425,11 +475,35 @@ impl Inner {
         if self.digest_idx.load(digest).is_ok() {
             return Ok(());
         }
+        // Atomic append+index (same rollback discipline as `EpochRecordDb::save_cert_atomic`): if
+        // the index write fails after the append lands, roll the log back to before the orphaned
+        // append and invalidate the index's data-length marker (`0` is never a valid length -> the
+        // next open's `data_file_length() != file_len()` check fails -> rebuild from the log).
+        // Without this a post-append index failure would orphan the cert bytes and a retry
+        // would append a duplicate (the index write never happened, so the idempotent check
+        // above misses).
+        let data_start = self.data.file_len();
+        if let Err(e) = self.append_and_index(digest, cert) {
+            self.data.rewind_to(data_start);
+            self.digest_idx.set_data_file_length(0);
+            return Err(e);
+        }
+        self.digest_idx.set_data_file_length(self.data.file_len());
+        Ok(())
+    }
+
+    /// Append `cert` to the data log and index it by `digest`. Split out from [`Self::save`] so the
+    /// caller can roll back atomically on any failure.
+    fn append_and_index(&mut self, digest: B256, cert: &Certificate) -> Result<(), PackError> {
         let position = self.data.append(cert).map_err(|e| PackError::Append(e.to_string()))?;
+        // Test-only injection: fail the index save after the append to exercise the rollback.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_index_save_after_append) {
+            return Err(PackError::IndexAppend("injected post-append index failure".to_string()));
+        }
         self.digest_idx
             .save(digest, position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
-        self.digest_idx.set_data_file_length(self.data.file_len());
         Ok(())
     }
 
@@ -492,6 +566,10 @@ pub enum PackError {
     PersistError(String),
     /// The pack file was detected to be corrupt.
     CorruptPack,
+    /// A cleanly-sealed data log stopped decoding partway through: at-rest corruption of committed
+    /// certificates that must not be silently truncated (INV4). Holds an operator-facing
+    /// description.
+    CorruptLog(String),
     /// The background pack thread failed to join on shutdown.
     JoinFailed,
 }
@@ -511,6 +589,7 @@ impl Display for PackError {
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             PackError::CorruptPack => write!(f, "Pack file is corrupt"),
+            PackError::CorruptLog(e) => write!(f, "Certificate log corrupt: {e}"),
             PackError::JoinFailed => write!(f, "Pack file thread failed to join"),
         }
     }
@@ -682,6 +761,142 @@ mod test {
         let len_before = inner.data.file_len();
         inner.save(&certs[0]).expect("idempotent re-save");
         assert_eq!(inner.data.file_len(), len_before, "re-save must not append a duplicate cert");
+    }
+
+    /// A post-append index-write failure must roll the data log back (no orphan) so a retry
+    /// re-appends cleanly with no duplicate, and a reopen still finds every cert. Regression for
+    /// the `CertificatePack::save` non-atomicity: pre-fix, the failed attempt left orphan bytes
+    /// in the log (`file_len() > len_before`) and the retry appended a second copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_save_atomic_rollback_and_retry() {
+        let temp_dir = TempDir::with_prefix("cert_save_atomic").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+        let mut inner = super::Inner::open(&dir, false).expect("open pack");
+
+        // Save a few certs cleanly.
+        let mut certs = Vec::new();
+        for i in 0..4usize {
+            let cert = make_unique_cert(&fixture, i);
+            inner.save(&cert).expect("save");
+            certs.push(cert);
+        }
+        let len_before = inner.data.file_len();
+
+        // Arm the injected post-append index failure and attempt one more cert.
+        let extra = make_unique_cert(&fixture, 4);
+        inner.fail_index_save_after_append = true;
+        let err = inner.save(&extra).expect_err("index save must fail");
+        assert!(matches!(err, super::PackError::IndexAppend(_)), "unexpected error: {err:?}");
+        // Rolled back: no orphan bytes left in the log, and the failed cert is not resolvable.
+        assert_eq!(inner.data.file_len(), len_before, "data log must be rewound (no orphan)");
+        assert!(!inner.contains(extra.digest()), "failed cert must not be indexed");
+
+        // Retry (the flag auto-cleared) re-appends at the same offset and succeeds, no duplicate.
+        inner.save(&extra).expect("retry save");
+        assert!(inner.contains(extra.digest()), "cert present after retry");
+        certs.push(extra);
+        inner.persist().expect("persist");
+        drop(inner); // clean close (seals)
+
+        // Reopen: every saved cert is present (and the rollback+retry left the log rebuildable).
+        let mut inner = super::Inner::open(&dir, false).expect("reopen");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "cert missing after reopen");
+        }
+    }
+
+    /// A cleanly-SEALED cert log that has a mid-log corrupt record must NOT be silently
+    /// truncated on a rebuild — that would zero every committed cert after the first bad one.
+    /// The rebuild fails closed (`CorruptLog`) and leaves the data file untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_sealed_log_tear_fails_closed() {
+        let temp_dir = TempDir::with_prefix("cert_sealed_tear").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        // Populate and cleanly close (normal drop seals the data file with the clean-close
+        // sentinel).
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..8usize {
+                inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
+            }
+            inner.persist().expect("persist");
+        }
+
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let len_before = std::fs::metadata(&data_path).expect("meta").len();
+
+        // Corrupt a mid-log record (avoid the 28-byte header and the trailing 8-byte sentinel).
+        {
+            let mut bytes = std::fs::read(&data_path).expect("read data");
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0xFF;
+            std::fs::write(&data_path, &bytes).expect("write corrupted data");
+        }
+        // Break the digest index so the reopen is forced to rebuild from the (sealed) data log.
+        let hdx = dir.join(super::Inner::HASH_NAME).join("index.hdx");
+        let f = std::fs::OpenOptions::new().write(true).open(&hdx).expect("open hdx");
+        f.set_len(4).expect("truncate hdx header");
+        drop(f);
+
+        // Rebuild hits the corrupt record in a SEALED log: fail closed, do not truncate committed
+        // data.
+        match super::Inner::open(&dir, false) {
+            Err(super::PackError::CorruptLog(_)) => {}
+            other => panic!("a sealed-log tear must be CorruptLog, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("meta").len(),
+            len_before,
+            "a sealed cert log must not be truncated"
+        );
+    }
+
+    /// An UNCLEAN cert log with a torn tail (an unacked partial write) is truncated back to
+    /// the last complete cert on rebuild — the surviving certs stay, the torn one is dropped,
+    /// and no error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_unclean_torn_tail_truncates() {
+        let temp_dir = TempDir::with_prefix("cert_unclean_tear").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..8usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+            // Normal drop cleanly closes: truncates the mmap padding to the exact logical end and
+            // writes the 8-byte clean-close sentinel. This leaves the file with NO padding, so the
+            // strip below lands inside the last real record rather than in padding.
+        }
+
+        // Make it unclean with a torn final record: remove the sentinel (8 bytes) AND one more
+        // byte, which falls inside the last cert's CRC so its read comes up short (a torn
+        // unacked tail).
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let len = f.metadata().expect("meta").len();
+            f.set_len(len - crate::archive::data_file::SENTINEL_LEN - 1)
+                .expect("strip sentinel + 1");
+        }
+
+        // Unclean + torn tail: rebuild truncates the incomplete last cert and keeps the rest (no
+        // error).
+        let mut inner = super::Inner::open(&dir, false).expect("reopen truncates the torn tail");
+        assert!(inner.contains(certs[0].digest()), "surviving certs must remain");
+        assert!(inner.contains(certs[6].digest()), "surviving certs must remain");
+        assert!(
+            !inner.contains(certs[7].digest()),
+            "the torn final cert must be dropped by the tail truncation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -814,6 +814,8 @@ mod tests {
     /// The call goes through `get_rpc_server`'s production registration, so this exercises
     /// the same handler an operator's `eth_syncing` request reaches. `SyncStatus::None`
     /// serializes as `false`; a syncing node answers a sync-progress object.
+    /// A fresh worker reports startup synchronization until the first caught-up update,
+    /// and reports syncing again if it later falls behind.
     #[tokio::test]
     async fn test_eth_syncing_answers_from_worker_shim_flag() -> eyre::Result<()> {
         let tmp_dir = TempDir::new()?;
@@ -842,10 +844,6 @@ mod tests {
         )?;
         let methods = server.methods_by(|name| name == "eth_syncing");
 
-        let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
-        assert_eq!(synced, serde_json::Value::Bool(false));
-
-        network.set_syncing(true);
         let syncing: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
         assert!(syncing.is_object(), "syncing answer is a sync-progress object: {syncing}");
         assert!(syncing.get("currentBlock").is_some(), "sync object names currentBlock");
@@ -854,6 +852,10 @@ mod tests {
         network.set_syncing(false);
         let caught_up: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
         assert_eq!(caught_up, serde_json::Value::Bool(false));
+
+        network.set_syncing(true);
+        let syncing_again: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
+        assert_eq!(syncing_again, syncing);
 
         Ok(())
     }

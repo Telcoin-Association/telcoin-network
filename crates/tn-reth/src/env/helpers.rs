@@ -11,9 +11,9 @@
 //!
 //! - **In-memory-tip-aware** reads call `blockchain_provider` directly, which overlays the
 //!   canonical in-memory chain on the database (reth's `ConsistentProvider`, or the in-memory head
-//!   state for `latest`). Verified members: `sealed_header_by_hash`, `header`, `blocks_for_range`,
-//!   `canonical_tip`, `latest`. These already see the in-flight blocks of the output being
-//!   executed.
+//!   state for `latest`). Verified members: `sealed_header_by_hash`, `sealed_header_by_id`,
+//!   `header`, `blocks_for_range`, `canonical_tip`, `latest`. These already see the in-flight
+//!   blocks of the output being executed.
 //!
 //! - **Committed-DB-only** reads go through `database_provider_ro()`, a raw read transaction with
 //!   no in-memory overlay. Verified members: `sealed_header_by_number`, `header_by_number`,
@@ -30,6 +30,7 @@
 
 use std::{ops::RangeInclusive, sync::Arc};
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth_chain_state::CanonicalInMemoryState;
 use reth_chainspec::BaseFeeParams;
@@ -38,10 +39,10 @@ use reth_evm::{ConfigureEvm as _, EvmFactory as _};
 use reth_primitives_traits::SignerRecoverable as _;
 use reth_provider::{
     AccountReader as _, BlockBodyIndicesProvider as _, BlockIdReader as _, BlockNumReader as _,
-    BlockReader as _, CanonStateNotificationStream, CanonStateSubscriptions as _, Chain,
-    ChainStateBlockReader as _, DatabaseProviderFactory as _, ExecutionOutcome,
-    HeaderProvider as _, ReceiptProvider as _, StateProviderBox, StateProviderFactory as _,
-    TransactionVariant, TransactionsProvider as _,
+    BlockReader as _, BlockReaderIdExt as _, CanonStateNotificationStream,
+    CanonStateSubscriptions as _, Chain, ChainStateBlockReader as _, DatabaseProviderFactory as _,
+    ExecutionOutcome, HeaderProvider as _, ReceiptProvider as _, StateProviderBox,
+    StateProviderFactory as _, TransactionVariant, TransactionsProvider as _,
 };
 use reth_revm::context::result::ExecutionResult;
 use tn_types::{
@@ -71,6 +72,11 @@ pub struct TxFeedEntry {
     /// Hash of the block containing this transaction.
     pub block_hash: B256,
     /// Timestamp of the containing block.
+    ///
+    /// Seconds granularity and not unique: every block of one consensus output carries the same
+    /// timestamp, and blocks of different outputs committed within the same second tie as well.
+    /// Order entries by (`block_number`, `index`), or equivalently by `tx_number`, never by
+    /// timestamp.
     pub timestamp: u64,
     /// Zero-based index of the transaction within its block.
     pub index: u64,
@@ -258,6 +264,40 @@ impl RethEnv {
     /// Return the execution header for block number if available.
     pub fn header_by_number(&self, block_num: u64) -> TnRethResult<Option<ExecHeader>> {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.header_by_number(block_num)?)
+    }
+
+    /// Resolve `id` to a sealed execution header, including blocks that are canonical in memory
+    /// but not yet committed to the database.
+    ///
+    /// Unlike [`Self::header_by_number`], which reads the committed database only, this read is
+    /// in-memory-tip-aware (see the module docs): it goes through reth's
+    /// `BlockReaderIdExt::sealed_header_by_id` on the blockchain provider, which overlays the
+    /// canonical in-memory chain on the database. Accepted ids:
+    ///
+    /// - `Number(n)` / `Hash(h)`: the header at that height or with that hash. The hash form does
+    ///   not consult `require_canonical`; reth's lookup ignores it.
+    /// - `latest`: the canonical in-memory head, as [`Self::canonical_tip`] returns it.
+    /// - `earliest`: reth's earliest available block (genesis unless history was expired).
+    /// - `safe` / `finalized`: the in-memory safe and finalized watches. Both are `None` until the
+    ///   node records a finalized block, so a fresh chain at genesis resolves neither.
+    /// - `pending`: resolved as `latest`. Reth reads `pending` from a separate pending-block slot,
+    ///   and TN produces no pending block distinct from the latest canonical block.
+    ///
+    /// `Ok(None)` means the id does not resolve: an unknown hash, a height above the canonical
+    /// tip, or a tag that has no header yet. The restored-state floor is not consulted, so on a
+    /// snapshot-restored datadir a height below [`Self::real_header_floor`] can resolve to a
+    /// scaffold placeholder header rather than `None`.
+    ///
+    /// The intended caller is the `tn_getBlockTimestampMillis` RPC method, which must answer for
+    /// every `BlockId` including the newest executed blocks.
+    pub fn sealed_header_by_id(&self, id: BlockId) -> TnRethResult<Option<SealedHeader>> {
+        // tn produces no pending block distinct from latest, so pending resolves to the canonical
+        // head rather than reth's separate pending-block slot
+        let id = match id {
+            BlockId::Number(BlockNumberOrTag::Pending) => BlockId::Number(BlockNumberOrTag::Latest),
+            id => id,
+        };
+        Ok(self.inner.blockchain_provider.sealed_header_by_id(id)?)
     }
 
     /// Return the finalized header, sealed with its hash, if available.
@@ -637,7 +677,7 @@ mod tests {
             consensus_output_for_tests, execute_payload_and_update_canonical_chain,
             TransactionFactory,
         },
-        RethChainSpec,
+        NewCanonicalChain, OutputTrieOverlay, RethChainSpec,
     };
     use tempfile::TempDir;
     use tn_types::{
@@ -861,6 +901,98 @@ mod tests {
             .read_contract_at_block(genesis_hash, return_42_addr, Bytes::default())
             .expect("read-only call at genesis succeeds");
         assert_eq!(U256::from_be_slice(&output), U256::from(42));
+
+        Ok(())
+    }
+
+    /// Resolve every `BlockId` form through `sealed_header_by_id` at three points: a fresh chain
+    /// at genesis, block 1 canonical in memory but not yet persisted, and block 1 persisted and
+    /// finalized.
+    #[tokio::test]
+    async fn test_sealed_header_by_id() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+        let genesis = chain.sealed_genesis_header();
+        let genesis_hash = genesis.hash();
+        let unknown_hash = B256::repeat_byte(0x42);
+        let resolve = |id: BlockId| -> eyre::Result<Option<B256>> {
+            Ok(reth_env.sealed_header_by_id(id)?.map(|header| header.hash()))
+        };
+
+        // fresh chain: every block-selecting id resolves to genesis
+        for id in [
+            BlockId::latest(),
+            BlockId::earliest(),
+            BlockId::number(0),
+            BlockId::hash(genesis_hash),
+            BlockId::pending(),
+        ] {
+            assert_eq!(resolve(id)?, Some(genesis_hash), "{id:?} at genesis");
+        }
+        // nothing has been finalized yet, so the safe and finalized watches are empty
+        assert_eq!(resolve(BlockId::safe())?, None);
+        assert_eq!(resolve(BlockId::finalized())?, None);
+        // unknown heights and hashes are Ok(None), not errors
+        assert_eq!(resolve(BlockId::number(u64::MAX))?, None);
+        assert_eq!(resolve(BlockId::hash(unknown_hash))?, None);
+
+        // execute block 1 and make it canonical in memory only, the state between executing a
+        // consensus output and committing it
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(genesis.clone(), &consensus_output);
+        let block = reth_env.build_block_from_batch_payload(
+            payload,
+            &Vec::new(),
+            &mut OutputTrieOverlay::new(),
+        )?;
+        let block1 = block.recovered_block.clone_sealed_header();
+        let block1_hash = block1.hash();
+        let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+        canonical_in_memory_state
+            .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+        canonical_in_memory_state.set_canonical_head(block1.clone());
+
+        // the committed-DB-only reads cannot see block 1 yet
+        assert_eq!(reth_env.last_block_number()?, 0);
+        assert!(reth_env.header_by_number(1)?.is_none());
+
+        // the in-memory block resolves by number, hash, latest, and pending
+        for id in
+            [BlockId::number(1), BlockId::hash(block1_hash), BlockId::latest(), BlockId::pending()]
+        {
+            assert_eq!(resolve(id)?, Some(block1_hash), "{id:?} with block 1 in memory");
+        }
+        // genesis still resolves by its own ids
+        for id in [BlockId::earliest(), BlockId::number(0), BlockId::hash(genesis_hash)] {
+            assert_eq!(resolve(id)?, Some(genesis_hash), "{id:?} with block 1 in memory");
+        }
+        // an executed but uncommitted block is not finalized
+        assert_eq!(resolve(BlockId::safe())?, None);
+        assert_eq!(resolve(BlockId::finalized())?, None);
+        assert_eq!(resolve(BlockId::number(2))?, None);
+
+        // commit block 1 and finalize it, as the engine does once the output is persisted
+        reth_env.finish_executing_output(vec![block], None)?;
+        reth_env.finalize_block(block1)?;
+        assert_eq!(reth_env.last_block_number()?, 1);
+
+        // block 1 now resolves from the database, and the safe and finalized watches follow it
+        for id in [
+            BlockId::number(1),
+            BlockId::hash(block1_hash),
+            BlockId::latest(),
+            BlockId::pending(),
+            BlockId::safe(),
+            BlockId::finalized(),
+        ] {
+            assert_eq!(resolve(id)?, Some(block1_hash), "{id:?} with block 1 finalized");
+        }
+        assert_eq!(resolve(BlockId::earliest())?, Some(genesis_hash));
+        assert_eq!(resolve(BlockId::number(u64::MAX))?, None);
+        assert_eq!(resolve(BlockId::hash(unknown_hash))?, None);
 
         Ok(())
     }

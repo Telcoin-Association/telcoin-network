@@ -20,7 +20,7 @@ use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
     AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{encode, encoded_size, try_decode, BlsPublicKey, Certificate, Epoch};
@@ -43,10 +43,61 @@ const SYNC_PACK_FRAME_OVERHEAD: usize = 1024;
 /// epoch-keyed bound, the pack is chunked at a fixed size, so this is constant.
 pub(crate) const MAX_SYNC_PACK_FRAME_SIZE: usize = SYNC_PACK_CHUNK_SIZE + SYNC_PACK_FRAME_OVERHEAD;
 
-/// Per-frame read timeout while reassembling the pack on the requester side. The
-/// whole import is also bounded by the caller's `record_timeout`; this guards a
-/// single stalled frame.
+/// Per-frame read timeout while reassembling the pack on the requester side. Guards a single
+/// stalled frame (a peer that sends nothing); the throughput floor ([`RateWatch`]) guards a peer
+/// that dribbles small frames just inside this timeout.
 const EPOCH_PACK_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Rolling window over which the epoch-pack transfer's throughput floor is evaluated (both the
+/// responder's writes and the requester's reads).
+const SYNC_RATE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Minimum bytes an epoch-pack transfer must carry per [`SYNC_RATE_WINDOW`] (~35 KiB/s). Below this
+/// a transfer is treated as a drip/stall and aborted. This replaces the old fixed, size-independent
+/// wall-clock caps (a large honest pack could not finish inside them on a slow link, while a
+/// Byzantine peer could dribble just inside the per-frame timeout for the whole cap): a pack now
+/// finishes at any sustained rate at/above the floor, and a below-floor peer is cut within roughly
+/// one window.
+const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
+
+/// How long one pack record may take to arrive over a sync stream: the time the largest record a
+/// pack may hold needs at the throughput floor, plus one window of slack. A shorter per-record
+/// timeout would cut an honest transfer the floor admits (a 1 MB batch needs ~30 s at the floor),
+/// while a stalled or dribbling peer is still cut by the per-frame timeout and the floor itself.
+pub(crate) const SYNC_RECORD_TIMEOUT: Duration = Duration::from_secs(
+    ((tn_storage::archive::pack_iter::MAX_RECORD_SIZE as u64).div_ceil(SYNC_RATE_MIN_BYTES) + 1)
+        * SYNC_RATE_WINDOW.as_secs(),
+);
+
+/// A coarse throughput floor over a tumbling time window. Each completed window (≥ `window` since
+/// the last reset) must have carried at least `min_bytes`, else the transfer is below the floor.
+/// Pure so it is unit-testable with an injected clock; see [`RateWatch::record`].
+struct RateWatch {
+    window: Duration,
+    min_bytes: u64,
+    window_start: Instant,
+    bytes: u64,
+}
+
+impl RateWatch {
+    fn new(window: Duration, min_bytes: u64, now: Instant) -> Self {
+        Self { window, min_bytes, window_start: now, bytes: 0 }
+    }
+
+    /// Record `n` bytes transferred as of `now`. Returns `false` when a just-completed window
+    /// carried fewer than `min_bytes` (below the floor — the caller aborts); otherwise `true`.
+    /// A completed window (below floor or not) resets the counter for the next window.
+    fn record(&mut self, now: Instant, n: u64) -> bool {
+        self.bytes = self.bytes.saturating_add(n);
+        if now.duration_since(self.window_start) >= self.window {
+            let ok = self.bytes >= self.min_bytes;
+            self.window_start = now;
+            self.bytes = 0;
+            return ok;
+        }
+        true
+    }
+}
 
 /// Target encoded size of one missing-certificates [`SyncFrame::Data`] frame: the
 /// responder accumulates certificates into a batch and flushes a frame once the
@@ -178,11 +229,13 @@ where
     // reuses the buffers across frames and keeps the writer's `&mut` out of the
     // `FnMut` closure, whose returned future cannot borrow per-call captures. Each
     // chunk's backing allocation is reclaimed into the `Data` frame without a copy.
-    let (stream, mut encode_buffer, mut compressed_buffer) =
+    let watch = RateWatch::new(SYNC_RATE_WINDOW, SYNC_RATE_MIN_BYTES, Instant::now());
+    let (stream, mut encode_buffer, mut compressed_buffer, _watch) =
         tokio_util::io::ReaderStream::with_capacity(reader, SYNC_PACK_CHUNK_SIZE)
             .try_fold(
-                (stream, Vec::new(), Vec::new()),
-                |(stream, mut encode_buffer, mut compressed_buffer), chunk| async move {
+                (stream, Vec::new(), Vec::new(), watch),
+                |(stream, mut encode_buffer, mut compressed_buffer, mut watch), chunk| async move {
+                    let len = chunk.len() as u64;
                     write_one_frame(
                         stream,
                         &SyncFrame::Data(chunk.into()),
@@ -192,7 +245,21 @@ where
                         buffer_timeout,
                     )
                     .await?;
-                    Ok((stream, encode_buffer, compressed_buffer))
+                    // Enforce the throughput floor on bytes the requester actually accepted (a
+                    // completed `write_one_frame` means the frame was flushed): a drip-reading peer
+                    // that keeps resetting the per-frame timer is cut here instead of pinning the
+                    // responder task (and its admission slot) for a fixed wall-clock cap.
+                    if !watch.record(Instant::now(), len) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "epoch pack serve throughput below floor ({} bytes / {}s)",
+                                SYNC_RATE_MIN_BYTES,
+                                SYNC_RATE_WINDOW.as_secs(),
+                            ),
+                        ));
+                    }
+                    Ok((stream, encode_buffer, compressed_buffer, watch))
                 },
             )
             .await?;
@@ -244,12 +311,31 @@ pub(crate) fn sync_pack_reader<S>(stream: S) -> impl TokioAsyncRead + Unpin + Se
 where
     S: FuturesAsyncRead + Unpin + Send + 'static,
 {
+    let watch = RateWatch::new(SYNC_RATE_WINDOW, SYNC_RATE_MIN_BYTES, Instant::now());
     let frames = futures::stream::unfold(
-        (stream, Vec::new(), Vec::new()),
-        |(mut stream, mut decode_buffer, mut compressed_buffer)| async move {
+        (stream, Vec::new(), Vec::new(), watch),
+        |(mut stream, mut decode_buffer, mut compressed_buffer, mut watch)| async move {
             let chunk =
                 next_pack_chunk(&mut stream, &mut decode_buffer, &mut compressed_buffer).await;
-            let state = (stream, decode_buffer, compressed_buffer);
+            // Enforce the throughput floor on delivered bytes: a peer that dribbles small frames
+            // just inside the per-frame timeout (never tripping it) is cut here instead
+            // of pinning the import for a fixed wall-clock cap. A below-floor window
+            // yields one error item, which unwinds `stream_import` so its `ImportPath`
+            // sentinel clears and the epoch is retryable.
+            let chunk = match chunk {
+                Ok(Some(bytes)) if !watch.record(Instant::now(), bytes.len() as u64) => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "epoch pack sync throughput below floor ({} bytes / {}s)",
+                            SYNC_RATE_MIN_BYTES,
+                            SYNC_RATE_WINDOW.as_secs(),
+                        ),
+                    ))
+                }
+                other => other,
+            };
+            let state = (stream, decode_buffer, compressed_buffer, watch);
             // Result<Option<bytes>> -> Option<Result<bytes>>: `End` stops the
             // stream, `Data` yields a chunk, an error yields one error item
             chunk.transpose().map(|item| (item.map(std::io::Cursor::new), state))
@@ -280,7 +366,21 @@ where
     .await
     .map_err(|_elapsed| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reading epoch pack sync frame")
-    })??;
+    })?
+    // A substream that closes without an `End` frame reads as EOF inside a frame. Left as
+    // `UnexpectedEof`, the pack decoder on top of this reader would take an EOF that lands on a
+    // record boundary for a clean end of the pack, and the importer would then charge the peer
+    // for a short pack. It is a transport failure: report it as one.
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "epoch pack sync stream closed before its End frame",
+            )
+        } else {
+            e
+        }
+    })?;
 
     match frame {
         SyncFrame::Data(bytes) => Ok(Some(bytes)),
@@ -613,6 +713,41 @@ mod tests {
     use super::*;
     use tn_network_libp2p::SyncFrameError;
 
+    /// F15: the throughput floor trips only on a COMPLETED window that carried fewer than
+    /// `min_bytes`; an at/above-floor window resets and does not trip, and a partial
+    /// (not-yet-elapsed) window keeps accumulating. Uses a manual clock so the tumbling-window
+    /// logic is deterministic.
+    /// A record of the largest size a pack may hold, delivered at exactly the throughput floor,
+    /// must arrive inside the per-record timeout: otherwise the timeout, not the floor, decides
+    /// which honest links can sync.
+    #[test]
+    fn record_timeout_admits_the_largest_record_at_the_floor() {
+        let max_record = tn_storage::archive::pack_iter::MAX_RECORD_SIZE as f64;
+        let floor_bytes_per_sec = SYNC_RATE_MIN_BYTES as f64 / SYNC_RATE_WINDOW.as_secs_f64();
+        assert!(SYNC_RECORD_TIMEOUT.as_secs_f64() > max_record / floor_bytes_per_sec);
+    }
+
+    #[test]
+    fn rate_watch_trips_only_below_floor_per_window() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(30);
+        let mut w = RateWatch::new(window, 1000, t0);
+
+        // Partial window: bytes accumulate, never trips even when below floor so far.
+        assert!(w.record(t0 + Duration::from_secs(10), 100));
+        assert!(w.record(t0 + Duration::from_secs(20), 100));
+        // First completed window (>= 30s) carried 200 < 1000 -> trips.
+        assert!(!w.record(t0 + Duration::from_secs(31), 0), "below-floor window must trip");
+
+        // Fresh window (reset at 31s); deliver >= floor before it elapses -> no trip, and it
+        // resets.
+        let mut w = RateWatch::new(window, 1000, t0);
+        assert!(w.record(t0 + Duration::from_secs(5), 5000));
+        assert!(w.record(t0 + Duration::from_secs(31), 0), "at/above-floor window must not trip");
+        // Next window below floor trips again (counter reset after the previous completed window).
+        assert!(!w.record(t0 + Duration::from_secs(62), 10));
+    }
+
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.
     async fn frame_pack(bytes: &[u8]) -> Vec<u8> {
         let mut reader = std::io::Cursor::new(bytes.to_vec());
@@ -677,6 +812,26 @@ mod tests {
         .await
         .expect("write err");
         assert!(read_back(framed).await.is_err(), "an Err frame must surface as a read error");
+    }
+
+    /// A stream that ends without an `End` frame is a transport failure, never a clean end of
+    /// the pack: the reader must surface an error (and not `UnexpectedEof`, which the pack decoder
+    /// above it treats as a clean end on a record boundary).
+    #[tokio::test]
+    async fn sync_pack_reader_rejects_eof_without_end_frame() {
+        let mut framed = Vec::new();
+        let (mut enc, mut comp) = (Vec::new(), Vec::new());
+        write_frame(
+            &mut framed,
+            &SyncFrame::<PrimarySyncRequest>::Data(vec![1, 2, 3]),
+            &mut enc,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("write data");
+        let err = read_back(framed).await.expect_err("EOF without End must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted, "got {err:?}");
     }
 
     /// An out-of-place control frame (e.g. a second `Ack`) is a protocol

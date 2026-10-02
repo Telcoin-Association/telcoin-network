@@ -3,18 +3,22 @@
 use crate::common::get_block;
 
 use super::common::{
-    create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
-    start_nodes, wait_for_rpc, ProcessGuard, NEW_VALIDATOR, NODE_PASSWORD,
+    assert_epoch_records_verify, create_genesis_for_test, fetch_verified_epoch_record,
+    generate_new_validator_txs, get_block_commit_time, loop_epochs, read_consensus_headers,
+    scrape_metric_value, start_nodes, start_validator_with_args, wait_for_rpc, BlockCommitTime,
+    ProcessGuard, NEW_VALIDATOR, NODE_PASSWORD,
 };
 use alloy::{
-    primitives::Bytes,
+    eips::BlockNumberOrTag,
+    primitives::{utils::parse_ether, Bytes},
     providers::{Provider, ProviderBuilder},
     sol_types::SolCall,
 };
-use e2e_tests::NodeEndpoints;
+use e2e_tests::{config_local_testnet_with_epoch_duration, NodeEndpoints};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    convert::Infallible,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,13 +37,14 @@ use tn_test_utils::wait_until;
 use tn_types::{
     forks::{
         leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
-        seed_signature_active,
+        seed_signature_active, subsecond_timestamp_fork_epoch_override,
     },
-    get_available_udp_port, keccak256, Address, BootstrapServer, Epoch, EpochCertificate,
-    EpochRecord, Genesis, P2pNode, B256, U256,
+    get_available_tcp_port, get_available_udp_port, keccak256, Address, BootstrapServer,
+    ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount, P2pNode, B256,
+    U256,
 };
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MIN_EPOCHS_TO_TEST: usize = 6;
 // Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
@@ -63,6 +68,10 @@ const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
 /// and every node it spawns (`tn_types::forks::leader_seeded_ordering_fork_epoch_override`).
 const LEADER_SEEDED_ORDERING_FORK_ENV: &str = "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH";
 
+/// Environment variable selecting the sub-second-timestamp fork epoch for this process and every
+/// node it spawns (`tn_types::forks::subsecond_timestamp_fork_epoch_override`).
+const SUBSECOND_TIMESTAMP_FORK_ENV: &str = "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH";
+
 /// Fork epoch for the cross-fork sync tests, [`test_epoch_sync_across_multi_workers_fork`] and
 /// [`test_epoch_sync_across_leader_seeded_ordering_fork`].
 ///
@@ -72,6 +81,35 @@ const LEADER_SEEDED_ORDERING_FORK_ENV: &str = "TN_LEADER_SEEDED_ORDERING_FORK_EP
 /// guarantees those sealed packs straddle it: epoch 0 written pre-fork (the legacy single-worker
 /// committee layout, or the legacy DFS commit order), epoch 1 onward written post-fork.
 const CROSS_FORK_EPOCH: Epoch = 1;
+
+/// Leader epoch at which [`test_epoch_subsecond_timestamps_across_fork`] arms the sub-second
+/// timestamp fork: epochs 0 and 1 commit whole seconds, every later epoch commits milliseconds.
+///
+/// Two pre-fork epochs rather than one because epoch 0 routinely holds a single commit: the nodes
+/// start after genesis, so their first commit is already past epoch 0's boundary and closes it.
+/// Epoch 1 is a full-length epoch, which is what gives the walk consecutive pre-fork commits.
+const SUBSECOND_FORK_EPOCH: Epoch = 2;
+
+/// Epoch [`test_epoch_subsecond_timestamps_across_fork`] runs the network to before it checks
+/// anything.
+///
+/// Epochs 0 through 4 have closed by then, so the run holds a pre-fork seam (0 to 1), the fork
+/// seam (1 to 2) and two post-fork seams (2 to 3 and 3 to 4), and every one of those epochs has at
+/// least its closing execution block.
+const SUBSECOND_TARGET_EPOCH: Epoch = 5;
+
+/// Prometheus series of the engine counter `tn_engine.evm_timestamp_clamped_total`.
+///
+/// The engine bumps it whenever it raises an EVM `timestamp` to its parent's. Consensus is meant
+/// to produce non-decreasing commit times on its own, so a non-zero reading in
+/// [`test_epoch_subsecond_timestamps_across_fork`] is a consensus bug. On a real network the first
+/// commits of epoch 0 can also be raised, when the validators' clocks lag the genesis timestamp,
+/// but not in that test: it keeps epoch 0 pre-fork ([`SUBSECOND_FORK_EPOCH`]), where the engine
+/// never clamps, and it stamps genesis from the host clock the nodes share, before they start.
+const EVM_TIMESTAMP_CLAMPED_SERIES: &str = "tn_engine_evm_timestamp_clamped_total";
+
+/// Pause between rounds of [`drive_light_tx_load`].
+const LIGHT_LOAD_INTERVAL: Duration = Duration::from_millis(750);
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -111,7 +149,7 @@ async fn test_epoch_boundary_inner(
         debug!(target: "epoch-test", "pending tx: {pending:?}");
         // Txns may land right at an epoch boundary, get orphaned, and be re-injected into
         // the next epoch. Allow two full epoch durations + startup buffer for confirmation.
-        timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
+        timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
     }
 
     // cross-check the `tn` namespace ConsensusRegistry endpoints against direct eth_call reads
@@ -336,7 +374,7 @@ async fn test_epoch_sync_inner(
     committee: &[(&str, Address)],
     temp_path: &Path,
     test: &str,
-    endpoints: &mut Vec<NodeEndpoints>,
+    endpoints: &mut [NodeEndpoints],
 ) -> eyre::Result<Range<Epoch>> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
@@ -419,10 +457,12 @@ async fn test_epoch_sync_inner(
                     .map_err(|e| eyre::eyre!("validator {val_name}: {e}"))?;
             // Make sure we have executed the final block from the epoch record.
             // This should prove we have the consensus output as well (i.e. verify the pack data).
-            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).expect(&format!(
-                "final block for {epoch} for {val_name} missing {}",
-                epoch_rec.final_state.number
-            ));
+            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).unwrap_or_else(|_| {
+                panic!(
+                    "final block for {epoch} for {val_name} missing {}",
+                    epoch_rec.final_state.number
+                )
+            });
             if i == kill_idx {
                 killed_epoch_records.insert(epoch, epoch_rec);
             }
@@ -494,11 +534,14 @@ fn fingerprint_sealed_packs(
 ///    which would mask the regression this pins, that restarting into an existing datadir leaves
 ///    closed epochs alone.
 ///
-/// Decoding a pack reaches two epoch-gated layouts: the [`tn_types::Committee`] in its `EpochMeta`
-/// record, selected by the committee's own epoch against the multi-workers fork
-/// ([`multi_workers_fork_active`]), and every nested `ConsensusHeader`, selected against the
-/// seed-signature fork ([`seed_signature_active`]). This process therefore has to sit on the same
-/// fork epochs the nodes wrote under for BOTH, which is what [`pin_fork_epochs`] arranges.
+/// Decoding a pack reaches three epoch-gated layouts: the [`tn_types::Committee`] in its
+/// `EpochMeta` record, selected by the committee's own epoch against the multi-workers fork
+/// ([`multi_workers_fork_active`]); the seed signature of every header nested in a
+/// `ConsensusHeader`, selected against the seed-signature fork ([`seed_signature_active`]); and the
+/// millisecond fields, each header's `created_at_millis` and each sub-dag's
+/// `commit_timestamp_millis`, selected against the sub-second-timestamp fork
+/// (`tn_types::forks::subsecond_timestamp_active`). This process therefore has to sit on the same
+/// fork epochs the nodes wrote under for ALL THREE, which is what [`pin_fork_epochs`] arranges.
 fn assert_sealed_packs_unchanged(
     datadir: &Path,
     fingerprints: &BTreeMap<Epoch, B256>,
@@ -537,23 +580,28 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin three fork epochs for this process and every node it spawns: the multi-workers fork
-/// (issue #554), the seed-signature fork (#1032), and the leader-seeded-ordering fork (#1260). The
-/// PREVRANDAO and governance-Safe forks are not pinned here; see below.
+/// Pin four fork epochs for this process and every node it spawns: the multi-workers fork
+/// (issue #554), the seed-signature fork (#1032), the leader-seeded-ordering fork (#1260), and the
+/// sub-second-timestamp fork. The PREVRANDAO and governance-Safe forks are not pinned; see below.
 ///
-/// Step 8 decodes sealed pack bytes in the harness, and that reaches the first two gates: the
-/// `EpochMeta`'s [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every
-/// nested `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to
-/// the same fork points the nodes wrote under. Left alone the two sides disagree the same way for
-/// each of those forks: `TestBinary::command` forwards `u32::MAX` to a child when the variable is
-/// unset, while this (non-adiri) harness build is active from genesis without it. Writing the
-/// variables settles both sides at once — children inherit them verbatim at spawn, and the
-/// harness's own overrides latch them on first read. The leader-seeded-ordering fork changes no
-/// serialized layout, only the commit order nodes write inside a pack, so the harness decode does
-/// not consult it; it is pinned here for the children (and against a latched-earlier override),
-/// with the always-armed `0` default `TestBinary::command` forwards for it.
+/// Step 8 decodes sealed pack bytes in the harness, and that reaches three of those gates: the
+/// `EpochMeta`'s [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`], and every
+/// nested `ConsensusHeader` by [`seed_signature_active`] and by
+/// `tn_types::forks::subsecond_timestamp_active` (the millisecond fields of its sub-DAG and of
+/// the headers inside it). So the harness has to resolve all three to the same fork points the
+/// nodes wrote under. Left alone the two sides disagree the same way for the first two:
+/// `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while this
+/// (non-adiri) harness build is active from genesis without it. Writing the variables settles
+/// both sides at once — children inherit them verbatim at spawn, and the harness's own overrides
+/// latch them on first read. The sub-second-timestamp fork's unset default already agrees
+/// (`TestBinary::command` forwards `0`, and this build is active from genesis), so its pin is
+/// what carries a forced fork point to both sides and turns a latched-earlier override into a
+/// named failure. The leader-seeded-ordering fork changes no serialized layout, only the commit
+/// order nodes write inside a pack, so the harness decode does not consult it; it is pinned here
+/// for the children (and against a latched-earlier override), with the always-armed `0` default
+/// `TestBinary::command` forwards for it.
 ///
-/// All three are pinned, not just the one a given test is about. Pinning only some leaves the rest
+/// All four are pinned, not just the one a given test is about. Pinning only some leaves the rest
 /// asymmetric whenever the suite runs outside the Makefile wrapper that exports them, and the
 /// symptom is misleading: children write dormant-layout headers, the harness decodes them as
 /// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
@@ -569,19 +617,24 @@ fn assert_sealed_packs_unchanged(
 /// Each `force_*` argument states that fork epoch outright, for a test whose claim is about a
 /// specific boundary. `None` inherits whatever the lane exported, defaulting to what
 /// `TestBinary::command` would have forwarded anyway (the dormant `u32::MAX`, or `0` for the
-/// leader-seeded-ordering fork), so `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
-/// meaning what it says.
+/// leader-seeded-ordering and sub-second-timestamp forks), so
+/// `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps meaning what it says.
 ///
 /// Call once per test, before the first node spawn and before anything in the process reads any
 /// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
-/// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
-/// plain `cargo test` two of these tests in one process would fight over it, and the assertions
-/// below are what turn that into a loud failure instead of a mis-decoded pack.
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`). Under
+/// plain `cargo test`, two of these tests in one process would fight over it, and a later pin
+/// would re-point the environment an already-running test spawns its nodes with. So only the
+/// first pin in a process is allowed ([`FORKS_PINNED_BY`]); any later one fails at once, before
+/// touching the environment, naming the test that holds the pins.
 fn pin_fork_epochs(
     force_multi_workers: Option<Epoch>,
     force_seed_signature: Option<Epoch>,
     force_leader_seeded: Option<Epoch>,
+    force_subsecond: Option<Epoch>,
 ) {
+    claim_fork_pins();
+
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
     // stated per-fork default when it exported nothing. an unparseable value normalizes to the
     // same default the gate would have fallen back to.
@@ -609,6 +662,29 @@ fn pin_fork_epochs(
         LEADER_SEEDED_ORDERING_FORK_ENV,
         force_leader_seeded.unwrap_or_else(|| lane(LEADER_SEEDED_ORDERING_FORK_ENV, 0)),
         leader_seeded_ordering_fork_epoch_override,
+    );
+    // `subsecond_timestamp_active` conjoins the seed-signature fork the same way, so this pin
+    // goes through its conjunct-free override reader for the same reason
+    pin_fork_epoch_override(
+        SUBSECOND_TIMESTAMP_FORK_ENV,
+        force_subsecond.unwrap_or_else(|| lane(SUBSECOND_TIMESTAMP_FORK_ENV, 0)),
+        subsecond_timestamp_fork_epoch_override,
+    );
+}
+
+/// The test (libtest names each test's thread after it) that pinned this process's fork epochs.
+static FORKS_PINNED_BY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Claim this process's fork pins for the current test, or fail with how to run the tests apart.
+fn claim_fork_pins() {
+    let me = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    let holder = FORKS_PINNED_BY.get_or_init(|| me.clone());
+    assert_eq!(
+        holder, &me,
+        "fork epochs are process-wide and `{holder}` already pinned them in this process, so \
+         `{me}` cannot run here. Run each e2e test in its own process: nextest \
+         (`make test-e2e` / `make test-epochs`), or `cargo test -p e2e-tests --test it -- \
+         <test> --exact --include-ignored`"
     );
 }
 
@@ -818,8 +894,8 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
 
 /// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
 ///
-/// Keytool currently generates only worker 0. Derive the second identity from the same keys
-/// the node loads at startup, and share both workers' addresses before starting any processes.
+/// Preserve the identities in the one-worker genesis while adding local capacity for worker 1.
+/// Share both workers' addresses before starting any processes.
 fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> eyre::Result<()> {
     let bootstrap_peers = committee
         .iter()
@@ -848,6 +924,138 @@ fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> 
     committee.iter().try_for_each(|(name, _)| network.write_config(&temp_path.join(name)))
 }
 
+/// Reserve worker 0's HTTP port and worker 1's derived port (200 lower) together.
+fn reserve_two_worker_http_ports() -> eyre::Result<(std::net::TcpListener, std::net::TcpListener)> {
+    (0..32)
+        .find_map(|_| {
+            let first = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let second_port = first.local_addr().ok()?.port().checked_sub(200)?;
+            std::net::TcpListener::bind(("127.0.0.1", second_port))
+                .ok()
+                .map(|second| (first, second))
+        })
+        .ok_or_else(|| eyre::eyre!("could not reserve both workers' HTTP ports"))
+}
+
+/// An observer's worker-1 pool forwards through the worker-1 endpoints supplied by keytool.
+/// Worker 0 advertises no endpoint, so selecting the wrong record cannot make this test pass.
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
+    use clap::Parser as _;
+    use telcoin_network_cli::keytool::KeyArgs;
+    use tn_types::test_utils::CommandParser;
+
+    let _permit = super::common::acquire_test_permit();
+    pin_fork_epochs(Some(0), None, None, None);
+    let temp_dir = tempfile::TempDir::with_prefix("worker_rpc")?;
+    e2e_tests::config_local_testnet_with_worker_fee_configs(
+        temp_dir.path(),
+        Some("restart_test".to_string()),
+        None,
+        None,
+        &["0:1:7", "1:1:7"],
+    )?;
+    let nodes = (0..5)
+        .map(|index| {
+            let name =
+                if index < 4 { format!("validator-{}", index + 1) } else { "observer".to_string() };
+            reserve_two_worker_http_ports().map(|(first, second)| (name, first, second))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    nodes.iter().filter(|(name, _, _)| name != "observer").try_for_each(
+        |(name, _, second)| -> eyre::Result<()> {
+            let url = format!("http://127.0.0.1:{}", second.local_addr()?.port());
+            let command = CommandParser::<KeyArgs>::try_parse_from([
+                "tn",
+                "set-rpc",
+                "--worker-id",
+                "1",
+                "--http",
+                &url,
+            ])?;
+            command.args.execute(temp_dir.path().join(name), None)
+        },
+    )?;
+
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut guard = ProcessGuard::empty();
+    let endpoints = nodes
+        .into_iter()
+        .map(|(name, first, second)| -> eyre::Result<_> {
+            let base_port = first.local_addr()?.port();
+            let url = format!("http://127.0.0.1:{}", second.local_addr()?.port());
+            drop((first, second));
+            let mut command = bin.command();
+            command
+                .env("TN_BLS_PASSPHRASE", "restart_test")
+                .arg("node")
+                .arg("--datadir")
+                .arg(temp_dir.path().join(&name))
+                .arg("--http")
+                .arg("--http.port")
+                .arg(base_port.to_string())
+                .arg("--ipcpath")
+                .arg(temp_dir.path().join(format!("{name}.ipc")))
+                .arg("--node-name")
+                .arg(format!("worker-rpc-{name}"));
+            guard.push(command.spawn()?);
+            Ok((name, url))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    // Empty non-epoch-closing outputs skip execution, so the height stays at genesis until the
+    // forwarded transaction lands. Wait only for each worker-1 RPC server to answer.
+    futures::future::try_join_all(endpoints.iter().map(|(_, url)| async move {
+        let provider = ProviderBuilder::new().connect_http(url.parse()?);
+        wait_until(std::time::Duration::from_secs(60), "worker 1 RPC to answer", || async {
+            Ok(provider.get_block_number().await.is_ok())
+        })
+        .await
+    }))
+    .await?;
+
+    let observer_url = endpoints
+        .iter()
+        .find(|(name, _)| name == "observer")
+        .map(|(_, url)| url)
+        .ok_or_else(|| eyre::eyre!("missing observer endpoint"))?;
+    let validator_url = endpoints
+        .iter()
+        .find(|(name, _)| name == "validator-1")
+        .map(|(_, url)| url)
+        .ok_or_else(|| eyre::eyre!("missing validator endpoint"))?;
+    let hash = super::common::send_tel(
+        observer_url,
+        &super::common::get_key("test-source"),
+        Address::from_slice(&[0x77; 20]),
+        1_000_000_000_000_000,
+        250,
+        21_000,
+        0,
+    )?
+    .parse()?;
+    let validator = ProviderBuilder::new().connect_http(validator_url.parse()?);
+    wait_until(
+        std::time::Duration::from_secs(60),
+        "worker 1 observer transaction to be included",
+        || async {
+            validator
+                .get_transaction_receipt(hash)
+                .await
+                .map(|receipt| receipt.is_some())
+                .map_err(Into::into)
+        },
+    )
+    .await?;
+    let receipt = validator
+        .get_transaction_receipt(hash)
+        .await?
+        .ok_or_else(|| eyre::eyre!("forwarded transaction receipt disappeared"))?;
+    eyre::ensure!(receipt.status(), "forwarded transaction reverted");
+    guard.kill_all();
+    Ok(())
+}
+
 /// Governance can grow and shrink the protocol worker count while validators keep running.
 ///
 /// Every node provisions two workers while genesis activates only one. The original processes
@@ -857,7 +1065,7 @@ fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    pin_fork_epochs(Some(0), None, None);
+    pin_fork_epochs(Some(0), None, None, None);
 
     let committee = vec![
         ("validator-1", Address::from_slice(&[0x11; 20])),
@@ -928,7 +1136,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     // whatever fork epochs the lane stated, defaults otherwise - this test is about sync, not
     // about any fork, but the harness still decodes pack bytes and must agree with the nodes
-    pin_fork_epochs(None, None, None);
+    pin_fork_epochs(None, None, None, None);
 
     run_epoch_sync_scenario("epoch_sync").await.map(|_sealed| ())
 }
@@ -948,7 +1156,7 @@ async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
     // forced rather than inherited: this test's claim is a crossing at a known multi-workers
     // epoch, so it states that fork point even when the lane exported a different one. the
     // other pins still follow the lane - this test makes no claim about them.
-    pin_fork_epochs(Some(CROSS_FORK_EPOCH), None, None);
+    pin_fork_epochs(Some(CROSS_FORK_EPOCH), None, None, None);
 
     let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?;
 
@@ -988,9 +1196,10 @@ async fn test_epoch_sync_across_leader_seeded_ordering_fork() -> eyre::Result<()
     let _permit = super::common::acquire_test_permit();
     // both forced rather than inherited: this test's claim is a crossing at a known
     // ordering-fork epoch with the seed fork active beneath it (the conjunct above), so it
-    // states both fork points even when the lane exported different ones. the multi-workers
-    // pin still follows the lane - this test makes no claim about committee layout.
-    pin_fork_epochs(None, Some(0), Some(CROSS_FORK_EPOCH));
+    // states both fork points even when the lane exported different ones. the multi-workers and
+    // sub-second-timestamp pins still follow the lane - this test makes no claim about committee
+    // layout or timestamp precision.
+    pin_fork_epochs(None, Some(0), Some(CROSS_FORK_EPOCH), None);
 
     let sealed = run_epoch_sync_scenario("epoch_sync_seeded").await?;
 
@@ -1004,5 +1213,694 @@ async fn test_epoch_sync_across_leader_seeded_ordering_fork() -> eyre::Result<()
          {CROSS_FORK_EPOCH}: the restart proved only one commit order"
     );
 
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Test consensus commit times across the sub-second timestamp fork, over RPC and on disk.
+///
+/// The fork is pinned at [`SUBSECOND_FORK_EPOCH`] (epochs 0 and 1 pre-fork) with the seed-signature
+/// fork active from genesis, and a four-validator network at the harness's 500/250/250 ms cadence
+/// runs under light transaction load until [`SUBSECOND_TARGET_EPOCH`] opens. Then, on every node:
+///
+/// - every execution block keeps a whole-second `timestamp` that never decreases, including across
+///   each epoch boundary, and equals its consensus commit time floored to seconds;
+/// - every block after genesis names its consensus header as its `parentBeaconBlockRoot`, and
+///   blocks naming the same header report the same commit time (the walk does not require any two
+///   to share one);
+/// - the node served post-fork blocks: at least five that do not close an epoch, and a pair of
+///   consecutive blocks from different consensus headers with the same `timestamp`;
+/// - the engine never clamped an EVM timestamp ([`EVM_TIMESTAMP_CLAMPED_SERIES`] reads 0);
+/// - nodes agree on every block and commit time they all hold;
+/// - the node serves a certified record for every epoch below [`SUBSECOND_TARGET_EPOCH`] and has
+///   executed the final block each record names, with the hash the record commits to.
+///
+/// Validator-1 is then stopped and its consensus chain walked on disk (see
+/// [`assert_consensus_commit_times`]), and every block it served is matched to the commit time its
+/// consensus header holds there.
+async fn test_epoch_subsecond_timestamps_across_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // both forced rather than inherited: the claim is a crossing at a known sub-second epoch, and
+    // the gate (`tn_types::forks::subsecond_timestamp_active`) conjoins the seed fork fail-closed,
+    // so a dormant seed fork would keep every epoch on whole seconds and quietly reduce this to a
+    // single-layout run. the multi-workers and leader-seeded pins follow the lane
+    pin_fork_epochs(None, Some(0), None, Some(SUBSECOND_FORK_EPOCH));
+
+    // short on purpose: node IPC socket paths are built under the temp dir
+    let test = "subsecond_fork";
+    let temp_dir = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = temp_dir.path();
+
+    // one funded sender per validator, so every round of load reaches every worker
+    let mut senders: Vec<TransactionFactory> = (0..4u64)
+        .map(|i| TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(0x5ec0 + i)))
+        .collect();
+    let funding = U256::from(parse_ether("1_000")?);
+    let accounts = senders
+        .iter()
+        .map(|sender| (sender.address(), GenesisAccount::default().with_balance(funding)))
+        .collect();
+    config_local_testnet_with_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        Some(accounts),
+        Some(EPOCH_DURATION as u32),
+    )?;
+    let genesis: Genesis = Config::load_from_path(
+        temp_path.join("shared-genesis").join("genesis").join("genesis.yaml"),
+        ConfigFmt::YAML,
+    )?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut guard = ProcessGuard::empty();
+    let mut rpc_urls = Vec::new();
+    let mut metrics_addrs = Vec::new();
+    for instance in 0..4 {
+        let rpc_port = get_available_tcp_port("127.0.0.1").expect("rpc port assigned by host");
+        let metrics_port =
+            get_available_tcp_port("127.0.0.1").expect("metrics port assigned by host");
+        let metrics_addr = format!("127.0.0.1:{metrics_port}");
+        guard.push(start_validator_with_args(
+            instance,
+            bin,
+            temp_path,
+            rpc_port,
+            test,
+            0,
+            &["--metrics", &metrics_addr],
+        ));
+        rpc_urls.push(format!("http://127.0.0.1:{rpc_port}"));
+        metrics_addrs.push(metrics_addr);
+    }
+    let providers = rpc_urls
+        .iter()
+        .map(|url| Ok(ProviderBuilder::new().connect_http(url.parse()?)))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
+
+    // the load only runs while the epochs roll; dropping it with the finished race stops it
+    let reached = tokio::select! {
+        reached = loop_epochs(0, SUBSECOND_TARGET_EPOCH, &rpc_urls[0], EPOCH_DURATION) => reached?,
+        never = drive_light_tx_load(&providers, &mut senders, chain) => match never {},
+    };
+    eyre::ensure!(
+        reached >= SUBSECOND_TARGET_EPOCH,
+        "network stopped at epoch {reached}, short of {SUBSECOND_TARGET_EPOCH}"
+    );
+    info!(target: "epoch-test", reached, "sub-second fork run reached its target epoch");
+
+    let mut served = Vec::with_capacity(providers.len());
+    for (provider, url) in providers.iter().zip(&rpc_urls) {
+        served.push(assert_block_commit_times(provider, url).await?);
+    }
+    assert_nodes_agree_on_commit_times(&served, &rpc_urls)?;
+
+    // every node is still the process it started as, so its counter covers the whole run
+    for (addr, url) in metrics_addrs.iter().zip(&rpc_urls) {
+        let clamped = scrape_metric_value(addr, EVM_TIMESTAMP_CLAMPED_SERIES)?;
+        eyre::ensure!(
+            clamped == 0.0,
+            "{url} clamped {clamped} EVM timestamps up to their parent's: consensus let commit \
+             time go backwards in a post-fork epoch (epoch 0 is pre-fork here, so validator clocks \
+             lagging the genesis timestamp cannot explain it; node logs under test_logs/{test}/ \
+             carry the \"evm timestamp clamped to parent\" warnings)"
+        );
+    }
+
+    // the walk above compares nodes only on the blocks they all hold, and only validator-1's
+    // epochs were polled. require every node to serve a certified record for each epoch the run
+    // closed and to have executed that record's final block with the hash it commits to, so each
+    // node went through every seam, the fork seam included, and ended each epoch on the same
+    // block. the helper reads only `http_url`. eject.rs gives each record 60 s (its 10 s epochs
+    // times 6); certificates take a fixed quorum-voting time that does not shrink with this
+    // file's 5 s epochs, so keep the same 60 s floor as the other record polls here
+    let endpoints: Vec<NodeEndpoints> = rpc_urls
+        .iter()
+        .map(|url| NodeEndpoints {
+            http_url: url.clone(),
+            ws_url: String::new(),
+            ipc_path: String::new(),
+        })
+        .collect();
+    assert_epoch_records_verify(
+        &endpoints,
+        0..=SUBSECOND_TARGET_EPOCH - 1,
+        (EPOCH_DURATION * 6).max(60),
+    )
+    .await?;
+
+    // stop validator-1 so its consensus chain can be opened from this process
+    let mut validator_1 = guard.take(0).ok_or_else(|| eyre::eyre!("validator-1 is not running"))?;
+    super::common::kill_child(&mut validator_1);
+    eyre::ensure!(
+        providers[0].get_chain_id().await.is_err(),
+        "validator-1 still answers RPC after being stopped"
+    );
+    let headers = read_consensus_headers(&temp_path.join("validator-1")).await?;
+    let commits = assert_consensus_commit_times(&headers)?;
+    assert_blocks_match_consensus(&served[0], &commits)?;
+
+    guard.kill_all();
+    Ok(())
+}
+
+/// Keep a light transaction load on every node until the caller drops this future.
+///
+/// Each round sends one transfer from `senders[i]` to `providers[i]`, so every worker regularly
+/// seals a batch of its own and a single commit often carries batches from several workers; the
+/// execution blocks built from such a commit share a `parentBeaconBlockRoot`, which is what the
+/// per-header commit-time check in [`assert_block_commit_times`] compares.
+///
+/// That walk requires blocks inside post-fork epochs, which only this load produces, so a sender
+/// must survive a rejected transfer. Signing has already advanced its nonce, and without a resync
+/// every later transfer from it would wait behind the gap. After a rejection the sender takes its
+/// next nonce from the node before it sends again. Each rejection is logged at warn and each
+/// resync at info (`light-load sender nonce resynced`).
+async fn drive_light_tx_load<P: Provider>(
+    providers: &[P],
+    senders: &mut [TransactionFactory],
+    chain: Arc<RethChainSpec>,
+) -> Infallible {
+    let sink = Address::from_slice(&[0x5e; 20]);
+    let mut stale_nonces = vec![false; senders.len()];
+    loop {
+        for ((provider, sender), stale) in
+            providers.iter().zip(senders.iter_mut()).zip(stale_nonces.iter_mut())
+        {
+            let address = sender.address();
+            if *stale {
+                // take the next nonce from the count the node has executed. while earlier
+                // transfers are still pooled that count trails them, so the next send repeats a
+                // pooled nonce and is rejected, and the sender resyncs each round until they
+                // execute. a sender whose resync fails sits the round out rather than sign past
+                // the gap
+                match provider.get_transaction_count(address).await {
+                    Ok(nonce) => {
+                        sender.set_nonce(nonce);
+                        *stale = false;
+                        info!(
+                            target: "epoch-test",
+                            sender = %address,
+                            nonce,
+                            "light-load sender nonce resynced",
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "epoch-test",
+                            %error,
+                            sender = %address,
+                            "light-load sender nonce resync failed",
+                        );
+                        continue;
+                    }
+                }
+            }
+            let tx = sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(sink),
+                U256::from(1),
+                Bytes::new(),
+            );
+            if let Err(error) = provider.send_raw_transaction(&tx).await {
+                warn!(
+                    target: "epoch-test",
+                    %error,
+                    sender = %address,
+                    "light-load transfer rejected",
+                );
+                // signing advanced the factory past the rejected nonce whether or not the node
+                // took the transfer
+                *stale = true;
+            }
+        }
+        tokio::time::sleep(LIGHT_LOAD_INTERVAL).await;
+    }
+}
+
+/// Assert the sub-second timestamp invariants `provider` serves for every execution block from
+/// genesis to its current head, and return each block's commit time in block order.
+///
+/// Per block, `tn_getBlockTimestampMillis` must describe the block `eth_getBlockByNumber` returns
+/// (number, hash and `timestamp`); the `timestamp` must equal the commit time floored to whole
+/// seconds and be no smaller than its parent's; and the consensus digest must be the block's
+/// `parentBeaconBlockRoot`. Blocks built from one consensus output name the same consensus header
+/// there and must report the same commit time. The node reads that time from the header the digest
+/// names, so this last check mostly restates the lookup, and how many blocks shared a header is
+/// logged, not required.
+///
+/// The walk must also contain the cases those checks exist for. It fails unless the node served
+/// at least one block with a sub-second commit time, so it executed past the fork seam; at least
+/// five post-fork blocks that do not close an epoch, which only the light load produces (without
+/// transactions the node builds one block for an epoch's closing commit and skips every other
+/// empty commit); and at least one pair of consecutive post-fork blocks from different consensus
+/// headers with the same `timestamp`, the case where only `timestampMillis` orders two commits.
+async fn assert_block_commit_times<P: Provider>(
+    provider: &P,
+    node: &str,
+) -> eyre::Result<Vec<BlockCommitTime>> {
+    const MIN_POST_FORK_OPEN_BLOCKS: usize = 5;
+    let head = provider.get_block_number().await?;
+    let mut served: Vec<BlockCommitTime> = Vec::new();
+    let mut by_beacon_root: BTreeMap<B256, u64> = BTreeMap::new();
+    let mut shared_root_blocks = 0usize;
+    let mut sub_second_blocks = 0usize;
+    let mut post_fork_open_blocks = 0usize;
+    let mut closing_blocks = 0usize;
+    let mut same_second_block_pairs = 0usize;
+    for number in 0..=head {
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await?
+            .ok_or_else(|| eyre::eyre!("{node} has no block {number} below its head {head}"))?;
+        let commit = get_block_commit_time(provider, number)
+            .await
+            .map_err(|e| eyre::eyre!("{node}: {e}"))?;
+        let context = format!("{node} block {number}: {commit:?}");
+        eyre::ensure!(
+            commit.block_number == number
+                && commit.block_hash == block.header.hash
+                && commit.timestamp == block.header.timestamp,
+            "tn_getBlockTimestampMillis disagrees with eth_getBlockByNumber (hash {}, timestamp \
+             {}): {context}",
+            block.header.hash,
+            block.header.timestamp,
+        );
+        eyre::ensure!(
+            commit.timestamp == commit.timestamp_millis / 1000,
+            "EVM timestamp is not the consensus commit time floored to seconds: {context}"
+        );
+        if let Some(parent) = served.last() {
+            eyre::ensure!(
+                commit.timestamp >= parent.timestamp,
+                "EVM timestamp went backwards from block {} at {}: {context}",
+                parent.block_number,
+                parent.timestamp,
+            );
+        }
+        // genesis carries the eip-4788 field zeroed; every later block names its consensus header
+        match block.header.parent_beacon_block_root.filter(|root| !root.is_zero()) {
+            None => eyre::ensure!(
+                number == 0 && commit.consensus_digest.is_none(),
+                "execution block without a consensus header: {context}"
+            ),
+            Some(root) => {
+                eyre::ensure!(
+                    commit.consensus_digest == Some(root),
+                    "consensusDigest is not the parentBeaconBlockRoot {root}: {context}"
+                );
+                match by_beacon_root.entry(root) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(commit.timestamp_millis);
+                    }
+                    Entry::Occupied(entry) => {
+                        eyre::ensure!(
+                            *entry.get() == commit.timestamp_millis,
+                            "blocks from consensus header {root} report different commit times \
+                             ({} ms earlier): {context}",
+                            entry.get(),
+                        );
+                        shared_root_blocks += 1;
+                    }
+                }
+            }
+        }
+        // a block closes an epoch when it is the last block of the epoch's closing output. the
+        // seam counters in `assert_consensus_commit_times` find that output as the last consensus
+        // header before a leader-epoch change; per block, the node marks it by storing the
+        // closing epoch's 32-byte seed in `extra_data`, which every other block leaves empty
+        // (`TNBlockAssembler::assemble_block` in `crates/tn-reth/src/evm/block.rs`, read back on
+        // replay by `context_for_block` in `crates/tn-reth/src/evm/config.rs`)
+        let closes_epoch = !block.header.extra_data.is_empty();
+        if closes_epoch {
+            closing_blocks += 1;
+        }
+        if commit.sub_second {
+            sub_second_blocks += 1;
+            if !closes_epoch {
+                post_fork_open_blocks += 1;
+            }
+        }
+        if let Some(parent) = served.last() {
+            if parent.sub_second
+                && commit.sub_second
+                && parent.consensus_digest != commit.consensus_digest
+                && parent.timestamp == commit.timestamp
+            {
+                same_second_block_pairs += 1;
+            }
+        }
+        served.push(commit);
+    }
+    info!(
+        target: "epoch-test",
+        node,
+        head,
+        consensus_headers = by_beacon_root.len(),
+        shared_root_blocks,
+        sub_second_blocks,
+        post_fork_open_blocks,
+        closing_blocks,
+        same_second_block_pairs,
+        "execution block commit times verified",
+    );
+    eyre::ensure!(
+        sub_second_blocks > 0,
+        "{node} served no block with a sub-second commit time up to its head {head}: it never \
+         executed a block past the sub-second fork at leader epoch {SUBSECOND_FORK_EPOCH}"
+    );
+    eyre::ensure!(
+        post_fork_open_blocks >= MIN_POST_FORK_OPEN_BLOCKS,
+        "{node} served {post_fork_open_blocks} post-fork blocks that do not close an epoch up to \
+         its head {head}, expected at least {MIN_POST_FORK_OPEN_BLOCKS}: the light load stopped \
+         putting blocks inside post-fork epochs (see the \"light-load transfer rejected\" and \
+         \"light-load sender nonce resynced\" lines)"
+    );
+    eyre::ensure!(
+        same_second_block_pairs > 0,
+        "{node} served no two consecutive post-fork blocks from different consensus headers with \
+         the same EVM timestamp up to its head {head}: the whole-second timestamp never tied two \
+         commits, so timestampMillis never had to order them"
+    );
+    Ok(served)
+}
+
+/// Assert every node reports the same block and commit time at every height they all hold.
+///
+/// Both derive from consensus output alone, so a disagreement at a shared height is a fork in the
+/// execution chain (the hash) or in the commit-time derivation (the milliseconds).
+fn assert_nodes_agree_on_commit_times(
+    served: &[Vec<BlockCommitTime>],
+    nodes: &[String],
+) -> eyre::Result<()> {
+    let Some((reference, others)) = served.split_first() else {
+        return Ok(());
+    };
+    for (other, node) in others.iter().zip(nodes.iter().skip(1)) {
+        for (expected, actual) in reference.iter().zip(other) {
+            eyre::ensure!(
+                expected == actual,
+                "{node} disagrees with {} at block {}: {actual:?} vs {expected:?}",
+                nodes[0],
+                expected.block_number,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A consensus header's commit, as read from a node's consensus chain on disk.
+#[derive(Debug, Clone, Copy)]
+struct ConsensusCommit {
+    /// The consensus header's number.
+    number: u64,
+    /// The epoch of the sub-dag's leader, which selects the commit-time layout.
+    leader_epoch: Epoch,
+    /// The commit time in milliseconds since the Unix epoch.
+    commit_ms: u64,
+}
+
+/// Assert the commit-time invariants over a node's whole consensus chain, walked in order, and
+/// return each header's commit keyed by its digest.
+///
+/// - Commit seconds never decrease, before the fork or after it, including across every consecutive
+///   pre-fork pair.
+/// - Every post-fork commit time equals the one recomputed from the chain: the leader's creation
+///   time raised to 1 ms past the floor. The floor is the previous commit within an epoch, the
+///   previous epoch's close in whole seconds at an epoch's first commit, and absent for epoch 0.
+///   The walk takes that close to be the previous commit's whole seconds, which holds when each
+///   epoch's closing EVM block kept its commit seconds: always before the fork, and after it unless
+///   the engine clamped an EVM timestamp, so the caller must first check that the clamp counter
+///   reads 0. Commit milliseconds therefore strictly increase within a post-fork epoch and across
+///   the fork seam, where the previous commit is whole seconds. How many commits the floor raised
+///   above their leader's creation time is logged, not asserted.
+/// - At every later epoch seam the first commit must also follow the previous epoch's last commit
+///   in milliseconds. The protocol does not promise this, because the floor drops the closing
+///   commit's sub-second part; it holds only because every node in this test reads this host's
+///   clock, so the new epoch's leaders are created after the previous epoch closed.
+/// - The layout the node wrote on each side of the fork is observed by the strict bcs decode in
+///   [`read_consensus_headers`], which fails on a sub-dag or header laid out for the other side,
+///   and by the digest and `subSecond` cross-checks in [`assert_blocks_match_consensus`]. The
+///   checks here that pre-fork headers decode with millis 0 and that only post-fork sub-dags
+///   serialize with `commit_timestamp_millis` are harness self-checks: they read this process's own
+///   decode and serialization, which follow the pinned fork gate, so they guard the pin and cannot
+///   see the node's bytes. That a pre-fork sub-dag keeps the legacy layout an old binary decodes,
+///   and that such a binary rejects a post-fork one, is shown by the unit tests
+///   `pre_fork_sub_dag_keeps_the_legacy_layout` (adiri builds) and `v2_sub_dag_serde_round_trips`
+///   in `crates/types/src/primary/output.rs`.
+///
+/// Fails loudly unless the walk covered what those claims need: at least two pre-fork headers and
+/// at least one consecutive pre-fork pair, the fork seam exactly once, at least two post-fork
+/// epoch seams, at least one consecutive post-fork pair committed within the same second, and at
+/// least one post-fork commit with non-zero millis.
+fn assert_consensus_commit_times(
+    headers: &[ConsensusHeader],
+) -> eyre::Result<BTreeMap<B256, ConsensusCommit>> {
+    let mut commits = BTreeMap::new();
+    let mut pre_fork_headers = 0usize;
+    let mut pre_fork_pairs = 0usize;
+    let mut fork_seams = 0usize;
+    let mut post_fork_seams = 0usize;
+    let mut same_second_pairs = 0usize;
+    let mut sub_second_commits = 0usize;
+    let mut raised_commits = 0usize;
+    let mut previous: Option<&ConsensusHeader> = None;
+    for header in headers {
+        let sub_dag = &header.sub_dag;
+        let epoch = sub_dag.leader_epoch();
+        let commit_ms = sub_dag.commit_timestamp_ms();
+        let post_fork = epoch >= SUBSECOND_FORK_EPOCH;
+        let context = format!(
+            "consensus header {} (leader epoch {epoch}, committed at {} ms)",
+            header.number,
+            commit_ms.as_millis()
+        );
+
+        let json = serde_json::to_value(sub_dag)?;
+        let fields = json
+            .as_object()
+            .ok_or_else(|| eyre::eyre!("{context}: sub-dag JSON is not an object: {json}"))?;
+        // harness self-checks: this process's serializer writes commit_timestamp_millis exactly
+        // when its own fork gate holds for the leader's epoch (`leader_subsecond_active`,
+        // `crates/types/src/primary/output.rs:443-445`), so the key checks confirm the harness's
+        // pinned gate agrees with `post_fork` and cannot see what the node wrote. the seconds key
+        // guards them against a renamed field reading as "absent"
+        eyre::ensure!(
+            fields.contains_key("commit_timestamp"),
+            "{context}: harness self-check: sub-dag JSON has no commit_timestamp field: {json}"
+        );
+        if post_fork {
+            eyre::ensure!(
+                fields.contains_key("commit_timestamp_millis"),
+                "{context}: harness self-check: this process serialized a post-fork sub-dag \
+                 without commit_timestamp_millis, so its fork gate disagrees with the pin"
+            );
+            // recompute the commit time the node derived: the leader's creation time raised to
+            // 1 ms past the floor, or the leader's time alone without a floor
+            // (`CommittedSubDag::strict_commit_timestamp_ms`,
+            // `crates/types/src/primary/output.rs:707-714`)
+            let leader_ms = sub_dag.leader().created_at_ms();
+            let (floor, floor_source) = match previous {
+                // within an epoch bullshark floors each commit on the one before it
+                // (`crates/consensus/primary/src/consensus/bullshark.rs:253-259,275`), which the
+                // subscriber writes as the next consensus header
+                // (`crates/consensus/executor/src/subscriber.rs:378-382`)
+                Some(prev) if prev.sub_dag.leader_epoch() == epoch => {
+                    (Some(prev.sub_dag.commit_timestamp_ms()), "the previous commit")
+                }
+                // an epoch's first commit has no previous sub-dag, because consensus recovers only
+                // its own epoch's pack (`crates/consensus/primary/src/consensus/state.rs:441-444`),
+                // so it takes the epoch commit floor: the prior epoch's closing EVM block timestamp
+                // in whole seconds (`resolve_epoch_commit_floor`, `state.rs:397-410`, fed by
+                // `crates/node/src/manager/node/start_epoch.rs:308`). that block executes the prior
+                // epoch's last header on disk, because the subscriber takes no sub-dag after the
+                // first to reach the epoch boundary (`subscriber.rs:371-373`) and the node closes
+                // the epoch on that same output (`crates/node/src/manager/node/run_epoch.rs:626`).
+                // the block's timestamp is that header's commit seconds, always before the fork and
+                // after it unless the engine clamped (`crates/tn-reth/src/payload.rs:275-282`),
+                // which the caller rules out with a zero clamp counter. at the fork seam the
+                // previous commit is pre-fork whole seconds, so this floor equals it
+                Some(prev) => (
+                    Some(tn_types::TimestampMs::from_parts(
+                        prev.sub_dag.commit_timestamp_ms().secs(),
+                        0,
+                    )),
+                    "the previous epoch's close in whole seconds",
+                ),
+                // header 1 is the first commit of epoch 0, which has no floor (`state.rs:397`)
+                None => (None, "epoch 0 has none"),
+            };
+            let expected =
+                floor.map_or(leader_ms, |floor| leader_ms.max(floor.saturating_add_millis(1)));
+            eyre::ensure!(
+                commit_ms == expected,
+                "{context}: expected a commit at {expected} ms, the leader's creation at \
+                 {leader_ms} ms raised to 1 ms past the floor {} ({floor_source})",
+                floor.map_or_else(|| "none".to_string(), |floor| format!("{floor} ms"))
+            );
+            if commit_ms != leader_ms {
+                raised_commits += 1;
+            }
+            if commit_ms.subsec_millis() != 0 {
+                sub_second_commits += 1;
+            }
+        } else {
+            pre_fork_headers += 1;
+            // harness self-checks: for a pre-fork leader this process's decoder never reads a
+            // sub-second field and fills 0 (`crates/types/src/primary/output.rs:514-525` for the
+            // sub-dag, `crates/types/src/primary/header.rs:406-417` for each header), so these
+            // confirm the harness follows the pin and cannot see the node's bytes
+            eyre::ensure!(
+                commit_ms.subsec_millis() == 0,
+                "{context}: harness self-check: pre-fork commit time decoded with a sub-second part"
+            );
+            eyre::ensure!(
+                !fields.contains_key("commit_timestamp_millis"),
+                "{context}: harness self-check: this process serialized a pre-fork sub-dag with \
+                 commit_timestamp_millis, so its fork gate disagrees with the pin: {json}"
+            );
+            if let Some(stray) = sub_dag.headers().iter().find(|h| h.created_at_millis() != 0) {
+                eyre::bail!(
+                    "{context}: harness self-check: pre-fork header {} decoded with {} sub-second \
+                     millis",
+                    stray.digest(),
+                    stray.created_at_millis()
+                );
+            }
+        }
+
+        if let Some(prev) = previous {
+            let prev_epoch = prev.sub_dag.leader_epoch();
+            let prev_ms = prev.sub_dag.commit_timestamp_ms();
+            let step = format!("from header {} at {} ms", prev.number, prev_ms.as_millis());
+            eyre::ensure!(epoch >= prev_epoch, "{context}: leader epoch went back {step}");
+            eyre::ensure!(
+                commit_ms.secs() >= prev_ms.secs(),
+                "{context}: commit seconds went backwards {step}"
+            );
+            let prev_post_fork = prev_epoch >= SUBSECOND_FORK_EPOCH;
+            if post_fork && prev_post_fork && epoch != prev_epoch {
+                // within an epoch and at the fork seam the recomputation above already puts each
+                // commit at least 1 ms after the previous one. at a later seam the protocol
+                // guarantees only the whole-second floor, so the first commit may sit up to 998 ms
+                // below the previous epoch's last (`crates/types/src/primary/output.rs:618-621`).
+                // this step holds only because every node here reads one host clock, so the new
+                // epoch's leaders are created after the previous epoch closed on that clock
+                eyre::ensure!(
+                    commit_ms > prev_ms,
+                    "{context}: first commit of the epoch is not after the previous epoch's last \
+                     commit {step}. the protocol guarantees only the whole-second floor at an \
+                     epoch seam; this strict step holds only because every node in this test \
+                     shares one host clock"
+                );
+            }
+            if !post_fork && !prev_post_fork {
+                // harness self-check, like the pre-fork checks above: both sides already decoded
+                // with millis 0, restated per pair
+                eyre::ensure!(
+                    commit_ms.subsec_millis() == 0 && prev_ms.subsec_millis() == 0,
+                    "{context}: harness self-check: pre-fork pair decoded with a sub-second part \
+                     {step}"
+                );
+                pre_fork_pairs += 1;
+            }
+            if post_fork && prev_post_fork && commit_ms.secs() == prev_ms.secs() {
+                same_second_pairs += 1;
+            }
+            if epoch != prev_epoch {
+                if post_fork && !prev_post_fork {
+                    fork_seams += 1;
+                } else if prev_post_fork {
+                    post_fork_seams += 1;
+                }
+            }
+        }
+
+        commits.insert(
+            B256::from(header.digest()),
+            ConsensusCommit {
+                number: header.number,
+                leader_epoch: epoch,
+                commit_ms: commit_ms.as_millis(),
+            },
+        );
+        previous = Some(header);
+    }
+
+    info!(
+        target: "epoch-test",
+        headers = headers.len(),
+        pre_fork_headers,
+        pre_fork_pairs,
+        fork_seams,
+        post_fork_seams,
+        same_second_pairs,
+        sub_second_commits,
+        raised_commits,
+        "consensus commit times verified",
+    );
+    eyre::ensure!(
+        pre_fork_headers >= 2,
+        "the walk holds {pre_fork_headers} pre-fork headers, expected at least 2"
+    );
+    eyre::ensure!(
+        pre_fork_pairs > 0,
+        "no two consecutive pre-fork commits: the whole-second ordering was never exercised"
+    );
+    eyre::ensure!(
+        fork_seams == 1,
+        "the walk crossed the sub-second fork seam {fork_seams} times, expected exactly once"
+    );
+    eyre::ensure!(
+        post_fork_seams >= 2,
+        "the walk crossed {post_fork_seams} post-fork epoch seams, expected at least 2"
+    );
+    eyre::ensure!(
+        same_second_pairs > 0,
+        "no two consecutive post-fork commits share a second: the strict millisecond ordering was \
+         never exercised below the seconds grid"
+    );
+    eyre::ensure!(
+        sub_second_commits > 0,
+        "no post-fork commit carries non-zero millis: commit times never left the seconds grid"
+    );
+    Ok(commits)
+}
+
+/// Assert every block a node served over RPC reports the commit time its consensus header holds
+/// in that node's consensus chain, with the matching `subSecond` flag, and that the blocks span
+/// every epoch below [`SUBSECOND_TARGET_EPOCH`] (so the RPC checks crossed the fork seam and the
+/// post-fork seams too).
+fn assert_blocks_match_consensus(
+    served: &[BlockCommitTime],
+    commits: &BTreeMap<B256, ConsensusCommit>,
+) -> eyre::Result<()> {
+    let mut epochs = BTreeSet::new();
+    for block in served {
+        // genesis has no consensus header
+        let Some(digest) = block.consensus_digest else { continue };
+        let commit = commits.get(&digest).ok_or_else(|| {
+            eyre::eyre!(
+                "block {} names consensus header {digest}, absent on disk",
+                block.block_number
+            )
+        })?;
+        eyre::ensure!(
+            block.consensus_number == Some(commit.number)
+                && block.timestamp_millis == commit.commit_ms
+                && block.sub_second == (commit.leader_epoch >= SUBSECOND_FORK_EPOCH),
+            "block served over RPC {block:?} disagrees with its consensus header on disk {commit:?}"
+        );
+        epochs.insert(commit.leader_epoch);
+    }
+    eyre::ensure!(
+        (0..SUBSECOND_TARGET_EPOCH).all(|epoch| epochs.contains(&epoch)),
+        "served blocks cover leader epochs {epochs:?}, not every epoch below \
+         {SUBSECOND_TARGET_EPOCH}"
+    );
     Ok(())
 }

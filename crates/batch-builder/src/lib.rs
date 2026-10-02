@@ -39,6 +39,7 @@ mod metrics;
 pub mod test_utils;
 
 use crate::metrics::BatchBuilderMetrics;
+pub use crate::metrics::{record_base_fee, record_pending_pool_transactions};
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]
@@ -64,8 +65,9 @@ enum BuildOutcome {
     /// run loop retries on a dedicated backoff and gates its logging on state changes rather
     /// than emitting per attempt (issue #1145).
     Refused,
-    /// Any other non-fatal seal failure (quorum, timeout, reporting). The pool keeps its
-    /// transactions and the loop retries on the next delay tick, as before.
+    /// Any other non-fatal seal failure (quorum, timeout, reporting, or the refusal once this
+    /// epoch's consensus shutdown has begun). The pool keeps its transactions and the loop
+    /// retries on the next delay tick, as before.
     Failed,
 }
 
@@ -213,7 +215,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred } =
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable } =
                 match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
                     Ok(output) => output,
                     Err(e) => {
@@ -230,14 +232,17 @@ impl BatchBuilder {
             metrics
                 .peer_deferred_txs_total
                 .increment(u64::try_from(peer_deferred).unwrap_or(u64::MAX));
+            // Evictions happen during selection, even if the batch is empty or quorum fails.
+            metrics.unpackable_txs_total.increment(u64::try_from(unpackable).unwrap_or(u64::MAX));
             // Canonical updates can drain the pending pool after the run loop's build gate.
             // Selection can also skip every candidate, including peer-deferred transactions
-            // (issue #1329). Peers reject empty batches, so record the deferral metric above
+            // (issue #1329). Peers reject empty batches, so record the selection metrics above
             // but send nothing to the worker in every empty-build case.
             if batch.transactions().is_empty() {
                 debug!(
                     target: "worker::batch_builder",
                     peer_deferred,
+                    unpackable,
                     "transaction selection produced an empty batch; sealing nothing"
                 );
                 result.send(Ok(BuildOutcome::Empty)).err().into_iter().for_each(|e| {
@@ -259,8 +264,12 @@ impl BatchBuilder {
                 // wait for worker to ack quorum reached then update pool with mined txs
                 match rx.await {
                     Ok(res) => {
-                        // measures build + broadcast + quorum, regardless of outcome
-                        metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        // measures build + broadcast + quorum, whatever the outcome; a refusal at
+                        // consensus shutdown never broadcasts, so it is left out rather than drag
+                        // the histogram toward the build time alone
+                        if !matches!(res, Err(BlockSealError::ConsensusShuttingDown)) {
+                            metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        }
                         match res {
                             Ok(_) => {
                                 debug!(target: "worker::batch-builder", ?res, "received ack");
@@ -285,6 +294,14 @@ impl BatchBuilder {
                                     BlockSealError::NotValidator => {
                                         debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
                                         Ok(BuildOutcome::Refused)
+                                    }
+                                    // the worker refuses once this epoch's consensus shutdown has
+                                    // begun; a few per worker are expected at every epoch
+                                    // boundary until the epoch's tasks are aborted, so this stays
+                                    // at debug and leaves the pool untouched
+                                    BlockSealError::ConsensusShuttingDown => {
+                                        debug!(target: "worker::batch_builder", "batch seal refused: consensus shutdown has begun");
+                                        Ok(BuildOutcome::Failed)
                                     }
                                     BlockSealError::QuorumRejected
                                     | BlockSealError::AntiQuorum

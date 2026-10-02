@@ -59,15 +59,24 @@ impl TxPool for TestPool {
     fn best_transactions(&self) -> tn_reth::BestTxns {
         tn_reth::BestTxns::new_for_test(self.best_transactions_int())
     }
-    fn remove_eip4844_txs(&mut self, _blobs: Vec<TxHash>) {
-        // remove EIP-4844 transactions from the transactions vec and btreemap
-        self.transactions.retain(|tx| !tx.is_eip4844());
-        self.by_id.retain(|_, tx| !tx.is_eip4844());
+    fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+        // Match production's hash-scoped descendant removal. This pool has no sidecar store.
+        self.remove_unsupported_txs(blobs);
     }
-    fn remove_unsupported_txs(&mut self, _txs: Vec<TxHash>) {
-        // remove non-allowlisted transaction types from the transactions vec and btreemap
-        self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
-        self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        // Match the production pool: remove the supplied hashes and their descendants,
+        // including allowlisted transaction types that exceed a whole-batch capacity limit.
+        let removed: Vec<_> = self
+            .transactions
+            .iter()
+            .filter(|tx| txs.contains(tx.hash()))
+            .map(|tx| (tx.sender_id(), tx.nonce()))
+            .collect();
+        let retain = |tx: &Arc<PoolTxn>| {
+            removed.iter().all(|(sender, nonce)| *sender != tx.sender_id() || *nonce > tx.nonce())
+        };
+        self.transactions.retain(retain);
+        self.by_id.retain(|_, tx| retain(tx));
     }
     fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
         addresses
@@ -83,7 +92,42 @@ impl TxPool for TestPool {
     }
 }
 
+#[cfg(test)]
+impl TxPool for &mut TestPool {
+    fn best_transactions(&self) -> tn_reth::BestTxns {
+        (**self).best_transactions()
+    }
+
+    fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+        (**self).remove_eip4844_txs(blobs);
+    }
+
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        (**self).remove_unsupported_txs(txs);
+    }
+
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        (**self).get_account_balances(addresses)
+    }
+
+    fn record_peer_batch(&self, hashes: &[TxHash]) {
+        (**self).record_peer_batch(hashes);
+    }
+
+    fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+        (**self).is_peer_deferred(hash)
+    }
+}
+
 impl TestPool {
+    /// Model mining by removing only the listed hashes, leaving later sender nonces pending.
+    /// Eviction through [`TxPool::remove_unsupported_txs`] also removes descendants.
+    #[cfg(test)]
+    pub(crate) fn prune_mined(&mut self, txs: Vec<TxHash>) {
+        self.transactions.retain(|tx| !txs.contains(tx.hash()));
+        self.by_id.retain(|_, tx| !txs.contains(tx.hash()));
+    }
+
     /// Override the balance [`TxPool::get_account_balances`] reports for `address`.
     #[cfg(test)]
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {
@@ -233,5 +277,61 @@ impl Iterator for BestTestTransactions {
                 return Some(best);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the test pool's mining and eviction semantics.
+
+    use super::*;
+    use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_types::{test_genesis, MIN_PROTOCOL_BASE_FEE};
+
+    /// Blob eviction respects the supplied hashes and descendants, preserving unrelated blobs.
+    #[test]
+    fn blob_removal_is_scoped_to_hashes_and_descendants() {
+        let chain = Arc::new(RethChainSpec::from(test_genesis()));
+        let gas_price = u128::from(MIN_PROTOCOL_BASE_FEE);
+        let mut first_sender = TransactionFactory::new();
+        let mut other_sender = TransactionFactory::new_random();
+        let mut sender_ids = SenderIdentifiers::default();
+        let first_id = sender_ids.sender_id_or_create(first_sender.address());
+        let other_id = sender_ids.sender_id_or_create(other_sender.address());
+        // Construct the fixture directly from pooled transactions to retain their blob sidecars.
+        let [first, successor, unrelated] = [
+            (
+                first_sender.create_eip4844_pooled(chain.clone(), None, gas_price),
+                PoolTxnId::new(first_id, 0),
+            ),
+            (
+                first_sender.create_eip4844_pooled(chain.clone(), None, gas_price),
+                PoolTxnId::new(first_id, 1),
+            ),
+            (
+                other_sender.create_eip4844_pooled(chain, None, gas_price),
+                PoolTxnId::new(other_id, 0),
+            ),
+        ]
+        .map(|(tx, id)| Arc::new(new_pool_txn(tx, id)));
+        let removed_hash = *first.hash();
+        let retained_hash = *unrelated.hash();
+        let transactions = vec![first, successor, unrelated];
+        let by_id = transactions.iter().map(|tx| (tx.transaction_id, tx.clone())).collect();
+        let mut pool = TestPool { transactions, by_id, ..Default::default() };
+
+        pool.remove_eip4844_txs(Vec::new());
+        assert_eq!(pool.transactions.len(), 3);
+        assert_eq!(pool.by_id.len(), 3);
+
+        pool.remove_eip4844_txs(vec![removed_hash]);
+        assert_eq!(
+            pool.transactions.iter().map(|tx| *tx.hash()).collect::<Vec<_>>(),
+            vec![retained_hash]
+        );
+        assert_eq!(
+            pool.by_id.values().map(|tx| *tx.hash()).collect::<Vec<_>>(),
+            vec![retained_hash]
+        );
     }
 }

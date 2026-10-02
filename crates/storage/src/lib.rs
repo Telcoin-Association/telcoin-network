@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
+// The pack files are mmap-backed and read with positional I/O (`std::os::unix::fs::FileExt`), and
+// the heal/import paths identify files by inode: this crate builds for unix targets only.
+#[cfg(not(unix))]
+compile_error!("tn-storage requires a unix target (mmap-backed pack files, positional file I/O)");
+
 mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -471,6 +476,7 @@ mod test {
         assert_eq!(None, iter.next());
     }
 
+    /// Verify clearing populated and empty tables across database backends.
     pub(crate) fn test_clear<DB: Database>(db: DB) {
         // Test clear of empty map
         let _ = db.clear_table::<TestTable>();
@@ -492,7 +498,8 @@ mod test {
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear with one item
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        // Wait for the write-behind insert before counting across memory and disk.
+        db.sync_persist();
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
         db.sync_persist(); // Either a no-op or a chance for write ops to catch up.

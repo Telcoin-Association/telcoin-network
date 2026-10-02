@@ -161,8 +161,12 @@ impl BtreeIndex {
             // reads are bounded by `page_count`, so trailing junk is simply never addressed.
             if !read_only {
                 let want = header.page_count as u64 * PAGE_SIZE as u64;
-                if file.len() != want {
-                    file.set_len(want)?;
+                // `truncate` is shrink-only; a short file is extended (zero-filled) through the
+                // preallocating `ensure_len`, never a sparse remap.
+                if file.len() > want {
+                    file.truncate(want)?;
+                } else if file.len() < want {
+                    file.ensure_len(want)?;
                 }
             }
             header
@@ -253,7 +257,7 @@ impl BtreeIndex {
         self.header.values = 0;
         self.header.first_leaf = 1;
         self.header.last_leaf = 1;
-        self.file.set_len(0)?; // unmap + truncate to nothing
+        self.file.truncate(0)?; // unmap + truncate to nothing
         self.file.ensure_len(2 * PAGE_SIZE as u64)?; // grow back to header + root leaf (zero-filled)
         let page = self.header.to_page();
         self.file

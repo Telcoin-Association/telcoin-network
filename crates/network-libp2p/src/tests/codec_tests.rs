@@ -112,7 +112,14 @@ async fn test_fail_to_write_message_too_big() {
 
 #[tokio::test]
 async fn test_reject_message_prefix_too_big() {
-    let max_chunk_size = 344; // 344 bytes
+    // the honest peer's limit is exactly the uncompressed size of the one-parent vote below
+    // (344 bytes with the legacy header layout, 348 once the epoch-gated sub-second field is
+    // on the wire), so a single extra certificate is enough to exceed it
+    let request = TestPrimaryRequest::Vote {
+        header: Header::default(),
+        parents: vec![Certificate::default()],
+    };
+    let max_chunk_size = tn_types::encode(&request).len();
     let mut honest_peer = TNCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/tn-test");
     // malicious peer writes legit messages that are too big
@@ -125,13 +132,6 @@ async fn test_reject_message_prefix_too_big() {
     //
     // sanity check
     let mut encoded = Vec::new();
-
-    //println!("size: {}", std::mem::size_of::<TestPrimaryRequest>());
-    // this is 344 bytes uncompressed (max chunk size)
-    let request = TestPrimaryRequest::Vote {
-        header: Header::default(),
-        parents: vec![Certificate::default()],
-    };
     malicious_peer
         .write_request(&protocol, &mut encoded, request.clone())
         .await
@@ -144,7 +144,7 @@ async fn test_reject_message_prefix_too_big() {
 
     // now encode legit message that's too big for honest peer
     let mut encoded = Vec::new();
-    // this is 344 bytes uncompressed
+    // one more certificate than the limit allows
     let big_request = TestPrimaryRequest::Vote {
         header: Header::default(),
         parents: vec![Certificate::default(), Certificate::default()],
@@ -162,7 +162,7 @@ async fn test_reject_message_prefix_too_big() {
     //
     // sanity check that block within bounds works
     let mut encoded = Vec::new();
-    // 138 bytes uncompressed
+    // one certificate stays well inside the limit
     let response = TestPrimaryResponse::MissingCertificates(vec![Certificate::default()]);
     malicious_peer
         .write_response(&protocol, &mut encoded, response.clone())
@@ -176,7 +176,7 @@ async fn test_reject_message_prefix_too_big() {
 
     // now encode legit message that's too big for honest peer
     let mut encoded = Vec::new();
-    // > 416 bytes uncompressed
+    // four certificates exceed the limit
     let big_response = TestPrimaryResponse::MissingCertificates(vec![
         Certificate::default(),
         Certificate::default(),
@@ -207,8 +207,8 @@ async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
     // encode valid message that's too big and change prefix to deceive peer into trying to read
     // content
     let mut encoded = Vec::new();
-    // this is 344 bytes uncompressed
-    // but only 74 bytes compressed (within max size)
+    // this is ~344 bytes uncompressed (348 with the sub-second header field on the wire)
+    // but only ~74 bytes compressed (within max size)
     let big_request = TestPrimaryRequest::Vote {
         header: Header::default(),
         parents: vec![Certificate::default(), Certificate::default()],

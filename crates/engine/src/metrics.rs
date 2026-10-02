@@ -42,6 +42,11 @@ pub(crate) struct EngineMetrics {
     /// producer's batch inside the detection window (priority-fee poaching indicator,
     /// issue #1259).
     pub(crate) cross_producer_repacked_txs_total: Counter,
+    /// EVM block timestamps clamped up to the parent's because the consensus commit time was
+    /// behind it. Non-zero indicates a consensus bug, except for the first commits of epoch 0:
+    /// epoch 0 has no commit floor, so they are clamped when validator clocks lag the genesis
+    /// timestamp.
+    pub(crate) evm_timestamp_clamped_total: Counter,
 }
 
 #[cfg(test)]
@@ -67,6 +72,7 @@ mod tests {
             metrics.persist_provider_fault_retries_total.increment(2);
             metrics.persist_failures_total.increment(1);
             metrics.cross_producer_repacked_txs_total.increment(4);
+            metrics.evm_timestamp_clamped_total.increment(5);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -92,5 +98,7 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_engine.cross_producer_repacked_txs_total");
         assert!(matches!(value, DebugValue::Counter(4)));
+        let (_, _, _, value) = find("tn_engine.evm_timestamp_clamped_total");
+        assert!(matches!(value, DebugValue::Counter(5)));
     }
 }

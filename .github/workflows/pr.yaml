@@ -23,7 +23,8 @@
 # suite can have covered it and nothing can attest it; a lane that required it would hang
 # the queue. It gates entry instead: a PR cannot be queued until its head sha is attested,
 # and a push to a queued PR removes it from the queue with a new head that is unattested
-# until a maintainer runs `make attest` again.
+# until a maintainer runs `make attest` again. That holds for a PR that leaves the gate
+# alone; the `attest` job below says what stops a PR that edits it.
 #
 # The compile lanes restore their dependency caches and never save them (`save-if:
 # "false"`). A cache saved by a pull_request run is scoped to that PR's branch and one
@@ -31,12 +32,20 @@
 # read either; the upload would only add minutes to the critical path and consume quota
 # that evicts the entries the queue does read. Those are written on main by
 # .github/workflows/cache-deps.yaml, and the cache steps here must stay in lockstep with
-# it: same env block, same steps before the cache step. Its header has the details.
+# it: same env block, same steps before the cache step, same rust-cache release. A release
+# that changes the key moves in both files in one pull request, and the queue builds cold
+# until main has re-warmed; cache-deps.yaml's header says why it cannot move there first.
 #
 # The fmt, clippy and test lanes below do not spell out their own commands. They call
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
 # enforces and what a maintainer attests locally are the same commands by construction
 # rather than by inspection. Change a lane there, not here.
+#
+# Every action the workflows use is pinned to a full commit SHA, with the release it
+# stands for in a trailing comment on the same line. A tag such as `v4` can be repointed
+# upstream, and the gate would then run new code with no change in this repository.
+# Dependabot proposes the bumps (.github/dependabot.yaml); the procedure is in
+# .github/ACTIONS.md, under "Action pins".
 name: Pull Request and Merge Queue Checks
 
 on:
@@ -140,16 +149,79 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # The script comes from main as it stands when this job starts, checked out into
+      # `trusted/`, and the PR's own tree is never checked out in this job. A bare
+      # checkout on `pull_request` is the PR's merge commit, so the script judging the PR
+      # would be supplied by the PR: an `exit 0` or a different CONTRACT_ADDRESS would
+      # turn this check green with no attestation. main moves only through the ruleset or
+      # an admin bypassing it, so the author cannot choose what is checked out here, nor
+      # keep an old copy by not pushing, as `pull_request.base.sha` would allow: that does
+      # not follow main, and neither a review request nor a re-run moves it.
+      #
+      # The ref is spelled `refs/heads/main`, fully qualified so that a tag named `main`
+      # cannot be picked up, rather than taken from `github.base_ref` or
+      # `pull_request.base.ref`: the trigger only accepts PRs into main today, and a
+      # literal stays main if that filter is ever widened, so no PR can have the script
+      # read from a branch its author can push to.
+      #
+      # The consequence to expect: a PR that changes verify_commit_hash.sh is judged by
+      # the old script, and every run after it lands uses the new one, on every open PR.
+      #
+      # What this does not cover: the job definition below and the `CI Success` allowlist
+      # still come from the PR's merge commit, and a PR can edit those instead. Such a PR
+      # is stopped by the required code-owner review (.github/CODEOWNERS), not here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          path: trusted
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
-      # cast, for the read-only registry call
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which the PR supplies, so they
+      # guard against a change upstream and not against a PR that edits them; the comment
+      # above the checkout says what stops that.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        env:
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
+        run: |
+          set -euo pipefail
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
 
       - name: Verify attestation on adiri
         env:
           COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
-        run: .github/scripts/verify_commit_hash.sh
+        run: trusted/.github/scripts/verify_commit_hash.sh
 
   # Format check - no compilation needed, finishes in ~30s
   fmt:
@@ -158,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read nightly version
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
@@ -186,9 +258,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       # Before the cache step: RUST_NIGHTLY is part of the cache key (rust-cache hashes
@@ -200,14 +272,11 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
-      # Restore only; cache-deps.yaml writes the entries on main (see the header). The
-      # `prefix-key` deliberately still defaults to v0-rust: the v1-rust entries cache-deps
-      # now writes do not exist until it has run on main, and a fully cold queue run would
-      # hit the timeout. Flip all three cache steps to `prefix-key: v1-rust` in a follow-up
-      # once it has (see .github/ACTIONS.md, "Caches").
+      # Restore only; cache-deps.yaml writes the v1-rust entries on main.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          prefix-key: v1-rust
           shared-key: clippy-cache
           save-if: "false"
 
@@ -226,23 +295,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
 
       # Restore only; see the clippy job.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          prefix-key: v1-rust
           shared-key: test-cache
           save-if: "false"
 
@@ -270,16 +340,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          submodules: true
           fetch-depth: 1
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
 
@@ -287,8 +357,9 @@ jobs:
       # both test lanes into one target dir, where the adiri variants of the shared
       # dependencies coexist with the default ones.
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          prefix-key: v1-rust
           shared-key: test-cache
           save-if: "false"
 
@@ -310,7 +381,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Assert no pruning entry point in the node
         run: ./etc/archive-mode-guard.sh

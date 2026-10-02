@@ -28,7 +28,7 @@ use std::{
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
-use tn_primary::ConsensusBus;
+use tn_primary::{ConsensusBus, NodeMode};
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{
     certificate_pack::CertificatePack, epoch_records::EpochRecordDb, tables::OurNodeBatchesCache,
@@ -44,6 +44,10 @@ use tracing::{debug, error, info, warn};
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
+/// How long the epoch's tasks may take to exit on their own once the epoch's shutdown is signalled,
+/// before the rest are aborted. Matches the epoch task manager's join wait: epoch handoff must not
+/// wait long.
+const EPOCH_TASK_EXIT_GRACE: Duration = Duration::from_millis(200);
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -300,7 +304,13 @@ where
             };
 
         let consensus_config = self
-            .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
+            .configure_consensus(
+                network_config,
+                committee,
+                next_committee_keys,
+                prior_epoch_record,
+                epoch_start,
+            )
             .await?;
 
         // Epoch-entry agreement check (issue #556): the committee's worker count sizes the
@@ -351,12 +361,16 @@ where
         }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
-        let certificate_pack = if consensus_bus.is_active_cvv() {
+        // `create_consensus` publishes this epoch's mode, so read it once here: the proposer and
+        // the batch builders below must decide from the same value
+        let node_mode = self.consensus_bus.current_node_mode();
+        let proposer_started = starts_proposer(node_mode);
+        let certificate_pack = if proposer_started {
             Some(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch))
         } else {
             None
         };
-        if self.consensus_bus.is_active_cvv() {
+        if proposer_started {
             // start primary
             primary
                 .start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack)
@@ -374,27 +388,44 @@ where
             self.epoch_boundary,
         );
 
-        // Drain the previous cache once, before any new builder can write this epoch's batches.
-        self.orphan_batches(&epoch_task_manager, engine.clone(), workers.clone(), current_epoch)
-            .await?;
+        // Snapshot the previous cache before any new builder can write this epoch's batches.
+        // Recovery removes only completed snapshot entries, retaining unfinished work on shutdown.
+        self.orphan_batches(engine.clone(), workers.clone(), current_epoch).await?;
 
         let batch_builder_task_spawner = epoch_task_manager.get_spawner();
-        futures::stream::iter(&mut workers)
-            .then(|worker| {
-                worker.spawn_batch_builder(
-                    &worker_task_manager_name(worker.id()),
-                    &epoch_task_manager,
+        for worker in &mut workers {
+            let worker_id = worker.id();
+            let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
+            if produces_batches(worker.seals_via_quorum(), proposer_started) {
+                worker
+                    .spawn_batch_builder(&worker_task_manager_name(worker_id), &epoch_task_manager);
+                engine
+                    .start_batch_builder(
+                        worker_id,
+                        worker.batches_tx(),
+                        &batch_builder_task_spawner,
+                        base_fee,
+                        current_epoch,
+                    )
+                    .await?;
+            } else {
+                let pending =
+                    engine.get_worker_transaction_pool(&worker_id).await?.pool_size().pending;
+                // the batch builder owns these gauges and is not running, so set them once here
+                // rather than leave the previous builder's last readings in place
+                tn_batch_builder::record_pending_pool_transactions(worker_id, pending);
+                tn_batch_builder::record_base_fee(worker_id, base_fee);
+                info!(
+                    target: "epoch-manager",
+                    worker_id,
+                    pending,
+                    ?node_mode,
+                    "batch builder not started: node is in committee but not an active CVV; \
+                     accepted transactions stay pooled until a later epoch entry starts a \
+                     builder: rejoin as CvvActive, or the next epoch as a non-member that forwards"
                 );
-                engine.start_batch_builder(
-                    worker.id(),
-                    worker.batches_tx(),
-                    &batch_builder_task_spawner,
-                    gas_accumulator.base_fee(worker.id()).base_fee(),
-                    current_epoch,
-                )
-            })
-            .try_collect::<()>()
-            .await?;
+            }
+        }
 
         // update tasks
         epoch_task_manager.update_tasks();
@@ -467,7 +498,11 @@ where
         // If the select exitted because of a join() then do not join() again- we are already
         // shutting down.
         consensus_shutdown.notify();
-        // abort all epoch-related tasks
+        // Give the epoch's tasks a short window to exit on their own first, so their graceful
+        // exits run (the consensus task seals its certificate pack and reports a queued save
+        // failure; the subscriber saves the outputs it already holds). Then abort whatever is
+        // still running.
+        epoch_task_manager.wait_for_exit(EPOCH_TASK_EXIT_GRACE).await;
         epoch_task_manager.abort_all_tasks();
         // Expect complaints from join so swallow those errors...
         // If we timeout here something is not playing nice and shutting down so return the
@@ -558,7 +593,7 @@ where
         mut output: ConsensusOutput,
     ) -> eyre::Result<()> {
         let last_forwarded_consensus_number = output.number();
-        if output.committed_at() >= self.epoch_boundary {
+        if output.reaches_epoch_boundary(self.epoch_boundary) {
             // update output so engine closes epoch
             output.set_epoch_close();
         }
@@ -617,7 +652,7 @@ where
                 OutputContinuity::Next => {}
             }
             // observe epoch boundary to initiate epoch transition
-            if output.committed_at() >= self.epoch_boundary {
+            if output.reaches_epoch_boundary(self.epoch_boundary) {
                 info!(
                     target: "epoch-manager",
                     epoch=?output.leader().epoch(),
@@ -944,6 +979,28 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
     } else {
         OutputContinuity::Gap
     }
+}
+
+/// Decide whether this epoch entry starts the primary's proposer.
+///
+/// Only a [`NodeMode::CvvActive`] node proposes. [`produces_batches`] takes this decision rather
+/// than the mode, so the batch builder gate cannot drift from the proposer start.
+fn starts_proposer(mode: NodeMode) -> bool {
+    mode.is_active_cvv()
+}
+
+/// Decide whether a worker gets a batch builder for this epoch entry.
+///
+/// `in_committee` is [`Worker::seals_via_quorum`](tn_worker::Worker::seals_via_quorum): the
+/// worker seals by committee quorum and must report each sealed batch to this node's proposer.
+/// `proposer_started` is [`starts_proposer`] for this entry's mode. Without a proposer, which is
+/// every mode but [`NodeMode::CvvActive`], a member would seal batches that can never be
+/// reported, and peers would validate and store each retry. A member vetoed to
+/// [`NodeMode::Observer`] by a newer epoch record falls in this case too. Workers outside the
+/// committee forward the transactions they accept to committee validators, so they always get a
+/// builder, including a non-member whose [`NodeMode::CvvInactive`] carried over.
+fn produces_batches(in_committee: bool, proposer_started: bool) -> bool {
+    !in_committee || proposer_started
 }
 
 /// Resolve the record that seeds the new epoch's chain and the digest that anchors its epoch-close
@@ -2066,5 +2123,29 @@ mod tests {
         assert_eq!(check_output_continuity(5, u64::MAX), OutputContinuity::Gap);
         // overflow safety at the top of the range
         assert_eq!(check_output_continuity(u64::MAX, u64::MAX), OutputContinuity::Stale);
+    }
+
+    /// Only a quorum-sealing worker without a running proposer is denied a batch builder.
+    #[test]
+    fn test_produces_batches_for_every_membership_and_mode() {
+        let cases = [
+            // an active member runs its proposer, so its sealed batches can be reported
+            (true, NodeMode::CvvActive, true),
+            // an inactive member has no proposer to report sealed batches to
+            (true, NodeMode::CvvInactive, false),
+            // a member vetoed to observer by a newer epoch record has no proposer either
+            (true, NodeMode::Observer, false),
+            // non-members forward accepted transactions, whatever mode carried over
+            (false, NodeMode::CvvActive, true),
+            (false, NodeMode::CvvInactive, true),
+            (false, NodeMode::Observer, true),
+        ];
+        for (in_committee, mode, expected) in cases {
+            assert_eq!(
+                produces_batches(in_committee, starts_proposer(mode)),
+                expected,
+                "in_committee={in_committee} mode={mode:?}"
+            );
+        }
     }
 }

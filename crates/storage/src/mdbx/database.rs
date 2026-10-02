@@ -164,17 +164,6 @@ impl MdbxDatabase {
         max_size: usize,
         growth_step: usize,
     ) -> eyre::Result<Self> {
-        let mut builder = Environment::builder();
-        builder.set_max_dbs(max_tables).write_map().set_geometry(Geometry {
-            // Maximum database size
-            size: Some(0..max_size),
-            // We grow the database in increments of 1 gigabyte
-            growth_step: Some(growth_step as isize),
-            // The database never shrinks
-            shrink_threshold: Some(0),
-            page_size: Some(PageSize::Set(default_page_size())),
-        });
-
         // Test and `test-utils` builds trade fsync durability for write speed: they open the
         // env in `SafeNoSync` instead of the default `Durable`, which removes the meta+data
         // `fsync` that MDBX performs at every `txn.commit()` on the consensus hot path.
@@ -207,9 +196,46 @@ impl MdbxDatabase {
         // (the harness never clears the child env), so a CI-level export reaches every
         // spawned node.
         #[cfg(any(test, feature = "test-utils"))]
-        {
+        let sync_mode = Some(resolve_sync_mode(std::env::var_os(TN_TEST_MDBX_SYNC_ENV))?);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let sync_mode = None;
+        Self::open_with(path, max_tables, max_size, growth_step, sync_mode)
+    }
+
+    /// Like [`Self::open`], with the sync mode given directly instead of resolved from
+    /// [`TN_TEST_MDBX_SYNC_ENV`], so a test can choose it without mutating the process environment
+    /// (which other threads of a test binary read concurrently). Test and `test-utils` builds only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_with_sync_mode<P: AsRef<Path>>(
+        path: P,
+        max_tables: usize,
+        max_size: usize,
+        growth_step: usize,
+        sync_mode: reth_libmdbx::SyncMode,
+    ) -> eyre::Result<Self> {
+        Self::open_with(path, max_tables, max_size, growth_step, Some(sync_mode))
+    }
+
+    /// Open the environment, with `sync_mode` when given (else MDBX's default, `Durable`).
+    fn open_with<P: AsRef<Path>>(
+        path: P,
+        max_tables: usize,
+        max_size: usize,
+        growth_step: usize,
+        sync_mode: Option<reth_libmdbx::SyncMode>,
+    ) -> eyre::Result<Self> {
+        let mut builder = Environment::builder();
+        builder.set_max_dbs(max_tables).write_map().set_geometry(Geometry {
+            // Maximum database size
+            size: Some(0..max_size),
+            // We grow the database in increments of 1 gigabyte
+            growth_step: Some(growth_step as isize),
+            // The database never shrinks
+            shrink_threshold: Some(0),
+            page_size: Some(PageSize::Set(default_page_size())),
+        });
+        if let Some(sync_mode) = sync_mode {
             use reth_libmdbx::{EnvironmentFlags, Mode};
-            let sync_mode = resolve_sync_mode(std::env::var_os(TN_TEST_MDBX_SYNC_ENV))?;
             builder.set_flags(EnvironmentFlags {
                 mode: Mode::ReadWrite { sync_mode },
                 ..Default::default()

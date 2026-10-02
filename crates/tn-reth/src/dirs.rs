@@ -149,6 +149,10 @@ impl TelcoinDirs for DataDirChainPath {
     fn network_config_path(&self) -> PathBuf {
         self.0.as_ref().join("network-config")
     }
+
+    fn node_pid_path(&self) -> PathBuf {
+        self.0.as_ref().join("telcoin.pid")
+    }
 }
 
 /// Returns the path to the telcoin network data dir.

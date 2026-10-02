@@ -34,6 +34,12 @@ pub struct PrimaryMetrics {
     pub(crate) invalid_votes_total: Counter,
     /// Failed vote requests during header certification.
     pub(crate) vote_request_failures_total: Counter,
+    /// Vote requests from peers answered with a recoverable "not yet" because the header was
+    /// created further ahead of the local clock than the drift tolerance, but by no more than the
+    /// tolerance plus the vote timeout.
+    ///
+    /// These carry no penalty, so a steady rate means a peer's clock (or this node's) is skewed.
+    pub(crate) votes_deferred_future_header_total: Counter,
     /// Certificates formed from own headers reaching vote quorum.
     pub(crate) certificates_formed_total: Counter,
     /// Time to certify an own header proposal (collect a quorum of votes).
@@ -54,8 +60,9 @@ pub struct PrimaryMetrics {
     pub(crate) committed_round: Gauge,
     /// Committed subdags.
     pub(crate) subdags_committed_total: Counter,
-    /// Time from leader header creation to subdag commit (whole seconds - the
-    /// timestamps are second-granularity, so this flags pathological commits, not p50s).
+    /// Time from leader header creation to subdag commit, in fractional seconds at millisecond
+    /// resolution. Before the sub-second timestamp fork a leader's creation time is a whole
+    /// second, so a pre-fork reading overstates the latency by up to one second.
     pub(crate) commit_latency_seconds: Histogram,
     /// The largest consensus output (in pack file encoded bytes) we have seen since startup.
     pub(crate) max_consensus_output_bytes: Gauge,
@@ -189,6 +196,7 @@ mod tests {
             metrics.headers_proposed_total.increment(1);
             metrics.votes_received_total.increment(3);
             metrics.invalid_votes_total.increment(1);
+            metrics.votes_deferred_future_header_total.increment(2);
             metrics.certificates_formed_total.increment(1);
             metrics.certificate_form_duration_seconds.record(0.05);
             metrics.certificates_received_total.increment(2);
@@ -212,6 +220,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.votes_received_total");
         assert!(matches!(value, DebugValue::Counter(3)));
+        let (_, _, _, value) = find("tn_primary.votes_deferred_future_header_total");
+        assert!(matches!(value, DebugValue::Counter(2)));
         let (_, _, _, value) = find("tn_primary.certificates_formed_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.round");

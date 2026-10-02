@@ -24,8 +24,7 @@ async fn test_certificate_signers_are_ordered() {
     // Need to sort validator by there BlsPublicKeys.
     let authorities: BTreeMap<BlsPublicKey, &AuthorityFixture<MemDatabase>> =
         fixture.authorities().map(|a| (a.primary_public_key(), a)).collect();
-    let authorities: Vec<&AuthorityFixture<MemDatabase>> =
-        authorities.values().map(|v| *v).collect();
+    let authorities: Vec<&AuthorityFixture<MemDatabase>> = authorities.values().copied().collect();
     // The authority that creates the Header
     let authority = authorities[0];
 
@@ -37,6 +36,7 @@ async fn test_certificate_signers_are_ordered() {
         BTreeSet::new(),
         BlockNumHash::default(),
         authority.seed_signature(1, 1),
+        tn_types::now_ms(),
     );
 
     // WHEN

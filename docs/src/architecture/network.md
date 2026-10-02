@@ -15,7 +15,8 @@ and the per-epoch wiring that decides a node's role lives in
 ## Node roles
 
 A node's role is chosen at every epoch boundary and can change mid-epoch.
-A node is an `Observer` if it is not in the entering committee or was started with `--observer`.
+A node is an `Observer` if it is not in the entering committee.
+The role is derived from committee membership and is not selectable by a flag; to take a validator out of consensus, exit it on chain.
 Otherwise it starts the epoch as `CvvActive`, optimistically assuming it is caught up, and is demoted to `CvvInactive` later if that turns out to be false.
 An existing `CvvInactive` state is sticky: it is carried into the next epoch unchanged until the node finishes catching up.
 
@@ -40,7 +41,7 @@ An inactive validator stays subscribed to its worker batch topic: warming the ba
 
 ### Observer
 
-An observer is any node that is not in the current committee, plus any node started with `--observer`.
+An observer is any node that is not in the current committee.
 It follows consensus output only and never votes.
 
 An observer **unsubscribes** from the worker batch topic.

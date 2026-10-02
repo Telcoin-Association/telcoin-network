@@ -21,16 +21,19 @@
 //!
 //! ## The cleared-set subtlety
 //!
-//! The per-header `batches` set is cleared after **every** consensus header
-//! (`consensus_pack.rs`), so a batch referenced by header *N* must appear as a `Batch` record
-//! within *N*'s group (after header *N-1*, at/before header *N*). A batch present elsewhere in the
-//! file but cleared before *N* still triggers `MissingBatches` — that is exactly the
-//! Absent-vs-Misordered distinction this validator surfaces.
+//! Each output's batches are written right after its header (the header-first layout of v1/v2), so
+//! a batch referenced by header *N* must appear as a `Batch` record within *N*'s group (after
+//! header *N*, before header *N+1*). A batch present elsewhere in the file but outside that group
+//! still triggers `MissingBatches` — that is exactly the Absent-vs-Misordered distinction this
+//! validator surfaces.
+//!
+//! A legacy v0 (batches-first) pack is not walked here: it is only ever read by its migration to
+//! v2, so it is judged by a dry run of that migration
+//! ([`legacy_migration_dry_run`](crate::consensus_pack::legacy_migration_dry_run)).
 
 use std::{
     collections::{BTreeSet, HashSet},
     fmt::{self, Display},
-    fs::File,
     path::Path,
 };
 
@@ -43,12 +46,14 @@ use crate::{
         digest_index::{BucketCrcReport, HdxIndex},
         error::fetch::FetchError,
         fxhasher::FxHasher,
-        pack::{DataHeader, Pack, PackCompression},
-        pack_iter::PackIter,
+        index::Index as _,
+        pack::{DataHeader, Pack, PackCompression, RawIter},
     },
     consensus_pack::{
-        attested_output_survives_past, verify_epoch_meta, PackError, PackRecord, BATCH_DIGEST_NAME,
-        CONSENSUS_DIGEST_NAME, PACK_VERSION,
+        attested_output_survives_past, check_recoverable, legacy_migration_refusal,
+        pack_unsealed_version, read_position_entries, verify_epoch_meta, wal_consistent_end,
+        PackError, PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME, PACK_VERSION,
+        POSITION_INDEX_NAME, SENTINEL_MIN_VERSION,
     },
 };
 
@@ -102,8 +107,7 @@ pub enum PackIssue {
     /// A v1 group's `Batch` records are present and correct as a set, but not in the ascending
     /// digest order the v1 importer ([`iter_to_output`](crate::consensus_pack)) requires. Only
     /// emitted when the group has no missing/extra batch, so it isolates a pure ordering defect —
-    /// distinct from [`BatchClass::Misordered`], which means a batch in the *wrong group*. (v1
-    /// only; v0 does not constrain intra-group batch order.)
+    /// distinct from [`BatchClass::Misordered`], which means a batch in the *wrong group*.
     UnsortedBatches {
         /// Consensus number of the group whose batches are out of order.
         number: u64,
@@ -143,6 +147,16 @@ pub enum PackIssue {
         /// Which index and the underlying open error.
         detail: String,
     },
+    /// A derived index does not agree with the data log: a record present in the log does not
+    /// resolve to its logged offset through the digest index. Unlike [`IndexBucketScan`]
+    /// (which only CRC-scans the main hdx buckets), this catches a corrupt odx overflow record
+    /// or a damaged/zeroed bloom filter — both of which pass the bucket scan yet make lookups
+    /// miss. The data log is intact; the index must be rebuilt (`db repair --epoch N
+    /// --force`).
+    IndexMismatch {
+        /// What disagreed (record kind, log offset, and the index's answer).
+        detail: String,
+    },
 }
 
 /// Overall verdict for a pack file.
@@ -170,15 +184,19 @@ impl Display for Verdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorruptionKind {
     /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
-    /// no outputs. No committed data is at risk, but both open doors REFUSE a torn meta (they
-    /// cannot read the committee), so it is not auto-healed: remove this `epoch-N` directory to
-    /// rebuild.
+    /// no outputs. No committed data is at risk, but it is not healed by truncation: both open
+    /// doors REFUSE torn meta bytes (they cannot read the committee), and only a header followed
+    /// by nothing but zeros is re-initialized, by the open that creates the epoch. Remove this
+    /// `epoch-N` directory to rebuild.
     TornMetaEmpty,
     /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
     /// unreachable without the meta. Data loss for this epoch.
     CorruptMetaWithData,
     /// A record past the meta is unreadable and no complete record follows: a torn trailing tail.
-    /// Truncatable — `recover_pack` drops it automatically on the next append-open.
+    /// Truncatable — but only the CURRENT epoch self-heals (the node append-opens it and
+    /// `recover_pack` drops the tail). A PAST epoch is only ever `open_static`'d, which refuses an
+    /// unsealed pack and never heals it, so it keeps failing `CorruptPack` until an operator runs
+    /// `db repair --epoch N --force` with the node stopped.
     TornTrailingTail,
     /// A record is unreadable and complete records still follow: mid-log corruption. The damaged
     /// record and everything after it are lost.
@@ -191,9 +209,11 @@ pub enum CorruptionKind {
 }
 
 impl CorruptionKind {
-    /// True when recovery can safely drop the damage by truncation, losing no committed data.
+    /// True when recovery heals the damage itself by truncating it, losing no committed data. A
+    /// torn epoch meta is not: nothing is truncated, and the open doors refuse it (see
+    /// [`CorruptionKind::TornMetaEmpty`]).
     pub fn is_truncatable(&self) -> bool {
-        matches!(self, CorruptionKind::TornMetaEmpty | CorruptionKind::TornTrailingTail)
+        matches!(self, CorruptionKind::TornTrailingTail)
     }
 }
 
@@ -241,14 +261,17 @@ impl Display for PhysicalCorruption {
         match self.kind {
             CorruptionKind::TornMetaEmpty => writeln!(
                 f,
-                "no committed data at risk, but ACTION NEEDED — both open doors refuse a torn \
-                 epoch-meta, so `open_append` will NOT reinitialize it: remove this `epoch-N` \
-                 directory to rebuild (re-sync the epoch from peers if it is not the current one)."
+                "no committed data at risk, but ACTION NEEDED — both open doors refuse torn \
+                 epoch-meta bytes (only a header followed by nothing but zeros is re-initialized, \
+                 and only when the node creates the epoch): remove this `epoch-N` directory to \
+                 rebuild (re-sync the epoch from peers if it is not the current one)."
             ),
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
-                "SAFE — `recover_pack` truncates this unacked tail automatically on the next \
-                 append-open; no action needed."
+                "truncatable unacked tail. If this is the CURRENT/latest epoch, the node heals it \
+                 automatically on the next append-open (no action needed). If it is a PAST epoch, the \
+                 node will NOT heal it (past epochs are only opened read-only) — stop the node and run \
+                 `telcoin-network db repair --epoch N --force`."
             ),
             CorruptionKind::CorruptMetaWithData
             | CorruptionKind::MidLogCorruption
@@ -266,13 +289,16 @@ impl Display for PhysicalCorruption {
 /// [`HdxIndex::bucket_crc_scan`]. `dirty` buckets are written-but-unstamped (a zeroed CRC trailer);
 /// on a cleanly-closed index that should be `0` — a non-zero count means the index was not synced
 /// or a bucket page was lost/zeroed. `corrupt` buckets have a non-zero CRC that fails to verify
-/// (bit rot). Either way the *data log is intact* (the index is rebuildable): the fix is to remove
-/// the `hash`/`bhash` dirs so the index rebuilds from the data WAL on next open.
+/// (bit rot). Either way the *data log is intact* (the index is rebuildable): the fix is to stop
+/// the node and run `db repair --epoch N --force`, which rebuilds the index from the data WAL.
+/// (Deleting the dirs by hand is unsafe — a past epoch is only opened read-only and never rebuilds
+/// them on its own, so it would read as absent until repaired.)
 ///
-/// Note (known residual, not a format change): a fully-zeroed bucket page presents as `dirty`, and
-/// a live node's next `ordered_sync` would stamp a valid CRC over the zeros, "laundering" it into a
-/// valid empty bucket. This scan is the detector for that window; run it (via `db validate`) before
-/// restarting a node whose index is suspect.
+/// A fully-zeroed bucket page presents as `dirty`. This is now caught at runtime, not just here: a
+/// handle only stamps (at `ordered_sync`) the buckets it actually wrote this cycle, so it can no
+/// longer "launder" an at-rest zeroed bucket into a valid empty one, and a lookup that misses in
+/// such a bucket returns `CorruptIndex` (see `HdxIndex::unsynced_buckets`). This scan remains the
+/// offline detector; run it (via `db validate`) before restarting a node whose index is suspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexBucketScan {
     /// Bucket-CRC report for the consensus-header digest index (`hash`).
@@ -397,7 +423,10 @@ pub fn validate_pack_file_bounded(
     if let Some(bound) = read_bound {
         pack.set_read_bound(bound);
     }
-    validate_pack_file_impl(path, pack, epoch, previous)
+    // A bounded walk validates the intact PREFIX of an unclean (torn-tail) pack, whose sidecar
+    // indexes legitimately lag the data log — so dirty buckets are expected there and the full
+    // index-vs-log cross-check would spuriously fail. Both are gated on this flag.
+    validate_pack_file_impl(path, pack, epoch, previous, read_bound.is_some())
 }
 
 fn validate_pack_file_impl(
@@ -405,7 +434,13 @@ fn validate_pack_file_impl(
     pack: Pack<PackRecord>,
     epoch: Epoch,
     previous: Option<&EpochRecord>,
+    bounded: bool,
 ) -> Result<PackValidationReport, PackError> {
+    // A legacy v0 (batches-first) pack is only ever read by its migration to v2: judge it with
+    // `legacy_migration_dry_run`, not this header-first walk.
+    if pack.version() == 0 {
+        return Err(PackError::InvalidVersion(PACK_VERSION, 0));
+    }
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = BoundedIssues::default();
 
@@ -450,15 +485,20 @@ fn validate_pack_file_impl(
         previous.map(|p| p.final_consensus.hash)
     };
 
-    let mut report = if pack.version() == 0 {
-        verify_v0_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
-    } else {
-        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
-    };
+    let mut report =
+        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?;
     // Best-effort: also scan the sidecar digest indexes' bucket CRCs — the one detector for a
     // lost/corrupt or zeroed bucket page, which nothing else runs (`files_consistent` only compares
     // lengths, and the data-stream walk above ignores the indexes entirely).
-    scan_index_buckets(path, pack.header(), &mut report);
+    scan_index_buckets(path, pack.header(), bounded, &mut report);
+    // On a sealed pack (its indexes are synced by the clean close) also cross-check every derived
+    // index entry against the data log: this is what makes a `Valid`/`Healthy` verdict mean
+    // "every derived index agrees with the log", catching an odx overflow record or a zeroed
+    // bloom that the bucket scan cannot see. Skipped for a bounded/unclean walk (indexes
+    // legitimately lag there).
+    if !bounded && !pack.opened_unclean() {
+        cross_check_indexes(path, &pack, &mut report);
+    }
     Ok(report)
 }
 
@@ -468,7 +508,12 @@ fn validate_pack_file_impl(
 /// `index_scan = None` (bare-data-file validation); an unreadable index becomes an issue. Any dirty
 /// or corrupt bucket flips the verdict to `Invalid` even when the data stream is clean — the data
 /// is intact but the index must be rebuilt.
-fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackValidationReport) {
+fn scan_index_buckets(
+    data_path: &Path,
+    header: &DataHeader,
+    bounded: bool,
+    report: &mut PackValidationReport,
+) {
     let Some(dir) = data_path.parent() else { return };
     let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
     let batch_dir = dir.join(BATCH_DIGEST_NAME);
@@ -498,7 +543,16 @@ fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackVa
     let batch = scan(batch_dir, "batch (bhash)");
     if let (Some(consensus), Some(batch)) = (consensus, batch) {
         let index_scan = IndexBucketScan { consensus, batch };
-        if !index_scan.is_clean() {
+        // On a bounded walk (the intact prefix of an unclean/torn-tail pack) the indexes are not
+        // yet synced, so DIRTY (written-but-unstamped) buckets are expected and must not
+        // flip the verdict. CORRUPT buckets (a non-zero CRC that fails) are still real
+        // damage on any pack.
+        let index_problem = if bounded {
+            index_scan.consensus.corrupt > 0 || index_scan.batch.corrupt > 0
+        } else {
+            !index_scan.is_clean()
+        };
+        if index_problem {
             report.verdict = Verdict::Invalid;
         }
         report.index_scan = Some(index_scan);
@@ -508,6 +562,220 @@ fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackVa
     if !report.issues.is_empty() {
         report.verdict = Verdict::Invalid;
     }
+}
+
+/// Cross-check every derived digest-index entry against the data log: re-walk the log and confirm
+/// each consensus header resolves through the `hash` index to its logged offset, and each batch
+/// resolves through the `bhash` index. This catches corruption the bucket-CRC scan cannot — a
+/// corrupt odx overflow record (a `load` that walks the chain errors) and a damaged/zeroed bloom (a
+/// `load` on a known-present digest returns a false miss) — so a `Valid` verdict means every lookup
+/// path agrees with the log. Read-only; opens its own index handles. Best-effort: absent/unreadable
+/// index dirs are left to [`scan_index_buckets`]. Mismatches are bounded to `MAX_MISMATCHES`
+/// reported rows.
+fn cross_check_indexes(
+    data_path: &Path,
+    pack: &Pack<PackRecord>,
+    report: &mut PackValidationReport,
+) {
+    const MAX_MISMATCHES: usize = 100;
+    let Some(dir) = data_path.parent() else { return };
+    // The derived indexes are one set: a read-only open refuses a pack missing any of them, so a
+    // directory absent beside the others is reported. A bare data file, with none of them, is
+    // validated on its own.
+    let names = [POSITION_INDEX_NAME, CONSENSUS_DIGEST_NAME, BATCH_DIGEST_NAME];
+    let missing: Vec<&str> = names.into_iter().filter(|name| !dir.join(name).is_dir()).collect();
+    if !missing.is_empty() && missing.len() < names.len() {
+        report.issues.push(PackIssue::IndexUnreadable {
+            detail: format!("derived index missing beside the others: {}", missing.join(", ")),
+        });
+        report.verdict = Verdict::Invalid;
+    }
+    let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
+    let batch_dir = dir.join(BATCH_DIGEST_NAME);
+    let open = |idx_dir: std::path::PathBuf| {
+        HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            idx_dir,
+            pack.header(),
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+    };
+    // A digest-index read failure is already reported by `scan_index_buckets` as
+    // `IndexUnreadable`; only cross-check digest indexes that open.
+    let mut digests = if consensus_dir.is_dir() && batch_dir.is_dir() {
+        match (open(consensus_dir), open(batch_dir)) {
+            (Ok(consensus_idx), Ok(batch_idx)) => Some((consensus_idx, batch_idx)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let positions = match read_position_entries(data_path, pack.header()) {
+        Ok(positions) => positions,
+        Err(e) => {
+            report
+                .issues
+                .push(PackIssue::IndexUnreadable { detail: format!("position index (idx): {e}") });
+            report.verdict = Verdict::Invalid;
+            None
+        }
+    };
+    if digests.is_none() && positions.is_none() {
+        return;
+    }
+    let Ok(mut iter) = pack.raw_iter() else { return };
+
+    let mut mismatches = 0usize;
+    let mut push = |report: &mut PackValidationReport, detail: String| -> bool {
+        report.issues.push(PackIssue::IndexMismatch { detail });
+        report.verdict = Verdict::Invalid;
+        mismatches += 1;
+        mismatches >= MAX_MISMATCHES
+    };
+    // Each consensus header's offset and the offset just past its record, in log order, for the
+    // position-index check below; plus the log's end when the walk reaches it cleanly.
+    let mut headers: Vec<u64> = Vec::new();
+    let mut walked_to_end = None;
+    loop {
+        let pos = iter.logical_position();
+        match iter.next() {
+            None => {
+                walked_to_end = Some(pos);
+                break;
+            }
+            // The epoch meta carries no index entry.
+            Some(Ok(PackRecord::EpochMeta(_))) => continue,
+            Some(Ok(PackRecord::Consensus(header))) => {
+                headers.push(pos);
+                // Each consensus header is unique, so its index entry must point at this exact
+                // record.
+                let stop = match digests.as_mut().map(|(c, _)| c.load(header.digest().into())) {
+                    None => false,
+                    Some(Ok(off)) if off == pos => false,
+                    Some(Ok(off)) => push(
+                        report,
+                        format!("consensus header at offset {pos} is indexed at {off}"),
+                    ),
+                    Some(Err(e)) => push(
+                        report,
+                        format!("consensus header at offset {pos} does not resolve via the hash index: {e}"),
+                    ),
+                };
+                if stop {
+                    break;
+                }
+            }
+            Some(Ok(PackRecord::Batch(batch))) => {
+                // A batch digest is stored once (deduped), so only require that it RESOLVES — a
+                // false miss means a damaged bloom or a corrupt odx chain. (Callers
+                // re-hash a fetched batch, so a wrong-but-present offset is
+                // self-defending and not flagged here.)
+                if let Some(Err(e)) = digests.as_mut().map(|(_, b)| b.load(batch.digest())) {
+                    if push(
+                        report,
+                        format!("batch at offset {pos} does not resolve via the bhash index: {e}"),
+                    ) {
+                        break;
+                    }
+                }
+            }
+            // A physical framing failure is classified by `classify_physical_corruption`; stop
+            // here.
+            Some(Err(_)) => break,
+        }
+    }
+    // The position index serves every by-number read (and restart's `read_last_committed` /
+    // `count_leaders` walk it), but opening a pack only checks its LAST entry. Check every entry
+    // against the log so a corrupt one is reported here — and `db repair` rebuilds it — rather than
+    // passing as healthy. Only when the walk reached the end cleanly, so every output is known.
+    if let (Some(entries), Some(end)) = (positions, walked_to_end) {
+        if entries.len() != headers.len() {
+            push(
+                report,
+                format!(
+                    "position index holds {} entries but the log holds {} outputs",
+                    entries.len(),
+                    headers.len()
+                ),
+            );
+        }
+        for (i, (entry, &header_pos)) in entries.iter().zip(&headers).enumerate() {
+            // Header-first: an output runs from its header to the next header (or the end of the
+            // log).
+            let expected_end = headers.get(i + 1).copied().unwrap_or(end);
+            let detail = match entry {
+                Err(e) => Some(format!("position entry {i} is unreadable: {e}")),
+                Ok((consensus_header, output_start, output_end))
+                    if *consensus_header != header_pos
+                        || *output_end != expected_end
+                        || *output_start != header_pos =>
+                {
+                    Some(format!(
+                        "position entry {i} is ({consensus_header}, {output_start}, {output_end}) \
+                         but the log places that output's header at {header_pos} and its end at \
+                         {expected_end}"
+                    ))
+                }
+                Ok(_) => None,
+            };
+            if let Some(detail) = detail {
+                if push(report, detail) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Why recovery of the unclean pack whose data log is `data_path` would NOT simply truncate its
+/// tail, or `None` when it would. `db validate` reports a tear as truncatable only when this is
+/// `None`, so its verdict matches what a node restart or `db repair --force` actually does:
+/// - a legacy (pre-v2) pack has no clean-close sentinel, so it always reads as unclean; its tail is
+///   judged by the migration to v2 (what `db migrate`, `db repair` and the node all run on it),
+///   which drops an unacked torn tail and refuses damage below the acked frontier;
+/// - a v2 pack's recovery refuses when an acked output lies past where the WAL replay stops (the
+///   tail commit marker, or a position-index-attested output that still decodes) — see
+///   `Inner::check_recoverable`.
+pub fn recovery_refusal(data_path: &Path, epoch: Epoch) -> Option<String> {
+    let (version, _) = pack_unsealed_version(data_path, epoch)?;
+    if version < SENTINEL_MIN_VERSION {
+        return legacy_migration_refusal(data_path, epoch)
+            .map(|why| format!("legacy (v{version}) pack: its migration to v2 refuses: {why}"));
+    }
+    check_recoverable(data_path, epoch).err().map(|e| e.to_string())
+}
+
+/// For a pack that was not cleanly closed, the end of its last COMPLETE output when the only thing
+/// past it is an incomplete output, i.e. the unacked in-flight write recovery truncates (INV1).
+///
+/// A torn tail usually shows up as a framing failure ([`classify_physical_corruption`] reports
+/// `TornTrailingTail`). But a crash can also leave an output whose header and some of its batches
+/// are complete records with nothing (no padding) after them: every record frames, so the
+/// physical walk is clean, while a full validation reports the output's missing batches as a data
+/// defect. That is not corruption. This returns `Some(end)` when the WAL replay stops short of the
+/// file end (and recovery would accept stopping there) and everything before `end` validates
+/// without a data-logical issue; `None` for a sealed pack, a log that replays to its end, a replay
+/// recovery would refuse, or a defect inside the complete prefix.
+pub fn incomplete_trailing_output(data_path: &Path, epoch: Epoch) -> Option<u64> {
+    let (_, unclean) = pack_unsealed_version(data_path, epoch)?;
+    if !unclean {
+        return None;
+    }
+    let data_len = Pack::<PackRecord>::open(
+        data_path,
+        epoch as u64,
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    )
+    .ok()?
+    .file_len();
+    let end = wal_consistent_end(data_path, epoch).ok()?;
+    if end >= data_len {
+        return None;
+    }
+    let prefix = validate_pack_file_bounded(data_path, epoch, None, Some(end)).ok()?;
+    (!prefix.has_data_logical_issue()).then_some(end)
 }
 
 /// Walk a pack's `data` stream read-only and classify the first physical (record-framing) failure,
@@ -534,7 +802,9 @@ pub fn classify_physical_corruption(
 
     let mut records_ok_before: u64 = 0;
     loop {
-        let offset = iter.position().map_err(|e| PackError::ReadError(e.to_string()))?;
+        // Captured at a frame boundary (before `next()`), where the logical position equals the
+        // physical one — and syscall-free (no per-frame `lseek`; see `PackIter::logical_position`).
+        let offset = iter.logical_position();
         match iter.next() {
             None => {
                 // No error surfaced. A record torn *within* its 4-byte size prefix reads as EOF
@@ -609,19 +879,21 @@ pub fn classify_physical_corruption(
 }
 
 /// After the walk hit an unreadable record, scan the rest of the stream: `true` if any later record
-/// still decodes (so the damage was not the final record). Mirrors the recovery `tail_is_torn`
+/// still decodes (so the damage was not the final record). Mirrors the recovery `output_after_tear`
 /// probe — a CRC-failed frame advances past itself, so decoding continues after it, while a
 /// short/torn record leaves the reader at EOF. Guards against a record whose claimed extent runs
 /// past EOF (the iterator's logical position does not advance on that read): if a repeated error
 /// makes no forward progress, stop rather than spin.
-fn probe_decodable_after(iter: &mut PackIter<PackRecord, File>) -> bool {
-    let mut last_pos = iter.position().unwrap_or(u64::MAX);
+fn probe_decodable_after(iter: &mut RawIter<PackRecord>) -> bool {
+    // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
+    // forward-progress signal — advanced by each frame's on-disk size, no per-frame `lseek`.
+    let mut last_pos = iter.logical_position();
     loop {
         match iter.next() {
             None => return false,
             Some(Ok(_)) => return true,
             Some(Err(_)) => {
-                let pos = iter.position().unwrap_or(u64::MAX);
+                let pos = iter.logical_position();
                 if pos <= last_pos {
                     // No forward progress (extent-past-EOF): treat as nothing readable after.
                     return false;
@@ -632,136 +904,16 @@ fn probe_decodable_after(iter: &mut PackIter<PackRecord, File>) -> bool {
     }
 }
 
-fn verify_v0_data(
-    iter: &mut impl Iterator<Item = Result<PackRecord, FetchError>>,
-    epoch: Epoch,
-    mut expected_parent: Option<ConsensusHeaderDigest>,
-    start_consensus_number: u64,
-    mut issues: BoundedIssues,
-) -> Result<PackValidationReport, PackError> {
-    let mut batch_count: u64 = 0;
-    let mut consensus_count: u64 = 0;
-    let mut first_consensus_number: Option<u64> = None;
-    let mut last_consensus_number: Option<u64> = None;
-    // Per-group sets, cleared after every consensus header exactly like `stream_import`.
-    let mut batches: HashSet<BlockHash> = HashSet::new();
-    let mut referenced_batches: HashSet<BlockHash> = HashSet::new();
-
-    // Persistent, never-cleared set of every batch digest seen anywhere in the file. This is what
-    // lets us tell an *absent* batch (a real data gap) apart from a *misordered* one (present,
-    // wrong group). Classification is deferred until end-of-loop, when this set is complete.
-    let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
-
-    for record in iter {
-        match record? {
-            PackRecord::EpochMeta(_) => {
-                // A second EpochMeta is the same failure `stream_import` rejects.
-                issues.push(PackIssue::EpochMetaMismatch {
-                    detail: "epoch meta data found more than once".to_string(),
-                });
-            }
-            PackRecord::Batch(batch) => {
-                batch_count += 1;
-                // Compute the (re-encode + hash) digest once and record it in both the per-group
-                // set and the persistent global set.
-                let digest = batch.digest();
-                batches.insert(digest);
-                all_batch_digests.insert(digest);
-            }
-            PackRecord::Consensus(consensus_header) => {
-                consensus_count += 1;
-                let number = consensus_header.number;
-                first_consensus_number.get_or_insert(number);
-                last_consensus_number = Some(number);
-
-                // 0. Sequential numbering, mirroring `Inner::save_consensus_output`. The expected
-                // number is position-based: `start + (headers seen before this one)`. Because the
-                // header `number` is hashed into the digest, a *missing/reordered* header normally
-                // trips the `parent_hash` chain check below — but a corrupted number on the final
-                // header has no successor to catch it, and the importer rejects any non-sequential
-                // number outright, so check it explicitly here. Keeping `expected` position-based
-                // (not "previous number + 1") means one bad header doesn't cascade into spurious
-                // issues for every following header.
-                let expected_number = start_consensus_number + (consensus_count - 1);
-                if number != expected_number {
-                    issues.push(PackIssue::NonSequentialConsensusNumber {
-                        expected: expected_number,
-                        found: number,
-                    });
-                }
-
-                // 1. Chain continuity (skip when we have no anchor yet).
-                if let Some(parent) = expected_parent {
-                    if consensus_header.parent_hash != parent {
-                        issues.push(PackIssue::ChainBreak {
-                            number,
-                            expected_parent: parent,
-                            found_parent: consensus_header.parent_hash,
-                        });
-                    }
-                }
-
-                // A committed output always names a leader (its last header); an empty sub-dag is
-                // structural corruption that would panic every leader()-derived accessor.
-                if consensus_header.sub_dag.is_empty() {
-                    issues.push(PackIssue::EmptySubDag { number });
-                }
-
-                // 2. Every referenced batch must be present in *this* header's group. The global
-                // set is not yet complete here (a referenced batch may appear later in the file),
-                // so record the issue with a placeholder class and resolve it after the loop.
-                for header in consensus_header.sub_dag.headers() {
-                    for (digest, _) in header.payload().iter() {
-                        if batches.contains(digest) {
-                            referenced_batches.insert(*digest);
-                        } else {
-                            issues.push(PackIssue::MissingBatch {
-                                number,
-                                digest: *digest,
-                                class: BatchClass::Absent,
-                            });
-                        }
-                    }
-                }
-
-                // 3. Any present-but-unreferenced batch in this group is an extra.
-                // `referenced_batches` only ever holds digests that were also in `batches`, so the
-                // difference is exactly the orphans (mirrors stream_import's `len()` comparison).
-                for digest in batches.difference(&referenced_batches) {
-                    issues.push(PackIssue::ExtraBatch { number, digest: *digest });
-                }
-
-                // Group boundary: clear, exactly like `stream_import`.
-                batches.clear();
-                referenced_batches.clear();
-                expected_parent = Some(consensus_header.digest());
-            }
-        }
-    }
-
-    Ok(finalize_report(
-        epoch,
-        start_consensus_number,
-        batch_count,
-        consensus_count,
-        first_consensus_number,
-        last_consensus_number,
-        issues,
-        &all_batch_digests,
-    ))
-}
-
-/// Validate the `data` record stream of a **v1** pack (header-first layout).
+/// Validate the `data` record stream of a header-first (v1/v2) pack.
 ///
-/// v1 writes each `Consensus` header *before* the `Batch` records it references (the reverse of
-/// v0), and those batches arrive in ascending digest order (`collect_batches` uses a `BTreeMap`;
+/// Each `Consensus` header is written *before* the `Batch` records it references, and those batches
+/// arrive in ascending digest order (`collect_batches` uses a `BTreeMap`;
 /// [`iter_to_output`](crate::consensus_pack) rejects any out-of-order batch). So a group's batches
 /// are exactly the `Batch` records between a header and the next header. We hold the open header
 /// and the batches seen since it, resolving the group when the next header (or EOF) closes it.
 ///
-/// The per-header sequential-number and chain-continuity checks are identical to
-/// [`verify_v0_data`]; only the batch grouping differs, plus the v1-only intra-group ordering check
-/// performed in [`close_v1_group`].
+/// Each closed group's batch checks, including the intra-group ordering check, are performed in
+/// [`close_v1_group`].
 fn verify_v1_data(
     iter: &mut impl Iterator<Item = Result<PackRecord, FetchError>>,
     epoch: Epoch,
@@ -771,12 +923,18 @@ fn verify_v1_data(
 ) -> Result<PackValidationReport, PackError> {
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
+    // Set once if the file's own (untrusted, `previous: None`) `start_consensus_number` overflows
+    // `u64` when the position-based expected number is computed — so the sequence check is skipped
+    // for the rest of the walk and a single meta issue is reported instead of panicking (debug)
+    // / wrapping (release) into spurious `NonSequentialConsensusNumber`s.
+    let mut meta_overflow_reported = false;
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
 
-    // Persistent, never-cleared set of every batch digest seen anywhere in the file — same role as
-    // in `verify_v0_data`: it lets the deferred `MissingBatch` classification tell an *absent*
-    // digest (a real gap) apart from a *misordered* one (present, wrong group).
+    // Persistent, never-cleared set of every batch digest seen anywhere in the file: it lets the
+    // deferred `MissingBatch` classification tell an *absent* digest (a real gap) apart from a
+    // *misordered* one (present, wrong group). Classification is deferred until the walk ends,
+    // when this set is complete.
     let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
 
     // The currently open consensus header and the batch digests seen since it, in arrival order
@@ -812,15 +970,38 @@ fn verify_v1_data(
                 first_consensus_number.get_or_insert(number);
                 last_consensus_number = Some(number);
 
-                // Sequential numbering and chain continuity, identical to `verify_v0_data`. See the
-                // comments there for why `expected` is position-based and why the trailing header
-                // needs the explicit sequential check.
-                let expected_number = start_consensus_number + (consensus_count - 1);
-                if number != expected_number {
-                    issues.push(PackIssue::NonSequentialConsensusNumber {
-                        expected: expected_number,
-                        found: number,
-                    });
+                // Sequential numbering, mirroring `Inner::save_consensus_output`. The expected
+                // number is position-based: `start + (headers seen before this one)`. Because the
+                // header `number` is hashed into the digest, a *missing/reordered* header normally
+                // trips the `parent_hash` chain check below — but a corrupted number on the final
+                // header has no successor to catch it, and the importer rejects any non-sequential
+                // number outright, so check it explicitly here. Keeping `expected` position-based
+                // (not "previous number + 1") means one bad header doesn't cascade into spurious
+                // issues for every following header.
+                // `consensus_count - 1` cannot underflow (incremented above). `start + (count-1)`
+                // can overflow only on a corrupt/wrong meta; report it once and
+                // stop sequence-checking.
+                match start_consensus_number.checked_add(consensus_count - 1) {
+                    Some(expected_number) if !meta_overflow_reported => {
+                        if number != expected_number {
+                            issues.push(PackIssue::NonSequentialConsensusNumber {
+                                expected: expected_number,
+                                found: number,
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !meta_overflow_reported {
+                            meta_overflow_reported = true;
+                            issues.push(PackIssue::EpochMetaMismatch {
+                                detail: format!(
+                                    "start_consensus_number {start_consensus_number} overflows u64 \
+                                     with {consensus_count} header(s); the epoch meta is corrupt"
+                                ),
+                            });
+                        }
+                    }
                 }
                 if let Some(parent) = expected_parent {
                     if consensus_header.parent_hash != parent {
@@ -856,9 +1037,9 @@ fn verify_v1_data(
 /// Resolve a closed v1 group: append the batch-presence, extra-batch and ordering issues for the
 /// header whose group just ended. `collected` is the group's batch digests in arrival (file) order.
 ///
-/// Mirrors the per-header batch checks `verify_v0_data` performs inline, plus the v1-only ordering
-/// check. `MissingBatch` is recorded with a placeholder [`BatchClass::Absent`]; the final class is
-/// resolved in [`finalize_report`] once every digest in the file is known.
+/// Batch presence, extra batches and intra-group ordering. `MissingBatch` is recorded with a
+/// placeholder [`BatchClass::Absent`]; the final class is resolved in [`finalize_report`] once
+/// every digest in the file is known.
 fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mut BoundedIssues) {
     let number = header.number;
     // A committed output always names a leader (its last header); an empty sub-dag is structural
@@ -910,7 +1091,7 @@ fn close_v1_group(header: &ConsensusHeader, collected: &[BlockHash], issues: &mu
 /// `all_batch_digests` set — a digest present anywhere in the file is [`BatchClass::Misordered`],
 /// otherwise it is a genuine [`BatchClass::Absent`] gap — then build the final report. This is a
 /// cheap pass over `issues` (bounded by the number of missing references), not another file
-/// traversal. Shared by [`verify_v0_data`] and [`verify_v1_data`].
+/// traversal.
 #[allow(clippy::too_many_arguments)]
 fn finalize_report(
     epoch: Epoch,
@@ -950,6 +1131,21 @@ fn finalize_report(
     }
 }
 
+impl PackValidationReport {
+    /// True if the report holds a defect in the DATA LOG itself — one a rebuild-from-log cannot fix
+    /// (chain break, non-sequential number, missing/extra/unsorted batches, empty sub-dag,
+    /// epoch-meta mismatch). Index-only problems
+    /// ([`PackIssue::IndexUnreadable`]/[`PackIssue::IndexMismatch`] and a not-clean
+    /// [`IndexBucketScan`]) are excluded — those ARE rebuildable. `db repair` uses this to give
+    /// the same verdict on a dry run and an apply (a data-logical defect is `Unrepairable` up
+    /// front, never `WouldRepair`).
+    pub fn has_data_logical_issue(&self) -> bool {
+        self.issues.iter().any(|i| {
+            !matches!(i, PackIssue::IndexUnreadable { .. } | PackIssue::IndexMismatch { .. })
+        })
+    }
+}
+
 impl Display for PackValidationReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Number of detail rows to print before truncating (a pathological pack can have
@@ -965,6 +1161,7 @@ impl Display for PackValidationReport {
         let mut meta = 0usize;
         let mut empty_subdag = 0usize;
         let mut index_unreadable = 0usize;
+        let mut index_mismatch = 0usize;
         for issue in &self.issues {
             match issue {
                 PackIssue::ChainBreak { .. } => chain_breaks += 1,
@@ -978,6 +1175,7 @@ impl Display for PackValidationReport {
                 PackIssue::EpochMetaMismatch { .. } => meta += 1,
                 PackIssue::EmptySubDag { .. } => empty_subdag += 1,
                 PackIssue::IndexUnreadable { .. } => index_unreadable += 1,
+                PackIssue::IndexMismatch { .. } => index_mismatch += 1,
             }
         }
 
@@ -1006,11 +1204,25 @@ impl Display for PackValidationReport {
                     scan.batch.dirty,
                     scan.batch.corrupt
                 )?;
-                if !scan.is_clean() {
+                let has_corrupt = scan.consensus.corrupt > 0 || scan.batch.corrupt > 0;
+                if has_corrupt || (!scan.is_clean() && self.verdict == Verdict::Invalid) {
                     writeln!(
                         f,
-                        "  the data log is intact but a digest index is degraded; remove the \
-                         `hash`/`bhash` dirs to rebuild it from the data log on next open."
+                        "  the data log is intact but a digest index is degraded; stop the node and \
+                         run `telcoin-network db repair --epoch N --force` to rebuild it from the data \
+                         log. Do NOT delete the `hash`/`bhash` dirs by hand — a past epoch is only \
+                         opened read-only and never rebuilds them on its own, so it would then read as \
+                         absent until repaired."
+                    )?;
+                } else if !scan.is_clean() {
+                    // Dirty-only on a walk that did not flag the verdict: this is the intact prefix
+                    // of an unclean pack whose indexes are simply unsynced.
+                    // Recovery rebuilds them.
+                    writeln!(
+                        f,
+                        "  dirty (unstamped) buckets are unsynced writes — expected when validating \
+                         the intact prefix of an unclean pack; recovery rebuilds them on the next \
+                         append-open. No action needed for these."
                     )?;
                 }
             }
@@ -1038,6 +1250,7 @@ impl Display for PackValidationReport {
         writeln!(f, "  epoch meta mismatches:  {meta}")?;
         writeln!(f, "  empty sub-dags:         {empty_subdag}")?;
         writeln!(f, "  unreadable indexes:     {index_unreadable}")?;
+        writeln!(f, "  index/log mismatches:   {index_mismatch}")?;
 
         if self.issues.is_empty() {
             return Ok(());
@@ -1071,6 +1284,9 @@ impl Display for PackValidationReport {
                 PackIssue::IndexUnreadable { detail } => {
                     writeln!(f, "  INDEX UNREADABLE  {detail}")?
                 }
+                PackIssue::IndexMismatch { detail } => {
+                    writeln!(f, "  INDEX MISMATCH    {detail}")?
+                }
             }
         }
         if self.issues.len() > MAX_ROWS {
@@ -1091,11 +1307,17 @@ mod test {
 
     use super::{
         classify_physical_corruption, validate_pack_file, validate_pack_file_bounded, BatchClass,
-        PackIssue, Verdict,
+        IndexBucketScan, PackIssue, PackValidationReport, Verdict,
     };
     use crate::{
-        archive::pack::{Pack, PackCompression},
-        consensus_pack::{test::make_test_output, EpochMeta, PackRecord},
+        archive::{
+            digest_index::BucketCrcReport,
+            pack::{Pack, PackCompression},
+        },
+        consensus_pack::{
+            legacy_migration_dry_run, test::make_test_output, EpochMeta, PackError, PackRecord,
+            PACK_VERSION,
+        },
         mem_db::MemDatabase,
     };
 
@@ -1111,7 +1333,7 @@ mod test {
         for i in 0..n {
             let output =
                 make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
-            parent = output.digest().into();
+            parent = output.digest();
             outputs.push(output);
         }
         outputs
@@ -1192,11 +1414,44 @@ mod test {
         (temp_dir, committee, chain)
     }
 
-    /// A well-formed pack validates clean, in both the v0 (batches-first) and v1 (header-first)
-    /// layouts.
+    /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so the validator
+    /// does not walk it; it is judged by a dry run of that migration instead: a clean one would
+    /// migrate every output, and a damaged one is refused with the migration's reason.
+    #[test]
+    fn test_validate_v0_pack_is_judged_by_its_migration() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 5);
+        let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, 0);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, 0);
+
+        let walked = validate_pack_file(&path, 0, None);
+        assert!(
+            matches!(walked, Err(PackError::InvalidVersion(_, 0))),
+            "a v0 pack is not walked, got {walked:?}"
+        );
+        assert_eq!(legacy_migration_dry_run(&path, 0), Ok(5), "a clean v0 pack migrates whole");
+
+        // A batch after the last header belongs to no output: the migration refuses.
+        let orphan = records
+            .iter()
+            .find(|r| matches!(r, PackRecord::Batch(_)))
+            .cloned()
+            .expect("fixture outputs carry batches");
+        records.push(orphan);
+        std::fs::remove_file(&path).expect("remove clean pack");
+        write_records(&path, &records, 0);
+        let refused = legacy_migration_dry_run(&path, 0);
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains("no consensus header")),
+            "a damaged v0 pack is refused, got {refused:?}"
+        );
+    }
+
+    /// A well-formed pack validates clean, as v1 and as v2 (the same header-first layout).
     #[test]
     fn test_validate_clean_pack() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1313,7 +1568,7 @@ mod test {
     /// in both layouts.
     #[test]
     fn test_validate_absent_batch() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, group_batches) =
@@ -1342,47 +1597,6 @@ mod test {
             // Must not be misclassified as misordered.
             assert_eq!(report.missing_batch_count(BatchClass::Misordered), 0, "v{version}");
         }
-    }
-
-    /// v0: moving a batch into a later group → reported Misordered where it belongs, and ExtraBatch
-    /// where it now (wrongly) sits. In the v0 (batches-first) layout the batch lands in group 5 by
-    /// being spliced just *before* consensus header 5.
-    #[test]
-    fn test_validate_misordered_batch() {
-        let (temp_dir, committee, chain) = setup();
-        let outputs = make_outputs(&committee, chain, 6);
-        let (mut records, group_batches) = build_records(epoch0_meta(&committee), &outputs, 0);
-
-        // Take the first batch of group 2 (consensus number 3) and splice it into group 4's records
-        // (just before consensus header number 5).
-        let target = group_batches[2][0];
-        let from = find_batch(&records, target);
-        let moved = records.remove(from);
-        let insert_at = records
-            .iter()
-            .position(|r| matches!(r, PackRecord::Consensus(h) if h.number == 5))
-            .expect("consensus header 5 present");
-        records.insert(insert_at, moved);
-
-        let path = temp_dir.path().join("data");
-        write_records(&path, &records, 0);
-
-        let report = validate_pack_file(&path, 0, None).expect("validate");
-        assert_eq!(report.verdict, Verdict::Invalid);
-        // Present in the file but not in group 3 → Misordered at consensus 3.
-        let misordered = report.issues.iter().any(|i| {
-            matches!(i,
-                PackIssue::MissingBatch { digest, class: BatchClass::Misordered, number }
-                if *digest == target && *number == 3)
-        });
-        assert!(misordered, "expected Misordered at consensus 3; issues: {:?}", report.issues);
-        // Now an orphan inside group 5 → ExtraBatch at consensus 5.
-        let extra = report.issues.iter().any(|i| {
-            matches!(i, PackIssue::ExtraBatch { digest, number } if *digest == target && *number == 5)
-        });
-        assert!(extra, "expected ExtraBatch at consensus 5; issues: {:?}", report.issues);
-        // Nothing should be classified Absent — the batch is still in the file.
-        assert_eq!(report.missing_batch_count(BatchClass::Absent), 0);
     }
 
     /// v1: same corruption in the header-first layout. To land the moved batch in group 5, splice
@@ -1481,7 +1695,7 @@ mod test {
     /// check, so only the explicit sequential-number check (mirroring the importer) catches it.
     #[test]
     fn test_validate_non_sequential_trailing_header() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1519,7 +1733,7 @@ mod test {
     /// header.
     #[test]
     fn test_validate_non_sequential_middle_header() {
-        for version in [0u16, 1] {
+        for version in [1u16, PACK_VERSION] {
             let (temp_dir, committee, chain) = setup();
             let outputs = make_outputs(&committee, chain, 5);
             let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, version);
@@ -1547,6 +1761,124 @@ mod test {
                 non_seq[0],
                 PackIssue::NonSequentialConsensusNumber { expected: 3, found: 7 }
             ));
+        }
+    }
+
+    /// The `TornTrailingTail` remediation is honest about past epochs — it no longer says the
+    /// unconditional "no action needed" (true only for the current epoch) and points a past epoch
+    /// at `db repair`.
+    #[test]
+    fn test_torn_trailing_tail_remediation_is_epoch_aware() {
+        let corruption = super::PhysicalCorruption {
+            kind: super::CorruptionKind::TornTrailingTail,
+            offset: 4096,
+            records_ok_before: 3,
+            decodable_after: false,
+            detail: "short read".to_string(),
+        };
+        let text = corruption.to_string();
+        assert!(text.contains("CURRENT"), "must qualify the current-epoch case: {text}");
+        assert!(text.contains("PAST epoch"), "must distinguish past epochs: {text}");
+        assert!(text.contains("db repair"), "must point a past epoch at db repair: {text}");
+    }
+
+    /// The index-degraded remediation no longer tells operators to delete `hash`/`bhash` by
+    /// hand (which turns a sealed past epoch absent) — it points at `db repair`.
+    #[test]
+    fn test_index_degraded_remediation_points_at_db_repair() {
+        let report = PackValidationReport {
+            epoch: 0,
+            start_consensus_number: 1,
+            batch_count: 4,
+            consensus_count: 1,
+            first_consensus_number: Some(1),
+            last_consensus_number: Some(1),
+            issues: Vec::new(),
+            dropped_issues: 0,
+            index_scan: Some(IndexBucketScan {
+                consensus: BucketCrcReport { dirty: 0, corrupt: 1 },
+                batch: BucketCrcReport::default(),
+            }),
+            verdict: Verdict::Invalid,
+        };
+        let text = report.to_string();
+        assert!(text.contains("db repair"), "must point at db repair: {text}");
+        assert!(text.contains("Do NOT delete"), "must warn against deleting by hand: {text}");
+    }
+
+    /// `has_data_logical_issue` distinguishes an unfixable data-log defect (a rebuild cannot
+    /// help) from purely index damage (rebuildable) — the discriminator `db repair` uses to
+    /// give the same verdict on a dry run and an apply.
+    #[test]
+    fn test_has_data_logical_issue_discriminates_index_from_data() {
+        let base = |issues: Vec<PackIssue>| PackValidationReport {
+            epoch: 0,
+            start_consensus_number: 1,
+            batch_count: 0,
+            consensus_count: 0,
+            first_consensus_number: None,
+            last_consensus_number: None,
+            issues,
+            dropped_issues: 0,
+            index_scan: None,
+            verdict: Verdict::Invalid,
+        };
+        // Index-only damage → rebuildable → not a data-logical issue.
+        assert!(
+            !base(vec![PackIssue::IndexMismatch { detail: "x".into() }]).has_data_logical_issue()
+        );
+        assert!(
+            !base(vec![PackIssue::IndexUnreadable { detail: "x".into() }]).has_data_logical_issue()
+        );
+        assert!(!base(Vec::new()).has_data_logical_issue());
+        // A defect in the data log itself → a rebuild cannot fix it.
+        assert!(base(vec![PackIssue::NonSequentialConsensusNumber { expected: 2, found: 5 }])
+            .has_data_logical_issue());
+        assert!(base(vec![PackIssue::EmptySubDag { number: 3 }]).has_data_logical_issue());
+        // Mixed: the data-logical defect dominates.
+        assert!(base(vec![
+            PackIssue::IndexMismatch { detail: "x".into() },
+            PackIssue::EmptySubDag { number: 1 },
+        ])
+        .has_data_logical_issue());
+    }
+
+    /// A CRC-valid but wrong `EpochMeta.start_consensus_number` near `u64::MAX` must not
+    /// overflow the position-based `start + (count - 1)` sequence check (debug panic / release
+    /// wrap into spurious `NonSequentialConsensusNumber`s). It is reported once as an
+    /// `EpochMetaMismatch` and the sequence check is skipped for the rest of the walk.
+    #[test]
+    fn test_validate_meta_start_overflow_reported_not_panicked() {
+        for version in [1u16, PACK_VERSION] {
+            let (temp_dir, committee, chain) = setup();
+            let outputs = make_outputs(&committee, chain, 3);
+            let mut meta = epoch0_meta(&committee);
+            meta.start_consensus_number = u64::MAX; // wrong/corrupt meta
+            let (records, _) = build_records(meta, &outputs, version);
+            let path = temp_dir.path().join("data");
+            write_records(&path, &records, version);
+
+            // Must not panic (debug) or wrap (release). Reaching here already proves no overflow
+            // panic.
+            let report = validate_pack_file(&path, 0, None).expect("validate");
+            let meta_overflow = report.issues.iter().any(|i| {
+                matches!(
+                    i,
+                    PackIssue::EpochMetaMismatch { detail } if detail.contains("overflows")
+                )
+            });
+            assert!(
+                meta_overflow,
+                "v{version}: expected a meta-overflow EpochMetaMismatch: {:?}",
+                report.issues
+            );
+            // Exactly one meta-overflow issue (reported once, not per header).
+            let overflow_count = report
+                .issues
+                .iter()
+                .filter(|i| matches!(i, PackIssue::EpochMetaMismatch { detail } if detail.contains("overflows")))
+                .count();
+            assert_eq!(overflow_count, 1, "v{version}: meta overflow must be reported once");
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Error types whenn validating types during consensus.
 
 use crate::{
-    crypto, BlockNumHash, BlsPublicKey, Digest, Epoch, HeaderDigest, Round, SendError,
+    crypto, BlockNumHash, BlsPublicKey, Digest, Epoch, HeaderDigest, Round, SendError, TimestampMs,
     TimestampSec, VoteDigest, WorkerId,
 };
 use thiserror::Error;
@@ -167,6 +167,10 @@ pub enum BlockSealError {
     NotValidator,
     #[error("Failed to report our validated batch")]
     FailedToReport,
+    /// This epoch's consensus shutdown has begun, so the proposer that receives batch reports is
+    /// exiting and a quorum-sealed batch could never be reported.
+    #[error("Consensus shutdown has begun for this epoch, refusing to seal")]
+    ConsensusShuttingDown,
 }
 
 #[derive(Error, Debug)]
@@ -266,9 +270,9 @@ pub enum HeaderError {
     InvalidParentRound,
     /// A parent certificate is invalid.
     #[error(
-        "Invalid parent timestamp: header created at {header:?} and parent created at {parent:?}"
+        "Invalid parent timestamp: header created at {header} ms and parent created at {parent} ms"
     )]
-    InvalidParentTimestamp { header: TimestampSec, parent: TimestampSec },
+    InvalidParentTimestamp { header: TimestampMs, parent: TimestampMs },
     /// The header's parents must be unique.
     #[error("Duplicate authors for parent headers. Authorities must be unique.")]
     DuplicateParents,
@@ -276,8 +280,11 @@ pub enum HeaderError {
     #[error("{0}")]
     SyncBatches(String),
     /// The header's timestamp is too far in the future
-    #[error("Invalid timestamp. Created at: {created}, received {received})")]
-    InvalidTimestamp { created: TimestampSec, received: TimestampSec },
+    #[error("Invalid timestamp. Created at: {created} ms, received {received} ms")]
+    InvalidTimestamp { created: TimestampMs, received: TimestampMs },
+    /// The header's sub-second creation time is outside `0..=999` milliseconds.
+    #[error("Invalid header created_at_millis {0}: must be below 1000")]
+    InvalidTimestampMillis(u16),
     /// Already voted for this header.
     #[error("Already voted for header {0} at round {1}")]
     AlreadyVoted(HeaderDigest, Round),

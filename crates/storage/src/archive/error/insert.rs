@@ -9,8 +9,17 @@ pub enum AppendError {
     SerializeValue(String),
     /// Database opened read-only.
     ReadOnly,
-    /// Got an io error writing the key/value record.
+    /// Got an io error writing the key/value record. Every such error moves a pack to its failed
+    /// state.
     WriteDataError(io::Error),
+    /// The record is larger than any read path accepts, so it was rejected before any byte was
+    /// written. A caller/value error: the pack stays healthy.
+    RecordTooLarge {
+        /// The rejected size in bytes (decoded, or framed after compression).
+        size: usize,
+        /// The per-record maximum.
+        max: u32,
+    },
     /// Attempted to insert a duplicate key to an index.
     DuplicateKey,
     /// CRC problem, some index types might need this.
@@ -29,6 +38,9 @@ impl fmt::Display for AppendError {
             Self::SerializeValue(e) => write!(f, "value serialization: {e}"),
             Self::ReadOnly => write!(f, "read only"),
             Self::WriteDataError(e) => write!(f, "write data failed: {e}"),
+            Self::RecordTooLarge { size, max } => {
+                write!(f, "record size {size} exceeds the maximum {max}")
+            }
             Self::DuplicateKey => write!(f, "duplicate key"),
             Self::CrcError => write!(f, "crc error"),
             Self::CorruptIndex(e) => write!(f, "corrupt index: {e}"),

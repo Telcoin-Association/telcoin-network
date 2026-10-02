@@ -20,7 +20,8 @@
 //! typical / wide batches per output). Each column writes [`NUM_OUTPUTS`] chained outputs built
 //! with [`make_wide_test_output`], whose batches are genuinely distinct across outputs (random
 //! transactions). Every one of the pack's files (data + position index + digest index) is
-//! memory-mapped, so the whole pack is `msync`-durable.
+//! memory-mapped; `persist()` msyncs the data log (the WAL, source of truth), while the derived
+//! indexes are written through the pack's background thread and rebuilt from the log on recovery.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:
@@ -80,6 +81,11 @@ trait BenchPack: Sized {
     ) -> Result<Self, PackError>;
 
     fn open_static(path: &Path, epoch: Epoch) -> Result<Self, PackError>;
+
+    /// Async-seal and close the pack (the production shutdown path). Awaiting this before a reopen
+    /// guarantees the pack is fully sealed, instead of racing the background drop-seal (which a
+    /// multi-thread runtime defers via `spawn_blocking`).
+    async fn close(self);
 
     async fn stream_import<R: AsyncRead + Unpin>(
         path: &Path,
@@ -192,6 +198,9 @@ macro_rules! impl_bench_pack {
             async fn consensus_output_end(&mut self, number: u64) -> Result<u64, PackError> {
                 <$ty>::consensus_output_end(self, number).await
             }
+            async fn close(self) {
+                <$ty>::close(self).await
+            }
         }
     };
 }
@@ -280,7 +289,7 @@ async fn bench_save_seq<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOutput]
         pack.save_consensus_output(output.clone()).await.expect("save");
     }
     let elapsed = start.elapsed();
-    pack.persist().await.expect("persist"); // settle before drop (untimed)
+    pack.close().await; // seal synchronously before the TempDir drops (untimed), not a deferred drop
     elapsed
 }
 
@@ -295,7 +304,9 @@ async fn bench_save_durable<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOut
         pack.save_consensus_output(output.clone()).await.expect("save");
         pack.persist().await.expect("persist");
     }
-    start.elapsed()
+    let elapsed = start.elapsed();
+    pack.close().await; // seal synchronously before the TempDir drops (untimed)
+    elapsed
 }
 
 /// One bulk `persist()` flushing all the un-persisted saves left by [`populate`].
@@ -408,6 +419,7 @@ async fn bench_stream_import<P: BenchPack>(fx: &Fixtures, data_path: &Path, end:
     let elapsed = start.elapsed();
     // stream_import drains the whole stream before returning, so the epoch is already present.
     pack.get_consensus_output(NUM_OUTPUTS).await.expect("last output present after import");
+    pack.close().await; // seal synchronously before the TempDir drops (untimed)
     elapsed
 }
 
@@ -459,8 +471,11 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, width: usize) -> Column {
     let full_stream = bench_full_stream(&data_path, data_len).await;
     let stream_import = bench_stream_import::<P>(fx, &data_path, data_len).await;
 
-    // Reopen read-only after the writer is gone (index load / cache-miss open).
-    drop(pack);
+    // Async-close (the production seal path) so the reopen sees a fully sealed pack. A plain
+    // `drop(pack)` here would defer the seal to `spawn_blocking` on this multi-thread runtime and
+    // return before it finished, so the read-only `open_static` below would race the unsealed pack
+    // and fail.
+    pack.close().await;
     let reopen_static = bench_reopen_static::<P>(dir.path(), fx.committee.epoch()).await;
     drop(dir);
 

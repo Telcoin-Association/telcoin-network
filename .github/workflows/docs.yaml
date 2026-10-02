@@ -44,9 +44,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Path prefix the site is served under. At the docs.telcoin.network DNS
-  # cutover, flip this to "" (and site-url in docs/book.toml to "/").
-  SITE_ROOT: /telcoin-network
+  # Path prefix the site is served under: empty, because docs.telcoin.network
+  # (the Pages custom domain) serves the site at its root. If the site ever
+  # moves under a prefix again, set "/<prefix>" (no trailing slash) here and
+  # match site-url in docs/book.toml.
+  SITE_ROOT: ""
 
 jobs:
   # Build latest + every tagged version with the pinned mdBook and hand the
@@ -58,12 +60,12 @@ jobs:
       # Full-history checkout: version builds check out each v* tag in a
       # worktree, and "latest" always builds from main even when the trigger
       # is a tag push. The docs build never touches the tn-contracts submodule.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install mdbook
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: mdbook@0.5.4
 
@@ -102,8 +104,13 @@ jobs:
           fi
           cat "${site}/versions.json"
 
+      # Since v4 hidden files (any path component starting with `.`) stay out of the
+      # artifact (v5 added `include-hidden-files: true` to keep them), so mdBook's
+      # `.nojekyll` is dropped. Nothing needs it: with the Pages source set to "GitHub
+      # Actions" the artifact is served as uploaded and no Jekyll build runs, and docs/
+      # has no dotfiles of its own.
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
 
@@ -123,4 +130,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

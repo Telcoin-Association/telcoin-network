@@ -8,11 +8,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::{
     proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
 };
-use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _};
+use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
 use parking_lot::Mutex;
+use rand::{seq::SliceRandom as _, Rng};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -112,6 +113,14 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
 pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
+/// Longest peer-supplied error text, in characters, that a vote request keeps.
+///
+/// A voter chooses the text of its error responses, bounded only by the RPC message size, and
+/// the requester logs it and hands it to the certifier, which retries until the proposal is
+/// superseded. Clipping keeps a Byzantine voter from turning each response into a megabyte-long
+/// log line.
+const MAX_PEER_ERROR_LEN: usize = 256;
+
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
@@ -129,16 +138,6 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// legacy request-response path's network timeout; a peer too slow to finish in this
 /// window is treated as failed and another peer (or the legacy path) is tried.
 const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Overall bound on importing a streamed epoch pack, on top of the per-record timeout — the
-/// epoch-pack analogue of [`MISSING_CERTS_RESPONSE_TIMEOUT`]. Without it a Byzantine peer that
-/// `Ack`s and then drips valid records just inside the per-record timeout keeps the import alive
-/// indefinitely, pinning the critical fetch worker and the `.inproc` `ImportPath` sentinel that
-/// makes every other fetcher skip the epoch until an operator restarts (finding #10). This caps the
-/// whole post-`Ack` import; on elapse the import future is dropped, the sentinel clears, and the
-/// epoch becomes retryable against another peer. Set above the responder's own 200s serve budget
-/// (`SEND_SYNC_PACK_TIMEOUT`) so it can never truncate a pack a peer could legitimately serve.
-const EPOCH_PACK_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Timeout for reading the opening request frame of an inbound sync stream, and the
 /// bound on every best-effort trailing write (shed `Deny`, malformed `Err`). A peer
@@ -333,6 +332,15 @@ pub struct PrimaryNetworkHandle {
     /// [`Self::clear_sync_capability`] so a peer upgraded over the rotation boundary
     /// is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
+    /// Per-peer memory of the last epoch a sync probe to that peer failed or timed out.
+    ///
+    /// The probe loops shuffle their candidate peers and then move any peer whose recorded epoch
+    /// equals the epoch being fetched to the BACK, so a "drip"/slow peer that ate a probe budget
+    /// on one call is de-prioritised (not skipped) on the retries for the same epoch — a
+    /// Byzantine peer in stable `HashMap` order can no longer starve every attempt. Stale
+    /// entries for older epochs are ignored (the compare is against the current epoch) and the
+    /// whole map is cleared on rotation via [`Self::clear_sync_capability`].
+    epoch_sync_failed: Arc<Mutex<HashMap<BlsPublicKey, Epoch>>>,
 }
 
 // Test-only conversion that defaults the chain id to 0. Gated to tests so the only
@@ -342,14 +350,24 @@ pub struct PrimaryNetworkHandle {
 #[cfg(test)]
 impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
     fn from(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle, chain_id: 0, sync_capability: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            handle,
+            chain_id: 0,
+            sync_capability: Arc::new(Mutex::new(HashMap::new())),
+            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
 impl PrimaryNetworkHandle {
     /// Create a new instance of Self.
     pub fn new(handle: NetworkHandle<Req, Res>, chain_id: u64) -> Self {
-        Self { handle, chain_id, sync_capability: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            handle,
+            chain_id,
+            sync_capability: Arc::new(Mutex::new(HashMap::new())),
+            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     //// Convenience method for creating a new Self for tests.
@@ -358,6 +376,7 @@ impl PrimaryNetworkHandle {
             handle: NetworkHandle::new(sender),
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
+            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -368,6 +387,7 @@ impl PrimaryNetworkHandle {
     /// re-probed for it this epoch.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
+        self.epoch_sync_failed.lock().clear();
     }
 
     /// Return a reference to the inner handle.
@@ -428,7 +448,12 @@ impl PrimaryNetworkHandle {
         let mut res = res.await??.result;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            warn!(target: "primary::network", "Got recoverable error {s}, retrying");
+            debug!(
+                target: "primary::network",
+                %peer,
+                error = %clip_peer_error(s),
+                "recoverable vote error, retrying"
+            );
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
             let res_raw = self.handle.send_request(request, peer).await?;
@@ -440,8 +465,14 @@ impl PrimaryNetworkHandle {
         }
         match res {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s))
-            | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            // still recoverable after the retries above: report it as retryable so the caller
+            // backs off and asks again rather than giving up on this peer for the header
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                Err(NetworkError::RPCRetryable(clip_peer_error(s)))
+            }
+            PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                Err(NetworkError::RPCError(clip_peer_error(s)))
+            }
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
@@ -586,6 +617,10 @@ impl PrimaryNetworkHandle {
         // Resolve the committee-selecting epoch once and bundle the request so every probe hop
         // carries the chain and the verified hash needed to stream-decode + verify in place.
         let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
+        // Shuffle + de-prioritise peers that already failed a probe for this epoch (same anti-
+        // starvation ordering as the full-pack path).
+        let peers =
+            order_probe_peers(peers, &self.epoch_sync_failed.lock(), epoch, &mut rand::rng());
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable for free, `take` bounds the
@@ -602,6 +637,7 @@ impl PrimaryNetworkHandle {
                 match self.sync_consensus_output_from_peer(peer, request).await {
                     ConsensusOutputAttempt::Fetched(output) => {
                         self.sync_capability.lock().insert(peer, true);
+                        self.epoch_sync_failed.lock().remove(&peer);
                         debug!(
                             target: "primary::network",
                             %peer,
@@ -626,6 +662,7 @@ impl PrimaryNetworkHandle {
                         // the peer speaks sync but this exchange failed; keep it
                         // sync-capable and try the next peer
                         self.sync_capability.lock().insert(peer, true);
+                        self.epoch_sync_failed.lock().insert(peer, epoch);
                         warn!(
                             target: "primary::network",
                             %peer,
@@ -747,7 +784,12 @@ impl PrimaryNetworkHandle {
                 let reader = sync_codec::sync_pack_reader(stream);
                 match request
                     .consensus_chain
-                    .stream_decode_consensus_output(request.epoch, reader, request.expected_hash)
+                    .stream_decode_consensus_output(
+                        request.epoch,
+                        reader,
+                        request.expected_hash,
+                        sync_codec::SYNC_RECORD_TIMEOUT,
+                    )
                     .await
                 {
                     Ok(output) => Ok(output),
@@ -909,6 +951,12 @@ impl PrimaryNetworkHandle {
     async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
         let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
+        // Shuffle and de-prioritise peers that already failed a probe for this epoch, so a
+        // Byzantine peer fixed in stable `HashMap` order can no longer eat the whole probe
+        // budget on every one of state-sync's ~100 retries for the same epoch (see
+        // `order_probe_peers`).
+        let peers =
+            order_probe_peers(peers, &self.epoch_sync_failed.lock(), epoch, &mut rand::rng());
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable this epoch for free, `take`
@@ -925,6 +973,9 @@ impl PrimaryNetworkHandle {
                 match self.sync_epoch_pack_from_peer(peer, sync).await {
                     EpochPackAttempt::Imported => {
                         self.sync_capability.lock().insert(peer, true);
+                        // Clear any prior this-epoch failure so a peer that recovered is no longer
+                        // de-prioritised.
+                        self.epoch_sync_failed.lock().remove(&peer);
                         info!(
                             target: "primary::network",
                             %peer,
@@ -956,6 +1007,9 @@ impl PrimaryNetworkHandle {
                         // the peer speaks sync but this exchange failed; keep it
                         // sync-capable and try the next peer
                         self.sync_capability.lock().insert(peer, true);
+                        // Remember it failed THIS epoch so the retries for the same epoch probe it
+                        // last (a drip/slow peer no longer starves every attempt).
+                        self.epoch_sync_failed.lock().insert(peer, epoch);
                         warn!(
                             target: "primary::network",
                             %peer,
@@ -1089,45 +1143,54 @@ impl PrimaryNetworkHandle {
             // during rollout: classify it `Failed` (try next peer) without a penalty.
             SyncFrame::Ack => {
                 let reader = sync_codec::sync_pack_reader(stream);
-                // pick the import target on `last_consensus_number.is_some()` (a bool,
-                // not an `Option` pattern-match); each branch normalizes to
-                // `Result<(), EpochPackAttempt>` then boxes so the `if` unifies their
-                // distinct future types.
-                let import = if last_consensus_number.is_some() {
-                    consensus_chain
-                        .import_partial_to_staging(
-                            reader,
-                            epoch_record,
-                            previous_epoch,
-                            record_timeout,
-                        )
-                        .map_err(|e| {
-                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
-                                "failed to import partial epoch pack over sync stream: {e}"
-                            )))
-                        })
-                        .boxed()
-                } else {
-                    consensus_chain
-                        .stream_import(reader, epoch_record, previous_epoch, record_timeout)
-                        .map_err(|e| {
-                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
-                                "failed to import epoch pack over sync stream: {e}"
-                            )))
-                        })
-                        .boxed()
-                };
-                // Cap the whole post-`Ack` import: a peer that drips valid records just inside the
-                // per-record timeout must not pin the import (and its critical worker + `.inproc`
-                // sentinel) indefinitely. On elapse the `import` future is dropped, unwinding
-                // `stream_import` so its `ImportPath` guard clears the sentinel and the epoch is
+                // The reader's own per-frame timeout and throughput floor cut a stalled or
+                // dribbling peer; the per-record timeout must not cut a transfer the floor admits.
+                let record_timeout = record_timeout.max(sync_codec::SYNC_RECORD_TIMEOUT);
+                // Pick the import target on `last_consensus_number.is_some()`; both resolve to
+                // `Result<(), ConsensusChainError>`, so box to unify the future types while keeping
+                // the TYPED error (a peer-caused stream fault must be penalised before it is
+                // flattened into `Failed`). A partial prefix imports to a side
+                // staging dir so it cannot race the in-order build of the current
+                // epoch's main pack; a full pack imports in place.
+                let import: futures::future::BoxFuture<'_, Result<(), ConsensusChainError>> =
+                    if last_consensus_number.is_some() {
+                        consensus_chain
+                            .import_partial_to_staging(
+                                reader,
+                                epoch_record,
+                                previous_epoch,
+                                record_timeout,
+                            )
+                            .boxed()
+                    } else {
+                        consensus_chain
+                            .stream_import(reader, epoch_record, previous_epoch, record_timeout)
+                            .boxed()
+                    };
+                // No fixed overall wall-clock cap: the reader (`sync_pack_reader`) enforces a
+                // throughput floor over a rolling window plus a per-frame timeout, so a large
+                // honest pack finishes at any sustained rate at/above the floor
+                // while a drip/stalled peer is cut quickly. On such an error the
+                // future resolves `Err`, which unwinds `stream_import` so its
+                // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
                 // retryable against another peer.
-                match tokio::time::timeout(EPOCH_PACK_IMPORT_TIMEOUT, import).await {
-                    Ok(result) => result,
-                    Err(_) => Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
-                        "epoch pack import exceeded the {}s overall deadline",
-                        EPOCH_PACK_IMPORT_TIMEOUT.as_secs(),
-                    )))),
+                match import.await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Charge the peer only for a fault attributable SOLELY to its streamed
+                        // bytes (never our local storage/IO).
+                        // Committee/allowlisted peers stay score-exempt
+                        // (`Peer::apply_penalty` only warns for them). Additive: still classified
+                        // `Failed` so the probe moves to the next peer.
+                        if Self::import_fault_is_peer_caused(&e) {
+                            if let Some(penalty) = Self::consensus_chain_error_to_penalty(&e) {
+                                self.report_penalty(peer, penalty).await;
+                            }
+                        }
+                        Err(EpochPackAttempt::Failed(NetworkError::RPCError(format!(
+                            "failed to import epoch pack over sync stream: {e}"
+                        ))))
+                    }
                 }
             }
             // sync-capable, but shedding load or lacking the pack: try next peer
@@ -1155,7 +1218,12 @@ impl PrimaryNetworkHandle {
                 PackError::MissingBatch
                 | PackError::NotConsensus
                 | PackError::NotBatch
-                | PackError::NotEpoch => Some(Penalty::Medium),
+                | PackError::NotEpoch
+                // A record out of place or not what the header declares, or one that frames but
+                // fails its CRC/decode: the sender's bytes are bad. Medium, not Severe: an honest
+                // peer serving a pack damaged at rest on its own disk produces the same bytes.
+                | PackError::UnexpectedRecord(_)
+                | PackError::UndecodableRecord(_) => Some(Penalty::Medium),
                 PackError::InvalidConsensusChain
                 | PackError::ExtraBatches
                 | PackError::MissingBatches
@@ -1163,12 +1231,14 @@ impl PrimaryNetworkHandle {
                 | PackError::CorruptPack(_)
                 | PackError::UnexpectedConsensusDigest { .. }
                 | PackError::EmptySubDag
-                // An oversized batch over an import stream is peer misbehavior (the batch validator
-                // caps legitimate batches at `max_batch_size`); charge Severe (finding #10 OOM).
+                // An oversized batch is peer misbehavior (the batch validator caps legitimate
+                // batches at `max_batch_size`); charge Severe.
                 | PackError::BatchTooLarge { .. }
-                // A non-advancing / gapped / over-`final` consensus number over an import stream is
-                // peer misbehavior (both return sites are on the peer-import path); charge Severe so a
-                // peer that wedges an import with a non-advancing chain is banned (finding #10).
+                // A crafted output whose buffered batches exceed the per-output decoded-memory budget
+                // is peer misbehavior (a memory-exhaustion attempt); charge Severe.
+                | PackError::OutputTooLarge { .. }
+                // A non-advancing / gapped / over-`final` consensus number is peer misbehavior (a peer
+                // trying to wedge a fetch/import with a non-advancing chain); charge Severe.
                 | PackError::InvalidConsensusNumber(_, _)
                 | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)
@@ -1185,6 +1255,7 @@ impl PrimaryNetworkHandle {
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
                 | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConflictingOutput { .. }
                 | PackError::ConsensusNumberTooLow
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => None,
@@ -1206,6 +1277,100 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::IO(_) => None,
         }
     }
+
+    /// Whether an epoch-pack IMPORT failure can be attributed SOLELY to the peer's streamed bytes,
+    /// so it is safe to charge the peer a penalty (via
+    /// [`Self::consensus_chain_error_to_penalty`]).
+    ///
+    /// The import builds a fresh pack from a single peer's stream, so a structural/framing fault in
+    /// that stream is unambiguously the peer's fault. But the same error types are ALSO produced by
+    /// local storage/IO during the import (a full disk, a failed mmap, an index write), and those
+    /// must never ban an honest peer. This whitelist admits only the peer-stream-caused
+    /// variants and excludes every local/ambiguous one — notably `CorruptPack` (also produced
+    /// by local recovery), all IO/Append/Persist/Open/EpochDb variants, and the
+    /// local-chain-state mismatches. Exhaustive so a new error variant forces a deliberate
+    /// classification here.
+    fn import_fault_is_peer_caused(error: &ConsensusChainError) -> bool {
+        match error {
+            ConsensusChainError::PackError(pack_error) => match pack_error {
+                // The peer's streamed pack is structurally malformed / mis-framed / over a resource
+                // bound: solely attributable to the bytes it sent.
+                PackError::MissingBatch
+                | PackError::NotConsensus
+                | PackError::NotBatch
+                | PackError::NotEpoch
+                | PackError::UnexpectedRecord(_)
+                | PackError::UndecodableRecord(_)
+                | PackError::InvalidConsensusChain
+                | PackError::ExtraBatches
+                | PackError::MissingBatches
+                | PackError::TooManyBatches(_)
+                | PackError::UnexpectedConsensusDigest { .. }
+                | PackError::EmptySubDag
+                | PackError::BatchTooLarge { .. }
+                | PackError::OutputTooLarge { .. }
+                | PackError::InvalidConsensusNumber(_, _)
+                | PackError::InvalidEpoch(_, _) => true,
+                // Local storage / IO / decode-of-our-own-state, or ambiguous: never charge the
+                // peer. `CorruptPack` is excluded deliberately — it is also
+                // produced by local recovery, so on the import path it is treated
+                // as possibly-local.
+                PackError::CorruptPack(_)
+                | PackError::IO(_)
+                | PackError::BatchLoad(_)
+                | PackError::EpochLoad(_)
+                | PackError::Append(_)
+                | PackError::IndexAppend(_)
+                | PackError::Fetch(_)
+                | PackError::Open(_)
+                | PackError::ReadOnly
+                | PackError::ReadError(_)
+                | PackError::MissingAuthority
+                | PackError::SendFailed
+                | PackError::ReceiveFailed
+                | PackError::PersistError(_)
+                | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConflictingOutput { .. }
+                | PackError::ConsensusNumberTooLow
+                | PackError::InvalidVersion(_, _)
+                | PackError::ConsensusNumberTooHigh => false,
+            },
+            // The imported stream had no / an invalid final output: the peer served a bad pack.
+            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => true,
+            // Local chain state, our own storage, or a benign mismatch: never charge the peer.
+            ConsensusChainError::EpochMismatch
+            | ConsensusChainError::PrevCommitteeEpochMismatch
+            | ConsensusChainError::CrcError
+            | ConsensusChainError::StreamUnavailable
+            | ConsensusChainError::NoCurrentEpoch
+            | ConsensusChainError::EpochDbError(_)
+            | ConsensusChainError::InvalidPackEpoch(_, _)
+            | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::NonMonotonicConsensusNumber { .. }
+            | ConsensusChainError::IO(_) => false,
+        }
+    }
+}
+
+/// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then move any
+/// peer that already failed/timed-out a probe for THIS `epoch` to the back (a stable partition
+/// preserving the shuffled order within each group). Pure so it is unit-testable with a seeded rng.
+///
+/// The shuffle defeats the stable-`HashMap`-order starvation (a Byzantine peer fixed in the first
+/// `MAX_EPOCH_SYNC_PROBES` slots), and the de-prioritisation keeps a slow/drip peer that ate one
+/// call's budget from being probed first again on the retries for the same epoch — without dropping
+/// it (a small network whose only peer had a transient failure is still retried, just last).
+fn order_probe_peers(
+    mut peers: Vec<BlsPublicKey>,
+    failed_this_epoch: &HashMap<BlsPublicKey, Epoch>,
+    epoch: Epoch,
+    rng: &mut impl Rng,
+) -> Vec<BlsPublicKey> {
+    peers.shuffle(rng);
+    // `sort_by_key` is stable, so `false` (fresh) peers keep their shuffled order ahead of `true`
+    // (failed-this-epoch) peers, which keep theirs behind.
+    peers.sort_by_key(|p| failed_this_epoch.get(p) == Some(&epoch));
+    peers
 }
 
 /// Handle inter-node communication between primaries.
@@ -1725,4 +1890,36 @@ pub enum RequestVoteResult {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<HeaderDigest>),
+}
+
+/// Clip peer-supplied error text to its first [`MAX_PEER_ERROR_LEN`] characters.
+///
+/// Cuts on a character boundary, so multi-byte text never splits mid-character.
+fn clip_peer_error(mut error: String) -> String {
+    if let Some((end, _)) = error.char_indices().nth(MAX_PEER_ERROR_LEN) {
+        error.truncate(end);
+    }
+    error
+}
+
+#[cfg(test)]
+mod clip_peer_error_tests {
+    use super::{clip_peer_error, MAX_PEER_ERROR_LEN};
+
+    /// Text at or under the limit is kept whole; longer text keeps exactly the first
+    /// [`MAX_PEER_ERROR_LEN`] characters, cut on a character boundary when they are multi-byte.
+    #[test]
+    fn clips_to_the_limit_on_a_char_boundary() {
+        let short = "x".repeat(MAX_PEER_ERROR_LEN);
+        assert_eq!(clip_peer_error(short.clone()), short);
+
+        let long = "x".repeat(1 << 20);
+        assert_eq!(clip_peer_error(long), "x".repeat(MAX_PEER_ERROR_LEN));
+
+        // three bytes per char, so a byte-count cut would land mid-character
+        let wide = "€".repeat(MAX_PEER_ERROR_LEN + 1);
+        let clipped = clip_peer_error(wide);
+        assert_eq!(clipped.chars().count(), MAX_PEER_ERROR_LEN);
+        assert_eq!(clipped, "€".repeat(MAX_PEER_ERROR_LEN));
+    }
 }

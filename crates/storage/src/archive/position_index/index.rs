@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, MmapDataFile},
+    data_file::{fsync_directory, sentinel_matches, MmapDataFile, SENTINEL_LEN},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -48,11 +48,16 @@ impl PdxHeader {
     fn load_header(hdx_file: &mut MmapDataFile) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
+        hdx_file.read_exact(&mut buffer[..])?;
+        Self::decode(&buffer)
+    }
+
+    /// Decode and CRC-check a header from its on-disk bytes.
+    fn decode(buffer: &[u8; PDX_HEADER_SIZE]) -> Result<Self, LoadHeaderError> {
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
-        hdx_file.read_exact(&mut buffer[..])?;
         if !check_crc(&buffer[..]) {
             return Err(LoadHeaderError::CrcFailed);
         }
@@ -194,9 +199,51 @@ impl<T: PosIndexValue> PositionIndex<T> {
             // Without this, the next append (always at the true EOF) would land
             // mid-stride and shift every subsequent record.
             let aligned = PDX_HEADER_SIZE as u64 + (index.len() as u64 * buffer_len);
-            index.pdx_file.set_len(aligned)?;
+            index.pdx_file.truncate(aligned)?;
         }
         Ok(index)
+    }
+
+    /// Every entry of the pdx file at `path`, in order, read straight from its bytes without
+    /// opening the index: empty if the file is absent, shorter than its header, not a pdx (type
+    /// tag / header CRC), or not the index of the data file whose header is `data_header` (the
+    /// version/appnum/uid identity [`Self::open_pdx_file`] checks). Entries that fail to decode
+    /// are skipped.
+    ///
+    /// For attesting record offsets from an index that a read-only open would refuse — an
+    /// unsealed file whose mmap capacity padding leaves its tail unaligned — while a writable
+    /// open (which would heal that tail) is not wanted: it yields the entries a writable open
+    /// would keep, and none where that open would discard the file. Zero-filled padding past an
+    /// unsealed index's logical end decodes as zero entries; a caller treating entries as record
+    /// offsets must ignore those (a real offset lies past the data file's header). A sealed index's
+    /// trailing clean-close sentinel is not read as an entry.
+    pub fn raw_entries(path: &Path, data_header: &DataHeader) -> Vec<T> {
+        let Ok(bytes) = fs::read(path) else { return Vec::new() };
+        let header = bytes
+            .first_chunk::<PDX_HEADER_SIZE>()
+            .and_then(|header| PdxHeader::decode(header).ok());
+        if !header.is_some_and(|header| {
+            header.version() == data_header.version()
+                && header.uid() == data_header.uid()
+                && header.appnum() == data_header.appnum()
+        }) {
+            return Vec::new();
+        }
+        // A cleanly closed index ends in its clean-close sentinel, which is not an entry.
+        let end = bytes
+            .len()
+            .checked_sub(SENTINEL_LEN as usize)
+            .filter(|&at| at >= PDX_HEADER_SIZE)
+            .filter(|&at| {
+                bytes[at..]
+                    .first_chunk::<{ SENTINEL_LEN as usize }>()
+                    .is_some_and(|tail| sentinel_matches(tail, at as u64))
+            })
+            .unwrap_or(bytes.len());
+        bytes[PDX_HEADER_SIZE..end]
+            .chunks_exact(T::buffer_len())
+            .filter_map(|chunk| T::decode(chunk).ok())
+            .collect()
     }
 
     /// Return the number of values in this index.
@@ -215,6 +262,19 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// rebuild.
     pub fn opened_unclean(&self) -> bool {
         self.pdx_file.opened_unclean()
+    }
+
+    /// Clear the backing pdx file's "opened unclean" flag after a successful rebuild, so a clean
+    /// `Drop` re-seals it and the next open skips recovery. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.pdx_file.mark_consistent();
+    }
+
+    /// Mark the backing pdx file to be removed (not sealed) when this handle drops. Used to abandon
+    /// a partial/failed build cheaply.
+    pub fn set_remove_on_drop(&mut self) {
+        self.pdx_file.set_remove_on_drop();
     }
 
     /// Return an iterator over file positions with up to len items.
@@ -240,19 +300,26 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// Truncate the index to key (inclusive).  `key` must be an existing index; truncating
     /// to a key at or beyond the current length would otherwise *extend* the file with
     /// zero-filled records, so this is a no-op in that case.
+    ///
+    /// Precondition: this physically shrinks the pdx file (`truncate` → ftruncate + remap), so it
+    /// is sound only while no read-only mmap of the same pdx is live — a read-only handle
+    /// mapped before the shrink would SIGBUS on any touch past the new EOF. The pack model
+    /// upholds this: recovery and heal run only on the writable append open, never concurrently
+    /// with an `open_static` read-only map of the same epoch.
     pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
         if key as usize >= self.len() {
             return Ok(());
         }
         let buffer_len = T::buffer_len() as u64;
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len) + buffer_len;
-        self.pdx_file.set_len(pos)
+        self.pdx_file.truncate(pos)
     }
 
-    /// Truncate the index to just the header.
+    /// Truncate the index to just the header. Same read-only-mmap SIGBUS precondition as
+    /// [`Self::truncate_to_index`] (physical shrink; no live read-only map of this pdx).
     pub fn truncate_all(&mut self) -> Result<(), io::Error> {
         let pos = PDX_HEADER_SIZE as u64;
-        self.pdx_file.set_len(pos)
+        self.pdx_file.truncate(pos)
     }
 
     /// Roll the index's logical end back to exactly `len` whole entries, dropping any beyond it, by
@@ -500,7 +567,7 @@ mod tests {
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 i * 100,
                 "failed on iteration {i}"
             );
@@ -517,7 +584,7 @@ mod tests {
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 i * 100,
                 "failed on iteration {i}"
             );
@@ -563,7 +630,7 @@ mod tests {
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 (i, i * 100),
                 "failed on iteration {i}"
             );
@@ -576,7 +643,7 @@ mod tests {
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).unwrap_or_else(|_| panic!("load idx {i}")),
                 (i, i * 100),
                 "failed on iteration {i}"
             );
@@ -683,5 +750,24 @@ mod tests {
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
         );
+    }
+
+    /// A cleanly closed index ends in the 8-byte clean-close sentinel; the raw read must not decode
+    /// it as one more entry (for an 8-byte stride it would otherwise be a whole chunk).
+    #[test]
+    fn test_raw_entries_skip_the_clean_close_sentinel() {
+        let tmp_path = TempDir::with_prefix("test_raw_entries_sentinel").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        {
+            let mut idx: PositionIndex<u64> =
+                PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "raw.pdx", false)
+                    .expect("pdx file");
+            for i in 0..3 {
+                idx.save(i, 100 + i).expect("add to index");
+            }
+        }
+        let entries =
+            PositionIndex::<u64>::raw_entries(&tmp_path.path().join("raw.pdx"), &data_header);
+        assert_eq!(entries, vec![100, 101, 102], "the sealed tail is not an entry");
     }
 }

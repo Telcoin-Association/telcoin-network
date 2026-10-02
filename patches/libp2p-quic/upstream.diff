@@ -1,0 +1,555 @@
+diff --git upstream/Cargo.toml patched/Cargo.toml
+index 9f9bd3c..e0c3b86 100644
+--- upstream/Cargo.toml
++++ patched/Cargo.toml
+@@ -1,28 +1,32 @@
++# Vendored copy of libp2p-quic 0.14.0 (crates.io). See PATCH.md.
++# This manifest follows the upstream Cargo.toml.orig layout, with the
++# rust-libp2p workspace inherits replaced by the registry versions from the
++# published manifest, so that the crate builds outside that workspace.
+ [package]
+ name = "libp2p-quic"
+ version = "0.14.0"
+ authors = ["Parity Technologies <admin@parity.io>"]
+-edition.workspace = true
+-rust-version = { workspace = true }
++edition = "2024"
++rust-version = "1.88.0"
+ description = "TLS based QUIC transport implementation for libp2p"
+ repository = "https://github.com/libp2p/rust-libp2p"
+ license = "MIT"
+ 
+ [dependencies]
+-futures = { workspace = true }
+-futures-timer = { workspace = true }
+-if-watch = { workspace = true }
+-libp2p-core = { workspace = true }
+-libp2p-tls = { workspace = true }
+-libp2p-identity = { workspace = true }
++futures = "0.3"
++futures-timer = "3.0"
++if-watch = "3.2"
++libp2p-core = "0.44.0"
++libp2p-tls = "0.7.0"
++libp2p-identity = "0.3.0"
+ quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "futures-io"] }
+ quinn-proto = { version = "0.11", default-features = false, features = ["bloom", "log", "ring"] }
+-rand = { workspace = true }
+-thiserror = { workspace = true }
+-tokio = { workspace = true, default-features = false, features = ["net", "rt", "time"], optional = true }
+-tracing = { workspace = true }
++rand = "0.10"
++thiserror = "2"
++tokio = { version = "1.53", default-features = false, features = ["net", "rt", "time"], optional = true }
++tracing = "0.1"
+ socket2 = "0.6"
+-ring = { workspace = true }
++ring = "0.17"
+ 
+ [features]
+ tokio = ["dep:tokio", "if-watch/tokio", "quinn/runtime-tokio"]
+@@ -32,19 +36,24 @@ tokio = ["dep:tokio", "if-watch/tokio", "quinn/runtime-tokio"]
+ [package.metadata.docs.rs]
+ all-features = true
+ 
++# The upstream `stream_compliance` test and its `libp2p-muxer-test-harness`
++# dev-dependency are dropped: the harness is not published on crates.io.
+ [dev-dependencies]
+-libp2p-identity = { workspace = true, features = ["rand"] }
+-libp2p-muxer-test-harness = { path = "../../muxers/test-harness" }
+-libp2p-noise = { workspace = true }
+-libp2p-tcp = { workspace = true, features = ["tokio"] }
+-libp2p-yamux = { workspace = true }
++libp2p-identity = { version = "0.3.0", features = ["rand"] }
++libp2p-noise = "0.47.0"
++libp2p-tcp = { version = "0.45.0", features = ["tokio"] }
++libp2p-yamux = "0.48.0"
+ quickcheck = "1"
+-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+-tracing-subscriber = { workspace = true, features = ["env-filter"] }
++tokio = { version = "1.53", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
++tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ 
+-[[test]]
+-name = "stream_compliance"
+-required-features = ["tokio"]
++[lints.clippy]
++dbg_macro = "warn"
++manual_let_else = "warn"
++unnecessary_wraps = "warn"
++used_underscore_binding = "warn"
++type_complexity = "allow"
++pedantic = { level = "allow", priority = -1 }
+ 
+-[lints]
+-workspace = true
++[lints.rust]
++unreachable_pub = "warn"
+diff --git upstream/src/config.rs patched/src/config.rs
+index 0d514db..e67051f 100644
+--- upstream/src/config.rs
++++ patched/src/config.rs
+@@ -25,6 +25,8 @@ use quinn::{
+     crypto::rustls::{QuicClientConfig, QuicServerConfig},
+ };
+ 
++use crate::incoming::IncomingStats;
++
+ /// Config for the transport.
+ #[derive(Clone)]
+ pub struct Config {
+@@ -71,6 +73,43 @@ pub struct Config {
+ 
+     /// Parameters governing MTU discovery. See [`MtuDiscoveryConfig`] for details.
+     mtu_discovery_config: Option<MtuDiscoveryConfig>,
++
++    /// Answer every incoming connection attempt whose source address is not
++    /// validated with a QUIC Retry packet (RFC 9000 section 8.1), before the
++    /// listener creates any connection state for it. The remote must echo the
++    /// Retry token from its address to get a handshake.
++    ///
++    /// Default `false` (upstream behavior: accept every attempt).
++    pub retry_unvalidated_incoming: bool,
++
++    /// Lifetime of the Retry tokens this endpoint issues.
++    /// `None` keeps the quinn default. See [`quinn::ServerConfig::retry_token_lifetime`].
++    pub retry_token_lifetime: Option<Duration>,
++
++    /// Maximum number of incoming attempts one endpoint holds before the
++    /// listener decides on them. Further Initial packets are dropped.
++    /// `None` keeps the quinn default. See [`quinn::ServerConfig::max_incoming`].
++    pub max_incoming: Option<usize>,
++
++    /// Maximum bytes buffered for one incoming attempt before the listener
++    /// decides on it. `None` keeps the quinn default.
++    /// See [`quinn::ServerConfig::incoming_buffer_size`].
++    pub incoming_buffer_size: Option<u64>,
++
++    /// Maximum bytes buffered for all incoming attempts of one endpoint.
++    /// `None` keeps the quinn default.
++    /// See [`quinn::ServerConfig::incoming_buffer_size_total`].
++    pub incoming_buffer_size_total: Option<u64>,
++
++    /// Maximum number of Retry, Refuse or Ignore outcomes a listener handles in
++    /// one poll. When a listener reaches it, the listener wakes its task and
++    /// returns `Poll::Pending`, so that the task yields to the executor.
++    /// An Accept outcome always returns an event at once. Values below 1 act as 1.
++    pub max_incoming_outcomes_per_poll: usize,
++
++    /// Shared counters of the listener decisions. Keep a clone of the [`Arc`]
++    /// before the transport is built to read them.
++    pub incoming_stats: Arc<IncomingStats>,
+ }
+ 
+ #[expect(deprecated)]
+@@ -98,6 +137,13 @@ impl Config {
+             max_stream_data: 10_000_000,
+             keypair: keypair.clone(),
+             mtu_discovery_config: Some(Default::default()),
++            retry_unvalidated_incoming: false,
++            retry_token_lifetime: None,
++            max_incoming: None,
++            incoming_buffer_size: None,
++            incoming_buffer_size_total: None,
++            max_incoming_outcomes_per_poll: 128,
++            incoming_stats: Arc::new(IncomingStats::default()),
+         }
+     }
+ 
+@@ -139,6 +185,13 @@ impl From<Config> for QuinnConfig {
+             handshake_timeout: _,
+             keypair,
+             mtu_discovery_config,
++            retry_unvalidated_incoming: _,
++            retry_token_lifetime,
++            max_incoming,
++            incoming_buffer_size,
++            incoming_buffer_size_total,
++            max_incoming_outcomes_per_poll: _,
++            incoming_stats: _,
+         } = config;
+         let mut transport = quinn::TransportConfig::default();
+         // Disable uni-directional streams.
+@@ -160,6 +213,18 @@ impl From<Config> for QuinnConfig {
+         // Long-term this should be enabled, however we then need to handle address change
+         // on connections in the `Connection`.
+         server_config.migration(false);
++        if let Some(lifetime) = retry_token_lifetime {
++            server_config.retry_token_lifetime(lifetime);
++        }
++        if let Some(max_incoming) = max_incoming {
++            server_config.max_incoming(max_incoming);
++        }
++        if let Some(size) = incoming_buffer_size {
++            server_config.incoming_buffer_size(size);
++        }
++        if let Some(size) = incoming_buffer_size_total {
++            server_config.incoming_buffer_size_total(size);
++        }
+ 
+         let mut client_config = quinn::ClientConfig::new(client_tls_config);
+         client_config.transport_config(transport);
+diff --git patched/src/incoming.rs patched/src/incoming.rs
+new file mode 100644
+index 0000000..d30ad5b
+--- /dev/null
++++ patched/src/incoming.rs
+@@ -0,0 +1,113 @@
++//! Aggregate counters for the decisions a listener makes on incoming
++//! connection attempts (vendored addition, see PATCH.md).
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++/// Shared counters for the outcomes of incoming connection attempts.
++///
++/// One instance is created per [`crate::Config`] and shared by every listener
++/// of the transport built from it. The counters only grow. They carry no
++/// address or per-attempt data.
++#[derive(Debug, Default)]
++pub struct IncomingStats {
++    retried: AtomicU64,
++    accepted: AtomicU64,
++    refused: AtomicU64,
++    ignored: AtomicU64,
++    budget_yields: AtomicU64,
++}
++
++impl IncomingStats {
++    /// Attempts answered with a QUIC Retry packet (address not yet validated).
++    pub fn retried(&self) -> u64 {
++        self.retried.load(Ordering::Relaxed)
++    }
++
++    /// Attempts accepted, which start a handshake.
++    pub fn accepted(&self) -> u64 {
++        self.accepted.load(Ordering::Relaxed)
++    }
++
++    /// Attempts refused with a connection close: attempts the listener
++    /// refuses, and attempts that fail in quinn `Incoming::accept` (quinn
++    /// sends a close response for those).
++    pub fn refused(&self) -> u64 {
++        self.refused.load(Ordering::Relaxed)
++    }
++
++    /// Attempts dropped without a reply.
++    pub fn ignored(&self) -> u64 {
++        self.ignored.load(Ordering::Relaxed)
++    }
++
++    /// Times a listener stopped handling attempts because it reached
++    /// [`crate::Config::max_incoming_outcomes_per_poll`] in one poll.
++    pub fn budget_yields(&self) -> u64 {
++        self.budget_yields.load(Ordering::Relaxed)
++    }
++
++    pub(crate) fn inc_retried(&self) {
++        self.retried.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn inc_accepted(&self) {
++        self.accepted.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn inc_refused(&self) {
++        self.refused.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn inc_ignored(&self) {
++        self.ignored.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn inc_budget_yields(&self) {
++        self.budget_yields.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// The part of [`crate::Config`] that a listener needs to decide on incoming
++/// connection attempts.
++#[derive(Debug, Clone)]
++pub(crate) struct IncomingPolicy {
++    /// See [`crate::Config::retry_unvalidated_incoming`].
++    pub(crate) retry_unvalidated: bool,
++    /// See [`crate::Config::max_incoming_outcomes_per_poll`].
++    pub(crate) max_outcomes_per_poll: usize,
++    /// See [`crate::Config::incoming_stats`].
++    pub(crate) stats: std::sync::Arc<IncomingStats>,
++}
++
++impl IncomingPolicy {
++    pub(crate) fn new(config: &crate::Config) -> Self {
++        Self {
++            retry_unvalidated: config.retry_unvalidated_incoming,
++            max_outcomes_per_poll: config.max_incoming_outcomes_per_poll,
++            stats: std::sync::Arc::clone(&config.incoming_stats),
++        }
++    }
++
++    /// Decide on an attempt whose source address is not validated: send a Retry
++    /// when quinn allows it, else refuse. A failed Retry is ignored, so that no
++    /// more bytes go to the unvalidated address.
++    pub(crate) fn decide_unvalidated(&self, incoming: quinn::Incoming) {
++        if incoming.may_retry() {
++            incoming.retry().map_or_else(
++                |error| {
++                    tracing::trace!("QUIC Retry failed, ignoring attempt");
++                    error.into_incoming().ignore();
++                    self.stats.inc_ignored();
++                },
++                |()| {
++                    tracing::trace!("sent QUIC Retry to unvalidated address");
++                    self.stats.inc_retried();
++                },
++            );
++        } else {
++            tracing::trace!("refusing unvalidated attempt that may not retry");
++            incoming.refuse();
++            self.stats.inc_refused();
++        }
++    }
++}
+diff --git upstream/src/lib.rs patched/src/lib.rs
+index 65c61f6..43667c9 100644
+--- upstream/src/lib.rs
++++ patched/src/lib.rs
+@@ -63,6 +63,7 @@
+ mod config;
+ mod connection;
+ mod hole_punching;
++mod incoming;
+ mod provider;
+ mod transport;
+ 
+@@ -70,6 +71,7 @@ use std::net::SocketAddr;
+ 
+ pub use config::Config;
+ pub use connection::{Connecting, Connection, Stream};
++pub use incoming::IncomingStats;
+ pub use provider::Provider;
+ #[cfg(feature = "tokio")]
+ pub use provider::tokio;
+diff --git upstream/src/transport.rs patched/src/transport.rs
+index 78f633e..c1133f5 100644
+--- upstream/src/transport.rs
++++ patched/src/transport.rs
+@@ -52,6 +52,7 @@ use crate::{
+     ConnectError, Connecting, Connection, Error,
+     config::{Config, QuinnConfig},
+     hole_punching::hole_puncher,
++    incoming::IncomingPolicy,
+     provider::Provider,
+ };
+ 
+@@ -82,6 +83,8 @@ pub struct GenTransport<P: Provider> {
+     waker: Option<Waker>,
+     /// Holepunching attempts
+     hole_punch_attempts: HashMap<SocketAddr, oneshot::Sender<Connecting>>,
++    /// How listeners decide on incoming connection attempts.
++    incoming_policy: IncomingPolicy,
+ }
+ 
+ #[expect(deprecated)]
+@@ -90,6 +93,7 @@ impl<P: Provider> GenTransport<P> {
+     pub fn new(config: Config) -> Self {
+         let handshake_timeout = config.handshake_timeout;
+         let support_draft_29 = config.support_draft_29;
++        let incoming_policy = IncomingPolicy::new(&config);
+         let quinn_config = config.into();
+         Self {
+             listeners: SelectAll::new(),
+@@ -99,6 +103,7 @@ impl<P: Provider> GenTransport<P> {
+             waker: None,
+             support_draft_29,
+             hole_punch_attempts: Default::default(),
++            incoming_policy,
+         }
+     }
+ 
+@@ -235,6 +240,7 @@ impl<P: Provider> Transport for GenTransport<P> {
+             endpoint,
+             self.handshake_timeout,
+             version,
++            self.incoming_policy.clone(),
+         )?;
+         self.listeners.push(listener);
+ 
+@@ -449,6 +455,9 @@ struct Listener<P: Provider> {
+     close_listener_waker: Option<Waker>,
+ 
+     listening_addresses: HashSet<IpAddr>,
++
++    /// How to decide on incoming connection attempts.
++    incoming_policy: IncomingPolicy,
+ }
+ 
+ impl<P: Provider> Listener<P> {
+@@ -458,6 +467,7 @@ impl<P: Provider> Listener<P> {
+         endpoint: quinn::Endpoint,
+         handshake_timeout: Duration,
+         version: ProtocolVersion,
++        incoming_policy: IncomingPolicy,
+     ) -> Result<Self, Error> {
+         let if_watcher;
+         let pending_event;
+@@ -491,9 +501,45 @@ impl<P: Provider> Listener<P> {
+             pending_event,
+             close_listener_waker: None,
+             listening_addresses,
++            incoming_policy,
+         })
+     }
+ 
++    /// Poll for the next incoming attempt that gets a handshake, and re-arm the
++    /// accept future.
++    ///
++    /// When [`Config::retry_unvalidated_incoming`] is set, attempts from addresses
++    /// that are not validated get a Retry (or Ignore / Refuse) here and never reach
++    /// the caller. At most [`Config::max_incoming_outcomes_per_poll`] such outcomes
++    /// are handled per call. Then the task is woken and `Poll::Pending` is returned,
++    /// so that the task yields to the executor. After each outcome the new accept
++    /// future is polled, so that it registers the waker.
++    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<quinn::Incoming>> {
++        let budget = self.incoming_policy.max_outcomes_per_poll.max(1);
++        let flow = (0..budget).try_fold((), |(), _| match self.accept.poll_unpin(cx) {
++            Poll::Ready(Some(incoming)) => {
++                let endpoint = self.endpoint.clone();
++                self.accept = async move { endpoint.accept().await }.boxed();
++                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated()
++                {
++                    self.incoming_policy.decide_unvalidated(incoming);
++                    std::ops::ControlFlow::Continue(())
++                } else {
++                    std::ops::ControlFlow::Break(Poll::Ready(Some(incoming)))
++                }
++            }
++            other => std::ops::ControlFlow::Break(other),
++        });
++        match flow {
++            std::ops::ControlFlow::Break(poll) => poll,
++            std::ops::ControlFlow::Continue(()) => {
++                self.incoming_policy.stats.inc_budget_yields();
++                cx.waker().wake_by_ref();
++                Poll::Pending
++            }
++        }
++    }
++
+     /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
+     /// terminate the stream.
+     fn close(&mut self, reason: Result<(), Error>) {
+@@ -587,14 +633,12 @@ impl<P: Provider> Stream for Listener<P> {
+                 return Poll::Ready(Some(event));
+             }
+ 
+-            match self.accept.poll_unpin(cx) {
++            match self.poll_accept(cx) {
+                 Poll::Ready(Some(incoming)) => {
+-                    let endpoint = self.endpoint.clone();
+-                    self.accept = async move { endpoint.accept().await }.boxed();
+-
+                     let connecting = match incoming.accept() {
+                         Ok(connecting) => connecting,
+                         Err(error) => {
++                            self.incoming_policy.stats.inc_refused();
+                             return Poll::Ready(Some(TransportEvent::ListenerError {
+                                 listener_id: self.listener_id,
+                                 error: Error::Connection(crate::ConnectionError(error)),
+@@ -602,6 +646,8 @@ impl<P: Provider> Stream for Listener<P> {
+                         }
+                     };
+ 
++                    self.incoming_policy.stats.inc_accepted();
++
+                     let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
+                     let remote_addr = connecting.remote_address();
+                     let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
+diff --git upstream/tests/stream_compliance.rs upstream/tests/stream_compliance.rs
+deleted file mode 100644
+index 8712ba1..0000000
+--- upstream/tests/stream_compliance.rs
++++ /dev/null
+@@ -1,84 +0,0 @@
+-use std::time::Duration;
+-
+-use futures::{StreamExt, channel::oneshot};
+-use libp2p_core::{
+-    Endpoint, Transport,
+-    transport::{DialOpts, ListenerId, PortUse},
+-};
+-use libp2p_quic as quic;
+-
+-#[tokio::test]
+-async fn close_implies_flush() {
+-    let (alice, bob) = connected_peers().await;
+-
+-    libp2p_muxer_test_harness::close_implies_flush(alice, bob).await;
+-}
+-
+-#[tokio::test]
+-async fn read_after_close() {
+-    let (alice, bob) = connected_peers().await;
+-
+-    libp2p_muxer_test_harness::read_after_close(alice, bob).await;
+-}
+-
+-async fn connected_peers() -> (quic::Connection, quic::Connection) {
+-    let mut dialer = new_transport().boxed();
+-    let mut listener = new_transport().boxed();
+-
+-    listener
+-        .listen_on(
+-            ListenerId::next(),
+-            "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+-        )
+-        .unwrap();
+-    let listen_address = listener.next().await.unwrap().into_new_address().unwrap();
+-
+-    let (dialer_conn_sender, dialer_conn_receiver) = oneshot::channel();
+-    let (listener_conn_sender, listener_conn_receiver) = oneshot::channel();
+-
+-    tokio::spawn(async move {
+-        let (upgrade, _) = listener.next().await.unwrap().into_incoming().unwrap();
+-
+-        tokio::spawn(async move {
+-            let (_, connection) = upgrade.await.unwrap();
+-
+-            let _ = listener_conn_sender.send(connection);
+-        });
+-
+-        loop {
+-            listener.next().await;
+-        }
+-    });
+-    let dial_fut = dialer
+-        .dial(
+-            listen_address,
+-            DialOpts {
+-                role: Endpoint::Dialer,
+-                port_use: PortUse::Reuse,
+-            },
+-        )
+-        .unwrap();
+-    tokio::spawn(async move {
+-        let connection = dial_fut.await.unwrap().1;
+-
+-        let _ = dialer_conn_sender.send(connection);
+-    });
+-
+-    tokio::spawn(async move {
+-        loop {
+-            dialer.next().await;
+-        }
+-    });
+-
+-    futures::future::try_join(dialer_conn_receiver, listener_conn_receiver)
+-        .await
+-        .unwrap()
+-}
+-
+-fn new_transport() -> quic::tokio::Transport {
+-    let keypair = libp2p_identity::Keypair::generate_ed25519();
+-    let mut config = quic::Config::new(&keypair);
+-    config.handshake_timeout = Duration::from_secs(1);
+-
+-    quic::tokio::Transport::new(config)
+-}
