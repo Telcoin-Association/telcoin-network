@@ -1,0 +1,36 @@
+name: Issue 1508 repository lint
+
+on:
+  push:
+    branches: [ci/1508-worker-state-lint]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Read nightly pin
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
+      - name: Install pinned nightly
+        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: clippy-cache
+          save-if: "false"
+      - name: Run repository workspace lint
+        run: ./etc/ci-lanes.sh clippy
