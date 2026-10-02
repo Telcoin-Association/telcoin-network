@@ -411,7 +411,7 @@ async fn hub_join_record_faults_every_swarm() -> eyre::Result<()> {
             );
             let mut replaced = publisher.network.node_record.info.clone();
             replaced.timestamp = replaced.timestamp.saturating_add(1);
-            replaced.multiaddrs = HashSet::from(["/ip4/127.0.0.1/udp/19099/quic-v1".parse()?]);
+            replaced.multiaddrs = vec!["/ip4/127.0.0.1/udp/19099/quic-v1".parse()?];
             let record = replacement_record(&publisher, replaced.clone());
             observer.network.process_kad_put_request(publisher.peer, record)?;
             // An older signed record cannot undo a replacement.
