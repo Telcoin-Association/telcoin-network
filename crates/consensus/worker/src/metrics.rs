@@ -65,11 +65,11 @@ impl SyncShedReason {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_worker")]
 struct WorkerMetricHandles {
-    /// Total batches sealed by this worker (quorum reached).
+    /// Total batches that reached quorum, were stored, and were reported to the primary.
     batches_sealed_total: Counter,
-    /// Size in bytes of sealed batches.
+    /// Bytes per batch that reached quorum, was stored, and was reported to the primary.
     batch_size_bytes: Histogram,
-    /// Number of transactions per sealed batch.
+    /// Transactions per batch that reached quorum, was stored, and was reported to the primary.
     batch_transactions: Histogram,
     /// Time waiting for a proposed batch to reach quorum (or fail).
     quorum_wait_seconds: Histogram,
@@ -103,7 +103,7 @@ impl WorkerMetrics {
         }
     }
 
-    /// Record a successfully sealed batch.
+    /// Record a batch that reached quorum, was stored, and was reported to the primary.
     pub(crate) fn record_batch_sealed(&self, batch_size: usize, num_txs: usize) {
         self.handles.batches_sealed_total.increment(1);
         self.handles.batch_size_bytes.record(batch_size as f64);

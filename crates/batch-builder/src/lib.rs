@@ -39,6 +39,7 @@ mod metrics;
 pub mod test_utils;
 
 use crate::metrics::BatchBuilderMetrics;
+pub use crate::metrics::{record_base_fee, record_pending_pool_transactions};
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]
@@ -64,8 +65,9 @@ enum BuildOutcome {
     /// run loop retries on a dedicated backoff and gates its logging on state changes rather
     /// than emitting per attempt (issue #1145).
     Refused,
-    /// Any other non-fatal seal failure (quorum, timeout, reporting). The pool keeps its
-    /// transactions and the loop retries on the next delay tick, as before.
+    /// Any other non-fatal seal failure (quorum, timeout, reporting, or the refusal once this
+    /// epoch's consensus shutdown has begun). The pool keeps its transactions and the loop
+    /// retries on the next delay tick, as before.
     Failed,
 }
 
@@ -262,8 +264,12 @@ impl BatchBuilder {
                 // wait for worker to ack quorum reached then update pool with mined txs
                 match rx.await {
                     Ok(res) => {
-                        // measures build + broadcast + quorum, regardless of outcome
-                        metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        // measures build + broadcast + quorum, whatever the outcome; a refusal at
+                        // consensus shutdown never broadcasts, so it is left out rather than drag
+                        // the histogram toward the build time alone
+                        if !matches!(res, Err(BlockSealError::ConsensusShuttingDown)) {
+                            metrics.seal_duration_seconds.record(seal_start.elapsed());
+                        }
                         match res {
                             Ok(_) => {
                                 debug!(target: "worker::batch-builder", ?res, "received ack");
@@ -288,6 +294,14 @@ impl BatchBuilder {
                                     BlockSealError::NotValidator => {
                                         debug!(target: "worker::batch_builder", "batch seal refused: no forward admitted the batch");
                                         Ok(BuildOutcome::Refused)
+                                    }
+                                    // the worker refuses once this epoch's consensus shutdown has
+                                    // begun; a few per worker are expected at every epoch
+                                    // boundary until the epoch's tasks are aborted, so this stays
+                                    // at debug and leaves the pool untouched
+                                    BlockSealError::ConsensusShuttingDown => {
+                                        debug!(target: "worker::batch_builder", "batch seal refused: consensus shutdown has begun");
+                                        Ok(BuildOutcome::Failed)
                                     }
                                     BlockSealError::QuorumRejected
                                     | BlockSealError::AntiQuorum
