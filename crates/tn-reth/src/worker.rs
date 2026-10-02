@@ -371,6 +371,7 @@ mod tests {
             peer_count: Arc::new(RwLock::new(0)),
             version: "test",
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            rpc_admission: WorkerRpcAdmission::default(),
             reth_env: None,
         }
     }
