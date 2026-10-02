@@ -817,6 +817,7 @@ pub(crate) fn create_genesis_for_test(
 }
 
 /// File locations used to prepare a test committee.
+#[derive(Debug)]
 pub(crate) struct CommitteeDirectories<'a> {
     /// Directory containing the individual validator configurations.
     pub(crate) temporary: &'a Path,

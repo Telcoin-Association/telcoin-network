@@ -11,6 +11,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = [
+    ("closed_connection_io", "crates/network-libp2p/src/consensus.rs",
+     "ReqResOutboundFailure::Io(e) => match e.kind() {\n                        ErrorKind::NotConnected\n                        | ErrorKind::ConnectionReset",
+     "ReqResOutboundFailure::Io(e) => match e.kind() {\n                        ErrorKind::ConnectionReset",
+     "disconnected_request_io_does_not_score_peer"),
     ("cancelled_permit_occupancy", "crates/network-libp2p/src/capacity.rs",
      "active.decrement(1.0);", "active.decrement(0.0);", "cancellation_releases_reserved_occupancy"),
     ("reserved_permit_occupancy", "crates/network-libp2p/src/capacity.rs",

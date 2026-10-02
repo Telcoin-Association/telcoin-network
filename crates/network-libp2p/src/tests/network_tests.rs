@@ -22,6 +22,52 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// A closed QUIC connection cannot score an honest peer, even with many requests in flight.
+/// Malformed response bytes retain the existing protocol penalty on the same tracked peer.
+#[tokio::test]
+async fn disconnected_request_io_does_not_score_peer() -> eyre::Result<()> {
+    use libp2p::swarm::ConnectionId;
+
+    let TestTypes { mut peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let source = register_untrusted_put_record_source(network)?;
+    (0..64).try_for_each(|_| {
+        let request_id = network
+            .swarm
+            .behaviour_mut()
+            .req_res
+            .send_request(&source, TestWorkerRequest::MissingBatches(Vec::new()));
+        network.process_reqres_event(ReqResEvent::OutboundFailure {
+            peer: source,
+            connection_id: ConnectionId::new_unchecked(0),
+            request_id,
+            error: ReqResOutboundFailure::Io(std::io::Error::new(
+                ErrorKind::NotConnected,
+                "QUIC connection closed",
+            )),
+        })
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), Some(0.0));
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+
+    let request_id = network
+        .swarm
+        .behaviour_mut()
+        .req_res
+        .send_request(&source, TestWorkerRequest::MissingBatches(Vec::new()));
+    network.process_reqres_event(ReqResEvent::OutboundFailure {
+        peer: source,
+        connection_id: ConnectionId::new_unchecked(0),
+        request_id,
+        error: ReqResOutboundFailure::Io(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed response",
+        )),
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), Some(-5.0));
+    Ok(())
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(

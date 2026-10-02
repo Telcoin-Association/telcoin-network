@@ -1781,13 +1781,14 @@ where
                         // transport-level: no penalty
                     }
                     ReqResOutboundFailure::Io(e) => match e.kind() {
-                        ErrorKind::ConnectionReset
+                        ErrorKind::NotConnected
+                        | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
                         | ErrorKind::Interrupted => {
-                            // transport flap on WAN — no penalty
+                            // A transport flap on WAN carries no protocol penalty.
                         }
                         _ => {
                             warn!(
@@ -1829,13 +1830,14 @@ where
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match &error {
                     ReqResInboundFailure::Io(e) => match e.kind() {
-                        ErrorKind::ConnectionReset
+                        ErrorKind::NotConnected
+                        | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
                         | ErrorKind::Interrupted => {
-                            // transport flap on WAN — no penalty
+                            // A transport flap on WAN carries no protocol penalty.
                         }
                         _ => {
                             warn!(
