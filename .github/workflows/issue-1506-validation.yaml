@@ -1,0 +1,117 @@
+name: Issue 1506 checked regression validation
+
+on:
+  push:
+    branches: [ci/1506-worker-admission-checks]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e430b3cb8144bfeb4bf064b115d4c0ef68dbd9b3
+          submodules: true
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94 --profile minimal
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Restore test dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+      - name: Limit compilation after restoring the repository cache
+        run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+      - name: Run admission regressions
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          feature_args=()
+          if [ "$FEATURE_SET" = adiri ]; then
+            feature_args+=(--features tn-reth/adiri)
+          fi
+          cargo +1.94 test --locked -p tn-reth --lib "${feature_args[@]}" test_removed_worker_ -- --nocapture
+      - name: Confirm raw admission regression by mutation
+        if: matrix.features == 'default'
+        run: |
+          trap 'git restore crates/tn-reth/src/rpc_fee_cap.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/tn-reth/src/rpc_fee_cap.rs')
+          source = path.read_text()
+          guard = '        self.ensure_active_worker()?;\n'
+          assert source.count(guard) == 2
+          path.write_text(source.replace(guard, '', 1))
+          PY
+          set +e
+          cargo +1.94 test --locked -p tn-reth --lib test_removed_worker_rejects_raw_transaction -- --nocapture > raw-mutation.log 2>&1
+          result=$?
+          set -e
+          cat raw-mutation.log
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          assert re.search(r'test_removed_worker_rejects_raw_transaction .*FAILED', Path('raw-mutation.log').read_text())
+          PY
+      - name: Confirm sync admission regression by mutation
+        if: matrix.features == 'default'
+        run: |
+          trap 'git restore crates/tn-reth/src/rpc_fee_cap.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/tn-reth/src/rpc_fee_cap.rs')
+          source = path.read_text()
+          guard = '        self.ensure_active_worker()?;\n'
+          assert source.count(guard) == 2
+          before, after = source.rsplit(guard, 1)
+          path.write_text(before + after)
+          PY
+          set +e
+          cargo +1.94 test --locked -p tn-reth --lib test_removed_worker_rejects_sync_transaction_before_decoding -- --nocapture > sync-mutation.log 2>&1
+          result=$?
+          set -e
+          cat sync-mutation.log
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          assert re.search(r'test_removed_worker_rejects_sync_transaction_before_decoding .*FAILED', Path('sync-mutation.log').read_text())
+          PY
+      - name: Verify restored source
+        run: git diff --exit-code
+      - name: Run repository test lanes
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          if [ "$FEATURE_SET" = adiri ]; then
+            ./etc/ci-lanes.sh test-adiri
+          else
+            ./etc/ci-lanes.sh test-default
+          fi
+      - name: Upload mutation evidence
+        if: always() && matrix.features == 'default'
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-1506-mutations
+          path: "*-mutation.log"
