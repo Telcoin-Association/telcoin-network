@@ -441,16 +441,22 @@ async fn admission_transition_grace_overlap_recovery_and_restart() {
         AdmissionMode::Closed,
         Duration::from_secs(10),
     );
+    let joining_one = AdmissionPeer::new();
+    let joining_two = AdmissionPeer::new();
+    [&joining_one, &joining_two].into_iter().for_each(|peer| {
+        fixture.manager.cache_known_peer(peer.bls, peer.info.clone());
+    });
+    let current_keys =
+        HashSet::from([fixture.local, fixture.next.bls, joining_one.bls, joining_two.bls]);
     tokio::time::advance(Duration::from_secs(6)).await;
     fixture.manager.update_committees_at(
         8,
         HashSet::from([fixture.current.bls]),
-        HashSet::from([fixture.local, fixture.next.bls]),
+        current_keys.clone(),
         HashSet::new(),
     );
     tokio::time::advance(Duration::from_secs(4)).await;
     let previous_key = fixture.current.bls;
-    let current_keys = HashSet::from([fixture.local, fixture.next.bls]);
     let renew_current = |manager: &mut PeerManager| {
         manager.update_committees_at(
             8,
@@ -461,6 +467,8 @@ async fn admission_transition_grace_overlap_recovery_and_restart() {
     };
     let status = fixture.manager.admission_status();
     assert_eq!(status.epoch(), Some(8));
+    assert_eq!(status.required_current(), 3);
+    assert_eq!(status.resolved_current(), 4);
     assert_eq!(status.effective(), AdmissionMode::Grace);
     assert_eq!(status.transition_remaining(), Duration::from_secs(6));
     fixture.renew(7);
@@ -477,7 +485,7 @@ async fn admission_transition_grace_overlap_recovery_and_restart() {
         Some(AdmissionFallback::Contradictory)
     );
     renew_current(&mut fixture.manager);
-    assert_eq!(fixture.manager.admission_status().required_current(), 2);
+    assert_eq!(fixture.manager.admission_status().required_current(), 3);
     assert_eq!(fixture.manager.admission_status().transition_remaining(), Duration::from_secs(6));
     tokio::time::advance(Duration::from_secs(6)).await;
     assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
