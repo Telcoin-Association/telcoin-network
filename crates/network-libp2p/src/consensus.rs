@@ -1384,14 +1384,18 @@ where
     /// Refill required rows after ownership updates, even if the restored peer cache already
     /// resolves a key. Queries hold no persistent ownership and are deduplicated by requested key.
     fn query_missing_required_records(&mut self) {
-        self.swarm.behaviour().kademlia.store().missing_required_records().into_iter().for_each(
-            |key| {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .missing_required_records()
+            .into_iter()
+            .for_each(|key| {
                 if self.kad_record_queries.values().all(|query| query.request != key) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
                 }
-            },
-        );
+            });
     }
 
     /// Process gossip events.
@@ -2565,12 +2569,12 @@ where
     }
 
     /// Preserve the longest accepted lifetime when a query returns an identical signed record.
-    fn preserve_record_expiry(&self, mut record: kad::Record) -> kad::Record {
+    fn preserve_record_expiry(&mut self, mut record: kad::Record) -> kad::Record {
         record.expires = self
             .swarm
-            .behaviour()
+            .behaviour_mut()
             .kademlia
-            .store()
+            .store_mut()
             .get(&record.key)
             .map_or(record.expires, |existing| {
                 existing.expires.zip(record.expires).map(|(old, new)| old.max(new))
