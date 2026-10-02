@@ -260,6 +260,12 @@ impl PrimaryResponse {
             PrimaryNetworkError::Timeout(_) => {
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
             }
+            // CvvInactive is local and ends when the node rejoins. A recoverable answer is
+            // not cached as a vote decision (`RequestHandler::vote`) and the proposer retries,
+            // so the same header can still be voted once this node is CvvActive (#1517).
+            PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv) => {
+                Self::RecoverableError(PrimaryRPCError(error.to_string()))
+            }
             PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Decode(_)
             | PrimaryNetworkError::Certificate(_)
