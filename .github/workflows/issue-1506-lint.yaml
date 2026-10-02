@@ -1,0 +1,48 @@
+name: Issue 1506 lint validation
+
+on:
+  push:
+    branches: [ci/1506-worker-admission-validation]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e430b3cb8144bfeb4bf064b115d4c0ef68dbd9b3
+          submodules: true
+      - name: Install pinned nightly
+        run: rustup toolchain install "$(cat rust-nightly)" -c clippy,rust-src,rustfmt --profile minimal
+      - name: Restore lint dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: clippy-cache
+          save-if: "false"
+      - name: Check formatting
+        run: cargo "+$(cat rust-nightly)" fmt --all -- --check
+      - name: Lint workspace using repository CI target selection
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          feature_args=()
+          if [ "$FEATURE_SET" = all ]; then
+            feature_args+=(--all-features)
+          fi
+          cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps "${feature_args[@]}" -- -D warnings
