@@ -3949,7 +3949,7 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
 /// whole epoch of peer-supplied bytes before its only authentication (the final header against the
 /// certified epoch record), and it shares that filesystem with the live pack and the node's other
 /// stores, so it stops here rather than filling the disk under them.
-pub const IMPORT_MIN_FREE_BYTES: u64 = 2 << 30;
+pub const IMPORT_MIN_FREE_BYTES: u64 = 256 << 20;
 
 /// How far an import's data log may grow between free-space checks.
 const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
