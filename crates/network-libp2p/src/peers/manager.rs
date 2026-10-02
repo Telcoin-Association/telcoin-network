@@ -1,6 +1,7 @@
 //! Manage peer connection status and reputation.
 
 use super::{
+    admission::{AdmissionPolicy, AdmissionStatus},
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
@@ -24,7 +25,7 @@ use std::{
     task::Context,
     time::Duration,
 };
-use tn_config::PeerConfig;
+use tn_config::{AdmissionConfig, AdmissionMode, PeerConfig};
 use tn_types::BlsPublicKey;
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
@@ -32,6 +33,10 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/admission.rs"]
+mod admission_tests;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -139,6 +144,12 @@ pub(crate) struct PeerManager {
     /// scored. Primary and each worker run separate swarms with distinct
     /// keypairs, so each `PeerManager` holds exactly one local id.
     local_peer_id: PeerId,
+    /// Local authenticated BLS identity for resolved-record accounting.
+    local_bls_key: Option<BlsPublicKey>,
+    /// Epoch-versioned connection policy and renewable lease.
+    admission_policy: AdmissionPolicy,
+    /// Explicit trusted/bootstrap grants, separate from pinned dial hints and reputation.
+    admission_operator_peers: HashMap<BlsPublicKey, PeerId>,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
@@ -250,6 +261,115 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Configure admission and bind this swarm's authenticated local identity.
+    pub(crate) fn configure_admission(&mut self, config: AdmissionConfig, local: BlsPublicKey) {
+        self.local_bls_key = Some(local);
+        self.admission_policy.configure(config);
+    }
+
+    /// Return admission observations separately from connected counts and consensus readiness.
+    pub(crate) fn admission_status(&self) -> AdmissionStatus {
+        self.evaluate_admission().0
+    }
+
+    /// Resolve the bounded committee and operator maps using this swarm's network identities.
+    fn evaluate_admission(&self) -> (AdmissionStatus, HashSet<PeerId>) {
+        self.admission_policy.evaluate(
+            &self.known_peers,
+            &self.stub_records,
+            &self.admission_operator_peers,
+            self.local_bls_key,
+            self.local_peer_id,
+            |peer| self.is_connected(peer),
+        )
+    }
+
+    /// Apply one predicate to every connection direction, including unknown pending identities.
+    /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
+    pub(super) fn check_admission(
+        &self,
+        peer: Option<&PeerId>,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let (status, authorized) = self.evaluate_admission();
+        if status.effective() != AdmissionMode::Closed
+            || peer.is_some_and(|id| authorized.contains(id))
+        {
+            Ok(())
+        } else {
+            Err(libp2p::swarm::ConnectionDenied::new("closed connection admission policy"))
+        }
+    }
+
+    /// A verified Closed grant bypasses discovery targets, never finite transport budgets.
+    pub(super) fn admission_is_privileged(&self, peer: &PeerId) -> bool {
+        let (status, authorized) = self.evaluate_admission();
+        status.effective() == AdmissionMode::Closed && authorized.contains(peer)
+    }
+
+    /// Unversioned compatibility updates must not enable a Closed policy.
+    pub(crate) fn invalidate_admission(&mut self) {
+        self.admission_policy.invalidate();
+    }
+
+    /// Atomically update authoritative membership and admission at an epoch revision.
+    /// Old and contradictory updates fall back without replacing the accepted membership.
+    pub(crate) fn update_committees_at(
+        &mut self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) {
+        let status = self.admission_status();
+        let membership_changed = status.epoch() != Some(epoch)
+            || status.fallback() == Some(super::AdmissionFallback::Missing);
+        if self.admission_policy.update(epoch, previous.clone(), current.clone(), next.clone()) {
+            if status.configured() != AdmissionMode::Open {
+                // Retry the complete window without reapplying ban forgiveness. Cold starts
+                // also need retiring identities before Closed can protect boundary traffic.
+                let window = previous
+                    .iter()
+                    .chain(&current)
+                    .chain(&next)
+                    .filter(|key| Some(**key) != self.local_bls_key)
+                    .copied()
+                    .collect();
+                self.trigger_missing_authorities(&window);
+            }
+            if membership_changed {
+                self.update_committees(previous, current, next);
+            }
+        }
+        self.reconcile_admission();
+    }
+
+    /// Revoke live connections outside a recovered Closed window without reputation penalties.
+    fn reconcile_admission(&mut self) {
+        let (status, authorized) = self.evaluate_admission();
+        self.metrics.set_admission(&status);
+        if status.effective() == AdmissionMode::Closed {
+            let revoked: Vec<_> =
+                self.peers.connected_peer_ids().filter(|peer| !authorized.contains(peer)).collect();
+            revoked.into_iter().for_each(|peer| {
+                let banned = self.peers.peer_banned(&peer);
+                let action = self
+                    .peers
+                    .update_connection_status(&peer, NewConnectionStatus::Disconnecting { banned });
+                self.events.push_back(PeerEvent::DisconnectPeer(peer));
+                // Ordinary disconnect actions impose a temporary ban. Admission revocation
+                // preserves existing ban ownership and creates no new ban or PX penalty.
+                match action {
+                    PeerAction::Ban(_) | PeerAction::Unban(_) => {
+                        self.apply_peer_action(peer, action)
+                    }
+                    PeerAction::NoAction
+                    | PeerAction::Disconnect
+                    | PeerAction::DisconnectWithPX => {}
+                }
+            });
+        }
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -274,6 +394,9 @@ impl PeerManager {
 
         Self {
             local_peer_id,
+            local_bls_key: None,
+            admission_policy: Default::default(),
+            admission_operator_peers: Default::default(),
             config: *config,
             heartbeat,
             peers,
@@ -302,6 +425,7 @@ impl PeerManager {
     ) {
         let peer_id: PeerId = info.pubkey.clone().into();
         let multiaddr = info.multiaddrs.clone();
+        self.admission_operator_peers.insert(bls_key, peer_id);
         self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
 
         // remove from temporary banned and warn if peer was banned
@@ -452,6 +576,7 @@ impl PeerManager {
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
+        self.reconcile_admission();
         // update peers
         let actions = self.peers.heartbeat_maintenance();
         for (peer_id, action) in actions {
@@ -801,6 +926,7 @@ impl PeerManager {
         // filter peers that are validators
         let ready_to_prune = connected_peers
             .iter()
+            .filter(|(peer_id, _)| !self.admission_is_privileged(peer_id))
             .filter_map(|(peer_id, peer)| {
                 if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
                     Some(*peer_id)
@@ -1040,6 +1166,7 @@ impl PeerManager {
     /// actually inserts is marked as a stub: a learned record that was already cached stays
     /// learned.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.admission_operator_peers.insert(bls_key, info.pubkey.clone().into());
         self.pinned_peers.insert(bls_key);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
