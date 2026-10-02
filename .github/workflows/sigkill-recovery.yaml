@@ -105,7 +105,12 @@ jobs:
             echo "::error::The recovery test passed without restarting the killed validator"
             exit 1
           fi
-          rg -q 'timed out waiting for condition: restarted validator catches up and becomes active' mutation.log
+          python3 -I - <<'PY'
+          from pathlib import Path
+          expected = "timed out waiting for condition: restarted validator catches up and becomes active"
+          if expected not in Path("mutation.log").read_text():
+              raise SystemExit("mutation failed before the recovery assertion")
+          PY
 
       - name: Assert committed source and lockfile restored
         run: git diff --exit-code
