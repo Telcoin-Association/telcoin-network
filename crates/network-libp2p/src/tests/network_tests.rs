@@ -3007,12 +3007,15 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     };
     let mut config = kad::Config::new(libp2p::StreamProtocol::new("/tn-retention-test"));
     crate::consensus::configure_record_jobs(&mut config, &settings);
-    let mut behaviour = kad::Behaviour::with_config(local, store, config);
-    behaviour.add_address(&remote, "/ip4/192.0.2.1/tcp/1".parse()?);
+    // `wait_until` takes an `Fn` condition and `poll` needs `&mut`, so the closures borrow
+    // the behaviour through a cell.
+    let behaviour = std::cell::RefCell::new(kad::Behaviour::with_config(local, store, config));
+    behaviour.borrow_mut().add_address(&remote, "/ip4/192.0.2.1/tcp/1".parse()?);
 
     wait_until(Duration::from_secs(5), "own-record publication job", || {
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
+        let mut behaviour = behaviour.borrow_mut();
         let _ = behaviour.poll(&mut context);
         let publishing: Vec<_> = behaviour
             .iter_queries()
@@ -3034,11 +3037,11 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     .await?;
 
     // Serving a retained committee binding is independent of the publication job.
-    behaviour.get_record(third_key.clone());
+    behaviour.borrow_mut().get_record(third_key.clone());
     wait_until(Duration::from_secs(5), "retained committee record lookup", || {
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
-        let found = matches!(behaviour.poll(&mut context), std::task::Poll::Ready(
+        let found = matches!(behaviour.borrow_mut().poll(&mut context), std::task::Poll::Ready(
             libp2p::swarm::ToSwarm::GenerateEvent(kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                     kad::PeerRecord { record, .. }
