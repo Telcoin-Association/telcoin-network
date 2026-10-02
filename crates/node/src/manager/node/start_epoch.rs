@@ -1492,10 +1492,10 @@ mod tests {
             .await?;
         assert_eq!(shrunk.len(), 1);
         assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         assert!(engine.worker_http_client(&1).await.is_err());
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
-        assert!(engine.is_worker_initialized(0).await);
+        assert!(engine.is_worker_running(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
         wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
             Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
@@ -1505,7 +1505,7 @@ mod tests {
         // Repeated deactivation and mode updates must not make the removed worker ready.
         engine.deactivate_workers_above(1).await;
         engine.set_workers_syncing(false).await;
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         drop(shrunk);
         shrink_tasks.update_tasks();
         shrink_tasks.abort_all_tasks();
@@ -1526,7 +1526,7 @@ mod tests {
             )
             .await?;
         assert_eq!(regrown.len(), 2);
-        assert!(engine.is_worker_initialized(1).await);
+        assert!(engine.is_worker_running(1).await);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
         let reactivated =

@@ -224,6 +224,9 @@ impl ExecutionNode {
     ///
     /// This method can run before startup synchronization. Call
     /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
+    /// Only call this for [`WorkerState::Uninitialized`], in consecutive worker id order.
+    /// Existing workers must use [`Self::restart_worker_rpc`] to reuse their components.
+    /// Invalid worker ids return an error before creating a pool or binding RPC listeners.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -329,7 +332,9 @@ impl ExecutionNode {
     ///
     /// Backs the `/health/workers` readiness endpoint. A retained pool alone does not make a
     /// removed worker ready to accept transactions.
-    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+    /// Use [`Self::worker_state`] to decide whether initial construction is needed: stopped
+    /// workers retain their components and must be restarted rather than initialized again.
+    pub async fn is_worker_running(&self, worker_id: WorkerId) -> bool {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 
