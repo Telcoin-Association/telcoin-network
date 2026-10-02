@@ -1,5 +1,6 @@
 //! Module for managing network peers.
 
+mod admission;
 mod all_peers;
 mod banned;
 mod behavior;
@@ -9,6 +10,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
+pub use admission::{AdmissionFallback, AdmissionStatus};
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
