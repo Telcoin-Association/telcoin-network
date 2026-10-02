@@ -268,6 +268,29 @@ where
     }
 
     /// Process a new reported batch.
+    ///
+    /// A committee member reports a batch to ask this worker to attest it. The worker
+    /// validates the batch, caches it in `NodeBatchesCache`, and reports the digest to its
+    /// own primary, which acknowledges the batch to the reporter.
+    ///
+    /// A digest that is already in `NodeBatchesCache` skips validation and the write
+    /// (issue #1515). The worker already treats a cached digest as validated: the vote-path
+    /// sync skips `validate_batch` for it, and [`Self::validate_and_cache_prefetched_batch`]
+    /// validates before it caches for that reason. The cache is cleared at every epoch
+    /// boundary, so a hit is always a batch validated in the current epoch. A repeat that
+    /// carries an older epoch is not in the cache and fails validation as before.
+    ///
+    /// A hit still reports the digest to the primary, so the reporter gets its acknowledgement
+    /// exactly as before. The acknowledgement is truthful because the worker validated that
+    /// digest itself. The digest in a [`SealedBatch`] comes from the sender and is not checked
+    /// when the value is built, so a repeat can attach a different body to a cached digest.
+    /// That body is dropped and the validated body stays in the cache, so the only party
+    /// misled is the sender.
+    ///
+    /// Without this check, any committee member (through a bug or on purpose) can make every
+    /// peer redo full validation and a database write for each repeat it sends, with no
+    /// penalty, because committee members are exempt from peer scoring. The check covers exact
+    /// repeats only. It does not limit a flood of distinct batches.
     pub(super) async fn process_report_batch(
         &self,
         peer: &BlsPublicKey,
@@ -284,7 +307,46 @@ where
                 self.id
             ))
         })?;
-        let store = self.consensus_config.node_storage().clone();
+        let digest = sealed_batch.digest();
+
+        // cheap key lookup before the expensive validation: a cached digest is already
+        // validated for this epoch, so a repeat only needs the acknowledgement below
+        let already_cached = self
+            .consensus_config
+            .node_storage()
+            .contains_key::<NodeBatchesCache>(&digest)
+            .map_err(|e| {
+                WorkerNetworkError::Internal(format!("failed to read batch store: {e}"))
+            })?;
+        if already_cached {
+            debug!(
+                target: "worker:network",
+                %peer,
+                ?digest,
+                "reported batch already validated and cached - skipping validation"
+            );
+        } else {
+            self.validate_and_cache_reported_batch(sealed_batch)?;
+        }
+
+        // notify primary for payload store
+        client
+            .report_others_batch(WorkerOthersBatchMessage::new(digest, self.id))
+            .await
+            .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Validate a reported batch, then cache it with the time it was received.
+    ///
+    /// A validation failure is recorded in metrics and returned, and the batch is not
+    /// cached. A repeat of a rejected batch is therefore validated again by
+    /// [`Self::process_report_batch`].
+    fn validate_and_cache_reported_batch(
+        &self,
+        sealed_batch: SealedBatch,
+    ) -> WorkerNetworkResult<()> {
         // validate batch - log error if invalid
         self.validator
             .validate_batch(sealed_batch.clone())
@@ -294,17 +356,9 @@ where
 
         // Set received_at timestamp for remote batch.
         batch.set_received_at(now());
-        store.insert::<NodeBatchesCache>(&digest, &batch).map_err(|e| {
-            WorkerNetworkError::Internal(format!("failed to write to batch store: {e}"))
-        })?;
-
-        // notify primary for payload store
-        client
-            .report_others_batch(WorkerOthersBatchMessage::new(digest, self.id))
-            .await
-            .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
-
-        Ok(())
+        self.consensus_config.node_storage().insert::<NodeBatchesCache>(&digest, &batch).map_err(
+            |e| WorkerNetworkError::Internal(format!("failed to write to batch store: {e}")),
+        )
     }
 
     /// Serve an admitted inbound sync batch exchange.
