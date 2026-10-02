@@ -149,7 +149,7 @@ async fn test_epoch_boundary_inner(
         debug!(target: "epoch-test", "pending tx: {pending:?}");
         // Txns may land right at an epoch boundary, get orphaned, and be re-injected into
         // the next epoch. Allow two full epoch durations + startup buffer for confirmation.
-        timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
+        timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
     }
 
     // cross-check the `tn` namespace ConsensusRegistry endpoints against direct eth_call reads
@@ -374,7 +374,7 @@ async fn test_epoch_sync_inner(
     committee: &[(&str, Address)],
     temp_path: &Path,
     test: &str,
-    endpoints: &mut Vec<NodeEndpoints>,
+    endpoints: &mut [NodeEndpoints],
 ) -> eyre::Result<Range<Epoch>> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
@@ -457,10 +457,12 @@ async fn test_epoch_sync_inner(
                     .map_err(|e| eyre::eyre!("validator {val_name}: {e}"))?;
             // Make sure we have executed the final block from the epoch record.
             // This should prove we have the consensus output as well (i.e. verify the pack data).
-            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).expect(&format!(
-                "final block for {epoch} for {val_name} missing {}",
-                epoch_rec.final_state.number
-            ));
+            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).unwrap_or_else(|_| {
+                panic!(
+                    "final block for {epoch} for {val_name} missing {}",
+                    epoch_rec.final_state.number
+                )
+            });
             if i == kill_idx {
                 killed_epoch_records.insert(epoch, epoch_rec);
             }
@@ -620,15 +622,19 @@ fn assert_sealed_packs_unchanged(
 ///
 /// Call once per test, before the first node spawn and before anything in the process reads any
 /// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
-/// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
-/// plain `cargo test` two of these tests in one process would fight over it, and the assertions
-/// below are what turn that into a loud failure instead of a mis-decoded pack.
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`). Under
+/// plain `cargo test`, two of these tests in one process would fight over it, and a later pin
+/// would re-point the environment an already-running test spawns its nodes with. So only the
+/// first pin in a process is allowed ([`FORKS_PINNED_BY`]); any later one fails at once, before
+/// touching the environment, naming the test that holds the pins.
 fn pin_fork_epochs(
     force_multi_workers: Option<Epoch>,
     force_seed_signature: Option<Epoch>,
     force_leader_seeded: Option<Epoch>,
     force_subsecond: Option<Epoch>,
 ) {
+    claim_fork_pins();
+
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
     // stated per-fork default when it exported nothing. an unparseable value normalizes to the
     // same default the gate would have fallen back to.
@@ -663,6 +669,22 @@ fn pin_fork_epochs(
         SUBSECOND_TIMESTAMP_FORK_ENV,
         force_subsecond.unwrap_or_else(|| lane(SUBSECOND_TIMESTAMP_FORK_ENV, 0)),
         subsecond_timestamp_fork_epoch_override,
+    );
+}
+
+/// The test (libtest names each test's thread after it) that pinned this process's fork epochs.
+static FORKS_PINNED_BY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Claim this process's fork pins for the current test, or fail with how to run the tests apart.
+fn claim_fork_pins() {
+    let me = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    let holder = FORKS_PINNED_BY.get_or_init(|| me.clone());
+    assert_eq!(
+        holder, &me,
+        "fork epochs are process-wide and `{holder}` already pinned them in this process, so \
+         `{me}` cannot run here. Run each e2e test in its own process: nextest \
+         (`make test-e2e` / `make test-epochs`), or `cargo test -p e2e-tests --test it -- \
+         <test> --exact --include-ignored`"
     );
 }
 
@@ -1246,7 +1268,7 @@ async fn test_epoch_subsecond_timestamps_across_fork() -> eyre::Result<()> {
         Some(EPOCH_DURATION as u32),
     )?;
     let genesis: Genesis = Config::load_from_path(
-        &temp_path.join("shared-genesis").join("genesis").join("genesis.yaml"),
+        temp_path.join("shared-genesis").join("genesis").join("genesis.yaml"),
         ConfigFmt::YAML,
     )?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -1276,7 +1298,7 @@ async fn test_epoch_subsecond_timestamps_across_fork() -> eyre::Result<()> {
         .iter()
         .map(|url| Ok(ProviderBuilder::new().connect_http(url.parse()?)))
         .collect::<eyre::Result<Vec<_>>>()?;
-    futures::future::try_join_all(providers.iter().map(|provider| wait_for_rpc(provider))).await?;
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
 
     // the load only runs while the epochs roll; dropping it with the finished race stops it
     let reached = tokio::select! {
