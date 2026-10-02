@@ -34,6 +34,9 @@ impl NetworkBehaviour for PeerManager {
         //
         // ensure PeerId isn't banned if known and register dial attempt
         if let Some(peer_id) = maybe_peer {
+            self.dial_retry_after(&peer_id).map_or(Ok(()), |delay| {
+                Err(ConnectionDenied::new(crate::error::NetworkError::DialBackoff(delay)))
+            })?;
             // refuse to dial our own identity. Kademlia can auto-dial an address
             // it learned for a peer id (e.g. our own record re-learned via a
             // hairpin address); if that id is ours, deny it here before a
@@ -323,6 +326,14 @@ impl PeerManager {
         self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
             if !self.is_connected(&peer_id) {
+                if matches!(
+                    error,
+                    DialError::Transport(_)
+                        | DialError::NoAddresses
+                        | DialError::WrongPeerId { .. }
+                ) {
+                    self.record_dial_failure(peer_id);
+                }
                 self.register_disconnected(&peer_id);
             }
 

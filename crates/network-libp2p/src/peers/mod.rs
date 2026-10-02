@@ -7,11 +7,13 @@ mod behavior;
 mod cache;
 mod manager;
 mod peer;
+mod retry;
 mod score;
 mod status;
 mod types;
 pub use admission::{AdmissionFallback, AdmissionStatus};
 pub(crate) use manager::{PeerManager, PutRecordRate};
+pub(crate) use retry::DialLogBook;
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 

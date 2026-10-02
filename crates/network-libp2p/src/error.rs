@@ -19,6 +19,9 @@ pub enum NetworkError {
     /// Swarm error dialing a peer.
     #[error("{0}")]
     Dial(String),
+    /// A previous failure is still cooling down; this request did not start a transport dial.
+    #[error("dial retry deferred for {0:?}")]
+    DialBackoff(std::time::Duration),
     /// Redial attempt.
     #[error("Peer already dialed")]
     RedialAttempt,

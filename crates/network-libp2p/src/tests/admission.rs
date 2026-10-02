@@ -9,6 +9,35 @@ use libp2p::{
 use rand::{rngs::StdRng, SeedableRng as _};
 use tn_types::{now, BlsKeypair, NetworkKeypair};
 
+#[test]
+fn exchange_outage_budget_survives_handle_clones_and_recreation() {
+    use crate::{
+        common::{TestWorkerRequest, TestWorkerResponse},
+        types::NetworkHandle,
+    };
+    let (sender, _) = tokio::sync::mpsc::channel(1);
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(crate::peers::DialLogBook::new(
+        1,
+        std::time::Instant::now(),
+    )));
+    let handle = NetworkHandle::<TestWorkerRequest, TestWorkerResponse>::with_dial_logs(
+        sender.clone(),
+        logs.clone(),
+    );
+    let clone = handle.clone();
+    let recreated =
+        NetworkHandle::<TestWorkerRequest, TestWorkerResponse>::with_dial_logs(sender, logs);
+    let identity = AdmissionPeer::new().bls;
+    assert_eq!(handle.report_dial_failure(identity, "transport".into()), Some(0));
+    assert_eq!(clone.report_dial_failure(identity, "transport".into()), None);
+    assert_eq!(recreated.report_dial_failure(identity, "transport".into()), None);
+    assert_eq!(recreated.dial_recovered(&identity), Some(3));
+    assert_eq!(clone.dial_recovered(&identity), None);
+    assert_eq!(handle.report_dial_failure(identity, "transport".into()), Some(0));
+    let other_swarm = NetworkHandle::<TestWorkerRequest, TestWorkerResponse>::new_for_test();
+    assert_eq!(other_swarm.report_dial_failure(identity, "transport".into()), Some(0));
+}
+
 /// One independently generated authenticated identity and its verified record.
 struct AdmissionPeer {
     /// BLS identity owning the record.
@@ -92,6 +121,179 @@ impl AdmissionFixture {
             HashSet::from([self.next.bls]),
         );
     }
+}
+
+/// Encode ordinary unsigned exchange hints without conferring any identity grant.
+fn exchange_hints(peers: &[&AdmissionPeer]) -> PeerExchangeMap {
+    peers
+        .iter()
+        .map(|peer| {
+            (peer.bls, (peer.info.pubkey.clone(), peer.info.multiaddrs.iter().cloned().collect()))
+        })
+        .collect::<HashMap<_, _>>()
+        .into()
+}
+
+#[tokio::test(start_paused = true)]
+async fn exchange_observer_filters_committee_and_preserves_open_discovery() {
+    [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].into_iter().for_each(
+        |network| {
+            let mut fixture = AdmissionFixture::new(network, AdmissionMode::Open);
+            fixture.manager.local_bls_key = Some(fixture.ordinary.bls);
+            fixture
+                .manager
+                .process_peer_exchange(exchange_hints(&[&fixture.current, &fixture.bootstrap]));
+            assert!(!fixture.manager.discovery_peers.contains_key(&fixture.current.id()));
+            assert!(fixture.manager.discovery_peers.contains_key(&fixture.bootstrap.id()));
+            // Re-advertising a verified validator under an unrelated BLS key also fails.
+            let spoof =
+                AdmissionPeer { bls: fixture.ordinary.bls, info: fixture.current.info.clone() };
+            fixture.manager.process_peer_exchange(exchange_hints(&[&spoof]));
+            assert!(!fixture.manager.discovery_peers.contains_key(&fixture.current.id()));
+            fixture.manager.dial_requests.clear();
+            fixture
+                .manager
+                .discovery_peers
+                .insert(fixture.current.id(), fixture.current.info.multiaddrs.clone());
+            fixture.manager.discovery_heartbeat();
+            assert!(fixture
+                .manager
+                .dial_requests
+                .iter()
+                .all(|request| request.peer_id != fixture.current.id()));
+            assert!(fixture
+                .manager
+                .dial_requests
+                .iter()
+                .any(|request| request.peer_id == fixture.bootstrap.id()));
+        },
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn exchange_closed_input_and_recipient_specific_output() {
+    [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].into_iter().for_each(
+        |network| {
+            let mut fixture = AdmissionFixture::new(network, AdmissionMode::Closed);
+            fixture
+                .manager
+                .process_peer_exchange(exchange_hints(&[&fixture.current, &fixture.ordinary]));
+            assert!(fixture.manager.discovery_peers.contains_key(&fixture.current.id()));
+            assert!(!fixture.manager.discovery_peers.contains_key(&fixture.ordinary.id()));
+            [&fixture.current, &fixture.previous, &fixture.bootstrap].into_iter().for_each(
+                |peer| {
+                    fixture.manager.peers.update_connection_status(
+                        &peer.id(),
+                        NewConnectionStatus::Connected {
+                            multiaddr: peer
+                                .info
+                                .multiaddrs
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| create_multiaddr(None)),
+                            direction: ConnectionDirection::Outgoing,
+                        },
+                    );
+                },
+            );
+            let observer = fixture.manager.peers_for_exchange_to(Some(&fixture.ordinary.id()));
+            assert!(observer
+                .into_iter()
+                .all(|(key, _)| !fixture.manager.peers.is_committee_member(&key)));
+            let committee = fixture.manager.peers_for_exchange_to(Some(&fixture.current.id()));
+            assert!(committee.into_iter().any(|(key, _)| key == fixture.previous.bls));
+        },
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn exchange_backoff_blocks_manager_kad_and_replayed_hints() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let peer = fixture.bootstrap.id();
+    fixture.manager.dial_requests.clear();
+    fixture.manager.on_dial_failure(Some(peer), &libp2p::swarm::DialError::NoAddresses);
+    let (reply, mut receiver) = oneshot::channel();
+    fixture.manager.dial_peer(peer, fixture.bootstrap.info.multiaddrs.clone(), Some(reply));
+    assert!(matches!(receiver.try_recv(), Ok(Err(NetworkError::DialBackoff(_)))));
+    assert!(fixture.manager.dial_requests.is_empty());
+    assert!(fixture
+        .manager
+        .handle_pending_outbound_connection(
+            ConnectionId::new_unchecked(10),
+            Some(peer),
+            &fixture.bootstrap.info.multiaddrs,
+            Endpoint::Dialer,
+        )
+        .is_err());
+    fixture.manager.process_peer_exchange(exchange_hints(&[&fixture.bootstrap]));
+    assert!(!fixture.manager.discovery_peers.contains_key(&peer));
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn exchange_same_endpoint_keeps_backoff_new_mapping_and_connection_recover() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let peer = fixture.current.id();
+    fixture.manager.dial_requests.clear();
+    fixture.manager.peers.record_dial_failure(peer);
+    fixture.manager.cache_known_peer(fixture.current.bls, fixture.current.info.clone());
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_some());
+    let mut new_info = fixture.current.info.clone();
+    new_info.multiaddrs = vec![Multiaddr::empty()
+        .with(Protocol::Ip4(std::net::Ipv4Addr::new(192, 0, 2, 2)))
+        .with(Protocol::Udp(9000))
+        .with(Protocol::QuicV1)];
+    fixture.manager.cache_known_peer(fixture.current.bls, new_info);
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_none());
+    assert!(fixture.manager.dial_requests.iter().any(|request| request.peer_id == peer));
+    fixture.manager.peers.record_dial_failure(peer);
+    fixture.manager.peers.update_connection_status(
+        &peer,
+        NewConnectionStatus::Connected {
+            multiaddr: fixture
+                .current
+                .info
+                .multiaddrs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| create_multiaddr(None)),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_none());
+    fixture.manager.register_disconnected(&peer);
+    fixture.manager.dial_requests.clear();
+    (0..fixture.manager.config.max_disconnected_peers).for_each(|_| {
+        fixture.manager.peers.record_dial_failure(PeerId::random());
+    });
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_some());
+    let mut fresh = fixture.current.info.clone();
+    fresh.multiaddrs = vec![Multiaddr::empty()
+        .with(Protocol::Ip4(std::net::Ipv4Addr::new(192, 0, 2, 3)))
+        .with(Protocol::Udp(9000))
+        .with(Protocol::QuicV1)];
+    let expected = fresh.multiaddrs.clone();
+    fixture.manager.cache_known_peer(fixture.current.bls, fresh);
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_none());
+    assert!(fixture
+        .manager
+        .dial_requests
+        .iter()
+        .any(|request| request.peer_id == peer && request.multiaddrs == expected));
+}
+
+#[tokio::test(start_paused = true)]
+async fn exchange_dial_timeout_also_starts_backoff() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Worker(1), AdmissionMode::Open);
+    let peer = fixture.current.id();
+    let (reply, mut receiver) = oneshot::channel();
+    fixture.manager.register_dial_attempt(peer, Some(reply));
+    fixture
+        .manager
+        .peers
+        .heartbeat_maintenance_at(std::time::Instant::now() + Duration::from_secs(86400));
+    assert!(matches!(receiver.try_recv(), Ok(Err(NetworkError::Dial(_)))));
+    assert!(fixture.manager.peers.dial_retry_after(&peer).is_some());
 }
 
 /// Apply both authenticated hooks and the known-identity pending hook to a peer.

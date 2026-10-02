@@ -777,7 +777,10 @@ where
     ///
     /// Dialing self is skipped. The task runs on the node-lifetime spawner (not the epoch
     /// spawner) so a slow-to-reach peer keeps being retried across epochs. Backoff doubles up to
-    /// 120s; an already-connected or already-dialing error is treated as success. The task only
+    /// 120s through the swarm's shared failure memory. In-flight and deferred attempts are
+    /// polled every five seconds. Accepted endpoint changes trigger recovery in the swarm
+    /// immediately. An already-connected error is
+    /// success; an in-flight dial is awaited by retrying. The task only
     /// gives up once it has retried enough and at least one other peer is connected — being
     /// unable to reach a single peer is expected, but it will not abandon dialing while isolated.
     pub(super) fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
@@ -793,32 +796,41 @@ where
         // spawn dials on long-running task manager
         let task_name = format!("DialPeer {bls_pubkey}");
         node_task_spawner.spawn_task(task_name, async move {
-            let mut backoff = 1;
             let mut retries = 0;
+            let mut backoff = Duration::from_secs(1);
 
             debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
             while let Err(e) = handle.dial_by_bls(bls_pubkey).await {
                 // ignore errors for peers that are already connected or being dialed
-                if matches!(e, NetworkError::AlreadyConnected(_))
-                    || matches!(e, NetworkError::AlreadyDialing(_))
-                {
+                if matches!(e, NetworkError::AlreadyConnected(_)) {
+                    handle.dial_recovered(&bls_pubkey).into_iter().for_each(|failures| {
+                        info!(target: "epoch-manager", ?bls_pubkey, failures, "committee peer recovered");
+                    });
                     return Ok(());
                 }
-                retries += 1;
-
-                warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                if backoff < 120 {
-                    backoff += backoff;
+                let deferred = matches!(e, NetworkError::DialBackoff(_) | NetworkError::AlreadyDialing(_));
+                if !deferred {
+                    retries += 1;
+                    handle.report_dial_failure(bls_pubkey, e.to_string()).into_iter().for_each(|suppressed| {
+                        warn!(target: "epoch-manager", ?bls_pubkey, ?e, suppressed, retries, "failed to dial committee peer");
+                    });
+                }
+                let delay = if deferred { Duration::from_secs(5) } else { backoff };
+                tokio::time::sleep(delay).await;
+                if !deferred {
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(120));
                 }
                 let peers = handle.connected_peer_count().await.unwrap_or(0);
                 // We have been trying for a while (at least two max backoffs at 120 secs), if we
                 // have any other peers give up.
                 if retries > 10 && peers > 0 {
-                    warn!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
+                    debug!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
                     return Ok(()); // failing to reach a peer is expected now and then
                 }
             }
+            handle.dial_recovered(&bls_pubkey).into_iter().for_each(|failures| {
+                info!(target: "epoch-manager", ?bls_pubkey, failures, "committee peer recovered");
+            });
             Ok(())
         });
     }
