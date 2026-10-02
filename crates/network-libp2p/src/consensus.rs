@@ -1982,6 +1982,28 @@ where
                 // remove blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
+            PeerEvent::CommitteeRecordUpdated { previous, peer, addresses } => {
+                self.swarm.behaviour_mut().kademlia.remove_peer(&previous);
+                if previous != peer {
+                    self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&previous);
+                    let _ = self.swarm.disconnect_peer_id(previous);
+                    self.connected_peers.retain(|connected| *connected != previous);
+                }
+                addresses.into_iter().for_each(|address| {
+                    self.swarm.add_peer_address(peer, address);
+                });
+                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+            }
+            PeerEvent::RefreshAuthorities(authorities) => {
+                // Keep the signed read model and admission identity. Evict only the local DHT
+                // copy so get_record cannot satisfy recovery from the very record that failed.
+                // The normal query path coalesces with periodic/missing-authority lookups and
+                // verifies signature, publisher, domain and freshness before changing a binding.
+                authorities.iter().for_each(|key| {
+                    self.swarm.behaviour_mut().kademlia.store_mut().remove(&node_record_key(key));
+                });
+                self.process_peer_manager_event(PeerEvent::MissingAuthorities(authorities))?;
+            }
             PeerEvent::MissingAuthorities(missing) => {
                 // Polling callers such as `current_committee_rpcs` report a member as
                 // missing on every call until its signed metadata reaches `known_peers`, so the
