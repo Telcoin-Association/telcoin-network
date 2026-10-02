@@ -80,17 +80,22 @@ use tn_reth::{
 };
 use tn_test_utils::wait_until;
 use tn_types::{
-    get_available_tcp_port, Address, Genesis, GenesisAccount, MIN_PROTOCOL_BASE_FEE, U256,
+    get_available_tcp_port, Address, Genesis, GenesisAccount, NodeMode, B256,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::info;
 
-use crate::common::{
-    address_from_word, assert_epoch_records_verify, assert_nodes_agree_on_commit_times,
-    current_epoch, fetch_verified_epoch_record, get_balance, get_block, get_key,
-    get_positive_balance_with_retry, get_tx_receipt_block, network_advancing, pin_fork_epochs,
-    read_base_fee, send_and_confirm, send_tel, start_observer, start_validator,
-    start_validator_with_args, wait_for_epoch_at_least, wait_for_head_at_least, wait_for_mid_epoch,
-    walk_block_commit_times, ProcessGuard,
+use crate::{
+    common::{
+        address_from_word, assert_epoch_records_verify, assert_nodes_agree_on_commit_times,
+        current_epoch, fetch_verified_epoch_record, force_kill_and_reap, get_balance, get_block,
+        get_key, get_positive_balance_with_retry, get_tx_receipt_block, network_advancing,
+        pin_fork_epochs, read_base_fee, scrape_metric_value, send_and_confirm, send_tel,
+        start_observer, start_validator, start_validator_with_args, wait_for_epoch_at_least,
+        wait_for_head_at_least, wait_for_mid_epoch, walk_block_commit_times, BlockCommitTime,
+        ProcessGuard, EVM_TIMESTAMP_CLAMPED_SERIES,
+    },
+    restarts::wait_for_node_mode,
 };
 
 /// Epoch duration (seconds) for this test. 6s sits a second above the 5s epoch tests' consensus
@@ -1172,19 +1177,20 @@ const SNAPSHOT_FORK_EPOCH: u32 = IMPORT_EPOCH + 1;
 const BLOCKS_PAST_FORK_EPOCH: u64 = 5;
 
 /// Configure a four-validator network under `temp_path` with `funded` in genesis and
-/// [`EXPORT_EPOCH_DURATION`] epochs, start it with `validator-1` (index 0) as the only
+/// `epoch_secs` epochs, start it with `validator-1` (index 0) as the only
 /// `--enable-state-export` node, logging under `test`, and wait until every validator serves
 /// RPC. Returns the guard (validator `i` at index `i`) and the validators' RPC URLs.
 fn start_exporting_committee(
     temp_path: &Path,
     test: &str,
     funded: Vec<(Address, GenesisAccount)>,
+    epoch_secs: u32,
 ) -> eyre::Result<(ProcessGuard, [String; 4])> {
     config_local_testnet_with_epoch_duration(
         temp_path,
         Some("restart_test".to_string()),
         Some(funded),
-        Some(EXPORT_EPOCH_DURATION as u32),
+        Some(epoch_secs),
     )?;
     let bin = e2e_tests::get_telcoin_network_binary();
     let mut guard = ProcessGuard::empty();
@@ -1289,6 +1295,60 @@ fn load_bundle(
     Ok(stdout)
 }
 
+/// Check that `walk`, the commit times a node restored from the epoch-[`IMPORT_EPOCH`] bundle
+/// served from the snapshot block `B` on, crosses the sub-second fork right after `B`, and return
+/// the first post-fork block's.
+///
+/// `B` must carry `snapshot_hash` (the hash its epoch record commits to), report `subSecond` false
+/// and commit at exactly its whole-second timestamp. Every later block must report `subSecond`
+/// true, the first of them committing strictly after `B`'s second (the floor of the first
+/// post-fork commit), and at least one must commit with a non-zero millisecond part, so the node
+/// decoded the millisecond layout rather than only reporting the flag. `fork_final`, the final
+/// block of [`SNAPSHOT_FORK_EPOCH`], must be in the walk, so the walk covers the whole fork epoch.
+fn assert_walk_crosses_fork_at_snapshot(
+    walk: &[BlockCommitTime],
+    snapshot_hash: B256,
+    fork_final: u64,
+) -> eyre::Result<&BlockCommitTime> {
+    let (snapshot, after) =
+        walk.split_first().ok_or_else(|| eyre::eyre!("no block walked from the snapshot"))?;
+    let snapshot_block = snapshot.block_number;
+    let fork_close =
+        walk.iter().find(|commit| commit.block_number == fork_final).ok_or_else(|| {
+            eyre::eyre!(
+                "the walk from the snapshot block {snapshot_block} misses block {fork_final}"
+            )
+        })?;
+    eyre::ensure!(
+        !snapshot.sub_second && fork_close.sub_second,
+        "the snapshot block {snapshot_block} (epoch {IMPORT_EPOCH}) and the final block {fork_final} \
+         of epoch {SNAPSHOT_FORK_EPOCH} do not straddle the sub-second fork, so the run proved only \
+         one timestamp layout: {snapshot:?} / {fork_close:?}"
+    );
+    eyre::ensure!(
+        snapshot.block_hash == snapshot_hash
+            && snapshot.timestamp_millis == snapshot.timestamp * 1000,
+        "the snapshot block is not the recorded whole-second block {snapshot_hash}: {snapshot:?}"
+    );
+    let first_post_fork = after
+        .first()
+        .ok_or_else(|| eyre::eyre!("the walk ends at the snapshot block {snapshot_block}"))?;
+    eyre::ensure!(
+        first_post_fork.sub_second && first_post_fork.timestamp_millis > snapshot.timestamp * 1000,
+        "the first post-fork commit is not a sub-second commit after the snapshot's second {}: \
+         {first_post_fork:?}",
+        snapshot.timestamp
+    );
+    if let Some(whole) = after.iter().find(|commit| !commit.sub_second) {
+        eyre::bail!("a block after the snapshot reports a whole-second commit: {whole:?}");
+    }
+    eyre::ensure!(
+        after.iter().any(|commit| commit.timestamp_millis % 1000 != 0),
+        "no commit time after the snapshot block {snapshot_block} has a millisecond part"
+    );
+    Ok(first_post_fork)
+}
+
 /// Test an observer bootstrapped from a pre-fork snapshot syncing across the sub-second timestamp
 /// fork, and agreeing with the network on every commit time from the snapshot block on.
 ///
@@ -1346,7 +1406,8 @@ async fn test_epoch_snapshot_import_across_subsecond_fork_inner() -> eyre::Resul
         tx_factory.address(),
         GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
     )];
-    let (mut guard, client_urls) = start_exporting_committee(&temp_path, test, funded)?;
+    let (mut guard, client_urls) =
+        start_exporting_committee(&temp_path, test, funded, EXPORT_EPOCH_DURATION as u32)?;
     let tx_sink = address_from_word("ss-snap-obs-tx-sink");
     let stop = Arc::new(AtomicBool::new(false));
     let stream = spawn_tx_stream(&temp_path, &client_urls[1], tx_factory, tx_sink, stop.clone())?;
@@ -1432,46 +1493,12 @@ async fn test_epoch_snapshot_import_across_subsecond_fork_inner() -> eyre::Resul
     info!(target: "restart-test", snapshot_block, head, "observer agrees with validator-1");
 
     let [_, observed] = &served;
-    let (snapshot, after) = observed
-        .split_first()
-        .ok_or_else(|| eyre::eyre!("the walk from {snapshot_block} is empty"))?;
-    let fork_close =
-        observed.iter().find(|commit| commit.block_number == fork_final).ok_or_else(|| {
-            eyre::eyre!("the walk {snapshot_block}..={head} misses block {fork_final}")
-        })?;
-    eyre::ensure!(
-        !snapshot.sub_second && fork_close.sub_second,
-        "the snapshot block {snapshot_block} (epoch {IMPORT_EPOCH}) and the final block {fork_final} \
-         of epoch {SNAPSHOT_FORK_EPOCH} do not straddle the sub-second fork, so the run proved only \
-         one timestamp layout: {snapshot:?} / {fork_close:?}"
-    );
-    eyre::ensure!(
-        snapshot.block_hash == import_record.final_state.hash
-            && snapshot.timestamp_millis == snapshot.timestamp * 1000,
-        "the snapshot block is not the recorded whole-second block {}: {snapshot:?}",
-        import_record.final_state.hash
-    );
-    let first_post_fork = after
-        .first()
-        .ok_or_else(|| eyre::eyre!("the walk {snapshot_block}..={head} ends at the snapshot"))?;
-    eyre::ensure!(
-        first_post_fork.sub_second && first_post_fork.timestamp_millis > snapshot.timestamp * 1000,
-        "the first post-fork commit is not a sub-second commit after the snapshot's second {}: \
-         {first_post_fork:?}",
-        snapshot.timestamp
-    );
-    if let Some(whole) = after.iter().find(|commit| !commit.sub_second) {
-        eyre::bail!("a block after the snapshot reports a whole-second commit: {whole:?}");
-    }
-    eyre::ensure!(
-        after.iter().any(|commit| commit.timestamp_millis % 1000 != 0),
-        "no commit time in blocks {}..={head} has a millisecond part",
-        snapshot_block + 1
-    );
+    let first_post_fork =
+        assert_walk_crosses_fork_at_snapshot(observed, import_record.final_state.hash, fork_final)?;
     info!(
         target: "restart-test",
         snapshot_block,
-        snapshot_ms = snapshot.timestamp_millis,
+        snapshot_ms = observed[0].timestamp_millis,
         first_post_fork = first_post_fork.block_number,
         first_post_fork_ms = first_post_fork.timestamp_millis,
         "the observer crossed the sub-second fork from a pre-fork snapshot"
@@ -1485,6 +1512,261 @@ async fn test_epoch_snapshot_import_across_subsecond_fork_inner() -> eyre::Resul
     // the dev-funded `test-source` account (nonce 0) is not the stream's sender
     let key = get_key("test-source");
     send_and_confirm(&client_urls[1], &obs_url, &key, address_from_word("ss-snap-obs-target"), 0)?;
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = stream.await;
+    guard.kill_all();
+    Ok(())
+}
+
+/// Epoch duration (seconds) for the validator restored inside the fork epoch. Validator-1 writes
+/// the epoch-[`IMPORT_EPOCH`] bundle a second or two into the fork epoch; stalling the epoch,
+/// loading the bundle into validator-4 and restarting it takes a few seconds more. 20 s keeps the
+/// fork epoch's boundary well past that sequence, so the commits validator-4 makes when it rejoins
+/// are ordinary in-epoch commits rather than the one that also closes the epoch, while the five
+/// epochs the test spans stay under two minutes.
+const RESTORE_EPOCH_DURATION: u64 = 20;
+
+/// Test a validator restored from a pre-fork snapshot inside the first post-fork epoch: it rejoins
+/// that epoch's consensus and agrees with its peers on every block and commit time from the
+/// snapshot block on.
+///
+/// This is the restore that reaches the epoch commit floor. The fork is pinned at
+/// [`SNAPSHOT_FORK_EPOCH`] with the seed-signature fork active from genesis, as in
+/// [`test_epoch_snapshot_import_across_subsecond_fork`]. Validator-4 is stopped early in
+/// [`IMPORT_EPOCH`], so it never proposes in the fork epoch before its wipe (once the peers have
+/// voted a validator's header they refuse a lower round from it, which is all a wiped validator
+/// can re-propose). Once the fork epoch is open and validator-1 has exported the
+/// epoch-[`IMPORT_EPOCH`] bundle, validator-3 is stopped too, which leaves two of four validators
+/// and stalls the fork epoch a few commits in. Validator-4's chain data (`db`, `static_files`,
+/// `consensus-db`, the directories `db load-state` creates and refuses to find populated) is
+/// removed, the bundle is loaded into its datadir, and it restarts. Its execution tip is then the
+/// snapshot block `B` and its pack holds no sub-dag of the fork epoch, so its consensus starts the
+/// epoch floored on `B`'s whole-second timestamp (`resolve_epoch_commit_floor` in
+/// `crates/consensus/primary/src/consensus/state.rs`), the floor its peers took from their own
+/// history.
+///
+/// The stall is what puts that floor to use. In a live committee the peers have committed several
+/// sub-dags of the fork epoch by the time the bundle exists, and a validator whose execution is
+/// still in the previous epoch treats the first of their consensus results it hears as proof that
+/// it is behind: it drops to `CvvInactive` and syncs the epoch's headers instead of committing
+/// them, and its floor on `B` never reaches a commit. With three validators left, the network
+/// moves only once validator-4 votes and certifies, so validator-4 commits the fork epoch's
+/// sub-dags itself, the first of them against the floor on `B`.
+///
+/// The test checks that:
+///
+/// - validator-4 came back from block `B` while the fork epoch was still open;
+/// - validator-1 executes three more blocks while validator-3 is down, which needs validator-4's
+///   votes and certificates;
+/// - after validator-3 restarts and validator-4 is two epochs past the fork, validator-4 is
+///   `CvvActive`;
+/// - from `B` to its head, every block hash, commit time, consensus number and consensus digest
+///   equals validator-1's, so both hold the same first post-fork consensus header, and the walk
+///   crosses the fork right after `B` (see [`assert_walk_crosses_fork_at_snapshot`]);
+/// - its engine never clamped an EVM timestamp since the restart ([`EVM_TIMESTAMP_CLAMPED_SERIES`]
+///   reads 0);
+/// - all four validators serve verified records for [`IMPORT_EPOCH`] through the last closed epoch,
+///   and have executed each record's final block with the recorded hash.
+///
+/// Known to fail on the node code this branch was cut from. The restore itself works: the
+/// restored validator commits the fork epoch's first leader against the floor on `B`, with the
+/// same certificates and the same block hash as its peers. The run then halts at the fork epoch's
+/// close, because a validator restarted within the QUIC idle timeout of its old process never
+/// receives its peers' gossipsub subscriptions again and the two fresh restarts close the epoch
+/// between themselves, and in some runs the restored validator never votes at all because the vote
+/// handler waits without bound for execution to reach a block it was restored one short of.
+/// Neither is specific to the fork. See `tasks/subsecond/fork-e2e/diagnosis-F6.md` (finding F6 in
+/// `FINDINGS.md`) for the timeline, the code paths and the fix approach. The assertions stay as
+/// they are so the test turns green when the node is fixed.
+#[test]
+#[ignore = "only run independently from all other it tests"]
+fn test_epoch_snapshot_restore_validator_across_subsecond_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // forced for the same reason as the observer variant: a crossing one epoch past the snapshot,
+    // with the seed fork the sub-second gate conjoins
+    pin_fork_epochs(None, Some(0), None, Some(SNAPSHOT_FORK_EPOCH));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(test_epoch_snapshot_restore_validator_across_subsecond_fork_inner())
+}
+
+async fn test_epoch_snapshot_restore_validator_across_subsecond_fork_inner() -> eyre::Result<()> {
+    // short on purpose: node IPC socket paths are built under the temp dir
+    let test = "ss_snap_val";
+    let tmp_guard = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let bin = e2e_tests::get_telcoin_network_binary();
+
+    let tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(1234));
+    let funded = vec![(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    let (mut guard, client_urls) =
+        start_exporting_committee(&temp_path, test, funded, RESTORE_EPOCH_DURATION as u32)?;
+    let tx_sink = address_from_word("ss-snap-val-tx-sink");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stream = spawn_tx_stream(&temp_path, &client_urls[1], tx_factory, tx_sink, stop.clone())?;
+
+    // validator-4 leaves early in the imported epoch, so it never proposes in the fork epoch
+    // before its wipe. SIGKILL is enough: everything it could still flush is removed below
+    let provider = ProviderBuilder::new().connect_http(client_urls[0].parse()?);
+    wait_for_epoch_at_least(&provider, IMPORT_EPOCH).await?;
+    let mut stopped =
+        guard.take(3).ok_or_else(|| eyre::eyre!("validator-4 is not in the process guard"))?;
+    force_kill_and_reap(&mut stopped);
+
+    // the bundle for the epoch before the fork appears about a second into the fork epoch
+    wait_for_epoch_at_least(&provider, SNAPSHOT_FORK_EPOCH).await?;
+    let bundle_dir = wait_for_bundle(&temp_path, IMPORT_EPOCH).await?;
+    let import_record = fetch_verified_epoch_record(&client_urls[0], IMPORT_EPOCH, 60).await?;
+    let snapshot_block = import_record.final_state.number;
+
+    // with validator-4 already gone, stopping validator-3 leaves two of four validators, below
+    // quorum: the fork epoch stalls a few commits in, so the peers cannot outrun the restored
+    // validator before it starts the epoch
+    let mut stalled =
+        guard.take(2).ok_or_else(|| eyre::eyre!("validator-3 is not in the process guard"))?;
+    force_kill_and_reap(&mut stalled);
+
+    let v4_dir = temp_path.join("validator-4");
+    for dir in ["db", "static_files", "consensus-db"] {
+        let path = v4_dir.join(dir);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+    let stdout = load_bundle(bin, &v4_dir, &bundle_dir, IMPORT_EPOCH)?;
+    info!(target: "restart-test", snapshot_block, %stdout, "validator-4 loaded the bundle");
+
+    let rpc_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no ephemeral rpc port for the restored validator"))?;
+    let metrics_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no ephemeral metrics port for the restored validator"))?;
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    let v4_url = format!("http://127.0.0.1:{rpc_port}");
+    let stalled_head = provider.get_block_number().await?;
+    guard.replace(
+        3,
+        start_validator_with_args(
+            3,
+            bin,
+            &temp_path,
+            rpc_port,
+            test,
+            1,
+            &["--metrics", &metrics_addr],
+        ),
+    );
+    let v4_provider = ProviderBuilder::new().connect_http(v4_url.parse()?);
+    let v4_log = format!("{test}/node3-run1");
+    wait_node(
+        &mut guard,
+        3,
+        "validator-4",
+        &v4_log,
+        60,
+        "restored validator-4 RPC to answer",
+        || async { v4_provider.get_block_number().await.is_ok() },
+    )
+    .await?;
+    let restored_head = v4_provider.get_block_number().await?;
+    let restored_in = current_epoch(&provider).await?.epoch_id;
+    eyre::ensure!(
+        restored_head >= snapshot_block,
+        "restored validator-4 started at block {restored_head}, below the snapshot block \
+         {snapshot_block}: it did not bootstrap from the bundle"
+    );
+    eyre::ensure!(
+        restored_in == SNAPSHOT_FORK_EPOCH,
+        "validator-4 came back in epoch {restored_in}, after the fork epoch {SNAPSHOT_FORK_EPOCH} \
+         closed, so it never floored a first post-fork commit on the snapshot block \
+         {snapshot_block}: lengthen RESTORE_EPOCH_DURATION"
+    );
+    info!(target: "restart-test", snapshot_block, restored_head, restored_in, stalled_head, "validator-4 restored inside the fork epoch");
+
+    // only validators 1, 2 and 4 run, so every new block now needs validator-4's votes and
+    // certificates: it rejoined the fork epoch's consensus instead of catching up behind it
+    let resumed = stalled_head + 3;
+    wait_node(
+        &mut guard,
+        3,
+        "validator-4",
+        &v4_log,
+        60,
+        &format!("validator-1 to execute block {resumed} with validator-4 as the third voter"),
+        || async { provider.get_block_number().await.is_ok_and(|h| h >= resumed) },
+    )
+    .await?;
+    let v3_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no ephemeral rpc port for validator-3"))?;
+    let v3_url = format!("http://127.0.0.1:{v3_port}");
+    guard.replace(2, start_validator_with_args(2, bin, &temp_path, v3_port, test, 1, &[]));
+
+    let settled = SNAPSHOT_FORK_EPOCH + 2;
+    wait_node(
+        &mut guard,
+        3,
+        "validator-4",
+        &v4_log,
+        RESTORE_EPOCH_DURATION * 4,
+        &format!("restored validator-4 to reach epoch {settled}"),
+        || async {
+            v4_provider
+                .raw_request::<_, u32>("tn_getCurrentEpoch".into(), ())
+                .await
+                .is_ok_and(|epoch| epoch >= settled)
+        },
+    )
+    .await?;
+    tokio::task::block_in_place(|| wait_for_node_mode(&v4_url, NodeMode::CvvActive))?;
+
+    // the restored node serves nothing below its restore floor, so both walks start at `B`
+    let head = v4_provider.get_block_number().await?;
+    wait_for_head_at_least(&client_urls[0], head, 60).await?;
+    let walked = snapshot_block..=head;
+    let served = [
+        walk_block_commit_times(&provider, &client_urls[0], walked.clone()).await?,
+        walk_block_commit_times(&v4_provider, &v4_url, walked).await?,
+    ];
+    assert_nodes_agree_on_commit_times(&served, &[client_urls[0].clone(), v4_url.clone()])?;
+    let fork_record = fetch_verified_epoch_record(&client_urls[0], SNAPSHOT_FORK_EPOCH, 60).await?;
+    let [_, restored] = &served;
+    let first_post_fork = assert_walk_crosses_fork_at_snapshot(
+        restored,
+        import_record.final_state.hash,
+        fork_record.final_state.number,
+    )?;
+    info!(
+        target: "restart-test",
+        snapshot_block,
+        snapshot_ms = restored[0].timestamp_millis,
+        first_post_fork = first_post_fork.block_number,
+        first_post_fork_ms = first_post_fork.timestamp_millis,
+        consensus_digest = ?first_post_fork.consensus_digest,
+        head,
+        "restored validator-4 agrees with validator-1 across the sub-second fork"
+    );
+
+    let clamped = tokio::task::block_in_place(|| {
+        scrape_metric_value(&metrics_addr, EVM_TIMESTAMP_CLAMPED_SERIES)
+    })?;
+    eyre::ensure!(
+        clamped == 0.0,
+        "restored validator-4 clamped {clamped} EVM timestamps since the restart"
+    );
+
+    let last_closed = current_epoch(&provider).await?.epoch_id - 1;
+    let endpoints = [&client_urls[0], &client_urls[1], &v3_url, &v4_url].map(|url| NodeEndpoints {
+        http_url: url.clone(),
+        ws_url: String::new(),
+        ipc_path: String::new(),
+    });
+    assert_epoch_records_verify(&endpoints, IMPORT_EPOCH..=last_closed, 60).await?;
 
     stop.store(true, Ordering::Relaxed);
     let _ = stream.await;
