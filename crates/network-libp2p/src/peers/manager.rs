@@ -1,6 +1,7 @@
 //! Manage peer connection status and reputation.
 
 use super::{
+    admission::{AdmissionPolicy, AdmissionStatus},
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
@@ -24,14 +25,21 @@ use std::{
     task::Context,
     time::Duration,
 };
-use tn_config::PeerConfig;
+use tn_config::{AdmissionConfig, AdmissionMode, PeerConfig};
 use tn_types::BlsPublicKey;
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
 
+/// Re-resolve cached committee records once per minute on primary and worker swarms.
+const COMMITTEE_RECORD_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/admission.rs"]
+mod admission_tests;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -139,10 +147,18 @@ pub(crate) struct PeerManager {
     /// scored. Primary and each worker run separate swarms with distinct
     /// keypairs, so each `PeerManager` holds exactly one local id.
     local_peer_id: PeerId,
+    /// Local authenticated BLS identity for resolved-record accounting.
+    local_bls_key: Option<BlsPublicKey>,
+    /// Epoch-versioned connection policy and renewable lease.
+    admission_policy: AdmissionPolicy,
+    /// Explicit trusted/bootstrap grants, separate from pinned dial hints and reputation.
+    admission_operator_peers: HashMap<BlsPublicKey, PeerId>,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
+    /// Last scheduled committee refresh, independent of cache presence and dial state.
+    last_committee_refresh: Instant,
     /// All peers for the manager.
     peers: AllPeers,
     /// The validated read-model of kad discovery: resolves a committee member's
@@ -151,9 +167,9 @@ pub(crate) struct PeerManager {
     /// resolving through the kad store instead would cost a key hash, a db get, and a decode
     /// per call.
     ///
-    /// The kad store is NOT a superset of this map: `get_record` query results are promoted
-    /// straight into this cache (`close_kad_query` in consensus.rs) and are deliberately never
-    /// written back to the store, so replacing this map with store reads would lose data.
+    /// Verified committee query results also attempt retention through the bounded kad store
+    /// gate. Store rejection never invalidates a verified cache entry, so resolving through the
+    /// store instead of this cache would lose data when the storage budget is exhausted.
     ///
     /// The lifecycles also differ. Store records lazily expire (the configured kad record TTL)
     /// and can be evicted (max-records cap, ban-triggered removal); entries here have NO TTL by
@@ -250,6 +266,115 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Configure admission and bind this swarm's authenticated local identity.
+    pub(crate) fn configure_admission(&mut self, config: AdmissionConfig, local: BlsPublicKey) {
+        self.local_bls_key = Some(local);
+        self.admission_policy.configure(config);
+    }
+
+    /// Return admission observations separately from connected counts and consensus readiness.
+    pub(crate) fn admission_status(&self) -> AdmissionStatus {
+        self.evaluate_admission().0
+    }
+
+    /// Resolve the bounded committee and operator maps using this swarm's network identities.
+    fn evaluate_admission(&self) -> (AdmissionStatus, HashSet<PeerId>) {
+        self.admission_policy.evaluate(
+            &self.known_peers,
+            &self.stub_records,
+            &self.admission_operator_peers,
+            self.local_bls_key,
+            self.local_peer_id,
+            |peer| self.is_connected(peer),
+        )
+    }
+
+    /// Apply one predicate to every connection direction, including unknown pending identities.
+    /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
+    pub(super) fn check_admission(
+        &self,
+        peer: Option<&PeerId>,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let (status, authorized) = self.evaluate_admission();
+        if status.effective() != AdmissionMode::Closed
+            || peer.is_some_and(|id| authorized.contains(id))
+        {
+            Ok(())
+        } else {
+            Err(libp2p::swarm::ConnectionDenied::new("closed connection admission policy"))
+        }
+    }
+
+    /// A verified Closed grant bypasses discovery targets, never finite transport budgets.
+    pub(super) fn admission_is_privileged(&self, peer: &PeerId) -> bool {
+        let (status, authorized) = self.evaluate_admission();
+        status.effective() == AdmissionMode::Closed && authorized.contains(peer)
+    }
+
+    /// Unversioned compatibility updates must not enable a Closed policy.
+    pub(crate) fn invalidate_admission(&mut self) {
+        self.admission_policy.invalidate();
+    }
+
+    /// Atomically update authoritative membership and admission at an epoch revision.
+    /// Old and contradictory updates fall back without replacing the accepted membership.
+    pub(crate) fn update_committees_at(
+        &mut self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) {
+        let status = self.admission_status();
+        let membership_changed = status.epoch() != Some(epoch)
+            || status.fallback() == Some(super::AdmissionFallback::Missing);
+        if self.admission_policy.update(epoch, previous.clone(), current.clone(), next.clone()) {
+            if status.configured() != AdmissionMode::Open {
+                // Retry the complete window without reapplying ban forgiveness. Cold starts
+                // also need retiring identities before Closed can protect boundary traffic.
+                let window = previous
+                    .iter()
+                    .chain(&current)
+                    .chain(&next)
+                    .filter(|key| Some(**key) != self.local_bls_key)
+                    .copied()
+                    .collect();
+                self.trigger_missing_authorities(&window);
+            }
+            if membership_changed {
+                self.update_committees(previous, current, next);
+            }
+        }
+        self.reconcile_admission();
+    }
+
+    /// Revoke live connections outside a recovered Closed window without reputation penalties.
+    fn reconcile_admission(&mut self) {
+        let (status, authorized) = self.evaluate_admission();
+        self.metrics.set_admission(&status);
+        if status.effective() == AdmissionMode::Closed {
+            let revoked: Vec<_> =
+                self.peers.connected_peer_ids().filter(|peer| !authorized.contains(peer)).collect();
+            revoked.into_iter().for_each(|peer| {
+                let banned = self.peers.peer_banned(&peer);
+                let action = self
+                    .peers
+                    .update_connection_status(&peer, NewConnectionStatus::Disconnecting { banned });
+                self.events.push_back(PeerEvent::DisconnectPeer(peer));
+                // Ordinary disconnect actions impose a temporary ban. Admission revocation
+                // preserves existing ban ownership and creates no new ban or PX penalty.
+                match action {
+                    PeerAction::Ban(_) | PeerAction::Unban(_) => {
+                        self.apply_peer_action(peer, action)
+                    }
+                    PeerAction::NoAction
+                    | PeerAction::Disconnect
+                    | PeerAction::DisconnectWithPX => {}
+                }
+            });
+        }
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -274,8 +399,12 @@ impl PeerManager {
 
         Self {
             local_peer_id,
+            local_bls_key: None,
+            admission_policy: Default::default(),
+            admission_operator_peers: Default::default(),
             config: *config,
             heartbeat,
+            last_committee_refresh: Instant::now(),
             peers,
             known_peers: Default::default(),
             pinned_peers: Default::default(),
@@ -302,6 +431,7 @@ impl PeerManager {
     ) {
         let peer_id: PeerId = info.pubkey.clone().into();
         let multiaddr = info.multiaddrs.clone();
+        self.admission_operator_peers.insert(bls_key, peer_id);
         self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
 
         // remove from temporary banned and warn if peer was banned
@@ -452,6 +582,7 @@ impl PeerManager {
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
+        self.reconcile_admission();
         // update peers
         let actions = self.peers.heartbeat_maintenance();
         for (peer_id, action) in actions {
@@ -487,6 +618,11 @@ impl PeerManager {
 
         // manage discovery peers
         self.discovery_heartbeat();
+        if self.last_committee_refresh.elapsed() >= COMMITTEE_RECORD_REFRESH_INTERVAL {
+            self.last_committee_refresh = Instant::now();
+            let members = self.committee_members().into_iter().collect();
+            self.events.push_back(PeerEvent::MissingAuthorities(members));
+        }
     }
 
     /// Remove fully lapsed inbound kad budgets so disconnected identities cannot accumulate.
@@ -801,6 +937,7 @@ impl PeerManager {
         // filter peers that are validators
         let ready_to_prune = connected_peers
             .iter()
+            .filter(|(peer_id, _)| !self.admission_is_privileged(peer_id))
             .filter_map(|(peer_id, peer)| {
                 if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
                     Some(*peer_id)
@@ -1040,6 +1177,7 @@ impl PeerManager {
     /// actually inserts is marked as a stub: a learned record that was already cached stays
     /// learned.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.admission_operator_peers.insert(bls_key, info.pubkey.clone().into());
         self.pinned_peers.insert(bls_key);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
@@ -1056,8 +1194,8 @@ impl PeerManager {
     /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
     /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
     /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
-    /// unaffected because kad lookups are only ever triggered for current/next committee members
-    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    /// unaffected: missing records, scheduled refresh, and endpoint recovery all resolve tracked
+    /// committee members while retaining the last verified mapping on lookup failure.
     pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         if !self.peers.is_committee_member(&bls_key) {
             trace!(
@@ -1272,27 +1410,37 @@ impl PeerManager {
         self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
     }
 
-    /// Return the advertised [RpcInfo] for every current-committee validator, and
-    /// chase node records for current members whose record is still unlearned.
+    /// Inspect the retained record when testing signed address and identity replacement.
+    #[cfg(test)]
+    pub(crate) fn known_record(&self, bls_key: &BlsPublicKey) -> Option<&NetworkInfo> {
+        self.known_peers.get(bls_key)
+    }
+
+    /// Return current committee RPCs and request recovery for missing submit URLs.
     ///
-    /// Scoped to the current committee: pinned operator peers and previous/next
-    /// committee members never appear, even if they advertised RPC info. For any
-    /// current member with no network-learned record, kad discovery is (re)triggered
-    /// via [`PeerEvent::MissingAuthorities`] — the same path `update_committees` takes
-    /// at epoch start — so a polling caller converges as records arrive. Members with
-    /// a network-learned record that carries no RPC info advertised none and are
-    /// skipped without a re-fetch; members still held only as a config stub
-    /// (bootstrap/trusted/explicit) are chased like unknown members, because a stub
-    /// says nothing about what the peer advertises.
+    /// A verified record with no RPC URL still needs recovery. Lookup coalescing and the retry
+    /// cooldown live in the swarm, so polling retains the last verified network mapping.
     pub(crate) fn current_committee_rpcs(&mut self) -> Vec<(BlsPublicKey, RpcInfo)> {
         let current = self.peers.current_committee().clone();
-        self.trigger_missing_authorities(&current);
+        let missing: Vec<_> = current
+            .iter()
+            .filter(|key| self.record_unlearned(key) || self.get_rpc(key).is_none())
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(missing));
+        }
         current
             .iter()
             .filter_map(|bls| {
                 self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
             })
             .collect()
+    }
+
+    /// Committee keys eligible for scheduled refresh and endpoint recovery.
+    pub(crate) fn committee_members(&self) -> HashSet<BlsPublicKey> {
+        self.peers.committee_members()
     }
 
     /// Find the peer id for an authority.

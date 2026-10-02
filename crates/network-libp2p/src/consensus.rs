@@ -64,6 +64,10 @@ mod admission_contention;
 #[path = "tests/loop_budget_tests.rs"]
 mod loop_budget_tests;
 
+#[cfg(test)]
+#[path = "tests/hub_join.rs"]
+mod hub_join;
+
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
 #[derive(Debug)]
@@ -419,6 +423,8 @@ where
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
     kad_record_queries: HashMap<QueryId, KadQuery>,
+    /// Last lookup start per tracked committee key, bounding retries after fast failures.
+    committee_record_attempts: HashMap<BlsPublicKey, tokio::time::Instant>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -595,8 +601,10 @@ where
             .set_max_packet_size(MAX_KAD_PACKET_SIZE)
             .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
-            .set_publication_interval(Some(libp2p.kad_publication_interval))
-            .set_replication_interval(Some(libp2p.kad_replication_interval))
+            // Either library interval creates a job that also replicates third-party records.
+            // Own publication uses the dedicated signed-record refresh in the run loop.
+            .set_publication_interval(None)
+            .set_replication_interval(None)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let mut kad_store = KadStore::new(db.clone(), peer_id, &key_config, network_type);
@@ -665,6 +673,7 @@ where
         // rotation. Our own record is skipped: both primary and worker key their record by
         // the primary BLS key, and there is no point caching ourselves as a known peer.
         let own_key = key_config.primary_public_key();
+        behavior.peer_manager.configure_admission(network_config.admission().clone(), own_key);
         let mut restored: usize = 0;
         for (key, info) in known {
             if key == own_key {
@@ -738,6 +747,7 @@ where
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             kad_record_queries: Default::default(),
+            committee_record_attempts: Default::default(),
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
@@ -775,7 +785,7 @@ where
     /// Re-sign our configured network information and publish it with a fresh timestamp.
     ///
     /// `provide_our_data` replaces the local store entry before publishing, so subsequent
-    /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
+    /// direct pushes use the new signed value. Our local copy keeps
     /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
     fn refresh_own_record(&mut self) {
         self.node_record = Self::create_node_record(
@@ -792,10 +802,8 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = node_record_key(&self.key_config.primary_public_key());
-        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
-        // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
-        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
-        // drives the wire-level expiry that remote peers store.
+        // Our dedicated signed-record publication gives outbound copies a fresh
+        // configured TTL. Keep our own local record without an expiry.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
@@ -1257,6 +1265,7 @@ where
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
+                self.swarm.behaviour_mut().peer_manager.invalidate_admission();
                 // The network mirrors three of the on-chain registry's committees: previous,
                 // current, and next. Peers in any of the three count as validators so the
                 // just-completed committee is not pruned while late gossip may still arrive and
@@ -1268,6 +1277,18 @@ where
                 // any peer that exits the three-slot window is demoted.
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                let members = self.swarm.behaviour().peer_manager.committee_members();
+                self.committee_record_attempts.retain(|key, _| members.contains(key));
+            }
+            NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next } => {
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .update_committees_at(epoch, previous, current, next);
+            }
+            NetworkCommand::AdmissionStatus { reply } => {
+                let status = self.swarm.behaviour().peer_manager.admission_status();
+                send_or_log_error!(reply, status, "AdmissionStatus");
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
@@ -1285,6 +1306,11 @@ where
             NetworkCommand::GetAllValidatorRpcs { reply } => {
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
+            }
+            NetworkCommand::RefreshCommitteeRecord { authority } => {
+                if self.swarm.behaviour().peer_manager.committee_members().contains(&authority) {
+                    self.start_record_query(authority);
+                }
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
@@ -1983,25 +2009,9 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
-                // Polling callers such as `current_committee_rpcs` report a member as
-                // missing on every call until its signed metadata reaches `known_peers`, so the
-                // same key arrives here repeatedly while its lookup is still in flight.
-                // Issue at most one live `get_record` per key: skip keys already tracked
-                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
-                // source because every terminal query path removes its entry (see
-                // `close_kad_query`), so a skipped key becomes queryable again as soon
-                // as its current query ends. The removal there runs before any result
-                // filtering, so even a query whose record is dropped as stale or
-                // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
-                        let key = node_record_key(&bls_key);
-                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                        self.kad_record_queries.insert(query_id, bls_key.into());
-                    } else {
-                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
-                    }
-                }
+                // Periodic refresh and missing-RPC polling share the same in-flight
+                // deduplication and cooldown, including unsuccessful terminal queries.
+                missing.into_iter().for_each(|key| self.start_record_query(key));
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
@@ -2100,6 +2110,16 @@ where
                         kad::PeerRecord { record, peer },
                     ))) => {
                         if let Some((key, node_record)) = self.peer_record_valid(&record) {
+                            let _ = self
+                                .kad_record_queries
+                                .get_mut(&query_id)
+                                .filter(|query| {
+                                    query.request == key
+                                        && query.result.as_ref().is_none_or(|old| {
+                                            old.info.timestamp < node_record.info.timestamp
+                                        })
+                                })
+                                .map(|query| query.replace_record(record));
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
                             self.process_kad_query_result(
                                 &query_id,
@@ -2467,26 +2487,77 @@ where
         }
     }
 
-    /// Cleanup kad record queries (called on last step).
+    /// Start at most one lookup per key and impose a 30-second committee retry cooldown.
     ///
-    /// The winning record is promoted ONLY into the peer manager's `known_peers` cache (via
-    /// `add_discovered_peer`) and deliberately NOT written to the kad store: `known_peers` is
-    /// the read model of discovery, and the node needs the resolution, not the record.
-    /// Persisting merely-queried third-party records would enlist libp2p's `PutRecordJob` to
-    /// republish them on every replication run (hourly by libp2p default), making this node an
-    /// hourly replicator of records it never needed to serve, and would erode the store's
-    /// max-records cap — the node's DHT storage-duty budget — with query traffic. Nothing is
-    /// lost: peers push their own records on first connect (an inbound kad put handled by
-    /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
-    fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
+    /// Existing verified mappings remain readable while a lookup is pending or fails. Only
+    /// tracked committee members consume cooldown entries, so rotation bounds this state.
+    fn start_record_query(&mut self, authority: BlsPublicKey) {
+        let in_flight = self.kad_record_queries.values().any(|query| query.request == authority);
+        let cooling_down = self
+            .committee_record_attempts
+            .get(&authority)
+            .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30));
+        if in_flight || cooling_down {
+            self.metrics.record_committee_refresh("coalesced");
+        } else {
+            if self.swarm.behaviour().peer_manager.committee_members().contains(&authority) {
+                self.committee_record_attempts.insert(authority, tokio::time::Instant::now());
+            }
+            let query_id =
+                self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&authority));
+            self.kad_record_queries.insert(query_id, authority.into());
+            self.metrics.record_committee_refresh("started");
+        }
+    }
+
+    /// Retain a verified committee query result through the bounded Kademlia store gate.
+    ///
+    /// Original publisher and remaining TTL survive the lookup. Non-local copies always have
+    /// finite expiry. Equal-timestamp conflicts and older records cannot replace stored data;
+    /// verified results can repair undecodable rows subject to the same capacity gate.
+    fn retain_committee_record(&mut self, mut record: kad::Record) {
+        if record.publisher != Some(*self.swarm.local_peer_id()) {
+            let deadline = std::time::Instant::now() + self.config.kad_record_ttl;
+            record.expires = Some(record.expires.map_or(deadline, |expiry| expiry.min(deadline)));
+            match self.record_freshness(&record) {
+                RecordFreshness::Newer | RecordFreshness::Undecodable => {
+                    self.swarm.behaviour_mut().kademlia.store_mut().put(record).map_or_else(
+                        |_| self.metrics.record_committee_refresh("store_rejected"),
+                        |()| self.metrics.record_committee_refresh("retained"),
+                    );
+                }
+                RecordFreshness::Identical | RecordFreshness::Older => {}
             }
         }
+    }
+
+    /// Finish a lookup without discarding the last verified mapping on failure.
+    fn close_kad_query(&mut self, query_id: &QueryId) {
+        self.kad_record_queries.remove(query_id).into_iter().for_each(|mut query| {
+            let mut record = query.take_record();
+            if query.result.is_none() {
+                self.metrics.record_committee_refresh("unresolved");
+            }
+            query.result.into_iter().for_each(|node_record| {
+                let members = self.swarm.behaviour().peer_manager.committee_members();
+                if members.contains(&query.request) {
+                    let previous_rpc = self.swarm.behaviour().peer_manager.get_rpc(&query.request);
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .add_discovered_peer(query.request, node_record.info);
+                    let current_rpc = self.swarm.behaviour().peer_manager.get_rpc(&query.request);
+                    self.metrics.record_committee_refresh("resolved");
+                    if previous_rpc != current_rpc {
+                        self.metrics.record_committee_refresh("rpc_updated");
+                    }
+                    record
+                        .take()
+                        .into_iter()
+                        .for_each(|record| self.retain_committee_record(record));
+                }
+            });
+        });
     }
 }
 

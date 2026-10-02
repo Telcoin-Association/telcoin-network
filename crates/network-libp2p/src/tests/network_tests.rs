@@ -22,6 +22,9 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+#[path = "committee_record_refresh.rs"]
+mod committee_record_refresh;
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
