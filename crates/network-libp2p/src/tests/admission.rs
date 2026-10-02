@@ -539,7 +539,7 @@ async fn admission_reconciliation_closure_bookkeeping_once() {
     );
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(matches!(fixture.manager.poll(&mut cx),
-        Poll::Ready(libp2p::swarm::ToSwarm::GenerateEvent(PeerEvent::DisconnectPeer(id))) if id == peer));
+        std::task::Poll::Ready(libp2p::swarm::ToSwarm::GenerateEvent(PeerEvent::DisconnectPeer(id))) if id == peer));
     assert!(fixture.manager.is_peer_connected_or_disconnecting(&peer));
     assert!(!fixture.manager.peer_banned(&peer));
     assert_eq!(fixture.manager.temporarily_banned.len(), 0);
