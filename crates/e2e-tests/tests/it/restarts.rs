@@ -8,6 +8,7 @@ use crate::common::{
     send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
     WEI_PER_TEL,
 };
+use alloy::primitives::utils::parse_ether;
 use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::{Report, WrapErr as _};
 use jsonrpsee::rpc_params;
@@ -19,11 +20,15 @@ use std::{
     cell::RefCell,
     path::Path,
     process::Child,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tn_config::NetworkConfig;
 use tn_test_utils::wait_until_blocking;
-use tn_types::{get_available_tcp_port, NodeMode};
+use tn_types::{get_available_tcp_port, Address, GenesisAccount, NodeMode, U256};
 use tracing::{error, info};
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -961,4 +966,152 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
         },
     )?;
     Ok(())
+}
+
+/// Word for the funded genesis account that drives load in [`test_restarts_lagged_under_load`].
+///
+/// It is separate from `test-source`, so the load never races the nonces of other transfers.
+const LOAD_SOURCE: &str = "load-source";
+
+/// Time limit for a lagged validator to catch up and rejoin while the load runs.
+///
+/// Longer than the unloaded catch-up wait, because the restarted node executes a non-empty block
+/// for every output it syncs.
+const LOADED_REJOIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Pending nonce of `address` on `node`, from `eth_getTransactionCount`.
+fn pending_nonce(node: &str, address: Address) -> eyre::Result<u128> {
+    let count: String = call_rpc(
+        node,
+        "eth_getTransactionCount",
+        rpc_params![address, "pending"],
+        1,
+        "eth_getTransactionCount",
+    )?;
+    u128::from_str_radix(count.trim_start_matches("0x"), 16)
+        .wrap_err("eth_getTransactionCount returned a count that is not hex")
+}
+
+/// Send value transfers from [`LOAD_SOURCE`] through `node` until `stop` is set.
+///
+/// `sent` counts the accepted transfers. A failed send resyncs the nonce from the pool, so a full
+/// per-sender pool slows the load to the rate of block inclusion instead of ending it.
+fn spawn_load(
+    node: String,
+    stop: Arc<AtomicBool>,
+    sent: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let key = get_key(LOAD_SOURCE);
+        let source = address_from_word(LOAD_SOURCE);
+        let sink = address_from_word("load-sink");
+        std::iter::successors(Some(0u128), |&nonce| {
+            (!stop.load(Ordering::Relaxed)).then(|| {
+                send_tel(&node, &key, sink, 1, 250, 21000, nonce).map_or_else(
+                    |_| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        pending_nonce(&node, source).unwrap_or(nonce)
+                    },
+                    |_| {
+                        sent.fetch_add(1, Ordering::Relaxed);
+                        nonce + 1
+                    },
+                )
+            })
+        })
+        .for_each(|_nonce| {});
+    })
+}
+
+/// A validator restarted far behind while transactions keep flowing must catch up and rejoin
+/// consensus before the load stops (issue #1513).
+///
+/// Before the fix a catching-up node rejoined only when the output it had just handled was the
+/// newest known header. A node that must execute every output does not reach that point while the
+/// committee keeps committing, so it stayed inactive until the load dropped.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_lagged_under_load() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "restarts_lagged_under_load";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let funded = vec![(
+        address_from_word(LOAD_SOURCE),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        Some(funded),
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let rpc_ports = (0..4)
+        .map(|_| {
+            get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no rpc port available"))
+        })
+        .collect::<eyre::Result<Vec<u16>>>()?;
+    let rpc_port2 =
+        rpc_ports.get(2).copied().ok_or_else(|| eyre::eyre!("missing rpc port for node 2"))?;
+    let client_urls = <[String; 4]>::try_from(
+        rpc_ports.iter().map(|port| format!("http://127.0.0.1:{port}")).collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let mut guard = ProcessGuard::empty();
+    rpc_ports.iter().enumerate().for_each(|(i, &rpc_port)| {
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, test, 0));
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
+
+    let mut rejoin = || -> eyre::Result<()> {
+        network_advancing(&client_urls)?;
+        wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
+            Ok(sent.load(Ordering::Relaxed) > 0)
+        })?;
+        let mut child2 = guard.take(2).ok_or_else(|| eyre::eyre!("missing child 2"))?;
+        kill_child(&mut child2);
+        wait_for_downtime(&client_urls, RESTART_TEST_DOWNTIME_SECS)?;
+        let metrics_port = get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
+        let metrics_addr = format!("127.0.0.1:{metrics_port}");
+        let sent_at_restart = sent.load(Ordering::Relaxed);
+        guard.replace(
+            2,
+            start_validator_with_args(
+                2,
+                bin,
+                &temp_path,
+                rpc_port2,
+                test,
+                1,
+                &["--metrics", &metrics_addr],
+            ),
+        );
+        wait_until_blocking(
+            LOADED_REJOIN_TIMEOUT,
+            "lagged validator to catch up and rejoin while the load runs",
+            || {
+                Ok(scrape_metrics(&metrics_addr).is_ok_and(|metrics| {
+                    get_node_mode(&client_urls[2])
+                        .is_ok_and(|mode| restart_catch_up_complete(mode, &metrics))
+                }))
+            },
+        )?;
+        eyre::ensure!(
+            !load.is_finished() && sent.load(Ordering::Relaxed) > sent_at_restart,
+            "the load stopped before the lagged validator rejoined"
+        );
+        Ok(())
+    };
+    let rejoined = rejoin();
+    stop.store(true, Ordering::Relaxed);
+    let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
+    guard.kill_all();
+    rejoined
+        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))
+        .and(joined)
 }
