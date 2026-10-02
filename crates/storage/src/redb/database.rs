@@ -11,7 +11,8 @@ use redb::{
 
 use tn_types::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
 
-use super::wraps::{KeyWrap, ValWrap};
+use super::wraps::{KeyWrap, RawBytes, ValWrap};
+use crate::epoch_db_recovery::RawRows;
 
 #[derive(Debug)]
 pub struct ReDbTx {
@@ -258,6 +259,27 @@ impl Database for ReDB {
 
     fn compact(&self) -> eyre::Result<()> {
         self.db.write().compact()?;
+        Ok(())
+    }
+}
+
+impl RawRows for ReDB {
+    fn for_each_raw_row<T: Table>(&self, mut visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
+        let td = TableDefinition::<RawBytes<T::Key>, RawBytes<T::Value>>::new(T::NAME);
+        let table = self.db.read().begin_read()?.open_table(td)?;
+        for row in table.iter()? {
+            let (key, value) = row?;
+            visit(key.value(), value.value());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn insert_raw_row<T: Table>(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
+        let td = TableDefinition::<RawBytes<T::Key>, RawBytes<T::Value>>::new(T::NAME);
+        let txn = self.db.read().begin_write()?;
+        txn.open_table(td)?.insert(key, value)?;
+        txn.commit()?;
         Ok(())
     }
 }
