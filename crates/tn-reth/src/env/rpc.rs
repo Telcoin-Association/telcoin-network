@@ -688,7 +688,8 @@ mod tests {
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<Methods> {
-        let mut genesis = test_genesis();
+        // Historical requests reconstruct this genesis, so its hash must be reproducible.
+        let mut genesis = tn_types::test_genesis_at(0);
         genesis.base_fee_per_gas = Some(u128::from(header_fee));
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(

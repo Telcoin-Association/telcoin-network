@@ -109,13 +109,14 @@ async fn test_rpc_simulation_rejects_cap_below_epoch_fee() -> eyre::Result<()> {
 }
 
 /// Explicit block numbers and hashes retain the header fee even when the live epoch is cheaper.
+/// Its timestamp matches the shared fixture even if setup crosses a second boundary.
 #[tokio::test]
 async fn test_rpc_simulation_preserves_historical_fee() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
     let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
-    let mut genesis = test_genesis();
+    let mut genesis = tn_types::test_genesis_at(0);
     genesis.base_fee_per_gas = Some(1_000);
     let chain: RethChainSpec = genesis.into();
     let blocks =
