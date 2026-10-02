@@ -454,7 +454,6 @@ mod tests {
                 RpcModule::new(()),
             )
             .map(|server| (server.methods_by(|name| name.starts_with("eth_send")), pool, chain))
-            .map_err(Into::into)
     }
 
     /// Shrink closes raw admission before listener shutdown; retained modules reopen on regrow.
