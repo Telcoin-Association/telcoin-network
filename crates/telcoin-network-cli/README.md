@@ -156,8 +156,8 @@ A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wal
 ```bash
 telcoin-network keytool set-rpc \
     --datadir /var/lib/telcoin \
-    --http https://validator.example.com:8545/ \
-    --ws wss://validator.example.com:8546/
+    --http https://rpc.validator.example.com/ \
+    --ws wss://rpc.validator.example.com/
 ```
 
 `--http` is the required HTTP/HTTPS endpoint; `--ws` is the optional WebSocket endpoint. Both are validated with the same check node startup applies — `--http` must use the `http` or `https` scheme and `--ws` must use `ws` or `wss` — so a bad scheme fails immediately instead of being advertised and rejected by peers.
@@ -170,7 +170,7 @@ telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
 
 `--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
 
-Validators should set this endpoint, because observers forward the transactions they accept to it. Advertise an `https://` URL served by a TLS reverse proxy, keep the node's RPC server on loopback, and never advertise a private address: observers refuse to dial one. [Validator production operations](../../docs/src/getting-started/validator-operations.md#advertising-an-rpc-endpoint) has the full rules.
+Validators should set this endpoint, because observers forward the transactions they accept to it. Advertise an `https://` URL served by a gateway or TLS reverse proxy, never the node's own RPC ports, and never a private address: observers refuse to dial one. [Validator production operations](../../docs/src/getting-started/validator-operations.md#advertising-an-rpc-endpoint) has the full rules.
 
 ## Genesis ceremony
 

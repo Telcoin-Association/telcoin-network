@@ -37,7 +37,7 @@ Distribute validator and sentry addresses through an authenticated operator chan
 
 Validators should advertise a JSON-RPC endpoint. Observers do not gossip the transactions they accept. They forward each one over JSON-RPC to the endpoint advertised by the committee validator whose slot owns the sender's account, and fall back to another validator's endpoint when that one has none or cannot be reached (see [Observer](../architecture/network.md#observer)). A validator without an endpoint receives no forwarded transactions, and if no committee validator advertises one, observers cannot forward at all.
 
-Keep the node's own RPC server on loopback (`--http.addr 127.0.0.1`, the default) and publish it through a TLS reverse proxy on the same host, so the raw RPC port stays private as [Network topology](#network-topology) requires. If the proxy runs on a separate gateway instead, bind the RPC server to a private interface that only the gateway can reach. Either way, advertise the proxy's `https://` URL, never the node's RPC port:
+Serve the endpoint from a gateway, as [Network topology](#network-topology) recommends: bind the node's RPC server to a private interface that only the gateway can reach, terminate TLS on the gateway, and keep the validator host off the public internet. A TLS reverse proxy on the validator host itself, in front of an RPC server on loopback (`--http.addr 127.0.0.1`, the default), also works, but it exposes the validator host to the internet. Either way, advertise the gateway's or proxy's `https://` URL, never the node's own RPC ports:
 
 ```bash
 telcoin-network keytool set-rpc \
@@ -51,8 +51,8 @@ Choose the URL with these rules:
 
 - use `https://`: the node also accepts `http://`, but observers then send signed transactions in cleartext;
 - use a public hostname or address: observers refuse loopback, private-use (RFC 1918), link-local, unique-local, shared-address-space and unspecified addresses, and the `localhost` and `.local` names, so an endpoint on one of them receives no forwarded transactions;
-- make sure the hostname resolves to a public address, because that check reads the host as written and does not resolve DNS;
-- rate-limit the proxy, because the endpoint is published in the validator's node record and anyone can find it.
+- make sure the hostname resolves to a public address: the check reads the host as written and does not resolve DNS, so a hostname that resolves to a private address passes it, and observers then dial that address, fail to reach it, and forward nothing to this validator;
+- rate-limit the gateway or proxy, because the endpoint is published in the validator's node record and anyone can find it.
 
 Networks where one operator runs every validator, such as a single-host test network that advertises `127.0.0.1`, can let observers dial private addresses with [`allow_private_forward_targets`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/telcoin-network-cli/README.md#allow_private_forward_targets). Production networks leave it off.
 
