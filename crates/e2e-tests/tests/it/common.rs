@@ -649,7 +649,8 @@ pub(crate) fn send_and_confirm(
     }
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
+    let expected_bal =
+        current_basefee.checked_div(nonce).map_or(0, |per_tx| current_basefee + per_tx);
     if nonce > 0 && bal < expected_bal {
         error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
@@ -789,13 +790,16 @@ pub(crate) fn create_genesis_for_test(
 
     // create the initial committee of validators and create genesis
     let genesis = config_committee(
-        CommitteeDirectories { temporary: temp_path, shared_genesis: &shared_genesis_dir },
-        passphrase,
-        governance_wallet,
-        accounts,
-        committee,
-        epoch_duration,
-        None,
+        temp_path,
+        &shared_genesis_dir,
+        GenesisConfig {
+            passphrase,
+            consensus_registry_owner: governance_wallet,
+            accounts,
+            validators: committee,
+            epoch_duration,
+            chain_id: None,
+        },
     )?;
 
     // copy genesis for the extra validator
@@ -816,13 +820,20 @@ pub(crate) fn create_genesis_for_test(
     Ok(genesis)
 }
 
-/// File locations used to prepare a test committee.
-#[derive(Debug)]
-pub(crate) struct CommitteeDirectories<'a> {
-    /// Directory containing the individual validator configurations.
-    pub(crate) temporary: &'a Path,
-    /// Directory containing the shared genesis ceremony.
-    pub(crate) shared_genesis: &'a Path,
+/// Genesis inputs for [`config_committee`].
+pub(crate) struct GenesisConfig<'a> {
+    /// Passphrase for the validators' keys.
+    pub(crate) passphrase: Option<String>,
+    /// Owner of the `ConsensusRegistry`.
+    pub(crate) consensus_registry_owner: Address,
+    /// Accounts funded in genesis.
+    pub(crate) accounts: Vec<(Address, GenesisAccount)>,
+    /// The initial committee: node name and execution address.
+    pub(crate) validators: &'a [(&'a str, Address)],
+    /// Epoch duration in seconds.
+    pub(crate) epoch_duration: u64,
+    /// Overrides the genesis ceremony's default chain id (see [`config_committee`]).
+    pub(crate) chain_id: Option<u64>,
 }
 
 /// Configure the initial committee and fund accounts for network genesis.
@@ -835,16 +846,18 @@ pub(crate) struct CommitteeDirectories<'a> {
 /// `2017`, so the two e2e binaries need different ids and neither can be left implicit on the
 /// adiri lane. Pass `None` everywhere else to keep the ceremony default.
 pub(crate) fn config_committee(
-    directories: CommitteeDirectories<'_>,
-    passphrase: Option<String>,
-    consensus_registry_owner: Address,
-    accounts: Vec<(Address, GenesisAccount)>,
-    validators: &Vec<(&str, Address)>,
-    epoch_duration: u64,
-    chain_id: Option<u64>,
+    temp_path: &Path,
+    shared_genesis_dir: &Path,
+    config: GenesisConfig<'_>,
 ) -> eyre::Result<Genesis> {
-    let CommitteeDirectories { temporary: temp_path, shared_genesis: shared_genesis_dir } =
-        directories;
+    let GenesisConfig {
+        passphrase,
+        consensus_registry_owner,
+        accounts,
+        validators,
+        epoch_duration,
+        chain_id,
+    } = config;
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;

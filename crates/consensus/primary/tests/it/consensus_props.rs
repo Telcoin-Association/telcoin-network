@@ -16,19 +16,19 @@ use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, Committee, ReputationScores};
 
-/// A committee and its stable authority ordering, shared by property tests.
-type CachedCommittee = (Committee, Vec<AuthorityIdentifier>);
-
 /// Committees memoized by committee size.
 ///
 /// Building a [CommitteeFixture] generates fresh BLS keypairs for every authority, which
 /// dominates the runtime of these property tests. The properties under test depend only on
 /// the committee for a given size, so each size is built once per test process.
-static COMMITTEE_CACHE: LazyLock<Mutex<HashMap<usize, CachedCommittee>>> =
+/// A committee and its authority ids, in committee order.
+type CommitteeAndIds = (Committee, Vec<AuthorityIdentifier>);
+
+static COMMITTEE_CACHE: LazyLock<Mutex<HashMap<usize, CommitteeAndIds>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Return the memoized [Committee] and authority ids for a committee of `size`.
-fn committee_for_size(size: usize) -> CachedCommittee {
+fn committee_for_size(size: usize) -> (Committee, Vec<AuthorityIdentifier>) {
     COMMITTEE_CACHE
         .lock()
         .unwrap()

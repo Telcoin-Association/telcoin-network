@@ -135,8 +135,7 @@ mod tests {
     fn tracks_latest_execution_and_consensus_after_execution() {
         let mut recent = RecentBlocks::new(4);
         let consensus_num_hash = ConsensusNumHash::new(11, ConsensusHeaderDigest::from([2u8; 32]));
-        let header = ExecHeader { number: 7, ..Default::default() };
-        let executed = SealedHeader::seal_slow(header);
+        let executed = SealedHeader::seal_slow(ExecHeader { number: 7, ..Default::default() });
 
         recent.push_latest(2, consensus_num_hash, Some(executed.clone()));
 

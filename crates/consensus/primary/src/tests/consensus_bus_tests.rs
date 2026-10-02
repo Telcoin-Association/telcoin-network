@@ -243,8 +243,11 @@ impl CanonicalExecutionReader for FakeCanonicalReader {
 /// Seal a distinct execution header at `number`; `salt` (written to `extra_data`) keeps hashes
 /// unique across blocks sharing a height.
 fn sealed_at(number: BlockNumber, salt: u8) -> SealedHeader {
-    let header = ExecHeader { number, extra_data: vec![salt].into(), ..Default::default() };
-    SealedHeader::seal_slow(header)
+    SealedHeader::seal_slow(ExecHeader {
+        number,
+        extra_data: vec![salt].into(),
+        ..Default::default()
+    })
 }
 
 /// Push `header` onto the bus `recent_blocks` ring as the latest executed tip.

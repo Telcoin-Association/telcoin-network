@@ -3343,3 +3343,98 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
 
     Ok(())
 }
+
+/// F16: `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
+/// THIS epoch to the back, so a Byzantine/drip peer fixed in stable `HashMap` order can no longer
+/// starve every retry. A failure recorded for a DIFFERENT epoch does not de-prioritise a peer.
+#[test]
+fn test_order_probe_peers_deprioritises_this_epoch_failures() {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers: Vec<BlsPublicKey> =
+        (0..5).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+
+    // peers[0], peers[1] failed THIS epoch (7); peers[2] failed a DIFFERENT epoch (6, ignored).
+    let mut failed: HashMap<BlsPublicKey, Epoch> = HashMap::new();
+    failed.insert(peers[0], 7);
+    failed.insert(peers[1], 7);
+    failed.insert(peers[2], 6);
+
+    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, &mut rng);
+
+    // Same set, no drops.
+    assert_eq!(
+        ordered.iter().copied().collect::<BTreeSet<_>>(),
+        peers.iter().copied().collect::<BTreeSet<_>>(),
+        "ordering must be a permutation of the input"
+    );
+    // The two this-epoch-failed peers occupy exactly the last two slots (order within a group is
+    // shuffled, so compare as a set).
+    let tail: BTreeSet<BlsPublicKey> = ordered[3..].iter().copied().collect();
+    assert_eq!(
+        tail,
+        [peers[0], peers[1]].into_iter().collect::<BTreeSet<_>>(),
+        "peers that failed this epoch must be probed last"
+    );
+    // peers[2] (failed a different epoch) is NOT de-prioritised — it is among the first three.
+    assert!(
+        ordered[..3].contains(&peers[2]),
+        "a failure recorded for another epoch must not de-prioritise the peer"
+    );
+}
+
+/// F40 + F2 (penalty half): `import_fault_is_peer_caused` admits ONLY faults attributable solely to
+/// the peer's streamed bytes (which then carry the severity `consensus_chain_error_to_penalty`
+/// assigns), and excludes every local/ambiguous error so an honest peer is never banned for this
+/// node's own storage/IO failure.
+#[test]
+fn test_import_fault_is_peer_caused_whitelist() {
+    use tn_network_libp2p::Penalty;
+    let peer_caused =
+        |e: ConsensusChainError| PrimaryNetworkHandle::import_fault_is_peer_caused(&e);
+    let cc = ConsensusChainError::PackError;
+
+    // Peer-caused stream faults -> penalised (and the severity is the mapper's).
+    assert!(peer_caused(cc(PackError::InvalidConsensusChain)));
+    assert!(peer_caused(cc(PackError::InvalidConsensusNumber(2, 1))));
+    assert!(peer_caused(cc(PackError::EmptySubDag)));
+    assert!(peer_caused(cc(PackError::BatchTooLarge { size: 2, max: 1 })));
+    assert!(peer_caused(cc(PackError::OutputTooLarge { size: 2, max: 1 })));
+    assert!(peer_caused(cc(PackError::TooManyBatches(9))));
+    assert!(peer_caused(cc(PackError::MissingBatch)));
+    assert!(peer_caused(ConsensusChainError::EmptyImport));
+    assert!(peer_caused(ConsensusChainError::InvalidImport));
+    // A record out of place / not what the header declares, or one that fails its CRC/decode, is
+    // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
+    // same).
+    assert!(peer_caused(cc(PackError::UnexpectedRecord("batch before header".into()))));
+    assert!(peer_caused(cc(PackError::UndecodableRecord("crc failed".into()))));
+    for error in [
+        PackError::UnexpectedRecord("batch before header".into()),
+        PackError::UndecodableRecord("crc failed".into()),
+    ] {
+        assert!(matches!(
+            PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(error)),
+            Some(Penalty::Medium)
+        ));
+    }
+    // Severity check: the whitelisted OOM/wedge faults are Severe.
+    assert!(matches!(
+        PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(PackError::BatchTooLarge {
+            size: 2,
+            max: 1
+        })),
+        Some(Penalty::Severe)
+    ));
+
+    // Local / ambiguous errors -> NEVER charge the peer.
+    assert!(!peer_caused(cc(PackError::CorruptPack("local recovery".into()))));
+    assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
+    assert!(!peer_caused(cc(PackError::Append("io".into()))));
+    assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // A transport failure or timeout says nothing about the sender's bytes.
+    assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
+    assert!(!peer_caused(ConsensusChainError::EpochMismatch));
+    assert!(!peer_caused(ConsensusChainError::PrevCommitteeEpochMismatch));
+    assert!(!peer_caused(ConsensusChainError::CrcError));
+    assert!(!peer_caused(ConsensusChainError::NoCurrentEpoch));
+}

@@ -909,22 +909,21 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
     // `test-source` sends every transfer, so its nonce must stay monotonic.
     let funded_key = get_key("test-source");
     let mut last_gas_epoch: Option<(u32, u64)> = None;
-    for (sent_nonce, i) in (0_u128..).zip(0..FEE_WARMUP_MAX_EPOCHS) {
+    for (i, nonce) in (0..FEE_WARMUP_MAX_EPOCHS).zip(0_u128..) {
         let next_epoch = last_gas_epoch.map_or(1, |(epoch, _)| epoch + 1);
         wait_for_epoch_at_least(&provider, next_epoch).await?;
         // Land on a MEASURED mid-epoch phase so the transaction clears both boundaries and the
         // epoch credited with its gas is exactly the one measured here.
         let snap = wait_for_mid_epoch(&provider, &client_urls[0]).await?;
         let to = address_from_word(&format!("state-export-fee-warmup-{i}"));
-        let (block, fee) = land_fee_warmup_tx(&client_urls[0], &funded_key, to, sent_nonce)
-            .await
-            .map_err(|e| {
-            eyre::eyre!(
-                "epoch {}: warm-up tx (nonce {sent_nonce}) did not confirm: {e}. Check \
+        let (block, fee) =
+            land_fee_warmup_tx(&client_urls[0], &funded_key, to, nonce).await.map_err(|e| {
+                eyre::eyre!(
+                    "epoch {}: warm-up tx (nonce {nonce}) did not confirm: {e}. Check \
                      crates/e2e-tests/test_logs/state_export_fee/",
-                snap.epoch_id
-            )
-        })?;
+                    snap.epoch_id
+                )
+            })?;
         info!(target: "restart-test", epoch = snap.epoch_id, block, fee, "fee warm-up epoch");
         last_gas_epoch = Some((snap.epoch_id, fee));
         if fee >= FEE_WARMUP_FLOOR {
