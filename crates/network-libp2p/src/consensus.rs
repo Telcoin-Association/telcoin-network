@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::{node_record_key, KadStore},
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
@@ -148,19 +148,20 @@ enum RecordFreshness {
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
 ///
-/// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of its
-/// own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct* `PeerId`s, so one
-/// peer holding many simultaneous connections still counts as one, and the inbound admission
-/// callback rejects only self-connections and banned peers. Without this cap a single unbanned peer
-/// could open connections up to the OS / QUIC file-descriptor and memory limits. Installing a
-/// [`connection_limits::Behaviour`] with this per-peer bound closes that gap (issue #1010).
+/// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of
+/// its own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct*
+/// `PeerId`s, so one peer holding many simultaneous connections still counts as one, and the
+/// inbound admission callback rejects only self-connections and banned peers. Without this cap
+/// a single unbanned peer could open connections up to the OS / QUIC file-descriptor and
+/// memory limits. Installing a [`connection_limits::Behaviour`] with this per-peer bound
+/// closes that gap (issue #1010).
 ///
-/// The value is generous headroom over legitimate use: a peer needs at most one inbound and one
-/// outbound connection concurrently (this node dials with `PeerCondition::Disconnected`, so it does
-/// not stack redundant outbound dials), and brief reconnection churn adds only a small transient
-/// overlap. Eight leaves room for that churn while bounding a hostile peer to a fixed, small number
-/// of connections instead of an unbounded fan-out.
-const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
+/// The value is generous headroom over legitimate use: a peer needs at most one inbound and
+/// one outbound connection concurrently (this node dials with `PeerCondition::Disconnected`,
+/// so it does not stack redundant outbound dials), and brief reconnection churn adds only a
+/// small transient overlap. Eight leaves room for that churn while bounding a hostile peer to
+/// a fixed, small number of connections instead of an unbounded fan-out.
+pub(crate) use tn_config::MAX_ESTABLISHED_CONNECTIONS_PER_PEER;
 
 /// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
 /// established) for one swarm.
@@ -534,6 +535,25 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let required_worker = match network_type {
+            NetworkType::Primary => None,
+            NetworkType::Worker(id) => Some(id),
+        };
+        network_config
+            .validate_operator_inventory(network_config.bootstrap_peers(), required_worker)
+            .map_err(|error| NetworkError::ProtocolError(error.to_string()))?;
+        let hub_connections = network_config
+            .dao_observers()
+            .map(|profile| {
+                profile.max_peers().checked_mul(MAX_ESTABLISHED_CONNECTIONS_PER_PEER).ok_or_else(
+                    || {
+                        NetworkError::ProtocolError(
+                            "DAO hub connection budget overflows u32".into(),
+                        )
+                    },
+                )
+            })
+            .transpose()?;
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -658,6 +678,15 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        hub_connections.into_iter().for_each(|total| {
+            behavior.connection_limits = connection_limits::Behaviour::new(
+                ConnectionLimits::default()
+                    .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+                    .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS))
+                    .with_max_pending_outgoing(Some(total))
+                    .with_max_established(Some(total)),
+            );
+        });
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -676,13 +705,18 @@ where
         if restored > 0 {
             info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
+        behavior.peer_manager.configure_operator_peers(network_config, network_type)?;
 
         let network_pubkey = keypair.public().into();
 
         // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
         let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
         let quic_limits = QuicIncomingLimits::new(
-            network_config.peer_config().max_priority_peers(),
+            network_config
+                .dao_observers()
+                .map_or(network_config.peer_config().max_priority_peers(), |profile| {
+                    usize::try_from(profile.max_peers()).unwrap_or(usize::MAX)
+                }),
             MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
         );
         let quic_stats = std::sync::Arc::clone(&quic_incoming);
@@ -1054,6 +1088,7 @@ where
                     },
                     reply,
                 );
+                self.refresh_explicit_peers();
             }
             NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
@@ -1268,6 +1303,7 @@ where
                 // any peer that exits the three-slot window is demoted.
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                self.refresh_explicit_peers();
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
@@ -1328,6 +1364,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconcile gossip mesh privileges for connected peers after committee rotation.
+    ///
+    /// Operator trust survives rotation; committee protection ends when the final slot expires.
+    fn refresh_explicit_peers(&mut self) {
+        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    fn refresh_explicit_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let protected = self.swarm.is_connected(peer)
+            && manager.peer_is_important(peer)
+            && !manager.peer_banned(peer);
+        if protected {
+            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+        } else {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
     }
 
     /// Process gossip events.
@@ -1460,7 +1517,10 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(peer_id, Penalty::Load(LoadPenalty::SlowPeer));
             }
         }
 
@@ -1602,7 +1662,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -1972,6 +2032,7 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table
@@ -2278,7 +2339,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
             }
             PutRecordRate::Shed => {
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
@@ -2386,7 +2450,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
@@ -2479,14 +2543,18 @@ where
     /// lost: peers push their own records on first connect (an inbound kad put handled by
     /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(|query| query.result.map(|record| (query.request, record)))
+            .into_iter()
+            .for_each(|(request, node_record)| {
+                let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
-        }
+                    .add_discovered_peer(request, node_record.info);
+                self.refresh_explicit_peer(&peer);
+            });
     }
 }
 

@@ -10,6 +10,8 @@ use std::{
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 
+pub use super::penalty::Penalty;
+
 /// Domain identity for a tracked peer.
 ///
 /// Telcoin associates a [BlsPublicKey] with a peer once its network settings are known
@@ -33,23 +35,6 @@ pub(super) enum PeerIdentity {
     Unidentified(PeerId),
 }
 
-/// Why a peer is exempt from the score model and penalties for the current epoch.
-///
-/// A peer subject to normal scoring has no basis (`None`). The two provenances are kept
-/// distinct on purpose (issue #715): operator allowlisting is sticky - set at construction
-/// and never altered by epoch rotation - whereas validator status is derived live from the
-/// tracked committee slots, so a validator rotating out of committee can never strip operator
-/// trust.
-/// Only the exemption *decision* (presence) drives behaviour; the variant is carried for
-/// observability (it names which provenance suppressed a penalty in logs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TrustBasis {
-    /// Explicitly allowlisted by the node operator.
-    Operator,
-    /// Sits in a tracked committee slot: the previous, current, or next epoch's committee.
-    Validator,
-}
-
 /// Events for the `PeerManager`.
 #[derive(Debug)]
 pub(crate) enum PeerEvent {
@@ -65,7 +50,10 @@ pub(crate) enum PeerEvent {
     DisconnectPeerX(PeerId, PeerExchangeMap),
     /// Peer manager has identified a peer and associated ip addresses to ban.
     Banned(PeerId),
-    /// Peer manager has unbanned a peer and associated ip addresses.
+    /// Both identity-ban owners (reputation and reconnect cache) now permit the peer.
+    /// Ordinary table eviction never emits this event. Capacity eviction or expiry of one
+    /// ban cache emits it only when the other no longer owns an identity ban; IP admission
+    /// restrictions remain independently enforced even when an identity is forgiven.
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers kad queries.
     MissingAuthorities(Vec<BlsPublicKey>),
@@ -97,32 +85,6 @@ impl PeerAction {
     pub(super) fn is_ban(&self) -> bool {
         matches!(self, PeerAction::Ban(_))
     }
-}
-
-/// Penalties applied to peers based on the significance of their actions.
-///
-/// Each variant has an associated score change.
-///
-/// NOTE: the number of variations is intentionally low.
-/// Too many variations or specific penalties would result in more complexity.
-#[derive(Debug, Clone, Copy)]
-pub enum Penalty {
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a high tolerance for this type of error and will be banned ~50 occurances.
-    Mild,
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a medium tolerance for this type of error and will be banned ~10 occurances.
-    Medium,
-    /// The penalty assessed for actions that are likely not malicious, but will not be tolerated.
-    ///
-    /// The peer will be banned after ~5 occurances (based on -100).
-    Severe,
-    /// The penalty assessed for unforgiveable actions.
-    ///
-    /// This type of action results in disconnecting from a peer and banning them.
-    Fatal,
 }
 
 /// Request for dialing peers.

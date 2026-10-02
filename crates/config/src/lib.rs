@@ -23,5 +23,9 @@ mod traits;
 pub use traits::*;
 mod network;
 pub use network::*;
+mod observers;
+pub use observers::{
+    DaoObserverProfile, ObserverConfigError, TrustedNode, MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+};
 mod retry;
 pub use retry::*;

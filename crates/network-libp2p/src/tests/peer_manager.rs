@@ -1,9 +1,13 @@
 //! Unit tests for peer manager
 
+#[path = "peer_admission.rs"]
+mod peer_admission;
+
 use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
@@ -131,6 +135,7 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
+/// Trusted peers bypass load penalties but remain eligible for protocol bans.
 #[tokio::test]
 async fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
@@ -164,11 +169,14 @@ async fn test_add_trusted_peer() {
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // assert penalty doesn't affect trusted peer
-    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    // Load penalties do not affect a trusted peer's score or ban status.
+    peer_manager.process_penalty(peer_id, Penalty::Load(LoadPenalty::Timeout));
     assert!(!peer_manager.peer_banned(&peer_id));
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
+
+    // Protocol violations can still ban a trusted peer.
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    assert!(peer_manager.peer_banned(&peer_id));
 }
 
 #[tokio::test]
@@ -1716,26 +1724,24 @@ async fn test_register_outgoing_connection() {
     assert!(peer_manager.is_connected(&peer_id));
 }
 
+/// A population committed before a new reservation still enforces the admission bound.
 #[tokio::test]
-async fn test_peer_limit_reached() {
+async fn test_admission_peer_limit_reached() {
     let mut peer_manager = create_test_peer_manager(None);
 
-    // Create many connected peers to reach the limit
-    let mut peer_ids = Vec::new();
-    for _ in 0..50 {
-        let peer_id = register_peer(&mut peer_manager, None);
-        peer_ids.push(peer_id);
-    }
-
-    // Create endpoint for inbound connection
-    let multiaddr = create_multiaddr(None);
-    let endpoint = ConnectedPoint::Listener {
-        local_addr: multiaddr.clone(),
-        send_back_addr: multiaddr.clone(),
-    };
-
-    // Check if peer limit is reached
-    assert!(peer_manager.peer_limit_reached(&endpoint), "Peer limit should be reached");
+    (0..peer_manager.config.max_peers()).for_each(|_| {
+        register_peer(&mut peer_manager, None);
+    });
+    assert!(
+        peer_manager
+            .reserve_connection(
+                ConnectionId::new_unchecked(1),
+                PeerId::random(),
+                Endpoint::Listener
+            )
+            .is_err(),
+        "a new identity must be denied at capacity"
+    );
 }
 
 #[tokio::test]
