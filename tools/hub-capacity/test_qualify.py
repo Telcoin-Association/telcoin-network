@@ -79,6 +79,16 @@ class QualificationTests(unittest.TestCase):
         self.plan = declaration()
         self.run = evidence(self.plan)
 
+    def test_fractional_cpu_limit_preserves_headroom(self):
+        self.plan["envelope"]["cpus_per_hub"] = 1
+        self.plan["thresholds"]["max_cpu_cores"] = 0.75
+        QUALIFY.validate_plan(self.plan)
+        for limit in (0, -0.1, 1, 1.1, float("nan"), float("inf"), True):
+            with self.subTest(limit=limit):
+                self.plan["thresholds"]["max_cpu_cores"] = limit
+                with self.assertRaises(ValueError):
+                    QUALIFY.validate_plan(self.plan)
+
     def test_cancelled_votes_have_a_separate_finite_budget(self):
         operations = self.run["operations"]["committee_progress"]
         operations.extend({"id": f"cancel-{index}", "success": False, "cancelled": True,

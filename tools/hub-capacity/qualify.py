@@ -121,12 +121,12 @@ def validate_plan(plan):
     if not plan["hubs"] or len(set(plan["hubs"])) != len(plan["hubs"]):
         fail("declare distinct hub IDs")
     thresholds = plan["thresholds"]
-    for field in ("max_rss_bytes", "max_cpu_cores", "max_queue_occupancy", "max_progress_stall_seconds"):
+    for field in ("max_rss_bytes", "max_queue_occupancy", "max_progress_stall_seconds"):
         number(thresholds[field], field, 1)
     if thresholds["max_rss_bytes"] > envelope["ram_bytes_per_hub"]:
         fail("RSS threshold exceeds available RAM")
-    if thresholds["max_cpu_cores"] >= envelope["cpus_per_hub"]:
-        fail("CPU threshold must leave aggregate headroom")
+    if not 0 < number(thresholds["max_cpu_cores"], "max_cpu_cores") < envelope["cpus_per_hub"]:
+        fail("CPU threshold must be positive and leave aggregate headroom")
     if set(thresholds["scenarios"]) != SCENARIOS:
         fail("declare acceptance criteria for all eight workload scenarios")
     for scenario, bounds in thresholds["scenarios"].items():
