@@ -13,7 +13,7 @@
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
 use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
-use tn_config::Config;
+use tn_config::{Config, PidLock};
 use tn_exex::ExExInstallFn;
 use tn_reth::{
     error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
@@ -76,6 +76,10 @@ pub struct TnBuilder {
     /// Optional process-local bootstrap dial hints, taking precedence over the network config.
     /// An explicitly empty map selects the genesis fallback.
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    /// The datadir lock, when the caller took it before opening the execution database (so a
+    /// second node is refused before it touches the live node's database). The node holds it for
+    /// its lifetime; see `launch_node`.
+    pid_lock: Option<PidLock>,
 }
 
 impl TnBuilder {
@@ -96,7 +100,20 @@ impl TnBuilder {
             reth_db,
             exex_fns: Vec::new(),
             bootstrap_peers: None,
+            pid_lock: None,
         }
+    }
+
+    /// Hand the node the datadir lock the caller already holds (taken before the execution
+    /// database was opened), instead of having the node take it itself.
+    pub fn with_pid_lock(mut self, pid_lock: PidLock) -> Self {
+        self.pid_lock = Some(pid_lock);
+        self
+    }
+
+    /// Take the datadir lock handed over with [`Self::with_pid_lock`], if any.
+    pub fn take_pid_lock(&mut self) -> Option<PidLock> {
+        self.pid_lock.take()
     }
 
     /// Set the maximum completed export bundles to retain, or leave retention unlimited.
@@ -178,6 +195,17 @@ impl std::fmt::Debug for TnBuilder {
             .field("exex_count", &self.exex_fns.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Lifecycle of a worker's persistent execution components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerState {
+    /// The worker has never been activated in this process.
+    Uninitialized,
+    /// The pool is retained, but the worker's RPC listeners have been stopped.
+    Stopped,
+    /// The worker's RPC listeners are running.
+    Running,
 }
 
 /// Wrapper for the inner execution node components.
@@ -274,14 +302,52 @@ impl ExecutionNode {
         !self.internal.read().await.workers.is_empty()
     }
 
-    /// Returns true if the worker identified by `worker_id` has been initialized.
+    /// Stop RPC listeners for initialized workers outside the current committee.
     ///
-    /// A worker's components (RPC server + transaction pool) are created once and never torn
-    /// down across epoch transitions. Worker 0 is created during process startup, before
-    /// startup epoch-record sync; other workers on the first epoch entry where their id is
-    /// active. Backs the `/health/workers` readiness endpoint.
+    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    pub async fn deactivate_workers_above(&self, active_workers: usize) {
+        self.internal
+            .write()
+            .await
+            .workers
+            .iter_mut()
+            .skip(active_workers)
+            .for_each(WorkerComponents::deactivate);
+    }
+
+    /// Refresh an initialized worker's fee and reopen its RPC listeners if stopped.
+    pub async fn restart_worker_rpc(&self, worker_id: WorkerId, base_fee: u64) -> eyre::Result<()> {
+        let mut guard = self.internal.write().await;
+        let reth_env = guard.reth_env.clone();
+        guard
+            .workers
+            .get_mut(usize::from(worker_id))
+            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))?
+            .restart_rpc(&reth_env, worker_id, base_fee)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Return whether a worker needs initial construction, RPC restart, or task refresh.
+    pub async fn worker_state(&self, worker_id: WorkerId) -> WorkerState {
+        self.internal.read().await.workers.get(usize::from(worker_id)).map_or(
+            WorkerState::Uninitialized,
+            |worker| {
+                if worker.rpc_handle().is_some() {
+                    WorkerState::Running
+                } else {
+                    WorkerState::Stopped
+                }
+            },
+        )
+    }
+
+    /// Return true only while the worker is active and its RPC listeners are running.
+    ///
+    /// Backs the `/health/workers` readiness endpoint. A retained pool alone does not make a
+    /// removed worker ready to accept transactions.
     pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
-        self.internal.read().await.workers.get(worker_id as usize).is_some()
+        self.worker_state(worker_id).await == WorkerState::Running
     }
 
     /// Batch maker
