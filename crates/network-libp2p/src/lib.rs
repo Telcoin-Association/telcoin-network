@@ -19,6 +19,7 @@
 mod codec;
 mod consensus;
 pub mod error;
+mod freshness;
 pub mod kad;
 mod metrics;
 mod peers;
