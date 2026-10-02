@@ -759,6 +759,19 @@ where
         NetworkHandle::new(self.handle.clone())
     }
 
+    /// Attach the process-wide source budget before starting the swarm.
+    ///
+    /// Pass clones of the same instance to the primary and every worker. The budget
+    /// charges only established QUIC endpoints, after the authenticated handshake.
+    #[must_use]
+    pub fn with_source_admission_budget(
+        mut self,
+        budget: Option<crate::source_admission::SourceAdmissionBudget>,
+    ) -> Self {
+        self.swarm.behaviour_mut().peer_manager.set_source_budget(budget);
+        self
+    }
+
     /// Create and sign this node's [NodeRecord].
     fn create_node_record(
         domain: RecordDomain,

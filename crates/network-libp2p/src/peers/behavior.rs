@@ -86,7 +86,7 @@ impl NetworkBehaviour for PeerManager {
 
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
@@ -104,12 +104,13 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
+        self.reserve_source(connection_id, peer, remote_addr)?;
         Ok(ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         addr: &Multiaddr,
         _role_override: Endpoint,
@@ -130,10 +131,12 @@ impl NetworkBehaviour for PeerManager {
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
 
+        self.reserve_source(connection_id, peer, addr)?;
         Ok(ConnectionHandler)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
+        self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id, endpoint, ..
