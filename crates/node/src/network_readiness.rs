@@ -245,6 +245,40 @@ mod tests {
         assert!(!NetworkReadiness::pending().is_reachable());
     }
 
+    /// A command-channel failure after a disconnected sample stays not-ready and can recover.
+    #[tokio::test(start_paused = true)]
+    async fn channel_failure_on_retry_recovers_on_later_probe() -> eyre::Result<()> {
+        let (responses, primary_response) = watch::channel(Ok::<usize, ()>(0));
+        let worker_response = primary_response.clone();
+        let (publisher, mut readiness) = watch::channel(NetworkReadiness::pending());
+        let monitor = tokio::spawn(monitor(
+            publisher,
+            move || ready(*primary_response.borrow()),
+            move || vec![(1, ready(*worker_response.borrow()))],
+        ));
+
+        readiness.changed().await?;
+        let disconnected = readiness.borrow_and_update().clone();
+        assert_eq!(disconnected.primary, SwarmReadiness::Disconnected);
+        assert!(!disconnected.is_reachable());
+
+        responses.send(Err(()))?;
+        readiness.changed().await?;
+        let unavailable = readiness.borrow_and_update().clone();
+        assert_eq!(unavailable.primary, SwarmReadiness::Unavailable);
+        assert!(unavailable
+            .workers
+            .iter()
+            .all(|worker| { worker.connectivity == SwarmReadiness::Unavailable }));
+        assert!(!unavailable.is_reachable());
+
+        responses.send(Ok(1))?;
+        readiness.changed().await?;
+        assert!(readiness.borrow_and_update().is_reachable());
+        monitor.abort();
+        Ok(())
+    }
+
     /// Epoch-task shutdown preserves the monitor, while node shutdown cancels stalled probes.
     #[tokio::test(start_paused = true)]
     async fn epoch_turnover_preserves_monitor_and_node_shutdown_cancels_it() -> eyre::Result<()> {
