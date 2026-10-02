@@ -32,8 +32,10 @@ cooldown request does not extend it or penalize reputation. Discovery eviction d
 erase failures.
 
 Each swarm retains at most its configured disconnected-peer budget (at least one) of
-failed identities. At capacity, new identities defer instead of evicting live failure
-memory. An accepted authoritative mapping may evict the oldest failure to reserve one retry
+failed identities. At capacity, new identities share a finite 120-second overflow cooldown
+instead of evicting live failure memory. Failures of tracked identities do not extend that
+deadline, so saturation cannot permanently defer an unchanged untracked endpoint.
+An accepted authoritative mapping may evict the oldest failure to reserve one retry
 slot, while preserving the same hard cap. Unsigned hints cannot reserve slots. Entries expire
 after 15 idle minutes. Successful authenticated inbound or outbound
 connections clear their entry. An accepted change to a verified BLS-to-network-identity or

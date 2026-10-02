@@ -33,18 +33,26 @@ pub(super) struct DialBackoff<K> {
     failures: HashMap<K, Failure>,
     /// Maximum retained identities, derived from the configured disconnected-peer budget.
     capacity: usize,
+    /// Untracked failures share a finite deadline instead of permanently denying new identities.
+    overflow_retry_at: Option<Instant>,
 }
 
 impl<K: Eq + Hash> DialBackoff<K> {
     /// Create a finite cache, retaining at least one outage entry.
     pub(super) fn new(capacity: usize) -> Self {
-        Self { failures: HashMap::new(), capacity: capacity.max(1) }
+        Self { failures: HashMap::new(), capacity: capacity.max(1), overflow_retry_at: None }
     }
 
     /// Return the remaining delay. At capacity, new identities wait rather than evict live memory.
     pub(super) fn retry_after(&self, key: &K, now: Instant) -> Option<Duration> {
         self.failures.get(key).map_or_else(
-            || (self.failures.len() >= self.capacity).then_some(MAX_DELAY),
+            || {
+                (self.failures.len() >= self.capacity)
+                    .then_some(self.overflow_retry_at)
+                    .flatten()
+                    .filter(|deadline| now < *deadline)
+                    .map(|deadline| deadline.duration_since(now))
+            },
             |failure| (now < failure.retry_at).then(|| failure.retry_at.duration_since(now)),
         )
     }
@@ -52,12 +60,18 @@ impl<K: Eq + Hash> DialBackoff<K> {
     /// Record a real failure; rejected cooldown attempts never call this method.
     pub(super) fn failed(&mut self, key: K, now: Instant) {
         self.prune(now);
+        let had_capacity = self.failures.len() < self.capacity;
         if self.failures.contains_key(&key) || self.failures.len() < self.capacity {
             let delay = self
                 .failures
                 .get(&key)
                 .map_or(Duration::from_secs(1), |old| old.delay.saturating_mul(2).min(MAX_DELAY));
             self.failures.insert(key, Failure { retry_at: now + delay, failed_at: now, delay });
+            if had_capacity && self.failures.len() == self.capacity {
+                self.overflow_retry_at = Some(now + MAX_DELAY);
+            }
+        } else {
+            self.overflow_retry_at = Some(now + MAX_DELAY);
         }
     }
 
@@ -215,6 +229,23 @@ mod tests {
         cache.prune(start + RETENTION);
         assert!(cache.failures.is_empty());
         assert_eq!(cache.retry_after(&99, start + RETENTION), None);
+    }
+
+    #[test]
+    fn exchange_backoff_saturation_has_a_finite_retry_deadline() {
+        let start = Instant::now();
+        let mut cache = DialBackoff::new(1);
+        cache.failed(1, start);
+        assert_eq!(cache.retry_after(&2, start), Some(MAX_DELAY));
+        (1..120).for_each(|seconds| cache.failed(1, start + Duration::from_secs(seconds)));
+        let expired = start + MAX_DELAY;
+        assert_eq!(cache.retry_after(&2, expired), None);
+        assert_eq!(cache.failures.len(), 1);
+        cache.failed(2, expired);
+        assert_eq!(cache.failures.len(), 1);
+        assert_eq!(cache.retry_after(&3, expired), Some(MAX_DELAY));
+        assert_eq!(cache.retry_after(&2, expired + MAX_DELAY), None);
+        assert_eq!(cache.retry_after(&3, expired + MAX_DELAY), None);
     }
 
     #[test]
