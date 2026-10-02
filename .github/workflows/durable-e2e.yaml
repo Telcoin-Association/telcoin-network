@@ -118,6 +118,10 @@ jobs:
           cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
           git diff --exit-code
 
+      - name: Workspace default test lane
+        if: inputs.grace_validation
+        run: ./etc/ci-lanes.sh test-default
+
       - name: Run restart e2e tests
         if: ${{ !inputs.grace_validation }}
         env:
