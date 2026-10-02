@@ -256,6 +256,7 @@ async fn peer_policy_rejection_fallback_and_recovery() -> eyre::Result<()> {
         BTreeMap::new(),
         0,
     )?;
+    let mut committee_first = manager(NetworkType::Primary);
     let mut manager = manager(NetworkType::Primary);
     manager.replace_operator_policy(&accepted, accepted.policy().primary());
     assert_eq!(manager.admission_status().effective(), AdmissionMode::Closed);
@@ -272,6 +273,26 @@ async fn peer_policy_rejection_fallback_and_recovery() -> eyre::Result<()> {
     manager.replace_operator_policy(&recovered, recovered.policy().primary());
     assert_eq!(manager.admission_status().effective(), AdmissionMode::Closed);
     hooks(&mut manager, id, false);
+    committee_first.replace_operator_policy(&accepted, accepted.policy().primary());
+    let other_local = committee_first.local_bls_key.ok_or_else(|| eyre::eyre!("local identity"))?;
+    committee_first.update_committees_at(
+        8,
+        HashSet::new(),
+        HashSet::from([other_local]),
+        HashSet::new(),
+    );
+    committee_first.replace_operator_policy(&rejected, rejected.policy().primary());
+    assert_eq!(committee_first.admission_status().epoch(), Some(8));
+    assert_eq!(committee_first.admission_status().effective(), AdmissionMode::Grace);
+    assert_eq!(committee_first.policy_admission, HashMap::from([(key, id)]));
+    assert_eq!(
+        committee_first.policy_update.as_ref().map(PeerPolicyUpdate::revision),
+        Some(accepted.revision())
+    );
+    committee_first.replace_operator_policy(&recovered, recovered.policy().primary());
+    assert_eq!(committee_first.admission_status().epoch(), Some(8));
+    assert_eq!(committee_first.admission_status().effective(), AdmissionMode::Closed);
+    assert_eq!(committee_first.policy_admission, manager.policy_admission);
     Ok(())
 }
 

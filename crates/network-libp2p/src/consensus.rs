@@ -921,9 +921,12 @@ where
                 NetworkType::Worker(id) => update.policy().worker(id),
             };
             policy.into_iter().for_each(|policy| {
-                let old_ids = self.swarm.behaviour().peer_manager.operator_policy_peer_ids();
-                if self.swarm.behaviour_mut().peer_manager.replace_operator_policy(&update, policy)
-                {
+                if self.swarm.behaviour().peer_manager.needs_operator_policy(&update) {
+                    let old_ids = self.swarm.behaviour().peer_manager.operator_policy_peer_ids();
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .replace_operator_policy(&update, policy);
                     old_ids.iter().for_each(|peer| self.refresh_explicit_peer(peer));
                     self.refresh_explicit_peers();
                     self.metrics.record_peer_policy(&update);

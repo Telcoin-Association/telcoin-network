@@ -503,7 +503,7 @@ impl PeerManager {
         update: &crate::PeerPolicyUpdate,
         policy: &tn_config::SwarmPeerPolicy,
     ) -> bool {
-        if self.policy_update.as_ref().is_none_or(|current| current.attempt() < update.attempt()) {
+        if self.needs_operator_policy(update) {
             let known: HashMap<_, _> = policy
                 .bootstrap()
                 .iter()
@@ -1736,6 +1736,11 @@ impl PeerManager {
     /// Return configuration-owned identities so obsolete explicit mesh entries can be removed.
     pub(crate) fn operator_policy_peer_ids(&self) -> HashSet<PeerId> {
         self.policy_admission.values().copied().collect()
+    }
+
+    /// Skip reconciliation work when this consumer already installed the latest attempt.
+    pub(crate) fn needs_operator_policy(&self, update: &crate::PeerPolicyUpdate) -> bool {
+        self.policy_update.as_ref().is_none_or(|current| current.attempt() < update.attempt())
     }
 
     /// Find the verified BlsPublicKey binding for a known PeerId.
