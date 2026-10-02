@@ -113,6 +113,7 @@ def handler_for(peers):
                 result = peers[name].command(request)
             except (OSError, ValueError, KeyError, TypeError, TimeoutError) as error:
                 result = {"operation_id": request.get("operation_id"), "scenario": request.get("scenario"),
+                          "identity": peers[name].declaration["identity"] if name in peers else None,
                           "success": False, "rejection_reason": str(error)}
             data = json.dumps(result, allow_nan=False, separators=(",", ":")).encode()
             self.send_response(200)

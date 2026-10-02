@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,65 @@ def telemetry():
 
 
 class CollectorTests(unittest.TestCase):
+    def test_operation_finishing_during_metrics_fetch_is_captured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile.json"
+            topology = root / "topology.json"
+            profile.write_text("{}")
+            topology.write_text("{}")
+            phase = {"revision": "a" * 40, "profile": {},
+                     "binary_sha256": {"telcoin-network": "b" * 64}}
+            plan = {"hubs": ["hub"], "baseline": phase, "adapter_command": "synthetic-workload",
+                    "envelope": {"duration_seconds": 4, "committee_peers": 0}}
+            frozen = {"plan": plan, "plan_sha256": COLLECT.QUALIFY.digest(plan)}
+            bindings = {"hubs": {"hub": {"revision": phase["revision"], "profile_path": str(profile),
+                        "pid": 42, "metrics_url": "http://synthetic.invalid/metrics"}},
+                        "workload": ["synthetic-workload"], "topology_artifact": str(topology),
+                        "protocol_logs": []}
+            output = root / "evidence"
+            clock = {"time": 0.0, "reads": 0, "completed": False}
+
+            def metrics_read(_maximum):
+                clock["reads"] += 1
+                if clock["reads"] == 3:
+                    clock["time"] += 0.5
+                    clock["completed"] = True
+                    operation = {"scenario": "record_lookup", "id": "closing-operation",
+                                 "success": False, "latency_ms": 500,
+                                 "elapsed_seconds": clock["time"], "rejection_reason": "fixture"}
+                    (output / "operations.jsonl").write_text(json.dumps(operation) + "\n")
+                return b""
+
+            def sleep(seconds):
+                clock["time"] += seconds
+
+            child = mock.Mock()
+            child.poll.side_effect = lambda: 0 if clock["completed"] else None
+            child.wait.return_value = 0
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.side_effect = metrics_read
+            # The synthetic deployment bypasses hardware validation. Exercise the real
+            # collection loop and retained operation timestamps, without qualifying capacity.
+            with mock.patch.object(COLLECT.QUALIFY, "validate_plan"), \
+                 mock.patch.object(COLLECT.QUALIFY, "validate_evidence"), \
+                 mock.patch.object(COLLECT, "validate_process"), \
+                 mock.patch.object(COLLECT, "file_hash", return_value="b" * 64), \
+                 mock.patch.object(COLLECT, "process_sample", return_value=(
+                     {"rss_bytes": 1, "cpu_seconds": 0}, 1, "synthetic proc stat")), \
+                 mock.patch.object(COLLECT, "observations", return_value={}), \
+                 mock.patch.object(COLLECT.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(COLLECT.urllib.request, "urlopen", return_value=response), \
+                 mock.patch.object(COLLECT.time, "monotonic", side_effect=lambda: clock["time"]), \
+                 mock.patch.object(COLLECT.time, "sleep", side_effect=sleep):
+                evidence = COLLECT.collect(frozen, bindings, "baseline", output)
+            operation = evidence["operations"]["record_lookup"][0]
+            self.assertEqual(operation["elapsed_seconds"], 4.5)
+            self.assertFalse(operation["success"])
+            self.assertGreaterEqual(evidence["samples"][-1]["elapsed_seconds"], operation["elapsed_seconds"])
+            self.assertEqual(clock["reads"], 4)
+
     def test_full_mapping_and_worker_omission(self):
         binding = {"progress": {"name": "progress"}, "dao_connected": {"name": "dao"}}
         parsed = COLLECT.parse_metrics(telemetry())
