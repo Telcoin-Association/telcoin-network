@@ -187,7 +187,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
             PrimaryNetworkError::UnknownConsensusOutput(_) => None,
-            PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Load(LoadPenalty::Synchronization)),
+            PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::InvalidEpochVote(_, _, _) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest => Some(Penalty::Medium),
