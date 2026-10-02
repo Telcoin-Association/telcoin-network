@@ -18,6 +18,8 @@ pub enum AdmissionFallback {
     Contradictory,
     /// Committee records or identity mappings are still unresolved.
     Unresolved,
+    /// A reload failed validation; the last accepted operator snapshot remains installed.
+    OperatorRejected,
 }
 
 /// Observations for one swarm. These counts do not imply consensus readiness.
@@ -94,9 +96,19 @@ pub(super) struct AdmissionPolicy {
     renewed: Option<Instant>,
     /// Rejected update, cleared by a consistent authoritative renewal.
     fault: Option<AdmissionFallback>,
+    /// Operator input validity is independent of committee renewals and rotations.
+    operator_fault: Option<AdmissionFallback>,
 }
 
 impl AdmissionPolicy {
+    /// Update operator validity without altering the accepted committee window or its lease.
+    pub(super) fn set_operator_validity(&mut self, validity: crate::PolicyValidity) {
+        self.operator_fault = match validity {
+            crate::PolicyValidity::Accepted => None,
+            crate::PolicyValidity::Rejected => Some(AdmissionFallback::OperatorRejected),
+        };
+    }
+
     /// Configure admission without accepting network-supplied claims.
     pub(super) fn configure(&mut self, config: AdmissionConfig) {
         self.config = config;
@@ -144,10 +156,16 @@ impl AdmissionPolicy {
         known: &HashMap<BlsPublicKey, NetworkInfo>,
         stubs: &HashSet<BlsPublicKey>,
         operator: &HashMap<BlsPublicKey, PeerId>,
+        configured: &HashMap<BlsPublicKey, PeerId>,
         local: Option<BlsPublicKey>,
         local_peer: PeerId,
         connected: impl Fn(&PeerId) -> bool,
     ) -> (AdmissionStatus, HashSet<PeerId>) {
+        let conflicting_operator = operator
+            .iter()
+            .any(|(key, peer)| configured.get(key).is_some_and(|other| other != peer));
+        let operator: HashMap<_, _> =
+            operator.iter().chain(configured).map(|(key, peer)| (*key, *peer)).collect();
         let resolve = |key: &BlsPublicKey| {
             if Some(*key) == local {
                 Some(local_peer)
@@ -170,7 +188,8 @@ impl AdmissionPolicy {
             .collect();
         let authorized: HashSet<_> = identities.values().copied().collect();
         let unresolved = keys.iter().any(|key| !identities.contains_key(key));
-        let contradictory = authorized.len() != identities.len()
+        let contradictory = conflicting_operator
+            || authorized.len() != identities.len()
             || operator
                 .iter()
                 .any(|(key, peer)| resolve(key).is_some_and(|resolved| resolved != *peer));
@@ -195,7 +214,7 @@ impl AdmissionPolicy {
                 (resolved, n.saturating_sub(n.saturating_sub(1) / 3), connected_count)
             })
             .unwrap_or_default();
-        let fallback = self.fault.or_else(|| match () {
+        let fallback = self.operator_fault.or(self.fault).or_else(|| match () {
             () if self.snapshot.is_none() => Some(AdmissionFallback::Missing),
             () if self.renewed.is_none_or(|at| at.elapsed() >= self.config.snapshot_max_age()) => {
                 Some(AdmissionFallback::Stale)
@@ -211,7 +230,9 @@ impl AdmissionPolicy {
             AdmissionMode::Grace => AdmissionMode::Grace,
             AdmissionMode::Closed => {
                 fallback.map_or(AdmissionMode::Closed, |reason| match reason {
-                    AdmissionFallback::Unresolved => AdmissionMode::Grace,
+                    AdmissionFallback::Unresolved | AdmissionFallback::OperatorRejected => {
+                        AdmissionMode::Grace
+                    }
                     AdmissionFallback::Missing
                     | AdmissionFallback::Stale
                     | AdmissionFallback::Contradictory => AdmissionMode::Open,

@@ -64,6 +64,8 @@ pub(super) struct AllPeers {
     ///
     /// Pre-emptively tracked so they are not banned before they begin voting.
     next_committee: HashSet<BlsPublicKey>,
+    /// Reload-owned trusted transport identities, replaced independently of other grants.
+    policy_trusted: HashSet<PeerId>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -91,6 +93,7 @@ impl AllPeers {
             previous_committee: Default::default(),
             current_committee: Default::default(),
             next_committee: Default::default(),
+            policy_trusted: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -446,13 +449,14 @@ impl AllPeers {
         let previous = &self.previous_committee;
         let current = &self.current_committee;
         let next = &self.next_committee;
+        let policy_trusted = &self.policy_trusted;
         let unbanned_peers = self.peers.iter_mut().filter_map(|(id, peer)| {
             let validator = match id {
                 PeerIdentity::Confirmed(key) => previous.contains(key) || current.contains(key) || next.contains(key),
                 PeerIdentity::Unidentified(_) => false,
             };
             let policy = PeerPolicy::from_bases(
-                peer.is_operator_allowlisted().then_some(TrustBasis::Operator).into_iter()
+                (peer.is_operator_allowlisted() || Self::peer_id_for(id, peer).is_some_and(|id| policy_trusted.contains(&id))).then_some(TrustBasis::Operator).into_iter()
                     .chain(validator.then_some(TrustBasis::Validator)),
             );
             let update = peer.heartbeat(policy);
@@ -889,13 +893,44 @@ impl AllPeers {
     ///
     /// Committee rotation revokes only committee-derived privileges; operator trust survives.
     pub(super) fn peer_policy(&self, peer_id: &PeerId) -> PeerPolicy {
-        let operator = self.get_peer(peer_id).is_some_and(|peer| peer.is_operator_allowlisted());
+        let operator = self.policy_trusted.contains(peer_id)
+            || self.get_peer(peer_id).is_some_and(|peer| peer.is_operator_allowlisted());
         PeerPolicy::from_bases(
             operator
                 .then_some(TrustBasis::Operator)
                 .into_iter()
                 .chain(self.is_peer_validator(peer_id).then_some(TrustBasis::Validator)),
         )
+    }
+
+    /// Replace only reload-owned trust; explicit grants and committee membership survive.
+    pub(super) fn replace_policy_trusted(&mut self, peers: HashSet<PeerId>) {
+        self.policy_trusted = peers;
+    }
+
+    /// Preserve attributable BLS reputation when configuration rotates its transport identity.
+    pub(super) fn bls_protocol_banned(&self, key: &BlsPublicKey) -> bool {
+        self.peers.get(&PeerIdentity::Confirmed(*key)).is_some_and(|peer| {
+            peer.has_protocol_penalty() && peer.reputation() == Reputation::Banned
+        })
+    }
+
+    /// Carry attributable protocol evidence across an operator-owned transport replacement.
+    ///
+    /// The destination stays unidentified until its signed record arrives. This grants neither
+    /// BLS authentication nor committee membership and preserves existing resource accounting.
+    pub(super) fn carry_policy_reputation(&mut self, previous: &PeerId, replacement: &PeerId) {
+        let evidence = self.get_peer(previous).filter(|peer| peer.has_protocol_penalty()).cloned();
+        evidence.into_iter().for_each(|evidence| {
+            let identity = self.identity_for(replacement);
+            self.peers.entry(identity).or_default().retain_worse_reputation(&evidence);
+            if self
+                .get_peer(replacement)
+                .is_some_and(|peer| peer.reputation() == Reputation::Banned)
+            {
+                self.update_connection_status(replacement, NewConnectionStatus::Banned);
+            }
+        });
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.

@@ -40,6 +40,7 @@ metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
+serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }

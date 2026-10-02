@@ -196,6 +196,30 @@ Every series below is exported under the `tn_network` prefix and carries a `netw
 | `outbound_request_failures_total` | Outbound request failures, labelled `kind` with the failure cause. |
 | `px_disconnects_pending` | Graceful peer-exchange disconnects awaiting the peer's acknowledgement. |
 
+
+## Reloading trusted and bootstrap connectivity
+
+On Unix, edit the existing YAML file `<datadir>/network-config`, then send `SIGHUP` to the node PID:
+
+```sh
+kill -HUP <node-pid>
+```
+
+Use the same OS account that owns the node and its data directory, or an authorized system administrator. File permissions and Unix signal permissions define the operator interface. Write a complete sibling file, preserve its owner and permissions, and atomically rename it over `network-config` before signaling. Reload only changes `trusted_nodes` and `bootstrap_peers`. Other network settings, the supported worker IDs, and admission rollout mode require a restart.
+
+The entire file is decoded and every primary/worker identity binding is validated before publication. A CLI bootstrap override keeps precedence for the process lifetime. An empty bootstrap map selects the original genesis fallback, so it does not revoke genesis bootstrap peers. To replace that fallback, provide a nonempty map. Trusted and bootstrap entries may share a BLS key only with consistent transport identities; trusted hints take precedence for reconnects when both own the same identity.
+
+One immutable revision is published to the primary and every configured worker, including workers awaiting activation. Each swarm replaces its admission grants, reconnect schedules, retained hints and gossip treatment together between swarm polls. Application is asynchronous across swarms; no swarm installs a partial endpoint map. Committee epochs have independent revisions and do not replace the operator snapshot.
+
+Removing an entry cancels its configuration-owned future retries and queued dials, removes its policy pin, and strips its former retention, mesh and load-scoring privileges. Separate explicit grants and previous/current/next committee membership survive. A remaining bootstrap grant still supplies admission and retained record hints, with ordinary retention and load scoring. In valid Closed mode, live connections with no remaining grant are disconnected without adding a reputation penalty. Open and Grace keep those connections as ordinary peers. In-flight dials are checked at establishment against the applied policy. Protocol evidence and bans survive transport replacements; configuration does not authenticate BLS records or authorize committee gossip.
+
+A missing, malformed, oversized or contradictory file publishes a rejected attempt while retaining the exact last accepted snapshot. Closed admission falls back to Grace on affected swarms until a valid reload clears the operator fault. Committee renewals cannot clear that fault; their own missing, stale or contradictory inputs retain the existing Open/Grace fallback rules. Signatures and finite connection, stream, message and memory budgets remain active in every mode.
+
+Reload reads at most 1 MiB plus one overflow byte. The union of configured BLS entries cannot exceed startup `peer_config.target_num_peers`, using the same validation at startup and reload. Signals are processed serially and coalesced, watch retains only the latest publication, and each swarm shares one retry timer with at most one schedule per configured peer. Unchanged endpoints retain backoff. Shutdown stops the reader and drops retry state with the swarms.
+
+Observe `tn_node.peer_policy_reload_total`, labeled only by finite `outcome` and `reason` values, and the per-network `tn_network.peer_policy_updates_total`, `peer_policy_attempt` and `peer_policy_revision` metrics. Revisions are gauge values, never label values. `admission_fallback` value `5` identifies rejected operator input. Reload logs contain attempt numbers, accepted revisions and rejection categories without keys or file contents.
+
+
 ## Source of truth
 
 | Behavior | Code |

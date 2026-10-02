@@ -535,6 +535,17 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// Role and shared revision used to avoid duplicate node-owned reconnect tasks.
+    peer_policy: Option<OperatorPolicyWatch>,
+}
+
+/// One handle's role within the process-wide operator policy.
+#[derive(Clone, Debug)]
+struct OperatorPolicyWatch {
+    /// Transport role choosing primary or one specific worker's endpoints.
+    network_type: NetworkType,
+    /// Latest accepted snapshot and independent rejection status.
+    updates: tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -544,7 +555,30 @@ where
 {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, peer_policy: None }
+    }
+
+    /// Attach the owning swarm's role and shared policy to this handle.
+    pub(crate) fn with_peer_policy(
+        mut self,
+        network_type: NetworkType,
+        updates: Option<tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>>,
+    ) -> Self {
+        self.peer_policy = updates.map(|updates| OperatorPolicyWatch { network_type, updates });
+        self
+    }
+
+    /// Whether this specific swarm already owns reconnect work for the requested identity.
+    pub fn maintains_operator_peer(&self, key: &BlsPublicKey) -> bool {
+        self.peer_policy.as_ref().is_some_and(|watch| {
+            let update = watch.updates.borrow();
+            match watch.network_type {
+                NetworkType::Primary => update.policy().primary().contains(key),
+                NetworkType::Worker(id) => {
+                    update.policy().worker(id).is_some_and(|policy| policy.contains(key))
+                }
+            }
+        })
     }
 
     /// Create a handle to no where for test setup.

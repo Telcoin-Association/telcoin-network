@@ -9,7 +9,12 @@ use serde::{
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
 use tn_types::{BlsPublicKey, BootstrapServer, P2pNode, Round, WorkerId};
 
+mod policy;
 mod trusted;
+pub use policy::{
+    OperatorPeerPolicy, PeerPolicyConfigError, PolicyPeerLimit, PolicyWorkerCount, SwarmPeerPolicy,
+    MAX_PEER_POLICY_FILE_BYTES,
+};
 use tracing::warn;
 pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
@@ -17,7 +22,7 @@ impl ConfigTrait for NetworkConfig {}
 
 /// The container for all network configurations.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     /// The configurations for libp2p library.
     ///

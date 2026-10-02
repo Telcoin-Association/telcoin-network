@@ -21,6 +21,8 @@ mod consensus;
 pub mod error;
 pub mod kad;
 mod metrics;
+mod operator_policy;
+pub use operator_policy::{PeerPolicyUpdate, PolicyRevision, PolicyValidity};
 mod peers;
 mod quic_incoming;
 pub mod stream;

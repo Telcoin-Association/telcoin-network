@@ -18,7 +18,7 @@ use crate::{
     },
     PeerExchangeMap,
 };
-use futures::StreamExt as _;
+use futures::{future::Either, StreamExt as _};
 use libp2p::{
     connection_limits::{self, ConnectionLimits},
     gossipsub::{
@@ -76,6 +76,10 @@ enum LoopEvent<E, C> {
     Command(C),
     /// Every command sender is gone, so the network loop must shut down.
     CommandsClosed,
+    /// A complete operator policy or rejection notification is ready.
+    PolicyChanged,
+    /// The publisher stopped; retain the last coherent snapshot without a busy loop.
+    PolicyClosed,
 }
 
 /// Wait for the next unit of work of the network loop: a record-refresh tick, a swarm event or a
@@ -379,6 +383,10 @@ where
     handle: Sender<NetworkCommand<Req, Res>>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand<Req, Res>>,
+    /// Shared latest-only operator publication, installed before spawning this swarm.
+    policy_updates: Option<tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>>,
+    /// Swarm role selecting this consumer's endpoints from each shared revision.
+    network_type: NetworkType,
     /// The collection of authorized publishers per topic.
     ///
     /// This set must be updated at the start of each epoch. It is used to verify messages
@@ -734,6 +742,8 @@ where
             swarm,
             handle,
             commands,
+            policy_updates: None,
+            network_type,
             event_stream,
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
@@ -758,6 +768,7 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+            .with_peer_policy(self.network_type, self.policy_updates.clone())
     }
 
     /// Create and sign this node's [NodeRecord].
@@ -891,7 +902,37 @@ where
         self.published_to_peers.put(peer_id, ()).is_none()
     }
 
-    /// Run the network loop to process incoming gossip.
+    /// Install the process-wide operator publisher before this swarm starts accepting connections.
+    pub fn set_peer_policy(
+        &mut self,
+        receiver: tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>,
+    ) {
+        self.policy_updates = Some(receiver);
+        self.reconcile_operator_policy();
+    }
+
+    /// Reconcile every policy consumer synchronously between swarm polls.
+    fn reconcile_operator_policy(&mut self) {
+        let update =
+            self.policy_updates.as_mut().map(|receiver| receiver.borrow_and_update().clone());
+        update.into_iter().for_each(|update| {
+            let policy = match self.network_type {
+                NetworkType::Primary => Some(update.policy().primary()),
+                NetworkType::Worker(id) => update.policy().worker(id),
+            };
+            policy.into_iter().for_each(|policy| {
+                let old_ids = self.swarm.behaviour().peer_manager.operator_policy_peer_ids();
+                if self.swarm.behaviour_mut().peer_manager.replace_operator_policy(&update, policy)
+                {
+                    old_ids.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+                    self.refresh_explicit_peers();
+                    self.metrics.record_peer_policy(&update);
+                }
+            });
+        });
+    }
+
+    /// Run the network loop to process incoming gossip and operator revisions.
     pub async fn run(mut self) -> NetworkResult<()> {
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
@@ -906,7 +947,19 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+            self.reconcile_operator_policy();
+            let changed = self.policy_updates.as_mut().map_or_else(
+                || Either::Right(std::future::pending()),
+                |receiver| Either::Left(receiver.changed()),
+            );
+            let event = tokio::select! {
+                result = changed => result.map_or(LoopEvent::PolicyClosed, |_| LoopEvent::PolicyChanged),
+                event = next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands) => event,
+            };
+            self.reconcile_operator_policy();
+            match event {
+                LoopEvent::PolicyChanged => {}
+                LoopEvent::PolicyClosed => self.policy_updates = None,
                 LoopEvent::Refresh => self.refresh_own_record(),
                 LoopEvent::Swarm(event) => {
                     if let Err(e) = self.process_event(event).await {

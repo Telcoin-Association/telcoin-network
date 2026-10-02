@@ -68,6 +68,21 @@ pub(crate) struct SwarmMetrics {
 }
 
 impl SwarmMetrics {
+    /// Observe applied revisions without public keys, peer labels or revision-valued labels.
+    pub(crate) fn record_peer_policy(&self, update: &crate::PeerPolicyUpdate) {
+        let outcome = match update.validity() {
+            crate::PolicyValidity::Accepted => "accepted",
+            crate::PolicyValidity::Rejected => "rejected",
+        };
+        metrics::counter!("tn_network.peer_policy_updates_total", "network" => self.network.clone(), "outcome" => outcome).increment(1);
+        metrics::gauge!("tn_network.peer_policy_attempt", "network" => self.network.clone())
+            .set(update.attempt().as_u64());
+        metrics::gauge!("tn_network.peer_policy_revision", "network" => self.network.clone())
+            .set(update.revision().as_u64());
+    }
+}
+
+impl SwarmMetrics {
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
@@ -203,6 +218,7 @@ impl PeerManagerMetrics {
             crate::AdmissionFallback::Stale => 2.0,
             crate::AdmissionFallback::Contradictory => 3.0,
             crate::AdmissionFallback::Unresolved => 4.0,
+            crate::AdmissionFallback::OperatorRejected => 5.0,
         }));
     }
 

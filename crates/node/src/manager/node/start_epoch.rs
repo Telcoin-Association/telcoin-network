@@ -835,8 +835,7 @@ where
         bls_pubkey: BlsPublicKey,
         node_task_spawner: TaskSpawner,
     ) {
-        if bls_pubkey == self.key_config.public_key()
-            || self.trusted_peer_keys.contains(&bls_pubkey)
+        if bls_pubkey == self.key_config.public_key() || handle.maintains_operator_peer(&bls_pubkey)
         {
             // Don't try to dial ourselves.
             return;
