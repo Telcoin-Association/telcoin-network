@@ -192,6 +192,8 @@ jobs:
   hub-capacity:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
+    outputs:
+      qualification_required: ${{ steps.scope.outputs.changed }}
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
@@ -208,7 +210,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          if git diff --quiet "${BASE_SHA}" HEAD -- tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
+          if git diff --quiet "${BASE_SHA}" HEAD -- .github/workflows/pr.yaml tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -269,7 +271,7 @@ jobs:
 
       - name: Check the pinned workspace with Clippy
         if: steps.scope.outputs.changed == 'true'
-        run: cargo +1.94 clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo +1.94 clippy --locked --workspace --all-targets --keep-going -- -D warnings
 
       - name: Confirm compiling Rust mutations
         if: steps.scope.outputs.changed == 'true'
@@ -283,6 +285,56 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
           path: target/debug/hub-capacity-mutations
+
+  # A measured qualification is required whenever the capacity source scope changes.
+  hub-capacity-qualification:
+    needs: hub-capacity
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Download attested qualification binaries
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: hub-capacity-linux-arm64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: qualification-binaries
+
+      - name: Install offline transaction signer
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build isolated Linux runtime
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        run: docker build -f tools/hub-capacity/Dockerfile -t tn-capacity-1476-runtime:ubuntu24 tools/hub-capacity
+
+      - name: Qualify the declared population and resource envelope
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        run: python3 -B -I tools/hub-capacity/docker-run.py --binaries qualification-binaries --output qualification --runner-envelope github-actions
+
+      - name: Retain qualification evidence and diagnostics
+        if: always() && needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-capacity-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            qualification/*.json
+            qualification/*-docker-exec.log
+            qualification/source
+            qualification/*-evidence
+            qualification/deployment/*/*.json
+            qualification/deployment/*/*.jsonl
+            qualification/deployment/*/peers/*.json
+            qualification/deployment/population.json
 
   # Clippy - replaces cargo check, catches more issues.
   #
@@ -435,7 +487,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, hub-capacity]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, hub-capacity, hub-capacity-qualification]
     steps:
       - name: Check all jobs passed
         env:
@@ -462,7 +514,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt hub-capacity test"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt hub-capacity hub-capacity-qualification test"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -490,8 +542,8 @@ jobs:
                 echo "::error::attest: ${result} on ${EVENT_NAME}"
                 failed=1
                 ;;
-              *:connection-limits-patch:success|*:hub-capacity:success) echo "  ok       ${job}" ;;
-              *:connection-limits-patch:*|*:hub-capacity:*)
+              *:connection-limits-patch:success|*:hub-capacity:success|*:hub-capacity-qualification:success) echo "  ok       ${job}" ;;
+              *:connection-limits-patch:*|*:hub-capacity:*|*:hub-capacity-qualification:*)
                 echo "::error::${job}: ${result}"
                 failed=1
                 ;;
