@@ -13,6 +13,7 @@
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
   * [Peers](network/peers.md)
+  * [Local Committee Inventory](network/committee-seeding.md)
   * [Request-response](network/request-response.md)
   * [Sync streams](network/sync-streams.md)
 * [Getting Started](getting-started/README.md)
