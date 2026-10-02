@@ -161,7 +161,7 @@ async fn drive(harness: Harness) -> Progress {
             LoopEvent::Refresh => h.progress.refresh_ticks += 1,
             LoopEvent::Swarm(()) => h.progress.events += 1,
             LoopEvent::Command(_) => h.progress.commands += 1,
-            LoopEvent::CommandsClosed => {}
+            LoopEvent::CommandsClosed | LoopEvent::PolicyChanged | LoopEvent::PolicyClosed => {}
         }
         let snapshot = h.snapshot();
         Some((snapshot, h))

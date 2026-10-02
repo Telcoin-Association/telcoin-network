@@ -1,9 +1,11 @@
 //! Information shared between peers.
 
 use super::{
+    penalty::PenaltyHistory,
+    policy::PeerPolicy,
     score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
-    types::{ConnectionDirection, TrustBasis},
+    types::ConnectionDirection,
     Penalty,
 };
 use libp2p::{
@@ -12,7 +14,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{error, warn};
+use tracing::{debug, error};
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -97,6 +99,8 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
+    /// Protocol failures survive trust grants; only load-only scores may be forgiven.
+    penalty_history: PenaltyHistory,
     /// The multiaddrs associated with this peer: addresses observed on real connections plus any
     /// self-advertised addresses folded in via [`Self::update_net`].
     ///
@@ -145,6 +149,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: true,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -164,6 +169,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::default(),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
             observed_ip_addresses: Default::default(),
@@ -184,6 +190,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -287,46 +294,41 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Exempt peers
-    /// (operator allowlist or committee validators) bypass the score model entirely.
-    pub(super) fn apply_penalty(
-        &mut self,
-        penalty: Penalty,
-        exemption: Option<TrustBasis>,
-    ) -> Reputation {
-        if let Some(basis) = exemption {
-            // Exempt peers bypass the score model entirely. Severe/Fatal suppressions are
-            // operationally significant: they hint that an exempt peer (committee member or
-            // operator allowlist) is misbehaving in ways that would normally ban an untrusted
-            // peer. Surface as a warn! so ops can correlate downstream issues with the signal.
-            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
-                warn!(
-                    target: "peer-manager",
-                    ?penalty,
-                    ?basis,
-                    "skipping severe/fatal penalty for exempt peer"
-                );
-            }
-        } else {
+    /// Load-scoring privileges suppress only temporary overload. Protocol and cryptographic
+    /// violations remain attributable, scored, and eligible for bans for every peer.
+    pub(super) fn apply_penalty(&mut self, penalty: Penalty, policy: PeerPolicy) -> Reputation {
+        if policy.applies(penalty) {
+            self.penalty_history.record(penalty);
             self.score.apply_penalty(penalty);
+        } else {
+            debug!(target: "peer-manager", ?penalty, ?policy, "skipping load penalty for privileged peer");
         }
 
         // return new reputation
         self.reputation()
     }
 
+    /// Whether rotation must preserve this peer's protocol penalties and bans.
+    pub(super) fn has_protocol_penalty(&self) -> bool {
+        self.penalty_history == PenaltyHistory::Protocol
+    }
+
+    /// Retain an operator-provisioned peer without resetting its score or connection state.
+    pub(super) fn retain_for_operator(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
     /// Ensure the peer's status is banned.
     ///
-    /// `exemption` is forwarded to [Self::apply_penalty]: an exempt peer (operator allowlist or
-    /// committee validator) bypasses the score model, so the `Fatal` here is suppressed and the
-    /// peer is not banned - the same protection exempt peers had before.
-    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId, exemption: Option<TrustBasis>) {
+    /// A ban is never suppressed by admission, retention, or load-scoring privileges.
+    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId) {
         match self.reputation() {
             Reputation::Banned => {}
-            _ => {
+            Reputation::Trusted | Reputation::Disconnected => {
                 // if the score isn't low enough to ban, this function has been called incorrectly.
                 error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
-                self.apply_penalty(Penalty::Fatal, exemption);
+                // Normalize an already requested ban without inventing a protocol violation.
+                self.score.apply_penalty(Penalty::Fatal);
             }
         }
     }
@@ -360,9 +362,22 @@ impl Peer {
     /// worse (or equal) of the two, so a genuinely better-behaved displaced record never drags
     /// the promoted record down.
     pub(super) fn retain_worse_reputation(&mut self, other: &Peer) {
+        self.penalty_history = self.penalty_history.merge(other.penalty_history);
         if other.score < self.score {
             self.score = other.score.clone();
         }
+    }
+
+    /// Preserve protocol reputation and bounded observed-IP evidence across a trust reload.
+    pub(super) fn retain_protocol_reputation(&mut self, other: &Peer) {
+        self.retain_worse_reputation(other);
+        let capacity = MAX_OBSERVED_IPS_PER_PEER.saturating_sub(self.observed_ip_addresses.len());
+        let addresses: Vec<_> = other
+            .known_ip_addresses()
+            .filter(|ip| !self.observed_ip_addresses.contains(ip))
+            .take(capacity)
+            .collect();
+        self.observed_ip_addresses.extend(addresses);
     }
 
     /// Register the dialing peer as connected.
@@ -452,42 +467,29 @@ impl Peer {
         self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
-    /// Heartbeat maintenance applies decaying penalty rates to a non-exempt peer's score.
+    /// Decay ordinary scores and protocol penalties earned by privileged peers.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any; exempt peers skip
-    /// score decay. The peer's reputation could change. This returns the reputation update for
-    /// the manager to react to.
-    pub(super) fn heartbeat(&mut self, exemption: Option<TrustBasis>) -> ReputationUpdate {
-        if exemption.is_none() {
-            let prev_reputation = self.reputation();
+    /// Recovery follows the ordinary ban duration and score-decay rules, independent of trust.
+    pub(super) fn heartbeat(&mut self, policy: PeerPolicy) -> ReputationUpdate {
+        if policy.exempts_load() && self.permits_load_forgiveness() {
+            ReputationUpdate::None
+        } else {
+            let previously_banned = self.reputation().banned();
             self.score.update();
-            let new_reputation = self.reputation();
-
-            match new_reputation {
-                Reputation::Trusted => {
-                    if prev_reputation.banned() {
-                        return ReputationUpdate::Unbanned;
-                    }
+            match (self.reputation(), previously_banned) {
+                (Reputation::Trusted | Reputation::Disconnected, true) => {
+                    ReputationUpdate::Unbanned
                 }
-                Reputation::Disconnected => {
-                    if prev_reputation.banned() {
-                        return ReputationUpdate::Unbanned;
-                    } else if self.connection_status.is_connected_or_dialing() {
-                        // disconnect if the peer is connected or dialing
-                        return ReputationUpdate::Disconnect;
-                    }
-                    // otherwise, peer was healthy and disconnected now
+                (Reputation::Disconnected, false)
+                    if self.connection_status.is_connected_or_dialing() =>
+                {
+                    ReputationUpdate::Disconnect
                 }
-                Reputation::Banned => {
-                    if !prev_reputation.banned() {
-                        return ReputationUpdate::Banned;
-                    }
-                }
+                (Reputation::Banned, false) => ReputationUpdate::Banned,
+                (Reputation::Trusted | Reputation::Disconnected, false)
+                | (Reputation::Banned, true) => ReputationUpdate::None,
             }
         }
-
-        // all other updates are no-op
-        ReputationUpdate::None
     }
 
     /// Whether the node operator explicitly allowlisted this peer.
@@ -503,14 +505,20 @@ impl Peer {
         self.network_key.as_ref().map(|network_key| (network_key.clone(), self.multiaddrs.clone()))
     }
 
-    /// Reset the peer's score to the maximum.
+    /// Whether a trust grant may forgive this peer's score and ban.
+    pub(super) fn permits_load_forgiveness(&self) -> bool {
+        self.penalty_history.permits_forgiveness()
+    }
+
+    /// Reset a load-only score to the maximum when the peer acquires committee privileges.
     ///
     /// Called when a peer enters the committee. Trust is not stored on the peer (validator
-    /// status is derived from the committee sets), but a committee member's score is primed to
-    /// the maximum so that, should it later rotate out and re-enter the score model, it starts
-    /// from a clean maximum rather than a stale value.
+    /// status is derived from the committee sets). A recorded protocol violation prevents
+    /// forgiveness, including during a later committee rotation or rediscovery.
     pub(super) fn reset_score_to_max(&mut self) {
-        self.score = Score::new_max();
+        if self.permits_load_forgiveness() {
+            self.score = Score::new_max();
+        }
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.

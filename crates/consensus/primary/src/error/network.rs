@@ -1,7 +1,7 @@
 //! Error types for primary's network task.
 
 use super::CertManagerError;
-use tn_network_libp2p::Penalty;
+use tn_network_libp2p::{LoadPenalty, Penalty};
 use tn_storage::{consensus::ConsensusChainError, StoreError};
 use tn_types::{
     error::{CertificateError, HeaderError},
@@ -139,6 +139,7 @@ impl PrimaryNetworkError {
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
+    /// Distinguish local lag and transient load from attributable validation failures.
     fn from(val: &PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
@@ -153,7 +154,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                         penalty_from_header_error(header_error)
                     }
                     // mild
-                    CertificateError::TooOld(_, _, _) => Some(Penalty::Mild),
+                    CertificateError::TooOld(_, _, _) => Some(Penalty::Load(LoadPenalty::Synchronization)),
                     // fatal
                     CertificateError::RecoverBlsAggregateSignatureBytes
                     | CertificateError::Unsigned
@@ -186,11 +187,18 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
             PrimaryNetworkError::UnknownConsensusOutput(_) => None,
+            PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::InvalidEpochVote(_, _, _)
-            | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
-            PrimaryNetworkError::InvalidEpochRequest
-            | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
+            | PrimaryNetworkError::InvalidEpochVote(_, _, _) => Some(Penalty::Mild),
+            PrimaryNetworkError::InvalidEpochRequest => Some(Penalty::Medium),
+            PrimaryNetworkError::StdIo(error) => Some(if matches!(error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
+                Penalty::Load(LoadPenalty::Transport)
+            } else {
+                Penalty::Medium
+            }),
             PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
@@ -210,11 +218,16 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
+        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => {
+            Some(Penalty::Load(LoadPenalty::Synchronization))
+        }
+        // `TooOld` is mild for the same reason as `CertificateError::TooOld`: an honest peer's
+        // vote request can fall behind this node's round while it is queued or in flight.
+        HeaderError::TooOld { .. } => Some(Penalty::Mild),
         // medium
-        HeaderError::InvalidParents
-        | HeaderError::WrongNumberOfParents(_, _)
-        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        HeaderError::InvalidParents | HeaderError::WrongNumberOfParents(_, _) => {
+            Some(Penalty::Medium)
+        }
         // severe
         //
         // `InvalidSeedSignature` is severe rather than fatal because it has a reachable honest
@@ -228,8 +241,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentRound
         | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
         // fatal
-        HeaderError::AlreadyVotedForLaterRound { .. }
-        | HeaderError::AlreadyVoted(_, _)
+        HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
         | HeaderError::TooManyBatches(_, _)
@@ -256,12 +268,33 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
+        // ignore (stale request, not a fault)
+        //
+        // This node already decided on a later header from the same author, so the request is
+        // stale. An honest proposer sends one vote request per round, and the requests it queued
+        // while this node was unreachable all arrive on reconnect, in any order. Refusing the
+        // stale header is enough. A fatal penalty here banned every committee peer of a
+        // restarted validator. The error carries rounds but no epoch, so a different header for
+        // the same round cannot be told apart from a stale request of an earlier epoch.
+        HeaderError::AlreadyVotedForLaterRound { .. } => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vote requests that an honest author queued while this node was down arrive together on
+    /// reconnect, and every one older than the first answered fails as
+    /// `AlreadyVotedForLaterRound`. A penalty that bans for this bans the whole committee.
+    #[test]
+    fn stale_vote_request_is_not_penalized() {
+        let stale = PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 8,
+            ours: 14,
+        });
+        assert!(Option::<Penalty>::from(&stale).is_none());
+    }
 
     /// Finding 2 (#819): faults determined by the gossip envelope's content — a malformed payload
     /// (`Decode`) or a wrong declared topic (`InvalidTopic`) — are the message author's, so the

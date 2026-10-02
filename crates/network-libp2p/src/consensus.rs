@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::{node_record_key, KadStore},
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
@@ -18,7 +18,7 @@ use crate::{
     },
     PeerExchangeMap,
 };
-use futures::StreamExt as _;
+use futures::{future::Either, StreamExt as _};
 use libp2p::{
     connection_limits::{self, ConnectionLimits},
     gossipsub::{
@@ -76,6 +76,10 @@ enum LoopEvent<E, C> {
     Command(C),
     /// Every command sender is gone, so the network loop must shut down.
     CommandsClosed,
+    /// A complete operator policy or rejection notification is ready.
+    PolicyChanged,
+    /// The publisher stopped; retain the last coherent snapshot without a busy loop.
+    PolicyClosed,
 }
 
 /// Wait for the next unit of work of the network loop: a record-refresh tick, a swarm event or a
@@ -379,6 +383,10 @@ where
     handle: Sender<NetworkCommand<Req, Res>>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand<Req, Res>>,
+    /// Shared latest-only operator publication, installed before spawning this swarm.
+    policy_updates: Option<tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>>,
+    /// Swarm role selecting this consumer's endpoints from each shared revision.
+    network_type: NetworkType,
     /// The collection of authorized publishers per topic.
     ///
     /// This set must be updated at the start of each epoch. It is used to verify messages
@@ -734,6 +742,8 @@ where
             swarm,
             handle,
             commands,
+            policy_updates: None,
+            network_type,
             event_stream,
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
@@ -758,6 +768,7 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+            .with_peer_policy(self.network_type, self.policy_updates.clone())
     }
 
     /// Create and sign this node's [NodeRecord].
@@ -891,7 +902,40 @@ where
         self.published_to_peers.put(peer_id, ()).is_none()
     }
 
-    /// Run the network loop to process incoming gossip.
+    /// Install the process-wide operator publisher before this swarm starts accepting connections.
+    pub fn set_peer_policy(
+        &mut self,
+        receiver: tokio::sync::watch::Receiver<crate::PeerPolicyUpdate>,
+    ) {
+        self.policy_updates = Some(receiver);
+        self.reconcile_operator_policy();
+    }
+
+    /// Reconcile every policy consumer synchronously between swarm polls.
+    fn reconcile_operator_policy(&mut self) {
+        let update =
+            self.policy_updates.as_mut().map(|receiver| receiver.borrow_and_update().clone());
+        update.into_iter().for_each(|update| {
+            let policy = match self.network_type {
+                NetworkType::Primary => Some(update.policy().primary()),
+                NetworkType::Worker(id) => update.policy().worker(id),
+            };
+            policy.into_iter().for_each(|policy| {
+                if self.swarm.behaviour().peer_manager.needs_operator_policy(&update) {
+                    let old_ids = self.swarm.behaviour().peer_manager.operator_policy_peer_ids();
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .replace_operator_policy(&update, policy);
+                    old_ids.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+                    self.refresh_explicit_peers();
+                    self.metrics.record_peer_policy(&update);
+                }
+            });
+        });
+    }
+
+    /// Run the network loop to process incoming gossip and operator revisions.
     pub async fn run(mut self) -> NetworkResult<()> {
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
@@ -906,7 +950,19 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            match next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands).await {
+            self.reconcile_operator_policy();
+            let changed = self.policy_updates.as_mut().map_or_else(
+                || Either::Right(std::future::pending()),
+                |receiver| Either::Left(receiver.changed()),
+            );
+            let event = tokio::select! {
+                result = changed => result.map_or(LoopEvent::PolicyClosed, |_| LoopEvent::PolicyChanged),
+                event = next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands) => event,
+            };
+            self.reconcile_operator_policy();
+            match event {
+                LoopEvent::PolicyChanged => {}
+                LoopEvent::PolicyClosed => self.policy_updates = None,
                 LoopEvent::Refresh => self.refresh_own_record(),
                 LoopEvent::Swarm(event) => {
                     if let Err(e) = self.process_event(event).await {
@@ -1055,6 +1111,7 @@ where
                     },
                     reply,
                 );
+                self.refresh_explicit_peers();
             }
             NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
@@ -1068,6 +1125,10 @@ where
                     },
                 );
                 let _ = reply.send(Ok(()));
+            }
+            NetworkCommand::AddTrustedPeers { peers, reply } => {
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peers(peers);
+                send_or_log_error!(reply, Ok(()), "AddTrustedPeers");
             }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
@@ -1153,6 +1214,11 @@ where
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
+            }
+            #[cfg(test)]
+            NetworkCommand::VerifiedPeerBls { peer, reply } => {
+                let binding = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                send_or_log_error!(reply, binding, "VerifiedPeerBls");
             }
             NetworkCommand::EstablishedPeerCount { reply } => {
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
@@ -1270,6 +1336,7 @@ where
                 // any peer that exits the three-slot window is demoted.
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                self.refresh_explicit_peers();
             }
             NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next } => {
                 self.swarm
@@ -1340,6 +1407,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconcile gossip mesh privileges for connected peers after committee rotation.
+    ///
+    /// Operator trust survives rotation; committee protection ends when the final slot expires.
+    fn refresh_explicit_peers(&mut self) {
+        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    fn refresh_explicit_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let protected = self.swarm.is_connected(peer)
+            && manager.peer_is_important(peer)
+            && !manager.peer_banned(peer);
+        if protected {
+            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+        } else {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
     }
 
     /// Process gossip events.
@@ -1472,7 +1560,10 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(peer_id, Penalty::Load(LoadPenalty::SlowPeer));
             }
         }
 
@@ -1614,7 +1705,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -1984,6 +2075,7 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table
@@ -2290,7 +2382,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
             }
             PutRecordRate::Shed => {
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
@@ -2398,7 +2493,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
@@ -2491,14 +2586,18 @@ where
     /// lost: peers push their own records on first connect (an inbound kad put handled by
     /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(|query| query.result.map(|record| (query.request, record)))
+            .into_iter()
+            .for_each(|(request, node_record)| {
+                let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
-        }
+                    .add_discovered_peer(request, node_record.info);
+                self.refresh_explicit_peer(&peer);
+            });
     }
 }
 

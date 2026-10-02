@@ -50,6 +50,8 @@ use tracing::{debug, error, info, warn};
 
 mod close_epoch;
 mod export_retention;
+#[cfg(unix)]
+mod peer_policy;
 mod run_epoch;
 mod start_epoch;
 pub use close_epoch::build_epoch_record;
@@ -291,6 +293,8 @@ pub(crate) struct EpochManager<P, DB> {
     /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
     /// the long-running networks.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Shared operator revisions installed on the primary and every worker before spawning.
+    peer_policy: Option<tokio::sync::watch::Receiver<tn_network_libp2p::PeerPolicyUpdate>>,
 
     /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
@@ -791,6 +795,7 @@ where
             last_forwarded_consensus_number: 0,
             consensus_chain,
             bootstrap_servers,
+            peer_policy: None,
             version_str,
             exec_state_exporter,
             state_export_retention,
@@ -979,8 +984,29 @@ where
         // #765). Genesis is the single source of truth; this one value is read by the
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        let genesis_bootstrap = self.bootstrap_servers.clone();
+        let cli_bootstrap = self.builder.bootstrap_peers().cloned();
+        let num_workers = tn_config::PolicyWorkerCount::from(
+            self.builder.tn_config.node_info.p2p_info.workers.len(),
+        );
+        let peer_limit =
+            tn_config::PolicyPeerLimit::from(network_config.peer_config().target_num_peers);
+        let policy = network_config.operator_peer_policy(
+            &genesis_bootstrap,
+            cli_bootstrap.as_ref(),
+            num_workers,
+            peer_limit,
+        )?;
+        let (policy_sender, policy_receiver) = tokio::sync::watch::channel(
+            tn_network_libp2p::PeerPolicyUpdate::accepted(Default::default(), policy),
+        );
+        self.peer_policy = Some(policy_receiver);
         self.bootstrap_servers = network_config
             .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
+        network_config.validate_trusted_nodes(
+            &self.bootstrap_servers,
+            self.builder.tn_config.node_info.p2p_info.workers.len(),
+        )?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         self.spawn_node_networks(
             node_task_spawner.clone(),
@@ -989,24 +1015,33 @@ where
             on_chain_workers,
         )
         .await?;
+        #[cfg(unix)]
+        {
+            let signals = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+            let inputs = peer_policy::ReloadInputs::new(
+                self.tn_datadir.network_config_path(),
+                genesis_bootstrap,
+                cli_bootstrap,
+                num_workers,
+                peer_limit,
+            );
+            let shutdown = self.node_shutdown.subscribe();
+            node_task_spawner.spawn_critical_task("Peer policy reload", async move {
+                tokio::select! {
+                    _ = &shutdown => Ok(()),
+                    result = peer_policy::reload(signals, inputs, policy_sender) => result.map_err(|error| TaskError::from_message(error.to_string())),
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        drop(policy_sender);
         let primary_network_handle = self
             .primary_network_handle
             .as_ref()
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
 
-        // Register bootstrap peers before per-epoch committee updates resolve known peers.
-        // Listening and bootstrap dials belong to process startup, before replay can close an
-        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
-        primary_network_handle
-            .inner_handle()
-            .add_bootstrap_peers(
-                self.bootstrap_servers
-                    .iter()
-                    .map(|(key, peer)| (*key, peer.primary.clone()))
-                    .collect(),
-            )
-            .await?;
+        // The shared policy already owns bootstrap and trusted retries on every swarm.
         let node_info = &self.builder.tn_config.node_info;
         let primary_address = Self::parse_listener_address_for_swarm(
             "PRIMARY_LISTENER_MULTIADDR",
@@ -1015,28 +1050,10 @@ where
         )?;
         info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
         primary_network_handle.inner_handle().start_listening(primary_address).await?;
-        self.bootstrap_servers.keys().copied().for_each(|key| {
-            self.dial_peer_bls(
-                primary_network_handle.inner_handle().clone(),
-                key,
-                node_task_spawner.clone(),
-            );
-        });
-
         let manager = &*self;
-        let startup_spawner = &node_task_spawner;
         futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
             .try_for_each(|network_handle| async move {
                 let worker_id = network_handle.worker_id();
-                let bootstrap_peers: BTreeMap<_, _> = manager
-                    .bootstrap_servers
-                    .iter()
-                    // Peers with fewer workers have no swarm for this id.
-                    .filter_map(|(key, peer)| {
-                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
-                    })
-                    .collect();
-                network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
                 let configured_address =
                     node_info.worker_network_address(worker_id).cloned().ok_or_else(|| {
                         eyre!("no network address for worker {worker_id} in node info")
@@ -1052,13 +1069,6 @@ where
                     configured_address
                 };
                 network_handle.inner_handle().start_listening(worker_address).await?;
-                bootstrap_peers.into_keys().for_each(|key| {
-                    manager.dial_peer_bls(
-                        network_handle.inner_handle().clone(),
-                        key,
-                        startup_spawner.clone(),
-                    );
-                });
                 Ok(())
             })
             .await?;
@@ -1361,7 +1371,7 @@ where
         //
 
         // create long-running network task for primary
-        let primary_network = ConsensusNetwork::new_for_primary(
+        let mut primary_network = ConsensusNetwork::new_for_primary(
             network_config,
             self.consensus_bus.primary_network_events_cloned(),
             self.key_config.clone(),
@@ -1369,6 +1379,10 @@ where
             node_task_spawner.clone(),
             self.builder.tn_config.node_info.primary_network_address().clone(),
         )?;
+        self.peer_policy
+            .clone()
+            .into_iter()
+            .for_each(|receiver| primary_network.set_peer_policy(receiver));
         let primary_network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
 
@@ -1399,7 +1413,7 @@ where
             .into_iter()
             .map(|PreparedWorkerNetwork { worker_id, p2p, event_stream }| {
                 // create long-running network task for this worker
-                let worker_network = ConsensusNetwork::new_for_worker(
+                let mut worker_network = ConsensusNetwork::new_for_worker(
                     worker_id,
                     network_config,
                     event_stream,
@@ -1409,6 +1423,10 @@ where
                     p2p.network_address,
                     p2p.rpc,
                 )?;
+                self.peer_policy
+                    .clone()
+                    .into_iter()
+                    .for_each(|receiver| worker_network.set_peer_policy(receiver));
                 let worker_network_handle = worker_network.network_handle();
                 let node_shutdown = self.node_shutdown.subscribe();
 

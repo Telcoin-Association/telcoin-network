@@ -1,7 +1,7 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    admission::{AdmissionPolicy, AdmissionStatus},
+    admission::{AdmissionPolicy, AdmissionStatus, OperatorBindings},
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
@@ -26,7 +26,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{AdmissionConfig, AdmissionMode, PeerConfig};
-use tn_types::BlsPublicKey;
+use tn_types::{BlsPublicKey, P2pNode};
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -37,6 +37,34 @@ mod peer_manager;
 #[cfg(test)]
 #[path = "../tests/admission.rs"]
 mod admission_tests;
+#[cfg(test)]
+#[path = "../tests/peer_policy_reload.rs"]
+mod peer_policy_reload_tests;
+
+/// Initial delay and polling resolution for configured hub reconnects.
+const TRUSTED_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Maximum delay during a hub outage, independent of unrelated connected peers.
+const TRUSTED_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// One bounded reconnect schedule per configured hub in this swarm.
+#[derive(Debug)]
+struct TrustedDial {
+    /// The operator's expected identity and address, never replaced by discovery.
+    info: NetworkInfo,
+    /// Earliest time a disconnected peer may be retried.
+    next_attempt: Instant,
+    /// Exponential delay for the next failed attempt.
+    backoff: Duration,
+}
+
+/// Owner of reconnect work, so reload cannot create a permanent explicit grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectOwner {
+    /// An explicit network command owns this schedule.
+    Explicit,
+    /// The current operator snapshot owns this schedule.
+    Policy,
+}
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -154,6 +182,18 @@ pub(crate) struct PeerManager {
     config: PeerConfig,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
+    /// A single timer shared by all configured hub reconnects, dropped with the swarm.
+    trusted_retry: Option<tokio::time::Interval>,
+    /// Persistent reconnect state, bounded by the operator's configured hubs.
+    trusted_dials: HashMap<BlsPublicKey, TrustedDial>,
+    /// Reload-owned reconnect work, separate from explicit trusted-peer commands.
+    policy_dials: HashMap<BlsPublicKey, TrustedDial>,
+    /// Reload-owned hints and pins; these never masquerade as signed node records.
+    policy_known: HashMap<BlsPublicKey, NetworkInfo>,
+    /// Reload-owned admission identities, independent of explicit grants.
+    policy_admission: HashMap<BlsPublicKey, PeerId>,
+    /// Last publication fully reconciled by this swarm.
+    policy_update: Option<crate::PeerPolicyUpdate>,
     /// All peers for the manager.
     peers: AllPeers,
     /// The validated read-model of kad discovery: resolves a committee member's
@@ -277,7 +317,7 @@ impl PeerManager {
         self.admission_policy.evaluate(
             &self.known_peers,
             &self.stub_records,
-            &self.admission_operator_peers,
+            OperatorBindings::new(&self.admission_operator_peers, &self.policy_admission),
             self.local_bls_key,
             self.local_peer_id,
             |peer| self.is_connected(peer),
@@ -399,6 +439,12 @@ impl PeerManager {
             admission_operator_peers: Default::default(),
             config: *config,
             heartbeat,
+            trusted_retry: None,
+            trusted_dials: HashMap::new(),
+            policy_dials: HashMap::new(),
+            policy_known: HashMap::new(),
+            policy_admission: HashMap::new(),
+            policy_update: None,
             peers,
             known_peers: Default::default(),
             pinned_peers: Default::default(),
@@ -413,9 +459,201 @@ impl PeerManager {
         }
     }
 
+    /// Install configured hubs once and start process-lifetime reconnect scheduling.
+    ///
+    /// Repeated installation cannot create duplicate dials or forgive an existing ban.
+    pub(crate) fn add_trusted_peers(
+        &mut self,
+        peers: std::collections::BTreeMap<BlsPublicKey, P2pNode>,
+    ) {
+        peers.into_iter().for_each(|(bls, endpoint)| {
+            self.admission_operator_peers.insert(bls, endpoint.network_key.clone().into());
+            self.trusted_dials.entry(bls).or_insert_with(|| {
+                let info = NetworkInfo {
+                    pubkey: endpoint.network_key,
+                    multiaddrs: vec![endpoint.network_address],
+                    timestamp: tn_types::now(),
+                    rpc: endpoint.rpc,
+                };
+                self.peers.retain_operator_peer(bls, info.pubkey.clone(), info.multiaddrs.clone());
+                self.pinned_peers.insert(bls);
+                self.stub_records.insert(bls);
+                self.known_peers.insert(bls, info.clone());
+                TrustedDial { info, next_attempt: Instant::now(), backoff: TRUSTED_RETRY_INITIAL }
+            });
+        });
+        if !self.trusted_dials.is_empty() {
+            self.trusted_retry.get_or_insert_with(|| {
+                let mut timer = tokio::time::interval(TRUSTED_RETRY_INITIAL);
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                timer
+            });
+            self.retry_trusted_peers();
+        }
+    }
+
+    /// Atomically replace this swarm's configuration-owned consumers without changing committees.
+    ///
+    /// Old live connections lose only their former privileges. Closed admission disconnects
+    /// identities that have no remaining grant; Open and Grace retain them as ordinary peers.
+    /// Rejected publications retain the accepted endpoints and independently activate Grace.
+    pub(crate) fn replace_operator_policy(
+        &mut self,
+        update: &crate::PeerPolicyUpdate,
+        policy: &tn_config::SwarmPeerPolicy,
+    ) -> bool {
+        if self.needs_operator_policy(update) {
+            let known: HashMap<_, _> = policy
+                .bootstrap()
+                .iter()
+                .chain(policy.trusted())
+                .map(|(bls, endpoint)| {
+                    (
+                        *bls,
+                        NetworkInfo {
+                            pubkey: endpoint.network_key.clone(),
+                            multiaddrs: vec![endpoint.network_address.clone()],
+                            timestamp: tn_types::now(),
+                            rpc: endpoint.rpc.clone(),
+                        },
+                    )
+                })
+                .collect();
+            let admission: HashMap<_, _> =
+                known.iter().map(|(bls, info)| (*bls, PeerId::from(info.pubkey.clone()))).collect();
+            let new_ids: HashSet<_> = admission.values().copied().collect();
+            let rotations: Vec<_> = self
+                .policy_admission
+                .iter()
+                .filter_map(|(key, previous)| {
+                    admission
+                        .get(key)
+                        .filter(|replacement| *replacement != previous)
+                        .map(|replacement| (*previous, *replacement))
+                })
+                .collect();
+            rotations.into_iter().for_each(|(previous, replacement)| {
+                self.peers.carry_policy_reputation(&previous, &replacement)
+            });
+            // Revoke policy trust before inspecting remaining independent retention reasons.
+            self.peers.replace_policy_trusted(
+                policy
+                    .trusted()
+                    .values()
+                    .map(|node| PeerId::from(node.network_key.clone()))
+                    .collect(),
+            );
+            let removed: HashSet<_> = self
+                .policy_admission
+                .values()
+                .copied()
+                .filter(|id| {
+                    !new_ids.contains(id)
+                        && !self.peers.peer_policy(id).protects_retention()
+                        && !self.admission_operator_peers.values().any(|explicit| explicit == id)
+                })
+                .collect();
+            self.dial_requests.retain(|request| !removed.contains(&request.peer_id));
+            self.dial_requests.iter_mut().for_each(|request| {
+                known
+                    .values()
+                    .filter(|info| PeerId::from(info.pubkey.clone()) == request.peer_id)
+                    .for_each(|info| request.multiaddrs.clone_from(&info.multiaddrs));
+            });
+            let mut previous = std::mem::take(&mut self.policy_dials);
+            self.policy_dials = known
+                .iter()
+                .map(|(bls, info)| {
+                    let dial = previous
+                        .remove(bls)
+                        .filter(|dial| {
+                            dial.info.pubkey == info.pubkey
+                                && dial.info.multiaddrs == info.multiaddrs
+                                && dial.info.rpc == info.rpc
+                        })
+                        .unwrap_or_else(|| TrustedDial {
+                            info: info.clone(),
+                            next_attempt: Instant::now(),
+                            backoff: TRUSTED_RETRY_INITIAL,
+                        });
+                    (*bls, dial)
+                })
+                .collect();
+            self.policy_known = known;
+            self.policy_admission = admission;
+            self.admission_policy.set_operator_validity(update.validity());
+            self.policy_update = Some(update.clone());
+            self.prune_known_peers();
+            self.reconcile_admission();
+            if self.trusted_dials.is_empty() && self.policy_dials.is_empty() {
+                self.trusted_retry = None;
+            } else {
+                self.trusted_retry.get_or_insert_with(|| {
+                    let mut timer = tokio::time::interval(TRUSTED_RETRY_INITIAL);
+                    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    timer
+                });
+                self.retry_trusted_peers();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Schedule due hub dials without depending on discovery or the population target.
+    fn retry_trusted_peers(&mut self) {
+        let now = Instant::now();
+        let peers = &self.peers;
+        let queued = &self.dial_requests;
+        let local_id = self.local_peer_id;
+        let dials: Vec<_> = self
+            .trusted_dials
+            .iter_mut()
+            .map(|(bls, dial)| (bls, dial, ReconnectOwner::Explicit))
+            .chain(
+                self.policy_dials.iter_mut().map(|(bls, dial)| (bls, dial, ReconnectOwner::Policy)),
+            )
+            .filter_map(|(bls, dial, owner)| {
+                let id: PeerId = dial.info.pubkey.clone().into();
+                let status = peers.get_peer(&id).map(|peer| peer.connection_status());
+                if id == local_id
+                    || status
+                        .is_some_and(|status| matches!(status, ConnectionStatus::Connected { .. }))
+                {
+                    dial.backoff = TRUSTED_RETRY_INITIAL;
+                    dial.next_attempt = now + TRUSTED_RETRY_INITIAL;
+                    None
+                } else if !peers.bls_protocol_banned(bls)
+                    && now >= dial.next_attempt
+                    && !queued.iter().any(|request| request.peer_id == id)
+                    && status.is_none_or(|status| {
+                        matches!(
+                            status,
+                            ConnectionStatus::Disconnected { .. } | ConnectionStatus::Unknown
+                        )
+                    })
+                {
+                    dial.next_attempt = now + dial.backoff;
+                    dial.backoff = dial.backoff.saturating_mul(2).min(TRUSTED_RETRY_MAX);
+                    Some((*bls, id, dial.info.clone(), owner))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dials.into_iter().for_each(|(bls, id, info, owner)| {
+            if owner == ReconnectOwner::Explicit {
+                self.peers.retain_operator_peer(bls, info.pubkey, info.multiaddrs.clone());
+            }
+            self.dial_peer(id, info.multiaddrs, None);
+        });
+    }
+
     /// Explicitly add a "trusted" peer and dial it.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain connections under population pressure and bypass load scoring.
+    /// Protocol and cryptographic violations remain eligible for penalties and bans.
     /// This does not unban ips and should only be called during initialization.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
@@ -566,9 +804,20 @@ impl PeerManager {
         }
     }
 
-    /// Returns a boolean indicating if the next instant in the heartbeat interval was reached.
+    /// Poll retry timers and refresh unresolved configured identities on each heartbeat.
+    ///
+    /// Return whether regular peer maintenance is due.
     pub(super) fn heartbeat_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        self.heartbeat.poll_tick(cx).is_ready()
+        if self.trusted_retry.as_mut().is_some_and(|timer| timer.poll_tick(cx).is_ready()) {
+            self.retry_trusted_peers();
+        }
+        let ready = self.heartbeat.poll_tick(cx).is_ready();
+        if ready {
+            // Retry after a failed or overlapping lookup without waiting for another connection.
+            let pinned = self.pinned_peers.clone();
+            self.trigger_missing_authorities(&pinned);
+        }
+        ready
     }
 
     /// Heartbeat maintenance.
@@ -686,13 +935,10 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
-    /// Returns a boolean if the peer is a known validator.
-    ///
-    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
-    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
-    /// work.)
+    /// Whether a peer belongs to any tracked committee slot, for membership regression tests.
+    #[cfg(test)]
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
-        self.peers.is_peer_validator(peer_id)
+        self.peer_to_bls(peer_id).is_some() && self.peers.is_peer_validator(peer_id)
     }
 
     /// Returns a boolean if the peer is connected.
@@ -722,7 +968,12 @@ impl PeerManager {
             "checking if peer banned...current banned peers:\n{:?}",
             self.temporarily_banned
         );
-        self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
+        self.temporarily_banned.contains(peer_id)
+            || self.peers.peer_banned(peer_id)
+            || self
+                .policy_admission
+                .iter()
+                .any(|(bls, id)| id == peer_id && self.peers.bls_protocol_banned(bls))
     }
 
     /// Process new connection and return boolean indicating if the peer limit was reached.
@@ -880,6 +1131,17 @@ impl PeerManager {
             }
         }
 
+        self.trusted_dials
+            .values_mut()
+            .filter(|dial| PeerId::from(dial.info.pubkey.clone()) == *peer_id)
+            .for_each(|dial| {
+                dial.backoff = TRUSTED_RETRY_INITIAL;
+                dial.next_attempt = Instant::now() + TRUSTED_RETRY_INITIAL;
+            });
+        // A replacement connection can resolve a hub whose initial record push was interrupted.
+        // Only configured keys are queried, and the network deduplicates in-flight queries.
+        let pinned = self.pinned_peers.clone();
+        self.trigger_missing_authorities(&pinned);
         true
     }
 
@@ -923,16 +1185,12 @@ impl PeerManager {
             return;
         }
 
-        // filter peers that are validators
+        // Retention protection does not exempt any peer from protocol bans or resource budgets.
         let ready_to_prune = connected_peers
             .iter()
             .filter(|(peer_id, _)| !self.admission_is_privileged(peer_id))
-            .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
-                    Some(*peer_id)
-                } else {
-                    None
-                }
+            .filter_map(|(peer_id, _)| {
+                (!self.peer_policy(peer_id).protects_retention()).then_some(*peer_id)
             })
             .collect::<Vec<_>>();
 
@@ -1016,10 +1274,28 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is operator-allowlisted or a validator.
+    /// Derive independent privileges from live committee membership and operator configuration.
+    ///
+    /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
+        let policy = self.peers.peer_policy(peer_id);
+        let policy = self
+            .peer_to_bls(peer_id)
+            .filter(|key| self.pinned_peers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap));
+        if self.policy_admission.values().any(|id| id == peer_id) {
+            policy.grant(super::policy::TrustBasis::Bootstrap)
+        } else {
+            policy
+        }
+    }
+
+    /// Whether retention policy protects this peer from population pruning and mesh treatment.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+        let policy = self.peer_policy(peer_id);
+        trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
+        policy.protects_retention()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
@@ -1078,9 +1354,13 @@ impl PeerManager {
     /// lookup if it becomes a committee member again, which is the intended discovery flow.
     fn prune_known_peers(&mut self) {
         let pinned = &self.pinned_peers;
+        let configured = &self.policy_known;
         let peers = &self.peers;
-        self.known_peers
-            .retain(|bls_key, _| pinned.contains(bls_key) || peers.is_committee_member(bls_key));
+        self.known_peers.retain(|bls_key, _| {
+            pinned.contains(bls_key)
+                || configured.contains_key(bls_key)
+                || peers.is_committee_member(bls_key)
+        });
         // keep the stub set a subset of `known_peers`; a no-op while every stub is pinned
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
@@ -1094,7 +1374,9 @@ impl PeerManager {
     /// [`Self::add_known_peer`]).
     fn forgive_temporarily_banned(&mut self, committee: &HashSet<BlsPublicKey>) {
         for bls_key in committee {
-            if let Some((peer_id, _)) = self.auth_to_peer(*bls_key) {
+            if let Some((peer_id, _)) = self.auth_to_peer(*bls_key).filter(|(peer_id, _)| {
+                self.peers.get_peer(peer_id).is_none_or(|peer| !peer.has_protocol_penalty())
+            }) {
                 if self.temporarily_banned.remove(&peer_id) {
                     warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
                 }
@@ -1180,17 +1462,15 @@ impl PeerManager {
     /// signature-valid kad record only proves the publisher owns the network key it advertises,
     /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
     /// record would let a peer grow `known_peers` without bound by publishing records for endless
-    /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
-    /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
-    /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
-    /// unaffected because kad lookups are only ever triggered for current/next committee members
-    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    /// fresh keys (issue #827). Accept only tracked committee members and operator-pinned keys.
+    /// The latter set is bounded by local configuration and lets an indirect lookup confirm a
+    /// hub's identity after its first connection was interrupted before the signed record arrived.
     pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
-        if !self.peers.is_committee_member(&bls_key) {
+        if !self.peers.is_committee_member(&bls_key) && !self.pinned_peers.contains(&bls_key) {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
-                "dropping discovered peer record for non-committee key"
+                "dropping discovered peer record for unconfigured non-committee key"
             );
             return;
         }
@@ -1296,7 +1576,7 @@ impl PeerManager {
                 return;
             }
             self.cache_known_peer(bls_key, info);
-        } else if source == advertised {
+        } else if source == advertised && self.trusted_binding_matches(bls_key, &info) {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
@@ -1356,21 +1636,47 @@ impl PeerManager {
     /// pinned or admitted at all. Every record reaching this point is treated as network-learned
     /// (kad discovery, a self-advertised push, or a restore from persistence), so any stub mark
     /// for the key is cleared; the operator-provisioned callers re-mark their entry afterwards.
-    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        if self.trusted_binding_matches(bls_key, &info) {
+            self.cache_matching_peer(bls_key, info);
+        } else {
+            warn!(target: "peer-manager", ?bls_key, "ignoring record that contradicts configured hub identity");
+        }
+    }
+
+    /// Reject both directions of a learned binding that contradicts a configured hub.
+    fn trusted_binding_matches(&self, bls_key: BlsPublicKey, info: &NetworkInfo) -> bool {
+        self.trusted_dials
+            .iter()
+            .map(|(key, dial)| (key, &dial.info))
+            .chain(self.policy_known.iter().filter(|(_, expected)| {
+                self.peers.is_policy_trusted(&PeerId::from(expected.pubkey.clone()))
+            }))
+            .all(|(expected_bls, expected)| {
+                (*expected_bls != bls_key || expected.pubkey == info.pubkey)
+                    && (expected.pubkey != info.pubkey || *expected_bls == bls_key)
+            })
+    }
+
+    /// Cache a record whose identity agrees with every configured hub in this swarm.
+    fn cache_matching_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in
         // `known_peers`. the rest of the (signed, authentic) record is still usable.
-        if let Some(rpc) = &info.rpc {
-            if let Err(err) = rpc.validate() {
-                warn!(
-                    target: "peer-manager",
-                    ?err,
-                    ?bls_key,
-                    "dropping malformed advertised RPC endpoint from peer record"
-                );
-                info.rpc = None;
-            }
-        }
+        info.rpc = info.rpc.filter(|rpc| {
+            rpc.validate().map_or_else(
+                |err| {
+                    warn!(
+                        target: "peer-manager",
+                        ?err,
+                        ?bls_key,
+                        "dropping malformed advertised RPC endpoint from peer record"
+                    );
+                    false
+                },
+                |()| true,
+            )
+        });
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
@@ -1393,10 +1699,19 @@ impl PeerManager {
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 
-    /// Return the most-recently-fetched [RpcInfo] for the given authority,
-    /// if any has been advertised.
+    /// Prefer configured RPC overrides, then signed advertisements bound to the active endpoint.
     pub(crate) fn get_rpc(&self, bls_key: &BlsPublicKey) -> Option<RpcInfo> {
-        self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
+        let known = self.known_peers.get(bls_key);
+        self.policy_known.get(bls_key).map_or_else(
+            || known.and_then(|info| info.rpc.clone()),
+            |configured| {
+                configured.rpc.clone().or_else(|| {
+                    known
+                        .filter(|info| info.pubkey == configured.pubkey)
+                        .and_then(|info| info.rpc.clone())
+                })
+            },
+        )
     }
 
     /// Return the advertised [RpcInfo] for every current-committee validator, and
@@ -1422,21 +1737,29 @@ impl PeerManager {
             .collect()
     }
 
-    /// Find the peer id for an authority.
+    /// Resolve an active operator endpoint before independently retained signed records.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
-        if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
-            Some((pubkey.clone().into(), multiaddrs.clone()))
-        } else {
-            debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
-            None
-        }
+        self.policy_known
+            .get(&bls_key)
+            .or_else(|| self.known_peers.get(&bls_key))
+            .map(|info| (info.pubkey.clone().into(), info.multiaddrs.clone()))
     }
 
-    /// Find the BlsPublicKey for a known PeerId.
+    /// Return configuration-owned identities so obsolete explicit mesh entries can be removed.
+    pub(crate) fn operator_policy_peer_ids(&self) -> HashSet<PeerId> {
+        self.policy_admission.values().copied().collect()
+    }
+
+    /// Skip reconciliation work when this consumer already installed the latest attempt.
+    pub(crate) fn needs_operator_policy(&self, update: &crate::PeerPolicyUpdate) -> bool {
+        self.policy_update.as_ref().is_none_or(|current| current.attempt() < update.attempt())
+    }
+
+    /// Find the verified BlsPublicKey binding for a known PeerId.
     ///
-    /// Backed by the peer store's `Confirmed`-identity index, populated for connected/known peers.
+    /// Configuration stubs remain dial hints until a verified signed record confirms the binding.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
-        self.peers.bls_for_peer(peer_id)
+        self.peers.bls_for_peer(peer_id).filter(|bls| !self.stub_records.contains(bls))
     }
 
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.

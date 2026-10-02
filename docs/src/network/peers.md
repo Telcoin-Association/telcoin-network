@@ -30,47 +30,55 @@ A peer's reputation is derived from its current score every time it is read, nev
 
 ## Penalties and thresholds
 
-Four penalty severities exist, and the number of variants is kept deliberately small:
+Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`, and `Fatal` report attributable protocol or validation failures. `Load(cause)` identifies transient load signals and assigns their existing severity score to ordinary peers.
 
-| Penalty  | Score change              | Meaning |
-|----------|---------------------------|---------|
-| `Mild`   | −1.0                      | An error that is very unlikely to be malicious. |
-| `Medium` | −5.0                      | An error that is probably not malicious but is not free. |
-| `Severe` | −10.0                     | Not necessarily malicious, but will not be tolerated. |
-| `Fatal`  | set to −100.0 (the floor) | Unforgivable; bans on the first occurrence. |
+| Severity | Score change | Examples |
+|----------|--------------|----------|
+| Mild | -1.0 | Invalid requests; `Load(Timeout)`, `Load(SlowPeer)`, or `Load(Synchronization)` for transient outbound failures, slow gossip, and synchronization races. |
+| Medium | -5.0 | Malformed responses; `Load(StreamRateLimit)`, `Load(KademliaRateLimit)`, `Load(EpochBoundary)`, or `Load(Transport)` for stream/provider limits, epoch overlap, and primary transport failures. |
+| Severe | -10.0 | Invalid validation data; `Load(KademliaFlood)` for Kademlia put-record flooding. |
+| Fatal | Set to -100.0 | Invalid signatures, invalid encoding, and authenticated protocol violations. |
 
-Two thresholds act on the resulting score, and both trigger at or below their value:
+Operator-provisioned hubs and tracked committee members ignore load penalties. Protocol penalties apply to every peer. Rate-limited work is still dropped for privileged peers, so load exemption never creates an unlimited service allowance.
 
-- **−20.0 — disconnect.** The node closes the connection.
-- **−50.0 — ban.** The node closes the connection, blacklists the peer in gossipsub, removes it from the Kademlia routing table, and refuses future connections.
+The score thresholds remain -20.0 for disconnection and -50.0 for a ban. From a fresh score of 0.0, ignoring decay, 50 mild, 10 medium, or 5 severe penalties cause a ban. Each report is evaluated immediately.
 
-From a fresh score of `0.0`, ignoring decay, that is 50 `Mild`, 10 `Medium`, or 5 `Severe` penalties before a ban.
-Penalties are not debounced: each report is evaluated immediately and any one of them can be the report that crosses a threshold.
-
-> [!WARNING]
-> Crossing the ban threshold pushes the peer's decay clock forward by 30 minutes.
-> A banned score does not decay during that window, so the lockout is real time served rather than a formality — the score only begins recovering after the 30 minutes elapse, and the peer becomes reconnectable once decay lifts it back above −50.0.
+Crossing the ban threshold delays score decay for 30 minutes. Epoch rotation, identity discovery, and repeated hub installation preserve attributable protocol penalties and their bans. Committee admission may still forgive load-only penalties.
 
 ## What makes a peer important
 
-The peer manager has no validator/observer enum.
-It has an identity and two independent bases for trust.
+A peer's identity is either `Confirmed`, carrying its BLS public key, or `Unidentified`, carrying its libp2p PeerId. Transport authentication proves the remote network key, and signed node records prove their advertised BLS binding. Configuration supplies expected identities and address hints; it does not replace either verification.
 
-An identity is either `Confirmed`, carrying the peer's BLS public key, or `Unidentified`, carrying only its libp2p peer id.
-A peer first seen as unidentified is re-keyed onto its confirmed identity the moment its BLS key is learned.
+Operator allowlisting remains sticky across epoch rotation. Validator membership derives from the previous, current, and next committee sets. Both grant connection-retention privileges and exemption from load-induced penalties, independently of permission to publish committee-only gossip. Neither grants exemption from protocol penalties. Finite connection, stream, message, and rate budgets continue to apply.
 
-The two trust bases are kept separate on purpose:
+Bootstrap entries supply discovery hints. They do not acquire operator retention or load privileges automatically. A compatible trusted entry takes precedence for persistent dial addresses. Conflicting BLS/PeerId bindings fail startup with the offending configuration field.
 
-- **Operator allowlisting** is sticky.
-  It is set when the peer record is constructed, from the node's own trusted and bootstrap configuration, and epoch rotation never alters it.
-- **Validator membership** is derived live from the previous, current, and next committee slots.
-  It is never stored on the peer record, so it cannot drift out of sync with rotation, and a validator rotating out of the committee can never strip operator trust.
+### Trusted hub configuration
 
-Either basis makes a peer "important", which means four things: it is exempt from the score model entirely, it is skipped by heartbeat pruning, it is allowed to connect past the connection ceiling, and it is added as a gossipsub explicit peer when it connects.
-A `Severe` or `Fatal` penalty suppressed for an important peer is logged as a warning, because an exempt peer misbehaving badly enough to earn one is operationally significant.
+Add `trusted_nodes` to the network configuration, keyed by each hub's BLS public key. Replace the key placeholders with the corresponding values from that hub's node information. This example is for a node configured with worker IDs 0 and 1:
 
-When a peer enters a tracked committee its score is primed to the maximum of `100.0`, any ban is forgiven, and its observed IPs are cleared from the per-IP ban counter.
-Priming the score means that if it later rotates out and re-enters the score model, it starts from a clean maximum rather than a stale value.
+```yaml
+trusted_nodes:
+  "<hub BLS public key>":
+    primary:
+      network_key: "<hub primary network key>"
+      network_address: /ip4/203.0.113.10/udp/9000/quic-v1
+    workers:
+      0:
+        network_key: "<hub worker 0 network key>"
+        network_address: /ip4/203.0.113.10/udp/9001/quic-v1
+      1:
+        network_key: "<hub worker 1 network key>"
+        network_address: /ip4/203.0.113.10/udp/9002/quic-v1
+```
+
+Every locally configured worker ID must be present, including workers provisioned ahead of activation. Missing or out-of-range IDs, contradictory BLS/PeerId assignments, and mismatched `/p2p` address suffixes reject startup before any swarm is spawned. An absent or empty `trusted_nodes` map preserves existing configurations. The primary uses only `primary`; worker `k` uses only `workers[k]`.
+
+Registration succeeds even when a hub is offline. The first dial is immediate, followed by delays of 1, 2, 4, 8, 16, 32, and at most 60 seconds during an outage. A successful connection resets the delay. Dial attempts continue across epoch transitions and while unrelated peers satisfy the discovery population target. An in-flight dial is never duplicated.
+
+Each swarm owns one shared retry timer and one schedule per configured hub. Dropping the network task cancels all its retries. Repeated registration preserves connection state and protocol bans. Learned records cannot replace configured identities; changing a hub's network key requires updating the configuration and restarting the node.
+
+When a connection becomes available, missing signed records for configured peers are queried through Kademlia. Unresolved records are retried on the existing peer-manager heartbeat, with at most one lookup in flight per key. This also allows a replacement peer-exchange connection to confirm a hub whose first record push was interrupted. Configuration alone never authorizes its gossip.
 
 ## Connection limits
 
@@ -187,6 +195,30 @@ Every series below is exported under the `tn_network` prefix and carries a `netw
 | `outbound_requests_pending` | Outbound requests in flight. |
 | `outbound_request_failures_total` | Outbound request failures, labelled `kind` with the failure cause. |
 | `px_disconnects_pending` | Graceful peer-exchange disconnects awaiting the peer's acknowledgement. |
+
+
+## Reloading trusted and bootstrap connectivity
+
+On Unix, edit the existing YAML file `<datadir>/network-config`, then send `SIGHUP` to the node PID:
+
+```sh
+kill -HUP <node-pid>
+```
+
+Use the same OS account that owns the node and its data directory, or an authorized system administrator. File permissions and Unix signal permissions define the operator interface. Write a complete sibling file, preserve its owner and permissions, and atomically rename it over `network-config` before signaling. Reload only changes `trusted_nodes` and `bootstrap_peers`. Other network settings, the supported worker IDs, and admission rollout mode require a restart.
+
+The entire file is decoded and every active primary/worker identity binding is validated before publication. RPC URLs must use HTTP(S) and optional WS(S) schemes and satisfy the existing URL length limit. A CLI bootstrap override keeps precedence for the process lifetime. An empty bootstrap map selects the original genesis fallback, so it does not revoke genesis bootstrap peers. To replace that fallback, provide a nonempty map. Trusted and bootstrap entries may share a BLS key only with consistent transport identities; trusted hints take precedence for reconnects when both own the same identity.
+
+One immutable revision is published to the primary and every configured worker, including workers awaiting activation. Each swarm replaces its admission grants, reconnect schedules, retained hints and gossip treatment together between swarm polls. Application is asynchronous across swarms; no swarm installs a partial endpoint map. Committee epochs have independent revisions and do not replace the operator snapshot.
+
+Removing an entry cancels its configuration-owned future retries and queued dials, removes its policy pin, and strips its former retention, mesh and load-scoring privileges. Separate explicit grants and previous/current/next committee membership survive. A remaining bootstrap grant still supplies admission and retained record hints, with ordinary retention and load scoring. In valid Closed mode, live connections with no remaining grant are disconnected without adding a reputation penalty. Open and Grace keep those connections as ordinary peers. In-flight dials are checked at establishment against the applied policy. Protocol evidence and bans survive transport replacements; configuration does not authenticate BLS records or authorize committee gossip.
+
+A missing, malformed, oversized or contradictory file publishes a rejected attempt while retaining the exact last accepted snapshot. Closed admission falls back to Grace on affected swarms until a valid reload clears the operator fault. Committee renewals cannot clear that fault; their own missing, stale or contradictory inputs retain the existing Open/Grace fallback rules. Signatures and finite connection, stream, message and memory budgets remain active in every mode.
+
+Reload reads at most 1 MiB plus one overflow byte. The union of configured BLS entries cannot exceed startup `peer_config.target_num_peers`, using the same validation at startup and reload. Signals are processed serially and coalesced, watch retains only the latest publication, and each swarm shares one retry timer with at most one schedule per configured peer. Unchanged endpoints retain backoff. Shutdown stops the reader and drops retry state with the swarms.
+
+Observe `tn_node.peer_policy_reload_total`, labeled only by finite `outcome` and `reason` values, and the per-network `tn_network.peer_policy_updates_total`, `peer_policy_attempt` and `peer_policy_revision` metrics. Revisions are gauge values, never label values. `admission_fallback` value `5` identifies rejected operator input. Reload logs contain attempt numbers, accepted revisions and rejection categories without keys or file contents.
+
 
 ## Source of truth
 

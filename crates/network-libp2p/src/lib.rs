@@ -21,6 +21,8 @@ mod consensus;
 pub mod error;
 pub mod kad;
 mod metrics;
+mod operator_policy;
+pub use operator_policy::{PeerPolicyUpdate, PolicyRevision, PolicyValidity};
 mod peers;
 mod quic_incoming;
 pub mod stream;
@@ -30,7 +32,7 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
-pub use peers::{AdmissionFallback, AdmissionStatus, PeerExchangeMap, Penalty};
+pub use peers::{AdmissionFallback, AdmissionStatus, LoadPenalty, PeerExchangeMap, Penalty};
 pub use stream::StreamError;
 pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,

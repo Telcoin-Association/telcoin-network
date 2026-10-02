@@ -7,14 +7,22 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
-use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tn_types::{BlsPublicKey, BootstrapServer, P2pNode, Round, WorkerId};
+
+mod policy;
+mod trusted;
+pub use policy::{
+    OperatorPeerPolicy, PeerPolicyConfigError, PolicyPeerLimit, PolicyWorkerCount, SwarmPeerPolicy,
+    MAX_PEER_POLICY_FILE_BYTES,
+};
 use tracing::warn;
+pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 impl ConfigTrait for NetworkConfig {}
 
 /// The container for all network configurations.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     /// The configurations for libp2p library.
     ///
@@ -37,12 +45,39 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Operator-provisioned hubs, maintained on the primary and every configured worker swarm.
+    ///
+    /// Keys identify BLS signers. Entries are dial hints and retention policy, never proof of
+    /// remote identity or permission to publish committee-only gossip.
+    trusted_nodes: BTreeMap<BlsPublicKey, TrustedNode>,
 }
 
 impl NetworkConfig {
     /// Return this node's connection admission configuration.
     pub fn admission(&self) -> &AdmissionConfig {
         &self.admission
+    }
+
+    /// Return the configured hubs and their per-swarm endpoints.
+    pub fn trusted_nodes(&self) -> &BTreeMap<BlsPublicKey, TrustedNode> {
+        &self.trusted_nodes
+    }
+
+    /// Select only the configured endpoints belonging to one worker swarm.
+    pub fn trusted_worker_peers(&self, worker_id: WorkerId) -> BTreeMap<BlsPublicKey, P2pNode> {
+        self.trusted_nodes
+            .iter()
+            .filter_map(|(bls, node)| node.worker(worker_id).cloned().map(|peer| (*bls, peer)))
+            .collect()
+    }
+
+    /// Validate every hub before spawning networks, including the resolved bootstrap overrides.
+    pub fn validate_trusted_nodes(
+        &self,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: usize,
+    ) -> Result<(), TrustedNodeConfigError> {
+        trusted::validate(&self.trusted_nodes, bootstrap, num_workers)
     }
 
     /// Return the configured bootstrap dial hints.
@@ -788,6 +823,147 @@ mod tests {
         serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
             .map(|committee| committee.bootstrap_servers())
             .map_err(Into::into)
+    }
+
+    /// Build hubs with explicit worker IDs from real genesis identities.
+    fn trusted_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, TrustedNode>> {
+        bootstrap_fixture().and_then(|peers| {
+            peers
+                .into_iter()
+                .map(|(bls, server)| {
+                    let worker =
+                        server.worker(0).cloned().ok_or_else(|| eyre::eyre!("genesis worker 0"))?;
+                    let workers = [(0, worker), (1, server.primary.clone())].into_iter().collect();
+                    Ok((bls, TrustedNode::new(server.primary, workers)))
+                })
+                .collect()
+        })
+    }
+
+    /// YAML preserves multiple hubs and explicit worker IDs, and old files need no new key.
+    #[test]
+    fn trusted_nodes_round_trip_multiple_workers() -> eyre::Result<()> {
+        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        assert_eq!(parsed.trusted_nodes(), config.trusted_nodes());
+        parsed.validate_trusted_nodes(&BTreeMap::new(), 2)?;
+        assert!(parsed.trusted_nodes().values().all(|node| node.worker(0).is_some()
+            && node.worker(1).is_some()
+            && node.worker(2).is_none()));
+        let legacy: NetworkConfig = serde_yaml::from_str("hostname: legacy\n")?;
+        assert!(legacy.trusted_nodes().is_empty());
+        Ok(())
+    }
+
+    /// Missing and unsupported worker IDs fail before any swarm can be spawned.
+    #[test]
+    fn trusted_nodes_require_every_supported_worker() -> eyre::Result<()> {
+        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        [1, 3].into_iter().try_for_each(|count| -> eyre::Result<()> {
+            let error = config
+                .validate_trusted_nodes(&BTreeMap::new(), count)
+                .err()
+                .ok_or_else(|| eyre::eyre!("expected invalid worker coverage"))?;
+            assert!(error.to_string().contains(".workers: expected every worker ID"));
+            Ok(())
+        })
+    }
+
+    /// The startup selector keeps worker identities and addresses isolated by worker ID.
+    #[test]
+    fn trusted_nodes_worker_endpoint_isolation() -> eyre::Result<()> {
+        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let worker0 = config.trusted_worker_peers(0);
+        let worker1 = config.trusted_worker_peers(1);
+        assert_eq!(worker0.len(), config.trusted_nodes().len());
+        assert_eq!(worker1.len(), config.trusted_nodes().len());
+        config.trusted_nodes().iter().for_each(|(bls, node)| {
+            assert_eq!(worker0.get(bls), node.worker(0));
+            assert_eq!(worker1.get(bls), node.worker(1));
+            assert_ne!(worker0.get(bls), worker1.get(bls));
+        });
+        assert!(config.trusted_worker_peers(2).is_empty());
+        Ok(())
+    }
+
+    /// Bootstrap and trusted entries may share hints, but cannot bind one BLS key to two IDs.
+    #[test]
+    fn trusted_nodes_reject_conflicting_bootstrap_identity() -> eyre::Result<()> {
+        let bootstrap = bootstrap_fixture()?;
+        let trusted: BTreeMap<_, _> = bootstrap
+            .iter()
+            .map(|(bls, server)| {
+                (
+                    *bls,
+                    TrustedNode::new(
+                        server.primary.clone(),
+                        server
+                            .workers
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .filter_map(|(id, worker)| {
+                                WorkerId::try_from(id).ok().map(|id| (id, worker))
+                            })
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        config.validate_trusted_nodes(&bootstrap, 1)?;
+        let alternate =
+            bootstrap.values().nth(1).ok_or_else(|| eyre::eyre!("second hub"))?.primary.clone();
+        let first =
+            config.trusted_nodes.values_mut().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        *first = TrustedNode::new(alternate.clone(), [(0, alternate)].into_iter().collect());
+        let error = config
+            .validate_trusted_nodes(&bootstrap, 1)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected conflicting BLS binding"))?;
+        assert!(error.to_string().contains("contradictory PeerId bindings"));
+        Ok(())
+    }
+
+    /// A PeerId cannot be assigned to multiple BLS identities in the same swarm.
+    #[test]
+    fn trusted_nodes_reject_duplicate_peer_identity() -> eyre::Result<()> {
+        let mut trusted = trusted_fixture()?;
+        let endpoint =
+            trusted.values().next().ok_or_else(|| eyre::eyre!("first hub"))?.primary().clone();
+        trusted.values_mut().for_each(|node| {
+            *node = TrustedNode::new(
+                endpoint.clone(),
+                [(0, endpoint.clone()), (1, endpoint.clone())].into_iter().collect(),
+            );
+        });
+        let config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected duplicate PeerId"))?;
+        assert!(error.to_string().contains("assigned to multiple BLS keys"));
+        Ok(())
+    }
+
+    /// A /p2p address suffix must identify the expected authenticated transport key.
+    #[test]
+    fn trusted_nodes_reject_conflicting_address_identity() -> eyre::Result<()> {
+        let mut trusted = trusted_fixture()?;
+        let node = trusted.values_mut().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        let mut endpoint = node.primary().clone();
+        endpoint.network_address.push(libp2p::multiaddr::Protocol::P2p(libp2p::PeerId::random()));
+        *node = TrustedNode::new(
+            endpoint,
+            [(0, node.primary().clone()), (1, node.primary().clone())].into_iter().collect(),
+        );
+        let config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected conflicting address identity"))?;
+        assert!(error.to_string().contains("address /p2p identity must match network key"));
+        Ok(())
     }
 
     /// Network config round-trips every worker and peer in the current bootstrap format.
