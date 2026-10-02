@@ -1,0 +1,58 @@
+name: Issue 1505 lint validation
+
+on:
+  push:
+    branches: [ci/1505-worker-rpc-lints]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8c01c8d6c992a1fc58fa24c70e5041ac696be166
+          submodules: true
+      - name: Install pinned nightly
+        run: rustup toolchain install "$(cat rust-nightly)" -c clippy,rust-src,rustfmt --profile minimal
+      - name: Restore lint dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          prefix-key: v1-rust
+          shared-key: clippy-cache
+          save-if: "true"
+      - name: Check formatting
+        run: cargo "+$(cat rust-nightly)" fmt --all -- --check
+      - name: Lint workspace using repository CI target selection
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          feature_args=()
+          if [ "$FEATURE_SET" = all ]; then
+            feature_args+=(--all-features)
+          fi
+          cargo "+$(cat rust-nightly)" clippy --locked --workspace --no-deps "${feature_args[@]}" -- -D warnings
+      - name: Lint changed crates including test targets
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          feature_args=()
+          if [ "$FEATURE_SET" = all ]; then
+            feature_args+=(--all-features)
+          fi
+          cargo "+$(cat rust-nightly)" clippy --locked -p tn-node -p tn-reth --all-targets --no-deps "${feature_args[@]}" -- -D warnings
+
