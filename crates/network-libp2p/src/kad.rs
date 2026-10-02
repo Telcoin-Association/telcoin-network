@@ -312,6 +312,10 @@ impl<DB: Database> KadStore<DB> {
     /// Enable ownership with separate process allowances for required keys and connected sources.
     /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024), bounding the union to
     /// 2,048 rows across all primary and worker swarms. Excess configuration fails explicitly.
+    ///
+    /// Persisted rows are not pruned here. At startup only our own key is retained, because the
+    /// committees are not known yet. The first committee update prunes the rows it does not
+    /// retain. Until then, `get` and `records` do not serve unretained rows.
     pub(crate) fn enable_retention(&mut self) -> libp2p::kad::store::Result<()> {
         /// Shared across database types and all primary and worker swarms.
         static BUDGET: OnceLock<Arc<RetentionBudget>> = OnceLock::new();
@@ -322,7 +326,7 @@ impl<DB: Database> KadStore<DB> {
             RecordRetention::new(self.node_key.clone(), Arc::clone(budget))
                 .map_err(|_| Error::MaxRecords)?,
         );
-        self.prune_unretained()
+        Ok(())
     }
 
     /// Reserve pins before granting operator-provisioned peer-manager privileges.
@@ -434,7 +438,8 @@ impl<DB: Database> KadStore<DB> {
         }
     }
 
-    /// Prune startup rows and rotated-out keys. Failed deletions stay counted and are explicit.
+    /// Prune rotated-out keys and persisted startup rows that the committee update does not
+    /// retain. Failed deletions stay counted and are explicit.
     fn prune_unretained(&mut self) -> libp2p::kad::store::Result<()> {
         let obsolete: Vec<_> = self
             .owned_records()

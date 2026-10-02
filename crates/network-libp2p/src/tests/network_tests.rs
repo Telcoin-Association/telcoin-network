@@ -2729,10 +2729,10 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
 async fn test_local_record_has_no_expiry() {
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let record = peer1.network.get_peer_record();
-    // Must be `None`. libp2p's PutRecordJob::poll only refreshes `expires` via
-    // `.or_else(...)`, so a `Some(_)` value here causes the local RecordIter to
-    // filter our row after `kad_record_ttl` and the node goes invisible. See
-    // get_peer_record() for the full reasoning.
+    // Must be `None`. libp2p's `put_record` stores the local row as given and fills
+    // `expires` only for outbound copies via `.or_else(...)`, so a `Some(_)` value here
+    // causes the local RecordIter to filter our row after `kad_record_ttl` and the node
+    // goes invisible. See get_peer_record() for the full reasoning.
     assert!(
         record.expires.is_none(),
         "local record must have expires: None (see nemesis-1 in security-eval-kad-table-bug.md)"
@@ -2740,14 +2740,14 @@ async fn test_local_record_has_no_expiry() {
 }
 
 /// End-to-end check on the nemesis-1 fix: peer 1's *own* record must survive
-/// past `kad_record_ttl` (because `get_peer_record` sets `expires: None` and
-/// libp2p's `PutRecordJob` keeps refreshing it), while peer 1's *copy of peer
+/// past `kad_record_ttl` (because `get_peer_record` sets `expires: None`, so the
+/// local row never lapses), while peer 1's *copy of peer
 /// 2's* record must drop off the read path once `expires: Some(_)` (filled in
 /// by peer 2's libp2p before sending) lapses with no further republishes.
 #[tokio::test]
 async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result<()> {
-    // Short TTL keeps the test fast. Publication interval is the libp2p check
-    // cadence for record refresh — must be < TTL.
+    // Short TTL keeps the test fast. The publication interval drives
+    // `refresh_own_record`. Configuration validation requires both intervals < TTL.
     let short_ttl = Duration::from_secs(2);
     let mut network_config = NetworkConfig::default();
     network_config.libp2p_config_mut().kad_record_ttl = short_ttl;
@@ -2982,15 +2982,18 @@ async fn test_kad_capacity_does_not_block_authoritative_membership() -> eyre::Re
     Ok(())
 }
 
-/// The resolved library republishes our record across job intervals, never third-party rows.
+/// The libp2p-kad record job stays disabled, so the library never sends stored records.
+///
+/// On libp2p-kad 0.49 one job serves publication and replication, and each run sends every
+/// stored third-party record. `refresh_own_record` republishes our record instead.
 #[tokio::test]
-async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
+async fn test_kad_record_jobs_never_republish_stored_records() -> eyre::Result<()> {
     use libp2p::swarm::NetworkBehaviour as _;
 
     let local = PeerId::random();
     let remote = PeerId::random();
     let own_key = kad::RecordKey::new(&b"own");
-    // The remote is strictly closest to this key, so a re-enabled replication job must
+    // The remote is strictly closest to this key, so a job that sends the record must
     // create an observable query instead of terminating with no eligible destination.
     let third_key = kad::RecordKey::new(&remote.to_bytes());
     let mut own = kad::Record::new(own_key.clone(), vec![1]);
@@ -3000,41 +3003,43 @@ async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
     let mut store = kad::store::MemoryStore::new(local);
     store.put(own)?;
     store.put(third)?;
-    let settings = tn_config::LibP2pConfig {
-        kad_publication_interval: Duration::from_millis(100),
-        kad_replication_interval: Duration::from_millis(20),
-        ..Default::default()
-    };
+    // Short intervals make a surviving job fire well inside the wait below. The configuration
+    // must disable both of them.
     let mut config = kad::Config::new(libp2p::StreamProtocol::new("/tn-retention-test"));
-    crate::consensus::configure_record_jobs(&mut config, &settings);
+    config
+        .set_publication_interval(Some(Duration::from_millis(20)))
+        .set_replication_interval(Some(Duration::from_millis(20)));
+    crate::consensus::configure_record_jobs(&mut config);
     // `wait_until` takes an `Fn` condition and `poll` needs `&mut`, so the closures borrow
     // the behaviour through a cell.
     let behaviour = std::cell::RefCell::new(kad::Behaviour::with_config(local, store, config));
     behaviour.borrow_mut().add_address(&remote, "/ip4/192.0.2.1/tcp/1".parse()?);
 
-    wait_until(Duration::from_secs(5), "own-record publication job", || {
-        let waker = futures::task::noop_waker();
-        let mut context = std::task::Context::from_waker(&waker);
-        let mut behaviour = behaviour.borrow_mut();
-        let _ = behaviour.poll(&mut context);
-        let publishing: Vec<_> = behaviour
-            .iter_queries()
-            .filter_map(|query| match query.info() {
-                kad::QueryInfo::PutRecord { record, .. } => Some(record.key.clone()),
-                kad::QueryInfo::Bootstrap { .. }
-                | kad::QueryInfo::GetClosestPeers { .. }
-                | kad::QueryInfo::GetProviders { .. }
-                | kad::QueryInfo::AddProvider { .. }
-                | kad::QueryInfo::GetRecord { .. } => None,
-            })
-            .collect();
-        assert!(
-            !publishing.contains(&third_key),
-            "third-party periodic replication must stay disabled"
-        );
-        std::future::ready(Ok(publishing.contains(&own_key)))
-    })
-    .await?;
+    // The job deadline is an `Instant`, so one poll after the wait starts any job that is due.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let waker = futures::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+    let _ = behaviour.borrow_mut().poll(&mut context);
+    let publishing: Vec<_> = behaviour
+        .borrow()
+        .iter_queries()
+        .filter_map(|query| match query.info() {
+            kad::QueryInfo::PutRecord { record, .. } => Some(record.key.clone()),
+            kad::QueryInfo::Bootstrap { .. }
+            | kad::QueryInfo::GetClosestPeers { .. }
+            | kad::QueryInfo::GetProviders { .. }
+            | kad::QueryInfo::AddProvider { .. }
+            | kad::QueryInfo::GetRecord { .. } => None,
+        })
+        .collect();
+    assert!(
+        !publishing.contains(&third_key),
+        "third-party periodic replication must stay disabled"
+    );
+    assert!(
+        !publishing.contains(&own_key),
+        "refresh_own_record republishes our record, not the library job"
+    );
 
     // Serving a retained committee binding is independent of the publication job.
     behaviour.borrow_mut().get_record(third_key.clone());
@@ -3355,6 +3360,9 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     // store with peer2 to generate old kad record
     peer2.network.node_record = old_record;
     let old_kad_record = peer2.network.get_peer_record();
+    // the retention policy stores records only for retained owners, so pin peer2 as an
+    // operator would
+    network.swarm.behaviour_mut().kademlia.store_mut().pin_records([peer2_pubkey])?;
     // put old record in store
     network.swarm.behaviour_mut().kademlia.store_mut().put(old_kad_record.clone())?;
     // assert kad store is old
@@ -3437,6 +3445,10 @@ async fn test_kad_put_shed_is_unscored_and_flood_is_penalized() -> eyre::Result<
     // Relay another node's valid signed record. The source remains an ordinary connected peer.
     let record = peer2.network.get_peer_record();
     assert_ne!(record.publisher, Some(source));
+    // The retention policy stores a relayed record only for a retained owner. Pin the owner at
+    // the store, so the source keeps its ordinary, non-exempt score.
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    network.swarm.behaviour_mut().kademlia.store_mut().pin_records([owner_bls])?;
 
     (0..MAX_PUT_RECORDS_PER_WINDOW)
         .try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
@@ -4095,11 +4107,12 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
 
     // owner is a committee member so the gated discovery path (#827) retains its record;
     // production applies committee membership from epoch state before processing records.
-    network.swarm.behaviour_mut().peer_manager.update_committees(
-        Default::default(),
-        std::iter::once(owner_bls).collect(),
-        Default::default(),
-    );
+    // The command also updates the store's committee retention, as production does.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner_bls]),
+        next: HashSet::new(),
+    })?;
 
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
 
