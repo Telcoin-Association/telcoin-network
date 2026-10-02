@@ -121,9 +121,14 @@ STAKE_CALLDATA=$(target/release/telcoin-network keytool export-staking-args \
 
 ### Step 3: Query the required stake amount
 
+`stake()` checks the value against the stake version of the current epoch. Read the version, then that version's config:
+
 ```bash
+STAKE_VERSION=$(cast call $REGISTRY "getCurrentStakeVersion()(uint8)" --rpc-url $RPC)
+
 cast call $REGISTRY \
-    "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" \
+    "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" \
+    $STAKE_VERSION \
     --rpc-url $RPC
 ```
 
@@ -182,7 +187,7 @@ cast send $REGISTRY \
     --rpc-url $RPC
 ```
 
-The validator enters `PendingActivation` and joins the committee at the next epoch transition.
+The validator enters `PendingActivation` and becomes `Active` at the next epoch transition. The earliest committee it can be selected for starts two epochs after that.
 
 ### Step 8: Start the new validator node
 

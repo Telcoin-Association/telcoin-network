@@ -264,7 +264,7 @@ telcoin-network node \
     --metrics 127.0.0.1:9101
 ```
 
-Available named chains: `adiri` (alias: `testnet`), `mainnet`.
+Available named chains: `adiri` and `test-net`, which both load the Adiri testnet config, and `main-net`.
 
 The `--chain` flag overrides local genesis files with the embedded config for that network.
 
@@ -303,7 +303,7 @@ telcoin-network node \
 
 | Flag                  | Default        | Description                                                                                    |
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
-| `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
+| `--chain`             | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                         |
 | `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
@@ -779,7 +779,7 @@ This command reads only public data from `node-info.yaml`. No private key, passp
 
 Default (human-readable):
 
-Prints the three arguments with byte lengths and `0x`-prefixed hex values.
+Prints the two arguments with byte lengths and `0x`-prefixed hex values.
 
 JSON (`--json`):
 
@@ -800,7 +800,7 @@ Single `0x`-prefixed hex string containing ABI-encoded calldata ready to submit 
 function stake(
     bytes calldata blsPubkey,
     ProofOfPossession calldata proofOfPossession
-) public
+) external payable
 
 struct ProofOfPossession {
     bytes signature; // 48 bytes (compressed G1)
@@ -808,6 +808,8 @@ struct ProofOfPossession {
 ```
 
 The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
+
+The transaction value must equal the `stakeAmount` of the current epoch's stake version: read the version with `getCurrentStakeVersion()`, then the config with `stakeConfig(uint8)`. See [How to Stake](../../docs/src/staking/how-to-stake.md) for the full sequence.
 
 ## Observer mode
 

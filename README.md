@@ -90,11 +90,12 @@ CONSENSUS_REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
 ```
 
 The `stake()` function is payable.
-Users must send the exact required stake amount as the transaction value.
-Query the current required stake amount:
+Users must send the exact stake amount of the current epoch's stake version as the transaction value.
+`getCurrentStakeConfig()` can return a version that only takes effect at the next epoch, so query the stake version, then that version's config:
 
 ```bash
-cast call $CONSENSUS_REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" --rpc-url RPC_URL
+STAKE_VERSION=$(cast call $CONSENSUS_REGISTRY "getCurrentStakeVersion()(uint8)" --rpc-url RPC_URL)
+cast call $CONSENSUS_REGISTRY "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" $STAKE_VERSION --rpc-url RPC_URL
 ```
 
 The first value returned is `stakeAmount` (in wei). Use it as the `--value` in the stake transaction:
