@@ -31,6 +31,8 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// The startup wait for an established peer on each primary and worker network.
+    peer_readiness_timeout: PeerReadinessTimeout,
     /// The hostname for the validator.
     hostname: String,
     /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
@@ -53,6 +55,21 @@ impl NetworkConfig {
     /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
     pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// Return the startup peer-readiness budget for each primary and worker network.
+    ///
+    /// Defaults to 120 seconds. Expiry continues startup so a node started alone can
+    /// serve RPC and join consensus when its peers arrive.
+    pub fn peer_readiness_timeout(&self) -> Duration {
+        self.peer_readiness_timeout.0
+    }
+
+    /// Set the startup peer-readiness budget for each primary and worker network.
+    ///
+    /// A zero budget skips waiting; it does not disable discovery or later connections.
+    pub fn set_peer_readiness_timeout(&mut self, timeout: Duration) {
+        self.peer_readiness_timeout = PeerReadinessTimeout(timeout);
     }
 
     /// Return the configured bootstrap dial hints.
@@ -162,6 +179,17 @@ impl NetworkConfig {
     pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
         let path = tn_datadir.network_config_path();
         Self::write_to_path(path, self, ConfigFmt::YAML)
+    }
+}
+
+/// A per-network startup budget that preserves the production default in legacy configs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(transparent)]
+struct PeerReadinessTimeout(Duration);
+
+impl Default for PeerReadinessTimeout {
+    fn default() -> Self {
+        Self(Duration::from_secs(120))
     }
 }
 
@@ -763,6 +791,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default and legacy configs retain the production two-minute readiness budget.
+    #[test]
+    fn peer_readiness_timeout_defaults_to_two_minutes() -> eyre::Result<()> {
+        assert_eq!(NetworkConfig::default().peer_readiness_timeout(), Duration::from_secs(120));
+        let legacy: NetworkConfig = serde_yaml::from_str("{}")?;
+        assert_eq!(legacy.peer_readiness_timeout(), Duration::from_secs(120));
+        Ok(())
+    }
+
+    /// The readiness budget survives operator YAML and a configured serialization round trip.
+    #[test]
+    fn peer_readiness_timeout_yaml_round_trips() -> eyre::Result<()> {
+        let configured: NetworkConfig =
+            serde_yaml::from_str("peer_readiness_timeout: {secs: 5, nanos: 0}")?;
+        assert_eq!(configured.peer_readiness_timeout(), Duration::from_secs(5));
+        let mut config = NetworkConfig::default();
+        config.set_peer_readiness_timeout(Duration::from_millis(125));
+        let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        assert_eq!(parsed.peer_readiness_timeout(), Duration::from_millis(125));
+        Ok(())
+    }
 
     /// Use the checked-in genesis peers so fixtures exercise real key decoding.
     fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
