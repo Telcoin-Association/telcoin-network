@@ -36,19 +36,18 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total timeout for serving an entire epoch pack over the sync protocol.
+/// Total timeout for serving a single consensus-output response over the sync protocol.
 ///
-/// A backstop above the per-frame [`SEND_STREAM_BUFFER_TIMEOUT`]: a peer that
-/// drip-reads just fast enough to keep resetting the per-frame timer cannot pin
-/// the responder task (and the admission slot it holds) indefinitely.
+/// A single output is small and bounded (unlike a whole epoch pack, whose serve is bounded by a
+/// throughput floor rather than a fixed wall-clock cap — see `send_sync_epoch_pack_over_stream`),
+/// so a fixed backstop is fine here: it caps the admission slot a drip-reading peer can hold.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
 ///
 /// The streaming collector is already bounded by its DB-read time limit, but the
 /// number of frames and a slow reader are not, so this backstops the whole serve
-/// (and the admission slot it holds) the same way [`SEND_SYNC_PACK_TIMEOUT`] does
-/// for an epoch pack.
+/// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
@@ -1361,7 +1360,8 @@ where
     ///
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
-    /// [`send_sync_epoch_pack_over_stream`] under a total timeout. A send failure is
+    /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
+    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
     /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
     /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
     /// during the item-6 rollout, like the legacy responder).
@@ -1378,21 +1378,20 @@ where
         debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
-        // bound the whole serve; flatten the timeout's outer Result into the send's
-        let served = timeout(
-            SEND_SYNC_PACK_TIMEOUT,
-            crate::network::sync_codec::send_sync_epoch_pack_over_stream(
-                &mut stream,
-                consensus_chain,
-                epoch,
-                stop_number,
-                SEND_STREAM_BUFFER_TIMEOUT,
-                peer,
-            ),
+        // No fixed overall serve cap: `send_sync_epoch_pack_over_stream` enforces a per-frame write
+        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`) AND a rolling-window throughput floor, so a large
+        // honest pack can take as long as it needs at/above the floor while a drip-reading peer
+        // (which keeps resetting the per-frame timer) is cut within roughly one window —
+        // without capping the pack size a slow-but-honest requester could ever receive.
+        let served = crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+            &mut stream,
+            consensus_chain,
+            epoch,
+            stop_number,
+            SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
         )
-        .await
-        .map_err(PrimaryNetworkError::from)
-        .and_then(|served| served);
+        .await;
 
         // a send failure or timeout is logged and best-effort signalled so the
         // requester stops waiting; it is not a peer fault, so no penalty

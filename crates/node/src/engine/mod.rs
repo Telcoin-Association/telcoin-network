@@ -13,7 +13,7 @@
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
 use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
-use tn_config::Config;
+use tn_config::{Config, PidLock};
 use tn_exex::ExExInstallFn;
 use tn_reth::{
     error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
@@ -76,6 +76,10 @@ pub struct TnBuilder {
     /// Optional process-local bootstrap dial hints, taking precedence over the network config.
     /// An explicitly empty map selects the genesis fallback.
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    /// The datadir lock, when the caller took it before opening the execution database (so a
+    /// second node is refused before it touches the live node's database). The node holds it for
+    /// its lifetime; see `launch_node`.
+    pid_lock: Option<PidLock>,
 }
 
 impl TnBuilder {
@@ -96,7 +100,20 @@ impl TnBuilder {
             reth_db,
             exex_fns: Vec::new(),
             bootstrap_peers: None,
+            pid_lock: None,
         }
+    }
+
+    /// Hand the node the datadir lock the caller already holds (taken before the execution
+    /// database was opened), instead of having the node take it itself.
+    pub fn with_pid_lock(mut self, pid_lock: PidLock) -> Self {
+        self.pid_lock = Some(pid_lock);
+        self
+    }
+
+    /// Take the datadir lock handed over with [`Self::with_pid_lock`], if any.
+    pub fn take_pid_lock(&mut self) -> Option<PidLock> {
+        self.pid_lock.take()
     }
 
     /// Set the maximum completed export bundles to retain, or leave retention unlimited.
@@ -333,7 +350,7 @@ impl ExecutionNode {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 
-    /// Batch maker
+    /// Start the worker's batch builder for the epoch.
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -342,10 +359,8 @@ impl ExecutionNode {
         base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
-        let mut guard = self.internal.write().await;
-        guard
-            .start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
-            .await
+        let guard = self.internal.read().await;
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
     }
 
     /// Batch validator

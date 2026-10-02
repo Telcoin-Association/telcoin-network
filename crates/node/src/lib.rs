@@ -48,12 +48,32 @@ pub fn launch_node<P>(
 where
     P: TelcoinDirs + Clone + 'static,
 {
-    let consensus_db = manager::open_consensus_db(&tn_datadir);
-
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
     tokio::spawn(async move {
+        // Refuse to run a second writer against this datadir, and hold the PID lockfile for the
+        // node's whole lifetime: it is released on the clean-shutdown path below, and on any early
+        // error or panic via the guard's `Drop`. The CLI takes it before it opens the execution
+        // engine's database (whose own lock only coordinates concurrent users, it does not
+        // exclude a second node) and hands it over in the builder; any other caller has it taken
+        // here, still before consensus storage is touched (its open is fail-fast and would
+        // otherwise panic on a datadir another node holds before this clear error is reached). A
+        // crashed holder never blocks a restart: the kernel releases its `flock` when the process
+        // exits. This is TN-owned and does not depend on the execution engine's own lock.
+        let mut builder = builder;
+        let _pid_lock = match builder.take_pid_lock() {
+            Some(lock) => lock,
+            None => match tn_config::PidLock::acquire(&tn_datadir) {
+                Ok(lock) => lock,
+                Err(err) => {
+                    tracing::error!("Error running node (datadir already locked): {err}");
+                    return Err(err);
+                }
+            },
+        };
+        let consensus_db = manager::open_consensus_db(&tn_datadir);
+
         // create the epoch manager
         let mut epoch_manager =
             match EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await {
@@ -67,6 +87,12 @@ where
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
         }
+        // Async-close consensus storage so its background-thread joins don't block this tokio
+        // worker on `Drop` (the runtime is still alive here, inside `block_on`). `run()` has
+        // already persisted and awaited task shutdown, so `epoch_manager` normally holds
+        // the last reference; if a winding-down RPC clone briefly outlives it, `shutdown()`
+        // bounds the wait and then force-seals rather than leaving the pack unsealed.
+        epoch_manager.shutdown().await;
         result
     })
 }
