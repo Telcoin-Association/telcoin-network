@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -57,8 +61,7 @@ jobs:
           LANE: ${{ matrix.lane }}
         run: |
           if [[ "$LANE" == clippy ]]; then
-            cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --no-deps -- -D warnings
-            cargo "+$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
+            ./etc/ci-lanes.sh clippy
           else
             ./etc/ci-lanes.sh "$LANE"
           fi
@@ -86,7 +89,7 @@ jobs:
             -E 'test(test_multi_worker_components_across_epochs) | test(epoch_starts_all_workers_and_reuses_components)' 2>&1 | tee fixed.log
       - name: Remove the initialization guard
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
           path = Path("crates/node/src/engine/inner.rs")
           source = path.read_text()
@@ -111,11 +114,11 @@ jobs:
           set -e
           cat guard-mutant.log
           test "$status" -eq 100
-          rg -F 'invalid worker initialization succeeded' guard-mutant.log
+          python3 -I -c 'from pathlib import Path; assert "invalid worker initialization succeeded" in Path("guard-mutant.log").read_text()'
           git restore --source=HEAD -- crates/node/src/engine/inner.rs
       - name: Make retained components count as running
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
           path = Path("crates/node/src/engine/mod.rs")
           source = path.read_text()
@@ -132,7 +135,7 @@ jobs:
           set -e
           cat running-mutant.log
           test "$status" -eq 100
-          rg -F 'assertion failed: !engine.is_worker_running(1).await' running-mutant.log
+          python3 -I -c 'from pathlib import Path; assert "assertion failed: !engine.is_worker_running(1).await" in Path("running-mutant.log").read_text()'
           git restore --source=HEAD -- crates/node/src/engine/mod.rs
       - name: Restore and verify the fix
         run: |
