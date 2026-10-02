@@ -326,6 +326,26 @@ where
     /// `epoch_start` is the timestamp of the pinned header, the previous epoch's closing block
     /// (genesis for epoch 0), from the same entry read as `committee`. It becomes the config's
     /// [`ConsensusConfig::prior_epoch_close`] for every epoch after 0.
+    ///
+    /// The vote-window check ([`ConsensusConfig::validate_epoch_timing`]) runs here, after
+    /// [`ConsensusConfig::new_for_epoch`] has built the config and enforced the operational
+    /// floors, and only for an epoch this node can still vote in. Every epoch the node enters
+    /// passes through this method, including the historical epochs that a catching-up node (a
+    /// fresh joiner, an observer following from genesis, a validator restoring an old snapshot)
+    /// only replays. Before the sub-second fork the voter rounds the drift tolerance up to whole
+    /// seconds, so the window is wider for pre-fork epochs. A config tuned for the post-fork
+    /// window would otherwise stop the node at the first pre-fork epoch it replays, although the
+    /// network has already closed that epoch and the node can never vote in it.
+    ///
+    /// An epoch counts as closed only when its record is stored with a certificate that verifies
+    /// against it (`certified_record_by_epoch`). Startup syncs records toward the network tip and
+    /// stores each one with its certificate, and the epoch record collector keeps extending that
+    /// certified prefix for the life of the process, so a catching-up node normally holds the
+    /// record of a closed epoch before it enters it; an epoch whose certified record it does not
+    /// hold yet keeps the check. A plain record lookup is not enough: a fresh genesis start seeds
+    /// an uncertified dummy record for epoch 0, and that dummy must not let the node skip the
+    /// check for the epoch it is about to vote in. A failed read of any kind leaves the check in
+    /// force.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
@@ -337,8 +357,9 @@ where
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
+        let epoch = committee.epoch();
         // epoch 0's pin is genesis, not a closed epoch, so there is no seam to floor
-        let prior_epoch_close = (committee.epoch() > 0).then_some(epoch_start);
+        let prior_epoch_close = (epoch > 0).then_some(epoch_start);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -350,6 +371,19 @@ where
             next_committee_keys,
             PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
         )?;
+
+        // a missing record, a missing certificate and a storage error all mean "not known to be
+        // closed", so only a verified certificate relaxes the check
+        let closed = self.consensus_chain.epochs().certified_record_by_epoch(epoch).await.is_ok();
+        if closed {
+            info!(
+                target: "epoch-manager",
+                epoch,
+                "epoch already closed by its committee; replaying it without the vote-window check"
+            );
+        } else {
+            consensus_config.validate_epoch_timing()?;
+        }
 
         Ok(consensus_config)
     }
@@ -1236,6 +1270,36 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
+    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
+    /// there: the on-disk state an `EpochManager` is built from.
+    fn reth_config_and_db<P>(
+        config: &tn_config::Config,
+        committee: &tn_types::Committee,
+        datadir: &P,
+    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
+    where
+        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
+    {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+
+        tn_reth::init_reth_defaults();
+        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            datadir,
+            true,
+            std::sync::Arc::new(config.chain_spec()),
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
+        Ok((node_config, reth_db))
+    }
+
     /// Epoch entry reuses worker 0's early RPC and joins worker peer waits concurrently.
     /// Subsequent entries reuse active RPC servers and pools, refresh sync state, and stop and
     /// reactivate removed workers over their retained pools.
@@ -1248,12 +1312,11 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+        use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
         use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
 
-        tn_reth::init_reth_defaults();
         let temp = tempfile::TempDir::new()?;
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
@@ -1274,20 +1337,7 @@ mod tests {
             .committee()
             .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
-        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
-        let chain = Arc::new(config.chain_spec());
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            &datadir,
-            true,
-            chain,
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
         let reth_env =
@@ -1544,6 +1594,225 @@ mod tests {
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
+        Ok(())
+    }
+
+    /// Every epoch after 0 floors its first commit on the timestamp of the previous epoch's
+    /// closing block, and `configure_consensus` is where that timestamp enters the consensus
+    /// config. Epoch 0's entry read is pinned to genesis, which closes no epoch, so its config
+    /// carries no close even though the pinned header has a timestamp.
+    #[tokio::test]
+    async fn configure_consensus_carries_prior_epoch_close_after_epoch_zero() -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{BlsKeypair, TimestampSec};
+
+        // both epochs get the same pinned-header timestamp, so only the committee's epoch decides
+        // whether it becomes the close
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let config = Config::default_for_test();
+        let genesis = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+
+        let epoch_zero = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_zero.prior_epoch_close(),
+            None,
+            "epoch 0 follows genesis rather than a closed epoch, so there is no close to floor on"
+        );
+
+        let committee =
+            CommitteeFixture::builder(MemDatabase::default).epoch(1).build().committee();
+        let epoch_one = manager
+            .configure_consensus(
+                &network_config,
+                committee,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_one.prior_epoch_close(),
+            Some(EPOCH_START),
+            "epoch 1 must floor its first commit on the timestamp of epoch 0's closing block"
+        );
+        Ok(())
+    }
+
+    /// The vote window bounds this node's own votes, so entering an epoch enforces it only while
+    /// the epoch may still be open. A record stored with a verified certificate is the
+    /// committee's own statement that the epoch closed, and a node entering such an epoch only
+    /// replays it. Anything less, including the uncertified dummy record a fresh genesis start
+    /// seeds for epoch 0, keeps the check strict. The parameters miss the window in both fork
+    /// regimes, so the outcome does not depend on the build's fork schedule.
+    #[tokio::test]
+    async fn configure_consensus_enforces_the_vote_window_only_while_the_epoch_is_open(
+    ) -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{
+            BlsAggregateSignature, BlsKeypair, EpochCertificate, EpochRecord, TimestampSec,
+        };
+
+        /// A record for `epoch` whose committee is `fixture`'s, with a certificate every member
+        /// signed, aggregated the way the epoch vote collector does.
+        fn certified_record(
+            fixture: &CommitteeFixture<MemDatabase>,
+            epoch: Epoch,
+            parent_hash: EpochDigest,
+        ) -> (EpochRecord, EpochCertificate) {
+            let keys: Vec<BlsPublicKey> =
+                fixture.authorities().map(|authority| authority.primary_public_key()).collect();
+            let record = EpochRecord {
+                epoch,
+                committee: keys.clone(),
+                next_committee: keys,
+                parent_hash,
+                ..Default::default()
+            };
+            let signatures: Vec<_> = fixture
+                .authorities()
+                .map(|authority| record.sign_vote(authority.consensus_config().key_config()))
+                .map(|vote| vote.signature)
+                .collect();
+            let signature = BlsAggregateSignature::aggregate(&signatures, true)
+                .expect("committee votes aggregate")
+                .to_signature();
+            let signed_authorities = (0..signatures.len() as u32).collect();
+            let cert =
+                EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
+            (record, cert)
+        }
+
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let mut config = Config::default_for_test();
+        // 2 s misses the vote window with sub-second timestamps (2.25 s) and without them (3 s),
+        // and still passes the operational floors
+        config.parameters.max_header_delay = Duration::from_secs(2);
+        config.parameters.vote_timeout = Duration::from_secs(2);
+        let genesis_fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let genesis = genesis_fixture.committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(29)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+        let epoch_one_fixture = CommitteeFixture::builder(MemDatabase::default).epoch(1).build();
+        let epochs = manager.consensus_chain.epochs();
+
+        // `err()` keeps a failure message free of the whole config's debug dump
+        let Some(err) = manager
+            .configure_consensus(
+                &network_config,
+                epoch_one_fixture.committee(),
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .err()
+        else {
+            panic!("an epoch with no stored record may still be open, so its vote window holds");
+        };
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "entering an open epoch must fail with the config's own vote_timeout error: {err}"
+        );
+
+        // the in-memory anchor a fresh genesis start seeds before it syncs any record
+        let genesis_keys: Vec<BlsPublicKey> = genesis.bls_keys().iter().copied().collect();
+        epochs
+            .save_dummy_epoch0(EpochRecord {
+                epoch: 0,
+                committee: genesis_keys.clone(),
+                next_committee: genesis_keys,
+                ..Default::default()
+            })
+            .await?;
+        let Some(err) = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .err()
+        else {
+            panic!(
+                "the uncertified epoch-0 dummy does not show that epoch 0 closed, so a fresh \
+                 genesis start must still enforce the vote window"
+            );
+        };
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "entering epoch 0 over the dummy record must fail with the vote_timeout error: {err}"
+        );
+
+        let (record_zero, cert_zero) =
+            certified_record(&genesis_fixture, 0, EpochDigest::default());
+        let (record_one, cert_one) = certified_record(&epoch_one_fixture, 1, record_zero.digest());
+        epochs.save(record_zero, cert_zero).await?;
+        epochs.save(record_one, cert_one).await?;
+        assert!(
+            epochs.certified_record_by_epoch(1).await.is_ok(),
+            "epoch 1's stored record must verify against its certificate"
+        );
+        manager
+            .configure_consensus(
+                &network_config,
+                epoch_one_fixture.committee(),
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .expect(
+                "an epoch its committee certified as closed is only replayed, so entering it must \
+                 not apply the vote window",
+            );
         Ok(())
     }
 
