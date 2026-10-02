@@ -10,9 +10,9 @@
 
 use super::common::{
     assert_epoch_records_verify, assert_nodes_agree_on_commit_times, drive_light_tx_load,
-    get_node_mode, loop_epochs, pin_fork_epochs, read_consensus_headers, scrape_metric_value,
-    start_validator_with_env, wait_for_rpc, walk_block_commit_times, ProcessGuard,
-    EVM_TIMESTAMP_CLAMPED_SERIES, RPC_REQUEST_TIMEOUT,
+    get_node_mode, loop_epochs, node_log_path, pin_fork_epochs, read_consensus_headers,
+    scrape_metric_value, start_validator_with_env, strip_ansi, wait_for_rpc,
+    walk_block_commit_times, ProcessGuard, EVM_TIMESTAMP_CLAMPED_SERIES, RPC_REQUEST_TIMEOUT,
 };
 use alloy::{
     primitives::utils::parse_ether,
@@ -20,11 +20,7 @@ use alloy::{
 };
 use e2e_tests::{config_local_testnet_with_epoch_duration, NodeEndpoints};
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, SyncConfig};
 use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
 use tn_test_utils::wait_until;
@@ -278,7 +274,7 @@ async fn run_clock_skew_scenario(offset_ms: i64, test: &str) -> eyre::Result<()>
     // the hook logs on the node's first clock read, long before its RPC is up; the wait only
     // covers the log writer. checked before the run so a binary without the hook fails at once
     // instead of running four unskewed nodes through every later check
-    let skewed_log = node_log(test, SKEWED)?;
+    let skewed_log = node_log_path(test, SKEWED, 0, false);
     let offset_field = format!("offset_ms={offset_ms}");
     wait_until(Duration::from_secs(20), "the skewed node to log its clock offset", || async {
         Ok(clock_offset_lines(&skewed_log)?
@@ -295,7 +291,7 @@ async fn run_clock_skew_scenario(offset_ms: i64, test: &str) -> eyre::Result<()>
         )
     })?;
     for instance in (0..4).filter(|&instance| instance != SKEWED) {
-        let log = node_log(test, instance)?;
+        let log = node_log_path(test, instance, 0, false);
         let lines = clock_offset_lines(&log)?;
         eyre::ensure!(
             lines.is_empty(),
@@ -522,15 +518,6 @@ async fn block_number<P: Provider>(provider: &P, node: &str) -> eyre::Result<u64
         .map_err(Into::into)
 }
 
-/// The stdout log of run 0 of validator `instance`, where `e2e_tests::setup_log_dir` puts it.
-fn node_log(test: &str, instance: usize) -> eyre::Result<PathBuf> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-    Ok(PathBuf::from(manifest_dir)
-        .join("test_logs")
-        .join(test)
-        .join(format!("node{instance}-run0.log")))
-}
-
 /// The lines of the node log at `log` that contain `needle`, with the ANSI styling the node's log
 /// layer adds removed, so a field reads as a plain `key=value` token.
 fn log_lines_with(log: &Path, needle: &str) -> eyre::Result<Vec<String>> {
@@ -552,7 +539,7 @@ fn clock_offset_lines(log: &Path) -> eyre::Result<Vec<String>> {
 /// the vote timeout, so a rejection means the voter charged a penalty for skew it should defer.
 fn assert_no_timestamp_rejections(test: &str) -> eyre::Result<()> {
     for instance in 0..4 {
-        let log = node_log(test, instance)?;
+        let log = node_log_path(test, instance, 0, false);
         let rejected = log_lines_with(&log, TIMESTAMP_REJECTION)?;
         eyre::ensure!(
             rejected.is_empty(),
@@ -564,25 +551,4 @@ fn assert_no_timestamp_rejections(test: &str) -> eyre::Result<()> {
         );
     }
     Ok(())
-}
-
-/// `line` without its ANSI escape sequences (`ESC [ parameters final-byte`).
-fn strip_ansi(line: &str) -> String {
-    let mut plain = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            plain.push(c);
-            continue;
-        }
-        if chars.next() == Some('[') {
-            // parameter and intermediate bytes, up to and including the final byte
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    plain
 }

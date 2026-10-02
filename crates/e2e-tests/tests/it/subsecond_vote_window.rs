@@ -13,17 +13,13 @@
 
 use super::common::{
     assert_epoch_records_verify, block_commit_time, current_epoch, fetch_verified_epoch_record,
-    get_block_number, get_node_mode, pin_fork_epochs, scrape_metric_value, start_validator,
-    start_validator_with_args, wait_for_epoch_at_least, wait_for_head_at_least, wait_for_rpc,
-    ProcessGuard,
+    get_block_number, get_node_mode, node_log_path, pin_fork_epochs, scrape_metric_value,
+    start_validator, start_validator_with_args, strip_ansi, wait_for_epoch_at_least,
+    wait_for_head_at_least, wait_for_rpc, ProcessGuard,
 };
 use alloy::providers::ProviderBuilder;
 use e2e_tests::{config_local_testnet_with_epoch_duration, NodeEndpoints};
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NetworkConfig, Parameters};
 use tn_test_utils::wait_until;
 use tn_types::{get_available_tcp_port, Epoch, NodeMode};
@@ -182,8 +178,8 @@ async fn test_epoch_late_validator_vote_window_across_subsecond_fork() -> eyre::
         0,
         &["--metrics", &metrics_addr],
     ));
-    let late_stdout = node_log(test, LATE_INSTANCE, "log")?;
-    let late_stderr = node_log(test, LATE_INSTANCE, "stderr.log")?;
+    let late_stdout = node_log_path(test, LATE_INSTANCE, 0, false);
+    let late_stderr = node_log_path(test, LATE_INSTANCE, 0, true);
 
     // the check that stopped the node before the fix runs as it enters its first epoch, a few
     // seconds in, so surviving 20 s means it entered the pre-fork epochs without failing it
@@ -334,7 +330,7 @@ async fn test_epoch_vote_window_refuses_prefork_genesis_subsecond_fork() -> eyre
         let rpc_port = get_available_tcp_port("127.0.0.1").expect("rpc port assigned by host");
         guard.push(start_validator(instance, bin, temp_path, rpc_port, test, 0));
     }
-    let refused_stderr = node_log(test, 0, "stderr.log")?;
+    let refused_stderr = node_log_path(test, 0, 0, true);
 
     let status = loop {
         let child = guard.get_mut(0).ok_or_else(|| eyre::eyre!("validator-1 is not tracked"))?;
@@ -356,7 +352,7 @@ async fn test_epoch_vote_window_refuses_prefork_genesis_subsecond_fork() -> eyre
         "validator-1's stderr does not carry the pre-fork vote-window refusal: {}",
         stderr.trim()
     );
-    ensure_running(&mut guard, 1, "validator-2", started, &node_log(test, 1, "stderr.log")?)?;
+    ensure_running(&mut guard, 1, "validator-2", started, &node_log_path(test, 1, 0, true))?;
 
     guard.kill_all();
     Ok(())
@@ -408,36 +404,10 @@ fn ensure_running(
     Ok(())
 }
 
-/// The path of a node's log file under `test_logs/<test>/`: `extension` is `log` for stdout and
-/// `stderr.log` for stderr. Every test here starts each node once, so the run is 0.
-fn node_log(test: &str, instance: usize, extension: &str) -> eyre::Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?)
-        .join("test_logs")
-        .join(test)
-        .join(format!("node{instance}-run0.{extension}")))
-}
-
 /// Read a node log with its ANSI colour codes removed, so lines match the plain text and fields
 /// read as `name=value`.
 fn read_log(path: &Path) -> eyre::Result<String> {
-    let raw = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
-    let mut plain = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            plain.push(c);
-            continue;
-        }
-        // a control sequence: ESC '[' then parameters, ended by a byte in '@'..='~'
-        if chars.next() == Some('[') {
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(plain)
+    Ok(strip_ansi(&String::from_utf8_lossy(&std::fs::read(path)?)))
 }
 
 /// The epochs a node's stdout says it entered without the vote-window check: the `epoch` field of

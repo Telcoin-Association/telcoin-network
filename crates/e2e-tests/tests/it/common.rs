@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     ops::RangeInclusive,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ExitStatus},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
@@ -491,6 +491,41 @@ pub(crate) fn start_validator_with_env(
     command.spawn().expect("failed to execute")
 }
 
+/// The log file [`setup_log_dir`] gives run `run` of node `instance` under `test_logs/<test>/`:
+/// `node<instance>-run<run>.log` for stdout, `node<instance>-run<run>.stderr.log` for stderr.
+///
+/// The directory is read from `CARGO_MANIFEST_DIR` at run time, as [`setup_log_dir`] reads it,
+/// and falls back to the crate's build-time manifest directory only where that variable is unset,
+/// in which case [`setup_log_dir`] would have panicked before writing any log.
+pub(crate) fn node_log_path(test: &str, instance: usize, run: u32, stderr: bool) -> PathBuf {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let suffix = if stderr { ".stderr" } else { "" };
+    manifest_dir.join("test_logs").join(test).join(format!("node{instance}-run{run}{suffix}.log"))
+}
+
+/// `text` without its ANSI escape sequences (`ESC [ parameters final-byte`), so node log lines
+/// read as plain `name=value` fields.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            plain.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            // parameter and intermediate bytes, up to and including the final byte
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    plain
+}
+
 /// Advertise a validator's JSON-RPC endpoint on its worker record.
 ///
 /// The genesis ceremony leaves `p2p_info.workers[0].rpc` unset, and a non-committee node
@@ -668,20 +703,21 @@ pub(crate) fn address_from_word(key_word: &str) -> Address {
     Address::from_slice(&hash[12..])
 }
 
-/// Send native tokens and confirm the account balance changed.
+/// Send native tokens and confirm the account balance changed, and return the transaction hash
+/// `node` answered `eth_sendRawTransaction` with.
 pub(crate) fn send_and_confirm(
     node: &str,
     node_test: &str,
     key: &str,
     to_account: Address,
     nonce: u128,
-) -> eyre::Result<()> {
+) -> eyre::Result<String> {
     let basefee_address = address!("0x9999999999999999999999999999999999999999");
     let current = get_balance(node_test, &to_account.to_string(), 1)?;
     let current_basefee = get_balance(node_test, &basefee_address.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
-    send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
+    let tx_hash = send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
 
     info!(target: "restart-test", "calling get_positive_balance_with_retry...");
 
@@ -699,7 +735,7 @@ pub(crate) fn send_and_confirm(
         error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
     }
-    Ok(())
+    Ok(tx_hash)
 }
 
 /// Send an RPC call to node to get the latest balance for address.
@@ -1921,7 +1957,6 @@ pub(crate) async fn walk_block_commit_times<P: Provider>(
 
 /// Check the commit time `provider` (the RPC of `node`) serves for execution block `block` and
 /// return it: [`walk_block_commit_times`] over that block alone, so there is no parent to compare.
-#[allow(dead_code, reason = "shared helper for sibling test modules, kept while none calls it")]
 pub(crate) async fn block_commit_time<P: Provider>(
     provider: &P,
     node: &str,
@@ -1941,8 +1976,9 @@ pub(crate) async fn block_commit_time<P: Provider>(
 /// Both derive from consensus output alone, so a disagreement at a shared height is a fork in the
 /// execution chain (the hash) or in the commit-time derivation (the milliseconds). Blocks are
 /// matched by number rather than by position, so walks that start at different heights (a node
-/// restored from a snapshot starts at its floor) still line up. A node that shares no height with
-/// the reference fails, since comparing nothing would pass without checking anything.
+/// restored from a snapshot starts at its floor) still line up. A node that shares no height above
+/// genesis with the reference fails: every walk from block 0 shares genesis, so a node that served
+/// nothing past it would otherwise pass without a single commit time compared.
 pub(crate) fn assert_nodes_agree_on_commit_times(
     served: &[Vec<BlockCommitTime>],
     nodes: &[String],
@@ -1959,7 +1995,7 @@ pub(crate) fn assert_nodes_agree_on_commit_times(
     let reference: BTreeMap<u64, &BlockCommitTime> =
         reference.iter().map(|commit| (commit.block_number, commit)).collect();
     for (other, node) in others.iter().zip(nodes.iter().skip(1)) {
-        let mut shared = 0usize;
+        let mut shared_above_genesis = 0usize;
         for actual in other {
             let Some(&expected) = reference.get(&actual.block_number) else { continue };
             eyre::ensure!(
@@ -1968,12 +2004,14 @@ pub(crate) fn assert_nodes_agree_on_commit_times(
                 nodes[0],
                 expected.block_number,
             );
-            shared += 1;
+            if actual.block_number > 0 {
+                shared_above_genesis += 1;
+            }
         }
         eyre::ensure!(
-            shared > 0,
-            "{node} served no block number that {} also served, so their commit times were never \
-             compared",
+            shared_above_genesis > 0,
+            "{node} served no block above genesis that {} also served, so their commit times were \
+             never compared",
             nodes[0],
         );
     }
@@ -2490,7 +2528,10 @@ pub(crate) fn assert_blocks_match_consensus(
 
 #[cfg(test)]
 mod tests {
-    use super::{pin_fork_epoch, pin_fork_epoch_override};
+    use super::{
+        assert_nodes_agree_on_commit_times, pin_fork_epoch, pin_fork_epoch_override,
+        BlockCommitTime,
+    };
     use std::{
         cell::Cell,
         panic::{catch_unwind, AssertUnwindSafe},
@@ -2559,5 +2600,32 @@ mod tests {
         assert_eq!(std::env::var(PROBE).as_deref(), Ok("3"), "a passing pin lost its value");
 
         std::env::remove_var(PROBE);
+    }
+
+    /// Block `number` as every node serves it, so two walks built from it agree.
+    fn commit(number: u64) -> BlockCommitTime {
+        BlockCommitTime {
+            block_number: number,
+            block_hash: tn_types::B256::with_last_byte(number as u8),
+            timestamp: 1_000 + number,
+            timestamp_millis: (1_000 + number) * 1_000,
+            sub_second: false,
+            consensus_number: (number > 0).then_some(number),
+            consensus_digest: None,
+            closes_epoch: false,
+        }
+    }
+
+    /// Genesis is the same on every node, so a walk that shares only block 0 with the reference
+    /// compared nothing and fails; one more shared block is enough to pass.
+    #[test]
+    fn agree_on_commit_times_needs_a_shared_block_above_genesis() {
+        let nodes = ["reference".to_string(), "other".to_string()];
+        let reference: Vec<_> = (0..=3).map(commit).collect();
+        let genesis_only =
+            assert_nodes_agree_on_commit_times(&[reference.clone(), vec![commit(0)]], &nodes);
+        assert!(genesis_only.is_err(), "a walk sharing only genesis passed");
+        assert_nodes_agree_on_commit_times(&[reference, vec![commit(0), commit(1)]], &nodes)
+            .expect("a walk sharing block 1 agrees");
     }
 }

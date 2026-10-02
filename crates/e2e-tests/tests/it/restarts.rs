@@ -702,8 +702,8 @@ const SUBSECOND_RESTART_RECORD_SECS: u64 = 60;
 /// active from genesis because the sub-second gate requires it. Four validators run 5 s epochs at
 /// the delayed restart tests' lowered gc depth, each serving `--metrics`.
 ///
-/// Phase 1 stops validator-3 in the middle of epoch F - 1, checks that a live peer is still in
-/// that epoch once the process has exited, and keeps the node down until a live peer has closed
+/// Phase 1 stops validator-3 in the middle of epoch F - 1, checks from its datadir that it never
+/// opened epoch F before the process exited, and keeps the node down until a live peer has closed
 /// epoch F and [`RESTART_TEST_DOWNTIME_SECS`] have passed. The node misses the whole first
 /// post-fork epoch and falls far enough behind to be demoted. Restarted on its own pre-fork
 /// history, it has to catch up through state sync and return to active consensus. After that, every
@@ -812,15 +812,19 @@ async fn restarts_across_subsecond_fork() -> eyre::Result<()> {
         providers[RESTARTED].get_chain_id().await.is_err(),
         "validator-3 still answers RPC after being stopped"
     );
-    // the process has exited; if a live peer is still in the last pre-fork epoch, validator-3
-    // never ran a post-fork epoch before its restart
-    let epoch_at_kill = current_epoch(&providers[REFERENCE]).await?.epoch_id;
+    // the process has exited, so its datadir shows how far it got. A live peer's epoch cannot
+    // show it: `wait_for_mid_epoch` leaves 1-3 s of the 5 s epoch, less up to 1 s of flooring, and
+    // `kill_child` polls the exit in 1.2 s steps for up to 6 s, so the network can enter F while
+    // validator-3 is already shutting down without validator-3 ever running F. Only the upper
+    // bound is the claim: the same flooring lets the window open milliseconds after the boundary,
+    // before validator-3 may have opened F - 1 itself
+    let epoch_at_kill = last_opened_epoch(&temp_path.join("validator-3"))?;
     eyre::ensure!(
-        epoch_at_kill == F - 1,
-        "validator-3 took until epoch {epoch_at_kill} to exit: the run cannot show it was down \
-         when the fork activated at epoch {F}"
+        epoch_at_kill < F,
+        "validator-3 opened epoch {epoch_at_kill} before it exited: the run cannot show it was \
+         down when the fork activated at epoch {F}"
     );
-    info!(target: "restart-test", epoch_at_kill, "validator-3 stopped in the last pre-fork epoch");
+    info!(target: "restart-test", epoch_at_kill, "validator-3 stopped before opening the fork epoch");
 
     // the 25 s floor and the consensus-header gap push validator-3 out of the gc window, and the
     // epoch wait makes the network close the first post-fork epoch without it
@@ -948,6 +952,45 @@ async fn restarts_across_subsecond_fork() -> eyre::Result<()> {
     );
 
     guard.kill_all();
+    Ok(())
+}
+
+/// The highest epoch whose consensus pack the node under `datadir` opened.
+///
+/// A node creates `consensus-db/epochs/epoch-<N>` when it starts epoch N (`open_epoch_pack` in
+/// `run_epoch`), before it replays or configures any consensus for that epoch, so on a stopped
+/// node the highest such directory is the last epoch it began to run. Only directory names are
+/// read, which leaves the datadir exactly as the node left it for its restart.
+fn last_opened_epoch(datadir: &Path) -> eyre::Result<Epoch> {
+    // the node's `TelcoinDirs::epochs_db_path`, as in `read_consensus_headers`
+    let base = datadir.join("consensus-db").join("epochs");
+    let mut last = None;
+    for entry in std::fs::read_dir(&base).wrap_err_with(|| format!("listing {}", base.display()))? {
+        let name = entry?.file_name();
+        // staging, import and slot entries share the directory; only `epoch-<N>` is a pack
+        let Some(epoch) =
+            name.to_str().and_then(|name| name.strip_prefix("epoch-")).and_then(|n| n.parse().ok())
+        else {
+            continue;
+        };
+        last = last.max(Some(epoch));
+    }
+    last.ok_or_else(|| eyre::eyre!("no epoch pack under {}", base.display()))
+}
+
+#[test]
+fn test_last_opened_epoch_reads_only_pack_directories() -> eyre::Result<()> {
+    let datadir = tempfile::TempDir::with_prefix("last_opened")?;
+    let base = datadir.path().join("consensus-db").join("epochs");
+    for dir in ["epoch-0", "epoch-2", "epoch-10", "staging-11", "import-12", "epoch-x"] {
+        std::fs::create_dir_all(base.join(dir))?;
+    }
+    std::fs::write(base.join("consensus_slot1"), [0u8; 16])?;
+    assert_eq!(last_opened_epoch(datadir.path())?, 10);
+
+    let empty = tempfile::TempDir::with_prefix("last_opened")?;
+    std::fs::create_dir_all(empty.path().join("consensus-db").join("epochs"))?;
+    assert!(last_opened_epoch(empty.path()).is_err(), "an empty chain has no opened epoch");
     Ok(())
 }
 

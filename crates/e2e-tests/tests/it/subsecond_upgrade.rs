@@ -16,10 +16,10 @@ use super::{
     common::{
         assert_blocks_match_consensus, assert_consensus_commit_times, assert_epoch_records_verify,
         assert_nodes_agree_on_commit_times, current_epoch, drive_light_tx_load,
-        fetch_verified_epoch_record, kill_child, loop_epochs, pin_fork_epoch,
+        fetch_verified_epoch_record, kill_child, loop_epochs, node_log_path, pin_fork_epoch,
         pin_fork_epoch_override, read_consensus_headers, scrape_metric_value,
-        start_validator_with_args, wait_for_epoch_at_least, wait_for_rpc, walk_block_commit_times,
-        BlockCommitTime, ProcessGuard, EVM_TIMESTAMP_CLAMPED_SERIES,
+        start_validator_with_args, strip_ansi, wait_for_epoch_at_least, wait_for_rpc,
+        walk_block_commit_times, BlockCommitTime, ProcessGuard, EVM_TIMESTAMP_CLAMPED_SERIES,
         LEADER_SEEDED_ORDERING_FORK_ENV, MULTI_WORKERS_FORK_ENV, RPC_REQUEST_TIMEOUT,
         SEED_SIGNATURE_FORK_ENV, SUBSECOND_TIMESTAMP_FORK_ENV,
     },
@@ -35,12 +35,7 @@ use e2e_tests::{
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use serde_json::Value;
-use std::{
-    future::Future,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _};
 use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
 use tn_test_utils::wait_until;
@@ -86,12 +81,17 @@ const BARE_DRIFT_TOLERANCE_LINE: &str = "max_header_time_drift_tolerance: 1";
 const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Start of the ERROR the new binary logs, once per epoch table, when it opens an epoch database
-/// holding a header it cannot decode (`discard_undecodable_header_tables` in
+/// holding a header it cannot decode (`discard_seconds_only_proposal` in
 /// `crates/storage/src/epoch_db_recovery.rs`).
 const UNDECODABLE_EPOCH_TABLE_ERROR: &str = "epoch table holds headers this binary cannot decode";
 
 /// Start of the WARN the new binary logs once it has cleared those tables.
 const DISCARDED_EPOCH_STATE_WARNING: &str = "discarded undecodable epoch state";
+
+/// Message of the INFO line the proposer logs for every header it proposes, with `round` and
+/// `epoch` fields (`Proposer::propose_header` in `crates/consensus/primary/src/proposer.rs`); the
+/// older binary writes the same line.
+const HEADER_PROPOSED: &str = "header proposed";
 
 /// Where a node panics when it decodes a header row it cannot read (`decode` in
 /// `crates/types/src/codec.rs`), which is how the new binary failed on the older binary's epoch
@@ -151,28 +151,6 @@ async fn with_light_load<T>(
         out = work => out,
         never = drive_light_tx_load(providers, senders, chain) => match never {},
     }
-}
-
-/// `text` without its ANSI colour escapes (`ESC [ parameters final-byte`), so node log lines read
-/// as plain `name=value` fields.
-fn strip_ansi(text: &str) -> String {
-    let mut plain = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            plain.push(c);
-            continue;
-        }
-        if chars.next() == Some('[') {
-            // parameter and intermediate bytes, up to and including the final byte
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    plain
 }
 
 /// Four validators started on the older binary, upgraded one at a time.
@@ -306,6 +284,21 @@ impl UpgradeNetwork {
     }
 
     /// Choose the sub-second fork epoch, [`UPGRADE_WINDOW_EPOCHS`] past the open one, and pin it.
+    ///
+    /// Unlike the other fork tests, which pin at the top of the test body, this writes the process
+    /// environment mid-run with the runtime's worker threads up. `std::env::set_var`, and the
+    /// restore a failed pin does, are synchronized only with Rust's own readers (`std::env::var`
+    /// and the environment snapshot `Command::spawn` takes), not with a libc `getenv` on another
+    /// thread such as a name lookup in `getaddrinfo` or a time-zone read, which is why edition
+    /// 2024 makes those calls `unsafe`. The write cannot move earlier: the fork epoch is known only
+    /// once the older binary has sealed two epochs and the open epoch has been read, and it has
+    /// to be in the environment before the first new-binary spawn forwards it
+    /// (`TestBinary::command`). It runs where nothing else in the harness is in flight: the light
+    /// load runs only inside [`Self::under_load`], which borrows the network mutably, so this
+    /// method cannot be reached while the load sends; no node is starting; and the HTTP clients
+    /// dial IP literals, so the idle connection tasks they leave on the runtime never resolve a
+    /// name. What remains is a libc `getenv` from code the harness does not run, which these
+    /// tests do not have.
     async fn pin_subsecond_fork(&self) -> eyre::Result<Epoch> {
         let fork = self.open_epoch().await? + UPGRADE_WINDOW_EPOCHS;
         pin_fork_epoch_override(
@@ -354,11 +347,7 @@ impl UpgradeNetwork {
 
     /// The `test_logs` file of `instance`'s current process, stdout or stderr.
     fn log_path(&self, instance: usize, stderr: bool) -> PathBuf {
-        let suffix = if stderr { ".stderr" } else { "" };
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test_logs")
-            .join(self.test)
-            .join(format!("node{instance}-run{}{suffix}.log", self.runs[instance]))
+        node_log_path(self.test, instance, self.runs[instance], stderr)
     }
 
     /// How `instance`'s current process ended, with the tail of its stderr, or `None` while it
@@ -507,6 +496,18 @@ impl UpgradeNetwork {
             path.display()
         );
         Ok(())
+    }
+
+    /// Whether `instance`'s current process logged a round-1 header proposal for `epoch`, the
+    /// `header proposed round=1 epoch=<epoch>` INFO line.
+    fn proposed_first_round(&self, instance: usize, epoch: Epoch) -> eyre::Result<bool> {
+        let path = self.log_path(instance, false);
+        let stdout = strip_ansi(&std::fs::read_to_string(&path)?);
+        let epoch_field = format!("epoch={epoch}");
+        Ok(stdout.lines().filter(|line| line.contains(HEADER_PROPOSED)).any(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.contains(&"round=1") && fields.contains(&epoch_field.as_str())
+        }))
     }
 
     /// Upgrade validator `instance` in place to `head_bin` before the fork epoch `fork`, and
@@ -798,10 +799,13 @@ async fn test_epoch_upgrade_in_place_before_subsecond_fork() -> eyre::Result<()>
 /// The three upgraded validators are a quorum on their own, so the network must keep committing
 /// through epoch `F + 1` and those three must agree on every block and commit time. Validator-4
 /// cannot read the new layout, so its head must stop inside epoch `F - 1` (after epoch `F - 2`'s
-/// final block, at most epoch `F - 1`'s) and stay there across two reads 15 s apart. Restarted on
-/// the new binary with its datadir intact, it must come back, apply headers from its peers, return
-/// to `CvvActive`, catch up with validator-1, cross the fork where the epoch records put it, and
-/// agree with validator-1 on every block and commit time from genesis to its head.
+/// final block, at most epoch `F - 1`'s) and stay there across two reads 15 s apart. The recovery
+/// below needs more than that: validator-4 must have executed epoch `F - 1`'s final block and
+/// logged a round-1 proposal for epoch `F`, and a run that stalls it earlier fails as a timing
+/// miss before the recovery is checked. Restarted on the new binary with its datadir intact, it
+/// must come back, apply headers from its peers, return to `CvvActive`, catch up with
+/// validator-1, cross the fork where the epoch records put it, and agree with validator-1 on every
+/// block and commit time from genesis to its head.
 ///
 /// The datadir the late upgrade opens holds what the older binary wrote for epoch `F` before it
 /// stalled, including its own epoch-`F` proposal in the legacy layout, which the new binary cannot
@@ -850,7 +854,7 @@ async fn test_epoch_late_upgrader_after_subsecond_fork() -> eyre::Result<()> {
     eyre::ensure!(reached >= fork + 2, "network stopped at epoch {reached}, short of {}", fork + 2);
     let finals = net.epoch_final_blocks(0, fork + 1).await?;
 
-    // validator-4, still on the older binary, stops inside epoch F - 1
+    // validator-4, still on the older binary, stops at the end of epoch F - 1
     let stalled = net.head(3).await.map_err(|e| net.explain(3, e))?;
     sleep(Duration::from_secs(15)).await;
     let still = net.head(3).await.map_err(|e| net.explain(3, e))?;
@@ -866,6 +870,19 @@ async fn test_epoch_late_upgrader_after_subsecond_fork() -> eyre::Result<()> {
          {last_pre_fork})",
         fork - 1,
         before_last_pre_fork + 1
+    );
+    // the late upgrade below has to discard the epoch-F header the older binary proposed, which
+    // exists only once validator-4 executed epoch F - 1's final block and opened F; a stall short
+    // of that leaves the recovery nothing to discard and is a timing miss of this run
+    let proposed_in_fork = net.proposed_first_round(3, fork)?;
+    eyre::ensure!(
+        still == last_pre_fork && proposed_in_fork,
+        "validator-4 (older binary) stalled at block {still} (epoch {} ends at {last_pre_fork}) \
+         and {} a round-1 header for epoch {fork}: the run's timing left it short of the state \
+         the late upgrade recovers from (the final pre-fork block executed and an epoch-{fork} \
+         proposal written), so this is a timing miss, not a failure of the recovery",
+        fork - 1,
+        if proposed_in_fork { "logged" } else { "never logged" }
     );
 
     let mut served = Vec::new();

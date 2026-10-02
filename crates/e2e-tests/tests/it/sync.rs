@@ -31,8 +31,8 @@ use crate::{
     common::{
         address_from_word, advertise_worker_rpc, assert_nodes_agree_on_commit_times,
         block_commit_time, current_epoch, drive_light_tx_load, fetch_verified_epoch_record,
-        get_block_number, get_key, get_latest_consensus_header_number, network_advancing,
-        pin_fork_epochs, scrape_metric_value, send_and_confirm, start_observer,
+        get_block_number, get_key, get_latest_consensus_header_number, get_tx_receipt_block,
+        network_advancing, pin_fork_epochs, scrape_metric_value, send_and_confirm, start_observer,
         start_observer_with_args, start_validator, wait_for_epoch_at_least, wait_for_head_at_least,
         wait_for_rpc, walk_block_commit_times, ProcessGuard, EVM_TIMESTAMP_CLAMPED_SERIES,
     },
@@ -304,7 +304,8 @@ fn observer_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// Run four validators across the sub-second timestamp fork at [`OBSERVER_FORK_EPOCH`] with an
 /// observer on `schedule`, check the observer against validator-1 (see
 /// [`assert_observer_agrees_across_fork`]), then send a transfer through the observer and require
-/// it to land in a post-fork block.
+/// it to land in a block after the fork epoch that the observer serves with validator-1's commit
+/// time.
 ///
 /// `test` names the temp dir and the log directory under `test_logs/`. Keep it short: node IPC
 /// socket paths are built under the temp dir.
@@ -459,18 +460,32 @@ async fn observer_across_subsecond_fork(
     )
     .await?;
 
-    // a transfer accepted by the observer is forwarded to the committee and lands in a block that
-    // the observer serves as post-fork
-    let before = get_block_number(&rpc_urls[0])?;
+    // a transfer accepted by the observer is forwarded to the committee and lands in a post-fork
+    // block, which the observer then executes with the transfer in it and validator-1's commit
+    // time. The block is the transfer's own, read from both receipts: every block after the fork
+    // epoch is sub-second, so checking the flag over a range of them would pass for any range
     let target = address_from_word("ss-observer-forward-target");
-    send_and_confirm(&obs_url, &rpc_urls[0], &get_key("test-source"), target, 0)?;
-    let after = get_block_number(&rpc_urls[0])?;
-    eyre::ensure!(after > before, "validator-1 confirmed the transfer without a new block");
-    wait_for_head_at_least(&obs_url, after, 60).await?;
-    let landed = walk_block_commit_times(&obs_provider, &obs_url, before + 1..=after).await?;
+    let tx_hash = send_and_confirm(&obs_url, &rpc_urls[0], &get_key("test-source"), target, 0)?;
+    let landed = get_tx_receipt_block(&rpc_urls[0], &tx_hash)?;
+    let fork_final_block = fork_record.final_state.number;
     eyre::ensure!(
-        landed.iter().all(|block| block.sub_second),
-        "the forwarded transfer's blocks are not all post-fork on the observer: {landed:?}"
+        landed > fork_final_block,
+        "the forwarded transfer landed in block {landed} on validator-1, not after the fork \
+         epoch's final block {fork_final_block}"
+    );
+    wait_for_head_at_least(&obs_url, landed, 60).await?;
+    let landed_on_observer = get_tx_receipt_block(&obs_url, &tx_hash)?;
+    eyre::ensure!(
+        landed_on_observer == landed,
+        "the observer has the forwarded transfer in block {landed_on_observer}, validator-1 in \
+         block {landed}"
+    );
+    let on_validator = block_commit_time(&providers[0], &rpc_urls[0], landed).await?;
+    let on_observer = block_commit_time(&obs_provider, &obs_url, landed).await?;
+    eyre::ensure!(
+        on_observer == on_validator && on_observer.sub_second,
+        "the forwarded transfer's block {landed} is not the same post-fork block on the observer: \
+         validator-1 serves {on_validator:?}, the observer {on_observer:?}"
     );
 
     guard.kill_all();
