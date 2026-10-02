@@ -139,7 +139,7 @@ def phase_inputs(root, phase, binary, profile_path):
         network["source_admission"].update({"max_connections": 12, "max_connections_per_address": 12,
                                             "max_connections_per_prefix": 12, "max_sources": 12})
         network["gossip_mesh"] = {"target": 2, "low": 1, "high": 4, "outbound_min": 1}
-        write_json(peers / f"{peer['name']}.json", {"seed": peer["seed"], "network": network,
+        write_json(peers / f"{peer['name']}.json", {"seed": peer["seed"], "network": network, "chain_id": CHAIN_ID,
                    "listen": [address(peer["ip"], role) for role in range(3)],
                    "control": f"{peer['ip']}:9500", "required_hubs": [node["bls_key"] for node in nodes[:2]],
                    "target": nodes[index % 2]["bls_key"], "sync_epoch": 0})

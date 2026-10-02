@@ -71,6 +71,13 @@ def select(metrics, name, labels=None):
     return int(value)
 
 
+def capacity_metrics(raw, progress_name):
+    """Parse capacity and progress series while preserving the full response in raw telemetry."""
+    selected = "\n".join(line for line in raw.splitlines()
+                         if line.startswith(("tn_network_", progress_name)))
+    return parse_metrics(selected)
+
+
 def process_sample(pid, proc=Path("/proc"), ticks=None, page_size=None):
     """Read whole-process CPU and RSS, preserving process identity across a run."""
     ticks = ticks or os.sysconf("SC_CLK_TCK")
@@ -290,7 +297,7 @@ def collect(frozen, bindings, phase, output):
                     text = body.decode()
                     raw.append({"hub": hub, "elapsed_seconds": elapsed,
                                 "pid": binding["pid"], "stat": stat, "metrics": text})
-                    hubs[hub] = {**process, **observations(parse_metrics(text), binding, phase)}
+                    hubs[hub] = {**process, **observations(capacity_metrics(text, binding["progress"]["name"]), binding, phase)}
                 samples.append({"elapsed_seconds": elapsed, "hubs": hubs})
                 if elapsed >= plan["envelope"]["duration_seconds"] and completed_before_sample:
                     break

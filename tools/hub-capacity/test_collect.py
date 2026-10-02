@@ -51,7 +51,8 @@ class CollectorTests(unittest.TestCase):
                     "envelope": {"duration_seconds": 4, "committee_peers": 0}}
             frozen = {"plan": plan, "plan_sha256": COLLECT.QUALIFY.digest(plan)}
             bindings = {"hubs": {"hub": {"revision": phase["revision"], "profile_path": str(profile),
-                        "pid": 42, "metrics_url": "http://synthetic.invalid/metrics"}},
+                        "pid": 42, "metrics_url": "http://synthetic.invalid/metrics",
+                        "progress": {"name": "synthetic_progress"}}},
                         "workload": ["synthetic-workload"], "topology_artifact": str(topology),
                         "protocol_logs": []}
             output = root / "evidence"
@@ -110,6 +111,18 @@ class CollectorTests(unittest.TestCase):
         incomplete = "\n".join(line for line in telemetry().splitlines() if 'network="worker-1"' not in line)
         with self.assertRaisesRegex(ValueError, "missing metric"):
             COLLECT.observations(COLLECT.parse_metrics(incomplete), binding, "candidate")
+
+    def test_capacity_sampling_preserves_required_validation(self):
+        binding = {"progress": {"name": "progress"}}
+        expected = COLLECT.observations(COLLECT.parse_metrics(telemetry()), binding, "candidate")
+        raw = telemetry() + '\nreth_unrelated_histogram_bucket{le="+Inf"} 9000'
+        selected = COLLECT.capacity_metrics(raw, "progress")
+        self.assertEqual(COLLECT.observations(selected, binding, "candidate"), expected)
+        self.assertNotIn(("reth_unrelated_histogram_bucket", (("le", "+Inf"),)), selected)
+        for invalid in ("progress NaN", "tn_network_source_address_rows 3",
+                        "tn_network_connections{broken} 1"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                COLLECT.capacity_metrics(raw + "\n" + invalid, "progress")
 
     def test_duplicate_nonfinite_and_malformed_metrics(self):
         for text in ('metric 1\nmetric 2', 'metric NaN', 'metric inf', 'metric{a="x",a="y"} 1',
