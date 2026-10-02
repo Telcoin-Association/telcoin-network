@@ -337,7 +337,11 @@ fn start_qualification_node(
     } else {
         (None, None)
     };
-    e2e_tests::setup_log_dir(&mut command, name, "hub_join", 1);
+    let attempt = std::env::var("HUB_JOIN_QUALIFICATION_ATTEMPT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    e2e_tests::setup_log_dir(&mut command, name, "hub_join", attempt);
     drop((first, second, metric));
     command
         .spawn()
