@@ -1647,10 +1647,16 @@ impl PeerManager {
 
     /// Reject both directions of a learned binding that contradicts a configured hub.
     fn trusted_binding_matches(&self, bls_key: BlsPublicKey, info: &NetworkInfo) -> bool {
-        self.trusted_dials.iter().all(|(expected_bls, dial)| {
-            (*expected_bls != bls_key || dial.info.pubkey == info.pubkey)
-                && (dial.info.pubkey != info.pubkey || *expected_bls == bls_key)
-        })
+        self.trusted_dials
+            .iter()
+            .map(|(key, dial)| (key, &dial.info))
+            .chain(self.policy_known.iter().filter(|(_, expected)| {
+                self.peers.is_policy_trusted(&PeerId::from(expected.pubkey.clone()))
+            }))
+            .all(|(expected_bls, expected)| {
+                (*expected_bls != bls_key || expected.pubkey == info.pubkey)
+                    && (expected.pubkey != info.pubkey || *expected_bls == bls_key)
+            })
     }
 
     /// Cache a record whose identity agrees with every configured hub in this swarm.
@@ -1694,12 +1700,19 @@ impl PeerManager {
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 
-    /// Return the active configured RPC hint or the most recently fetched advertisement.
+    /// Prefer configured RPC overrides, then signed advertisements bound to the active endpoint.
     pub(crate) fn get_rpc(&self, bls_key: &BlsPublicKey) -> Option<RpcInfo> {
-        self.policy_known
-            .get(bls_key)
-            .or_else(|| self.known_peers.get(bls_key))
-            .and_then(|info| info.rpc.clone())
+        let known = self.known_peers.get(bls_key);
+        self.policy_known.get(bls_key).map_or_else(
+            || known.and_then(|info| info.rpc.clone()),
+            |configured| {
+                configured.rpc.clone().or_else(|| {
+                    known
+                        .filter(|info| info.pubkey == configured.pubkey)
+                        .and_then(|info| info.rpc.clone())
+                })
+            },
+        )
     }
 
     /// Return the advertised [RpcInfo] for every current-committee validator, and

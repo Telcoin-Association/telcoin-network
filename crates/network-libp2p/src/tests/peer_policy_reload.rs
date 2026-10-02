@@ -186,7 +186,8 @@ async fn peer_policy_replacement_every_swarm() -> eyre::Result<()> {
         hooks(&mut manager, old_id, false);
         hooks(&mut manager, new_id, true);
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 /// Removing policy trust preserves independent committee and explicit bootstrap ownership.
@@ -332,15 +333,6 @@ async fn peer_policy_repeated_reload_bounded_and_bans_survive() -> eyre::Result<
     );
     assert!(manager.peer_to_bls(&id).is_none());
     manager.process_penalty(id, Penalty::Fatal);
-    manager.known_peers.insert(
-        key,
-        NetworkInfo {
-            pubkey: endpoint.network_key.clone(),
-            multiaddrs: vec![endpoint.network_address.clone()],
-            timestamp: tn_types::now(),
-            rpc: None,
-        },
-    );
     let (_, replacement) = policy_endpoint(51);
     let replacement_id = PeerId::from(replacement.network_key.clone());
     revision = revision.next().ok_or_else(|| eyre::eyre!("revision"))?;
@@ -366,5 +358,60 @@ async fn peer_policy_repeated_reload_bounded_and_bans_survive() -> eyre::Result<
     assert!(manager.policy_admission.is_empty());
     assert!(manager.trusted_retry.is_none());
     assert!(manager.peer_banned(&id));
+    Ok(())
+}
+
+/// Configured replacements revoke stale RPC hints while preserving matching signed discovery.
+#[tokio::test]
+async fn peer_policy_record_hints_follow_active_identity() -> eyre::Result<()> {
+    let (key, endpoint) = policy_endpoint(60);
+    let (_, replacement) = policy_endpoint(61);
+    let (other_key, _) = policy_endpoint(62);
+    let revision = PolicyRevision::default().next().ok_or_else(|| eyre::eyre!("revision"))?;
+    let initial = publication(
+        revision,
+        BTreeMap::from([(key, TrustedNode::new(endpoint.clone(), BTreeMap::new()))]),
+        BTreeMap::new(),
+        0,
+    )?;
+    let rotated = publication(
+        revision.next().ok_or_else(|| eyre::eyre!("revision"))?,
+        BTreeMap::from([(key, TrustedNode::new(replacement.clone(), BTreeMap::new()))]),
+        BTreeMap::new(),
+        0,
+    )?;
+    let rpc = tn_types::RpcInfo { http: "https://hub.example.com/".parse()?, ws: None };
+    let previous_info = NetworkInfo {
+        pubkey: endpoint.network_key,
+        multiaddrs: vec![endpoint.network_address],
+        timestamp: tn_types::now(),
+        rpc: Some(rpc.clone()),
+    };
+    let mut manager = manager(NetworkType::Primary);
+    manager.replace_operator_policy(&initial, initial.policy().primary());
+    manager.cache_known_peer(key, previous_info.clone());
+    assert_eq!(manager.get_rpc(&key), Some(rpc.clone()));
+    manager.replace_operator_policy(&rotated, rotated.policy().primary());
+    assert_eq!(
+        manager.auth_to_peer(key),
+        Some((
+            PeerId::from(replacement.network_key.clone()),
+            vec![replacement.network_address.clone()]
+        ))
+    );
+    assert!(manager.get_rpc(&key).is_none());
+    assert!(!manager.trusted_binding_matches(key, &previous_info));
+    let mut replacement_info = NetworkInfo {
+        pubkey: replacement.network_key,
+        multiaddrs: vec![replacement.network_address],
+        timestamp: tn_types::now(),
+        rpc: None,
+    };
+    assert!(manager.trusted_binding_matches(key, &replacement_info));
+    assert!(!manager.trusted_binding_matches(other_key, &replacement_info));
+    replacement_info.rpc = Some(rpc.clone());
+    manager.cache_known_peer(key, replacement_info);
+    assert_eq!(manager.get_rpc(&key), Some(rpc));
+    assert_eq!(manager.admission_status().effective(), AdmissionMode::Closed);
     Ok(())
 }

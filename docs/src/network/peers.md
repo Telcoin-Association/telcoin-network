@@ -30,13 +30,13 @@ A peer's reputation is derived from its current score every time it is read, nev
 
 ## Penalties and thresholds
 
-Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`, and `Fatal` report attributable protocol or validation failures. `LoadMild`, `LoadMedium`, and `LoadSevere` report transient load with the same score changes for ordinary peers.
+Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`, and `Fatal` report attributable protocol or validation failures. `Load(cause)` identifies transient load signals and assigns their existing severity score to ordinary peers.
 
 | Severity | Score change | Examples |
 |----------|--------------|----------|
-| Mild | -1.0 | Invalid requests; `LoadMild` for timeouts and slow gossip consumers. |
-| Medium | -5.0 | Malformed responses; `LoadMedium` for inbound stream and provider rate limits. |
-| Severe | -10.0 | Invalid validation data; `LoadSevere` for Kademlia put-record flooding. |
+| Mild | -1.0 | Invalid requests; `Load(Timeout)`, `Load(SlowPeer)`, or `Load(Synchronization)` for transient outbound failures, slow gossip, and synchronization races. |
+| Medium | -5.0 | Malformed responses; `Load(StreamRateLimit)`, `Load(KademliaRateLimit)`, `Load(EpochBoundary)`, or `Load(Transport)` for stream/provider limits, epoch overlap, and primary transport failures. |
+| Severe | -10.0 | Invalid validation data; `Load(KademliaFlood)` for Kademlia put-record flooding. |
 | Fatal | Set to -100.0 | Invalid signatures, invalid encoding, and authenticated protocol violations. |
 
 Operator-provisioned hubs and tracked committee members ignore load penalties. Protocol penalties apply to every peer. Rate-limited work is still dropped for privileged peers, so load exemption never creates an unlimited service allowance.
@@ -207,7 +207,7 @@ kill -HUP <node-pid>
 
 Use the same OS account that owns the node and its data directory, or an authorized system administrator. File permissions and Unix signal permissions define the operator interface. Write a complete sibling file, preserve its owner and permissions, and atomically rename it over `network-config` before signaling. Reload only changes `trusted_nodes` and `bootstrap_peers`. Other network settings, the supported worker IDs, and admission rollout mode require a restart.
 
-The entire file is decoded and every primary/worker identity binding is validated before publication. A CLI bootstrap override keeps precedence for the process lifetime. An empty bootstrap map selects the original genesis fallback, so it does not revoke genesis bootstrap peers. To replace that fallback, provide a nonempty map. Trusted and bootstrap entries may share a BLS key only with consistent transport identities; trusted hints take precedence for reconnects when both own the same identity.
+The entire file is decoded and every active primary/worker identity binding is validated before publication. RPC URLs must use HTTP(S) and optional WS(S) schemes and satisfy the existing URL length limit. A CLI bootstrap override keeps precedence for the process lifetime. An empty bootstrap map selects the original genesis fallback, so it does not revoke genesis bootstrap peers. To replace that fallback, provide a nonempty map. Trusted and bootstrap entries may share a BLS key only with consistent transport identities; trusted hints take precedence for reconnects when both own the same identity.
 
 One immutable revision is published to the primary and every configured worker, including workers awaiting activation. Each swarm replaces its admission grants, reconnect schedules, retained hints and gossip treatment together between swarm polls. Application is asynchronous across swarms; no swarm installs a partial endpoint map. Committee epochs have independent revisions and do not replace the operator snapshot.
 

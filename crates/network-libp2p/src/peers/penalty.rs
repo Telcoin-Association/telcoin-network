@@ -3,8 +3,14 @@
 /// A temporary service or transport load signal, without evidence of a protocol violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadPenalty {
-    /// An outbound request or stream negotiation timed out.
+    /// An outbound operation timed out or suffered a transient transport failure.
     Timeout,
+    /// A request raced chain or consensus data synchronization.
+    Synchronization,
+    /// A header or batch belongs to an obsolete committee window.
+    EpochBoundary,
+    /// A primary request suffered a transient transport failure.
+    Transport,
     /// Gossip delivery could not keep up with the sender.
     SlowPeer,
     /// The peer exceeded the inbound stream budget.
@@ -55,11 +61,17 @@ impl Penalty {
     /// The score impact of this penalty, retaining the existing overload severity weights.
     pub(crate) fn severity(self) -> Severity {
         match self {
-            Self::Mild | Self::Load(LoadPenalty::Timeout | LoadPenalty::SlowPeer) => Severity::Mild,
+            Self::Mild
+            | Self::Load(
+                LoadPenalty::Timeout | LoadPenalty::SlowPeer | LoadPenalty::Synchronization,
+            ) => Severity::Mild,
             Self::Medium
-            | Self::Load(LoadPenalty::StreamRateLimit | LoadPenalty::KademliaRateLimit) => {
-                Severity::Medium
-            }
+            | Self::Load(
+                LoadPenalty::StreamRateLimit
+                | LoadPenalty::KademliaRateLimit
+                | LoadPenalty::EpochBoundary
+                | LoadPenalty::Transport,
+            ) => Severity::Medium,
             Self::Severe | Self::Load(LoadPenalty::KademliaFlood) => Severity::Severe,
             Self::Fatal => Severity::Fatal,
         }

@@ -1116,7 +1116,11 @@ fn test_committee_rotation_revokes_validator_exemption() -> eyre::Result<()> {
     (0..100).for_each(|_| {
         all_peers.process_penalty(&peer_id, load);
     });
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+    assert_eq!(
+        all_peers.get_peer(&peer_id).map(|peer| peer.reputation()),
+        Some(Reputation::Banned)
+    );
+    Ok(())
 }
 
 /// Trusted and committee peers retain load privileges while protocol bans survive rotation.

@@ -107,6 +107,10 @@ pub(super) fn validate(
             .map(|protocol| protocol.to_string())
             .filter(|protocol| protocol.starts_with("/p2p/"));
         let reason = [
+            node.rpc
+                .as_ref()
+                .and_then(|rpc| rpc.validate().err())
+                .map(|error| format!("invalid RPC endpoint: {error}")),
             address_peer
                 .is_some_and(|id| id != format!("/p2p/{peer}"))
                 .then(|| format!("address /p2p identity must match network key {peer}")),

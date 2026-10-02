@@ -1029,7 +1029,7 @@ where
             node_task_spawner.spawn_critical_task("Peer policy reload", async move {
                 tokio::select! {
                     _ = &shutdown => Ok(()),
-                    result = peer_policy::reload(signals, inputs, policy_sender) => result,
+                    result = peer_policy::reload(signals, inputs, policy_sender) => result.map_err(|error| TaskError::from_message(error.to_string())),
                 }
             });
         }

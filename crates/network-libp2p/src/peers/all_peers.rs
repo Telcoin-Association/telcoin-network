@@ -908,6 +908,11 @@ impl AllPeers {
         self.policy_trusted = peers;
     }
 
+    /// Identify trust owned by the active operator snapshot independently of other grants.
+    pub(super) fn is_policy_trusted(&self, peer: &PeerId) -> bool {
+        self.policy_trusted.contains(peer)
+    }
+
     /// Preserve attributable BLS reputation when configuration rotates its transport identity.
     pub(super) fn bls_protocol_banned(&self, key: &BlsPublicKey) -> bool {
         self.peers.get(&PeerIdentity::Confirmed(*key)).is_some_and(|peer| {

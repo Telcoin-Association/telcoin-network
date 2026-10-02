@@ -17,6 +17,14 @@ impl PolicyRevision {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Convert to a numeric gauge observation; ordering and logs retain the integer identity.
+    pub(crate) fn gauge_value(self) -> f64 {
+        let [a, b, c, d, e, f, g, h] = self.0.to_be_bytes();
+        let high = u32::from_be_bytes([a, b, c, d]);
+        let low = u32::from_be_bytes([e, f, g, h]);
+        f64::from(high).mul_add(f64::from(u32::MAX) + 1.0, f64::from(low))
+    }
 }
 
 /// Whether the most recent operator input validated successfully.

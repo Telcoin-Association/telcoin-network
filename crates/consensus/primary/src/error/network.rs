@@ -1,7 +1,7 @@
 //! Error types for primary's network task.
 
 use super::CertManagerError;
-use tn_network_libp2p::Penalty;
+use tn_network_libp2p::{LoadPenalty, Penalty};
 use tn_storage::{consensus::ConsensusChainError, StoreError};
 use tn_types::{
     error::{CertificateError, HeaderError},
@@ -154,7 +154,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                         penalty_from_header_error(header_error)
                     }
                     // mild
-                    CertificateError::TooOld(_, _, _) => Some(Penalty::LoadMild),
+                    CertificateError::TooOld(_, _, _) => Some(Penalty::Load(LoadPenalty::Synchronization)),
                     // fatal
                     CertificateError::RecoverBlsAggregateSignatureBytes
                     | CertificateError::Unsigned
@@ -187,7 +187,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
             PrimaryNetworkError::UnknownConsensusOutput(_) => None,
-            PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::LoadMild),
+            PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Load(LoadPenalty::Synchronization)),
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::InvalidEpochVote(_, _, _) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest => Some(Penalty::Medium),
@@ -195,7 +195,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                 | std::io::ErrorKind::TimedOut | std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
-                Penalty::LoadMedium
+                Penalty::Load(LoadPenalty::Transport)
             } else {
                 Penalty::Medium
             }),
@@ -218,9 +218,11 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::LoadMild),
+        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => {
+            Some(Penalty::Load(LoadPenalty::Synchronization))
+        }
         // medium
-        HeaderError::TooOld { .. } => Some(Penalty::LoadMedium),
+        HeaderError::TooOld { .. } => Some(Penalty::Load(LoadPenalty::EpochBoundary)),
         HeaderError::InvalidParents | HeaderError::WrongNumberOfParents(_, _) => {
             Some(Penalty::Medium)
         }

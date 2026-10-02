@@ -76,9 +76,9 @@ impl SwarmMetrics {
         };
         metrics::counter!("tn_network.peer_policy_updates_total", "network" => self.network.clone(), "outcome" => outcome).increment(1);
         metrics::gauge!("tn_network.peer_policy_attempt", "network" => self.network.clone())
-            .set(update.attempt().as_u64());
+            .set(update.attempt().gauge_value());
         metrics::gauge!("tn_network.peer_policy_revision", "network" => self.network.clone())
-            .set(update.revision().as_u64());
+            .set(update.revision().gauge_value());
     }
 }
 

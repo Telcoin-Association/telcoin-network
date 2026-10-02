@@ -302,6 +302,20 @@ mod tests {
             config.operator_peer_policy(&BTreeMap::new(), Some(&cli), 2usize.into(), 1usize.into()),
             Err(PeerPolicyConfigError::TooManyPeers { limit: 1 })
         ));
+        let mut malformed = primary;
+        malformed.rpc =
+            Some(tn_types::RpcInfo { http: "ftp://hub.example.com/".parse()?, ws: None });
+        let invalid_rpc = NetworkConfig {
+            trusted_nodes: BTreeMap::from([(
+                hub_key,
+                TrustedNode::new(malformed, BTreeMap::from([(0, zero), (1, one)])),
+            )]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            invalid_rpc.operator_peer_policy(&BTreeMap::new(), None, 2usize.into(), 2usize.into()),
+            Err(PeerPolicyConfigError::Invalid(_))
+        ));
         Ok(())
     }
 

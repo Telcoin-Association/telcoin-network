@@ -1,5 +1,5 @@
 //! Worker's network-related errors.
-use tn_network_libp2p::{error::NetworkError, Penalty};
+use tn_network_libp2p::{error::NetworkError, LoadPenalty, Penalty};
 use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
 use tokio::time::error::Elapsed;
 
@@ -83,7 +83,9 @@ impl WorkerNetworkError {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild
-                    BatchValidationError::CanonicalChain { .. } => Some(Penalty::LoadMild),
+                    BatchValidationError::CanonicalChain { .. } => {
+                        Some(Penalty::Load(LoadPenalty::Synchronization))
+                    }
                     // medium
                     BatchValidationError::InvalidEpoch { .. }
                     | BatchValidationError::InvalidTx4844(_)
@@ -114,12 +116,14 @@ impl WorkerNetworkError {
                     | std::io::ErrorKind::TimedOut
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::Interrupted => Some(Penalty::LoadMild),
+                    | std::io::ErrorKind::Interrupted => Some(Penalty::Load(LoadPenalty::Timeout)),
                     _ => Some(Penalty::Medium),
                 }
             }
             // may occur at epoch boundaries
-            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::LoadMedium),
+            WorkerNetworkError::NonCommitteeBatch => {
+                Some(Penalty::Load(LoadPenalty::EpochBoundary))
+            }
             // protocol violations - fatal penalty
             WorkerNetworkError::InvalidTopic
             | WorkerNetworkError::Bcs(_)
