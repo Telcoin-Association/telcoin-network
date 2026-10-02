@@ -22,6 +22,36 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+#[tokio::test]
+async fn exchange_recovery_is_reported_without_a_retry_task() -> Result<(), &'static str> {
+    let (mut target, peers, _tasks) = create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+        NonZeroUsize::new(2).ok_or("nonzero fixture size")?,
+        None,
+    );
+    let remote = peers.first().ok_or("missing remote fixture")?;
+    let identity = remote.config.key_config().public_key();
+    let pubkey = remote.config.key_config().primary_network_keypair().public();
+    let peer_id = PeerId::from(pubkey.clone());
+    let addr = remote.config.primary_address();
+    let mut network = target.network.take().ok_or("missing network fixture")?;
+    network.swarm.behaviour_mut().peer_manager.add_bootstrap_peer(
+        identity,
+        NetworkInfo {
+            pubkey: pubkey.into(),
+            multiaddrs: vec![addr.clone()],
+            timestamp: tn_types::now(),
+            rpc: None,
+        },
+    );
+    let handle = network.network_handle();
+    assert_eq!(handle.report_dial_failure(identity, "transport".into()), Some(0));
+    network
+        .process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr))
+        .map_err(|_| "failed connected event")?;
+    assert_eq!(handle.dial_recovered(&identity), None);
+    Ok(())
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(

@@ -7,14 +7,14 @@ use crate::{
     error::NetworkError,
     kad::{node_record_key, KadStore},
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, DialLogBook, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
         NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
-        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        NodeRecord, RecordDomain, ResponseChannel, RpcInfo, SharedDialLogs,
     },
     PeerExchangeMap,
 };
@@ -377,6 +377,8 @@ where
     event_stream: Events,
     /// The sender for network handles.
     handle: Sender<NetworkCommand<Req, Res>>,
+    /// Logging memory survives handle recreation and epoch changes.
+    dial_logs: SharedDialLogs,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand<Req, Res>>,
     /// The collection of authorized publishers per topic.
@@ -733,6 +735,10 @@ where
         Ok(Self {
             swarm,
             handle,
+            dial_logs: std::sync::Arc::new(std::sync::Mutex::new(DialLogBook::new(
+                network_config.peer_config().max_disconnected_peers,
+                std::time::Instant::now(),
+            ))),
             commands,
             event_stream,
             authorized_publishers: Default::default(),
@@ -757,7 +763,7 @@ where
 
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::with_dial_logs(self.handle.clone(), self.dial_logs.clone())
     }
 
     /// Create and sign this node's [NodeRecord].
@@ -1960,6 +1966,21 @@ where
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return Ok(());
                 }
+
+                // Recovery can follow a mapping update after every retry task has stopped.
+                self.swarm
+                    .behaviour()
+                    .peer_manager
+                    .peer_to_bls(&peer_id)
+                    .and_then(|identity| {
+                        self.network_handle()
+                            .dial_recovered(&identity)
+                            .map(|failures| (identity, failures))
+                    })
+                    .into_iter()
+                    .for_each(|(identity, failures)| {
+                        info!(target: "network", ?identity, failures, "committee peer recovered");
+                    });
 
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`

@@ -1,8 +1,10 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, GossipMessage,
-    PeerExchangeMap,
+    codec::TNMessage,
+    error::NetworkError,
+    peers::{DialLogBook, Penalty},
+    AdmissionStatus, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -11,7 +13,11 @@ use libp2p::{
     request_response::ResponseChannel as Libp2pResponseChannel,
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tn_types::{BlsPublicKey, NetworkPublicKey, P2pNode};
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
@@ -520,7 +526,12 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// Swarm-lifetime logging state shared by every handle and retry task.
+    dial_logs: SharedDialLogs,
 }
+
+/// Shared bounded outage state for one swarm.
+pub(crate) type SharedDialLogs = Arc<Mutex<DialLogBook<BlsPublicKey>>>;
 
 impl<Req, Res> NetworkHandle<Req, Res>
 where
@@ -529,13 +540,37 @@ where
 {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        let dial_logs =
+            Arc::new(Mutex::new(DialLogBook::new(sender.max_capacity(), Instant::now())));
+        Self::with_dial_logs(sender, dial_logs)
+    }
+
+    /// Reuse the swarm's logging state when obtaining another handle.
+    pub(crate) fn with_dial_logs(
+        sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+        dial_logs: SharedDialLogs,
+    ) -> Self {
+        Self { sender, dial_logs }
+    }
+
+    /// Return the suppressed count when this committee failure should be logged.
+    pub fn report_dial_failure(&self, identity: BlsPublicKey, class: String) -> Option<usize> {
+        self.dial_logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).report(
+            identity,
+            class.chars().take(256).collect(),
+            Instant::now(),
+        )
+    }
+
+    /// Consume a committee outage once and return its failure count for a recovery summary.
+    pub fn dial_recovered(&self, identity: &BlsPublicKey) -> Option<usize> {
+        self.dial_logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recovered(identity)
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not

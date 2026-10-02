@@ -131,7 +131,7 @@ fn test_peer_exchange() {
     let disc_peer_id = PeerId::random();
     all_peers.update_connection_status(&disc_peer_id, NewConnectionStatus::Disconnected);
 
-    let exchange = all_peers.peer_exchange();
+    let exchange = all_peers.peer_exchange(|_, _| true);
     assert_eq!(exchange.0.len(), 3);
     let mut rng = StdRng::from_seed([0; 32]);
     let bls = *BlsKeypair::generate(&mut rng).public();
