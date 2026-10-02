@@ -291,6 +291,9 @@ jobs:
     needs: hub-capacity
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
+    env:
+      HUB_CAPACITY_BINARIES: ${{ runner.temp }}/hub-capacity-binaries
+      HUB_CAPACITY_EVIDENCE: ${{ runner.temp }}/hub-capacity-qualification
     steps:
       - uses: actions/checkout@v4
         if: needs.hub-capacity.outputs.qualification_required == 'true'
@@ -303,7 +306,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: hub-capacity-linux-arm64-${{ github.event.pull_request.head.sha || github.sha }}
-          path: qualification-binaries
+          path: ${{ env.HUB_CAPACITY_BINARIES }}
 
       - name: Install offline transaction signer
         if: needs.hub-capacity.outputs.qualification_required == 'true'
@@ -317,7 +320,7 @@ jobs:
 
       - name: Qualify the declared population and resource envelope
         if: needs.hub-capacity.outputs.qualification_required == 'true'
-        run: python3 -B -I tools/hub-capacity/docker-run.py --binaries qualification-binaries --output qualification --runner-envelope github-actions
+        run: python3 -B -I tools/hub-capacity/docker-run.py --binaries "$HUB_CAPACITY_BINARIES" --output "$HUB_CAPACITY_EVIDENCE" --runner-envelope github-actions
 
       - name: Retain qualification evidence and diagnostics
         if: always() && needs.hub-capacity.outputs.qualification_required == 'true'
@@ -327,14 +330,14 @@ jobs:
           retention-days: 90
           if-no-files-found: error
           path: |
-            qualification/*.json
-            qualification/*-docker-exec.log
-            qualification/source
-            qualification/*-evidence
-            qualification/deployment/*/*.json
-            qualification/deployment/*/*.jsonl
-            qualification/deployment/*/peers/*.json
-            qualification/deployment/population.json
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/*.json
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/*-docker-exec.log
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/source
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/*-evidence
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/deployment/*/*.json
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/deployment/*/*.jsonl
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/deployment/*/peers/*.json
+            ${{ env.HUB_CAPACITY_EVIDENCE }}/deployment/population.json
 
   # Clippy - replaces cargo check, catches more issues.
   #
