@@ -26,12 +26,15 @@ jobs:
           submodules: true
       - name: Install stable toolchain
         run: rustup toolchain install 1.94 --profile minimal
+      - name: Install result checker
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Restore dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           prefix-key: v1-rust
           shared-key: test-cache
           save-if: "true"
+          cache-on-failure: "true"
       - name: Run lifecycle and admission regressions
         run: |
           cargo +1.94 test --locked -p tn-node --lib epoch_starts_all_workers_and_reuses_components -- --nocapture
