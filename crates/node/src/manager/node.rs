@@ -2202,4 +2202,31 @@ mod tests {
         check_restore_consistency(&tip_at(5, 7), Some(&header))
             .expect("populated tip with a resolved producing header must not be refused");
     }
+
+    /// Build the [`TnBuilder`] that [`EpochManager::new`] takes, over a fresh reth database in
+    /// `datadir`, and write `committee` there as the genesis committee the manager loads.
+    pub(super) fn test_builder(
+        datadir: &std::path::Path,
+        config: Config,
+        committee: &Committee,
+    ) -> eyre::Result<TnBuilder> {
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
+
+        tn_reth::init_reth_defaults();
+        Config::write_to_path(datadir.to_path_buf().committee_path(), committee, ConfigFmt::YAML)?;
+        let chain = Arc::new(config.chain_spec());
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            datadir,
+            true,
+            chain,
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        Ok(TnBuilder::new(node_config, config, reth_db))
+    }
 }

@@ -1243,12 +1243,12 @@ mod tests {
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
         use super::*;
-        use crate::engine::TnBuilder;
+        use crate::manager::node::tests::test_builder;
         use jsonrpsee::core::client::ClientT as _;
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+        use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
         use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
@@ -1274,25 +1274,16 @@ mod tests {
             .committee()
             .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
-        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
-        let chain = Arc::new(config.chain_spec());
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            &datadir,
-            true,
-            chain,
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        let builder = test_builder(&datadir, config.clone(), &committee)?;
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
-        let reth_env =
-            RethEnv::new(&node_config, &network_tasks, reth_db.clone(), None, accumulator.clone())?;
-        let builder = TnBuilder::new(node_config, config.clone(), reth_db);
+        let reth_env = RethEnv::new(
+            &builder.node_config,
+            &network_tasks,
+            builder.reth_db.clone(),
+            None,
+            accumulator.clone(),
+        )?;
         let engine = ExecutionNode::new(&builder, reth_env)?;
         let db = MemDatabase::default();
         let consensus_config = ConsensusConfig::new_with_committee_for_test(

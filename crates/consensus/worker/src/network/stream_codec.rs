@@ -211,6 +211,109 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    /// Issue #1443: the node evicts a batch from `NodeBatchesCache` once the output committing it
+    /// is saved to the current epoch's pack. The execution fetch, the sync-stream responder and
+    /// the vote path's `synchronize` must all still find the body in that pack, with no network
+    /// request.
+    #[tokio::test]
+    async fn test_evicted_committed_batches_served_from_pack() {
+        use crate::{batch_fetcher::BatchFetcher, network::primary::PrimaryReceiverHandler};
+        use std::sync::Arc;
+        use tn_batch_validator::NoopBatchValidator;
+        use tn_network_types::{PrimaryToWorkerClient as _, WorkerSynchronizeMessage};
+        use tn_storage::tables::NodeBatchesCache;
+        use tn_types::{
+            Address, AuthorityIdentifier, Certificate, CertifiedBatch, CommittedSubDag,
+            ConsensusHeader, ConsensusOutput, EpochSeedChainValue, ReputationScores,
+        };
+
+        let batches = create_test_batches(3);
+        let db = setup_batch_db(&batches);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        let digests: Vec<B256> = batches.iter().map(|b| b.digest()).collect();
+
+        // commit the batches to the epoch 0 pack, then evict them like the node does
+        let leader = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        let output = ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            1,
+            false,
+            digests.iter().copied().collect(),
+            vec![CertifiedBatch { address: Address::ZERO, batches: batches.clone() }],
+        );
+        consensus_chain.save_consensus_output(output).await.expect("save output");
+        consensus_chain.persist_current().await.expect("persist pack");
+        for digest in &digests {
+            db.remove::<NodeBatchesCache>(digest).expect("evict");
+        }
+        assert!(db.is_empty::<NodeBatchesCache>(), "every batch is evicted from the cache");
+
+        // execution fetch
+        let fetched = get_batches_local(0, &digests, &db, &consensus_chain).await.expect("fetch");
+        let fetched: BTreeSet<B256> = fetched.iter().map(|b| b.digest()).collect();
+        let digest_set: BTreeSet<B256> = digests.iter().copied().collect();
+        assert_eq!(
+            fetched, digest_set,
+            "the execution fetch must read evicted batches from the pack"
+        );
+
+        // sync-stream responder serving a lagging peer
+        let max_frame = crate::network::handle::max_sync_frame_size(0);
+        let mut served = Vec::new();
+        send_sync_batches_over_stream(
+            &mut served,
+            &db,
+            &consensus_chain,
+            &digest_set,
+            0,
+            max_frame,
+        )
+        .await
+        .expect("serve sync batches");
+        let mut cursor = Cursor::new(served);
+        read_sync_ack(&mut cursor, max_frame).await;
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let received =
+            handle.read_sync_batches(&mut cursor, &digest_set).await.expect("read sync batches");
+        let received: BTreeSet<B256> = received.iter().map(|(d, _)| *d).collect();
+        assert_eq!(received, digest_set, "the sync responder must serve evicted batches");
+
+        // vote path: the test handle has no network behind it, so any peer request errors
+        let batch_fetcher = BatchFetcher::new(
+            handle.clone(),
+            db.clone(),
+            consensus_chain.clone(),
+            crate::metrics::WorkerMetrics::new_for_worker(0),
+        );
+        let handler = PrimaryReceiverHandler {
+            store: db.clone(),
+            network: Some(handle),
+            batch_fetcher,
+            validator: Arc::new(NoopBatchValidator),
+        };
+        handler
+            .synchronize(WorkerSynchronizeMessage {
+                digests,
+                target: AuthorityIdentifier::default(),
+                is_certified: true,
+            })
+            .await
+            .expect("synchronize must find evicted batches locally, without a network request");
+    }
+
     /// Multi-chunk sync serve (>200 batches): the responder emits one Data frame
     /// per batch across chunk boundaries and the requester reassembles them all.
     #[tokio::test]
