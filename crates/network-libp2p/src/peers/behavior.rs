@@ -192,7 +192,8 @@ impl NetworkBehaviour for PeerManager {
         }
 
         // pass the next event to the swarm if the manager's events aren't empty
-        if let Some(next_event) = self.poll_events() {
+        if let Some(next_event) = self.poll_admission_revocation(cx).or_else(|| self.poll_events())
+        {
             return Poll::Ready(ToSwarm::GenerateEvent(next_event));
         }
 
@@ -300,8 +301,9 @@ impl PeerManager {
             return;
         }
 
-        // there are no more connections
-        if self.is_peer_connected_or_disconnecting(&peer_id) {
+        // Peer records may have changed identity while the old transport was still live.
+        let was_live = self.remove_live_admission_peer(&peer_id);
+        if was_live || self.is_peer_connected_or_disconnecting(&peer_id) {
             // if the peer's connection status is either `Connected` or `Disconnecting`,
             // ensure the application layer is notified the peer has disconnected
             self.push_event(PeerEvent::PeerDisconnected(peer_id));

@@ -38,6 +38,18 @@ mod peer_manager;
 #[path = "../tests/admission.rs"]
 mod admission_tests;
 
+/// Maximum live identities examined by one admission sweep poll, even if all remain eligible.
+const MAX_ADMISSION_RECONCILIATIONS_PER_POLL: usize = 32;
+
+/// Lifecycle of an authenticated transport identity, independent of replaceable peer records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveAdmissionState {
+    /// At least one established connection remains eligible for reevaluation.
+    Connected,
+    /// A closure was committed; final transport closure owns removal.
+    Closing,
+}
+
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -150,6 +162,12 @@ pub(crate) struct PeerManager {
     admission_policy: AdmissionPolicy,
     /// Explicit trusted/bootstrap grants, separate from pinned dial hints and reputation.
     admission_operator_peers: HashMap<BlsPublicKey, PeerId>,
+    /// Live identities awaiting reevaluation, bounded by the established connection budget.
+    /// Entries are candidates, not committed disconnects, and carry no stale policy grants.
+    admission_reconciliation: VecDeque<PeerId>,
+    /// Actual established identities and pending closures, bounded by the transport budget.
+    /// Record replacement never removes a live identity; the last `ConnectionClosed` event does.
+    live_admission_peers: HashMap<PeerId, LiveAdmissionState>,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
@@ -265,6 +283,7 @@ impl PeerManager {
     pub(crate) fn configure_admission(&mut self, config: AdmissionConfig, local: BlsPublicKey) {
         self.local_bls_key = Some(local);
         self.admission_policy.configure(config);
+        self.reconcile_admission();
     }
 
     /// Return admission observations separately from connected counts and consensus readiness.
@@ -309,6 +328,7 @@ impl PeerManager {
     /// Unversioned compatibility updates must not enable a Closed policy.
     pub(crate) fn invalidate_admission(&mut self) {
         self.admission_policy.invalidate();
+        self.reconcile_admission();
     }
 
     /// Atomically update authoritative membership and admission at an epoch revision.
@@ -343,30 +363,78 @@ impl PeerManager {
         self.reconcile_admission();
     }
 
-    /// Revoke live connections outside a recovered Closed window without reputation penalties.
+    /// Schedule one reevaluation per live identity using the current authoritative policy.
+    /// Open and Grace preserve existing connections, including unknown authenticated peers.
+    /// Pending order survives renewals so repeated updates cannot restart a sweep indefinitely.
+    /// The queue contains at most one candidate per live identity in the transport budget.
     fn reconcile_admission(&mut self) {
-        let (status, authorized) = self.evaluate_admission();
+        let (status, _) = self.evaluate_admission();
         self.metrics.set_admission(&status);
         if status.effective() == AdmissionMode::Closed {
-            let revoked: Vec<_> =
-                self.peers.connected_peer_ids().filter(|peer| !authorized.contains(peer)).collect();
-            revoked.into_iter().for_each(|peer| {
-                let banned = self.peers.peer_banned(&peer);
-                let action = self
-                    .peers
-                    .update_connection_status(&peer, NewConnectionStatus::Disconnecting { banned });
-                self.events.push_back(PeerEvent::DisconnectPeer(peer));
-                // Ordinary disconnect actions impose a temporary ban. Admission revocation
-                // preserves existing ban ownership and creates no new ban or PX penalty.
-                match action {
-                    PeerAction::Ban(_) | PeerAction::Unban(_) => {
-                        self.apply_peer_action(peer, action)
-                    }
-                    PeerAction::NoAction
-                    | PeerAction::Disconnect
-                    | PeerAction::DisconnectWithPX => {}
-                }
+            self.admission_reconciliation.retain(|peer| {
+                self.live_admission_peers.get(peer) == Some(&LiveAdmissionState::Connected)
             });
+            let pending: HashSet<_> = self.admission_reconciliation.iter().copied().collect();
+            self.admission_reconciliation.extend(self.live_admission_peers.iter().filter_map(
+                |(peer, state)| {
+                    (*state == LiveAdmissionState::Connected && !pending.contains(peer))
+                        .then_some(*peer)
+                },
+            ));
+        } else {
+            self.admission_reconciliation.clear();
+        }
+    }
+
+    /// Recheck a bounded batch against the latest policy before committing one closure.
+    /// Membership/configuration updates and establishment run on the same swarm task. No policy
+    /// update can interleave the final check and the emitted disconnect. Lease expiry and record
+    /// changes are checked here too, so pending work never closes peers using stale grants.
+    /// Transport closure retains ownership of counters, mesh removal and final disconnection.
+    pub(super) fn poll_admission_revocation(&mut self, cx: &mut Context<'_>) -> Option<PeerEvent> {
+        if self.admission_reconciliation.is_empty() {
+            None
+        } else {
+            let (status, authorized) = self.evaluate_admission();
+            self.metrics.set_admission(&status);
+            if status.effective() == AdmissionMode::Closed {
+                let event = (0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL).find_map(|_| {
+                    self.admission_reconciliation
+                        .pop_front()
+                        .filter(|peer| {
+                            self.live_admission_peers.get(peer)
+                                == Some(&LiveAdmissionState::Connected)
+                                && !authorized.contains(peer)
+                        })
+                        .map(|peer| {
+                            self.live_admission_peers.insert(peer, LiveAdmissionState::Closing);
+                            let banned = self.peers.peer_banned(&peer);
+                            let action = self.peers.update_connection_status(
+                                &peer,
+                                NewConnectionStatus::Disconnecting { banned },
+                            );
+                            // Ordinary disconnect actions impose a temporary ban. Admission
+                            // revocation preserves existing ban
+                            // ownership and creates no new ban or PX penalty.
+                            match action {
+                                PeerAction::Ban(_) | PeerAction::Unban(_) => {
+                                    self.apply_peer_action(peer, action)
+                                }
+                                PeerAction::NoAction
+                                | PeerAction::Disconnect
+                                | PeerAction::DisconnectWithPX => {}
+                            }
+                            PeerEvent::DisconnectPeer(peer)
+                        })
+                });
+                if !self.admission_reconciliation.is_empty() {
+                    cx.waker().wake_by_ref();
+                }
+                event
+            } else {
+                self.admission_reconciliation.clear();
+                None
+            }
         }
     }
 
@@ -397,6 +465,8 @@ impl PeerManager {
             local_bls_key: None,
             admission_policy: Default::default(),
             admission_operator_peers: Default::default(),
+            admission_reconciliation: Default::default(),
+            live_admission_peers: Default::default(),
             config: *config,
             heartbeat,
             peers,
@@ -411,6 +481,12 @@ impl PeerManager {
             add_provider_windows: Default::default(),
             metrics,
         }
+    }
+
+    /// Release a transport identity exactly once after its last connection closes.
+    /// The return value preserves application cleanup even if metadata replaced the old key.
+    pub(super) fn remove_live_admission_peer(&mut self, peer: &PeerId) -> bool {
+        self.live_admission_peers.remove(peer).is_some()
     }
 
     /// Explicitly add a "trusted" peer and dial it.
@@ -438,6 +514,7 @@ impl PeerManager {
         self.stub_records.insert(bls_key);
         self.known_peers.insert(bls_key, info);
 
+        self.reconcile_admission();
         self.dial_peer(peer_id, multiaddr, Some(reply));
     }
 
@@ -647,6 +724,16 @@ impl PeerManager {
     ///
     /// Actions on peers happen when their reputation or connection status changes.
     fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
+        let closing = match &action {
+            PeerAction::Ban(_) | PeerAction::Disconnect | PeerAction::DisconnectWithPX => true,
+            PeerAction::Unban(_) | PeerAction::NoAction => false,
+        };
+        if closing {
+            self.live_admission_peers
+                .get_mut(&peer_id)
+                .into_iter()
+                .for_each(|state| *state = LiveAdmissionState::Closing);
+        }
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
@@ -851,7 +938,11 @@ impl PeerManager {
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
-        if self.peers.peer_banned(peer_id) {
+        let banned = self.peers.peer_banned(peer_id);
+        let state =
+            if banned { LiveAdmissionState::Closing } else { LiveAdmissionState::Connected };
+        self.live_admission_peers.entry(*peer_id).or_insert(state);
+        if banned {
             // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
@@ -1172,6 +1263,7 @@ impl PeerManager {
             self.cache_known_peer(bls_key, info);
             self.stub_records.insert(bls_key);
         }
+        self.reconcile_admission();
     }
 
     /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
@@ -1381,6 +1473,7 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        self.reconcile_admission();
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
