@@ -72,6 +72,25 @@ impl AdmissionStatus {
     }
 }
 
+/// Independent configured grants borrowed from one coherent swarm revision.
+#[derive(Debug)]
+pub(super) struct OperatorBindings<'a> {
+    /// Explicit grants owned by their original callers.
+    explicit: &'a HashMap<BlsPublicKey, PeerId>,
+    /// Grants owned by the current operator configuration.
+    configured: &'a HashMap<BlsPublicKey, PeerId>,
+}
+
+impl<'a> OperatorBindings<'a> {
+    /// Keep ownership separate while supplying both binding maps to admission evaluation.
+    pub(super) fn new(
+        explicit: &'a HashMap<BlsPublicKey, PeerId>,
+        configured: &'a HashMap<BlsPublicKey, PeerId>,
+    ) -> Self {
+        Self { explicit, configured }
+    }
+}
+
 /// Immutable committee window at one epoch revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CommitteeSnapshot {
@@ -155,12 +174,12 @@ impl AdmissionPolicy {
         &self,
         known: &HashMap<BlsPublicKey, NetworkInfo>,
         stubs: &HashSet<BlsPublicKey>,
-        operator: &HashMap<BlsPublicKey, PeerId>,
-        configured: &HashMap<BlsPublicKey, PeerId>,
+        operator: OperatorBindings<'_>,
         local: Option<BlsPublicKey>,
         local_peer: PeerId,
         connected: impl Fn(&PeerId) -> bool,
     ) -> (AdmissionStatus, HashSet<PeerId>) {
+        let OperatorBindings { explicit: operator, configured } = operator;
         let conflicting_operator = operator
             .iter()
             .any(|(key, peer)| configured.get(key).is_some_and(|other| other != peer));

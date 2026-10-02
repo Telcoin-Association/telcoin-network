@@ -2119,10 +2119,7 @@ async fn test_new_epoch_preserves_protocol_bans() -> eyre::Result<()> {
 
     // Only load-induced bans are forgiven when a peer acquires committee privileges.
     futures::future::join_all((0..20).map(|_| {
-        peer1.report_penalty(
-            config_2.key_config().primary_public_key(),
-            Penalty::Severe,
-        )
+        peer1.report_penalty(config_2.key_config().primary_public_key(), Penalty::Severe)
     }))
     .await;
 

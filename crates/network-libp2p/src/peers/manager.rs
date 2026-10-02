@@ -1,7 +1,7 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    admission::{AdmissionPolicy, AdmissionStatus},
+    admission::{AdmissionPolicy, AdmissionStatus, OperatorBindings},
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
@@ -317,8 +317,7 @@ impl PeerManager {
         self.admission_policy.evaluate(
             &self.known_peers,
             &self.stub_records,
-            &self.admission_operator_peers,
-            &self.policy_admission,
+            OperatorBindings::new(&self.admission_operator_peers, &self.policy_admission),
             self.local_bls_key,
             self.local_peer_id,
             |peer| self.is_connected(peer),
