@@ -27,6 +27,7 @@ use std::{
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig};
 use tn_kad_client::{BlsPublicKey, Multiaddr, NetworkType, PeerId};
 use tn_network_libp2p::{
+    error::NetworkError,
     read_frame,
     types::{NetworkEvent, NetworkHandle},
     write_frame, ConsensusNetwork, PeerExchangeMap, PrimarySyncRequest, SyncFrame, TNMessage,
@@ -518,6 +519,15 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                                 gateway.network_address,
                             )
                             .await
+                            .or_else(|error| {
+                                matches!(
+                                    &error,
+                                    NetworkError::AlreadyDialing(_)
+                                        | NetworkError::AlreadyConnected(_)
+                                )
+                                .then_some(())
+                                .ok_or(error)
+                            })
                     }
                 }))
                 .await?;
