@@ -446,11 +446,11 @@ async fn run_peer(args: RunArgs) -> Result<()> {
     let config = Config::read(&args.config)?;
     if config.listen.len() != 3
         || config.required_hubs.len() != 2
-        || !config
+        || config
             .required_hubs
             .first()
             .zip(config.required_hubs.get(1))
-            .is_some_and(|(first, second)| first != second)
+            .is_none_or(|(first, second)| first == second)
         || !config.required_hubs.contains(&config.target)
         || config.listen.iter().any(|address| address.to_string().contains("/udp/0/"))
     {

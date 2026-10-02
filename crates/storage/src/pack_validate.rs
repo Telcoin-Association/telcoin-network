@@ -659,7 +659,7 @@ mod test {
         for i in 0..n {
             let output =
                 make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
-            parent = output.digest().into();
+            parent = output.digest();
             outputs.push(output);
         }
         outputs

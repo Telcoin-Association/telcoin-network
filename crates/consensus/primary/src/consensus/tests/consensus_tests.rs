@@ -145,12 +145,12 @@ async fn test_consensus_recovery_with_bullshark() {
     let (certificates, _next_parents) =
         make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
     let temp_dir = TempDir::new().unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -255,11 +255,11 @@ async fn test_consensus_recovery_with_bullshark() {
     // Make new chain DB to "clear" it.
     let path2 = temp_dir.path().join("2");
     create_dir_all(&path2).await.unwrap();
-    let mut consensus_chain = ConsensusChain::new_for_test(path2, committee.clone()).await.unwrap();
+    let consensus_chain = ConsensusChain::new_for_test(path2, committee.clone()).await.unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await

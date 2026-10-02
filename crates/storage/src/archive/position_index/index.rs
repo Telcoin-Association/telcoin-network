@@ -426,11 +426,8 @@ mod tests {
         )
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
-            assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
-                i * 100,
-                "failed on iteration {i}"
-            );
+            let record_error_430 = format!("load idx {i}");
+            assert_eq!(idx.load(i).expect(&record_error_430), i * 100, "failed on iteration {i}");
         }
         idx.save(1_000_000, 66).expect("add to index");
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
@@ -443,11 +440,8 @@ mod tests {
         )
         .expect("pdx file");
         for i in (0..1_000_000).rev() {
-            assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
-                i * 100,
-                "failed on iteration {i}"
-            );
+            let record_error_447 = format!("load idx {i}");
+            assert_eq!(idx.load(i).expect(&record_error_447), i * 100, "failed on iteration {i}");
         }
 
         // Test reverse iter.
@@ -489,8 +483,9 @@ mod tests {
             PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", false)
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
+            let record_error_493 = format!("load idx {i}");
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).expect(&record_error_493),
                 (i, i * 100),
                 "failed on iteration {i}"
             );
@@ -502,8 +497,9 @@ mod tests {
             PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", true)
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
+            let record_error_506 = format!("load idx {i}");
             assert_eq!(
-                idx.load(i).expect(&format!("load idx {i}")),
+                idx.load(i).expect(&record_error_506),
                 (i, i * 100),
                 "failed on iteration {i}"
             );

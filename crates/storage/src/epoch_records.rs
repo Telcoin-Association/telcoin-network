@@ -2122,10 +2122,8 @@ mod test {
         // Reopen should heal: last record is dropped, all others remain readable.
         let db = EpochRecordDb::open(temp_dir.path()).expect("open after damage");
         for (record, _) in pairs.iter().take(pairs.len() - 1) {
-            let by_epoch = db
-                .record_by_epoch(record.epoch)
-                .await
-                .expect(&format!("damaged reopen: epoch {}", record.epoch));
+            let record_error_2128 = format!("damaged reopen: epoch {}", record.epoch);
+            let by_epoch = db.record_by_epoch(record.epoch).await.expect(&record_error_2128);
             assert_eq!(by_epoch.digest(), record.digest());
         }
         // The damaged final record should be gone.
@@ -2156,10 +2154,8 @@ mod test {
 
         let db = EpochRecordDb::open(temp_dir.path()).expect("open after extend");
         for (record, _) in &pairs {
-            let by_epoch = db
-                .record_by_epoch(record.epoch)
-                .await
-                .expect(&format!("extended reopen: epoch {}", record.epoch));
+            let record_error_2162 = format!("extended reopen: epoch {}", record.epoch);
+            let by_epoch = db.record_by_epoch(record.epoch).await.expect(&record_error_2162);
             assert_eq!(by_epoch.digest(), record.digest());
         }
         drop(db);

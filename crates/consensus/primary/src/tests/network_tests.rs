@@ -931,7 +931,7 @@ async fn test_primary_batch_gossip_topics() {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
 
-    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let gossip = PrimaryGossip::Certificate(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let goodish_msg =
@@ -940,7 +940,7 @@ async fn test_primary_batch_gossip_topics() {
     // This will be rejected for other reasons, but make sure not for an invalid topic.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let gossip = PrimaryGossip::Consensus(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -948,7 +948,7 @@ async fn test_primary_batch_gossip_topics() {
 
     // EpochVote::default()'s all-zero public_key is not a committee member, so the committee gate
     // rejects it (before the signature verify); see GHSA-j2g4-553f-875r.
-    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -956,7 +956,7 @@ async fn test_primary_batch_gossip_topics() {
     // Not rejected for InvalidTopic — rejected for non-committee membership instead.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let gossip = PrimaryGossip::Certificate(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -964,13 +964,13 @@ async fn test_primary_batch_gossip_topics() {
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
     assert!(matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let gossip = PrimaryGossip::Consensus(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 
-    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -3093,7 +3093,7 @@ async fn test_consensus_certs_publisher_flood_cannot_evict_honest_tally() -> eyr
     let (epoch, round) = (0u32, 1u32);
     let quorum = committee.committee().size() / 3 + 1;
     let authorities: Vec<_> = committee.authorities().collect();
-    assert!(authorities.len() >= quorum + 1, "need a flooder plus a distinct honest quorum");
+    assert!(authorities.len() > quorum, "need a flooder plus a distinct honest quorum");
 
     let hash_real = ConsensusHeaderDigest::from(B256::random());
     for auth in authorities.iter().skip(1).take(quorum) {
@@ -3197,18 +3197,13 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     // (= committee size) stays above that, so the map never fills and the honest number-2 tally is
     // never evicted. Under a fixed cap this same flood would evict it and number 2 would stall.
     let hash_real = ConsensusHeaderDigest::from(B256::random());
+    assert!(authorities.len() >= f, "need the declared Byzantine population");
     for h in f..(f + quorum) {
-        for b in 0..f {
+        for authority in authorities.iter().take(f) {
             for _ in 0..MAX_TALLIES_PER_SIGNER_PER_NUMBER {
                 let flood = ConsensusHeaderDigest::from(B256::random());
                 handler
-                    .process_gossip(&signed_consensus_gossip(
-                        authorities[b],
-                        epoch,
-                        round,
-                        1,
-                        flood,
-                    ))
+                    .process_gossip(&signed_consensus_gossip(authority, epoch, round, 1, flood))
                     .await?;
             }
         }
