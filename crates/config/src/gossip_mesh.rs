@@ -123,9 +123,13 @@ mod tests {
         network.validate_process_budget(3)?;
         let swarm =
             network.swarm_budget()?.ok_or_else(|| eyre::eyre!("missing hub process budget"))?;
-        assert_eq!(swarm.connections(), 64 + 8 + 12 + 2);
-        assert_eq!(swarm.connections_per_peer(), 1);
-        assert_eq!(swarm.streams_per_connection(), 16);
+        assert_eq!(swarm.connections(), (64 + 8 + 12 + 2) * 2);
+        assert_eq!(swarm.connections_per_peer(), 2);
+        assert_eq!(swarm.streams_per_connection(), 8);
+        assert_eq!(
+            u64::from(swarm.connections()) * 3 * u64::from(swarm.streams_per_connection()),
+            4_128
+        );
         assert!(
             u64::from(swarm.connections()) * 3 * u64::from(swarm.receive_credit_per_connection())
                 <= 1_073_741_824
@@ -133,7 +137,7 @@ mod tests {
         assert_eq!(network.peer_config().max_peers(), 86);
         assert_eq!(network.public_peer_limit().map(|limit| limit.get()), Some(64));
         assert_eq!(network.gossip_mesh().target(), 12);
-        assert_eq!(network.source_admission().map(|source| source.max_sources()), Some(258));
+        assert_eq!(network.source_admission().map(|source| source.max_sources()), Some(516));
         Ok(())
     }
 }
