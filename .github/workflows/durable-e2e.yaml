@@ -92,8 +92,7 @@ jobs:
           nightly=$(cat rust-nightly)
           rustup toolchain install "$nightly" --profile minimal --component rustfmt,clippy
           ./etc/ci-lanes.sh fmt
-          cargo "+$nightly" clippy --locked --workspace --all-targets --no-deps -- -D warnings
-          cargo "+$nightly" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
+          ./etc/ci-lanes.sh clippy
 
       - name: Admission regressions and live-sweep mutations
         if: inputs.grace_validation
