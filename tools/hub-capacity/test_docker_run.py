@@ -1,7 +1,9 @@
 """Exercise binary attestation and deployment rejection without synthetic qualification results."""
 
 import hashlib
+import copy
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,6 +23,29 @@ COLLECT = load("capacity_deployment_collect", "collect.py")
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_measurement_requires_every_exact_transaction_acknowledgement(self):
+        transactions = [f"signed-{nonce}" for nonce in range(512)]
+        hashes = [f"0x{nonce:064x}" for nonce in range(512)]
+        complete = [{"nonce": nonce, "success": True, "transaction_hash": hashes[nonce],
+                     "raw_sha256": hashlib.sha256(transactions[nonce].encode()).hexdigest()}
+                    for nonce in range(128, 512)]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, output = Path(directory) / "fixture.json", Path(directory) / "stream.jsonl"
+            fixture.write_text(json.dumps({"transactions": transactions, "transaction_hashes": hashes}))
+            output.write_text("".join(json.dumps(row) + "\n" for row in complete))
+            RUNNER.verify_transactions(fixture, output)
+            for field, invalid in (("success", False), ("nonce", 510),
+                                   ("transaction_hash", hashes[510]), ("raw_sha256", "wrong")):
+                with self.subTest(field=field):
+                    rows = copy.deepcopy(complete)
+                    rows[-1][field] = invalid
+                    output.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                    with self.assertRaisesRegex(ValueError, "did not acknowledge"):
+                        RUNNER.verify_transactions(fixture, output)
+            output.write_text("".join(json.dumps(row) + "\n" for row in complete[:-1]))
+            with self.assertRaisesRegex(ValueError, "did not acknowledge"):
+                RUNNER.verify_transactions(fixture, output)
+
     def test_phase_cleanup_requires_stopped_actors_and_successful_peer_cleanup(self):
         actor = mock.Mock()
         supervisor = mock.Mock()

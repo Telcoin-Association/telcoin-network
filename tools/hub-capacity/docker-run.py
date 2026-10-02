@@ -322,8 +322,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                        f"{container_dir}/bindings.json", "--phase", phase, "--output", f"/qualification/{phase}-evidence")
         if any(process.poll() not in (None, 0) for process in processes):
             raise ValueError("qualification traffic process failed during measurement")
-        if len((phase_dir / "stream-transactions.jsonl").read_text().splitlines()) != 384:
-            raise ValueError("qualification did not submit all declared measurement transactions")
+        verify_transactions(docker.output / "transactions.json", phase_dir / "stream-transactions.jsonl")
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/netns.py", "snapshot",
                        "--output", f"{container_dir}/links-after.json")
     finally:
@@ -333,6 +332,18 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             except (subprocess.CalledProcessError, ValueError):
                 pass
         wait_for_phase_exit(processes, peer_supervisor)
+
+
+def verify_transactions(fixture, observations):
+    """Require the complete signed workload, including exact acknowledgements, before scoring."""
+    inputs = json.loads(fixture.read_text())
+    rows = [json.loads(line) for line in observations.read_text().splitlines()]
+    if len(rows) != 384 or any(
+            row.get("nonce") != nonce or row.get("success") is not True
+            or row.get("transaction_hash") != inputs["transaction_hashes"][nonce]
+            or row.get("raw_sha256") != hashlib.sha256(inputs["transactions"][nonce].encode()).hexdigest()
+            for nonce, row in zip(range(128, 512), rows)):
+        raise ValueError("qualification did not acknowledge all declared measurement transactions")
 
 
 def execute_qualification(args):
