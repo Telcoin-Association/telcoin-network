@@ -85,6 +85,19 @@ const BARE_DRIFT_TOLERANCE_LINE: &str = "max_header_time_drift_tolerance: 1";
 /// JSON-RPC "method not found", which the older binary answers for `tn_getBlockTimestampMillis`.
 const METHOD_NOT_FOUND: i64 = -32601;
 
+/// Start of the ERROR the new binary logs, once per epoch table, when it opens an epoch database
+/// holding a header it cannot decode (`discard_undecodable_header_tables` in
+/// `crates/storage/src/epoch_db_recovery.rs`).
+const UNDECODABLE_EPOCH_TABLE_ERROR: &str = "epoch table holds headers this binary cannot decode";
+
+/// Start of the WARN the new binary logs once it has cleared those tables.
+const DISCARDED_EPOCH_STATE_WARNING: &str = "discarded undecodable epoch state";
+
+/// Where a node panics when it decodes a header row it cannot read (`decode` in
+/// `crates/types/src/codec.rs`), which is how the new binary failed on the older binary's epoch
+/// state before it discarded that state.
+const UNDECODABLE_ROW_PANIC: &str = "codec.rs:67";
+
 /// The older binary when the lane provides one, or `None` after saying the test was skipped.
 fn previous_binary_or_skip(test: &str) -> Option<&'static TestBinary> {
     let previous = get_previous_telcoin_network_binary();
@@ -138,6 +151,28 @@ async fn with_light_load<T>(
         out = work => out,
         never = drive_light_tx_load(providers, senders, chain) => match never {},
     }
+}
+
+/// `text` without its ANSI colour escapes (`ESC [ parameters final-byte`), so node log lines read
+/// as plain `name=value` fields.
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            plain.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            // parameter and intermediate bytes, up to and including the final byte
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    plain
 }
 
 /// Four validators started on the older binary, upgraded one at a time.
@@ -417,6 +452,58 @@ impl UpgradeNetwork {
             log.contains(BARE_DRIFT_TOLERANCE_WARNING),
             "{} lacks \"{BARE_DRIFT_TOLERANCE_WARNING}\": the upgraded node did not read the older \
              binary's network-config",
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Require `instance`'s current process to have discarded the epoch-`fork` proposal the older
+    /// binary left in its epoch database instead of failing on it: stdout carries the ERROR naming
+    /// the `last_proposed` table and epoch `fork`, then the WARN that the epoch state was
+    /// discarded, and stderr carries no panic.
+    fn assert_discarded_stale_proposal(&self, instance: usize, fork: Epoch) -> eyre::Result<()> {
+        let node = format!("validator-{}", instance + 1);
+        let stderr_path = self.log_path(instance, true);
+        let stderr = std::fs::read_to_string(&stderr_path)?;
+        if let Some(line) = stderr
+            .lines()
+            .find(|line| line.contains(UNDECODABLE_ROW_PANIC) || line.contains("panicked"))
+        {
+            eyre::bail!(
+                "{} reports a panic: {node} panicked on the new binary instead of discarding the \
+                 epoch state the older binary left (a panic at {UNDECODABLE_ROW_PANIC} is the \
+                 decode of that state): {line}",
+                stderr_path.display()
+            );
+        }
+
+        let path = self.log_path(instance, false);
+        let stdout = strip_ansi(&std::fs::read_to_string(&path)?);
+        let at_level = |line: &str, level: &str| line.split_whitespace().nth(1) == Some(level);
+        let epoch_field = format!("epoch=Some({fork})");
+        let error = stdout
+            .lines()
+            .position(|line| {
+                at_level(line, "ERROR")
+                    && line.contains(UNDECODABLE_EPOCH_TABLE_ERROR)
+                    && line.contains("table=last_proposed")
+                    && line.contains(&epoch_field)
+            })
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "{} lacks an ERROR \"{UNDECODABLE_EPOCH_TABLE_ERROR}\" with \
+                     table=last_proposed and {epoch_field}: {node} did not take the recovery path \
+                     for the epoch-{fork} proposal the older binary wrote in the legacy header \
+                     layout",
+                    path.display()
+                )
+            })?;
+        eyre::ensure!(
+            stdout.lines().skip(error + 1).any(|line| {
+                at_level(line, "WARN") && line.contains(DISCARDED_EPOCH_STATE_WARNING)
+            }),
+            "{} lacks a WARN \"{DISCARDED_EPOCH_STATE_WARNING}\" after the ERROR: {node} found the \
+             undecodable epoch-{fork} proposal but did not discard it",
             path.display()
         );
         Ok(())
@@ -716,10 +803,13 @@ async fn test_epoch_upgrade_in_place_before_subsecond_fork() -> eyre::Result<()>
 /// to `CvvActive`, catch up with validator-1, cross the fork where the epoch records put it, and
 /// agree with validator-1 on every block and commit time from genesis to its head.
 ///
-/// The datadir the late upgrade opens holds whatever the older binary wrote for epoch `F` before
-/// it stalled, possibly its own epoch-`F` proposal in the legacy layout, which the new binary
-/// decodes under the post-fork layout. The correct behaviour is to discard or re-sync that state
-/// rather than fail on it, and that is what this test asserts.
+/// The datadir the late upgrade opens holds what the older binary wrote for epoch `F` before it
+/// stalled, including its own epoch-`F` proposal in the legacy layout, which the new binary cannot
+/// decode under the post-fork layout. The new binary discards that stale header when it opens the
+/// datadir and logs it: validator-4's stdout must carry the ERROR naming the `last_proposed`
+/// table and epoch `F`, then the WARN that the epoch state was discarded, and its stderr no panic.
+/// It then fetches epoch `F` from its peers and catches up, which the return to `CvvActive` and the
+/// agreement with validator-1 above prove.
 ///
 /// Fork pins as in [`test_epoch_upgrade_in_place_before_subsecond_fork`]; this test decodes no
 /// consensus data in-process, so the sub-second pin's latch here only backs its own read-back.
@@ -807,6 +897,7 @@ async fn test_epoch_late_upgrader_after_subsecond_fork() -> eyre::Result<()> {
     .map_err(|e| net.explain(3, e))?;
     net.assert_runs_new_binary(3, true).await?;
     net.assert_warned_bare_drift_tolerance(3)?;
+    net.assert_discarded_stale_proposal(3, fork)?;
 
     let reference = net.walk(0).await?;
     let late_walk = net.walk(3).await?;
