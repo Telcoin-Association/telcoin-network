@@ -101,7 +101,7 @@ jobs:
           set -euo pipefail
           cargo nextest run --locked -p tn-network-libp2p -E 'test(admission_)'
           source_file=crates/network-libp2p/src/peers/manager.rs
-          for mutation in authority revocation budget physical cleanup; do
+          for mutation in authority revocation budget physical cleanup fairness; do
             python3 -I - "$mutation" <<'PY'
           from pathlib import Path
           import sys
@@ -109,7 +109,7 @@ jobs:
           path = Path('crates/network-libp2p/src/peers/' +
                       ('behavior.rs' if name == 'cleanup' else 'manager.rs'))
           original = path.read_text()
-          begin = 0 if name in ('physical', 'cleanup') else original.index('pub(super) fn poll_admission_revocation(')
+          begin = 0 if name in ('physical', 'cleanup', 'fairness') else original.index('pub(super) fn poll_admission_revocation(')
           prefix, body = original[:begin], original[begin:]
           replacements = {
               'authority': ('if status.effective() == AdmissionMode::Closed {',
@@ -118,10 +118,12 @@ jobs:
                              'authorized.contains(peer) && false'),
               'budget': ('0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL',
                          '0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 8'),
-              'physical': ('(*state == LiveAdmissionState::Connected).then_some(*peer)',
-                           '(*state == LiveAdmissionState::Connected && self.is_connected(peer)).then_some(*peer)'),
+              'physical': ('!pending.contains(peer)',
+                           '!pending.contains(peer) && self.is_connected(peer)'),
               'cleanup': ('was_live || self.is_peer_connected_or_disconnecting(&peer_id)',
                           'was_live && false || self.is_peer_connected_or_disconnecting(&peer_id)'),
+              'fairness': ('let pending: HashSet<_> =',
+                           'self.admission_reconciliation.clear(); let pending: HashSet<_> ='),
           }
           old, new = replacements[name]
           assert body.count(old) == 1
@@ -132,6 +134,7 @@ jobs:
               revocation) regressions='admission_reconciliation_rotation_every_swarm admission_reconciliation_closure_bookkeeping_once' ;;
               budget) regressions='admission_reconciliation_bounds_each_poll' ;;
               physical|cleanup) regressions='admission_reconciliation_survives_record_key_replacement' ;;
+              fairness) regressions='admission_reconciliation_progress_survives_renewals' ;;
             esac
             for regression in $regressions; do
               set +e
