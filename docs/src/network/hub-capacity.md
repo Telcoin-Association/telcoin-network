@@ -142,7 +142,8 @@ fresh signature-validated record queries, worker submit-URL resolution and
 nonempty ACK/DATA/END epoch transfers. Shared-NAT commands restart the actual
 peer process, preserve its keys and verify connections to both hubs on every
 swarm. DAO checks observe those same live authenticated connections.
-
+Each client pins the two declared gateways as trusted peers in its own swarms.
+The measured hubs apply their public and DAO admission rules to those clients.
 
 Transaction traffic uses 512 offline-signed chain-4476 transactions from the
 public Anvil test account funded in the local genesis. `cast` must be installed.
@@ -167,8 +168,10 @@ production JSON log, with the measured hubs' actual vote-request latency,
 completion, failure and cancellation data.
 
 `workload.py` schedules all eight scenarios concurrently with bounded command
-concurrency. Its frozen manifest binds agent identities and argv; every reply
-must match its operation nonce, scenario and identity. Failed commands remain
+concurrency. The declared scenarios overlap at 44 commands; the driver allows
+48 active commands and the private control server allows 64 handlers. Overload
+refusals remain failed attempts. Its frozen manifest binds agent identities and
+argv; every reply must match its operation nonce, scenario and identity. Failed commands remain
 in the operation log and success denominator. Reconnect scheduling offsets NAT
 restarts from ordinary joins.
 

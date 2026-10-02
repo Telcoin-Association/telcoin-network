@@ -18,6 +18,52 @@ SPEC.loader.exec_module(WORKLOAD)
 
 
 class WorkloadTests(unittest.TestCase):
+    def test_declared_overlap_has_execution_headroom(self):
+        concurrency = {"committee_progress": 4, "concurrent_sync": 8,
+                       "dao_connectivity": 4, "gossip_two_hops": 16,
+                       "public_join": 2, "record_lookup": 4,
+                       "shared_nat_reconnect": 2, "submit_url_lookup": 4}
+        overlap = threading.Barrier(sum(concurrency.values()))
+        active = peak = 0
+        lock = threading.Lock()
+
+        def execute(_agent, scenario, operation_id, origin, _timeout):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            success = True
+            try:
+                if not operation_id.startswith("committee_progress-final-"):
+                    overlap.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                success = False
+            finally:
+                with lock:
+                    active -= 1
+            return {"scenario": scenario, "id": operation_id, "success": success,
+                    "rejection_reason": None if success else "declared overlap not admitted",
+                    "latency_ms": 1, "elapsed_seconds": time.monotonic() - origin}
+
+        with tempfile.TemporaryDirectory() as directory:
+            topology = Path(directory) / "topology.json"
+            topology.write_text('{"synthetic":true}')
+            manifest = {"topology_artifact": str(topology), "scenarios": {
+                scenario: {"concurrency": count, "burst_size": count, "agents": [
+                    {"identity": "synthetic", "argv": ["synthetic"]}
+                ]} for scenario, count in concurrency.items()}}
+            plan = {"envelope": {"duration_seconds": 0.03, "public_peers": 1,
+                                 "shared_nat_peers": 1, "dao_observers": 1},
+                    "thresholds": {"scenarios": {scenario: {"minimum_attempts": count}
+                                                  for scenario, count in concurrency.items()}}}
+            output = Path(directory) / "operations.jsonl"
+            with patch.object(WORKLOAD, "execute", execute):
+                WORKLOAD.run(plan, manifest, output, time.monotonic())
+            operations = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(peak, 44)
+            self.assertEqual(len(operations), 45)
+            self.assertTrue(all(entry["success"] for entry in operations))
+
     def test_total_driver_capacity_preserves_refused_attempts(self):
         active = peak = 0
         lock = threading.Lock()

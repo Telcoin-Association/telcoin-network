@@ -466,6 +466,7 @@ async fn run_peer(args: RunArgs) -> Result<()> {
         |(role, address)| {
             let keys = keys.clone();
             let network_config = &config.network;
+            let required_hubs = &config.required_hubs;
             let manager = &manager;
             let gossip = gossip.clone();
             async move {
@@ -492,21 +493,34 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                 };
                 let handle = network.network_handle();
                 let task = tokio::spawn(network.run());
-                handle
-                    .add_bootstrap_peers(
-                        network_config
-                            .bootstrap_peers()
-                            .iter()
-                            .filter_map(|(key, server)| {
-                                match role {
-                                    NetworkType::Primary => Some(server.primary.clone()),
-                                    NetworkType::Worker(id) => server.worker(id).cloned(),
-                                }
-                                .map(|peer| (*key, peer))
-                            })
-                            .collect(),
-                    )
-                    .await?;
+                let gateways = network_config
+                    .bootstrap_peers()
+                    .iter()
+                    .filter(|(key, _)| required_hubs.contains(key))
+                    .filter_map(|(key, server)| {
+                        match role {
+                            NetworkType::Primary => Some(server.primary.clone()),
+                            NetworkType::Worker(id) => server.worker(id).cloned(),
+                        }
+                        .map(|peer| (*key, peer))
+                    })
+                    .collect::<Vec<_>>();
+                handle.add_bootstrap_peers(gateways.iter().cloned().collect()).await?;
+                // Pin the declared gateways in the client swarm. The measured hubs still
+                // classify each client using their unchanged public or DAO profile.
+                futures::future::try_join_all(gateways.into_iter().map(|(key, gateway)| {
+                    let handle = handle.clone();
+                    async move {
+                        handle
+                            .add_trusted_peer_and_dial(
+                                key,
+                                gateway.network_key,
+                                gateway.network_address,
+                            )
+                            .await
+                    }
+                }))
+                .await?;
                 let receiver_id = PeerId::from(match role {
                     NetworkType::Primary => keys.primary_network_public_key(),
                     NetworkType::Worker(id) => keys.worker_network_public_key(id),

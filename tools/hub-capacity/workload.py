@@ -20,7 +20,7 @@ QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
 
 # Leave eight control-server slots for handlers finishing timed-out commands.
-MAX_ACTIVE_COMMANDS = 24
+MAX_ACTIVE_COMMANDS = 48
 
 
 def validate_manifest(plan, manifest):

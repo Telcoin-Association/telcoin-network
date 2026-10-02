@@ -129,8 +129,8 @@ def phase_inputs(root, phase, binary, profile_path):
         network = copy.deepcopy(candidate)
         network["dao_observers"] = []
         network["bootstrap_peers"] = {node["bls_key"]: node["p2p_info"] for node in nodes[:2]}
-        # Bootstrap grants admission rather than protected retention. Clients allocate their
-        # ordinary slots to both hubs; measured hub profiles remain exact and separate.
+        # Fixtures pin both declared gateways locally. Public and DAO admission on the
+        # measured hubs remains independent of this client setup.
         network["public_peer_limit"] = len(network["bootstrap_peers"])
         network["peer_config"]["target_num_peers"] = 2
         network["process_budget"].update({"max_established_connections": 12,
