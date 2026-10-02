@@ -97,6 +97,8 @@ struct Config {
     seed: u64,
     /// Chain and bootstrap configuration shared by its three swarms.
     network: NetworkConfig,
+    /// Genesis chain ID, stamped after the network configuration is deserialized.
+    chain_id: u64,
     /// Primary, worker-0, and worker-1 QUIC listeners, each with a fixed nonzero port.
     listen: Vec<Multiaddr>,
     /// Private control address reachable by the local qualification coordinator.
@@ -107,6 +109,18 @@ struct Config {
     target: BlsPublicKey,
     /// A completed epoch available before measurement begins.
     sync_epoch: Epoch,
+}
+
+impl Config {
+    /// Load bounded deployment inputs and apply the genesis-derived protocol domain.
+    fn read(path: &std::path::Path) -> Result<Self> {
+        if std::fs::metadata(path)?.len() > 128 * 1024 {
+            Err(eyre!("peer configuration exceeds 128 KiB"))?;
+        }
+        let mut config: Self = serde_json::from_reader(File::open(path)?)?;
+        config.network.set_chain_id(config.chain_id);
+        Ok(config)
+    }
 }
 
 /// Peer-exchange compatibility; these read-only peers never issue consensus RPC messages.
@@ -429,10 +443,7 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
 
 /// Start three persistent production swarms and the bounded private control server.
 async fn run_peer(args: RunArgs) -> Result<()> {
-    if std::fs::metadata(&args.config)?.len() > 128 * 1024 {
-        Err(eyre!("peer configuration exceeds 128 KiB"))?;
-    }
-    let config: Config = serde_json::from_reader(File::open(&args.config)?)?;
+    let config = Config::read(&args.config)?;
     if config.listen.len() != 3
         || config.required_hubs.len() != 2
         || !config
@@ -582,7 +593,7 @@ async fn run_peer(args: RunArgs) -> Result<()> {
 }
 
 /// Export public qualification identities or run the peer with its frozen deployment file.
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     match Args::parse().mode {
         Mode::Identity { seed } => {
@@ -607,5 +618,33 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Mode::Run(args) => run_peer(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_chain_overrides_non_persisted_network_domain() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(4476)));
+        let mut fixture = tempfile::NamedTempFile::new()?;
+        serde_json::to_writer(
+            fixture.as_file_mut(),
+            &json!({
+                "seed": 4476, "chain_id": 4476,
+                "network": {"libp2p_config": {"chain_id": 999}},
+                "listen": [], "control": "127.0.0.1:9500",
+                "required_hubs": [], "target": keys.primary_public_key(), "sync_epoch": 0,
+            }),
+        )?;
+        let config = Config::read(fixture.path())?;
+        assert_eq!(config.network.libp2p_config().chain_id, 4476);
+        assert_eq!(
+            LibP2pConfig::primary_topic(config.network.libp2p_config().chain_id),
+            "tn-primary-4476"
+        );
+        Ok(())
     }
 }

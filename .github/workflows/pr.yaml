@@ -245,6 +245,7 @@ jobs:
         run: |
           cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api
           cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer
+          cargo +1.94 test --locked -p tn-node-record-api --example hub-capacity-peer
           git rev-parse HEAD > target/debug/hub-capacity-revision.txt
           sha256sum target/debug/telcoin-network target/debug/node-record-api target/debug/examples/hub-capacity-peer > target/debug/hub-capacity-binaries.sha256
 
