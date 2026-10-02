@@ -15,7 +15,7 @@ on:
         description: "Late-kill offset before the boundary: 2 locally, 59 for fleet B"
         default: "2"
       downtime_secs:
-        description: "Minimum downtime across the boundary: 45 locally, 240 for fleet B"
+        description: "Minimum time from kill to restart: 45 locally, 300 for fleet B"
         default: "45"
       recovery_secs:
         description: "Catch-up deadline after restart, with capture every minute"
@@ -89,7 +89,7 @@ jobs:
             cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/$sync_mode/"
           done
 
-      - name: Confirm recovery assertion detects an omitted restart
+      - name: Confirm both recovery assertions detect an omitted restart
         env:
           TN_SIGKILL_EPOCH_SECS: "10"
           TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
@@ -109,19 +109,30 @@ jobs:
               raise SystemExit("expected exactly one restart to mutate")
           source.write_text(text.replace(restart, "// Mutation: the killed validator is never restarted."))
           PY
-          if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --locked -p e2e-tests --test it --run-ignored all -E 'test(=sigkill::test_sigkill_before_epoch_close_recovers)' > mutation.log 2>&1; then
+          if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --locked -p e2e-tests --test it --run-ignored all -E 'test(sigkill::test_sigkill_)' > mutation.log 2>&1; then
             echo "::error::The recovery test passed without restarting the killed validator"
             exit 1
           fi
           python3 -I - <<'PY'
           from pathlib import Path
           expected = "timed out waiting for condition: restarted validator catches up and becomes active"
-          if expected not in Path("mutation.log").read_text():
-              raise SystemExit("mutation failed before the recovery assertion")
+          if Path("mutation.log").read_text().count("Error: " + expected) != 2:
+              raise SystemExit("both mutations must fail at the recovery assertion")
           PY
 
       - name: Assert committed source and lockfile restored
         run: git diff --exit-code
+
+      - name: Archive retained data from a failed reproduction
+        if: failure()
+        run: |
+          mkdir -p validation-logs/failed-data
+          for marker in crates/e2e-tests/test_logs/sigkill*/retained-datadir.txt; do
+            [ -f "$marker" ] || continue
+            retained_dir="$(cat "$marker")"
+            case_name="$(basename "$(dirname "$marker")")"
+            tar -czf "validation-logs/failed-data/$case_name.tgz" -C "$retained_dir" .
+          done
 
       - name: Preserve successful and failed recovery capture
         if: always()
