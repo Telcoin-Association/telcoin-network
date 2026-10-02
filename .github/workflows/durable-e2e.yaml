@@ -57,6 +57,7 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TARGET_DIR: target
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
       RUST_BACKTRACE: 1
     steps:
@@ -85,13 +86,22 @@ jobs:
             echo "qualification_attempt=$attempt"
             cargo nextest run --locked -p tn-network-libp2p -E 'test(hub_join_)' --success-output immediate --failure-output immediate
           done 2>&1 | tee hub-join-qualification.log
+      - name: Build the real node for governance qualification
+        run: make build-e2e-bin
+      - name: Qualify governance admission and hub-independent consensus
+        run: |
+          set -o pipefail
+          TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --locked -p e2e-tests -E 'test(hub_join_governance_two_workers)' --run-ignored only --success-output immediate --failure-output immediate 2>&1 | tee hub-join-governance.log
       - name: Run default workspace regression lane
         run: ./etc/ci-lanes.sh test-default
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: hub-join-qualification
-          path: hub-join-qualification.log
+          path: |
+            hub-join-qualification.log
+            hub-join-governance.log
+            crates/e2e-tests/test_logs/hub_join
   durable-e2e:
     if: ${{ inputs.hub_validation != true }}
     runs-on: ubuntu-latest
