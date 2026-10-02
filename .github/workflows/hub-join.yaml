@@ -16,6 +16,36 @@ permissions:
   contents: read
 
 jobs:
+  regression:
+    name: Hub join regression (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [fmt, clippy, test-default, test-adiri]
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: '-D warnings -D unused_extern_crates'
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Install the repository nightly for formatting and clippy
+        if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
+        run: rustup toolchain install "$(cat rust-nightly)" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: hub-join-${{ matrix.lane }}
+          cache-on-failure: 'true'
+      - name: Run the unmodified repository lane
+        run: ./etc/ci-lanes.sh "${{ matrix.lane }}"
   qualification:
     runs-on: ubuntu-latest
     timeout-minutes: 150

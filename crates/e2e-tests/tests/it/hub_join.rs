@@ -474,7 +474,12 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
     .await?;
     let published = started.elapsed();
     wait_until(RESOLUTION_BUDGET, "cold committee record resolution on every swarm", || async {
-        joining.all_swarms("tn_network_admission_resolved_window", 5.0).or(Ok(false))
+        let fresh =
+            joining.all_swarms("tn_network_admission_resolved_window", 5.0).unwrap_or(false);
+        let current = nodes.iter().all(|node| {
+            node.all_swarms("tn_network_admission_resolved_window", 5.0).unwrap_or(false)
+        });
+        Ok(fresh && current)
     })
     .await?;
     let resolved = started.elapsed();

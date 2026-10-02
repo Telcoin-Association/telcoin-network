@@ -1,5 +1,6 @@
 //! Test the epoch boundary and validator shuffles.
 
+#[cfg(target_os = "linux")]
 #[path = "hub_join.rs"]
 mod hub_join;
 
