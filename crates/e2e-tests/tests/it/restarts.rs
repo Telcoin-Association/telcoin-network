@@ -241,9 +241,11 @@ fn run_restart_tests_lagged1(
             error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
         })?;
     }
-    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
+    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)
+        .inspect_err(|_| kill_child(&mut child2))?;
     if expected != bal {
         error!(target: "restart-test", "{expected} != {bal} - returning error!");
+        kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
     }
 
@@ -492,7 +494,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, test, 0));
     }
 
     // Take child2 out of guard for restart testing
@@ -503,14 +505,14 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         run_restart_tests_lagged1(
             &client_urls,
             &mut child2,
-            &bin,
+            bin,
             &temp_path,
             rpc_ports[2],
             delay,
             test,
         )
     } else {
-        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay, test)
+        run_restart_tests1(&client_urls, &mut child2, bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
@@ -540,9 +542,9 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
-    for i in 0..4 {
-        guard.replace(i, start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
-    }
+    rpc_ports.iter().copied().enumerate().for_each(|(i, rpc_port)| {
+        guard.replace(i, start_validator(i, bin, &temp_path, rpc_port, test, 3));
+    });
 
     info!(target: "restart-test", "Running restart tests 2");
     let res2 = run_restart_tests2(&client_urls);
@@ -633,10 +635,10 @@ fn test_restarts_observer() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    client_urls.iter_mut().enumerate().try_for_each(|(i, url)| {
         let rpc_port = get_available_tcp_port("127.0.0.1")
-            .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
+            .ok_or_else(|| eyre::eyre!("No ephemeral RPC port available for child"))?;
+        url.push_str(&format!(":{rpc_port}"));
         // The observer forwards accepted txns to the committee's advertised RPC
         // endpoints; without this each seal is refused with NotValidator and the txns
         // stay pending in the observer's pool until an endpoint is discoverable.
@@ -644,13 +646,14 @@ fn test_restarts_observer() -> eyre::Result<()> {
         // A seated validator must remain active even when a legacy launch command has the flag.
         let extra_args: &[&str] = if i == 0 { &["--observer"] } else { &[] };
         guard.push(start_validator_with_args(
-            i, &bin, &temp_path, rpc_port, "observer", 0, extra_args,
+            i, bin, &temp_path, rpc_port, "observer", 0, extra_args,
         ));
-    }
+        Ok::<(), Report>(())
+    })?;
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
     // Guard cleanup handles all process shutdown on drop
     run_observer_tests(&client_urls, &obs_url)
@@ -822,12 +825,13 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    client_urls.iter_mut().enumerate().try_for_each(|(i, url)| {
         let rpc_port = get_available_tcp_port("127.0.0.1")
-            .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "late_join", 0));
-    }
+            .ok_or_else(|| eyre::eyre!("No ephemeral RPC port available for child"))?;
+        url.push_str(&format!(":{rpc_port}"));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "late_join", 0));
+        Ok::<(), Report>(())
+    })?;
 
     // Wait for validators to produce blocks
     network_advancing(&client_urls)?;
@@ -854,7 +858,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "late_join", 0));
 
     // Observer must catch up to at least the validator consensus height we recorded.
     // Guard cleanup handles all process shutdown on drop; on timeout the `?` surfaces the
@@ -895,16 +899,17 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    client_urls.iter_mut().enumerate().try_for_each(|(i, url)| {
         let rpc_port = get_available_tcp_port("127.0.0.1")
-            .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "reconnect", 0));
-    }
+            .ok_or_else(|| eyre::eyre!("No ephemeral RPC port available for child"))?;
+        url.push_str(&format!(":{rpc_port}"));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "reconnect", 0));
+        Ok::<(), Report>(())
+    })?;
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "reconnect", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "reconnect", 0));
 
     // Wait for network to advance and observer to be in sync
     network_advancing(&client_urls)?;

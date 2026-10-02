@@ -481,6 +481,21 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                 };
                 let handle = network.network_handle();
                 let task = tokio::spawn(network.run());
+                handle
+                    .add_bootstrap_peers(
+                        network_config
+                            .bootstrap_peers()
+                            .iter()
+                            .filter_map(|(key, server)| {
+                                match role {
+                                    NetworkType::Primary => Some(server.primary.clone()),
+                                    NetworkType::Worker(id) => server.worker(id).cloned(),
+                                }
+                                .map(|peer| (*key, peer))
+                            })
+                            .collect(),
+                    )
+                    .await?;
                 let receiver_id = PeerId::from(match role {
                     NetworkType::Primary => keys.primary_network_public_key(),
                     NetworkType::Worker(id) => keys.worker_network_public_key(id),

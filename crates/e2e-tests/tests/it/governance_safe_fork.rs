@@ -259,7 +259,7 @@ fn assert_pre_fork_alloc(genesis: &Genesis) -> eyre::Result<()> {
             .alloc
             .get(&address)
             .and_then(|account| account.code.as_ref())
-            .map(|code| keccak256(code))
+            .map(keccak256)
             .unwrap_or(B256::ZERO)
     };
 
@@ -449,8 +449,10 @@ async fn test_governance_safe_fork_boundary() -> eyre::Result<()> {
     let shared_genesis_dir = temp_path.join("shared-genesis");
 
     let genesis = config_committee(
-        temp_path,
-        &shared_genesis_dir,
+        super::common::CommitteeDirectories {
+            temporary: temp_path,
+            shared_genesis: &shared_genesis_dir,
+        },
         Some(NODE_PASSWORD.to_string()),
         // registry owner is never used by this test; a distinct address keeps it from
         // entangling with the governance Safe whose state the fork rewrites

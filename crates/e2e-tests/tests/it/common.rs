@@ -395,7 +395,7 @@ where
             .build()?
             .block_on(call_rpc_inner(node, command, params, retries, debug_params)),
     };
-    Ok(resp?)
+    resp
 }
 
 /// Check if the network is advancing (query all nodes).
@@ -790,8 +790,7 @@ pub(crate) fn create_genesis_for_test(
 
     // create the initial committee of validators and create genesis
     let genesis = config_committee(
-        temp_path,
-        &shared_genesis_dir,
+        CommitteeDirectories { temporary: temp_path, shared_genesis: &shared_genesis_dir },
         passphrase,
         governance_wallet,
         accounts,
@@ -818,6 +817,14 @@ pub(crate) fn create_genesis_for_test(
     Ok(genesis)
 }
 
+/// File locations used to prepare a test committee.
+pub(crate) struct CommitteeDirectories<'a> {
+    /// Directory containing the individual validator configurations.
+    pub(crate) temporary: &'a Path,
+    /// Directory containing the shared genesis ceremony.
+    pub(crate) shared_genesis: &'a Path,
+}
+
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
@@ -828,8 +835,7 @@ pub(crate) fn create_genesis_for_test(
 /// `2017`, so the two e2e binaries need different ids and neither can be left implicit on the
 /// adiri lane. Pass `None` everywhere else to keep the ceremony default.
 pub(crate) fn config_committee(
-    temp_path: &Path,
-    shared_genesis_dir: &Path,
+    directories: CommitteeDirectories<'_>,
     passphrase: Option<String>,
     consensus_registry_owner: Address,
     accounts: Vec<(Address, GenesisAccount)>,
@@ -837,6 +843,8 @@ pub(crate) fn config_committee(
     epoch_duration: u64,
     chain_id: Option<u64>,
 ) -> eyre::Result<Genesis> {
+    let CommitteeDirectories { temporary: temp_path, shared_genesis: shared_genesis_dir } =
+        directories;
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
