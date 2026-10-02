@@ -18,6 +18,7 @@ use crate::{
         revote_uncertified_epoch_record_on_startup, spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
+    network_readiness::{monitor, NetworkReadiness},
 };
 use eyre::{eyre, WrapErr as _};
 use futures::TryStreamExt as _;
@@ -889,14 +890,21 @@ where
             .await?;
 
         // Bind operator endpoints before any startup synchronization waits for peers.
+        let (network_readiness_tx, network_readiness_rx) =
+            watch::channel(NetworkReadiness::pending());
         if let Some(port) = self.builder.healthcheck {
             let engine = engine.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
                 async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
             };
-            let _ =
-                HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;
+            let _ = HealthcheckServer::spawn(
+                node_task_manager.get_spawner(),
+                port,
+                worker_ready,
+                network_readiness_rx,
+            )
+            .await;
         }
 
         // Propagate metrics bind errors because the operator requested this endpoint.
@@ -999,9 +1007,35 @@ where
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
 
+        // Monitor process-lifetime handles before startup issues any network commands.
+        let primary = primary_network_handle.inner_handle().clone();
+        let workers = self.worker_network_handles.clone();
+        node_task_spawner.spawn_task("network-readiness", async move {
+            monitor(
+                network_readiness_tx,
+                move || {
+                    let primary = primary.clone();
+                    async move { primary.established_peer_count().await }
+                },
+                move || {
+                    workers
+                        .iter()
+                        .map(|worker| {
+                            let worker_id = worker.worker_id();
+                            let handle = worker.inner_handle().clone();
+                            (worker_id, async move { handle.established_peer_count().await })
+                        })
+                        .collect()
+                },
+            )
+            .await;
+            Ok(())
+        });
+
         // Register bootstrap peers before per-epoch committee updates resolve known peers.
         // Listening and bootstrap dials belong to process startup, before replay can close an
-        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
+        // epoch without creating consensus. Membership stays per-epoch; readiness and reconnect
+        // work continue independently for the entire process.
         primary_network_handle
             .inner_handle()
             .add_bootstrap_peers(
