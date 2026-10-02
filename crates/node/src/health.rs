@@ -61,7 +61,7 @@ pub(crate) struct WorkerReadiness {
     worker_id: WorkerId,
     /// Whether the worker is up and accepting transactions.
     ///
-    /// True only when the worker's RPC server and pool are initialized, its id is
+    /// True only while the worker's RPC listeners are running, its id is
     /// in the current committee's worker range, and that epoch has not shut down.
     /// Persistent components alone do not imply current readiness.
     accepting_transactions: bool,

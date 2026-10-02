@@ -1,4 +1,4 @@
-//! Current-epoch readiness for persistent worker RPC servers and transaction pools.
+//! Current-epoch readiness for worker RPC listeners and persistent transaction pools.
 
 use crate::health::WorkerReadiness;
 use tn_types::{Noticer, WorkerId};
@@ -25,17 +25,23 @@ impl WorkerReadinessState {
         self.epoch = Some(WorkerEpoch { worker_count, shutdown });
     }
 
-    /// Report every initialized worker, accepting only while its current epoch is active.
-    pub(super) fn snapshot(&self, initialized_workers: usize) -> Vec<WorkerReadiness> {
+    /// Report every initialized worker, accepting only with a running RPC and active epoch.
+    pub(super) fn snapshot(
+        &self,
+        running_workers: impl IntoIterator<Item = bool>,
+    ) -> Vec<WorkerReadiness> {
         let active_workers = self
             .epoch
             .as_ref()
             .filter(|epoch| !epoch.shutdown.noticed())
             .map_or(0, |epoch| epoch.worker_count);
         (0..=WorkerId::MAX)
-            .take(initialized_workers)
-            .map(|worker_id| {
-                WorkerReadiness::new(worker_id, usize::from(worker_id) < active_workers)
+            .zip(running_workers)
+            .map(|(worker_id, rpc_running)| {
+                WorkerReadiness::new(
+                    worker_id,
+                    rpc_running && usize::from(worker_id) < active_workers,
+                )
             })
             .collect()
     }
@@ -51,28 +57,28 @@ mod tests {
     #[test]
     fn readiness_follows_initialization_and_epoch_membership() {
         let mut state = WorkerReadinessState::default();
-        assert!(state.snapshot(0).is_empty());
-        assert_eq!(state.snapshot(1), vec![WorkerReadiness::new(0, false)]);
+        assert!(state.snapshot([]).is_empty());
+        assert_eq!(state.snapshot([true]), vec![WorkerReadiness::new(0, false)]);
 
         let first_epoch = ShutdownNotifier::new();
         state.start_epoch(2, first_epoch.subscribe());
-        assert!(state.snapshot(0).is_empty());
-        assert_eq!(state.snapshot(1), vec![WorkerReadiness::new(0, true)]);
+        assert!(state.snapshot([]).is_empty());
+        assert_eq!(state.snapshot([true]), vec![WorkerReadiness::new(0, true)]);
         assert_eq!(
-            state.snapshot(2),
+            state.snapshot([true, true]),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
         );
 
         first_epoch.notify();
         assert_eq!(
-            state.snapshot(2),
+            state.snapshot([true, true]),
             vec![WorkerReadiness::new(0, false), WorkerReadiness::new(1, false)]
         );
 
         let smaller_epoch = ShutdownNotifier::new();
         state.start_epoch(1, smaller_epoch.subscribe());
         assert_eq!(
-            state.snapshot(2),
+            state.snapshot([true, true]),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
         );
 
@@ -80,7 +86,23 @@ mod tests {
         state.start_epoch(2, larger_epoch.subscribe());
         smaller_epoch.notify();
         assert_eq!(
-            state.snapshot(2),
+            state.snapshot([true, true]),
+            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
+        );
+    }
+
+    /// A retained worker stays unavailable on regrowth until its RPC listeners restart.
+    #[test]
+    fn readiness_waits_for_rpc_restart() {
+        let mut state = WorkerReadinessState::default();
+        let epoch = ShutdownNotifier::new();
+        state.start_epoch(2, epoch.subscribe());
+        assert_eq!(
+            state.snapshot([true, false]),
+            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
+        );
+        assert_eq!(
+            state.snapshot([true, true]),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
         );
     }
