@@ -1425,11 +1425,8 @@ where
                     )
                     .into()));
                 } else {
-                    let query_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .get_record(libp2p::kad::RecordKey::new(&encode(&key)));
+                    let query_id =
+                        self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(
                         query_id,
                         KadQuery { request: key, result: None, reply: Some(reply) },

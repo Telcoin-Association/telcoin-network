@@ -46,9 +46,13 @@ def declaration():
 
 def evidence(plan, phase="candidate"):
     """Build telemetry fixtures solely for validating the scorer."""
-    swarm = {"connections": 86, "connection_limit": 86, "streams_per_connection_limit": 16,
+    budget = plan["candidate"]["profile"]["process_budget"]
+    connection_limit = budget["max_established_connections"] // budget["swarm_count"]
+    allocated_connections = connection_limit * budget["swarm_count"]
+    swarm = {"connections": connection_limit, "connection_limit": connection_limit,
+             "streams_per_connection_limit": budget["max_inbound_streams"] // allocated_connections,
              "ordinary_peers": 64, "dao_connected": 8,
-             "receive_credit_per_connection_bytes": 1_073_741_824 // 258,
+             "receive_credit_per_connection_bytes": budget["max_receive_credit_bytes"] // allocated_connections,
              "queue_occupancy": 0, "rejections": {"capacity": 0}}
     hub = {"rss_bytes": 1024**3, "cpu_seconds": 0, "progress": 1,
            "dao_connected": 8, "source_rows": 64,
@@ -168,8 +172,9 @@ class QualificationTests(unittest.TestCase):
             QUALIFY.validate_evidence(self.plan, self.run, "candidate")
 
     def test_memory_cpu_task_and_queue_limits(self):
+        source_limit = self.plan["candidate"]["profile"]["source_admission"]["max_sources"]
         for field, value in (("rss_bytes", 5 * 1024**3), ("cpu_seconds", 100),
-                             ("source_rows", 259)):
+                             ("source_rows", source_limit + 1)):
             run = evidence(self.plan)
             run["samples"][1]["hubs"]["hub-0"][field] = value
             self.assertFalse(QUALIFY.score(self.plan, run)["passed"], field)

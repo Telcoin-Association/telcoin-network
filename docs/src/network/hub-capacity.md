@@ -14,25 +14,30 @@ Validator validated-address and handshake qualification retains its Launch scope
 
 | Resource | Per swarm | Whole hub process |
 | --- | ---: | ---: |
-| Ordinary connected or dialing peers | 64 | 192 peer slots |
-| Established connections | 86 | 258 |
-| Established connections per PeerId | 1 | Source admission additionally caps each PeerId at 3 |
-| Negotiated inbound streams per connection | 16 | 4,128 |
-| Receive credit per connection | floor(1 GiB / 258) bytes | At most 1 GiB |
-| Observed address rows | Shared accounting | 258 |
-| Connections per observed address | Shared accounting | 64 |
-| Connections per IPv4 /24 or IPv6 /64 | Shared accounting | 192 |
+| Ordinary established peers | 64 | 192 peer slots |
+| Established connections | 172 | 516 |
+| Established connections per PeerId | 2 | Source admission additionally caps each PeerId at 6 |
+| Negotiated inbound streams per connection | 8 | 4,128 |
+| Receive credit per connection | floor(1 GiB / 516) bytes | At most 1 GiB |
+| Observed address rows | Shared accounting | 516 |
+| Connections per observed address | Shared accounting | 128 |
+| Connections per IPv4 /24 or IPv6 /64 | Shared accounting | 384 |
 | Banned, disconnected, temporarily banned peers | 512 in each table | Three swarm allocations |
 | Gossip target / low / high / outbound floor | 12 / 8 / 16 / 4 per topic | Primary and every worker |
 
-The ordinary limit excludes peers with a current retention privilege. The 22
-remaining connection slots accommodate 8 operator-provisioned DAO observers and
-12 distinct committee peers across previous/current/next committees, plus 2
-bootstrap/hub identities. Provision
-DAO identities as trusted peers and bound the protected population to this
-envelope. Additional protected identities compete for these slots. Protocol
-violations can still cause bans, and every peer remains subject to the hard
-process, source, stream, and receive-credit limits.
+The ordinary limit counts established peer identities and excludes peers with a
+current retention privilege. Each swarm allows 64 ordinary identities plus 22
+protected identities: 8 DAO observers, 12 distinct committee peers across the
+previous/current/next committees, and 2 bootstrap/hub identities. Two connections
+per identity give a finite ceiling of 172 per swarm and 516 across all three.
+This permits inbound and outbound connections during simultaneous dialing. The
+stream and receive-credit totals remain fixed as connection headroom increases.
+
+Select at most 8 DAO identities through `dao_observers`, using identities already
+present in `bootstrap_peers`. This selection reserves retention while preserving
+normal load scoring. Additional operator-protected identities compete for the
+same protected headroom. Protocol violations can still cause bans, and every peer
+remains subject to the hard process, source, stream, and receive-credit limits.
 
 Network allocations do not bound RSS: engine state, record storage, caches, RPC,
 cryptography, queues, and allocator overhead also consume memory. Qualification

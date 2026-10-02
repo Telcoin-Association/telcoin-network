@@ -18,17 +18,17 @@
   },
   "process_budget": {
     "swarm_count": 3,
-    "max_established_connections": 258,
-    "max_established_connections_per_peer": 1,
+    "max_established_connections": 516,
+    "max_established_connections_per_peer": 2,
     "max_inbound_streams": 4128,
     "max_receive_credit_bytes": 1073741824
   },
   "source_admission": {
-    "max_connections": 258,
-    "max_connections_per_peer": 3,
-    "max_connections_per_address": 64,
-    "max_connections_per_prefix": 192,
-    "max_sources": 258,
+    "max_connections": 516,
+    "max_connections_per_peer": 6,
+    "max_connections_per_address": 128,
+    "max_connections_per_prefix": 384,
+    "max_sources": 516,
     "ipv4_prefix_length": 24,
     "ipv6_prefix_length": 64
   },

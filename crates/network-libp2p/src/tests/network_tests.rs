@@ -379,6 +379,20 @@ async fn application_record_queries_are_bounded_and_complete(
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
     assert_eq!(ids.len(), 100);
+    assert_eq!(
+        network
+            .swarm
+            .behaviour()
+            .kademlia
+            .iter_queries()
+            .filter(|query| {
+                matches!(query.info(), kad::QueryInfo::GetRecord { key: requested, .. }
+                    if requested == &crate::kad::node_record_key(&key))
+            })
+            .count(),
+        100,
+        "application lookups must query the same raw key used by signed record publishers"
+    );
     ids.iter().for_each(|id| network.close_kad_query(id));
     receivers.into_iter().try_for_each(|mut receiver| {
         assert!(receiver.try_recv()?.is_err(), "an empty query must report failure");
