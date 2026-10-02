@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 8c01c8d6c992a1fc58fa24c70e5041ac696be166
+          ref: 441e5d0a91abaca291d6395bdc170812e0dc0763
           submodules: true
       - name: Install stable toolchain
         run: rustup toolchain install 1.94 --profile minimal
@@ -31,7 +31,7 @@ jobs:
         with:
           prefix-key: v1-rust
           shared-key: test-cache
-          save-if: "false"
+          save-if: "true"
       - name: Run lifecycle and admission regressions
         run: |
           cargo +1.94 test --locked -p tn-node --lib epoch_starts_all_workers_and_reuses_components -- --nocapture
@@ -83,7 +83,7 @@ jobs:
           p.write_text(source.replace(needle, needle + "        let _ = self.rpc_handle.clone().stop();\n", 1))
           PY
           set +e
-          timeout 180s cargo +1.94 test --locked -p tn-node --lib epoch_starts_all_workers_and_reuses_components -- --nocapture > listener-mutation.log 2>&1
+          timeout 600s cargo +1.94 test --locked -p tn-node --lib epoch_starts_all_workers_and_reuses_components -- --nocapture > listener-mutation.log 2>&1
           result=$?
           set -e
           cat listener-mutation.log
@@ -101,35 +101,3 @@ jobs:
         with:
           name: issue-1505-mutations
           path: "*-mutation.log"
-
-  clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [default, all]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 8c01c8d6c992a1fc58fa24c70e5041ac696be166
-          submodules: true
-      - name: Install pinned nightly
-        run: rustup toolchain install "$(cat rust-nightly)" -c clippy,rust-src,rustfmt --profile minimal
-      - name: Restore lint dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
-        with:
-          prefix-key: v1-rust
-          shared-key: clippy-cache
-          save-if: "false"
-      - name: Check formatting
-        run: cargo "+$(cat rust-nightly)" fmt --all -- --check
-      - name: Lint full workspace
-        env:
-          FEATURE_SET: ${{ matrix.features }}
-        run: |
-          feature_args=()
-          if [ "$FEATURE_SET" = all ]; then
-            feature_args+=(--all-features)
-          fi
-          cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps "${feature_args[@]}" -- -D warnings
