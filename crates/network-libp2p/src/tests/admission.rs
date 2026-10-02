@@ -573,6 +573,62 @@ async fn admission_reconciliation_closure_bookkeeping_once() {
     assert!(poll_reconciliation(&mut fixture.manager).is_none());
 }
 
+/// Replacing metadata cannot hide a live old transport from revocation or final app cleanup.
+#[tokio::test]
+async fn admission_reconciliation_survives_record_key_replacement() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Worker(1), AdmissionMode::Closed);
+    let old = fixture.current.id();
+    let replacement = AdmissionPeer::new();
+    fixture.manager.register_peer_connection(
+        &old,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    fixture.manager.cache_known_peer(fixture.current.bls, replacement.info.clone());
+    assert!(!fixture.manager.is_connected(&old));
+    assert!(fixture.manager.live_admission_peers.contains_key(&old));
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    assert!(matches!(poll_reconciliation(&mut fixture.manager),
+        Some(PeerEvent::DisconnectPeer(peer)) if peer == old));
+    fixture.manager.heartbeat();
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    assert!(!fixture.manager.peer_banned(&old));
+    assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+
+    let mut open = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let retired = open.current.id();
+    open.manager.register_peer_connection(
+        &retired,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    open.manager.cache_known_peer(open.current.bls, replacement.info);
+    assert!(!open.manager.is_peer_connected_or_disconnecting(&retired));
+    assert!(poll_reconciliation(&mut open.manager).is_none());
+    assert!(open.manager.live_admission_peers.contains_key(&retired));
+    open.manager.events.clear();
+    let endpoint = ConnectedPoint::Listener {
+        local_addr: create_multiaddr(None),
+        send_back_addr: create_multiaddr(None),
+    };
+    [1, 0, 0].into_iter().for_each(|remaining| {
+        open.manager.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: retired,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: &endpoint,
+            cause: None,
+            remaining_established: remaining,
+        }));
+        assert_eq!(open.manager.live_admission_peers.contains_key(&retired), remaining > 0);
+    });
+    assert_eq!(
+        open.manager
+            .events
+            .iter()
+            .filter(|event| matches!(event, PeerEvent::PeerDisconnected(peer) if *peer == retired))
+            .count(),
+        1
+    );
+}
+
 /// Every swarm enters Grace even with resolved records; renewals do not restart its clock.
 #[tokio::test(start_paused = true)]
 async fn admission_transition_grace_uses_snapshot_clock_every_swarm() {
