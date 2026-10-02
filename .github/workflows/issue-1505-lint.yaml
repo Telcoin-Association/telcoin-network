@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 8c01c8d6c992a1fc58fa24c70e5041ac696be166
+          ref: 441e5d0a91abaca291d6395bdc170812e0dc0763
           submodules: true
       - name: Install pinned nightly
         run: rustup toolchain install "$(cat rust-nightly)" -c clippy,rust-src,rustfmt --profile minimal
@@ -55,4 +55,3 @@ jobs:
             feature_args+=(--all-features)
           fi
           cargo "+$(cat rust-nightly)" clippy --locked -p tn-node -p tn-reth --all-targets --no-deps "${feature_args[@]}" -- -D warnings
-
