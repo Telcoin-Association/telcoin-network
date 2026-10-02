@@ -38,6 +38,10 @@ pub struct AdmissionStatus {
     fallback: Option<AdmissionFallback>,
     /// Current identities with authenticated records, including the local identity.
     resolved_current: usize,
+    /// Authenticated records in the previous/current/next window, including this node.
+    resolved_window: usize,
+    /// Number of distinct identities in the previous/current/next window.
+    required_window: usize,
     /// Resolved-record quorum: n minus floor((n - 1) / 3).
     required_current: usize,
     /// Connected current peers, excluding the local identity.
@@ -66,6 +70,16 @@ impl AdmissionStatus {
     /// Return the authenticated current-record count.
     pub fn resolved_current(&self) -> usize {
         self.resolved_current
+    }
+
+    /// Count authenticated records across the entire admission window.
+    pub fn resolved_window(&self) -> usize {
+        self.resolved_window
+    }
+
+    /// Count distinct identities whose records are required before closing the window.
+    pub fn required_window(&self) -> usize {
+        self.required_window
     }
     /// Return the minimum resolved-record quorum.
     pub fn required_current(&self) -> usize {
@@ -251,6 +265,13 @@ impl AdmissionPolicy {
                 epoch: self.snapshot.as_ref().map(|s| s.epoch),
                 fallback,
                 resolved_current,
+                resolved_window: keys
+                    .iter()
+                    .filter(|key| {
+                        Some(**key) == local || (known.contains_key(key) && !stubs.contains(key))
+                    })
+                    .count(),
+                required_window: keys.len(),
                 required_current,
                 connected_current,
                 transition_remaining,

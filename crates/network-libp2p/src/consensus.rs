@@ -64,6 +64,10 @@ mod admission_contention;
 #[path = "tests/loop_budget_tests.rs"]
 mod loop_budget_tests;
 
+#[cfg(test)]
+#[path = "tests/hub_join.rs"]
+mod hub_join;
+
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
 #[derive(Debug)]
