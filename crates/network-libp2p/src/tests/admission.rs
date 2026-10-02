@@ -522,6 +522,42 @@ async fn admission_reconciliation_bounds_each_poll() {
     assert_eq!(fixture.manager.peers.connected_peer_ids().count(), before);
 }
 
+/// Identical policy renewals keep pending order while appending previously checked identities.
+#[tokio::test]
+async fn admission_reconciliation_progress_survives_renewals() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Worker(2), AdmissionMode::Open);
+    (0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 2 + 1).for_each(|_| {
+        let peer = AdmissionPeer::new();
+        let id = peer.id();
+        fixture.manager.add_bootstrap_peer(peer.bls, peer.info);
+        fixture.manager.register_peer_connection(
+            &id,
+            ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+        );
+    });
+    let ordinary = fixture.ordinary.id();
+    fixture.manager.register_peer_connection(
+        &ordinary,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    fixture.manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300))
+            .with_transition_grace(Duration::ZERO),
+        fixture.local,
+    );
+    // Force two complete batches of eligible identities ahead of the revocation candidate.
+    fixture.manager.admission_reconciliation.retain(|peer| *peer != ordinary);
+    fixture.manager.admission_reconciliation.push_back(ordinary);
+    fixture.renew(7);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    fixture.renew(7);
+    assert!(poll_reconciliation(&mut fixture.manager).is_none());
+    fixture.renew(7);
+    assert!(matches!(poll_reconciliation(&mut fixture.manager),
+        Some(PeerEvent::DisconnectPeer(peer)) if peer == ordinary));
+    assert_eq!(fixture.manager.temporarily_banned.len(), 0);
+}
+
 /// Revocation is dispatched by the swarm, and only the last transport closure removes the peer.
 #[tokio::test]
 async fn admission_reconciliation_closure_bookkeeping_once() {

@@ -166,7 +166,7 @@ pub(crate) struct PeerManager {
     /// Entries are candidates, not committed disconnects, and carry no stale policy grants.
     admission_reconciliation: VecDeque<PeerId>,
     /// Actual established identities and pending closures, bounded by the transport budget.
-    /// Record replacement never removes a live identity; the last ConnectionClosed event does.
+    /// Record replacement never removes a live identity; the last `ConnectionClosed` event does.
     live_admission_peers: HashMap<PeerId, LiveAdmissionState>,
     /// Config
     config: PeerConfig,
@@ -365,20 +365,25 @@ impl PeerManager {
 
     /// Schedule one reevaluation per live identity using the current authoritative policy.
     /// Open and Grace preserve existing connections, including unknown authenticated peers.
-    /// The queue replaces earlier work and is bounded by the swarm's transport connection budget.
+    /// Pending order survives renewals so repeated updates cannot restart a sweep indefinitely.
+    /// The queue contains at most one candidate per live identity in the transport budget.
     fn reconcile_admission(&mut self) {
         let (status, _) = self.evaluate_admission();
         self.metrics.set_admission(&status);
-        self.admission_reconciliation = if status.effective() == AdmissionMode::Closed {
-            self.live_admission_peers
-                .iter()
-                .filter_map(|(peer, state)| {
-                    (*state == LiveAdmissionState::Connected).then_some(*peer)
-                })
-                .collect()
+        if status.effective() == AdmissionMode::Closed {
+            self.admission_reconciliation.retain(|peer| {
+                self.live_admission_peers.get(peer) == Some(&LiveAdmissionState::Connected)
+            });
+            let pending: HashSet<_> = self.admission_reconciliation.iter().copied().collect();
+            self.admission_reconciliation.extend(self.live_admission_peers.iter().filter_map(
+                |(peer, state)| {
+                    (*state == LiveAdmissionState::Connected && !pending.contains(peer))
+                        .then_some(*peer)
+                },
+            ));
         } else {
-            VecDeque::new()
-        };
+            self.admission_reconciliation.clear();
+        }
     }
 
     /// Recheck a bounded batch against the latest policy before committing one closure.
