@@ -187,3 +187,75 @@ async fn observer_seal_without_admission_returns_not_validator() {
     let empty_batch = Batch { transactions: vec![], ..Default::default() };
     assert!(batch_provider.seal(empty_batch.seal_slow()).await.is_ok());
 }
+
+/// The batch metrics count a batch only once its report to the primary succeeds (issue #1444).
+///
+/// The first seal reaches quorum but no primary handler is registered, so the report fails
+/// with `FailedToReport`, as it does on a node whose proposer is not running, so nothing accepts
+/// the report. The batch builder keeps the transactions and re-seals the same batch, which
+/// reaches quorum again and is reported this time. Recording at quorum would count both attempts.
+#[tokio::test]
+async fn seal_records_batch_metrics_only_after_report() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let client = LocalNetwork::new_with_empty_id();
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // metric handles bind to the recorder active at construction, so seals awaited outside
+    // this closure still record into the debugging recorder
+    let batch_provider = metrics::with_local_recorder(&recorder, || {
+        Worker::new(
+            0,
+            Some(RecordingQuorumWaiter::default()),
+            client.clone(),
+            store.clone(),
+            Duration::from_secs(5),
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Arc::new(NoopTxnForwarder),
+            Vec::new(),
+        )
+    });
+    let tx = transaction(test_chain_spec_arc());
+    let sealed_batch =
+        Batch { transactions: vec![tx.clone(), tx], ..Default::default() }.seal_slow();
+
+    // the worker records `Batch::size()`, which excludes the sealed digest
+    let expected_size = sealed_batch.batch().size() as f64;
+    // each snapshot swaps the counters to zero and drains the histograms, so every call returns
+    // only what the worker recorded since the previous call
+    let drain = || {
+        let (mut sealed, mut sizes, mut txs) = (None, None, None);
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if !key.key().labels().any(|l| l.key() == "worker" && l.value() == "0") {
+                continue;
+            }
+            match (key.key().name(), value) {
+                ("tn_worker.batches_sealed_total", DebugValue::Counter(n)) => sealed = Some(n),
+                ("tn_worker.batch_size_bytes", DebugValue::Histogram(xs)) => {
+                    sizes = Some(xs.into_iter().map(|x| x.0).collect::<Vec<f64>>())
+                }
+                ("tn_worker.batch_transactions", DebugValue::Histogram(xs)) => {
+                    txs = Some(xs.into_iter().map(|x| x.0).collect::<Vec<f64>>())
+                }
+                _ => {}
+            }
+        }
+        (
+            sealed.expect("tn_worker.batches_sealed_total registered for worker 0"),
+            sizes.expect("tn_worker.batch_size_bytes registered for worker 0"),
+            txs.expect("tn_worker.batch_transactions registered for worker 0"),
+        )
+    };
+
+    let res = batch_provider.seal(sealed_batch.clone()).await;
+    assert!(matches!(res, Err(BlockSealError::FailedToReport)), "first seal: {res:?}");
+    assert_eq!(drain(), (0, vec![], vec![]), "a seal whose report fails records nothing");
+
+    client
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
+    batch_provider.seal(sealed_batch).await.expect("re-seal reports to the primary");
+    assert_eq!(drain(), (1, vec![expected_size], vec![2.0]), "the reported seal is recorded once");
+}
