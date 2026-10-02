@@ -142,6 +142,8 @@ impl PathAcl {
 struct NodeOwnership {
     /// Directory delegated to the unprivileged child.
     dir: PathBuf,
+    /// Directory permissions to restore after the unprivileged child stops.
+    dir_permissions: std::fs::Permissions,
     /// Fixture parent whose traversal permission was temporarily opened.
     parent: PathBuf,
     /// Parent permissions to restore on cleanup.
@@ -158,6 +160,8 @@ impl Drop for NodeOwnership {
             .args(["-n", "chown", "-R", &format!("{}:{}", self.uid, self.gid)])
             .arg(&self.dir)
             .status();
+        let _directory_permissions =
+            std::fs::set_permissions(&self.dir, self.dir_permissions.clone());
         let _permissions = std::fs::set_permissions(&self.parent, self.parent_permissions.clone());
     }
 }
@@ -168,12 +172,14 @@ impl NodeOwnership {
         let metadata = std::fs::metadata(dir)?;
         let guard = Self {
             dir: dir.to_owned(),
+            dir_permissions: metadata.permissions(),
             parent: parent.to_owned(),
             parent_permissions: std::fs::metadata(parent)?.permissions(),
             uid: metadata.uid(),
             gid: metadata.gid(),
         };
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))?;
         let changed = std::process::Command::new("sudo")
             .args(["-n", "chown", "-R", &format!("{JOIN_UID}:{JOIN_UID}")])
             .arg(dir)
@@ -188,7 +194,11 @@ impl NodeOwnership {
 }
 
 /// Preserve explicit fork overrides while launching the child without root privileges.
-fn restricted_command(original: std::process::Command, pid_file: &Path) -> std::process::Command {
+fn restricted_command(
+    original: std::process::Command,
+    pid_file: &Path,
+    executable: &Path,
+) -> std::process::Command {
     let mut command = std::process::Command::new("sudo");
     command.args([
         "-n",
@@ -213,9 +223,9 @@ fn restricted_command(original: std::process::Command, pid_file: &Path) -> std::
         })
     }));
     command
-        .args(["sh", "-c", "echo $$ > \"$1\"; shift; exec \"$@\"", "hub-join"])
+        .args(["sh", "-c", "umask 022; echo $$ > \"$1\"; shift; exec \"$@\"", "hub-join"])
         .arg(pid_file)
-        .arg(original.get_program())
+        .arg(executable)
         .args(original.get_args());
     original.get_current_dir().into_iter().for_each(|dir| {
         command.current_dir(dir);
@@ -352,11 +362,15 @@ fn start_qualification_node(
         .arg("--bootstrap-peers")
         .arg(bootstrap_json);
     let (ownership, path_acl, restricted_pid) = if name == NEW_VALIDATOR {
+        // The runner's home directory is private, so execute an identical copy under /tmp.
+        let executable = dir.join("qualification-node");
+        std::fs::copy(command.get_program(), &executable)?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
         let ownership = NodeOwnership::acquire(base, &dir)?;
         let hub = bootstraps.values().next().ok_or_else(|| eyre::eyre!("sole open hub"))?;
         let path_acl = PathAcl::install(hub)?;
         let pid_file = dir.join("qualification.pid");
-        command = restricted_command(command, &pid_file);
+        command = restricted_command(command, &pid_file, &executable);
         (Some(ownership), Some(path_acl), Some(pid_file))
     } else {
         (None, None, None)

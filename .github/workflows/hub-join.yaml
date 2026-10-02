@@ -49,6 +49,13 @@ jobs:
   qualification:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TARGET_DIR: target
+      RUSTFLAGS: '-D warnings -D unused_extern_crates'
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
         with:
