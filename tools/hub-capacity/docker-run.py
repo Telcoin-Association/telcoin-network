@@ -128,7 +128,7 @@ def workload_manifest(population):
         {"identity": node["bls_key"], "argv": ["python3", "-B", "-I", "/tools/control.py",
          "--identity", node["bls_key"], "--observations", "http://127.0.0.1:9400"]}
         for node in population["validators"] if node["hub"]]}
-    return {"scenarios": scenarios}
+    return {"scenarios": scenarios, "topology_artifact": "/qualification/links-initial.json"}
 
 
 def stop_process(docker, container, pid_file, command_token):
