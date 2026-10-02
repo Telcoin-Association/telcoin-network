@@ -59,8 +59,11 @@ pub struct TNPayload {
     /// epoch carried in the output, never on a node-local epoch, so every node executing the
     /// same output computes the same value and replaying pre-fork history reproduces the
     /// original timestamps. Consensus already keeps commit times non-decreasing from the fork
-    /// on, so a clamp that raises the value signals a consensus bug; the engine counts those
-    /// blocks in `evm_timestamp_clamped_total`.
+    /// on, so a clamp that raises the value signals a consensus bug, with one exception: epoch 0
+    /// has no commit floor, so if the validators' clocks lag the genesis `timestamp`, which the
+    /// host that built genesis stamped from its own clock, the first commits of epoch 0 fall below
+    /// that timestamp and are raised to it although consensus is correct. The engine counts every
+    /// raised block in `evm_timestamp_clamped_total`.
     pub timestamp: u64,
     /// This is used as the ommers hash.
     /// The default is `B256::ZERO` (no batches to execute).
