@@ -192,25 +192,20 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
     /// The k-bucket size for kademlia.
     pub k_bucket_size: NonZeroUsize,
-    /// The TTL applied to kademlia records — both the libp2p record TTL and the
+    /// The TTL applied to kademlia records, both the libp2p record TTL and the
     /// local store's `expires` timestamp. Drives eviction of records that are
     /// never refreshed. Also used for provider record TTL.
     pub kad_record_ttl: Duration,
-    /// How often this node republishes its own kademlia records.
+    /// How often the dedicated network timer re-signs and publishes this node's own record.
     ///
     /// Must be nonzero to give republication a positive cadence. Must also be <
     /// `kad_record_ttl`, otherwise records expire before they are refreshed.
     pub kad_publication_interval: Duration,
-    /// How often this node replicates every stored record (its own and others') to the
-    /// `replication_factor` closest peers.
+    /// Legacy replication cadence retained for serialized configuration compatibility.
     ///
-    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
-    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
-    /// so the value is a deliberate choice rather than an inherited libp2p default; the
-    /// default matches the libp2p default (1h).
-    ///
-    /// Exactly zero panics libp2p's replication job on the first swarm poll. Must also be <
-    /// `kad_record_ttl`, otherwise other publishers' records expire before they are re-replicated.
+    /// Library publication and replication jobs are disabled because they periodically
+    /// replicate retained third-party records. Own records use `kad_publication_interval`.
+    /// The existing nonzero and TTL validation remains for configuration compatibility.
     pub kad_replication_interval: Duration,
     /// The chain id, used to namespace every libp2p wire protocol and gossip
     /// topic so nodes on different chains never negotiate a connection or share
@@ -225,13 +220,11 @@ pub struct LibP2pConfig {
 }
 
 impl LibP2pConfig {
-    /// Reject kad cadences that would panic the network task or break record persistence.
+    /// Validate the signed publication cadence and legacy replication configuration.
     ///
-    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
-    /// equal to the current time, triggering its unconditional assertion on the first swarm
-    /// poll. Publication and replication must also occur before records expire. Validate at
-    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
-    /// configuration error before either critical network task starts.
+    /// Own publication must occur before records expire. Preserve the legacy replication
+    /// constraints while retaining that serialized setting. Validate at startup beside
+    /// [`ScoreConfig::validate`] to report field-named errors before network tasks start.
     pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
             !self.kad_replication_interval.is_zero(),
