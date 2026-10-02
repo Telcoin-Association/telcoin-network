@@ -102,9 +102,11 @@ Fields:
 - `name`: human-readable identifier (e.g. `node-JMQq7ZqVT`)
 - `bls_public_key`: Base58-encoded BLS12-381 public key (96 bytes compressed)
 - `p2p_info.primary`: primary network multiaddr and Ed25519 public key
-- `p2p_info.worker`: worker network multiaddr and Ed25519 public key
+- `p2p_info.workers`: one entry per worker, in worker ID order, each with the worker's network multiaddr, Ed25519 public key, and optional `rpc` endpoint (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint))
 - `execution_address`: EVM address that receives block rewards
 - `proof_of_possession`: BLS signature binding the public key to the execution address
+
+Files written by v0.14.0-adiri and earlier have a single `worker:` map in place of `workers:`. The node and keytool still read that shape, and a keytool command that rewrites the file (`set-rpc`, `generate pop`) saves it as a `workers:` list.
 
 Example:
 
@@ -115,9 +117,11 @@ p2p_info:
   primary:
     network_address: "/ip4/34.31.250.229/udp/49590/quic-v1/p2p/12D3KooW..."
     network_key: "4XTTM1f3EZanf..."
-  worker:
-    network_address: "/ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooW..."
-    network_key: "4XTTMD3rST8E7..."
+    rpc: ~
+  workers:
+    - network_address: "/ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooW..."
+      network_key: "4XTTMD3rST8E7..."
+      rpc: ~ # set with --rpc-http at generation or with keytool set-rpc
 execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
 proof_of_possession: "kFa9r..."
 ```
@@ -145,7 +149,7 @@ telcoin-network keytool export-staking-args \
 
 ### Advertising a JSON-RPC endpoint
 
-A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.worker.rpc` and advertised by the worker network when the node runs.
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.workers[0].rpc` (worker 0's entry) and advertised by the worker network when the node runs.
 
 `keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
 
