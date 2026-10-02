@@ -975,7 +975,7 @@ where
         )
         .await;
 
-        // Bind worker 0's RPC before either startup synchronization or epoch peer waits. Its
+        // Bind worker 0's RPC before startup synchronization and epoch network setup. Its
         // network shim reports syncing until the first epoch publishes the node's mode.
         engine
             .initialize_worker_components(

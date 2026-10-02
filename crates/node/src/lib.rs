@@ -23,6 +23,7 @@ mod error;
 mod health;
 mod manager;
 mod metrics;
+mod network_dial;
 mod network_readiness;
 pub mod primary;
 pub mod worker;

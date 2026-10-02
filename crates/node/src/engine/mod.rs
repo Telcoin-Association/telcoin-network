@@ -51,8 +51,9 @@ pub struct TnBuilder {
     /// service starts.
     ///
     /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
-    /// var.
+    /// liveness route responds unconditionally; `/health/workers` reports transaction acceptance
+    /// and `/health/network` reports cached swarm reachability and established-peer counts,
+    /// returning 503 while not-ready. This reads from the `HEALTHCHECK_TCP_PORT` env var.
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,

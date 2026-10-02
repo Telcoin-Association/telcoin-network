@@ -26,7 +26,7 @@ use super::{read_num_workers_at_epoch_entry, run_epoch::retry_provider_faults};
 use crate::{
     engine::{ExecutionNode, WorkerState},
     manager::EpochManager,
-    network_readiness::{probe, NETWORK_COMMAND_TIMEOUT},
+    network_dial::{retry_peer_dial, DialOutcome},
     primary::PrimaryNode,
     worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -494,8 +494,8 @@ where
     /// Construct every worker in the committee's on-chain worker range.
     ///
     /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
-    /// engine's contiguous worker indexing, then bring up the epoch networks concurrently so peer
-    /// waits overlap. Extra configured swarms stay idle until a future epoch activates their ids.
+    /// engine's contiguous worker indexing, then bring up the epoch networks concurrently.
+    /// Extra configured swarms stay idle until a future epoch activates their ids.
     /// Workers removed from the committee stop their RPC listeners before the new epoch's workers
     /// start.
     #[allow(clippy::too_many_arguments)]
@@ -823,55 +823,50 @@ where
 
     /// Spawn a long-running task that dials a peer by [`BlsPublicKey`], retrying with backoff.
     ///
-    /// Dialing self is skipped. The task runs on the node-lifetime spawner (not the epoch
-    /// spawner) so a slow-to-reach peer keeps being retried across epochs. Backoff doubles up to
-    /// 120s; an already-connected or already-dialing error is treated as success. Dial commands
-    /// and established-peer probes each have a one-second bound, including channel admission.
+    /// Dialing self is skipped. Startup callers use the node-lifetime spawner, so their retries
+    /// survive epoch turnover; per-epoch callers use the epoch spawner and are cancelled at its
+    /// boundary. Backoff doubles up to 120s. Only a successful dial or an already-connected peer
+    /// ends retries immediately; an in-flight dial may still fail and must keep being retried.
+    /// Dial outcome waits and established-peer probes each have a one-second bound, including
+    /// channel admission. A timed-out outcome wait does not cancel the swarm's transport dial.
     /// The task only gives up once it has retried enough and another peer is established.
     /// It will not abandon dialing while isolated, and task-manager shutdown cancels retries.
     pub(super) fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
         bls_pubkey: BlsPublicKey,
-        node_task_spawner: TaskSpawner,
+        task_spawner: TaskSpawner,
     ) {
         if bls_pubkey == self.key_config.public_key() {
             // Don't try to dial ourselves.
             return;
         }
-        // spawn dials on long-running task manager
+        // The caller selects node-lifetime or epoch-lifetime reconnect work.
         let task_name = format!("DialPeer {bls_pubkey}");
-        node_task_spawner.spawn_task(task_name, async move {
+        task_spawner.spawn_task(task_name, async move {
             debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
-            futures::stream::unfold((1_u64, 0_u32), move |(backoff, retries)| {
-                let handle = handle.clone();
-                async move {
-                    let outcome = tokio::time::timeout(
-                        NETWORK_COMMAND_TIMEOUT,
-                        handle.dial_by_bls(bls_pubkey),
-                    )
-                    .await
-                    .unwrap_or(Err(NetworkError::Timeout));
-                    let complete = outcome.is_ok()
-                        || outcome.as_ref().is_err_and(|error| {
-                            matches!(error, NetworkError::AlreadyConnected(_) | NetworkError::AlreadyDialing(_))
-                        });
-                    if complete {
-                        None
-                    } else {
-                        warn!(target: "epoch-manager", ?outcome, "failed to dial {bls_pubkey}");
-                        tokio::time::sleep(Duration::from_secs(backoff)).await;
-                        let reachable = probe(handle.established_peer_count()).await.is_reachable();
-                        if retries >= 10 && reachable {
-                            warn!(target: "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
-                            None
-                        } else {
-                            Some(((), ((backoff * 2).min(120), retries.saturating_add(1))))
-                        }
+            retry_peer_dial(
+                bls_pubkey,
+                || {
+                    let handle = handle.clone();
+                    async move {
+                        handle.dial_by_bls(bls_pubkey).await.map_or_else(
+                            |error| {
+                                if matches!(error, NetworkError::AlreadyConnected(_)) {
+                                    DialOutcome::Connected
+                                } else if matches!(error, NetworkError::AlreadyDialing(_)) {
+                                    DialOutcome::Pending
+                                } else {
+                                    warn!(target: "epoch-manager", %error, "failed to dial {bls_pubkey}");
+                                    DialOutcome::Failed
+                                }
+                            },
+                            |()| DialOutcome::Connected,
+                        )
                     }
-                }
-            })
-            .for_each(|()| std::future::ready(()))
+                },
+                || handle.established_peer_count(),
+            )
             .await;
             Ok(())
         });

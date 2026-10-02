@@ -9,7 +9,7 @@
 //! - `GET /health/workers` -> readiness: a `200 OK` carrying a JSON envelope that reports, per
 //!   worker, whether the worker is accepting transactions.
 //!
-//! The readiness route is the contract a stateless worker gateway polls to
+//! The `/health/workers` readiness route is the contract a stateless worker gateway polls to
 //! decide whether to forward RPC traffic to this node (see issue #712). The
 //! endpoint always answers `200`; the JSON body is the machine-readable signal,
 //! so the gateway (not the node) is responsible for translating "not accepting"
@@ -54,8 +54,8 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// timeout the worker is reported not-ready (fail-closed).
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Fixed liveness response: the process is up. Returned for every path other
-/// than the readiness route (and for empty or malformed requests).
+/// Fixed liveness response: the process is up. Returned for paths other than
+/// `/health/workers` and `/health/network` (and for empty or malformed requests).
 const LIVENESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
 
 /// Fallback body used only if the readiness payload (impossibly) fails to
@@ -108,14 +108,16 @@ fn readiness_json(accepting_transactions: bool) -> String {
 
 /// Minimal HTTP health/readiness responder for service monitoring.
 ///
-/// Binds to a TCP port and serves the liveness and `/health/workers` readiness
-/// routes. Uses raw TCP sockets for minimal overhead and dependencies.
+/// Binds to a TCP port and serves liveness, `/health/workers` transaction readiness,
+/// and `/health/network` cached swarm reachability. Uses raw TCP sockets for minimal
+/// overhead and dependencies.
 ///
 /// # Security Considerations
 ///
 /// This endpoint accepts connections from any source. Liveness responds
-/// unconditionally; readiness reports only worker-id and an accepting flag (no
-/// sensitive internals).
+/// unconditionally. Worker readiness reports worker id and transaction acceptance;
+/// network readiness exposes aggregate reachability, configured worker ids, each swarm's
+/// probe status and established-peer count. Neither route certifies consensus or sync readiness.
 ///
 /// Node operators must ensure the endpoint is protected by a firewall.
 /// This service is off by default, but can be enabled through the CLI node
@@ -186,7 +188,8 @@ impl HealthcheckServer {
 /// Drive the accept loop over a stream of accepted connections.
 ///
 /// Serves each connection synchronously (bounded per-connection read timeout),
-/// routing the workers path to readiness and everything else to liveness.
+/// routing `/health/workers` to transaction readiness, `/health/network` to cached
+/// swarm reachability, and other paths to liveness.
 ///
 /// A transient `accept()` error (fd exhaustion `EMFILE`/`ENFILE`,
 /// `ECONNABORTED`, `EINTR`, `ENOBUFS`) is logged and skipped: the loop must
@@ -221,8 +224,8 @@ async fn serve<S, F, Fut>(
                     .and_then(Result::ok)
                     .unwrap_or(0);
 
-                // route on the request-line path; readiness for the workers
-                // path, liveness for everything else (preserves prior behavior)
+                // Route workers to transaction readiness, network to cached reachability,
+                // and other request-line paths to liveness.
                 let path = buf.get(..n).and_then(request_path);
                 if path.is_some_and(|path| path == WORKERS_PATH) {
                     // bound the readiness probe too: if it cannot resolve
