@@ -147,6 +147,7 @@ reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -205,6 +206,7 @@ tn-test-utils-committee = { path = "./crates/test-utils-committee" }
 
 # misc
 match_opt = "0.1.2"
+memmap2 = "0.9"
 serde = { version = "^1.0", features = ["derive", "rc"] }
 serde_repr = "0.1"
 rand = "0.9"

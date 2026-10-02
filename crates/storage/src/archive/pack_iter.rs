@@ -13,13 +13,18 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
-    pack::{DataHeader, PackCompression},
+    pack::{DataHeader, PackCompression, DATA_HEADER_BYTES},
 };
 
 /// Provide an upper bound on a record size.
 /// This should be large enough for any record but provide
 /// an upper bound on memory allocations for a record.
-pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
+pub const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
+
+/// A zstd failure on a CRC-valid record is a fault in the record's bytes, not in reading them.
+fn zstd_decode_error(e: io::Error) -> FetchError {
+    FetchError::DeserializeValue(format!("zstd: {e}"))
+}
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
@@ -35,6 +40,14 @@ where
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
     version: u16,
+    /// Logical data length: the sequential scan stops here rather than at physical EOF. The mmap
+    /// backend pads the physical file past the data, and a `try_clone`d handle can see that
+    /// padding re-grow under a concurrent append, so reading to EOF would decode trailing
+    /// zeros as a (CRC-failing) record. `end` is the exact byte length of the header + all
+    /// complete records.
+    end: u64,
+    /// Absolute file offset of the next record to read, tracked so the scan can stop at `end`.
+    pos: u64,
 }
 
 impl<V, R> PackIter<V, R>
@@ -45,7 +58,10 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    ///
+    /// `end` is the logical data length (header + all complete records); the scan stops there
+    /// instead of at physical EOF so mmap capacity padding is never decoded as a record.
+    pub fn open(mut reader: R, uid_idx: u64, end: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
@@ -58,6 +74,10 @@ where
             decompress_buffer: Vec::new(),
             compression: header.compression(),
             version: header.version(),
+            end,
+            // `load_header` consumed exactly the fixed-size header, so the first record starts
+            // here.
+            pos: DATA_HEADER_BYTES as u64,
         })
     }
 
@@ -66,25 +86,41 @@ where
         self.version
     }
 
-    /// Return the current position of the data file.
-    pub fn position(&mut self) -> io::Result<u64> {
-        self.reader.stream_position()
+    /// Byte offset just past the last record `next()` returned (the header + all whole record
+    /// frames consumed so far). After a successful `next()` this is a record boundary — the
+    /// safe point to truncate a torn log back to. It is NOT a valid boundary after `next()`
+    /// returns an `Err`: `pos` advances by the frame's claimed length before the CRC/decode is
+    /// checked, so on a decode failure it can sit past an incomplete (or, on a corrupt size
+    /// prefix, out-of-range) frame. Recovery callers capture it *before* each `next()` and
+    /// never read it after an `Err`.
+    pub fn logical_position(&self) -> u64 {
+        self.pos
     }
 
     /// Sets the current position of the data file.
     pub fn set_position(&mut self, position: u64) -> io::Result<()> {
         self.reader.seek(io::SeekFrom::Start(position))?;
+        self.pos = position;
         Ok(())
     }
 
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
+    ///
+    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
+    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
         decompress_buffer: &mut Vec<u8>,
         compression: PackCompression,
+        end: u64,
+        pos: &mut u64,
     ) -> Result<V, FetchError> {
+        // At (or past) the logical data end: stop cleanly rather than decode trailing padding.
+        if *pos >= end {
+            return Err(FetchError::NotFound);
+        }
         let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
@@ -101,12 +137,32 @@ where
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
         }
+        // On-disk frame: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors the
+        // offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above plus
+        // real mmap file-size limits already make an overflow impossible, so this only formalizes
+        // it.
+        let frame_end = pos.checked_add(4 + val_size as u64 + 4).ok_or_else(|| {
+            FetchError::IO(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack record position overflow",
+            ))
+        })?;
+        // The whole frame must end within the logical data. A frame that straddles `end` would
+        // read its tail from bytes past the data (capacity padding, or bytes appended after the
+        // iterator was opened), so it is a torn frame here, not a record.
+        if frame_end > end {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "record frame extends past the logical data end",
+            )));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
+        *pos = frame_end;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
@@ -114,12 +170,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
+                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
+                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
+                // importer treats `IO` as a transport failure that says nothing about the bytes).
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
+                decoder.window_log_max(24).map_err(zstd_decode_error)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
+                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
@@ -142,6 +202,8 @@ where
             &mut self.buffer,
             &mut self.decompress_buffer,
             self.compression,
+            self.end,
+            &mut self.pos,
         ) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
@@ -154,6 +216,13 @@ where
 
 /// Async Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
+///
+/// Unlike [`PackIter`], this has **no logical-end bound** — it reads to reader EOF and stops only
+/// when the next record's size prefix hits EOF. Callers must therefore feed it exactly the logical
+/// bytes: a sealed file, or a framed/length-bounded network stream (state-sync bounds its copy to
+/// `data_file_len()`). It must **not** be handed a live, capacity-padded mmap data file: the
+/// trailing zero padding would decode as a 0-size record and surface a recoverable padded tail as a
+/// `CrcFailed` error instead of a clean end.
 #[derive(Debug)]
 pub struct AsyncPackIter<V, R>
 where
@@ -176,13 +245,22 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    pub async fn open(
+        mut reader: R,
+        uid_idx: u64,
+        max_version: u16,
+    ) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
-        // so the (peer-facing) async path rejects future/foreign formats instead of parsing
-        // them with current-format logic.
+        // This is a peer-facing parser: reject a foreign `appnum`, and reject a pack-format version
+        // newer than the caller understands, UP FRONT — so no caller can forget to bound the
+        // version and end up parsing an unknown future format with current-format logic.
+        // `max_version` is the caller's supported ceiling (e.g. `PACK_VERSION`); pass
+        // `u16::MAX` to accept any version.
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
+        }
+        if header.version() > max_version {
+            return Err(LoadHeaderError::InvalidVersion);
         }
         Ok(AsyncPackIter {
             _val: PhantomData,
@@ -256,12 +334,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
-                decoder.window_log_max(24)?;
+                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
+                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
+                // importer treats `IO` as a transport failure that says nothing about the bytes).
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
+                decoder.window_log_max(24).map_err(zstd_decode_error)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer)?;
+                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
