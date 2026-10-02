@@ -18,6 +18,27 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 
 
+def runner_resources(name):
+    """Declare disjoint CPU sets and memory budgets before measuring either phase."""
+    if name == "github-actions":
+        return {"hub_cpus": 1, "hub_memory": 3 * 1024**3, "coordinator_cpus": "2-3",
+                "coordinator_cpu_count": 2, "coordinator_memory": 8 * 1024**3,
+                "minimum_cpus": 4, "minimum_memory": 14 * 1024**3,
+                "max_cpu_cores": 0.75, "max_rss_bytes": 2 * 1024**3}
+    if name == "workstation":
+        return {"hub_cpus": 4, "hub_memory": 8 * 1024**3, "coordinator_cpus": "8-11",
+                "coordinator_cpu_count": 4, "coordinator_memory": 8 * 1024**3,
+                "minimum_cpus": 12, "minimum_memory": 24 * 1024**3,
+                "max_cpu_cores": 3, "max_rss_bytes": 4 * 1024**3}
+    raise ValueError("unknown runner envelope")
+
+
+def hub_cpu_set(resources, index):
+    """Use the same disjoint affinity in Docker and the process binding attestation."""
+    count = resources["hub_cpus"]
+    return list(range(index * count, (index + 1) * count))
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with path.open("rb") as stream:
@@ -33,10 +54,11 @@ def write_json(path, value):
 
 
 class Docker:
-    def __init__(self, output, binaries, image):
+    def __init__(self, output, binaries, image, resources=None):
         self.output = output
         self.binaries = binaries
         self.image = image
+        self.resources = resources or runner_resources("workstation")
         self.names = []
         self.network = None
         self.commands = []
@@ -55,9 +77,12 @@ class Docker:
         return result.stdout.strip()
 
     def container(self, name, ip, cpus, anchor=None, coordinator=False):
+        kind = "coordinator" if coordinator else "hub"
+        cpu_count = self.resources["coordinator_cpu_count" if coordinator else "hub_cpus"]
+        memory = str(self.resources[kind + "_memory"])
         arguments = ["run", "-d", "--name", name, "--label", "tn.capacity.issue=1476",
                      "--network", self.network, "--ip", ip, "--cpuset-cpus", cpus,
-                     "--cpus", "4", "--memory", "8g", "--memory-swap", "8g",
+                     "--cpus", str(cpu_count), "--memory", memory, "--memory-swap", memory,
                      "--cap-add", "NET_ADMIN", "--hostname", name,
                      "--mount", f"type=bind,source={self.output},target=/qualification",
                      "--mount", f"type=bind,source={self.output / 'source'},target=/tools,readonly",
@@ -65,7 +90,9 @@ class Docker:
         if anchor:
             arguments += ["--pid", f"container:{anchor}"]
         if coordinator:
-            arguments += ["--cap-add", "SYS_ADMIN", "--sysctl", "net.ipv4.ip_forward=1"]
+            # Creating network namespaces requires mount permission in this isolated coordinator.
+            arguments += ["--cap-add", "SYS_ADMIN", "--security-opt", "apparmor=unconfined",
+                          "--sysctl", "net.ipv4.ip_forward=1"]
         identifier = self.run(*arguments, self.image, "sleep", "infinity")
         self.names.append(identifier)
         return identifier
@@ -230,6 +257,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
         wait_file(phase_dir / "supervisor.pid", processes)
         stops.append((coordinator, f"{container_dir}/supervisor.pid", "/tools/supervise.py"))
         wait_file(phase_dir / "peers-ready.json", processes, timeout=180)
+        print(f"{phase}: peer readiness reports retained; seeding the local chain", flush=True)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "initial",
                        "--fixture", "/qualification/transactions.json", "--output", f"{container_dir}/initial-transactions.jsonl")
         arguments = ["python3", "-B", "-I", "/tools/observations.py", "--pid-file", f"{container_dir}/observations.pid"]
@@ -241,6 +269,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
         wait_file(phase_dir / "observations.pid", processes)
         stops.append((coordinator, f"{container_dir}/observations.pid", "/tools/observations.py"))
         warmup(docker, coordinator, processes)
+        print(f"{phase}: warmup completed; binding canonical batch targets", flush=True)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "targets",
                        "--output", f"{container_dir}/bulk-targets.json", "--observations", f"{container_dir}/canonical-batch-observations.json")
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/netns.py", "snapshot",
@@ -266,7 +295,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             command = json.loads((phase_dir / f"{node['name']}-command.json").read_text())
             bindings["hubs"][plan["hubs"][index]] = {
                 "pid": int((phase_dir / f"{node['name']}.pid").read_text()), "revision": revision,
-                "argv": command["argv"], "cpu_affinity": list(range(index * 4, index * 4 + 4)),
+                "argv": command["argv"], "cpu_affinity": hub_cpu_set(docker.resources, index),
                 "profile_path": f"{container_dir}/{node['name']}/network-config",
                 "metrics_url": f"http://{node['ip']}:9000", "progress": {"name": "tn_engine_canonical_height"}}
         write_json(phase_dir / "bindings.json", bindings)
@@ -275,6 +304,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             "--output", f"{container_dir}/stream-transactions.jsonl", "--pid-file", f"{container_dir}/transactions.pid"))
         wait_file(phase_dir / "transactions.pid", processes)
         stops.append((coordinator, f"{container_dir}/transactions.pid", "/tools/traffic.py"))
+        print(f"{phase}: starting the frozen 600-second concurrent measurement", flush=True)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/collect.py", "/qualification/plan.json",
                        f"{container_dir}/bindings.json", "--phase", phase, "--output", f"/qualification/{phase}-evidence")
         if any(process.poll() not in (None, 0) for process in processes):
@@ -309,11 +339,12 @@ def execute_qualification(args):
     revision, hashes = stage_binaries(args.binaries, output / "bin")
     provenance = verify_source_provenance(revision)
     write_json(output / "source-provenance.json", provenance)
-    docker = Docker(output, output / "bin", args.image)
+    resources = runner_resources(args.runner_envelope)
+    docker = Docker(output, output / "bin", args.image, resources)
     try:
         information = json.loads(docker.run("info", "--format", "{{json .}}"))
-        if information["NCPU"] < 12 or information["MemTotal"] < 20 * 1024**3:
-            raise ValueError("qualification requires at least 12 Linux CPUs and 20 GiB memory")
+        if information["NCPU"] < resources["minimum_cpus"] or information["MemTotal"] < resources["minimum_memory"]:
+            raise ValueError("Docker host is smaller than the declared runner envelope")
         image = json.loads(docker.run("image", "inspect", args.image))[0]
         if image["Architecture"] != "arm64":
             raise ValueError("qualification CI binaries require an arm64 Linux runtime")
@@ -323,8 +354,9 @@ def execute_qualification(args):
         docker.run("network", "create", "--internal", "--subnet", "10.147.0.0/16", "--gateway", "10.147.0.254",
                    "--label", "tn.capacity.issue=1476", network)
         docker.network = network
-        coordinator = docker.container(network + "-coordinator", "10.147.0.20", "8-11", coordinator=True)
-        hubs = [docker.container(network + f"-hub-{index}", f"10.147.0.{10 + index}", f"{index * 4}-{index * 4 + 3}", anchor=coordinator)
+        coordinator = docker.container(network + "-coordinator", "10.147.0.20", resources["coordinator_cpus"], coordinator=True)
+        hubs = [docker.container(network + f"-hub-{index}", f"10.147.0.{10 + index}",
+                    ",".join(map(str, hub_cpu_set(resources, index))), anchor=coordinator)
                 for index in range(2)]
         for hub in hubs:
             for subnet in (1, 3, 4):
@@ -355,13 +387,18 @@ def execute_qualification(args):
                 "qualification_revision": provenance["qualification_revision"],
                 "build_command": "cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api; cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer",
                 "profile": json.loads((output / f"deployment/baseline/{phase}-profile.json").read_text())})
-        plan["envelope"]["hardware"] = f"Docker Linux arm64, {information['NCPU']} CPUs, {information['MemTotal']} bytes RAM; image {docker.image}; hubs on CPUs 0-3 and 4-7, coordinator on 8-11"
+        plan["envelope"].update({"cpus_per_hub": resources["hub_cpus"], "ram_bytes_per_hub": resources["hub_memory"]})
+        plan["thresholds"].update({"max_cpu_cores": resources["max_cpu_cores"], "max_rss_bytes": resources["max_rss_bytes"]})
+        affinity = [hub_cpu_set(resources, index) for index in range(2)]
+        plan["envelope"]["hardware"] = f"Docker Linux arm64, {information['NCPU']} CPUs, {information['MemTotal']} bytes RAM; image {docker.image}; preset {args.runner_envelope}; hub CPUs {affinity}; coordinator CPUs {resources['coordinator_cpus']}"
         plan["envelope"]["network_setup"] = "docker-run.py and netns.py at the recorded source revision; isolated internal bridge; 25 Mbit/s and 25 ms netem per participant egress, 0.1 percent loss; sixteen namespace peers share kernel SNAT at 10.147.0.20"
         plan["adapter_command"] = shlex.join(["python3", "-B", "-I", "/tools/workload.py", "/qualification/plan.json",
                                              "/qualification/manifest.json", "--manifest-sha256", digest(output / "manifest.json")])
         write_json(output / "declaration.json", plan)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/qualify.py", "freeze", "/qualification/declaration.json", "--output", "/qualification/plan.json")
+        print(f"Frozen {args.runner_envelope} envelope and workload at {provenance['qualification_revision']}", flush=True)
         for phase in ("baseline", "candidate"):
+            print(f"{phase}: starting the declared topology", flush=True)
             if phase == "candidate":
                 docker.execute(coordinator, "python3", "-B", "-I", "/tools/prepare.py", "phase", "/qualification/deployment", phase,
                                "/binaries/telcoin-network", "/tools/profile-v1.json")
@@ -378,6 +415,7 @@ def main():
     parser.add_argument("--binaries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--image", default="tn-capacity-1476-runtime:ubuntu24")
+    parser.add_argument("--runner-envelope", choices=("workstation", "github-actions"), default="workstation")
     args = parser.parse_args()
     execute_qualification(args)
 

@@ -61,8 +61,9 @@ poll and releases its measurement on completion, failure, or cancellation.
 
 ## Predeclared qualification
 
-The template declares two hubs, each with four assigned CPUs, 8 GiB RAM, a
-25 Mbit/s link, 50 ms RTT and 0.1% loss. It uses 64 ordinary public peers,
+The GitHub Actions envelope declares two hubs, each with one assigned CPU and
+3 GiB RAM. The workstation template uses four CPUs and 8 GiB per hub. Both use a
+25 Mbit/s link, 50 ms RTT and 0.1% loss, with 64 ordinary public peers,
 including sixteen behind one kernel NAT, eight DAO observers, four active
 validators and two workers per hub. The profile reserves twelve committee
 identities across previous, current and next committees. Four active validators
@@ -82,8 +83,9 @@ observations retain failures and cancellations. Completed requests determine
 success and latency; cancellations must remain at or below 35%, reflecting the
 certifier's cancellation of obsolete proposals and requests after quorum.
 
-Whole-process RSS must stay at or below 4 GiB, CPU at or below three cores per
-sample interval, queue occupancy at or below 100, and DAO connectivity at eight
+For GitHub Actions, whole-process RSS must stay at or below 2 GiB and CPU at or
+below 0.75 cores per sample interval. The workstation limits are 4 GiB and three
+cores. Both require queue occupancy at or below 100 and DAO connectivity at eight
 on the primary and each worker throughout measurement. Executed-chain progress
 must never regress or stall for more than fifteen seconds.
 
@@ -96,8 +98,11 @@ baseline uses default network limits with the same bootstrap peers and DAO
 identities. The candidate uses `profile-v1.json`. Each phase starts with fresh
 databases and waits ninety seconds before measurement.
 
-The Linux VM needs twelve CPUs and at least 20 GiB RAM. Each hub has a separate
-four-CPU, 8 GiB container; the coordinator hosts the other two validators and
+The `github-actions` preset needs four CPUs and at least 14 GiB RAM. Each hub has
+a separate one-CPU, 3 GiB container. The coordinator has two other CPUs and 8 GiB.
+The default `workstation` preset needs twelve CPUs and at least 24 GiB RAM, with
+four CPUs and 8 GiB for each of the three containers. The coordinator hosts the
+other two validators and
 72 persistent peer processes. Participant namespaces receive 25 Mbit/s,
 25 ms egress delay and 0.1% loss. Sixteen namespace peers share the coordinator's
 SNAT address. The coordinator shares a private PID namespace with the hubs so
@@ -119,6 +124,12 @@ python3 -B -I tools/hub-capacity/docker-run.py \
   --binaries /absolute/path/to/extracted-ci-artifact \
   --output /absolute/path/to/new-qualification-directory
 ```
+
+Use `--runner-envelope github-actions` for the smaller declared envelope.
+The required `hub-capacity-qualification` CI job runs this preset after workspace
+compilation, tests, Clippy and compiling mutations pass. It uses the same commit's
+attested binaries and retains raw evidence and diagnostics for ninety days.
+The artifact excludes generated validator key files and executable copies.
 
 The peer example uses the production libp2p network, deterministic local test
 identities and three persistent swarms. Commands perform authenticated joins,
