@@ -44,6 +44,11 @@ pub enum LoadHeaderError {
     BloomError(BloomError),
     /// Compression setting is not a valid value.
     InvalidCompression,
+    /// The data file has a physical size but is entirely zero: a first write sized the file
+    /// (ftruncate + fsync) but crashed before the header reached disk. It is an unwritten file,
+    /// not corrupt — a writable open reinitializes it; a read-only open surfaces this so the
+    /// operator can remove the pack directory.
+    Unwritten,
 }
 
 impl Error for LoadHeaderError {}
@@ -54,7 +59,7 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidType => write!(f, "invalid type id"),
             Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
-            Self::InvalidVersion => write!(f, "invalid version (should be 0)"),
+            Self::InvalidVersion => write!(f, "unsupported pack file version"),
             Self::InvalidDataUID => write!(f, "invalid data file uid"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
             Self::InvalidIndexVersion => write!(f, "invalid index version"),
@@ -69,6 +74,9 @@ impl fmt::Display for LoadHeaderError {
             Self::ReadOnlyEmpty => write!(f, "attempted to open index read only with no index"),
             Self::BloomError(e) => write!(f, "bloom error: {e}"),
             Self::InvalidCompression => write!(f, "invalid compression value"),
+            Self::Unwritten => {
+                write!(f, "data file is all zeros (sized but never written); remove the pack directory and it will be recreated")
+            }
         }
     }
 }

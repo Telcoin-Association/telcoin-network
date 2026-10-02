@@ -164,9 +164,10 @@ impl<DB: Database> Subscriber<DB> {
         .await?;
 
         // Once we've drained through the staged partial pack's final output, it has all been
-        // written to the main pack in order — drop the staging dir.
+        // written to the main pack in order — drop the staging dir. `clear_staging` is async so the
+        // staging pack's background-thread join does not block this tokio worker.
         if self.inner.consensus_chain.staging_final() == Some(number) {
-            self.inner.consensus_chain.clear_staging();
+            self.inner.consensus_chain.clear_staging().await;
         }
 
         let last_round = consensus_output.leader_round();
