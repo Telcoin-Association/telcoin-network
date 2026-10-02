@@ -37,10 +37,10 @@ members = [
     "crates/batch-validator",
     "crates/execution/tn-rpc",
 ]
-# Vendored copy of libp2p-quic 0.14.0 with QUIC Retry support. It is wired in through
-# `[patch.crates-io]` below and kept out of the workspace so that upstream code is not held to
-# the house lints. See patches/libp2p-quic/PATCH.md.
-exclude = ["patches/libp2p-quic"]
+# Carried libp2p patches are wired in through `[patch.crates-io]` below and kept out of
+# the workspace so that upstream code is not held to the house lints. Each patch has a PATCH.md
+# maintenance record.
+exclude = ["patches/libp2p-quic", "patches/libp2p-connection-limits"]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
@@ -290,3 +290,6 @@ blake3 = { version = "1.8.2" }
 # QUIC listener address validation (Retry) and bounded incoming queues.
 # See patches/libp2p-quic/PATCH.md for the maintenance record.
 libp2p-quic = { path = "patches/libp2p-quic" }
+# Release per-peer connection accounting after the last connection closes.
+# See patches/libp2p-connection-limits/PATCH.md for provenance and retirement criteria.
+libp2p-connection-limits = { path = "patches/libp2p-connection-limits" }
