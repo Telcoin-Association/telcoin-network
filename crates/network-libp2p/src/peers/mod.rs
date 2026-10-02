@@ -5,11 +5,14 @@ mod banned;
 mod behavior;
 mod cache;
 mod manager;
+mod mesh;
 mod peer;
 mod score;
 mod status;
 mod types;
 pub(crate) use manager::{PeerManager, PutRecordRate};
+pub use mesh::ConfiguredPeerKind;
+pub(crate) use mesh::MeshPeerChange;
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 
