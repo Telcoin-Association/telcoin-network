@@ -212,8 +212,11 @@ impl AllPeers {
         (current != confirmed)
             .then(|| self.evict(&current))
             .flatten()
-            .map_or((), |displaced| self.release_displaced_record(&displaced));
-        self.evict(&confirmed).map_or((), |displaced| self.release_displaced_record(&displaced));
+            .into_iter()
+            .for_each(|displaced| self.release_displaced_record(&displaced));
+        self.evict(&confirmed)
+            .into_iter()
+            .for_each(|displaced| self.release_displaced_record(&displaced));
         let mut peer = Peer::new_trusted(bls_public_key, network_key);
         protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
         if peer.reputation().banned() {
@@ -1208,7 +1211,7 @@ impl AllPeers {
 
             // update peer regardless of connection status; validator trust is derived from the
             // committee slots, so we only prime the score (no trust flag is stored)
-            self.peers.get_mut(&identity).map_or((), |peer| {
+            self.peers.get_mut(&identity).into_iter().for_each(|peer| {
                 peer.reset_score_to_max();
                 self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
             });

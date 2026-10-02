@@ -240,18 +240,9 @@ jobs:
         if: steps.scope.outputs.changed == 'true'
         run: cargo +1.94 test --locked --workspace --no-run
 
-      - name: Test capacity integration and cancellation
-        if: steps.scope.outputs.changed == 'true'
-        run: cargo +1.94 nextest run --locked --workspace --exclude tn-faucet
-
-      - name: Check the pinned workspace with Clippy
-        if: steps.scope.outputs.changed == 'true'
-        run: cargo +1.94 clippy --locked --workspace --all-targets -- -D warnings
-
       - name: Build Linux qualification binaries
         if: steps.scope.outputs.changed == 'true'
         run: |
-          python3 -B -I tools/hub-capacity/mutate-rust.py --output target/debug/hub-capacity-mutations
           cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api
           cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer
           git rev-parse HEAD > target/debug/hub-capacity-revision.txt
@@ -270,6 +261,18 @@ jobs:
             target/debug/examples/hub-capacity-peer
             target/debug/hub-capacity-revision.txt
             target/debug/hub-capacity-binaries.sha256
+
+      - name: Test capacity integration and cancellation
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 nextest run --locked --workspace --exclude tn-faucet
+
+      - name: Check the pinned workspace with Clippy
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Confirm compiling Rust mutations
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -B -I tools/hub-capacity/mutate-rust.py --output target/debug/hub-capacity-mutations
 
       - name: Retain mutation diagnostics
         if: always() && steps.scope.outputs.changed == 'true'
