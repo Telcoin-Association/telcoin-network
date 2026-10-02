@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Confirm new load-bearing Rust regressions with compiling, reverted production mutations."""
+"""Confirm new load-bearing Rust regressions with compiling, reverted production mutations.
+
+The required Hub lane compiles and tests the full workspace before this script.
+These cases change expressions without changing public signatures or types.
+Each control, mutant compilation and selected regression uses the source's owning
+package, avoiding a rebuild of unrelated workspace binaries for every expression.
+"""
 
 import argparse
 import hashlib
@@ -7,6 +13,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +60,25 @@ def execute(argv, directory, label):
         "log": path.name, "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def mutation_commands(relative, regression):
+    """Compile the expression's owning crate and run the same mandatory regression."""
+    source = (ROOT / relative).resolve()
+    repository = ROOT.resolve()
+    if not source.is_relative_to(repository):
+        raise ValueError("mutation source must belong to the repository")
+    manifests = [directory / "Cargo.toml" for directory in source.parents
+                 if directory.is_relative_to(repository) and (directory / "Cargo.toml").is_file()]
+    if not manifests:
+        raise ValueError("mutation source must belong to a Cargo package")
+    package = tomllib.loads(manifests[0].read_text()).get("package", {}).get("name")
+    if not package:
+        raise ValueError("mutation source must have an owning Cargo package")
+    compile_argv = ["cargo", "+1.94", "test", "--locked", "-p", package, "--no-run"]
+    test_argv = ["cargo", "+1.94", "nextest", "run", "--locked", "-p", package,
+                 "-E", f"test({regression})", "--no-tests", "fail", "--test-threads", "1"]
+    return package, compile_argv, test_argv
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -66,18 +92,15 @@ def main():
             text = original.decode()
             if text.count(before) != 1:
                 raise ValueError(f"{name}: mutation must select exactly one production expression")
-            selector = f"test({regression})"
-            test_argv = ["cargo", "+1.94", "nextest", "run", "--locked", "--workspace", "--exclude", "tn-faucet",
-                         "-E", selector, "--no-tests", "fail", "--test-threads", "1"]
+            package, compile_argv, test_argv = mutation_commands(relative, regression)
             control_code, _, control = execute(test_argv, args.output, name + "-control")
             if control_code:
                 raise ValueError(f"{name}: original regression must pass")
-            report = {"mutation": name, "path": relative, "regression": regression,
+            report = {"mutation": name, "path": relative, "package": package, "regression": regression,
                       "source_sha256": hashlib.sha256(original).hexdigest(), "control": control}
             try:
                 path.write_text(text.replace(before, after))
-                compiler, _, compilation = execute(
-                    ["cargo", "+1.94", "test", "--locked", "--workspace", "--no-run"], args.output, name + "-compile")
+                compiler, _, compilation = execute(compile_argv, args.output, name + "-compile")
                 report["compilation"] = compilation
                 if compiler:
                     raise ValueError(f"{name}: mutant did not compile, no mutation confirmation")
