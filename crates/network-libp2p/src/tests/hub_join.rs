@@ -228,7 +228,8 @@ async fn qualify_hub_join(network_type: NetworkType, delayed_hub: bool) -> eyre:
     let joining = joining.start().await?;
     if delayed_hub {
         // Dial the actual unavailable endpoint, then observe the entire minimum Grace interval.
-        joining.handle.dial(hub.peer, hub.address.clone()).await?;
+        let unavailable = joining.handle.dial(hub.peer, hub.address.clone()).await;
+        assert!(unavailable.is_err(), "an unavailable hub must fail its transport dial");
         first.handle.find_authorities(vec![joining.bls]).await?;
         joining.handle.find_authorities(current.iter().copied().collect()).await?;
         wait_until(

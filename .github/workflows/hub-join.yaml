@@ -1,0 +1,41 @@
+name: Hub join qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/hub-join.yaml'
+      - 'etc/hub-join-*'
+      - 'crates/network-libp2p/**'
+      - 'crates/e2e-tests/**'
+      - 'crates/node/**'
+      - 'crates/config/**'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: durable-e2e-cache
+          cache-on-failure: 'true'
+      - name: Qualify all swarms and governance activation five times
+        run: bash etc/hub-join-qualification.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hub-join-qualification
+          path: |
+            hub-join-evidence
+            crates/e2e-tests/test_logs/hub_join

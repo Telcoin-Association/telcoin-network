@@ -12,6 +12,7 @@
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
+  * [Validator Joins](network/validator-joins.md)
   * [Peers](network/peers.md)
   * [Request-response](network/request-response.md)
   * [Sync streams](network/sync-streams.md)
