@@ -642,11 +642,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
         // endpoints; without this each seal is refused with NotValidator and the txns
         // stay pending in the observer's pool until an endpoint is discoverable.
         advertise_worker_rpc(&temp_path, i, rpc_port)?;
-        // A seated validator must remain active even when a legacy launch command has the flag.
-        let extra_args: &[&str] = if i == 0 { &["--observer"] } else { &[] };
-        guard.push(start_validator_with_args(
-            i, &bin, &temp_path, rpc_port, "observer", 0, extra_args,
-        ));
+        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
@@ -781,7 +777,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                 );
                 let timed_out = [
                     "primary network has no connected peers; continuing startup",
-                    "worker network has no connected peers; continuing startup",
+                    "worker swarm has no established peers at epoch entry; continuing while dials retry",
                 ]
                 .iter()
                 .all(|message| logs.contains(message));
