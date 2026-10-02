@@ -812,6 +812,43 @@ impl WorkerTxPool {
         self.0.queued_transactions()
     }
 
+    /// Subscribe to admissions in every subpool, including transactions that cannot propagate.
+    ///
+    /// Retired workers subscribe before draining so in-flight admissions also reach an active
+    /// worker. Include private and parked transactions regardless of their propagation policy.
+    pub(crate) fn admitted_transactions(&self) -> impl Stream<Item = ()> + Send + 'static {
+        tokio_stream::wrappers::ReceiverStream::new(
+            self.0
+                .new_transactions_listener_for(reth_transaction_pool::TransactionListenerKind::All),
+        )
+        .map(|_| ())
+    }
+
+    /// Move pending and parked transactions to an active worker under its normal admission rules.
+    ///
+    /// Preserve each transaction's origin. A duplicate already in the destination is complete;
+    /// validation or capacity refusals are logged and discarded. Remove from this pool only after
+    /// the destination has handled the transaction, so cancelling a handoff cannot lose it.
+    /// Callers must stop this worker's producers and keep relaying late admissions until regrowth.
+    pub(crate) async fn migrate_transactions_to(&self, destination: &Self) {
+        stream::iter(self.0.all_transactions())
+            .for_each(|transaction| async move {
+                let hash = *transaction.hash();
+                if destination.get(&hash).is_none() {
+                    let _ = destination
+                        .0
+                        .add_transaction(transaction.origin, transaction.transaction.clone())
+                        .await
+                        .inspect_err(|error| {
+                            warn!(target: "tn::execution", ?hash, ?error,
+                                "active worker refused a retired worker transaction; discarding");
+                        });
+                }
+                self.0.remove_transaction(hash);
+            })
+            .await;
+    }
+
     /// This method is called when a canonical state update is received.
     ///
     /// Collect account changes and mined hashes on the blocking executor, borrowing the tip
@@ -1289,6 +1326,153 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(pool.pool_size().pending, 1);
         assert!(pool.get(&hash).is_some());
+    }
+
+    /// A retired worker hands off pending, base-fee-parked and nonce-queued transactions once.
+    #[tokio::test]
+    async fn retired_pool_migrates_every_subpool_and_deduplicates() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        source.set_epoch_base_fee(100);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        destination.set_epoch_base_fee(150);
+        let pending = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let pending_hash = *pending.hash();
+        source
+            .add_transaction_local(
+                EthPooledTransaction::try_from_consensus(pending)
+                    .map_err(|_| eyre::eyre!("expected an EIP1559 pool transaction"))?,
+            )
+            .await?;
+        let parked = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            50,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let parked_hash = *parked.hash();
+        source.add_recovered_transaction_external(parked).await?;
+        factory.set_nonce(4);
+        let queued = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            200,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let queued_hash = *queued.hash();
+        source.add_recovered_transaction_external(queued.clone()).await?;
+        destination.add_recovered_transaction_external(queued).await?;
+        assert_eq!(source.pool_size().pending, 1);
+        assert_eq!(source.pool_size().basefee, 1);
+        assert_eq!(source.pool_size().queued, 1);
+
+        source.migrate_transactions_to(&destination).await;
+        source.migrate_transactions_to(&destination).await;
+        assert_eq!(source.0.all_transactions().count(), 0);
+        assert_eq!(destination.0.all_transactions().count(), 3);
+        assert!(destination.get(&pending_hash).is_some());
+        assert!(destination.get(&parked_hash).is_some());
+        assert!(destination.get(&queued_hash).is_some());
+        assert_eq!(
+            destination.get(&pending_hash).map(|transaction| transaction.origin),
+            Some(TransactionOrigin::Local)
+        );
+        assert_eq!(destination.pool_size().pending, 1);
+        assert_eq!(destination.pool_size().basefee, 1);
+        assert_eq!(destination.pool_size().queued, 1);
+        assert_eq!(destination.block_info().pending_basefee, 150);
+        Ok(())
+    }
+
+    /// Destination refusal discards the retired copy without replacing an active transaction.
+    #[tokio::test]
+    async fn retired_pool_discards_refused_transactions() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        let retired = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let retired_hash = *retired.hash();
+        source.add_recovered_transaction_external(retired).await?;
+        factory.set_nonce(0);
+        let active = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            14,
+            Some(Address::ZERO),
+            U256::from(200),
+            Bytes::new(),
+        ))?;
+        let active_hash = *active.hash();
+        destination.add_recovered_transaction_external(active).await?;
+
+        source.migrate_transactions_to(&destination).await;
+        assert_eq!(source.0.all_transactions().count(), 0);
+        assert!(destination.get(&retired_hash).is_none());
+        assert!(destination.get(&active_hash).is_some());
+        assert_eq!(destination.0.all_transactions().count(), 1);
+        Ok(())
+    }
+
+    /// Handoff observes non-propagating admissions and preserves their private origin.
+    #[tokio::test]
+    async fn retired_pool_observes_non_propagating_admissions() -> eyre::Result<()> {
+        use futures::StreamExt as _;
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        let mut admissions = pin!(source.admitted_transactions());
+        let recovered = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let hash = *recovered.hash();
+        source
+            .0
+            .add_transaction(
+                TransactionOrigin::Private,
+                EthPooledTransaction::try_from_consensus(recovered)
+                    .map_err(|_| eyre::eyre!("expected an EIP1559 pool transaction"))?,
+            )
+            .await?;
+        assert!(source.get(&hash).is_some_and(|transaction| !transaction.propagate));
+        tokio::time::timeout(Duration::from_secs(5), admissions.next())
+            .await?
+            .ok_or_else(|| eyre::eyre!("all-admissions listener closed"))?;
+        source.migrate_transactions_to(&destination).await;
+        assert!(source.get(&hash).is_none());
+        assert_eq!(
+            destination.get(&hash).map(|transaction| transaction.origin),
+            Some(TransactionOrigin::Private)
+        );
+        Ok(())
     }
 
     /// The DoS fix for issue #1159: the pool refuses EIP-4844 (blob) transactions at
