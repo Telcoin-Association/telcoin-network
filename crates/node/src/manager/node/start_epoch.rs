@@ -1520,7 +1520,13 @@ mod tests {
                         }
                     })
                     .collect::<Vec<_>>();
-            let observed = std::iter::from_fn(|| topic_changes.try_recv().ok()).collect::<Vec<_>>();
+            let mut observed =
+                std::iter::from_fn(|| topic_changes.try_recv().ok()).collect::<Vec<_>>();
+            // Worker peer waits run concurrently, so topic commands can arrive in either order.
+            observed.sort_by_key(|change| match change {
+                BatchTopicChange::Subscribe(worker_id, ..)
+                | BatchTopicChange::Unsubscribe(worker_id, ..) => *worker_id,
+            });
             assert_eq!(observed, expected);
         };
         let key = manager.key_config.public_key();
