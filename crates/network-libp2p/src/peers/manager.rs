@@ -41,6 +41,15 @@ mod admission_tests;
 /// Maximum live identities examined by one admission sweep poll, even if all remain eligible.
 const MAX_ADMISSION_RECONCILIATIONS_PER_POLL: usize = 32;
 
+/// Lifecycle of an authenticated transport identity, independent of replaceable peer records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveAdmissionState {
+    /// At least one established connection remains eligible for reevaluation.
+    Connected,
+    /// A closure was committed; final transport closure owns removal.
+    Closing,
+}
+
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -156,6 +165,9 @@ pub(crate) struct PeerManager {
     /// Live identities awaiting reevaluation, bounded by the established connection budget.
     /// Entries are candidates, not committed disconnects, and carry no stale policy grants.
     admission_reconciliation: VecDeque<PeerId>,
+    /// Actual established identities and pending closures, bounded by the transport budget.
+    /// Record replacement never removes a live identity; the last ConnectionClosed event does.
+    live_admission_peers: HashMap<PeerId, LiveAdmissionState>,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
@@ -358,7 +370,12 @@ impl PeerManager {
         let (status, _) = self.evaluate_admission();
         self.metrics.set_admission(&status);
         self.admission_reconciliation = if status.effective() == AdmissionMode::Closed {
-            self.peers.connected_peer_ids().collect()
+            self.live_admission_peers
+                .iter()
+                .filter_map(|(peer, state)| {
+                    (*state == LiveAdmissionState::Connected).then_some(*peer)
+                })
+                .collect()
         } else {
             VecDeque::new()
         };
@@ -379,8 +396,13 @@ impl PeerManager {
                 let event = (0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL).find_map(|_| {
                     self.admission_reconciliation
                         .pop_front()
-                        .filter(|peer| self.is_connected(peer) && !authorized.contains(peer))
+                        .filter(|peer| {
+                            self.live_admission_peers.get(peer)
+                                == Some(&LiveAdmissionState::Connected)
+                                && !authorized.contains(peer)
+                        })
                         .map(|peer| {
+                            self.live_admission_peers.insert(peer, LiveAdmissionState::Closing);
                             let banned = self.peers.peer_banned(&peer);
                             let action = self.peers.update_connection_status(
                                 &peer,
@@ -439,6 +461,7 @@ impl PeerManager {
             admission_policy: Default::default(),
             admission_operator_peers: Default::default(),
             admission_reconciliation: Default::default(),
+            live_admission_peers: Default::default(),
             config: *config,
             heartbeat,
             peers,
@@ -453,6 +476,12 @@ impl PeerManager {
             add_provider_windows: Default::default(),
             metrics,
         }
+    }
+
+    /// Release a transport identity exactly once after its last connection closes.
+    /// The return value preserves application cleanup even if metadata replaced the old key.
+    pub(super) fn remove_live_admission_peer(&mut self, peer: &PeerId) -> bool {
+        self.live_admission_peers.remove(peer).is_some()
     }
 
     /// Explicitly add a "trusted" peer and dial it.
@@ -690,6 +719,16 @@ impl PeerManager {
     ///
     /// Actions on peers happen when their reputation or connection status changes.
     fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
+        let closing = match &action {
+            PeerAction::Ban(_) | PeerAction::Disconnect | PeerAction::DisconnectWithPX => true,
+            PeerAction::Unban(_) | PeerAction::NoAction => false,
+        };
+        if closing {
+            self.live_admission_peers
+                .get_mut(&peer_id)
+                .into_iter()
+                .for_each(|state| *state = LiveAdmissionState::Closing);
+        }
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
@@ -894,7 +933,11 @@ impl PeerManager {
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
-        if self.peers.peer_banned(peer_id) {
+        let banned = self.peers.peer_banned(peer_id);
+        let state =
+            if banned { LiveAdmissionState::Closing } else { LiveAdmissionState::Connected };
+        self.live_admission_peers.entry(*peer_id).or_insert(state);
+        if banned {
             // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
