@@ -1,7 +1,7 @@
 # Networks and RPC Endpoints
 
 > [!NOTE]
-> The public RPC URLs listed below are rate limited and do not support websocket connections: they are load balanced, and the balancer answers a WebSocket upgrade with HTTP 405. If such functionality is required, please reach out to the team.
+> The public RPC URLs listed below are rate limited and do not support WebSocket connections: a WebSocket upgrade to these URLs gets HTTP 405. If such functionality is required, please reach out to the team.
 
 ## Adiri Testnet
 
