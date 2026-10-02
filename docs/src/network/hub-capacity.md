@@ -6,7 +6,7 @@ network configuration path, preserving the deployment's bootstrap peers and
 hostname. Restart after changing the profile. Inactive configured workers are
 included in its allocation.
 
-No live population run has been recorded for this candidate. Its unit tests and
+This candidate has not passed live qualification. Its unit tests and
 synthetic scoring fixtures do not qualify capacity or complete issue #1476.
 Validator validated-address and handshake qualification retains its Launch scope.
 
@@ -45,6 +45,12 @@ therefore measures the whole process alongside every primary/worker allocation.
 Record retention protects operator and committee records under the existing
 finite record/provider quotas. TTL remains 48 hours, publication 12 hours,
 and replication 1 hour.
+
+Application lookups return the first verified signed record matching the requested
+authority and cancel the remaining DHT traversal. Authority discovery makes that
+binding usable immediately while continuing to collect newer signed records.
+Signature, record-key, chain and swarm-domain validation remain required before
+either path accepts a record.
 
 | Serve class | Whole hub process concurrency |
 | --- | ---: |
@@ -151,6 +157,11 @@ Each transaction carries 32 KiB of deterministic calldata. The signed fixture
 is hashed into the workload manifest before freezing: 128 transactions seed
 the warmup, and 384 are submitted at a fixed cadence during measurement.
 Every RPC acknowledgement and canonical batch-selection observation is retained.
+Offline Keccak transaction hashes are frozen with the signed inputs. A transport
+failure triggers a bounded lookup of that exact hash before resubmitting the same
+payload and nonce, with at most three submission attempts. Failed submissions and
+lookup outcomes remain in the raw log. Protocol rejections remain fatal, and an
+unacknowledged transaction prevents the qualification run from completing.
 
 Bulk commands run in bursts of eight, divided between the two hubs. Each command
 simultaneously transfers a completed primary epoch pack and four executed batches

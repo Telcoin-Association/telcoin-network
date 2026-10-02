@@ -2684,7 +2684,8 @@ where
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.request == key {
+        let matches_requested_key = query.request == key;
+        if matches_requested_key {
             match &mut query.result {
                 None => query.result = Some(new_record),
                 Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
@@ -2700,8 +2701,28 @@ where
             }
         }
 
-        // handle last step
-        if is_last_step {
+        // Application callers can use the first verified matching record. Cancel the
+        // remaining traversal so unrelated cache candidates cannot delay their reply.
+        // Authority discovery still collects records until the final lookup step.
+        let discovered = matches_requested_key
+            .then_some(())
+            .and_then(|_| query.result.as_ref())
+            .map(|record| record.info.clone());
+        let application_ready = query.reply.is_some() && query.result.is_some();
+        discovered.into_iter().for_each(|info| {
+            let peer: PeerId = info.pubkey.clone().into();
+            self.swarm.behaviour_mut().peer_manager.add_discovered_peer(key, info);
+            self.refresh_explicit_peer(&peer);
+        });
+        if is_last_step || application_ready {
+            if application_ready {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .query_mut(query_id)
+                    .into_iter()
+                    .for_each(|mut query| query.finish());
+            }
             self.close_kad_query(query_id);
         }
     }

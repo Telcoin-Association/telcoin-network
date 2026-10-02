@@ -416,6 +416,54 @@ async fn application_record_queries_are_bounded_and_complete(
         .ok_or("application query disappeared")?;
     network.close_kad_query(&id);
     assert_eq!(encode(&complete.try_recv()??), encode(&record));
+
+    let (reply, mut first_record) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    let id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .ok_or("application query was not retained")?;
+    network.process_kad_query_result(&id, key, record.clone(), None, false);
+    let result = first_record.try_recv();
+    assert!(result.is_ok(), "verified application records must reply before the final lookup step");
+    assert_eq!(encode(&result??), encode(&record));
+    assert!(
+        !network.kad_record_queries.contains_key(&id),
+        "completed application lookups must release their query allocation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn authority_record_is_usable_before_lookup_finishes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+    let key = peer2.network.key_config.primary_public_key();
+    let record = peer2.network.node_record.clone();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [key].into_iter().collect(),
+        Default::default(),
+    );
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(key).is_none());
+    let id = network.swarm.behaviour_mut().kademlia.get_record(crate::kad::node_record_key(&key));
+    network
+        .kad_record_queries
+        .insert(id, crate::consensus::KadQuery { request: key, result: None, reply: None });
+    network.process_kad_query_result(&id, key, record.clone(), None, false);
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(key).is_some(),
+        "verified authority bindings must be usable before the final lookup step"
+    );
+    assert!(
+        network.kad_record_queries.contains_key(&id),
+        "authority discovery must continue collecting newer signed records"
+    );
+    network.close_kad_query(&id);
     Ok(())
 }
 

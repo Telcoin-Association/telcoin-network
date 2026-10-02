@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 
@@ -18,6 +19,8 @@ CHAIN = 4476
 ADDRESS = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 # Public Anvil test key, funded only by the isolated chain-4476 genesis.
 KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+SUBMISSION_ATTEMPTS = 3
+SUBMISSION_RETRY_SECONDS = 0.1
 
 
 def rpc(url, method, parameters):
@@ -34,6 +37,38 @@ def rpc(url, method, parameters):
     return result["result"]
 
 
+def submit(url, raw, expected_hash, attempts):
+    """Retry uncertain transport delivery of the same signed transaction, retaining every attempt."""
+    for number in range(1, SUBMISSION_ATTEMPTS + 1):
+        try:
+            result = rpc(url, "eth_sendRawTransaction", [raw])
+            if result != expected_hash:
+                raise ValueError("transaction RPC did not acknowledge the exact signed transaction")
+        except (OSError, ValueError) as error:
+            attempts.append({"attempt": number, "success": False, "error": type(error).__name__})
+            transport = isinstance(error, (ConnectionError, TimeoutError)) or (
+                isinstance(error, urllib.error.URLError)
+                and isinstance(error.reason, (ConnectionError, TimeoutError)))
+            if not transport:
+                raise
+            probe = {"attempt": number, "method": "eth_getTransactionByHash", "success": False}
+            try:
+                known = rpc(url, "eth_getTransactionByHash", [expected_hash])
+                probe["transaction_hash"] = known.get("hash") if isinstance(known, dict) else None
+                probe["success"] = probe["transaction_hash"] == expected_hash
+            except (OSError, ValueError) as probe_error:
+                probe["error"] = type(probe_error).__name__
+            attempts.append(probe)
+            if probe["success"]:
+                return expected_hash
+            if number == SUBMISSION_ATTEMPTS:
+                raise
+            time.sleep(SUBMISSION_RETRY_SECONDS)
+        else:
+            attempts.append({"attempt": number, "success": True})
+            return result
+
+
 def create(cast, output):
     """Sign all declared inputs offline before freezing the run, without contacting any RPC."""
     def sign(nonce):
@@ -44,14 +79,22 @@ def create(cast, output):
         raw = subprocess.run(argv, check=True, capture_output=True, timeout=10).stdout.decode().strip()
         if not raw.startswith("0x") or len(raw) > 68000:
             raise ValueError("offline transaction exceeds its 34 KiB wire bound")
-        return raw
+        transaction_hash = subprocess.run([cast, "keccak", raw], check=True,
+            capture_output=True, timeout=10).stdout.decode().strip()
+        if not transaction_hash.startswith("0x") or len(transaction_hash) != 66:
+            raise ValueError("offline transaction hash is not a Keccak-256 digest")
+        return raw, transaction_hash
     version = subprocess.run([cast, "--version"], check=True, capture_output=True, timeout=10).stdout.decode().strip()
     with ThreadPoolExecutor(max_workers=8) as pool:
-        transactions = list(pool.map(sign, range(512)))
+        signed = list(pool.map(sign, range(512)))
+    transactions, transaction_hashes = map(list, zip(*signed))
     output.write_text(json.dumps({"chain_id": CHAIN, "sender": ADDRESS, "cast_version": version,
         "count": 512, "calldata_bytes": 32768, "initial_count": 128, "stream_count": 384,
-        "stream_duration_seconds": 600, "initial_interval_seconds": 0.05,
+        "stream_duration_seconds": 600, "initial_interval_seconds": 0.5,
+        "submission_attempts": SUBMISSION_ATTEMPTS,
+        "submission_retry_seconds": SUBMISSION_RETRY_SECONDS,
         "batch_selection": "first completed epoch with four distinct executed nonempty batches",
+        "transaction_hashes": transaction_hashes,
         "transactions": transactions}, separators=(",", ":")) + "\n")
 
 
@@ -78,7 +121,8 @@ def feed(fixture, url, output, stream, pid_file):
     if fixture.stat().st_size > 40 * 1024**2:
         raise ValueError("signed transaction fixture exceeds 40 MiB")
     inputs = json.loads(fixture.read_text())
-    if inputs["chain_id"] != CHAIN or inputs["count"] != 512 or len(inputs["transactions"]) != 512:
+    if inputs["chain_id"] != CHAIN or inputs["count"] != 512 or len(inputs["transactions"]) != 512 \
+            or len(inputs["transaction_hashes"]) != 512:
         raise ValueError("transaction fixture does not match the declared workload")
     start, end, interval = (128, 512, 600 / 384) if stream else (0, 128, 0.5)
     if pid_file:
@@ -88,10 +132,15 @@ def feed(fixture, url, output, stream, pid_file):
         for nonce in range(start, end):
             time.sleep(max(0, origin + (nonce - start) * interval - time.monotonic()))
             raw = inputs["transactions"][nonce]
-            result = rpc(url, "eth_sendRawTransaction", [raw])
-            log.write(json.dumps({"nonce": nonce, "unix_us": time.time_ns() // 1000,
-                "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(), "transaction_hash": result}) + "\n")
-            log.flush()
+            row = {"nonce": nonce, "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                   "success": False, "attempts": []}
+            try:
+                row["transaction_hash"] = submit(url, raw, inputs["transaction_hashes"][nonce], row["attempts"])
+                row["success"] = True
+            finally:
+                row["unix_us"] = time.time_ns() // 1000
+                log.write(json.dumps(row) + "\n")
+                log.flush()
 
 
 def targets(url, output, observations):

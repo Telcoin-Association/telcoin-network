@@ -288,7 +288,14 @@ impl Peer {
             } else if require_existing {
                 Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
             }
-            handle.dial_by_bls(key).await?;
+            handle.dial_by_bls(key).await.or_else(|error| {
+                matches!(
+                    &error,
+                    NetworkError::AlreadyDialing(_) | NetworkError::AlreadyConnected(_)
+                )
+                .then_some(())
+                .ok_or(error)
+            })?;
             connected(&handle, key, true).await
         }))
         .await?;
