@@ -505,7 +505,6 @@ pub(crate) fn start_observer(
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
         .arg("node")
-        .arg("--observer")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
         .arg("--http")

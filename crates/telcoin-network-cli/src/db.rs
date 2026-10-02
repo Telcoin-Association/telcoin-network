@@ -189,13 +189,15 @@ impl DbLoadStateArgs {
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
         // command). Genesis is the trust root, so it must match the chain the pack came from.
-        let tn_config = match self.chain {
-            Some(NamedChain::Adiri | NamedChain::TestNet) => {
-                Config::load_adiri(&datadir, false, SHORT_VERSION)?
-            }
-            Some(NamedChain::MainNet) => Config::load_mainnet(&datadir, false, SHORT_VERSION)?,
-            None => Config::load(&datadir, false, SHORT_VERSION)?,
-        };
+        let tn_config = self.chain.map_or_else(
+            || Config::load(&datadir, SHORT_VERSION),
+            |chain| match chain {
+                NamedChain::Adiri | NamedChain::TestNet => {
+                    Config::load_adiri(&datadir, SHORT_VERSION)
+                }
+                NamedChain::MainNet => Config::load_mainnet(&datadir, SHORT_VERSION),
+            },
+        )?;
 
         // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
         // the node command, refused before any datadir mutation.
