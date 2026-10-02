@@ -24,21 +24,26 @@ class Peer:
         self.phase = phase
         self.binary = binary
         self.lock = threading.Lock()
+        self.lifecycle_lock = threading.RLock()
+        self.stopping = False
         self.generation = -1
         self.process = None
         self.log = None
         self.ready = None
 
     def start(self):
-        self.generation += 1
-        if self.generation > 64:
-            raise ValueError("peer restart allocation exhausted")
-        name = self.declaration["name"]
-        self.ready = self.phase / f"{name}-ready-{self.generation:02}.json"
-        self.log = (self.phase / f"{name}-process-{self.generation:02}.log").open("xb")
-        self.process = subprocess.Popen(["ip", "netns", "exec", self.declaration["namespace"],
-                                        str(self.binary), "run", "--config", str(self.phase / "peers" / f"{name}.json"),
-                                        "--ready", str(self.ready)], stdout=self.log, stderr=self.log)
+        with self.lifecycle_lock:
+            if self.stopping:
+                raise ValueError("peer supervisor is shutting down")
+            self.generation += 1
+            if self.generation > 64:
+                raise ValueError("peer restart allocation exhausted")
+            name = self.declaration["name"]
+            self.ready = self.phase / f"{name}-ready-{self.generation:02}.json"
+            self.log = (self.phase / f"{name}-process-{self.generation:02}.log").open("xb")
+            self.process = subprocess.Popen(["ip", "netns", "exec", self.declaration["namespace"],
+                                            str(self.binary), "run", "--config", str(self.phase / "peers" / f"{name}.json"),
+                                            "--ready", str(self.ready)], stdout=self.log, stderr=self.log)
 
     def wait_ready(self, timeout=12):
         deadline = time.monotonic() + timeout
@@ -58,18 +63,21 @@ class Peer:
         raise TimeoutError("peer process did not publish its public ready report")
 
     def stop(self):
-        if self.process is not None and self.process.poll() is None:
-            self.process.send_signal(signal.SIGINT)
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        if self.log is not None:
-            self.log.close()
+        with self.lifecycle_lock:
+            if self.process is not None and self.process.poll() is None:
+                self.process.send_signal(signal.SIGINT)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            if self.log is not None:
+                self.log.close()
 
     def command(self, request):
         with self.lock:
+            if self.stopping:
+                raise ValueError("peer supervisor is shutting down")
             restart = None
             if request["scenario"] == "shared_nat_reconnect":
                 if not self.declaration["nat"] or self.process.poll() is not None:
@@ -98,6 +106,37 @@ class Peer:
             if restart is not None:
                 result["trace"] = {"restart": restart, "connections": result.get("trace")}
             return result
+
+
+def stop_peers(peers, grace_seconds=5, kill_seconds=5):
+    """Stop only recorded children, with shared deadlines and no restart during shutdown."""
+    peers = tuple(peers)
+    for peer in peers:
+        peer.stopping = True
+    owned = []
+    for peer in peers:
+        with peer.lifecycle_lock:
+            peer.stopping = True
+            owned.append((peer.process, peer.log))
+    for process, _log in owned:
+        if process is not None and process.poll() is None:
+            process.send_signal(signal.SIGINT)
+    deadline = time.monotonic() + grace_seconds
+    for process, _log in owned:
+        if process is not None and process.poll() is None:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+    for process, _log in owned:
+        if process is not None and process.poll() is None:
+            process.kill()
+    deadline = time.monotonic() + kill_seconds
+    for process, log in owned:
+        if process is not None:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        if log is not None:
+            log.close()
 
 
 def handler_for(peers):
@@ -154,9 +193,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop_peers(peers.values())
         server.server_close()
-        for peer in peers.values():
-            peer.stop()
 
 
 if __name__ == "__main__":

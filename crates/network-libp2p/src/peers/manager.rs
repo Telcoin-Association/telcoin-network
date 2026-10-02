@@ -670,7 +670,7 @@ impl PeerManager {
         self.public_peer_limit = limit;
     }
 
-    /// Select the prevalidated DAO identities without changing their admission or penalty policy.
+    /// Reserve retention for prevalidated DAO identities while preserving their penalty policy.
     pub(crate) fn set_dao_observers(&mut self, observers: HashSet<BlsPublicKey>) {
         self.dao_observers = observers;
         self.metrics.set_population_counts(0, 0);
@@ -971,12 +971,17 @@ impl PeerManager {
     /// Derive independent privileges from live committee membership and operator configuration.
     ///
     /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Configured DAO observers also reserve retention, while remaining subject to load penalties.
     /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
     pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
         let policy = self.peers.peer_policy(peer_id);
-        self.peer_to_bls(peer_id)
+        let policy = self
+            .peer_to_bls(peer_id)
             .filter(|key| self.pinned_peers.contains(key))
-            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap));
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.dao_observers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::DaoObserver))
     }
 
     /// Whether retention policy protects this peer from population pruning and mesh treatment.

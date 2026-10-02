@@ -236,10 +236,22 @@ def warmup(docker, coordinator, processes):
                    "http://10.147.0.11:9000")
 
 
+def wait_for_phase_exit(processes, peer_supervisor, timeout=30):
+    """Require every recorded actor to exit and the supervisor to confirm child cleanup."""
+    deadline = time.monotonic() + timeout
+    while any(process.poll() is None for process in processes) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if any(process.poll() is None for process in processes):
+        raise ValueError("owned phase processes did not stop, refusing to reuse the topology")
+    if peer_supervisor is not None and peer_supervisor.poll() != 0:
+        raise ValueError("peer supervisor failed to reap its owned children")
+
+
 def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
     phase_dir = docker.output / "deployment" / phase
     container_dir = f"/qualification/deployment/{phase}"
     processes, stops = [], []
+    peer_supervisor = None
     try:
         for index, node in enumerate(population["validators"]):
             command = f"{container_dir}/{node['name']}-command.json"
@@ -251,9 +263,10 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             wait_file(phase_dir / f"{node['name']}.pid", processes)
             wait_file(phase_dir / f"{node['name']}.jsonl", processes)
             stops.append((container, f"{container_dir}/{node['name']}.pid", "/binaries/telcoin-network"))
-        processes.append(docker.background_execute(coordinator, f"{phase}-peers", "python3", "-B", "-I",
+        peer_supervisor = docker.background_execute(coordinator, f"{phase}-peers", "python3", "-B", "-I",
             "/tools/supervise.py", "/qualification/deployment", phase, "/binaries/examples/hub-capacity-peer",
-            "--ready", f"{container_dir}/peers-ready.json", "--pid-file", f"{container_dir}/supervisor.pid"))
+            "--ready", f"{container_dir}/peers-ready.json", "--pid-file", f"{container_dir}/supervisor.pid")
+        processes.append(peer_supervisor)
         wait_file(phase_dir / "supervisor.pid", processes)
         stops.append((coordinator, f"{container_dir}/supervisor.pid", "/tools/supervise.py"))
         wait_file(phase_dir / "peers-ready.json", processes, timeout=180)
@@ -319,11 +332,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                 stop_process(docker, container, pid_file, token)
             except (subprocess.CalledProcessError, ValueError):
                 pass
-        deadline = time.monotonic() + 20
-        while any(process.poll() is None for process in processes) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if any(process.poll() is None for process in processes):
-            raise ValueError("owned phase processes did not stop, refusing to reuse the topology")
+        wait_for_phase_exit(processes, peer_supervisor)
 
 
 def execute_qualification(args):

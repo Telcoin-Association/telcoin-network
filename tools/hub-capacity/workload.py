@@ -219,7 +219,8 @@ def run(plan, manifest, output, origin):
                 if scenario == "committee_progress":
                     time.sleep(max(0, origin + duration - time.monotonic()))
                     for index, agent in enumerate(definition["agents"]):
-                        record(execute(agent, scenario, f"committee_progress-final-{index}", origin, 30))
+                        with command_slots:
+                            record(execute(agent, scenario, f"committee_progress-final-{index}", origin, 30))
 
         with ThreadPoolExecutor(max_workers=len(QUALIFY.SCENARIOS)) as executor:
             list(executor.map(scenario_run, sorted(QUALIFY.SCENARIOS)))

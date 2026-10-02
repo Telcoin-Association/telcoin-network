@@ -111,14 +111,14 @@ async fn dao_metrics_track_identity_and_disconnection() {
     let recorder = DebuggingRecorder::new();
     metrics::with_local_recorder(&recorder, || {
         let mut manager = create_test_peer_manager(None);
+        manager.set_public_peer_limit(std::num::NonZeroUsize::new(1));
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([83; 32])));
         let public_key = keys.primary_public_key();
         let network_key = keys.primary_network_public_key();
         let observer: PeerId = network_key.clone().into();
         let address = create_multiaddr(None);
-        let (reply, _receiver) = oneshot::channel();
-        manager.add_trusted_peer_and_dial(
+        manager.add_bootstrap_peer(
             public_key,
             NetworkInfo {
                 pubkey: network_key,
@@ -126,9 +126,12 @@ async fn dao_metrics_track_identity_and_disconnection() {
                 timestamp: now(),
                 rpc: None,
             },
-            reply,
         );
         manager.set_dao_observers(HashSet::from([public_key]));
+        assert!(manager.peer_is_important(&observer));
+        assert!(manager
+            .peer_policy(&observer)
+            .applies(Penalty::Load(crate::peers::penalty::LoadPenalty::KademliaFlood)));
         assert!(manager.register_peer_connection(
             &observer,
             ConnectionType::IncomingConnection { multiaddr: address }
@@ -160,6 +163,8 @@ async fn dao_metrics_track_identity_and_disconnection() {
         let snapshot = recorder.snapshotter().snapshot().into_vec();
         assert!(measured(&snapshot, "tn_network.dao_observers_connected", 0.0));
         assert!(measured(&snapshot, "tn_network.ordinary_peers_connected", 1.0));
+        manager.set_dao_observers(HashSet::new());
+        assert!(!manager.peer_is_important(&observer));
     });
 }
 

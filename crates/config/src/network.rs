@@ -30,7 +30,7 @@ pub struct NetworkConfig {
     serve_limits: NetworkServeConfig,
     /// Optional ceiling for ordinary peers, leaving process-budget headroom for protected peers.
     public_peer_limit: Option<NonZeroUsize>,
-    /// DAO observer identities, separately measured within the configured trusted bootstrap set.
+    /// Prevalidated bootstrap identities with reserved DAO retention and normal load penalties.
     dao_observers: BTreeSet<BlsPublicKey>,
     /// The configurations for libp2p library.
     ///

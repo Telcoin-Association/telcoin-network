@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
 
@@ -20,6 +21,20 @@ COLLECT = load("capacity_deployment_collect", "collect.py")
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_phase_cleanup_requires_stopped_actors_and_successful_peer_cleanup(self):
+        actor = mock.Mock()
+        supervisor = mock.Mock()
+        actor.poll.return_value = 130
+        supervisor.poll.return_value = 0
+        RUNNER.wait_for_phase_exit([actor, supervisor], supervisor, timeout=0)
+        supervisor.poll.return_value = 1
+        with self.assertRaisesRegex(ValueError, "failed to reap"):
+            RUNNER.wait_for_phase_exit([actor, supervisor], supervisor, timeout=0)
+        supervisor.poll.return_value = 0
+        actor.poll.return_value = None
+        with self.assertRaisesRegex(ValueError, "refusing to reuse"):
+            RUNNER.wait_for_phase_exit([actor, supervisor], supervisor, timeout=0)
+
     def test_runner_envelopes_reserve_disjoint_cpu_and_memory_budgets(self):
         for name in ("workstation", "github-actions"):
             with self.subTest(name=name):

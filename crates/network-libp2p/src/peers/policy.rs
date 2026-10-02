@@ -39,6 +39,8 @@ pub(super) enum LoadScoring {
 pub(super) enum TrustBasis {
     /// An operator-provisioned bootstrap or explicit discovery peer.
     Bootstrap,
+    /// An explicitly configured DAO observer with reserved retention and normal load scoring.
+    DaoObserver,
     /// A peer explicitly allowlisted by the operator.
     Operator,
     /// Membership in the previous, current, or next committee.
@@ -66,6 +68,9 @@ impl PeerPolicy {
     pub(super) fn grant(self, basis: TrustBasis) -> Self {
         match basis {
             TrustBasis::Bootstrap => Self { admission: Admission::Authorized, ..self },
+            TrustBasis::DaoObserver => {
+                Self { admission: Admission::Authorized, retention: Retention::Protected, ..self }
+            }
             TrustBasis::Operator | TrustBasis::Validator => Self {
                 admission: Admission::Authorized,
                 retention: Retention::Protected,
@@ -112,6 +117,13 @@ mod tests {
                 Some(TrustBasis::Bootstrap),
                 Admission::Authorized,
                 Retention::Ordinary,
+                LoadScoring::Apply,
+            ),
+            (
+                "dao observer",
+                Some(TrustBasis::DaoObserver),
+                Admission::Authorized,
+                Retention::Protected,
                 LoadScoring::Apply,
             ),
             (
