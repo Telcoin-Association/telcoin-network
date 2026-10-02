@@ -975,9 +975,6 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
                 .arg(temp_dir.path().join(format!("{name}.ipc")))
                 .arg("--node-name")
                 .arg(format!("worker-rpc-{name}"));
-            if name == "observer" {
-                command.arg("--observer");
-            }
             guard.push(command.spawn()?);
             Ok((name, url))
         })

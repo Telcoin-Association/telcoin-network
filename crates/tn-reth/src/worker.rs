@@ -8,11 +8,11 @@
 //! management, ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held
 //! behind an `Arc`, so cloning the shim is cheap.
 //!
-//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC server handle, the
-//! worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
+//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC modules and active handle,
+//! the worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
 //! respawned when the epoch rolls over).
 
-use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use crate::{error::TnRethResult, ChainSpec, RethEnv, RpcServer, WorkerTxPool};
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -28,13 +28,16 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_types::{WorkerId, MIN_PROTOCOL_BASE_FEE};
 use tn_worker::WorkerNetworkHandle;
 
 /// Execution components on a per-worker basis.
 #[derive(Debug)]
 pub struct WorkerComponents {
-    /// The RPC handle.
-    rpc_handle: RpcServerHandle,
+    /// The running RPC handle, absent while this worker is outside the committee.
+    rpc_handle: Option<RpcServerHandle>,
+    /// Built RPC modules retained for reactivation over the same transaction pool.
+    rpc_server: RpcServer,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
     /// Keep the WorkerNetwork around so we can update it's task(s).
@@ -43,13 +46,49 @@ pub struct WorkerComponents {
 
 impl WorkerComponents {
     /// Create a new instance of [Self].
-    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool, network: WorkerNetwork) -> Self {
-        Self { rpc_handle, pool, network }
+    pub fn new(
+        rpc_handle: RpcServerHandle,
+        rpc_server: RpcServer,
+        pool: WorkerTxPool,
+        network: WorkerNetwork,
+    ) -> Self {
+        Self { rpc_handle: Some(rpc_handle), rpc_server, pool, network }
     }
 
-    /// Return a reference to the rpc handle
-    pub fn rpc_handle(&self) -> &RpcServerHandle {
-        &self.rpc_handle
+    /// Return the RPC handle only while this worker is active.
+    pub fn rpc_handle(&self) -> Option<&RpcServerHandle> {
+        self.rpc_handle.as_ref()
+    }
+
+    /// Stop accepting transactions while retaining the pool for a later reactivation.
+    ///
+    /// A removed worker has no batch builder. Keep its shim unavailable and align its stored
+    /// fee with the accumulator's fallback for a removed slot, including canonical updates.
+    pub fn deactivate(&mut self) {
+        self.network.set_syncing(true);
+        self.pool.set_epoch_base_fee(MIN_PROTOCOL_BASE_FEE);
+        self.rpc_handle.take().into_iter().for_each(|handle| {
+            let _ = handle.stop().inspect_err(|error| {
+                tracing::warn!(target: "tn::execution", ?error, "worker RPC already stopped");
+            });
+        });
+    }
+
+    /// Refresh the pool's epoch fee before reopening a stopped worker's RPC listeners.
+    ///
+    /// Running listeners are reused. The retained modules keep existing transactions in the
+    /// same pool, and the per-query fee handle resolves the reactivated accumulator slot.
+    pub async fn restart_rpc(
+        &mut self,
+        reth_env: &RethEnv,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> TnRethResult<()> {
+        self.pool.set_epoch_base_fee(base_fee);
+        if self.rpc_handle.is_none() {
+            self.rpc_handle = Some(reth_env.start_rpc(&self.rpc_server, worker_id).await?);
+        }
+        Ok(())
     }
 
     /// Return a reference to the worker's transaction pool.
