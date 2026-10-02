@@ -337,11 +337,11 @@ cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
 | `RequiresConsensusNFT`     | Address not whitelisted             | Request governance approval first                   |
 | `InvalidStatus`            | Wrong validator state for operation | Check current status with `getValidator()`          |
 | `InvalidStakeAmount`       | Incorrect stake value sent          | Send `stakeAmount` from `stakeConfig(getCurrentStakeVersion())` |
-| `InvalidProofOfPossession` | BLS signature verification failed   | Regenerate keys and ensure correct address          |
-| `DuplicateBLSPubkey`       | BLS key already registered          | Generate new keys with `--force` flag               |
+| `InvalidProofOfPossession` | BLS signature verification failed   | The proof was usually signed for a different address. Re-sign it for the staking address with `keytool generate pop --address <ADDRESS>`, then export the staking arguments again |
+| `DuplicateBLSPubkey`       | BLS key already registered          | A registered key is never released, not even after unstaking. Generate a new validator's keys in a new datadir, and never overwrite the keys of a validator that has staked |
 
 #### Key Management
 
-* **Lost passphrase:** BLS keys cannot be recovered without the passphrase. Generate new keys.
-* **Regenerating keys:** Use `--force` flag to overwrite existing keys (old keys will be lost).
+* **Lost passphrase:** BLS keys cannot be recovered without the passphrase. Before staking, generate new keys. After staking, the registered key cannot be replaced: exit and unstake from the validator address, then onboard a new validator address with new keys.
+* **Regenerating keys:** Never run `keytool generate validator --force` for a validator that has staked. The registry binds the BLS key to that validator for good and has no way to replace it, so `--force` overwrites the only key that can sign for the validator. If the proof of possession names the wrong address, re-sign it with `keytool generate pop --address <ADDRESS>` instead: it keeps every key and rewrites only `execution_address` and `proof_of_possession` in `node-info.yaml`.
 * **Backing up keys:** Securely backup the contents of your data directory, especially the encrypted key files.
