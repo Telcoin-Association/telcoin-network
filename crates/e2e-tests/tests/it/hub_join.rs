@@ -400,11 +400,41 @@ fn start_qualification_node(
         .map_err(Into::into)
 }
 
-/// Read a committed consensus header through the running node's typed serialization.
-fn qualification_header(rpc: &str) -> eyre::Result<ConsensusHeader> {
-    super::super::common::get_latest_consensus_header(rpc).and_then(|header| {
-        serde_json::to_value(header).and_then(serde_json::from_value).map_err(Into::into)
-    })
+/// Fields needed from the running node's committed consensus header JSON.
+#[derive(serde::Deserialize)]
+struct QualificationHeader {
+    /// Committed consensus header number returned by the RPC.
+    number: u64,
+    /// JSON view of the committed sub-DAG, whose final header is the leader.
+    sub_dag: QualificationSubDag,
+}
+
+/// The RPC fields needed to observe committed leadership without decoding the BCS wire format.
+#[derive(serde::Deserialize)]
+struct QualificationSubDag {
+    /// Ordered committed headers, with the leader last.
+    headers: Vec<QualificationLeader>,
+}
+
+/// Author and epoch of a committed header in the RPC JSON response.
+#[derive(serde::Deserialize)]
+struct QualificationLeader {
+    /// Authority that authored the committed header.
+    author: AuthorityIdentifier,
+    /// Committee epoch in which the authority committed its header.
+    epoch: tn_types::Epoch,
+}
+
+/// Observe the committed leader through the RPC's JSON representation.
+fn qualification_header(rpc: &str) -> eyre::Result<(u64, QualificationLeader)> {
+    let value = serde_json::to_value(super::super::common::get_latest_consensus_header(rpc)?)?;
+    let mut header: QualificationHeader = serde_json::from_value(value)?;
+    header
+        .sub_dag
+        .headers
+        .pop()
+        .ok_or_else(|| eyre::eyre!("empty committed sub-DAG"))
+        .map(|leader| (header.number, leader))
 }
 
 /// Exercise governance admission, record publication, all swarms, and actual consensus readiness.
@@ -528,13 +558,10 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 .await
                 .is_ok_and(|info| info.committee.contains(&new_validator.address()));
             let closed = joining.all_swarms("tn_network_admission_mode", 2.0).unwrap_or(false);
-            let leads = qualification_header(joining.rpc()?).is_ok_and(|header| {
-                let own = header.sub_dag.leader().author() == &author;
+            let leads = qualification_header(joining.rpc()?).is_ok_and(|(_, leader)| {
+                let own = leader.author == author;
                 if own {
-                    leader_epoch.store(
-                        header.sub_dag.leader().epoch(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    leader_epoch.store(leader.epoch, std::sync::atomic::Ordering::Relaxed);
                 }
                 own
             });
@@ -554,10 +581,10 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
         );
         println!(
             "latest leader observation={:?}",
-            qualification_header(joining.rpc().unwrap_or_default()).map(|header| (
-                header.number,
-                header.sub_dag.leader().epoch(),
-                header.sub_dag.leader().author().clone()
+            qualification_header(joining.rpc().unwrap_or_default()).map(|(number, leader)| (
+                number,
+                leader.epoch,
+                leader.author
             ))
         );
         println!(
