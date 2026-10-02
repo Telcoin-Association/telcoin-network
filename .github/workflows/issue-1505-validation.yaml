@@ -28,6 +28,10 @@ jobs:
         run: rustup toolchain install 1.94 --profile minimal
       - name: Install result checker
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Restore dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
@@ -93,12 +97,12 @@ jobs:
           test "$result" -eq 101
           rg -q 'epoch_starts_all_workers_and_reuses_components .*FAILED' listener-mutation.log
           git restore crates/tn-reth/src/worker.rs
-      - name: Run affected crate test suites after restoration
-        run: cargo +1.94 test --locked -p tn-node -p tn-reth --lib
-      - name: Run affected adiri test suites
-        run: cargo +1.94 test --locked -p tn-node -p tn-reth --lib --features tn-node/adiri,tn-reth/adiri
       - name: Verify source restoration
         run: git diff --exit-code
+      - name: Run affected crate test suites after restoration
+        run: cargo +1.94 nextest run --locked -p tn-node -p tn-reth --lib
+      - name: Run affected adiri test suites
+        run: cargo +1.94 nextest run --locked -p tn-node -p tn-reth --lib --features tn-node/adiri,tn-reth/adiri
       - uses: actions/upload-artifact@v4
         if: always()
         with:
