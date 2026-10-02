@@ -23,7 +23,11 @@ use tn_types::{
     encode, error::DagError, BlsKeypair, BlsSigner, DBIter, HeaderBuilder, Table, TnSender,
     VotingPower,
 };
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::Instant,
+};
 
 // ===== Certifier test harness =====
 
@@ -1380,9 +1384,93 @@ async fn already_certified_header_is_republished() {
     cx.network.assert_quiet("already-certified header: no vote request may follow").await;
 }
 
+/// Start `spawn_header_proposal` for a header whose certificate the proposer's
+/// `ProposedCertificates` already holds, on an unspawned certifier over a committee of held
+/// [`FaultDb`]s, and check that the republish waits on its barrier.
+///
+/// Panics, naming `context`, if anything is sent on the network while the barrier is pending, or
+/// if the proposal is not waiting on exactly one `ProposedCertificates` barrier. Returns the
+/// context, the stored certificate, and the proposal task, which waits until the test calls
+/// [`FaultDb::release`] on the proposer's store.
+async fn pending_republish(
+    context: &str,
+) -> (CertifierContext<FaultDb>, Certificate, JoinHandle<TaskResult>) {
+    let fixture = CommitteeFixture::builder(FaultDb::held).randomize_ports(true).build();
+    let (mut cx, certifier) = CertifierContext::unspawned_from_fixture(fixture);
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let stored = certificate_over(&committee, &header, cx.fixture.authorities());
+    cx.proposer()
+        .consensus_config()
+        .node_storage()
+        .insert::<ProposedCertificates>(&header.digest(), &stored)
+        .expect("record the header's certificate before it is proposed");
+    let proposal = tokio::spawn(certifier.spawn_header_proposal(header));
+    cx.network
+        .assert_quiet(&format!(
+            "{context}: nothing may be republished while the barrier is pending"
+        ))
+        .await;
+    assert_eq!(
+        cx.proposer().consensus_config().node_storage().proposed_barriers(),
+        1,
+        "{context}: the republish must wait on exactly one ProposedCertificates barrier"
+    );
+    (cx, stored, proposal)
+}
+
+/// An already-certified header's stored certificate is republished only after its
+/// `ProposedCertificates` barrier commits: nothing is gossiped while the barrier is pending, and
+/// once it commits exactly the stored certificate is gossiped, the proposal succeeds, the node is
+/// not shut down, and no vote is requested.
+///
+/// The row this path reads can still be memory-only, so the republish waits on a barrier queued
+/// after that read (issue #1530). Before that fix the stored certificate was gossiped at once with
+/// no barrier, so the quiet check in [`pending_republish`] fails.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn already_certified_republish_waits_for_durable_barrier() {
+    let (mut cx, stored, proposal) = pending_republish("committed barrier").await;
+    cx.proposer().consensus_config().node_storage().release(BarrierVerdict::Commit);
+    let gossip =
+        cx.network.next_publish("committed barrier: republish of the stored certificate").await;
+    assert!(
+        gossip == certificate_gossip(stored).await,
+        "committed barrier: the republish must carry exactly the stored certificate"
+    );
+    let result = header_proposal_result(proposal, "committed barrier").await;
+    assert!(result.is_ok(), "committed barrier: expected Ok(()), got {result:?}");
+    assert!(
+        !cx.proposer().consensus_config().shutdown().is_notified(),
+        "committed barrier: a durable republish must not shut the node down"
+    );
+    cx.network.assert_quiet("committed barrier: no vote request may follow").await;
+}
+
+/// An already-certified header whose `ProposedCertificates` barrier fails is not republished:
+/// `spawn_header_proposal` fails with exactly the barrier's error and shuts the node down, because
+/// the stored record can be lost on restart (issue #1530).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn already_certified_republish_refused_when_durable_barrier_fails() {
+    let (mut cx, _, proposal) = pending_republish("failed barrier").await;
+    cx.proposer().consensus_config().node_storage().release(BarrierVerdict::Fail);
+    cx.network.assert_quiet("failed barrier: the certificate must not be republished").await;
+    let error = header_proposal_result(proposal, "failed barrier")
+        .await
+        .expect_err("failed barrier: spawn_header_proposal must refuse the republish");
+    assert_eq!(
+        error.to_string(),
+        INJECTED_BARRIER_FAILURE,
+        "failed barrier: the proposal must fail with the barrier's error"
+    );
+    assert!(
+        cx.proposer().consensus_config().shutdown().is_notified(),
+        "failed barrier: refusing the republish must shut the node down"
+    );
+}
+
 /// A certificate whose `ProposedCertificates` record the durable barrier fails to make durable is
-/// never externalized: `spawn_header_proposal` fails with exactly the barrier's error, and the
-/// certificate is neither delivered to the node nor gossiped.
+/// never externalized: `spawn_header_proposal` fails with exactly the barrier's error and shuts the
+/// node down, and the certificate is neither delivered to the node nor gossiped.
 ///
 /// Every peer votes, so the certificate forms, and exactly one `ProposedCertificates` barrier is
 /// awaited: the refusal is the barrier's, not an earlier failure. The network is checked first
@@ -1405,6 +1493,10 @@ async fn certificate_withheld_when_durable_barrier_fails() {
         cx.proposer().consensus_config().node_storage().proposed_barriers(),
         1,
         "failed barrier: the certificate must reach exactly one ProposedCertificates barrier"
+    );
+    assert!(
+        cx.proposer().consensus_config().shutdown().is_notified(),
+        "failed barrier: refusing a non-durable certificate must shut the node down"
     );
     if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
         panic!("failed barrier: expected no certificate delivered, got {result:?}");
@@ -1429,23 +1521,38 @@ async fn certificate_withheld_when_durable_barrier_fails() {
         1,
         "healthy barrier: the certificate must reach exactly one ProposedCertificates barrier"
     );
+    assert!(
+        !cx.proposer().consensus_config().shutdown().is_notified(),
+        "healthy barrier: a durable certificate must not shut the node down"
+    );
 }
 
 /// What a failing [`FaultDb`] barrier resolves to.
 const INJECTED_BARRIER_FAILURE: &str = "injected durable barrier failure";
 
+/// How a [`FaultDb`] barrier for `ProposedCertificates` resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarrierVerdict {
+    /// The barrier resolves to the inner database's `persist`, as a durable commit does.
+    Commit,
+    /// The barrier resolves to [`INJECTED_BARRIER_FAILURE`], as a failed physical commit does.
+    Fail,
+}
+
 /// A [`MemDatabase`] whose durable barrier for `ProposedCertificates` can fail, as a failed
-/// physical commit (disk full, `EIO`, a checksum error) makes it fail on a disk-backed store.
+/// physical commit (disk full, `EIO`, a checksum error) makes it fail on a disk-backed store, or
+/// stay pending until the test releases it.
 ///
 /// Every other operation, including `persist` for every other table, is the inner database's.
-/// Clones share one count of the `ProposedCertificates` barriers awaited, so the count read from
-/// the proposer's store includes the certifier's.
+/// Clones share one verdict and one count of the `ProposedCertificates` barriers awaited, so a
+/// test can release, and read the count of, the certifier's barrier through the proposer's store.
 #[derive(Clone, Debug)]
 struct FaultDb {
     /// The database every operation but the faulted barrier is delegated to.
     inner: MemDatabase,
-    /// Whether `persist::<ProposedCertificates>` resolves to [`INJECTED_BARRIER_FAILURE`].
-    fail: bool,
+    /// The verdict every `persist::<ProposedCertificates>` resolves to, across every clone.
+    /// `None` holds each such barrier pending until [`Self::release`] sets a verdict.
+    verdict: Arc<watch::Sender<Option<BarrierVerdict>>>,
     /// How many times `persist::<ProposedCertificates>` has been awaited, across every clone.
     proposed_barriers: Arc<AtomicUsize>,
 }
@@ -1453,12 +1560,47 @@ struct FaultDb {
 impl FaultDb {
     /// An empty store whose `ProposedCertificates` barrier fails if `fail` and succeeds otherwise.
     fn new(fail: bool) -> Self {
-        Self { inner: MemDatabase::default(), fail, proposed_barriers: Arc::default() }
+        let verdict = if fail { BarrierVerdict::Fail } else { BarrierVerdict::Commit };
+        Self::with_verdict(Some(verdict))
+    }
+
+    /// An empty store whose `ProposedCertificates` barrier stays pending until [`Self::release`].
+    fn held() -> Self {
+        Self::with_verdict(None)
+    }
+
+    /// An empty store whose `ProposedCertificates` barrier starts with `verdict`.
+    fn with_verdict(verdict: Option<BarrierVerdict>) -> Self {
+        Self {
+            inner: MemDatabase::default(),
+            verdict: Arc::new(watch::Sender::new(verdict)),
+            proposed_barriers: Arc::default(),
+        }
+    }
+
+    /// Resolve every pending and later `ProposedCertificates` barrier on this store and its clones
+    /// with `verdict`.
+    fn release(&self, verdict: BarrierVerdict) {
+        self.verdict.send_modify(|current| *current = Some(verdict));
     }
 
     /// How many times `persist::<ProposedCertificates>` has been awaited on this store or a clone.
     fn proposed_barriers(&self) -> usize {
         self.proposed_barriers.load(Ordering::SeqCst)
+    }
+
+    /// Wait until this store has a verdict, and return it.
+    ///
+    /// The verdict is copied out of the watch borrow in the statement that waits for it, so no
+    /// `watch::Ref` (which is not `Send`) is held across an await and `persist` stays `Send`.
+    async fn wait_for_verdict(&self) -> BarrierVerdict {
+        let mut verdicts = self.verdict.subscribe();
+        verdicts
+            .wait_for(Option::is_some)
+            .await
+            .map(|verdict| *verdict)
+            .expect("the verdict sender lives as long as this store")
+            .expect("wait_for returns only a set verdict")
     }
 }
 
@@ -1532,7 +1674,7 @@ impl Database for FaultDb {
     async fn persist<T: Table>(&self) -> eyre::Result<()> {
         if TypeId::of::<T>() == TypeId::of::<ProposedCertificates>() {
             self.proposed_barriers.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
+            if self.wait_for_verdict().await == BarrierVerdict::Fail {
                 return Err(eyre::Report::msg(INJECTED_BARRIER_FAILURE));
             }
         }
