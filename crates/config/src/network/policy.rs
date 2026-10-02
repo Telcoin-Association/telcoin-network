@@ -232,24 +232,24 @@ mod tests {
     use tn_types::{BlsKeypair, NetworkKeypair};
 
     /// Construct an independent endpoint for policy binding tests.
-    fn endpoint(seed: u8) -> (BlsPublicKey, P2pNode) {
-        (
+    fn endpoint(seed: u8) -> eyre::Result<(BlsPublicKey, P2pNode)> {
+        Ok((
             *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public(),
             P2pNode {
                 network_key: NetworkKeypair::generate_ed25519().public().into(),
-                network_address: "/ip4/127.0.0.1/udp/9000/quic-v1".parse().unwrap_or_default(),
+                network_address: "/ip4/127.0.0.1/udp/9000/quic-v1".parse()?,
                 rpc: None,
             },
-        )
+        ))
     }
 
     /// The same validated revision contains the primary and exactly the configured workers.
     #[test]
     fn peer_policy_workers_and_cli_precedence() -> eyre::Result<()> {
-        let (hub_key, primary) = endpoint(1);
-        let (_, zero) = endpoint(2);
-        let (_, one) = endpoint(3);
-        let (bootstrap_key, bootstrap_primary) = endpoint(4);
+        let (hub_key, primary) = endpoint(1)?;
+        let (_, zero) = endpoint(2)?;
+        let (_, one) = endpoint(3)?;
+        let (bootstrap_key, bootstrap_primary) = endpoint(4)?;
         let bootstrap = BTreeMap::from([(
             bootstrap_key,
             BootstrapServer {
@@ -271,8 +271,8 @@ mod tests {
         assert!(config
             .operator_peer_policy(&bootstrap, None, 2usize.into(), 2usize.into())
             .is_err());
-        let (_, boot_zero) = endpoint(5);
-        let (_, boot_one) = endpoint(6);
+        let (_, boot_zero) = endpoint(5)?;
+        let (_, boot_one) = endpoint(6)?;
         let cli = BTreeMap::from([(
             bootstrap_key,
             BootstrapServer {
