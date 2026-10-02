@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e430b3cb8144bfeb4bf064b115d4c0ef68dbd9b3
+          ref: e352e27c0b4f46be0a4d3e7610a2e81e7567934e
           submodules: true
       - name: Pin nightly for the dependency cache
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
