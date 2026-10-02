@@ -84,3 +84,54 @@ kernel, five timing samples per role and hub condition, five governance samples 
 per-stage p50, p95, and maximum values. Node logs preserve each attempt independently.
 The signed-record swarm fixture reports policy activation separately from the governance
 fixture's actual consensus participation. Preserve both: one cannot substitute for the other.
+
+## Qualification results (2026-10-02)
+
+[Run 36993984423](https://github.com/Telcoin-Association/telcoin-network/actions/runs/36993984423)
+passed all four unmodified repository regression lanes, 35 swarm qualifications, and ten
+governance qualifications: five healthy-hub and five unavailable-hub samples, without retries.
+Every governance sample reached Closed on primary and both workers, committed a header led
+by the fresh validator, verified its epoch certificate, and continued consensus after hub loss.
+The resolution-getter mutation failed all seven swarm tests and both governance tests as
+tests, rather than compilation failures.
+
+The tested checkout was `b00eb690fdc1438d6580826ceb7c7d5f64995e4e`, GitHub's PR merge
+commit for source head `1393a68dbada73ba79ac84b94e127d5a097281ec`. Both commits have the
+same source tree. The contracts revision was `10cc12b7db43e2fbab67dc6a87fa5e159716bdc0`;
+the runner used Rust 1.94.1 and Linux 6.17.0-1022-azure on x86_64. The topology and
+accelerated parameters are those declared above, with loopback QUIC and a fresh database
+for each joining validator. The unavailable case blocks fresh-process UDP from launch
+through a minimum 15-second observation interval after governance receipts. The summary's
+`hub_unavailable_seconds` records that enforced interval, rather than total process uptime.
+
+[Raw samples and environment](evidence/hub-join-2026-10-02.json) are preserved byte-for-byte
+from the successful run, SHA-256 `6832f161ca2fc2debb7709a731491d122ed2223037d8b3f2e80145bc81177980`.
+Each row below has five samples. Percentiles use nearest rank; p95 equals the maximum with
+this sample size and does not establish a WAN percentile or confidence interval. Governance
+timings are observed milestones after governance receipts, including metric and polling
+resolution, rather than timestamps of the first wire publication or provider propagation.
+
+| Hub condition | Governance stage | p50 (ms) | p95 / maximum (ms) | Limit (ms) |
+| --- | --- | --- | --- | --- |
+| Healthy | Publication | 17,507 | 47,839 | 120,000 |
+| Healthy | Publication to resolution | 10,061 | 10,118 | 60,000 |
+| Healthy | Resolution to connection | 1,153 | 1,191 | 60,000 |
+| Healthy | Connection to consensus readiness | 5,007 | 5,988 | 120,000 |
+| Unavailable | Publication | 22,413 | 36,824 | 120,000 |
+| Unavailable | Publication to resolution | 10,091 | 10,113 | 60,000 |
+| Unavailable | Resolution to connection | 1,129 | 2,173 | 60,000 |
+| Unavailable | Connection to consensus readiness | 4,996 | 5,018 | 120,000 |
+
+The isolated swarm fixture separates authenticated publication, cold resolution, direct
+connection, and policy activation. Its activation measurement is not consensus participation.
+The unavailable endpoint held resolution incomplete through Grace while existing validators
+completed direct requests, then the same join path recovered once the hub started.
+
+| Swarm / hub condition | Publication p50 / max (ms) | Resolution p50 / max (ms) | Connection p50 / max (ms) | Policy activation p50 / max (ms) |
+| --- | --- | --- | --- | --- |
+| Primary / healthy | 62 / 67 | 540 / 549 | 4 / 6 | 1,004 / 1,008 |
+| Worker 0 / healthy | 55 / 55 | 536 / 542 | 1 / 5 | 1,005 / 1,010 |
+| Worker 1 / healthy | 62 / 63 | 537 / 555 | 3 / 5 | 1,005 / 1,011 |
+| Primary / unavailable | 10,060 / 10,061 | 537 / 544 | 2 / 4 | 1,005 / 1,010 |
+| Worker 0 / unavailable | 10,057 / 10,058 | 530 / 543 | 3 / 4 | 1,005 / 1,006 |
+| Worker 1 / unavailable | 10,058 / 10,059 | 529 / 543 | 3 / 5 | 1,004 / 1,010 |
