@@ -491,8 +491,8 @@ where
     /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
     /// engine's contiguous worker indexing, then bring up the epoch networks concurrently so peer
     /// waits overlap. Extra configured swarms stay idle until a future epoch activates their ids.
-    /// Workers removed from the committee stop their RPC listeners before the new epoch's workers
-    /// start.
+    /// Workers removed from the committee close transaction admission before the new epoch's
+    /// workers start.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
@@ -1237,8 +1237,8 @@ mod tests {
     use std::num::NonZeroUsize;
 
     /// Epoch entry reuses worker 0's early RPC and joins worker peer waits concurrently.
-    /// Subsequent entries reuse active RPC servers and pools, refresh sync state, and stop and
-    /// reactivate removed workers over their retained pools.
+    /// Subsequent entries reuse RPC listeners and pools, refresh sync state, and deactivate and
+    /// reactivate removed workers without rebinding, even with a partially received request.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
@@ -1250,8 +1250,9 @@ mod tests {
         use tn_network_libp2p::types::NetworkCommand;
         use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
         use tn_storage::mem_db::MemDatabase;
-        use tn_test_utils::{wait_until, CommitteeFixture};
+        use tn_test_utils::CommitteeFixture;
         use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         tn_reth::init_reth_defaults();
         let temp = tempfile::TempDir::new()?;
@@ -1276,17 +1277,26 @@ mod tests {
         let datadir = temp.path().to_path_buf();
         Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
         let chain = Arc::new(config.chain_spec());
+        let (base_port_reservation, worker_port_reservation) = reserve_worker_rpc_ports()?;
+        let base_port = base_port_reservation.local_addr()?.port();
         let node_config = RethConfig::new(
             RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                rpc: RpcServerArgs {
+                    http: true,
+                    http_port: base_port,
+                    ipcdisable: true,
+                    ..Default::default()
+                },
                 txpool: Default::default(),
                 db: Default::default(),
             },
             None,
             &datadir,
-            true,
+            false,
             chain,
         );
+        drop(base_port_reservation);
+        drop(worker_port_reservation);
         let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
@@ -1471,6 +1481,26 @@ mod tests {
         next_tasks.abort_all_tasks();
         next_tasks.wait_for_task_shutdown().await;
         drop(next_tasks);
+
+        // Receiving 100 Continue proves that HTTP/1 has parsed the headers and is waiting
+        // for the body. Keep that connection busy until after the worker is reactivated.
+        let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_gasPrice","params":[]}"#;
+        let mut held_connection = tokio::net::TcpStream::connect(worker_one_address).await?;
+        held_connection
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+                    request_body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut interim = [0_u8; b"HTTP/1.1 100 Continue\r\n\r\n".len()];
+        tokio::time::timeout(Duration::from_secs(5), held_connection.read_exact(&mut interim))
+            .await??;
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
         accumulator.set_num_workers(1);
         let smaller_committee = ConsensusConfig::new_with_committee_for_test(
             config,
@@ -1497,10 +1527,12 @@ mod tests {
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert!(engine.is_worker_initialized(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
-        wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
-            Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
-        })
-        .await?;
+        let inactive = client
+            .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
+            .await
+            .err()
+            .ok_or_else(|| eyre!("removed worker accepted an RPC submission"))?;
+        assert!(inactive.to_string().contains("worker is inactive"), "{inactive}");
 
         // Repeated deactivation and mode updates must not make the removed worker ready.
         engine.deactivate_workers_above(1).await;
@@ -1527,6 +1559,7 @@ mod tests {
             .await?;
         assert_eq!(regrown.len(), 2);
         assert!(engine.is_worker_initialized(1).await);
+        assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
         let reactivated =
@@ -1544,7 +1577,32 @@ mod tests {
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
+        held_connection.write_all(request_body.as_bytes()).await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), held_connection.read_to_end(&mut response))
+            .await??;
+        assert!(String::from_utf8(response)?.contains(&format!("0x{:x}", 100_000_004)));
         Ok(())
+    }
+
+    /// Reserve both fixed worker HTTP ports without assuming either port is free.
+    /// Retry only address collisions when reserving worker 1's derived port.
+    #[cfg(not(feature = "adiri"))]
+    fn reserve_worker_rpc_ports() -> std::io::Result<(std::net::TcpListener, std::net::TcpListener)>
+    {
+        let base = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let worker_port = base.local_addr()?.port().checked_sub(200).ok_or_else(|| {
+            std::io::Error::other("ephemeral HTTP port is below the worker port offset")
+        })?;
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, worker_port))
+            .map(|worker| (base, worker))
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AddrInUse {
+                    reserve_worker_rpc_ports()
+                } else {
+                    Err(error)
+                }
+            })
     }
 
     /// Both the initial readiness probe and its retry must use established connections. A zero
