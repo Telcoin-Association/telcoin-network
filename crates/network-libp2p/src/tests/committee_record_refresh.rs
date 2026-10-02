@@ -2,7 +2,6 @@
 
 use super::*;
 use futures::FutureExt;
-use libp2p::swarm::NetworkBehaviour as _;
 use std::task::{Context, Poll};
 use tn_config::KeyConfig;
 

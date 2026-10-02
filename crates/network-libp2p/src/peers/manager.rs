@@ -1410,6 +1410,12 @@ impl PeerManager {
         self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
     }
 
+    /// Inspect the retained record when testing signed address and identity replacement.
+    #[cfg(test)]
+    pub(crate) fn known_record(&self, bls_key: &BlsPublicKey) -> Option<&NetworkInfo> {
+        self.known_peers.get(bls_key)
+    }
+
     /// Return current committee RPCs and request recovery for missing submit URLs.
     ///
     /// A verified record with no RPC URL still needs recovery. Lookup coalescing and the retry
