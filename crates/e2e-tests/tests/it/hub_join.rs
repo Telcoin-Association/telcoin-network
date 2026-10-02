@@ -350,6 +350,8 @@ fn start_qualification_node(
         .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
         .arg("--bls-passphrase-source")
         .arg("env")
+        .arg("--log.file.directory")
+        .arg(dir.join("logs"))
         .arg("node")
         .arg("--datadir")
         .arg(&dir)
@@ -360,7 +362,8 @@ fn start_qualification_node(
         .arg("--metrics")
         .arg(&metrics)
         .arg("--bootstrap-peers")
-        .arg(bootstrap_json);
+        .arg(bootstrap_json)
+        .current_dir(&dir);
     let (ownership, path_acl, restricted_pid) = if name == NEW_VALIDATOR {
         // The runner's home directory is private, so execute an identical copy under /tmp.
         let executable = dir.join("qualification-node");
