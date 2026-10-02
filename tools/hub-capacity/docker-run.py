@@ -402,6 +402,9 @@ def execute_qualification(args):
             if phase == "candidate":
                 docker.execute(coordinator, "python3", "-B", "-I", "/tools/prepare.py", "phase", "/qualification/deployment", phase,
                                "/binaries/telcoin-network", "/tools/profile-v1.json")
+            # The host publishes runtime metadata here; key files keep their existing ownership.
+            docker.execute(coordinator, "chown", f"{os.getuid()}:{os.getgid()}",
+                           f"/qualification/deployment/{phase}")
             run_phase(docker, coordinator, hubs, population, phase, plan, revision)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/qualify.py", "score", "/qualification/plan.json",
                        "/qualification/baseline-evidence/evidence.json", "/qualification/candidate-evidence/evidence.json",
