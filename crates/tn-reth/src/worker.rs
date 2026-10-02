@@ -13,6 +13,7 @@
 //! respawned when the epoch rolls over).
 
 use crate::{error::TnRethResult, ChainSpec, RethEnv, RpcServer, WorkerTxPool};
+use futures::StreamExt as _;
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -40,6 +41,8 @@ pub struct WorkerComponents {
     rpc_server: RpcServer,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
+    /// Relay late admissions to worker 0 while this worker has no batch builder.
+    pool_handoff: Option<tokio::task::JoinHandle<()>>,
     /// Keep the WorkerNetwork around so we can update it's task(s).
     network: WorkerNetwork,
 }
@@ -52,7 +55,7 @@ impl WorkerComponents {
         pool: WorkerTxPool,
         network: WorkerNetwork,
     ) -> Self {
-        Self { rpc_handle: Some(rpc_handle), rpc_server, pool, network }
+        Self { rpc_handle: Some(rpc_handle), rpc_server, pool, pool_handoff: None, network }
     }
 
     /// Return the RPC handle only while this worker is active.
@@ -60,30 +63,47 @@ impl WorkerComponents {
         self.rpc_handle.as_ref()
     }
 
-    /// Stop accepting transactions while retaining the pool for a later reactivation.
+    /// Stop RPC and hand all admitted transactions to an active worker.
     ///
-    /// A removed worker has no batch builder. Keep its shim unavailable and align its stored
-    /// fee with the accumulator's fallback for a removed slot, including canonical updates.
-    pub fn deactivate(&mut self) {
+    /// The empty pool and RPC modules survive for reactivation. Subscribe before stopping RPC
+    /// because reth's stop signal does not wait for in-flight requests. A relay handles their late
+    /// admissions until reactivation. Parked transactions are migrated under the destination fee,
+    /// even if the removed slot's fallback fee promotes them locally.
+    pub async fn deactivate(&mut self, destination: &WorkerTxPool) {
         self.network.set_syncing(true);
+        let admissions = self.pool.admitted_transactions();
         self.pool.set_epoch_base_fee(MIN_PROTOCOL_BASE_FEE);
         self.rpc_handle.take().into_iter().for_each(|handle| {
             let _ = handle.stop().inspect_err(|error| {
                 tracing::warn!(target: "tn::execution", ?error, "worker RPC already stopped");
             });
         });
+        self.pool.migrate_transactions_to(destination).await;
+        if self.pool_handoff.is_none() {
+            let pool = self.pool.clone();
+            let destination = destination.clone();
+            self.pool_handoff = Some(tokio::spawn(async move {
+                admissions.for_each(|()| pool.migrate_transactions_to(&destination)).await;
+            }));
+        }
     }
 
     /// Refresh the pool's epoch fee before reopening a stopped worker's RPC listeners.
     ///
-    /// Running listeners are reused. The retained modules keep existing transactions in the
-    /// same pool, and the per-query fee handle resolves the reactivated accumulator slot.
+    /// Running listeners are reused. Stop the retired-pool relay before reopening admission;
+    /// transactions already handed off remain with the active worker. The per-query fee handle
+    /// resolves the reactivated accumulator slot.
     pub async fn restart_rpc(
         &mut self,
         reth_env: &RethEnv,
         worker_id: WorkerId,
         base_fee: u64,
     ) -> TnRethResult<()> {
+        futures::future::OptionFuture::from(self.pool_handoff.take().map(|task| async move {
+            task.abort();
+            let _ = task.await;
+        }))
+        .await;
         self.pool.set_epoch_base_fee(base_fee);
         if self.rpc_handle.is_none() {
             self.rpc_handle = Some(reth_env.start_rpc(&self.rpc_server, worker_id).await?);
@@ -99,6 +119,13 @@ impl WorkerComponents {
     /// Return the worker network inteface (RPC helper) for this worker.
     pub fn worker_network(&self) -> &WorkerNetwork {
         &self.network
+    }
+}
+
+impl Drop for WorkerComponents {
+    /// Stop the relay when the retained worker components leave the node.
+    fn drop(&mut self) {
+        self.pool_handoff.take().into_iter().for_each(|task| task.abort());
     }
 }
 

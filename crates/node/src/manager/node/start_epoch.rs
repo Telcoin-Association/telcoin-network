@@ -1318,7 +1318,7 @@ mod tests {
 
     /// Epoch entry reuses worker 0's early RPC and joins worker peer waits concurrently.
     /// Subsequent entries reuse active RPC servers and pools, refresh sync state, and stop and
-    /// reactivate removed workers over their retained pools.
+    /// reactivate removed workers over empty retained pools after handing transactions to worker 0.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
@@ -1328,10 +1328,10 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
-        use tn_reth::RethEnv;
+        use tn_reth::{recover_raw_transaction, test_utils::TransactionFactory, RethEnv};
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
-        use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
+        use tn_types::{Address, BlsKeypair, Bytes, P2pNode, MIN_PROTOCOL_BASE_FEE, U256};
 
         let temp = tempfile::TempDir::new()?;
         let keys =
@@ -1354,6 +1354,7 @@ mod tests {
             .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
         let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let chain = Arc::new(config.chain_spec());
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
         let reth_env =
@@ -1493,6 +1494,29 @@ mod tests {
         let rpc_one = engine.worker_http_local_address(&1).await?;
         let worker_one_address = rpc_one.ok_or_else(|| eyre!("worker one address"))?;
         let retained_pool = engine.get_worker_transaction_pool(&1).await?;
+        let mut factory = TransactionFactory::new();
+        let pending = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let pending_hash = *pending.hash();
+        retained_pool.add_recovered_transaction_external(pending).await?;
+        let parked = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            50_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let parked_hash = *parked.hash();
+        retained_pool.add_recovered_transaction_external(parked).await?;
+        assert_eq!(retained_pool.pool_size().pending, 1);
+        assert_eq!(retained_pool.pool_size().basefee, 1);
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
         let info: serde_json::Value = client.request("tn_info", jsonrpsee::rpc_params![]).await?;
         assert_eq!(
@@ -1563,6 +1587,28 @@ mod tests {
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert!(engine.is_worker_initialized(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+        let active_pool = engine.get_worker_transaction_pool(&DEFAULT_WORKER_ID).await?;
+        assert!(retained_pool.get(&pending_hash).is_none());
+        assert!(retained_pool.get(&parked_hash).is_none());
+        assert!(active_pool.get(&pending_hash).is_some());
+        assert!(active_pool.get(&parked_hash).is_some());
+        assert_eq!(active_pool.pool_size().basefee, 1);
+
+        // Model a request admitted after reth's non-blocking RPC stop and the initial drain.
+        let late = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let late_hash = *late.hash();
+        retained_pool.add_recovered_transaction_external(late).await?;
+        wait_until(Duration::from_secs(5), "late retired admission handed to worker 0", || async {
+            Ok(active_pool.get(&late_hash).is_some() && retained_pool.get(&late_hash).is_none())
+        })
+        .await?;
         wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
             Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
         })
@@ -1595,6 +1641,20 @@ mod tests {
         assert!(engine.is_worker_initialized(1).await);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
+        assert!(retained_pool.pending_transactions().is_empty());
+        assert!(retained_pool.queued_transactions().is_empty());
+        let fresh = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let fresh_hash = *fresh.hash();
+        retained_pool.add_recovered_transaction_external(fresh).await?;
+        assert!(retained_pool.get(&fresh_hash).is_some());
+        assert!(active_pool.get(&fresh_hash).is_none());
         let reactivated =
             engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
         let syncing: serde_json::Value =
