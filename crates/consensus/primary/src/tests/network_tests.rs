@@ -13,6 +13,7 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
@@ -2524,6 +2525,122 @@ async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
         "the repeat request must be answered from the cached verdict"
     );
     assert_matches!(repeat, PrimaryResponse::Error(_), "the cached verdict must be permanent");
+
+    Ok(())
+}
+
+/// A tier-two header is deferred before the voter checks its seed signature, so a header the voter
+/// will not vote on yet costs it no BLS verify.
+///
+/// The header leads the local clock by the drift tolerance plus half the vote timeout and carries
+/// a seed signature over another epoch's seed message, which the seed check refuses with
+/// `InvalidSeedSignature` (see `test_vote_rejects_invalid_seed_signature`). The drift tier needs
+/// only the header and the clock, so the voter decides it first and answers `RecoverableError`.
+/// The deferral counter moving by one shows the answer is the tier-two one. The answer also leaves
+/// the author's vote-cache entry as it was, so a valid header from the same author for the same
+/// round still earns a vote. Had the seed check run first, its cached error would refuse that
+/// header as `AlreadyVotedForLaterRound`.
+#[tokio::test]
+async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+    };
+
+    // the middle of tier two, so the lead is still in it when the request arrives
+    let lead = tolerance + vote_timeout / 2;
+    let ahead = builder()
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .seed_signature(author.seed_signature(42, 1))
+        .build();
+    assert_matches!(
+        handler.vote(peer, ahead, vec![]).await,
+        Ok(PrimaryResponse::RecoverableError(_)),
+        "a tier-two header must be deferred before its seed signature is checked"
+    );
+    let deferrals = snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.votes_deferred_future_header_total").then_some(value)
+    });
+    assert_matches!(
+        deferrals,
+        Some(DebugValue::Counter(1)),
+        "the recoverable answer must be the tier-two deferral"
+    );
+
+    let legit = builder().created_at(1).build();
+    assert_matches!(
+        handler.vote(peer, legit, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the deferral must leave the author free to earn a vote in the same round"
+    );
+
+    Ok(())
+}
+
+/// A tier-three header is rejected before the voter waits for its execution block.
+///
+/// The header leads the local clock by more than the drift tolerance plus the vote timeout and
+/// names execution block 1, which this node has not reached (the fixture stops at block 0). The
+/// execution wait would suspend on that block until the vote timeout fired and end the request as
+/// a `Timeout`, which carries no penalty (see `test_vote_inner_timeout`). The drift tier is decided
+/// first instead: the answer is `InvalidTimestamp` with its severe penalty. The paused clock moves
+/// only while every task waits, so a call that never waits takes no virtual time.
+#[tokio::test(start_paused = true)]
+async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    // anti-vacuity: the execution wait would suspend on this block rather than fail at once
+    assert!(
+        consensus_bus.latest_execution_block_num_hash().number < unexecuted.number,
+        "the voter must not have executed the header's block yet"
+    );
+    let lead = tolerance + vote_timeout + Duration::from_secs(1);
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(unexecuted)
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let created_at = header.created_at_ms();
+
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header, vec![])
+        .await
+        .expect_err("a header beyond the vote window must be rejected");
+    let waited = start.elapsed();
+
+    assert_matches!(
+        &err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
+            if *created == created_at,
+        "the drift tier must reject the header before the execution wait; the request ended \
+         after {waited:?}"
+    );
+    assert_eq!(waited, Duration::ZERO, "the voter must not wait for the header's execution block");
+    assert_matches!(
+        Option::<Penalty>::from(&err),
+        Some(Penalty::Severe),
+        "a header beyond the vote window must cost the author a severe penalty"
+    );
 
     Ok(())
 }

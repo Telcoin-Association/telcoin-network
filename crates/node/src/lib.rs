@@ -11,7 +11,7 @@ use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
-use tn_rpc::{EngineToPrimary, RpcNodeInfo};
+use tn_rpc::{ConsensusStorageError, EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -134,22 +134,19 @@ impl EngineToPrimary for EngineToPrimaryRpc {
         &self,
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
-    ) -> Option<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_digest(epoch, digest).await {
-            Ok(header) => header,
-            Err(e) => {
-                // an unreadable pack is a hard error in storage, but rpc callers only learn
-                // "not found"; the warn keeps the storage failure visible to operators
-                tracing::warn!(
-                    target: "engine",
-                    ?e,
-                    epoch,
-                    ?digest,
-                    "consensus header lookup failed"
-                );
-                None
-            }
-        }
+    ) -> Result<Option<ConsensusHeader>, ConsensusStorageError> {
+        self.consensus_chain.consensus_header_by_digest(epoch, digest).await.map_err(|e| {
+            // rpc callers only learn that the lookup failed, never why; the warn is where
+            // operators see the storage error
+            tracing::warn!(
+                target: "engine",
+                ?e,
+                epoch,
+                ?digest,
+                "consensus header lookup failed"
+            );
+            ConsensusStorageError
+        })
     }
 
     fn node_info(&self) -> &tn_rpc::RpcNodeInfo {

@@ -713,10 +713,10 @@ impl CommittedSubDag {
         if leader_ms >= min_ms {
             return leader_ms;
         }
-        // the previous leader of the same epoch is an ancestor of this one and certified parents
-        // are strictly older post-fork, so an in-epoch clamp needs an earlier clamp at the epoch
-        // seam; it stays a warning as a tripwire. the first commit of an epoch is routinely
-        // raised above the previous epoch's closing timestamp, which is expected
+        // the previous leader of the same epoch is normally an ancestor of this one (after a
+        // schedule change it can be one committed indirectly), and certified parents are strictly
+        // older post-fork, so an in-epoch clamp normally follows one at the epoch seam and is a
+        // tripwire warning. raising an epoch's first commit above the previous close is expected
         if previous_sub_dag.is_some_and(|s| s.leader_epoch() == leader.epoch()) {
             warn!(
                 target: "tn::consensus",
