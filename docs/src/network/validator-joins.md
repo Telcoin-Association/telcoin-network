@@ -16,7 +16,7 @@ must advance and the direct committee connections must survive.
 ## Predeclared acceptance limits
 
 These limits qualify the accelerated loopback fixture. They are not measurements of a
-provider's propagation delay or of a production WAN. The fixture uses five-second epochs,
+provider's propagation delay or of a production WAN. The fixture uses 15-second epochs,
 a one-second transition grace, a 300-second snapshot lease, and two workers charging fee 7.
 Each invocation runs five independent samples without retrying a failed qualification.
 

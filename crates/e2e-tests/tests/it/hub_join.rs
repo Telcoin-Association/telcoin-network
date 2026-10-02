@@ -23,6 +23,8 @@ const CONNECTION_BUDGET: Duration = Duration::from_secs(60);
 const CONSENSUS_BUDGET: Duration = Duration::from_secs(120);
 /// Disposable numeric identity used only by the joining child on the Linux runner.
 const JOIN_UID: &str = "59599";
+/// Allow all five validators a full leader cycle within each accelerated epoch.
+const JOIN_EPOCH_DURATION: u64 = 15;
 
 /// State of the fixture's UDP provider ACL, restored before the runner is reused.
 enum PathAclState {
@@ -426,7 +428,7 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
         (NEW_VALIDATOR, new_validator.address()),
         governance.address(),
         &committee,
-        EPOCH_DURATION,
+        JOIN_EPOCH_DURATION,
         &["0:1:7", "1:1:7"],
     )?;
     let hub_dir = base.join("open-hub");
@@ -512,6 +514,10 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
     let connected = started.elapsed();
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider.clone());
     let author = AuthorityIdentifier::from(joining.info.bls_public_key);
+    let leader_seen = std::sync::atomic::AtomicBool::new(false);
+    let leader_epoch = std::sync::atomic::AtomicU32::new(0);
+    let current_state = std::sync::atomic::AtomicBool::new(false);
+    let closed_state = std::sync::atomic::AtomicBool::new(false);
     wait_until(
         CONSENSUS_BUDGET,
         "current activation, closed swarms, and own consensus leader",
@@ -522,15 +528,49 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 .await
                 .is_ok_and(|info| info.committee.contains(&new_validator.address()));
             let closed = joining.all_swarms("tn_network_admission_mode", 2.0).unwrap_or(false);
-            let leads = qualification_header(joining.rpc()?)
-                .is_ok_and(|header| header.sub_dag.leader().author() == &author);
-            Ok(current && closed && leads)
+            let leads = qualification_header(joining.rpc()?).is_ok_and(|header| {
+                let own = header.sub_dag.leader().author() == &author;
+                if own {
+                    leader_epoch.store(
+                        header.sub_dag.leader().epoch(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                own
+            });
+            current_state.store(current, std::sync::atomic::Ordering::Relaxed);
+            closed_state.store(closed, std::sync::atomic::Ordering::Relaxed);
+            leader_seen.fetch_or(leads, std::sync::atomic::Ordering::Relaxed);
+            Ok(current && closed && leader_seen.load(std::sync::atomic::Ordering::Relaxed))
         },
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        println!(
+            "consensus gate current={} closed={} leader_seen={}",
+            current_state.load(std::sync::atomic::Ordering::Relaxed),
+            closed_state.load(std::sync::atomic::Ordering::Relaxed),
+            leader_seen.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        println!(
+            "latest leader observation={:?}",
+            qualification_header(joining.rpc().unwrap_or_default()).map(|header| (
+                header.number,
+                header.sub_dag.leader().epoch(),
+                header.sub_dag.leader().author().clone()
+            ))
+        );
+        println!(
+            "admission metrics={:?}",
+            super::super::common::scrape_metrics(&joining.metrics).map(|body| body
+                .lines()
+                .filter(|line| line.starts_with("tn_network_admission_"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>())
+        );
+    })?;
     let ready = started.elapsed();
-    let header = qualification_header(joining.rpc()?)?;
-    let epoch = header.sub_dag.leader().epoch();
+    let epoch = leader_epoch.load(std::sync::atomic::Ordering::Relaxed);
     fetch_verified_epoch_record(joining.rpc()?, epoch, 120).await?;
     let before_hub_loss = provider.get_block_number().await?;
     hub.stop()?;
@@ -553,6 +593,7 @@ async fn hub_join_governance_two_workers() -> eyre::Result<()> {
                 "swarms": REQUIRED_SWARMS,
             }, "conditions": {
             "transport": "loopback QUIC", "worker_fees": [7, 7],
+            "epoch_duration_seconds": JOIN_EPOCH_DURATION,
             "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
                 "transition_grace_seconds": 1, "snapshot_lease_seconds": 300,
             }, "publication_ms": published.as_millis(),
