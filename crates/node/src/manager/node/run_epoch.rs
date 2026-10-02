@@ -304,7 +304,13 @@ where
             };
 
         let consensus_config = self
-            .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
+            .configure_consensus(
+                network_config,
+                committee,
+                next_committee_keys,
+                prior_epoch_record,
+                epoch_start,
+            )
             .await?;
 
         // Epoch-entry agreement check (issue #556): the committee's worker count sizes the
@@ -378,9 +384,9 @@ where
             self.epoch_boundary,
         );
 
-        // Drain the previous cache once, before any new builder can write this epoch's batches.
-        self.orphan_batches(&epoch_task_manager, engine.clone(), workers.clone(), current_epoch)
-            .await?;
+        // Snapshot the previous cache before any new builder can write this epoch's batches.
+        // Recovery removes only completed snapshot entries, retaining unfinished work on shutdown.
+        self.orphan_batches(engine.clone(), workers.clone(), current_epoch).await?;
 
         let batch_builder_task_spawner = epoch_task_manager.get_spawner();
         futures::stream::iter(&mut workers)
@@ -566,7 +572,7 @@ where
         mut output: ConsensusOutput,
     ) -> eyre::Result<()> {
         let last_forwarded_consensus_number = output.number();
-        if output.committed_at() >= self.epoch_boundary {
+        if output.reaches_epoch_boundary(self.epoch_boundary) {
             // update output so engine closes epoch
             output.set_epoch_close();
         }
@@ -625,7 +631,7 @@ where
                 OutputContinuity::Next => {}
             }
             // observe epoch boundary to initiate epoch transition
-            if output.committed_at() >= self.epoch_boundary {
+            if output.reaches_epoch_boundary(self.epoch_boundary) {
                 info!(
                     target: "epoch-manager",
                     epoch=?output.leader().epoch(),

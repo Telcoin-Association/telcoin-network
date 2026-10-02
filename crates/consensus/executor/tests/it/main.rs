@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::Duration,
 };
 use tempfile::TempDir;
 use tn_executor::subscriber::spawn_subscriber;
@@ -18,9 +19,10 @@ use tn_primary::{
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
-    now, test_chain_spec_arc, Batch, BlockHash, CommittedSubDag, ConsensusHeaderDigest,
-    ConsensusNumHash, ExecHeader, Hash as _, HeaderBuilder, HeaderDigest, ReputationScores,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
+    forks::subsecond_timestamp_active, now, test_chain_spec_arc, Batch, BlockHash, CommittedSubDag,
+    ConsensusHeaderDigest, ConsensusNumHash, EpochSeedChainValue, ExecHeader, Hash as _,
+    HeaderBuilder, HeaderDigest, ReputationScores, SealedHeader, TaskManager, TimestampMs,
+    TimestampSec, TnReceiver as _, TnSender as _, WorkerId, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
@@ -734,6 +736,129 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
         Some(true),
         "last batch must close the epoch"
     );
+
+    Ok(())
+}
+
+/// Test that the subscriber decides the epoch boundary on the whole-second grid when commit
+/// times carry milliseconds.
+///
+/// Feeds three crafted subdags directly to the subscriber, bypassing Bullshark. Their leaders
+/// commit at `(B - 1)·1000 + 999`, `B·1000` and `B·1000 + 400` ms against an epoch boundary of
+/// `B` seconds. Only the second reaches the boundary on the sequence path: the first is 1 ms
+/// short even though it rounds to `B` at the nearest second. The third also reaches the
+/// boundary, but the subscriber stops pulling after the second, so the third stays queued in
+/// the sequence channel.
+#[tokio::test]
+async fn test_subscriber_epoch_boundary_mid_second() -> eyre::Result<()> {
+    const BOUNDARY: TimestampSec = 1_700_000_000;
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let mut task_manager = TaskManager::new("mid-second epoch boundary tests");
+    let rx_shutdown = config.shutdown().subscribe();
+    let consensus_bus = ConsensusBus::new();
+    let temp_dir = TempDir::with_prefix("test_subscriber_epoch_boundary_mid_second").unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // network mock to handle publish commands, on its own manager so waiting for the
+    // subscriber's shutdown below does not wait on it
+    let network_tasks = TaskManager::new("network mock");
+    let (tx, mut rx) = mpsc::channel(5);
+    network_tasks.spawn_task("publish replies", async move {
+        while let Some(com) = rx.recv().await {
+            if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                reply.send(Ok(MessageId::new(&[0]))).unwrap();
+            }
+        }
+        Ok(())
+    });
+    let network = PrimaryNetworkHandle::new_for_test(tx);
+
+    spawn_subscriber(
+        config.clone(),
+        rx_shutdown,
+        consensus_bus.clone(),
+        &task_manager,
+        network,
+        consensus_chain.clone(),
+        BOUNDARY,
+    );
+    tokio::task::yield_now().await;
+
+    // leaders 1 ms short of the boundary, exactly on it, and 400 ms past it
+    let leader_ms = [
+        TimestampMs::from_parts(BOUNDARY - 1, 999),
+        TimestampMs::from_parts(BOUNDARY, 0),
+        TimestampMs::from_parts(BOUNDARY, 400),
+    ];
+    let parents: BTreeSet<HeaderDigest> = fixture.genesis().collect();
+    let mut sub_dags: Vec<CommittedSubDag> = Vec::with_capacity(leader_ms.len());
+    for ((round, authority), created_at) in (1u32..).zip(fixture.authorities()).zip(leader_ms) {
+        let header = HeaderBuilder::default()
+            .author(authority.id())
+            .round(round)
+            .epoch(0)
+            .parents(parents.clone())
+            .build();
+        let mut leader = fixture.certificate(&header);
+        leader.update_header_created_at_ms_for_test(created_at);
+        let seed_chain = sub_dags.last().map_or_else(
+            EpochSeedChainValue::genesis_placeholder,
+            CommittedSubDag::seed_chain_value,
+        );
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            u64::from(round),
+            ReputationScores::default(),
+            sub_dags.last().cloned(),
+            seed_chain,
+        );
+        sub_dags.push(sub_dag);
+    }
+
+    // each leader is at least 1 ms past the previous commit, so the commit clamp keeps every
+    // leader's time; the sub-second part survives only while the fork gate holds for epoch 0
+    let millis_active = subsecond_timestamp_active(0);
+    for (sub_dag, created_at) in sub_dags.iter().zip(leader_ms) {
+        let expected =
+            if millis_active { created_at } else { TimestampMs::from_parts(created_at.secs(), 0) };
+        assert_eq!(sub_dag.commit_timestamp_ms(), expected, "commit time for leader {created_at}");
+    }
+    let reaches: Vec<bool> =
+        sub_dags.iter().map(|sub_dag| sub_dag.reaches_epoch_boundary(BOUNDARY)).collect();
+    assert_eq!(reaches, [false, true, true], "boundary predicate on the seconds grid");
+
+    // feed all three before reading any output, so a subscriber that kept pulling past the
+    // boundary would find the third already queued
+    for sub_dag in sub_dags.iter().cloned() {
+        consensus_bus.sequence().send(sub_dag).await?;
+    }
+
+    // the first two come out in order and only the second is at the boundary
+    for (expected, reaches_boundary) in sub_dags.iter().zip([false, true]) {
+        let output = tokio::time::timeout(Duration::from_secs(10), consensus_output.recv())
+            .await
+            .expect("timed out waiting for consensus output — subscriber may have crashed")
+            .expect("consensus output");
+        assert_eq!(output.sub_dag().digest(), expected.digest(), "outputs out of order");
+        assert_eq!(output.reaches_epoch_boundary(BOUNDARY), reaches_boundary);
+    }
+
+    // once the subscriber exits its sequence receiver is restored to the channel, so a fresh
+    // subscription sees exactly what the subscriber never pulled
+    config.shutdown().notify();
+    task_manager.wait_for_task_shutdown().await;
+    assert!(consensus_output.try_recv().is_err(), "no output past the epoch boundary");
+    let mut rx_sequence = consensus_bus.subscribe_sequence();
+    let unconsumed = rx_sequence.try_recv().expect("third subdag must never be pulled");
+    assert_eq!(unconsumed.digest(), sub_dags[2].digest());
+    assert!(rx_sequence.try_recv().is_err(), "only the third subdag is left unconsumed");
 
     Ok(())
 }

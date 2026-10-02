@@ -285,8 +285,7 @@ Start your observer node:
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
 Node role is derived from committee membership: a key outside the current committee runs as an
-observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
-chain.
+observer. To take a validator out of consensus, exit it on chain.
 
 
 ### Using local config
@@ -306,7 +305,6 @@ telcoin-network node \
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
 | `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
 | `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
-| `--observer`          | `false`        | Deprecated, hidden no-op. Node role follows committee membership.                              |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
@@ -491,6 +489,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + `max_header_time_drift_tolerance` (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -522,6 +521,7 @@ header_num_of_batches_threshold: 5
 max_header_num_of_batches: 10
 max_header_delay: 3s
 min_header_delay: 1s
+vote_timeout: 5s
 gc_depth: 50
 sync_retry_delay: 5s
 sync_retry_nodes: 3
@@ -745,10 +745,8 @@ telcoin-network node \
 Observers still require key generation (`keytool generate observer`) and the genesis files. They need the same genesis config and parameters as validators.
 
 An observer generates its own network identity keys for P2P connectivity. If its key joins the
-committee, the node takes the validator role and participates once caught up. `--observer` remains
-accepted for compatibility, but is hidden from CLI help and only logs a deprecation warning
-([#1355](https://github.com/Telcoin-Association/telcoin-network/issues/1355)). It cannot keep a seated
-validator out of consensus; exit the validator on chain to do that.
+committee, the node takes the validator role and participates once caught up. To take a validator
+out of consensus, exit it on chain.
 
 ## Security considerations
 

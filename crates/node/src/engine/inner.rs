@@ -40,8 +40,8 @@ pub(super) struct ExecutionNodeInner {
     pub(super) tn_config: Config,
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
-    /// Collection of execution components by worker.
-    /// Index of vec is worker id.
+    /// Initialized execution components indexed by worker id.
+    /// Removed workers retain their pools with stopped RPC listeners until reactivation.
     pub(super) workers: Vec<WorkerComponents>,
 }
 
@@ -134,6 +134,7 @@ impl ExecutionNodeInner {
     }
 
     /// Initialize the worker's transaction pool and public RPC.
+    /// Peer tracking is attached separately when the worker enters an epoch.
     /// Must call this function in accending worker_id order or will panic,
     /// for instance call for worker id 0, then 1, etc.
     ///
@@ -144,7 +145,6 @@ impl ExecutionNodeInner {
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
-        network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
         base_fee: BaseFeeContainer,
         worker_base_fee: WorkerBaseFee,
@@ -156,7 +156,6 @@ impl ExecutionNodeInner {
 
         let network = WorkerNetwork::new(
             self.reth_env.chainspec(),
-            network_handle,
             self.tn_config.version,
             self.reth_env.clone(),
         );
@@ -182,7 +181,7 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server, worker_id).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
+        let components = WorkerComponents::new(rpc_handle, server, transaction_pool, network);
         // Must call this function in accending worker_id order or will panic.
         if worker_id as usize != self.workers.len() {
             panic!("initialize_worker_components not called with sequencial worker ids!")
@@ -236,12 +235,15 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
-    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    /// Push the node's consensus catch-up state into each active worker's RPC network shim.
     ///
     /// The epoch manager's node-mode watch task drives this on every mode change so the
     /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
     pub(super) fn set_workers_syncing(&self, syncing: bool) {
-        self.workers.iter().for_each(|worker| worker.worker_network().set_syncing(syncing));
+        self.workers
+            .iter()
+            .filter(|worker| worker.rpc_handle().is_some())
+            .for_each(|worker| worker.worker_network().set_syncing(syncing));
     }
 
     /// Create a new block validator.
@@ -323,14 +325,13 @@ impl ExecutionNodeInner {
         self.reth_env.clone()
     }
 
-    /// Return a worker's RpcServerHandle if the RpcServer exists.
+    /// Return a running worker's RPC handle, or an error if absent or stopped.
     pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
-        let handle = self
-            .workers
-            .get(*worker_id as usize)
+        self.workers
+            .get(usize::from(*worker_id))
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .rpc_handle();
-        Ok(handle)
+            .rpc_handle()
+            .ok_or_else(|| eyre!("worker {worker_id} RPC is stopped"))
     }
 
     /// Return a worker's HttpClient if the RpcServer exists.

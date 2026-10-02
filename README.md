@@ -31,8 +31,7 @@ Start your observer node:
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
 Node role is derived from committee membership: a key outside the current committee runs as an
-observer. `--observer` is deprecated and ignored. To take a validator out of consensus, exit it on
-chain.
+observer. To take a validator out of consensus, exit it on chain.
 
 ### Run a validator
 

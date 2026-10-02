@@ -8,11 +8,11 @@
 //! management, ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held
 //! behind an `Arc`, so cloning the shim is cheap.
 //!
-//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC server handle, the
-//! worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
+//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC modules and active handle,
+//! the worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
 //! respawned when the epoch rolls over).
 
-use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use crate::{error::TnRethResult, ChainSpec, RethEnv, RpcServer, WorkerTxPool};
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -28,13 +28,16 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_types::{WorkerId, MIN_PROTOCOL_BASE_FEE};
 use tn_worker::WorkerNetworkHandle;
 
 /// Execution components on a per-worker basis.
 #[derive(Debug)]
 pub struct WorkerComponents {
-    /// The RPC handle.
-    rpc_handle: RpcServerHandle,
+    /// The running RPC handle, absent while this worker is outside the committee.
+    rpc_handle: Option<RpcServerHandle>,
+    /// Built RPC modules retained for reactivation over the same transaction pool.
+    rpc_server: RpcServer,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
     /// Keep the WorkerNetwork around so we can update it's task(s).
@@ -43,13 +46,49 @@ pub struct WorkerComponents {
 
 impl WorkerComponents {
     /// Create a new instance of [Self].
-    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool, network: WorkerNetwork) -> Self {
-        Self { rpc_handle, pool, network }
+    pub fn new(
+        rpc_handle: RpcServerHandle,
+        rpc_server: RpcServer,
+        pool: WorkerTxPool,
+        network: WorkerNetwork,
+    ) -> Self {
+        Self { rpc_handle: Some(rpc_handle), rpc_server, pool, network }
     }
 
-    /// Return a reference to the rpc handle
-    pub fn rpc_handle(&self) -> &RpcServerHandle {
-        &self.rpc_handle
+    /// Return the RPC handle only while this worker is active.
+    pub fn rpc_handle(&self) -> Option<&RpcServerHandle> {
+        self.rpc_handle.as_ref()
+    }
+
+    /// Stop accepting transactions while retaining the pool for a later reactivation.
+    ///
+    /// A removed worker has no batch builder. Keep its shim unavailable and align its stored
+    /// fee with the accumulator's fallback for a removed slot, including canonical updates.
+    pub fn deactivate(&mut self) {
+        self.network.set_syncing(true);
+        self.pool.set_epoch_base_fee(MIN_PROTOCOL_BASE_FEE);
+        self.rpc_handle.take().into_iter().for_each(|handle| {
+            let _ = handle.stop().inspect_err(|error| {
+                tracing::warn!(target: "tn::execution", ?error, "worker RPC already stopped");
+            });
+        });
+    }
+
+    /// Refresh the pool's epoch fee before reopening a stopped worker's RPC listeners.
+    ///
+    /// Running listeners are reused. The retained modules keep existing transactions in the
+    /// same pool, and the per-query fee handle resolves the reactivated accumulator slot.
+    pub async fn restart_rpc(
+        &mut self,
+        reth_env: &RethEnv,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> TnRethResult<()> {
+        self.pool.set_epoch_base_fee(base_fee);
+        if self.rpc_handle.is_none() {
+            self.rpc_handle = Some(reth_env.start_rpc(&self.rpc_server, worker_id).await?);
+        }
+        Ok(())
     }
 
     /// Return a reference to the worker's transaction pool.
@@ -84,41 +123,33 @@ pub struct WorkerNetwork {
 
 /// Sync flags backing the shim's `eth_syncing` answers.
 ///
-/// `syncing` mirrors whether the node is catching up on consensus output; the node manager
+/// `syncing` starts true while startup synchronization is pending, then the node manager
 /// drives it from the consensus node-mode watch. `completed_initial_sync` latches on the
 /// first caught-up report so `is_initially_syncing` distinguishes the first catch-up of
 /// this process from a later mid-epoch fall-behind.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SyncFlags {
-    /// True while the node is catching up on consensus output.
+    /// True during startup synchronization or while catching up on consensus output.
     syncing: bool,
     /// True once the node has reported caught-up at least once.
     completed_initial_sync: bool,
 }
 
+impl Default for SyncFlags {
+    fn default() -> Self {
+        Self { syncing: true, completed_initial_sync: false }
+    }
+}
+
 impl WorkerNetwork {
-    /// Create a new instance of self.
-    pub fn new(
-        chain_spec: ChainSpec,
-        worker_network: WorkerNetworkHandle,
-        version: &'static str,
-        reth_env: RethEnv,
-    ) -> Self {
-        let peer_count = Arc::new(RwLock::new(0));
-        let peer_count_clone = peer_count.clone();
-        let spawner = worker_network.get_task_spawner().clone();
-        spawner.spawn_task("Worker Network Peers", async move {
-            loop {
-                if let Ok(peers) = worker_network.connected_peers_count().await {
-                    let mut guard = peer_count_clone.write();
-                    *guard = peers;
-                }
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        });
+    /// Create an RPC network shim that reports syncing until the node publishes its mode.
+    ///
+    /// Peer tracking starts separately through [`Self::respawn_peer_count`] when the worker's
+    /// epoch tasks are ready, so RPC can bind before startup waits for peers.
+    pub fn new(chain_spec: ChainSpec, version: &'static str, reth_env: RethEnv) -> Self {
         Self {
             chain_spec: chain_spec.reth_chain_spec(),
-            peer_count,
+            peer_count: Arc::new(RwLock::new(0)),
             version,
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
             reth_env: Some(reth_env),
@@ -145,10 +176,9 @@ impl WorkerNetwork {
     /// The node manager drives this from the consensus node-mode watch; the stock reth
     /// `eth_syncing` handler reads it back through [`NetworkInfo::is_syncing`]. The first
     /// caught-up report latches `completed_initial_sync`, so a later mid-epoch fall-behind
-    /// reports as syncing but no longer as initially syncing. The node boots
-    /// optimistic-current, so the driver's first not-syncing report usually latches the
-    /// initial sync as already complete; `is_initially_syncing` is true only when a
-    /// demotion lands before that first report. Nothing in TN's RPC surface consumes the
+    /// reports as syncing but no longer as initially syncing. Both flags report syncing
+    /// before the first node-mode update, including while startup epoch records are fetched.
+    /// Nothing in TN's RPC surface consumes the
     /// initial-sync distinction today: `eth_syncing` reads only `is_syncing`.
     pub fn set_syncing(&self, syncing: bool) {
         let mut flags = self.sync_flags.write();
@@ -157,7 +187,8 @@ impl WorkerNetwork {
     }
 
     /// Spawn a new task to keep up with peer counts.
-    /// Use this when the epoch rolls over and the worker_network gets a new task manager.
+    /// Call once when the worker enters an epoch, including its first epoch. The previous
+    /// epoch's task manager must stop its task before this is called again.
     pub fn respawn_peer_count(&self, worker_network: WorkerNetworkHandle) {
         let peer_count = self.peer_count.clone();
         let spawner = worker_network.get_task_spawner().clone();
@@ -346,8 +377,8 @@ mod tests {
     #[test]
     fn test_sync_flags_follow_recorded_state() {
         let network = test_network();
-        assert!(!network.is_syncing());
-        assert!(!network.is_initially_syncing());
+        assert!(network.is_syncing());
+        assert!(network.is_initially_syncing());
 
         // A node that starts behind is initially syncing.
         network.set_syncing(true);
