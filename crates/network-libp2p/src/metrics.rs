@@ -149,6 +149,19 @@ impl SwarmMetrics {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct PeerManagerMetricHandles {
+    /// Effective admission mode: Open = 0, Grace = 1, Closed = 2.
+    admission_mode: Gauge,
+    /// Resolved current-committee records, including the local identity.
+    admission_resolved_current: Gauge,
+    /// Minimum authenticated-record quorum for Closed.
+    admission_required_current: Gauge,
+    /// Connected current peers, excluding the local identity.
+    admission_connected_current: Gauge,
+    /// Fallback: healthy = 0, missing = 1, stale = 2, contradictory = 3, unresolved = 4,
+    /// transition = 5.
+    admission_fallback: Gauge,
+    /// Seconds left in the minimum transition interval; zero alone does not authorize Closed.
+    admission_transition_remaining_seconds: Gauge,
     /// Currently connected peers.
     connected_peers: Gauge,
     /// Peers known with a resolved network record (BLS key -> address).
@@ -178,6 +191,35 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Publish admission inputs independently of connections and node consensus readiness.
+    pub(crate) fn set_admission(&self, status: &crate::AdmissionStatus) {
+        let mode = match status.effective() {
+            tn_config::AdmissionMode::Open => 0.0,
+            tn_config::AdmissionMode::Grace => 1.0,
+            tn_config::AdmissionMode::Closed => 2.0,
+        };
+        self.handles.admission_mode.set(mode);
+        self.handles
+            .admission_transition_remaining_seconds
+            .set(status.transition_remaining().as_secs_f64());
+        self.handles
+            .admission_resolved_current
+            .set(u32::try_from(status.resolved_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_required_current
+            .set(u32::try_from(status.required_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_connected_current
+            .set(u32::try_from(status.connected_current()).map_or(f64::MAX, f64::from));
+        self.handles.admission_fallback.set(status.fallback().map_or(0.0, |reason| match reason {
+            crate::AdmissionFallback::Missing => 1.0,
+            crate::AdmissionFallback::Stale => 2.0,
+            crate::AdmissionFallback::Contradictory => 3.0,
+            crate::AdmissionFallback::Unresolved => 4.0,
+            crate::AdmissionFallback::Transition => 5.0,
+        }));
+    }
+
     /// Create the peer manager metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);

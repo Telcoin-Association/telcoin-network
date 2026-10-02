@@ -26,6 +26,8 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Connection admission policy shared by the primary and every worker swarm.
+    admission: AdmissionConfig,
     /// The hostname for the validator.
     hostname: String,
     /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
@@ -38,6 +40,11 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Return this node's connection admission configuration.
+    pub fn admission(&self) -> &AdmissionConfig {
+        &self.admission
+    }
+
     /// Return the configured bootstrap dial hints.
     pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.bootstrap_peers
@@ -145,6 +152,69 @@ impl NetworkConfig {
     pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
         let path = tn_datadir.network_config_path();
         Self::write_to_path(path, self, ConfigFmt::YAML)
+    }
+}
+
+/// Connection admission rollout mode. Authentication and resource limits apply in every mode.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionMode {
+    /// Preserve unrestricted discovery and the existing identity and ban checks.
+    #[default]
+    Open,
+    /// Permit discovery while operators observe and repair the admission inputs.
+    Grace,
+    /// Admit only committee, trusted, and bootstrap identities when inputs are complete.
+    Closed,
+}
+
+/// Settings for renewable, epoch-versioned connection admission snapshots.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct AdmissionConfig {
+    /// Requested rollout mode; an unsafe snapshot always falls back to Open or Grace.
+    mode: AdmissionMode,
+    /// Maximum seconds since the epoch owner last renewed the authoritative snapshot.
+    snapshot_max_age_secs: u64,
+    /// Minimum Grace interval for each accepted epoch, independent of the renewal lease.
+    transition_grace_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300, transition_grace_secs: 30 }
+    }
+}
+
+impl AdmissionConfig {
+    /// Construct a policy with an explicit renewal lease. A zero lease prevents Closed.
+    pub fn new(mode: AdmissionMode, snapshot_max_age: Duration) -> Self {
+        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs(), ..Self::default() }
+    }
+
+    /// Set the minimum transition interval. Zero still requires valid, resolved policy inputs.
+    pub fn with_transition_grace(mut self, interval: Duration) -> Self {
+        self.transition_grace_secs = interval.as_secs();
+        self
+    }
+
+    /// Return the minimum Grace interval measured from acceptance of a new epoch snapshot.
+    pub fn transition_grace(&self) -> Duration {
+        Duration::from_secs(self.transition_grace_secs)
+    }
+
+    /// Return the requested rollout mode.
+    pub fn mode(&self) -> AdmissionMode {
+        self.mode
+    }
+
+    /// Return the snapshot lease, measured with the swarm's monotonic clock.
+    pub fn snapshot_max_age(&self) -> Duration {
+        Duration::from_secs(self.snapshot_max_age_secs)
+    }
+
+    /// Renew at one third of the lease, with a minimum interval of one second.
+    pub fn refresh_interval(&self) -> Duration {
+        Duration::from_secs((self.snapshot_max_age_secs / 3).max(1))
     }
 }
 
