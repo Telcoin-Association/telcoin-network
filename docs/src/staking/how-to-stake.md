@@ -17,7 +17,7 @@ Size the validator host from [Hardware Requirements](../getting-started/hardware
 #### Network Requirements
 
 * Static public IP address
-* Open UDP ports for P2P communication (default: primary and worker ports)
+* Open UDP ports for P2P communication: the primary and worker ports you pass at key generation (49590 and 49594 by convention; the node has no default ports)
 * Reliable, low-latency internet connection
 
 #### Software Requirements

@@ -19,7 +19,7 @@ Permissionless observers need public entry points. Provide those through sentrie
 
 ## Firewall configuration
 
-The default consensus ports are UDP 49590 for the primary network and UDP 49595 for the worker network. RPC and metrics ports are TCP and should remain private unless a dedicated gateway protects them.
+The node has no default consensus ports: it takes them from the primary and worker addresses recorded in `node-info.yaml` at key generation. By convention, validators use UDP 49590 for the primary network and UDP 49594 for the worker network. RPC and metrics ports are TCP and should remain private unless a dedicated gateway protects them.
 
 Apply these controls outside the node process:
 

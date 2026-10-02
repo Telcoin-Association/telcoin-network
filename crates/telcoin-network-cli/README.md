@@ -425,10 +425,12 @@ selection with a warning.
 
 All peer-to-peer communication uses QUIC (v1) over UDP, managed by libp2p. Each node runs two QUIC endpoints:
 
-| Endpoint | Default port | Purpose                                |
-| -------- | ------------ | -------------------------------------- |
-| Primary  | UDP 49590    | Consensus headers, certificates, votes |
-| Worker   | UDP 49595    | Transaction batches                    |
+| Endpoint | Conventional port | Purpose                                |
+| -------- | ----------------- | -------------------------------------- |
+| Primary  | UDP 49590         | Consensus headers, certificates, votes |
+| Worker   | UDP 49594         | Transaction batches                    |
+
+The node has no default for these ports. It takes them from the addresses recorded in `node-info.yaml` at key generation (see [External address configuration](#external-address-configuration)), or from `PRIMARY_LISTENER_MULTIADDR` and `WORKER_LISTENER_MULTIADDR` (worker 0) when set. Validators use the ports above by convention; other free UDP ports work if peers can reach them.
 
 ### External address configuration
 
@@ -439,7 +441,7 @@ telcoin-network keytool generate validator \
     --datadir /var/lib/telcoin \
     --address 0xYOUR_ADDRESS \
     --external-primary-addr /ip4/YOUR_PUBLIC_IP/udp/49590/quic-v1 \
-    --external-worker-addrs /ip4/YOUR_PUBLIC_IP/udp/49595/quic-v1
+    --external-worker-addrs /ip4/YOUR_PUBLIC_IP/udp/49594/quic-v1
 ```
 
 If not set, addresses default to `127.0.0.1` with a random port (only useful for local testing).
@@ -466,12 +468,12 @@ Nodes discover each other through Kademlia DHT (libp2p). Bootstrap peers are loa
 
 ### Firewall requirements
 
-Inbound (must be open):
+Inbound (must be open; the P2P rows use the conventional ports, so substitute the ports in your `node-info.yaml` if you chose others):
 
 | Port  | Protocol | Service                                                       |
 | ----- | -------- | ------------------------------------------------------------- |
 | 49590 | UDP      | Primary consensus P2P                                         |
-| 49595 | UDP      | Worker consensus P2P                                          |
+| 49594 | UDP      | Worker consensus P2P                                          |
 | 8545  | TCP      | HTTP RPC (if enabled; restrict to trusted sources)            |
 | 8546  | TCP      | WebSocket RPC (if enabled; restrict to trusted sources)       |
 | 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
@@ -868,7 +870,7 @@ chmod 600 /var/lib/telcoin/node-keys/*
 - RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting.
 - Health check: The `--healthcheck` endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)). Keep it behind a firewall.
 - Metrics: Restrict Prometheus metrics to your monitoring infrastructure. Do not expose port 9101 publicly.
-- P2P ports: UDP 49590 and 49595 must be reachable by other validators. All other ports should be firewalled.
+- P2P ports: the primary and worker UDP ports from `node-info.yaml` (49590 and 49594 by convention) must be reachable by other validators. All other ports should be firewalled.
 
 ### Proof of possession
 

@@ -41,7 +41,8 @@ observer. To take a validator out of consensus, exit it on chain.
 telcoin-network --datadir DATADIR --bls-passphrase-source ask \
   keytool generate validator \
   --address 0xYOUR_EXECUTION_ADDRESS \
-  --external-primary-addr /ip4/YOUR_IP/udp/PORT/quic-v1
+  --external-primary-addr /ip4/YOUR_IP/udp/49590/quic-v1 \
+  --external-worker-addrs /ip4/YOUR_IP/udp/49594/quic-v1
 ```
 
 This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
@@ -55,7 +56,8 @@ Restore worker key entries using the expected Base58 key printed in the startup 
 configure a separate listen address for each worker.
 
 - `--address` is the execution layer address that receives fees
-- `--external-primary-addr` should be set to the node's public IP and port
+- `--external-primary-addr` and `--external-worker-addrs` should be set to the node's public IP and the UDP ports it listens on (49590 and 49594 by convention; the node has no default P2P ports)
+- without them, key generation records `127.0.0.1` with random ports, which only works for local testing
 
 #### 2. Export staking arguments
 
