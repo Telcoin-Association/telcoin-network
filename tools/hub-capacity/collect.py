@@ -276,6 +276,7 @@ def collect(frozen, bindings, phase, output):
                            "HUB_CAPACITY_PHASE": phase, "HUB_CAPACITY_PLAN_SHA256": QUALIFY.digest(plan)}
             child = subprocess.Popen(bindings["workload"], stdout=log, stderr=log, env=environment)
             while True:
+                completed_before_sample = child.poll() == 0
                 elapsed = 0.0 if not samples else time.monotonic() - started
                 hubs = {}
                 for hub, binding in bindings["hubs"].items():
@@ -291,7 +292,7 @@ def collect(frozen, bindings, phase, output):
                                 "pid": binding["pid"], "stat": stat, "metrics": text})
                     hubs[hub] = {**process, **observations(parse_metrics(text), binding, phase)}
                 samples.append({"elapsed_seconds": elapsed, "hubs": hubs})
-                if elapsed >= plan["envelope"]["duration_seconds"] and child.poll() == 0:
+                if elapsed >= plan["envelope"]["duration_seconds"] and completed_before_sample:
                     break
                 if elapsed >= plan["envelope"]["duration_seconds"] + 30:
                     raise ValueError("workload did not finish within the measured drain interval")

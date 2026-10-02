@@ -128,7 +128,7 @@ def workload_manifest(population):
         {"identity": node["bls_key"], "argv": ["python3", "-B", "-I", "/tools/control.py",
          "--identity", node["bls_key"], "--observations", "http://127.0.0.1:9400"]}
         for node in population["validators"] if node["hub"]]}
-    return {"scenarios": scenarios}
+    return {"scenarios": scenarios, "topology_artifact": "/qualification/links-initial.json"}
 
 
 def stop_process(docker, container, pid_file, command_token):
@@ -224,14 +224,14 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             wait_file(phase_dir / f"{node['name']}.pid", processes)
             wait_file(phase_dir / f"{node['name']}.jsonl", processes)
             stops.append((container, f"{container_dir}/{node['name']}.pid", "/binaries/telcoin-network"))
-        docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "initial",
-                       "--fixture", "/qualification/transactions.json", "--output", f"{container_dir}/initial-transactions.jsonl")
         processes.append(docker.background_execute(coordinator, f"{phase}-peers", "python3", "-B", "-I",
             "/tools/supervise.py", "/qualification/deployment", phase, "/binaries/examples/hub-capacity-peer",
             "--ready", f"{container_dir}/peers-ready.json", "--pid-file", f"{container_dir}/supervisor.pid"))
         wait_file(phase_dir / "supervisor.pid", processes)
         stops.append((coordinator, f"{container_dir}/supervisor.pid", "/tools/supervise.py"))
         wait_file(phase_dir / "peers-ready.json", processes, timeout=180)
+        docker.execute(coordinator, "python3", "-B", "-I", "/tools/traffic.py", "initial",
+                       "--fixture", "/qualification/transactions.json", "--output", f"{container_dir}/initial-transactions.jsonl")
         arguments = ["python3", "-B", "-I", "/tools/observations.py", "--pid-file", f"{container_dir}/observations.pid"]
         for node in population["validators"]:
             arguments += ["--source", f"{node['bls_key']}={container_dir}/{node['name']}.jsonl"]
@@ -345,6 +345,8 @@ def execute_qualification(args):
         manifest = workload_manifest(population)
         manifest["qualification_revision"] = provenance["qualification_revision"]
         manifest["transaction_fixture_sha256"] = digest(output / "transactions.json")
+        manifest["transaction_workload"] = {"initial_count": 128, "initial_interval_seconds": 0.5,
+                                            "measurement_count": 384, "measurement_seconds": 600}
         write_json(output / "manifest.json", manifest)
         docker.execute(coordinator, "python3", "-B", "-I", "/tools/qualify.py", "template", "--output", "/qualification/declaration-template.json")
         plan = json.loads((output / "declaration-template.json").read_text())

@@ -16,6 +16,7 @@ class Observations:
         self.condition = threading.Condition()
         self.publications = OrderedDict()
         self.committee = {hub: deque() for hub in hubs}
+        self.measuring = set()
         self.error = None
 
     def ingest(self, source, record):
@@ -33,7 +34,9 @@ class Observations:
             elif fields["event"] == "committee_request" and source in self.committee:
                 queue = self.committee[source]
                 if len(queue) >= 1024:
-                    raise ValueError("committee observation allocation exhausted")
+                    if source in self.measuring:
+                        raise ValueError("committee observation allocation exhausted")
+                    queue.popleft()
                 queue.append(observation)
             self.condition.notify_all()
 
@@ -51,6 +54,7 @@ class Observations:
                         trace = {**trace, "publication": publication}
                         return {"success": True, "trace": trace, "route": trace["route"]}
                 elif request["scenario"] == "committee_progress":
+                    self.measuring.add(request["identity"])
                     queue = self.committee[request["identity"]]
                     entries = []
                     while queue and len(entries) < 32:

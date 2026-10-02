@@ -80,7 +80,7 @@ def feed(fixture, url, output, stream, pid_file):
     inputs = json.loads(fixture.read_text())
     if inputs["chain_id"] != CHAIN or inputs["count"] != 512 or len(inputs["transactions"]) != 512:
         raise ValueError("transaction fixture does not match the declared workload")
-    start, end, interval = (128, 512, 600 / 384) if stream else (0, 128, 0.05)
+    start, end, interval = (128, 512, 600 / 384) if stream else (0, 128, 0.5)
     if pid_file:
         pid_file.write_text(str(os.getpid()))
     origin = time.monotonic()
@@ -101,6 +101,7 @@ def targets(url, output, observations):
     if height > 2048:
         raise ValueError("warmup block observations exceed the declared 2048-block bound")
     blocks = [rpc(url, "eth_getBlockByNumber", [hex(number), False]) for number in range(1, height + 1)]
+    observations.write_text(json.dumps({"rpc_url": url, "height": height, "blocks": blocks}, separators=(",", ":")) + "\n")
     if not blocks or any(block is None for block in blocks):
         raise ValueError("warmup has no complete canonical block observations")
     current_epoch = int(blocks[-1]["nonce"], 16) >> 32
@@ -113,7 +114,6 @@ def targets(url, output, observations):
                      if len(digests) >= 4), None)
     if selected is None:
         raise ValueError("warmup has no completed epoch with four executed nonempty batches")
-    observations.write_text(json.dumps({"rpc_url": url, "height": height, "blocks": blocks}, separators=(",", ":")) + "\n")
     output.write_text(json.dumps({"sync_epoch": selected[0], "batch_digests": selected[1]}, separators=(",", ":")) + "\n")
 
 

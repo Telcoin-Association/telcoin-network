@@ -23,6 +23,16 @@ TRAFFIC, WORKLOAD = load("traffic"), load("workload")
 
 
 class TrafficTests(unittest.TestCase):
+    def test_failed_target_selection_retains_canonical_observations(self):
+        block = {"nonce": "0x0", "sha3Uncles": "0x" + "a" * 64, "transactions": ["fixture"]}
+        with tempfile.TemporaryDirectory(prefix="capacity-target-observations-") as directory:
+            output, observations = Path(directory) / "targets.json", Path(directory) / "canonical.json"
+            with patch.object(TRAFFIC, "rpc", side_effect=[hex(TRAFFIC.CHAIN), "0x1", block]):
+                with self.assertRaisesRegex(ValueError, "no completed epoch"):
+                    TRAFFIC.targets("http://10.147.0.10:8545", output, observations)
+            self.assertEqual(json.loads(observations.read_text())["blocks"], [block])
+            self.assertFalse(output.exists())
+
     def test_bulk_rejects_missing_worker_or_empty_transfer(self):
         digests = ["0x" + f"{number:064x}" for number in range(1, 5)]
         valid = {"completed": True, "transfers": [
