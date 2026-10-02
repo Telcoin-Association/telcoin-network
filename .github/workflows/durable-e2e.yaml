@@ -119,7 +119,7 @@ jobs:
               'budget': ('0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL',
                          '0..MAX_ADMISSION_RECONCILIATIONS_PER_POLL * 8'),
               'physical': ('!pending.contains(peer)',
-                           '!pending.contains(peer) && self.is_connected(peer)'),
+                           '!pending.contains(peer) && self.peers.get_peer(peer).is_some_and(|info| matches!(info.connection_status(), ConnectionStatus::Connected { .. }))'),
               'cleanup': ('was_live || self.is_peer_connected_or_disconnecting(&peer_id)',
                           'was_live && false || self.is_peer_connected_or_disconnecting(&peer_id)'),
               'fairness': ('let pending: HashSet<_> =',
