@@ -120,7 +120,7 @@ def phase_inputs(root, phase, binary, profile_path):
                              "--bls-passphrase-source", "no-passphrase", "--http", "--http.addr", "0.0.0.0",
                              "--http.port", "8545", "--ipcdisable", "--node-name", node["name"],
                              "--metrics", "0.0.0.0:9000", "--log.stdout.format", "json"],
-                   "environment": {"RUST_LOG": "info,network=trace,network-kad=trace,peer-manager=debug"},
+                   "environment": {"RUST_LOG": "info,network::capacity=debug"},
                    "log": str(output / f"{node['name']}.jsonl"), "pid_file": str(output / f"{node['name']}.pid")}
         write_json(output / f"{node['name']}-command.json", command)
     peers = output / "peers"
@@ -139,7 +139,7 @@ def phase_inputs(root, phase, binary, profile_path):
         network["source_admission"].update({"max_connections": 12, "max_connections_per_address": 12,
                                             "max_connections_per_prefix": 12, "max_sources": 12})
         network["gossip_mesh"] = {"target": 2, "low": 1, "high": 4, "outbound_min": 1}
-        write_json(peers / f"{peer['name']}.json", {"seed": peer["seed"], "network": network,
+        write_json(peers / f"{peer['name']}.json", {"seed": peer["seed"], "network": network, "chain_id": CHAIN_ID,
                    "listen": [address(peer["ip"], role) for role in range(3)],
                    "control": f"{peer['ip']}:9500", "required_hubs": [node["bls_key"] for node in nodes[:2]],
                    "target": nodes[index % 2]["bls_key"], "sync_epoch": 0})
