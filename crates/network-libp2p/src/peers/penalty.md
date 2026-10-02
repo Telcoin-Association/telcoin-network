@@ -201,46 +201,46 @@ malformed certificate it did not write.
 
 ### 5.3 `penalty_from_header_error`
 
-Source: `crates/consensus/primary/src/error/network.rs:210-260`.
+Source: `crates/consensus/primary/src/error/network.rs:210-273`.
 
 | `HeaderError` variant              | Severity | Source                                                  |
 | ---------------------------------- | -------- | ------------------------------------------------------- |
-| `SyncBatches(_)`                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:213` |
-| `TooNew { .. }`                    | `Mild`   | `crates/consensus/primary/src/error/network.rs:213` |
-| `InvalidParents`                   | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `WrongNumberOfParents(_, _)`       | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `TooOld { .. }`                    | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `InvalidTimestamp { .. }`          | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `InvalidSeedSignature`             | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `AlreadyVotedForLaterRound { .. }` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidTimestampMillis(_)`        | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
-| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
-| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `SyncBatches(_)`                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:216-218` |
+| `TooNew { .. }`                    | `Mild`   | `crates/consensus/primary/src/error/network.rs:216-218` |
+| `InvalidParents`                   | `Medium` | `crates/consensus/primary/src/error/network.rs:220-222` |
+| `WrongNumberOfParents(_, _)`       | `Medium` | `crates/consensus/primary/src/error/network.rs:220-222` |
+| `TooOld { .. }`                    | `Mild`   | `crates/consensus/primary/src/error/network.rs:216-218` |
+| `InvalidTimestamp { .. }`          | `Severe` | `crates/consensus/primary/src/error/network.rs:232-234` |
+| `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:232-234` |
+| `InvalidSeedSignature`             | `Severe` | `crates/consensus/primary/src/error/network.rs:232-234` |
+| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidTimestampMillis(_)`        | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:249-262` |
+| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:249-262` |
+| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `AlreadyVotedForLaterRound { .. }` | None     | `crates/consensus/primary/src/error/network.rs:263-271` |
 
 `InvalidSeedSignature` is `Severe` rather than `Fatal` on purpose.
 The seed message is anchored to the verifier's local `prior_epoch_record`, so a node whose record diverged
 signs an anchor no peer accepts and rejects every honest peer's header.
 `Fatal` would make that ban mutual, total and non-self-healing — neither side could ever repair its record
 from the other once both have banned. `Severe` still suppresses a genuinely bad signer while leaving a
-divergent node a path back. `crates/consensus/primary/src/error/network.rs:220-226`.
+divergent node a path back. `crates/consensus/primary/src/error/network.rs:225-231`.
 
 `InvalidTimestampMillis(_)` is `Fatal` because no honest node can produce it.
 An honest `created_at_millis` is derived from a millisecond timestamp and is always below 1000,

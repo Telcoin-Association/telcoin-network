@@ -221,8 +221,10 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => {
             Some(Penalty::Load(LoadPenalty::Synchronization))
         }
+        // `TooOld` is mild for the same reason as `CertificateError::TooOld`: an honest peer's
+        // vote request can fall behind this node's round while it is queued or in flight.
+        HeaderError::TooOld { .. } => Some(Penalty::Mild),
         // medium
-        HeaderError::TooOld { .. } => Some(Penalty::Load(LoadPenalty::EpochBoundary)),
         HeaderError::InvalidParents | HeaderError::WrongNumberOfParents(_, _) => {
             Some(Penalty::Medium)
         }
@@ -239,8 +241,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentRound
         | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
         // fatal
-        HeaderError::AlreadyVotedForLaterRound { .. }
-        | HeaderError::AlreadyVoted(_, _)
+        HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
         | HeaderError::TooManyBatches(_, _)
@@ -267,12 +268,33 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
+        // ignore (stale request, not a fault)
+        //
+        // This node already decided on a later header from the same author, so the request is
+        // stale. An honest proposer sends one vote request per round, and the requests it queued
+        // while this node was unreachable all arrive on reconnect, in any order. Refusing the
+        // stale header is enough. A fatal penalty here banned every committee peer of a
+        // restarted validator. The error carries rounds but no epoch, so a different header for
+        // the same round cannot be told apart from a stale request of an earlier epoch.
+        HeaderError::AlreadyVotedForLaterRound { .. } => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vote requests that an honest author queued while this node was down arrive together on
+    /// reconnect, and every one older than the first answered fails as
+    /// `AlreadyVotedForLaterRound`. A penalty that bans for this bans the whole committee.
+    #[test]
+    fn stale_vote_request_is_not_penalized() {
+        let stale = PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 8,
+            ours: 14,
+        });
+        assert!(Option::<Penalty>::from(&stale).is_none());
+    }
 
     /// Finding 2 (#819): faults determined by the gossip envelope's content — a malformed payload
     /// (`Decode`) or a wrong declared topic (`InvalidTopic`) — are the message author's, so the

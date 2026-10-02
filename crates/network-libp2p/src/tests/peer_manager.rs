@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
@@ -429,7 +430,7 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
-/// Legacy trusted registration retains its load exemption and creates exactly one dial.
+/// Trusted registration creates one dial, exempts load, and preserves protocol bans.
 #[tokio::test]
 async fn test_add_trusted_peer() -> eyre::Result<()> {
     let config = ScoreConfig::default();
@@ -465,12 +466,14 @@ async fn test_add_trusted_peer() -> eyre::Result<()> {
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // Load penalties do not affect retention privileges.
-    peer_manager.process_penalty(peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+    // Load penalties do not affect a trusted peer's score or ban status.
+    peer_manager.process_penalty(peer_id, Penalty::Load(LoadPenalty::Timeout));
     assert!(!peer_manager.peer_banned(&peer_id));
-    let score =
-        peer_manager.peer_score(&peer_id).ok_or_else(|| eyre::eyre!("missing trusted score"))?;
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
+
+    // Protocol violations can still ban a trusted peer.
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    assert!(peer_manager.peer_banned(&peer_id));
     Ok(())
 }
 
