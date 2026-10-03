@@ -20,7 +20,7 @@ QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
 
 # Leave eight control-server slots for handlers finishing timed-out commands.
-MAX_ACTIVE_COMMANDS = 48
+MAX_ACTIVE_COMMANDS = 64
 
 
 def validate_manifest(plan, manifest):
@@ -28,8 +28,8 @@ def validate_manifest(plan, manifest):
     if set(manifest["scenarios"]) != QUALIFY.SCENARIOS:
         raise ValueError("manifest must implement every required scenario")
     for scenario, definition in manifest["scenarios"].items():
-        if QUALIFY.integer(definition["concurrency"], "driver concurrency", 1) > 16:
-            raise ValueError("driver concurrency must not exceed sixteen")
+        if QUALIFY.integer(definition["concurrency"], "driver concurrency", 1) > 32:
+            raise ValueError("driver concurrency must not exceed thirty-two")
         if not 0 <= QUALIFY.number(definition.get("offset_fraction", 0), "schedule offset") < 1:
             raise ValueError("schedule offset must be between zero and one")
         if QUALIFY.integer(definition.get("burst_size", 1), "burst size", 1) > definition["concurrency"]:

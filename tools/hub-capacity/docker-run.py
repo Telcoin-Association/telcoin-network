@@ -146,7 +146,7 @@ def workload_manifest(population):
                  for name, concurrency, peers in [
                      ("public_join", 2, ordinary),
                      ("shared_nat_reconnect", 2, [peer for peer in ordinary if peer["nat"]]),
-                     ("gossip_two_hops", 16, ordinary), ("record_lookup", 4, ordinary),
+                     ("gossip_two_hops", 32, ordinary), ("record_lookup", 4, ordinary),
                      ("submit_url_lookup", 4, ordinary), ("concurrent_sync", 8, ordinary),
                      ("dao_connectivity", 4, dao) ]}
     scenarios["shared_nat_reconnect"]["offset_fraction"] = 0.5

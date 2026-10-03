@@ -20,7 +20,7 @@ SPEC.loader.exec_module(WORKLOAD)
 class WorkloadTests(unittest.TestCase):
     def test_declared_overlap_has_execution_headroom(self):
         concurrency = {"committee_progress": 4, "concurrent_sync": 8,
-                       "dao_connectivity": 4, "gossip_two_hops": 16,
+                       "dao_connectivity": 4, "gossip_two_hops": 32,
                        "public_join": 2, "record_lookup": 4,
                        "shared_nat_reconnect": 2, "submit_url_lookup": 4}
         overlap = threading.Barrier(sum(concurrency.values()))
@@ -60,8 +60,8 @@ class WorkloadTests(unittest.TestCase):
             with patch.object(WORKLOAD, "execute", execute):
                 WORKLOAD.run(plan, manifest, output, time.monotonic())
             operations = [json.loads(line) for line in output.read_text().splitlines()]
-            self.assertEqual(peak, 44)
-            self.assertEqual(len(operations), 45)
+            self.assertEqual(peak, 60)
+            self.assertEqual(len(operations), 61)
             self.assertTrue(all(entry["success"] for entry in operations))
 
     def test_total_driver_capacity_preserves_refused_attempts(self):

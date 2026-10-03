@@ -1599,6 +1599,8 @@ where
                     // silently dropping it.
                     if let Err(ref e) = vote {
                         if let Some(penalty) = e.into() {
+                            warn!(target: "primary-network", ?peer, ?penalty, error = %e,
+                                "vote request rejected with a peer penalty");
                             network_handle.report_penalty(peer, penalty).await;
                         }
                     }
@@ -1657,6 +1659,8 @@ where
                         // penalize peer's reputation for bad request
                         if let Err(err) = &header {
                             if let Some(penalty) = err.into() {
+                                warn!(target: "primary-network", ?peer, ?penalty, error = %err,
+                                    "epoch record request rejected with a peer penalty");
                                 network_handle.report_penalty(peer, penalty).await;
                             }
                         }

@@ -123,11 +123,11 @@ def handler_for(observations):
 
 
 class BoundedServer(ThreadingHTTPServer):
-    """At most 64 active private control handlers, with no queued application tasks."""
+    """At most 72 active private control handlers, with no queued application tasks."""
     daemon_threads = True
 
     def __init__(self, *args):
-        self.slots = threading.BoundedSemaphore(64)
+        self.slots = threading.BoundedSemaphore(72)
         super().__init__(*args)
 
     def process_request(self, request, client_address):

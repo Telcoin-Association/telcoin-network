@@ -42,6 +42,64 @@ class SupervisorTests(unittest.TestCase):
                          [request["operation_id"] for request in requests])
         self.assertTrue(all(result["success"] for result in results))
 
+    def test_nat_restart_excludes_transport_to_the_stopped_process(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        restarting, release, ordinary_waiting = threading.Event(), threading.Event(), threading.Event()
+        mutex = threading.Lock()
+
+        class CoordinatedLock:
+            def __enter__(self):
+                if restarting.is_set():
+                    ordinary_waiting.set()
+                mutex.acquire()
+
+            def __exit__(self, *_error):
+                mutex.release()
+
+        peer.lock = CoordinatedLock()
+        peer.process = mock.Mock(pid=123)
+        peer.process.poll.return_value = None
+
+        def start():
+            peer.process = mock.Mock(pid=456)
+            peer.generation = 1
+
+        def ready():
+            restarting.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("test did not release restart")
+            restarting.clear()
+            return {"identity": "declared-peer"}
+
+        def transport(request, timeout):
+            payload = json.loads(request.data)
+            was_restarting = restarting.is_set()
+            if payload["scenario"] == "gossip_two_hops":
+                ordinary_waiting.set()
+                if was_restarting:
+                    raise ConnectionRefusedError("the owned process is stopped")
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                **payload, "identity": "declared-peer", "success": True}).encode()
+            return response
+
+        with mock.patch.object(peer, "stop"), mock.patch.object(peer, "start", side_effect=start), \
+                mock.patch.object(peer, "wait_ready", side_effect=ready), \
+                mock.patch.object(SUPERVISE.urllib.request, "urlopen", side_effect=transport), \
+                ThreadPoolExecutor(max_workers=2) as executor:
+            reconnect = executor.submit(peer.command, {"operation_id": "reconnect", "scenario": "shared_nat_reconnect"})
+            self.assertTrue(restarting.wait(timeout=2))
+            ordinary = executor.submit(peer.command, {"operation_id": "ordinary", "scenario": "gossip_two_hops"})
+            try:
+                self.assertTrue(ordinary_waiting.wait(timeout=2))
+            finally:
+                release.set()
+            results = [reconnect.result(timeout=2), ordinary.result(timeout=2)]
+        self.assertTrue(all(result["success"] for result in results))
+        self.assertEqual(results[0]["trace"]["restart"]["old_pid"], 123)
+        self.assertEqual(results[0]["trace"]["restart"]["new_pid"], 456)
+
     def test_shutdown_signals_every_child_before_shared_wait(self):
         peers = [SUPERVISE.Peer({}, Path("unused"), Path("unused")) for _ in range(4)]
         clock = [0.0]

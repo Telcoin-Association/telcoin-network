@@ -77,7 +77,9 @@ class Peer:
                 self.log.close()
 
     def command(self, request):
-        if request["scenario"] != "shared_nat_reconnect":
+        if self.stopping:
+            raise ValueError("peer supervisor is shutting down")
+        if request["scenario"] != "shared_nat_reconnect" and not self.declaration["nat"]:
             if self.stopping:
                 raise ValueError("peer supervisor is shutting down")
             return self.forward(request, request, None)
