@@ -37,6 +37,183 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     )
 }
 
+/// Protected peers do not consume the hub profile's ordinary-peer admission slots.
+#[tokio::test]
+async fn public_peer_limit_preserves_protected_headroom() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    let keys =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([81; 32])));
+    let network_key = keys.primary_network_public_key();
+    let protected: PeerId = network_key.clone().into();
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    let (reply, _receiver) = oneshot::channel();
+    manager.add_trusted_peer_and_dial(
+        keys.primary_public_key(),
+        NetworkInfo {
+            pubkey: network_key,
+            multiaddrs: vec![address.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
+        reply,
+    );
+    assert!(manager.register_peer_connection(
+        &protected,
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.register_peer_connection(
+        &PeerId::random(),
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    assert!(manager.peer_limit_reached(&endpoint));
+    manager.set_public_peer_limit(None);
+    assert!(!manager.peer_limit_reached(&endpoint));
+}
+
+/// Pending dials do not consume established public slots or appear as live connections.
+#[tokio::test]
+async fn public_peer_limit_excludes_pending_dials() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    manager.register_dial_attempt(PeerId::random(), None);
+    manager.register_dial_attempt(PeerId::random(), None);
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert!(manager.connected_peers().is_empty());
+    let established = PeerId::random();
+    assert!(manager.register_peer_connection(
+        &established,
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    assert!(!manager.peer_limit_reached(&endpoint));
+    assert_eq!(manager.connected_peers(), vec![established]);
+}
+
+/// DAO connectivity follows the declared identity rather than any other protected connection.
+#[tokio::test]
+async fn dao_metrics_track_identity_and_disconnection() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        let mut manager = create_test_peer_manager(None);
+        manager.set_public_peer_limit(std::num::NonZeroUsize::new(1));
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([83; 32])));
+        let public_key = keys.primary_public_key();
+        let network_key = keys.primary_network_public_key();
+        let observer: PeerId = network_key.clone().into();
+        let address = create_multiaddr(None);
+        manager.add_bootstrap_peer(
+            public_key,
+            NetworkInfo {
+                pubkey: network_key,
+                multiaddrs: vec![address.clone()],
+                timestamp: now(),
+                rpc: None,
+            },
+        );
+        manager.set_dao_observers(HashSet::from([public_key]));
+        assert!(manager.peer_is_important(&observer));
+        assert!(manager
+            .peer_policy(&observer)
+            .applies(Penalty::Load(crate::peers::penalty::LoadPenalty::KademliaFlood)));
+        assert!(manager.register_peer_connection(
+            &observer,
+            ConnectionType::IncomingConnection { multiaddr: address }
+        ));
+        register_peer(&mut manager, None);
+        manager.heartbeat();
+        let measured = |snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+                        name,
+                        expected| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "network" && label.value() == "primary")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        let snapshot = recorder.snapshotter().snapshot().into_vec();
+        assert!(measured(&snapshot, "tn_network.dao_observers_connected", 1.0));
+        assert!(measured(&snapshot, "tn_network.ordinary_peers_connected", 1.0));
+        manager.register_disconnected(&observer);
+        manager.heartbeat();
+        let snapshot = recorder.snapshotter().snapshot().into_vec();
+        assert!(measured(&snapshot, "tn_network.dao_observers_connected", 0.0));
+        assert!(measured(&snapshot, "tn_network.ordinary_peers_connected", 1.0));
+        manager.set_dao_observers(HashSet::new());
+        assert!(!manager.peer_is_important(&observer));
+    });
+}
+
+/// Committee rotation reclaims public slots even below the aggregate connection ceiling.
+#[tokio::test]
+async fn public_peer_limit_prunes_after_committee_rotation() {
+    let mut manager = create_test_peer_manager(None);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(2));
+    let keys =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([82; 32])));
+    let protocol_key = keys.primary_public_key();
+    let network_key = keys.primary_network_public_key();
+    let protected: PeerId = network_key.clone().into();
+    let address = create_multiaddr(None);
+    manager.add_known_peer(
+        protocol_key,
+        NetworkInfo {
+            pubkey: network_key,
+            multiaddrs: vec![address.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
+    );
+    manager.update_committees(HashSet::new(), HashSet::from([protocol_key]), HashSet::new());
+    assert!(manager.register_peer_connection(
+        &protected,
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    register_peer(&mut manager, None);
+    register_peer(&mut manager, None);
+    manager.heartbeat();
+    let initial_events = collect_all_events(&mut manager);
+    assert!(!initial_events.iter().any(|event| {
+        matches!(event, PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _))
+    }));
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(!manager.peer_is_important(&protected));
+    let rotated_events = collect_all_events(&mut manager);
+    assert_eq!(
+        rotated_events
+            .iter()
+            .filter(|event| {
+                matches!(event, PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _))
+            })
+            .count(),
+        1,
+    );
+}
+
 /// Helper function to extract events of a certain type
 fn extract_events<'a>(
     events: &'a [PeerEvent],
@@ -131,8 +308,9 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
+/// Trusted peers retain load privileges while authenticated protocol faults remain bannable.
 #[tokio::test]
-async fn test_add_trusted_peer() {
+async fn test_add_trusted_peer() -> eyre::Result<()> {
     let config = ScoreConfig::default();
     let mut peer_manager = create_test_peer_manager(None);
     let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
@@ -156,19 +334,22 @@ async fn test_add_trusted_peer() {
         sender,
     );
 
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
 
     // Verify a dial request was created
-    let dial_request = peer_manager.next_dial_request().unwrap();
+    let dial_request = peer_manager
+        .next_dial_request()
+        .ok_or_else(|| eyre::eyre!("trusted peer did not produce a dial request"))?;
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // assert penalty doesn't affect trusted peer
+    // Overload retains trust privileges; authenticated protocol violations do not.
+    peer_manager.process_penalty(peer_id, Penalty::Load(crate::LoadPenalty::Timeout));
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
     peer_manager.process_penalty(peer_id, Penalty::Fatal);
-    assert!(!peer_manager.peer_banned(&peer_id));
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert!(peer_manager.peer_banned(&peer_id));
+    assert!(peer_manager.peer_score(&peer_id).is_some_and(|score| score < config.max_score));
+    Ok(())
 }
 
 #[tokio::test]

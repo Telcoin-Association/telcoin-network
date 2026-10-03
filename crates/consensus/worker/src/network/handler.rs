@@ -4,11 +4,7 @@ use super::{
     handle::WorkerNetworkHandle,
     message::WorkerGossip,
 };
-use crate::{
-    batch_fetcher::get_batch_local_cache,
-    metrics::WorkerMetrics,
-    network::{stream_codec, MAX_CONCURRENT_GOSSIP_PREFETCHES},
-};
+use crate::{batch_fetcher::get_batch_local_cache, metrics::WorkerMetrics, network::stream_codec};
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
@@ -18,6 +14,11 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
+    types::NetworkType,
     write_frame, GossipMessage, Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -26,7 +27,6 @@ use tn_types::{
     ensure, now, try_decode, Batch, BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch,
     WorkerId, B256,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 /// Total timeout for sending all batches over a stream.
@@ -63,8 +63,8 @@ impl Drop for PrefetchPermit {
 /// Try to admit one gossip-triggered batch prefetch for `digest`.
 ///
 /// Returns `None` to skip the prefetch when either guard trips:
-/// - concurrency: the semaphore already holds [`MAX_CONCURRENT_GOSSIP_PREFETCHES`] in-flight
-///   prefetches, so load is shed rather than amplified;
+/// - concurrency: the semaphore already holds its configured maximum in-flight prefetches, so load
+///   is shed rather than amplified;
 /// - dedup: a prefetch for `digest` is already in flight, so a re-gossiped digest collapses to a
 ///   single fetch.
 ///
@@ -80,7 +80,10 @@ fn try_admit_prefetch(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     // Dedup: skip (releasing `permit`) when a prefetch for this digest is already in
     // flight. `insert` returns `false` when the digest is already present.
-    in_flight.lock().insert(digest).then_some(())?;
+    in_flight.lock().insert(digest).then_some(()).or_else(|| {
+        semaphore.record_rejection(ServeRejection::Duplicate);
+        None
+    })?;
     Some(PrefetchPermit { _permit: permit, in_flight: in_flight.clone(), digest })
 }
 
@@ -107,7 +110,7 @@ pub struct RequestHandler<DB> {
     /// retained only while its permit is held).
     in_flight_prefetch: Arc<Mutex<HashSet<B256>>>,
     /// Caps concurrent gossip-triggered batch prefetches at
-    /// [`MAX_CONCURRENT_GOSSIP_PREFETCHES`], shedding beyond that to bound the fetch
+    /// the configured `serve_limits.prefetch`, shedding beyond that to bound the fetch
     /// fan-out a Byzantine author can trigger by gossiping many distinct digests.
     prefetch_semaphore: Arc<Semaphore>,
 }
@@ -124,6 +127,7 @@ where
         network_handle: WorkerNetworkHandle,
     ) -> Self {
         let metrics = WorkerMetrics::new_for_worker(id);
+        let prefetch_limit = consensus_config.network_config().serve_limits().prefetch();
         Self {
             id,
             validator,
@@ -131,7 +135,11 @@ where
             network_handle,
             metrics,
             in_flight_prefetch: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GOSSIP_PREFETCHES)),
+            prefetch_semaphore: Arc::new(Semaphore::new_for(
+                prefetch_limit,
+                ServeClass::Prefetch,
+                &NetworkType::Worker(id),
+            )),
         }
     }
 
@@ -425,11 +433,12 @@ where
 
 #[cfg(test)]
 mod prefetch_tests {
-    use super::{try_admit_prefetch, MAX_CONCURRENT_GOSSIP_PREFETCHES};
+    use super::try_admit_prefetch;
+    use crate::network::MAX_CONCURRENT_GOSSIP_PREFETCHES;
     use parking_lot::Mutex;
     use std::{collections::HashSet, sync::Arc};
+    use tn_network_libp2p::capacity::CapacitySemaphore as Semaphore;
     use tn_types::B256;
-    use tokio::sync::Semaphore;
 
     /// A prefetch pool sized to the production cap.
     fn new_pool() -> (Arc<Semaphore>, Arc<Mutex<HashSet<B256>>>) {

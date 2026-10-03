@@ -1,0 +1,43 @@
+{
+  "gossip_mesh": {
+    "target": 12,
+    "low": 8,
+    "high": 16,
+    "outbound_min": 4
+  },
+  "public_peer_limit": 64,
+  "peer_config": {
+    "target_num_peers": 86,
+    "peer_excess_factor": 0.0,
+    "priority_peer_excess": 0.0,
+    "target_outbound_only_factor": 0.2,
+    "min_outbound_only_factor": 0.1,
+    "max_banned_peers": 512,
+    "max_disconnected_peers": 512,
+    "max_temporarily_banned_peers": 512
+  },
+  "process_budget": {
+    "swarm_count": 3,
+    "max_established_connections": 516,
+    "max_established_connections_per_peer": 2,
+    "max_inbound_streams": 4128,
+    "max_receive_credit_bytes": 1073741824
+  },
+  "source_admission": {
+    "max_connections": 516,
+    "max_connections_per_peer": 6,
+    "max_connections_per_address": 128,
+    "max_connections_per_prefix": 384,
+    "max_sources": 516,
+    "ipv4_prefix_length": 24,
+    "ipv6_prefix_length": 64
+  },
+  "serve_limits": {
+    "epoch_stream": 5,
+    "epoch_record": 5,
+    "primary_shed": 8,
+    "batch_stream": 5,
+    "worker_shed": 8,
+    "prefetch": 8
+  }
+}

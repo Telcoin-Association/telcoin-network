@@ -30,9 +30,7 @@ use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::{ConsensusBus, NodeMode};
 use tn_reth::{error::StateReadError, RethEnv};
-use tn_storage::{
-    certificate_pack::CertificatePack, epoch_records::EpochRecordDb, tables::OurNodeBatchesCache,
-};
+use tn_storage::{certificate_pack::CertificatePack, epoch_records::EpochRecordDb};
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
@@ -48,6 +46,25 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// before the rest are aborted. Matches the epoch task manager's join wait: epoch handoff must not
 /// wait long.
 const EPOCH_TASK_EXIT_GRACE: Duration = Duration::from_millis(200);
+
+/// Concrete node recovery adapter shared by every worker in the epoch.
+#[derive(Clone)]
+struct WorkerLocalBatchRecovery {
+    /// Persistent worker pools share the RethEnv's accepted-byte owner.
+    pools: std::sync::Arc<Vec<tn_reth::WorkerTxPool>>,
+}
+
+impl tn_worker::LocalBatchRecovery for WorkerLocalBatchRecovery {
+    fn cache_resolved(&self, batch: &tn_types::Batch) -> bool {
+        self.pools
+            .first()
+            .is_some_and(|pool| pool.local_batch_canonically_resolved(batch.transactions()))
+    }
+
+    fn observer_accepted(&self, digest: tn_types::BlockHash) {
+        self.pools.iter().for_each(|pool| pool.mark_observer_seal(digest));
+    }
+}
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -344,8 +361,21 @@ where
         let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
+        let cache_gate = reth_env.local_batch_cache_gate();
+        let seal_locks = reth_env.local_batch_seal_locks();
+        let pools = engine.get_all_worker_transaction_pools().await;
+        let local_recovery = WorkerLocalBatchRecovery { pools: std::sync::Arc::new(pools) };
         let mut workers = futures::stream::iter(&worker_nodes)
-            .then(|worker_node| worker_node.new_worker())
+            .then(|worker_node| {
+                let cache_gate = cache_gate.clone();
+                let local_recovery = local_recovery.clone();
+                let seal_locks = seal_locks.clone();
+                async move {
+                    worker_node.new_worker().await.map(|worker| {
+                        worker.with_local_recovery(cache_gate, seal_locks, local_recovery)
+                    })
+                }
+            })
             .try_collect::<Vec<_>>()
             .await?;
         let current_epoch = primary.current_committee().await.epoch();
@@ -583,8 +613,9 @@ where
     ///
     /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
-    /// evicted from [`OurNodeBatchesCache`] (they have reached execution, so we no longer need to
-    /// rebroadcast them), then the output is sent. `last_forwarded_consensus_number` is updated
+    /// retained in [`tn_storage::tables::OurNodeBatchesCache`] until canonical nonce resolution or
+    /// validated replay.
+    /// `last_forwarded_consensus_number` is updated
     /// only after the send succeeds, so the restart-replay and leftover-drain paths can rely on
     /// it marking what actually reached the engine rather than what was merely dequeued.
     pub(super) async fn process_output(
@@ -597,13 +628,8 @@ where
             // update output so engine closes epoch
             output.set_epoch_close();
         }
-        // Now that this output has made it to execution (or almost) clear any of
-        // batches from our batches cache.
-        for digest in output.batch_digests().iter() {
-            if let Err(e) = self.consensus_db.remove::<OurNodeBatchesCache>(digest) {
-                error!(target: "epoch-manager", "Remove from our batches cache failed with error: {:?}", e);
-            }
-        }
+        // Sending consensus output does not prove that every accepted transaction executed.
+        // The durable cache keeps ownership through nonce gaps and process restarts.
         // only forward the output to the engine
         to_engine.send(output).await?;
         // store number after successful send

@@ -4184,6 +4184,7 @@ mod test {
         }
 
         // Each saved number returns Some(bytes) that decode back to the original output.
+        assert!(outputs.len() >= num_outputs, "all expected outputs must be retained");
         for (i, expected) in outputs.iter().enumerate().take(num_outputs) {
             let number = i as u64 + 1;
             let bytes = consensus_chain

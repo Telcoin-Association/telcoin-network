@@ -16,11 +16,15 @@ use parking_lot::Mutex;
 use rand::{seq::SliceRandom as _, Rng};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
     error::NetworkError,
     read_frame,
     types::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        NetworkResult, NetworkType,
     },
     write_frame, DenyReason, GossipMessage, Penalty, PrimarySyncRequest, ResponseChannel, Stream,
     StreamError, SyncFrame, SyncFrameError,
@@ -36,11 +40,36 @@ use tn_types::{
     ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
     Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, WorkerId,
 };
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
 mod sync_codec;
+
+/// Observe a real vote request, including errors and cancellation, when capacity tracing is
+/// enabled.
+struct VoteObservation {
+    /// Monotonic request start for its complete duration, including retries.
+    started: std::time::Instant,
+    /// Signed header being voted on.
+    header: HeaderDigest,
+    /// Authenticated committee destination.
+    peer: BlsPublicKey,
+    /// Whether the request reached a final response rather than cancellation or an early error.
+    completed: bool,
+    /// Whether that final response was a vote or a missing-parent response.
+    success: bool,
+}
+
+impl Drop for VoteObservation {
+    fn drop(&mut self) {
+        debug!(target: "network::capacity", event = "committee_request",
+            header = %self.header, peer = %self.peer, completed = self.completed,
+            success = self.success, latency_us = %self.started.elapsed().as_micros(),
+            unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_micros()), "capacity observation");
+    }
+}
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -111,7 +140,7 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// stream is dropped without spawning (the requester sees a reset and retries
 /// elsewhere), so the primary's total sync-task fan-out stays bounded by
 /// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
-pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+pub const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Longest peer-supplied error text, in characters, that a vote request keeps.
 ///
@@ -279,10 +308,15 @@ fn try_admit_sync(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *sync_guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -310,10 +344,15 @@ pub(crate) fn try_admit_epoch_record(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut guard = peers.lock();
     let count = guard.get(&peer).copied().unwrap_or(0);
-    (count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
-    })
+    (count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Primary network specific handle.
@@ -442,47 +481,61 @@ impl PrimaryNetworkHandle {
         header: Header,
         parents: Vec<Certificate>,
     ) -> NetworkResult<RequestVoteResult> {
-        let header = Arc::new(header);
-        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-        let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??.result;
-        let mut tries = 0;
-        while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            debug!(
-                target: "primary::network",
-                %peer,
-                error = %clip_peer_error(s),
-                "recoverable vote error, retrying"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut observation = VoteObservation {
+            started: std::time::Instant::now(),
+            header: header.digest(),
+            peer,
+            completed: false,
+            success: false,
+        };
+        let result = async {
+            let header = Arc::new(header);
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-            let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??.result;
-            tries += 1;
-            if tries > 5 {
-                break;
+            let res = self.handle.send_request(request, peer).await?;
+            let mut res = res.await??.result;
+            let mut tries = 0;
+            while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    error = %clip_peer_error(s),
+                    "recoverable vote error, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let request =
+                    PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+                let res_raw = self.handle.send_request(request, peer).await?;
+                res = res_raw.await??.result;
+                tries += 1;
+                if tries > 5 {
+                    break;
+                }
+            }
+            match res {
+                PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
+                // still recoverable after the retries above: report it as retryable so the caller
+                // backs off and asks again rather than giving up on this peer for the header
+                PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCRetryable(clip_peer_error(s)))
+                }
+                PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCError(clip_peer_error(s)))
+                }
+                PrimaryResponse::MissingParents(parents) => {
+                    Ok(RequestVoteResult::MissingParents(parents))
+                }
+                PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is epoch record!".to_string(),
+                )),
+                PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is peer exchange!".to_string(),
+                )),
             }
         }
-        match res {
-            PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            // still recoverable after the retries above: report it as retryable so the caller
-            // backs off and asks again rather than giving up on this peer for the header
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(clip_peer_error(s)))
-            }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCError(clip_peer_error(s)))
-            }
-            PrimaryResponse::MissingParents(parents) => {
-                Ok(RequestVoteResult::MissingParents(parents))
-            }
-            PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is epoch record!".to_string(),
-            )),
-            PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is peer exchange!".to_string(),
-            )),
-        }
+        .await;
+        observation.completed = true;
+        observation.success = result.is_ok();
+        result
     }
 
     /// Fetch missing certificates from `peer` over the typed sync protocol.
@@ -1425,13 +1478,18 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             consensus_chain.clone(),
         );
-        let epoch_stream_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+        let epoch_stream_semaphore = Arc::new(Semaphore::new_for(
+            serve.epoch_stream(),
+            ServeClass::EpochStream,
+            &NetworkType::Primary,
+        ));
         Self {
             network_events,
             network_handle,
@@ -1440,8 +1498,16 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
-            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
-            epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
+            shed_task_semaphore: Arc::new(Semaphore::new_for(
+                serve.primary_shed(),
+                ServeClass::PrimaryShed,
+                &NetworkType::Primary,
+            )),
+            epoch_record_semaphore: Arc::new(Semaphore::new_for(
+                serve.epoch_record(),
+                ServeClass::EpochRecord,
+                &NetworkType::Primary,
+            )),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
         }
     }
@@ -1533,6 +1599,8 @@ where
                     // silently dropping it.
                     if let Err(ref e) = vote {
                         if let Some(penalty) = e.into() {
+                            warn!(target: "primary-network", ?peer, ?penalty, error = %e,
+                                "vote request rejected with a peer penalty");
                             network_handle.report_penalty(peer, penalty).await;
                         }
                     }
@@ -1591,6 +1659,8 @@ where
                         // penalize peer's reputation for bad request
                         if let Err(err) = &header {
                             if let Some(penalty) = err.into() {
+                                warn!(target: "primary-network", ?peer, ?penalty, error = %err,
+                                    "epoch record request rejected with a peer penalty");
                                 network_handle.report_penalty(peer, penalty).await;
                             }
                         }

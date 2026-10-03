@@ -17,6 +17,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 pub mod admission;
+pub mod capacity;
 mod codec;
 mod consensus;
 pub mod error;
@@ -24,6 +25,8 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod retention;
+pub mod source_admission;
 pub mod stream;
 mod sync;
 pub mod types;
@@ -31,7 +34,7 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
-pub use peers::{PeerExchangeMap, Penalty};
+pub use peers::{LoadPenalty, PeerExchangeMap, Penalty};
 pub use stream::StreamError;
 pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,

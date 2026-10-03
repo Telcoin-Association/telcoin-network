@@ -691,12 +691,18 @@ where
                 } else if header.epoch() < last_epoch
                     || (last_epoch == header.epoch() && last_round >= header.round())
                 {
-                    *auth_last_vote = Some((last_epoch, last_round, last_digest, None));
-                    return Err(HeaderError::AlreadyVotedForLaterRound {
-                        theirs: header.round(),
-                        ours: last_round,
-                    }
-                    .into());
+                    *auth_last_vote = previous_vote;
+                    let error = match () {
+                        () if last_epoch == header.epoch() && last_round == header.round() => {
+                            // A second digest in the same slot is equivocation.
+                            HeaderError::AlreadyVoted(header.digest(), header.round())
+                        }
+                        () => HeaderError::AlreadyVotedForLaterRound {
+                            theirs: header.round(),
+                            ours: last_round,
+                        },
+                    };
+                    return Err(error.into());
                 }
             }
             let epoch = header.epoch();

@@ -28,7 +28,10 @@
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
 
-use alloy::primitives::{keccak256, map::AddressSet, B256};
+use alloy::{
+    consensus::Transaction as _,
+    primitives::{keccak256, map::AddressSet, B256},
+};
 use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
@@ -71,7 +74,7 @@ use crate::{
     error::TnRethResult,
     evm::TnEvmConfig,
     forward::{FORWARD_BATCH_BUDGET, FORWARD_PENDING_LIFETIME, REQUEUE_GRACE},
-    forward_pending::{PendingForwards, RetentionLimits, SubmissionHead},
+    forward_pending::{ForwardRetentionStatus, PendingForwards, RetentionLimits, SubmissionHead},
     metrics::{ForwarderMetrics, RETH_METRICS},
     peer_batch::PeerBatchTxs,
     traits::TelcoinNode,
@@ -79,6 +82,286 @@ use crate::{
 };
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
+
+/// Shared limits for locally sealed bytes awaiting execution or validated replay.
+pub(crate) const LOCAL_SEAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Shared transaction entry ceiling for every worker pool in the node.
+pub(crate) const LOCAL_SEAL_MAX_ENTRIES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Worker identity within one explicit node recovery owner.
+struct LocalPoolId(
+    /// Allocated identity, shared by clones of this pool.
+    u64,
+);
+
+/// Ownership transition of one local seal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalSealPhase {
+    /// A build task owns bytes before the run loop accepts its result.
+    Reserved,
+    /// The run loop owns the forthcoming optimistic prune.
+    Accepted,
+    /// Optimistic removal has completed.
+    Pruned,
+}
+
+/// Execution feedback independent of optimistic pruning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalExecutionPhase {
+    /// The original accepted batch has not reported a skip.
+    Pending,
+    /// This exact observer batch handed its bytes to normal forwarding admission.
+    ObserverForwarding,
+    /// Forward ownership ended or early readmission was removed by optimistic pruning.
+    ObserverRetryReady,
+    /// Execution omitted these bytes; await canonical confirmation of this output.
+    NonceGap(B256),
+    /// The omitted output is canonical, so ordinary validation may readmit the bytes.
+    ReplayReady,
+    /// An asynchronous replay lease owns the current attempt.
+    Replaying,
+}
+
+/// Signed bytes and canonical account identity owned by one seal.
+#[derive(Debug)]
+struct RetainedLocalTransaction {
+    /// Exact signed transaction hash.
+    hash: TxHash,
+    /// Sender whose canonical nonce resolves ownership.
+    sender: Address,
+    /// Signed transaction nonce.
+    nonce: u64,
+    /// Exact admitted transaction encoding.
+    raw: Vec<u8>,
+    /// Confirmed omission and replay status.
+    execution: LocalExecutionPhase,
+}
+
+/// One seal's independent ownership, including duplicate reservation references.
+#[derive(Debug)]
+struct RetainedLocalSeal {
+    /// Worker pool to which replay is routed.
+    pool: LocalPoolId,
+    /// Optimistic removal status.
+    phase: LocalSealPhase,
+    /// Build task guards still referring to this seal.
+    reservations: usize,
+    /// Bytes retained through canonical resolution or normal readmission.
+    transactions: Vec<RetainedLocalTransaction>,
+}
+
+/// One owner is shared by every worker pool belonging to a RethEnv.
+/// Accepted bytes have no expiry and are never evicted to admit another seal.
+#[derive(Debug)]
+pub(crate) struct LocalSealRecovery {
+    /// Digest identifies independent accepted batch ownership.
+    seals: HashMap<B256, RetainedLocalSeal>,
+    /// Total owned raw encoding bytes.
+    bytes: usize,
+    /// Total owned transactions, counting independent seals.
+    entries: usize,
+    /// Allocate worker identities within this node.
+    next_pool: u64,
+    /// Shared byte ceiling, clamped to the normal pending pool budget.
+    max_bytes: usize,
+    /// Shared transaction ceiling, clamped to the normal pending pool budget.
+    max_entries: usize,
+}
+
+impl Default for LocalSealRecovery {
+    fn default() -> Self {
+        Self {
+            seals: HashMap::new(),
+            bytes: 0,
+            entries: 0,
+            next_pool: 0,
+            max_bytes: LOCAL_SEAL_MAX_BYTES,
+            max_entries: LOCAL_SEAL_MAX_ENTRIES,
+        }
+    }
+}
+
+impl LocalSealRecovery {
+    /// Release one canonically resolved or successfully handed-back transaction.
+    fn remove_transaction(&mut self, batch: &B256, hash: &TxHash) {
+        let removed = self.seals.get_mut(batch).map(|seal| {
+            let bytes = seal
+                .transactions
+                .iter()
+                .filter(|transaction| transaction.hash == *hash)
+                .map(|transaction| transaction.raw.len())
+                .sum::<usize>();
+            let before = seal.transactions.len();
+            seal.transactions.retain(|transaction| transaction.hash != *hash);
+            (
+                bytes,
+                before - seal.transactions.len(),
+                seal.transactions.is_empty() && seal.reservations == 0,
+            )
+        });
+        removed.into_iter().for_each(|(bytes, entries, empty)| {
+            self.bytes -= bytes;
+            self.entries -= entries;
+            if empty {
+                self.seals.remove(batch);
+            }
+        });
+        crate::metrics::record_local_seal_retention(self.bytes, self.entries);
+    }
+
+    /// Record explicit omission only for bytes already owned by this local batch.
+    pub(crate) fn nonce_gap(&mut self, batch: B256, hash: TxHash, output: B256) {
+        self.seals.get_mut(&batch).into_iter().for_each(|seal| {
+            seal.transactions.iter_mut().filter(|transaction| transaction.hash == hash).for_each(
+                |transaction| {
+                    if transaction.execution == LocalExecutionPhase::Pending {
+                        transaction.execution = LocalExecutionPhase::NonceGap(output);
+                    }
+                },
+            );
+        });
+    }
+
+    /// Actual canonical hashes release bytes; output confirmation enables skipped-byte replay.
+    fn canonical(&mut self, output: Option<B256>, hashes: &[TxHash]) {
+        let batches: Vec<B256> = self.seals.keys().copied().collect();
+        batches.into_iter().for_each(|batch| {
+            hashes.iter().for_each(|hash| self.remove_transaction(&batch, hash));
+        });
+        self.seals.values_mut().for_each(|seal| {
+            seal.transactions.iter_mut().for_each(|transaction| {
+                if output.is_some_and(|root| {
+                    transaction.execution == LocalExecutionPhase::NonceGap(root)
+                }) {
+                    transaction.execution = LocalExecutionPhase::ReplayReady;
+                }
+            });
+        });
+    }
+
+    /// Mark actual optimistic pool removal, independently of canonical execution timing.
+    fn pruned(&mut self, pool: LocalPoolId, hashes: &[TxHash]) {
+        self.seals.values_mut().filter(|seal| seal.pool == pool).for_each(|seal| {
+            if seal.phase == LocalSealPhase::Accepted
+                && seal.transactions.iter().all(|transaction| hashes.contains(&transaction.hash))
+            {
+                seal.phase = LocalSealPhase::Pruned;
+            }
+        });
+    }
+}
+
+/// A local seal cannot proceed unless its complete admitted bytes can be retained.
+#[derive(Debug)]
+pub enum LocalSealRecoveryError {
+    /// Shared retention capacity cannot admit another accepted seal.
+    Capacity,
+    /// The signed hash lacks a validated normal pool owner.
+    TransactionNotInPool(TxHash),
+    /// Signed bytes cannot be decoded or their sender recovered.
+    InvalidTransaction(String),
+}
+
+impl std::fmt::Display for LocalSealRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capacity => formatter.write_str("local sealed transaction retention is full"),
+            Self::TransactionNotInPool(hash) => {
+                write!(formatter, "local sealed transaction is not validated in this pool: {hash}")
+            }
+            Self::InvalidTransaction(error) => {
+                write!(formatter, "invalid local sealed transaction: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocalSealRecoveryError {}
+
+/// Rolls back an unacknowledged seal without releasing another seal's ownership.
+#[derive(Debug)]
+pub struct LocalSealReservation {
+    /// Node-wide retained-byte owner.
+    owner: Arc<Mutex<LocalSealRecovery>>,
+    /// A live build task may roll this reservation back.
+    pending: Option<B256>,
+}
+
+impl LocalSealReservation {
+    /// Transfer the reservation to the accepted batch after its worker acknowledgement.
+    pub fn accepted(mut self) {
+        self.pending.take().into_iter().for_each(|batch| {
+            let mut recovery = self.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            recovery.seals.get_mut(&batch).into_iter().for_each(|seal| {
+                seal.reservations -= 1;
+                if seal.phase == LocalSealPhase::Reserved {
+                    seal.phase = LocalSealPhase::Accepted;
+                }
+            });
+            if recovery
+                .seals
+                .get(&batch)
+                .is_some_and(|seal| seal.reservations == 0 && seal.transactions.is_empty())
+            {
+                recovery.seals.remove(&batch);
+            }
+        });
+    }
+}
+
+impl Drop for LocalSealReservation {
+    fn drop(&mut self) {
+        self.pending.take().into_iter().for_each(|batch| {
+            let mut recovery = self.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let remove = recovery.seals.get_mut(&batch).is_some_and(|seal| {
+                seal.reservations -= 1;
+                seal.reservations == 0
+                    && (seal.phase == LocalSealPhase::Reserved || seal.transactions.is_empty())
+            });
+            if remove {
+                recovery.seals.remove(&batch).into_iter().for_each(|seal| {
+                    recovery.bytes -= seal
+                        .transactions
+                        .iter()
+                        .map(|transaction| transaction.raw.len())
+                        .sum::<usize>();
+                    recovery.entries -= seal.transactions.len();
+                });
+                crate::metrics::record_local_seal_retention(recovery.bytes, recovery.entries);
+            }
+        });
+    }
+}
+
+/// Cancellation restores replay eligibility without dropping accepted bytes.
+#[derive(Debug)]
+struct LocalReplayLease {
+    /// Node-wide byte owner survives asynchronous admission.
+    owner: Arc<Mutex<LocalSealRecovery>>,
+    /// Exact original seal ownership.
+    batch: B256,
+    /// Exact signed transaction being readmitted.
+    hash: TxHash,
+    /// Restore this role's replay state after cancellation or admission refusal.
+    resume: LocalExecutionPhase,
+}
+
+impl Drop for LocalReplayLease {
+    fn drop(&mut self) {
+        let mut recovery = self.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.seals.get_mut(&self.batch).into_iter().for_each(|seal| {
+            seal.transactions
+                .iter_mut()
+                .filter(|transaction| transaction.hash == self.hash)
+                .for_each(|transaction| {
+                    if transaction.execution == LocalExecutionPhase::Replaying {
+                        transaction.execution = self.resume;
+                    }
+                });
+        });
+    }
+}
 
 /// Upper bound on canonical account reads per maintenance-loop iteration while recovering
 /// from canonical-state broadcast lag (reth's `max_reload_accounts` analogue).
@@ -225,6 +508,12 @@ pub struct WorkerTxPool(
     PeerBatchTxs,
     /// Observer transactions awaiting canonical inclusion, shared across epoch forwarders.
     Arc<Mutex<PendingForwards<TxHash, BlsPublicKey, B256>>>,
+    /// Node-wide accepted local bytes, bounded across all worker pools.
+    Arc<Mutex<LocalSealRecovery>>,
+    /// Route omitted byte replay to its original worker pool.
+    LocalPoolId,
+    /// Per-worker cursor avoids duplicate reads and starvation between worker pools.
+    Arc<Mutex<usize>>,
 );
 
 impl From<WorkerTxPool>
@@ -272,8 +561,33 @@ impl WorkerTxPool {
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
-        let this =
-            Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
+        Self::new_with_local_recovery(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            Arc::new(Mutex::new(LocalSealRecovery::default())),
+        )
+    }
+
+    /// Construct a worker pool with its explicit node-wide accepted-byte owner.
+    pub(crate) fn new_with_local_recovery(
+        node_config: &NodeConfig<ChainSpec>,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
+        local_recovery: Arc<Mutex<LocalSealRecovery>>,
+    ) -> eyre::Result<Self> {
+        let this = Self::build_with_local_recovery(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            local_recovery,
+        )?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
         this.spawn_expiry_task(task_spawner);
         Ok(this)
@@ -284,12 +598,32 @@ impl WorkerTxPool {
     /// Kept separate from [`WorkerTxPool::new`] so tests can reproduce a pool that missed
     /// canonical updates (the drifted state the maintenance task's lag handling recovers
     /// from) without racing a live subscription (see issue #1236).
+    #[cfg(test)]
     pub(crate) fn build(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
+    ) -> eyre::Result<Self> {
+        Self::build_with_local_recovery(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            Arc::new(Mutex::new(LocalSealRecovery::default())),
+        )
+    }
+
+    /// Build the pool while sharing one recovery budget across the node's workers.
+    fn build_with_local_recovery(
+        node_config: &NodeConfig<ChainSpec>,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
+        local_recovery: Arc<Mutex<LocalSealRecovery>>,
     ) -> eyre::Result<Self> {
         // The pool and validator survive epoch changes, so admission must fit the smallest
         // batch limit across all supported epochs. Non-blob reth validation measures the full
@@ -310,6 +644,8 @@ impl WorkerTxPool {
             .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
+        let local_max_bytes = pool_config.pending_limit.max_size;
+        let local_max_entries = pool_config.pending_limit.max_txs;
         let forward_limits = RetentionLimits::new(
             pool_config.pending_limit.max_txs,
             pool_config.pending_limit.max_size,
@@ -372,13 +708,336 @@ impl WorkerTxPool {
         );
         */
 
+        let pool_id = {
+            let mut recovery =
+                local_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            recovery.max_bytes = recovery.max_bytes.min(local_max_bytes);
+            recovery.max_entries = recovery.max_entries.min(local_max_entries);
+            recovery.next_pool =
+                recovery.next_pool.checked_add(1).ok_or(LocalSealRecoveryError::Capacity)?;
+            LocalPoolId(recovery.next_pool)
+        };
         Ok(Self(
             transaction_pool,
             blockchain_provider.clone(),
             base_fee,
             PeerBatchTxs::default(),
             Arc::new(Mutex::new(PendingForwards::new(forward_limits))),
+            local_recovery,
+            pool_id,
+            Arc::new(Mutex::new(0)),
         ))
+    }
+
+    /// Reserve validated local bytes before any worker can acknowledge this seal.
+    pub fn reserve_local_seal(
+        &self,
+        batch: B256,
+        raws: &[Vec<u8>],
+    ) -> Result<LocalSealReservation, LocalSealRecoveryError> {
+        let transactions: Vec<RetainedLocalTransaction> = raws
+            .iter()
+            .map(|raw| {
+                let recovered = recover_raw_transaction(raw).map_err(|error| {
+                    LocalSealRecoveryError::InvalidTransaction(error.to_string())
+                })?;
+                let hash = *recovered.hash();
+                self.get(&hash).ok_or(LocalSealRecoveryError::TransactionNotInPool(hash))?;
+                Ok(RetainedLocalTransaction {
+                    hash,
+                    sender: recovered.signer(),
+                    nonce: recovered.nonce(),
+                    raw: raw.clone(),
+                    execution: LocalExecutionPhase::Pending,
+                })
+            })
+            .collect::<Result<_, LocalSealRecoveryError>>()?;
+        let mut recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A recovered copy can race with reselection of the exact original digest. Defer
+        // that reseal until replay finishes handing off its accepted ownership.
+        (!recovery.seals.get(&batch).is_some_and(|seal| seal.phase != LocalSealPhase::Reserved))
+            .then_some(())
+            .ok_or(LocalSealRecoveryError::Capacity)?;
+        if recovery.seals.contains_key(&batch) {
+            recovery.seals.get_mut(&batch).into_iter().for_each(|seal| seal.reservations += 1);
+        } else {
+            let bytes = transactions.iter().map(|transaction| transaction.raw.len()).sum::<usize>();
+            let next_bytes = recovery
+                .bytes
+                .checked_add(bytes)
+                .filter(|next| *next <= recovery.max_bytes)
+                .ok_or(LocalSealRecoveryError::Capacity)?;
+            let next_entries = recovery
+                .entries
+                .checked_add(transactions.len())
+                .filter(|next| *next <= recovery.max_entries)
+                .ok_or(LocalSealRecoveryError::Capacity)?;
+            if recovery.seals.len() >= recovery.max_entries {
+                Err(LocalSealRecoveryError::Capacity)?;
+            }
+            recovery.seals.insert(
+                batch,
+                RetainedLocalSeal {
+                    pool: self.6,
+                    phase: LocalSealPhase::Reserved,
+                    reservations: 1,
+                    transactions,
+                },
+            );
+            recovery.bytes = next_bytes;
+            recovery.entries = next_entries;
+        }
+        crate::metrics::record_local_seal_retention(recovery.bytes, recovery.entries);
+        Ok(LocalSealReservation { owner: self.5.clone(), pending: Some(batch) })
+    }
+
+    /// Retry only explicitly omitted, canonically confirmed, optimistically pruned bytes.
+    async fn replay_local_seals(&self) {
+        let ready = {
+            let mut recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut keys: Vec<(B256, TxHash)> = recovery
+                .seals
+                .iter()
+                .filter(|(_, seal)| seal.pool == self.6 && seal.phase == LocalSealPhase::Pruned)
+                .flat_map(|(batch, seal)| {
+                    seal.transactions
+                        .iter()
+                        .filter(|transaction| {
+                            matches!(
+                                transaction.execution,
+                                LocalExecutionPhase::ReplayReady
+                                    | LocalExecutionPhase::ObserverRetryReady
+                            )
+                        })
+                        .map(|transaction| (*batch, transaction.hash))
+                })
+                .collect();
+            keys.sort_unstable();
+            keys.into_iter()
+                .take(MAX_RELOAD_ACCOUNTS)
+                .filter_map(|(batch, hash)| {
+                    recovery
+                        .seals
+                        .get_mut(&batch)
+                        .and_then(|seal| {
+                            seal.transactions
+                                .iter_mut()
+                                .find(|transaction| transaction.hash == hash)
+                        })
+                        .map(|transaction| {
+                            let resume = transaction.execution;
+                            transaction.execution = LocalExecutionPhase::Replaying;
+                            (
+                                LocalReplayLease { owner: self.5.clone(), batch, hash, resume },
+                                transaction.sender,
+                                transaction.nonce,
+                                transaction.raw.clone(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        futures::stream::iter(ready)
+            .for_each(|(lease, sender, nonce, raw)| async move {
+                let account = self.local_canonical_account(sender).await;
+                OptionFuture::from(account.map(|account| async move {
+                    self.0.update_accounts(vec![account]);
+                    if account.nonce > nonce {
+                        self.5
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove_transaction(&lease.batch, &lease.hash);
+                    } else {
+                        OptionFuture::from(recover_pooled_transaction(&raw).ok().map(
+                            |recovered| async {
+                                if self
+                                    .0
+                                    .add_transaction(TransactionOrigin::External, recovered)
+                                    .await
+                                    .is_ok()
+                                {
+                                    self.5
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove_transaction(&lease.batch, &lease.hash);
+                                } else {
+                                    self.finish_local_replay_handoff(&lease);
+                                }
+                            },
+                        ))
+                        .await;
+                    }
+                }))
+                .await;
+            })
+            .await;
+    }
+
+    /// Finish a pool-present replay race, keeping quorum ownership stricter than observers.
+    fn finish_local_replay_handoff(&self, lease: &LocalReplayLease) {
+        let mut recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let newer_owner = recovery.seals.iter().any(|(batch, seal)| {
+            *batch != lease.batch
+                && seal.transactions.iter().any(|transaction| transaction.hash == lease.hash)
+        });
+        let observer_handoff = lease.resume == LocalExecutionPhase::ObserverRetryReady;
+        if (observer_handoff || newer_owner) && self.get(&lease.hash).is_some() {
+            recovery.remove_transaction(&lease.batch, &lease.hash);
+        }
+    }
+
+    /// Observer success marks only this exact digest; local quorum bytes keep their role.
+    pub fn mark_observer_seal(&self, batch: B256) {
+        self.5
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seals
+            .get_mut(&batch)
+            .filter(|seal| seal.pool == self.6)
+            .into_iter()
+            .for_each(|seal| {
+                seal.transactions
+                    .iter_mut()
+                    .filter(|transaction| transaction.execution == LocalExecutionPhase::Pending)
+                    .for_each(|transaction| {
+                        transaction.execution = LocalExecutionPhase::ObserverForwarding
+                    });
+            });
+    }
+
+    /// Hand back only pruned observer bytes; early requeue must survive a later prune.
+    fn reconcile_observer_seals(&self) {
+        let pending = self.pending_forwards();
+        let mut recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observers: Vec<_> = recovery
+            .seals
+            .iter()
+            .filter(|(_, seal)| seal.pool == self.6 && seal.phase == LocalSealPhase::Pruned)
+            .flat_map(|(batch, seal)| {
+                seal.transactions
+                    .iter()
+                    .filter(|transaction| {
+                        matches!(
+                            transaction.execution,
+                            LocalExecutionPhase::ObserverForwarding
+                                | LocalExecutionPhase::ObserverRetryReady
+                        )
+                    })
+                    .map(|transaction| (*batch, transaction.hash))
+            })
+            .collect();
+        observers.into_iter().for_each(|(batch, hash)| match pending.retention_status(&hash) {
+            ForwardRetentionStatus::Retained => {}
+            ForwardRetentionStatus::Queued | ForwardRetentionStatus::Absent
+                if self.get(&hash).is_some() =>
+            {
+                recovery.remove_transaction(&batch, &hash)
+            }
+            ForwardRetentionStatus::Queued | ForwardRetentionStatus::Absent => {
+                recovery.seals.get_mut(&batch).into_iter().for_each(|seal| {
+                    seal.transactions
+                        .iter_mut()
+                        .filter(|transaction| transaction.hash == hash)
+                        .for_each(|transaction| {
+                            transaction.execution = LocalExecutionPhase::ObserverRetryReady
+                        });
+                });
+            }
+        });
+    }
+
+    /// Read canonical account state away from the asynchronous maintenance task.
+    async fn local_canonical_account(&self, sender: Address) -> Option<ChangedAccount> {
+        let pool = self.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.1.latest().ok().and_then(|state| Self::load_changed_account(&state, sender).ok())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Prove that the canonical account has consumed a cached transaction's nonce.
+    pub async fn local_transaction_canonically_resolved(&self, raw: &[u8]) -> bool {
+        OptionFuture::from(recover_raw_transaction(raw).ok().map(|transaction| async move {
+            self.local_canonical_account(transaction.signer())
+                .await
+                .is_some_and(|account| account.nonce > transaction.nonce())
+        }))
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Remove durable batch ownership only when canonical nonces consume every signed byte.
+    pub fn local_batch_canonically_resolved(&self, raws: &[Vec<u8>]) -> bool {
+        self.1.latest().ok().is_some_and(|state| {
+            raws.iter().all(|raw| {
+                recover_raw_transaction(raw).ok().is_some_and(|transaction| {
+                    Self::load_changed_account(&state, transaction.signer())
+                        .ok()
+                        .is_some_and(|account| account.nonce > transaction.nonce())
+                })
+            })
+        })
+    }
+
+    /// Release consumed nonces for every retained seal without making pending batches replayable.
+    async fn reconcile_local_seals(&self) {
+        let senders = {
+            let recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut senders: Vec<_> = recovery
+                .seals
+                .values()
+                .filter(|seal| seal.pool == self.6)
+                .flat_map(|seal| seal.transactions.iter())
+                .map(|transaction| transaction.sender)
+                .collect();
+            senders.sort_unstable();
+            senders.dedup();
+            let count = senders.len();
+            let mut cursor = self.7.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let offset = (*cursor).min(count);
+            senders.rotate_left(offset);
+            *cursor = if count == 0 { 0 } else { (offset + MAX_RELOAD_ACCOUNTS) % count };
+            senders.into_iter().take(MAX_RELOAD_ACCOUNTS).collect::<Vec<_>>()
+        };
+        stream::iter(senders)
+            .for_each(|sender| async move {
+                self.local_canonical_account(sender).await.into_iter().for_each(|account| {
+                    let mut recovery =
+                        self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let consumed: Vec<_> = recovery
+                        .seals
+                        .iter()
+                        .flat_map(|(batch, seal)| {
+                            seal.transactions
+                                .iter()
+                                .filter(|transaction| {
+                                    transaction.sender == sender
+                                        && transaction.nonce < account.nonce
+                                })
+                                .map(|transaction| (*batch, transaction.hash))
+                        })
+                        .collect();
+                    consumed
+                        .into_iter()
+                        .for_each(|(batch, hash)| recovery.remove_transaction(&batch, &hash));
+                });
+            })
+            .await;
+    }
+
+    /// Hand accepted orphan ownership back only after every byte has a validated pool owner.
+    pub fn release_local_batch_after_replay(&self, batch: B256) {
+        let mut recovery = self.5.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hashes: Vec<_> = recovery
+            .seals
+            .get(&batch)
+            .filter(|seal| seal.reservations == 0)
+            .into_iter()
+            .flat_map(|seal| seal.transactions.iter().map(|transaction| transaction.hash))
+            .collect();
+        hashes.into_iter().for_each(|hash| recovery.remove_transaction(&batch, &hash));
     }
 
     /// Spawn the critical task that expires parked transactions even when the chain is idle.
@@ -534,6 +1193,9 @@ impl WorkerTxPool {
                 })
             };
             self.retry_forwarded(Instant::now(), max_reload).await;
+            self.reconcile_local_seals().await;
+            self.reconcile_observer_seals();
+            self.replay_local_seals().await;
         }
         Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
     }
@@ -768,6 +1430,7 @@ impl WorkerTxPool {
         let pool = self.clone();
         let new_tip = new_tip.clone();
         tokio::task::spawn_blocking(move || {
+            let locally_pruned = mined_transactions.clone();
             // Reth's pool and validator only read header fields from the tip. This synthetic
             // block satisfies that API without copying a body and stays inside this closure.
             let new_tip = SealedBlock::from_sealed_parts(new_tip, BlockBody::default());
@@ -777,6 +1440,10 @@ impl WorkerTxPool {
                 mined_transactions,
                 changed_accounts,
             );
+            pool.5
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pruned(pool.6, &locally_pruned);
         })
         .await
     }
@@ -839,6 +1506,10 @@ impl WorkerTxPool {
 
             // Collect hashes to remove transactions mined in this canonical update.
             let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+            pool.5
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .canonical(tip.parent_beacon_block_root, &mined_transactions);
 
             tip.parent_beacon_block_root.into_iter().for_each(|output| {
                 pool.pending_forwards().committed(
@@ -1164,6 +1835,215 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
+    }
+
+    /// One node's cap is shared across worker pools and refusal leaves normal pool bytes intact.
+    #[tokio::test]
+    async fn local_recovery_capacity_is_shared_across_worker_pools() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, first_pool) = funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let second_pool = env.init_txn_pool(BaseFeeContainer::default())?;
+        let transaction = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let raw = transaction.encoded_2718();
+        factory.submit_tx_to_pool(transaction.clone(), first_pool.clone()).await;
+        factory.submit_tx_to_pool(transaction.clone(), second_pool.clone()).await;
+        {
+            let mut owner = first_pool.5.lock().unwrap();
+            owner.max_bytes = raw.len();
+            owner.max_entries = 1;
+        }
+        let first_batch = B256::with_last_byte(1);
+        first_pool.reserve_local_seal(first_batch, &[raw.clone()])?.accepted();
+        assert!(matches!(
+            second_pool.reserve_local_seal(B256::with_last_byte(2), &[raw.clone()]),
+            Err(LocalSealRecoveryError::Capacity)
+        ));
+        assert!(first_pool.get(transaction.hash()).is_some());
+        assert!(second_pool.get(transaction.hash()).is_some());
+        assert_eq!(first_pool.5.lock().unwrap().entries, 1);
+        first_pool.release_local_batch_after_replay(first_batch);
+        assert!(second_pool.reserve_local_seal(B256::with_last_byte(2), &[raw]).is_ok());
+        Ok(())
+    }
+
+    /// Canonical execution before ACK releases the final empty seal without another event.
+    #[tokio::test]
+    async fn local_recovery_canonical_before_ack_and_duplicate_cleanup() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, _env, pool) = funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let transaction = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let raw = transaction.encoded_2718();
+        factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
+        let batch = B256::with_last_byte(1);
+        let first = pool.reserve_local_seal(batch, &[raw.clone()])?;
+        let duplicate = pool.reserve_local_seal(batch, &[raw])?;
+        drop(first);
+        {
+            let mut owner = pool.5.lock().unwrap();
+            assert_eq!(owner.entries, 1);
+            assert_eq!(owner.seals[&batch].reservations, 1);
+            owner.canonical(None, &[*transaction.hash()]);
+            assert_eq!(owner.entries, 0);
+            assert_eq!(owner.bytes, 0);
+            assert_eq!(owner.seals.len(), 1);
+        }
+        duplicate.accepted();
+        assert!(pool.5.lock().unwrap().seals.is_empty());
+        Ok(())
+    }
+
+    /// Dropping an asynchronous replay attempt preserves bytes and restores eligibility.
+    #[tokio::test]
+    async fn local_recovery_replay_cancellation_keeps_accepted_bytes() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, _env, pool) = funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let transaction = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let raw = transaction.encoded_2718();
+        factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
+        let batch = B256::with_last_byte(1);
+        let output = B256::with_last_byte(2);
+        pool.reserve_local_seal(batch, &[raw.clone()])?.accepted();
+        {
+            let mut owner = pool.5.lock().unwrap();
+            owner.pruned(pool.6, &[*transaction.hash()]);
+            owner.nonce_gap(batch, *transaction.hash(), output);
+            owner.canonical(Some(output), &[]);
+            owner.seals.get_mut(&batch).unwrap().transactions[0].execution =
+                LocalExecutionPhase::Replaying;
+        }
+        drop(LocalReplayLease {
+            owner: pool.5.clone(),
+            batch,
+            hash: *transaction.hash(),
+            resume: LocalExecutionPhase::ReplayReady,
+        });
+        let owner = pool.5.lock().unwrap();
+        assert_eq!(owner.bytes, raw.len());
+        assert_eq!(owner.entries, 1);
+        assert_eq!(owner.seals[&batch].transactions[0].execution, LocalExecutionPhase::ReplayReady);
+        Ok(())
+    }
+
+    /// Early forward retry cannot hand off before prune; a late known copy can hand off afterward.
+    #[tokio::test]
+    async fn observer_retry_handoff_survives_prune_and_known_race() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, _background) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        let pool = env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let transaction = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let raw = transaction.encoded_2718();
+        let hash = *transaction.hash();
+        factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
+        let batch = B256::with_last_byte(5);
+        pool.reserve_local_seal(batch, &[raw.clone()])?.accepted();
+        pool.mark_observer_seal(batch);
+        assert_eq!(pool.admit_forwards(vec![raw.clone()]), Some(vec![raw.clone()]));
+        pool.pending_forwards().defer(&hash);
+        (1_u8..=3).for_each(|output| {
+            pool.pending_forwards().committed(u64::from(output), B256::repeat_byte(output), []);
+        });
+        pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
+        pool.reconcile_observer_seals();
+        assert_eq!(
+            pool.5.lock().unwrap().entries,
+            1,
+            "forward retry before prune cannot release ownership"
+        );
+        pool.update_canonical_state(
+            &chain.sealed_genesis_header(),
+            Some(u128::MAX),
+            vec![hash],
+            vec![],
+        )
+        .await?;
+        assert!(pool.get(&hash).is_none());
+        pool.reconcile_observer_seals();
+        assert_eq!(
+            pool.5.lock().unwrap().seals[&batch].transactions[0].execution,
+            LocalExecutionPhase::ObserverRetryReady
+        );
+        pool.5.lock().unwrap().seals.get_mut(&batch).unwrap().transactions[0].execution =
+            LocalExecutionPhase::Replaying;
+        drop(LocalReplayLease {
+            owner: pool.5.clone(),
+            batch,
+            hash,
+            resume: LocalExecutionPhase::ObserverRetryReady,
+        });
+        assert_eq!(
+            pool.5.lock().unwrap().seals[&batch].transactions[0].execution,
+            LocalExecutionPhase::ObserverRetryReady
+        );
+        // Normal admission wins after replay selection, so the retry receives AlreadyKnown.
+        factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
+        assert!(pool
+            .0
+            .add_transaction(
+                TransactionOrigin::External,
+                recover_pooled_transaction(&raw).expect("valid signed fixture")
+            )
+            .await
+            .is_err());
+        let observer = LocalReplayLease {
+            owner: pool.5.clone(),
+            batch,
+            hash,
+            resume: LocalExecutionPhase::ObserverRetryReady,
+        };
+        pool.finish_local_replay_handoff(&observer);
+        assert!(pool.5.lock().unwrap().seals.is_empty());
+        drop(observer);
+        let resealed = pool.reserve_local_seal(batch, &[raw.clone()])?;
+        resealed.accepted();
+        pool.5.lock().unwrap().pruned(pool.6, &[hash]);
+        let quorum = LocalReplayLease {
+            owner: pool.5.clone(),
+            batch,
+            hash,
+            resume: LocalExecutionPhase::ReplayReady,
+        };
+        pool.finish_local_replay_handoff(&quorum);
+        assert_eq!(pool.5.lock().unwrap().entries, 1, "quorum bytes require a newer seal owner");
+        drop(quorum);
+        pool.release_local_batch_after_replay(batch);
+        assert!(pool.reserve_local_seal(batch, &[raw]).is_ok());
+        Ok(())
     }
 
     /// A real canonical notification retires retained forwarding state independently of pool

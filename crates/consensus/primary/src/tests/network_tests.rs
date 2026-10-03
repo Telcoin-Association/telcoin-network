@@ -1315,6 +1315,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_a, chain_id),
             relayer: None,
             author: None,
+            receipt: None,
         })))
         .await
         .expect("inject epoch-A event");
@@ -1341,6 +1342,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_gap, chain_id),
             relayer: None,
             author: None,
+            receipt: None,
         })))
         .await
         .expect("inject gap event");
@@ -1434,7 +1436,7 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
     let peer = *committee.last_authority().authority().protocol_key();
 
     // First vote should succeed
-    let res1 = handler.vote(peer, header1, parents.clone()).await;
+    let res1 = handler.vote(peer, header1.clone(), parents.clone()).await;
     assert!(res1.is_ok(), "First vote should succeed");
 
     // Create different header for same round (different timestamp = different digest)
@@ -1447,10 +1449,13 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
     // Second vote for different digest in same round should be rejected
     let res2 = handler.vote(peer, header2, parents).await;
     assert_matches!(
-        res2,
-        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        &res2,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
         "Vote for different header in same round should be rejected as equivocation"
     );
+    let error = res2.err().ok_or_else(|| eyre::eyre!("conflicting vote was accepted"))?;
+    assert_eq!(Option::<Penalty>::from(&error), Some(Penalty::Fatal));
+    assert_matches!(handler.vote(peer, header1, vec![]).await, Ok(PrimaryResponse::Vote(_)));
 
     Ok(())
 }
@@ -1791,12 +1796,85 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
     let res2 = handler.vote(peer, header_round1, parents).await;
     // This should be rejected because we already processed a header for a later round
     assert_matches!(
-        res2,
+        &res2,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
         "Vote for older round should be rejected"
     );
+    let error = res2.err().ok_or_else(|| eyre::eyre!("stale vote was accepted"))?;
+    assert!(
+        Option::<Penalty>::from(&error).is_none(),
+        "a delayed vote must not penalize its author"
+    );
 
     Ok(())
+}
+
+/// A delayed request after restart must preserve the durable newer vote without banning its author.
+#[tokio::test]
+async fn test_vote_older_round_after_restart_preserves_vote_without_penalty() -> eyre::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority().id();
+    let stored = VoteInfo {
+        epoch: committee.committee().epoch(),
+        round: 2,
+        vote_digest: VoteDigest::default(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author, &stored)?;
+    let header = committee
+        .header_builder_last_authority()
+        .round(1)
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let result = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        &result,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 1,
+            ours: 2,
+        }))
+    );
+    let error = result.err().ok_or_else(|| eyre::eyre!("stale vote was accepted"))?;
+    assert!(Option::<Penalty>::from(&error).is_none());
+    let retained = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author)?
+        .ok_or_else(|| eyre::eyre!("durable vote was removed"))?;
+    assert_eq!(retained.epoch(), stored.epoch());
+    assert_eq!(retained.round(), stored.round());
+    assert_eq!(retained.vote_digest(), stored.vote_digest());
+    Ok(())
+}
+
+/// Round age alone is not evidence of misconduct; same-slot equivocation and malformed rounds are.
+#[test]
+fn delayed_vote_errors_do_not_penalize_committee() {
+    let stale_vote = PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+        theirs: 1,
+        ours: 2,
+    });
+    let collected = PrimaryNetworkError::InvalidHeader(HeaderError::TooOld {
+        digest: HeaderDigest::default(),
+        header_round: 6,
+        max_round: 21,
+    });
+    let conflicting =
+        PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(HeaderDigest::default(), 2));
+    let malformed =
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidRound(HeaderDigest::default()));
+    assert!(Option::<Penalty>::from(&stale_vote).is_none());
+    assert!(Option::<Penalty>::from(&collected).is_none());
+    assert_eq!(Option::<Penalty>::from(&conflicting), Some(Penalty::Fatal));
+    assert_eq!(Option::<Penalty>::from(&malformed), Some(Penalty::Fatal));
 }
 
 // ============================================================================
@@ -2878,7 +2956,9 @@ async fn test_sync_epoch_pack_unavailable_denies() {
 /// penalty-free task per request, so a non-committee peer could exhaust task/CPU capacity.
 #[test]
 fn test_epoch_record_admission_enforces_per_peer_cap() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let semaphore = Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+    ));
     let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let mut rng = StdRng::seed_from_u64(1);
     let peer = *BlsKeypair::generate(&mut rng).public();
@@ -2912,7 +2992,9 @@ fn test_epoch_record_admission_enforces_per_peer_cap() {
 /// serve's lifetime, the total in-flight certificate-wait budget as well.
 #[test]
 fn test_epoch_record_admission_enforces_global_cap() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let semaphore = Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+    ));
     let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let mut rng = StdRng::seed_from_u64(2);
 
@@ -2953,7 +3035,8 @@ fn test_epoch_record_admission_enforces_global_cap() {
 /// work rather than with the cap.
 #[test]
 fn test_shed_admit_enforces_budget_and_frees_on_drop() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+    let semaphore =
+        Arc::new(tn_network_libp2p::capacity::CapacitySemaphore::new(MAX_CONCURRENT_SHED_TASKS));
 
     // fill the shed budget
     let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
@@ -3307,6 +3390,7 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     // (= committee size) stays above that, so the map never fills and the honest number-2 tally is
     // never evicted. Under a fixed cap this same flood would evict it and number 2 would stall.
     let hash_real = ConsensusHeaderDigest::from(B256::random());
+    assert!(authorities.len() >= f, "need the declared Byzantine population");
     for h in f..(f + quorum) {
         for authority in authorities.iter().take(f) {
             for _ in 0..MAX_TALLIES_PER_SIGNER_PER_NUMBER {

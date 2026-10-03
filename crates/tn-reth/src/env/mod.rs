@@ -20,7 +20,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -71,6 +71,12 @@ pub struct RethEnv {
 ///
 /// This struct holds all the actual fields and is wrapped in an `Arc` by `RethEnv`.
 struct RethEnvInner {
+    /// Shared by this execution environment and all of its worker pools.
+    local_recovery: Arc<Mutex<crate::txn_pool::LocalSealRecovery>>,
+    /// Serialize accepted local batch cache quotas across workers and epochs.
+    local_cache_gate: Arc<Mutex<()>>,
+    /// Shared exact-digest serialization for durable cache retry across epochs.
+    local_seal_locks: Arc<tn_types::LocalBatchSealLocks>,
     /// The type that holds all information needed to launch the node's engine.
     ///
     /// The [NodeConfig] is reth-specific and holds many helper functions that
@@ -193,6 +199,9 @@ impl RethEnv {
 
         Ok(Self {
             inner: Arc::new(RethEnvInner {
+                local_recovery: Arc::new(Mutex::new(crate::txn_pool::LocalSealRecovery::default())),
+                local_cache_gate: Arc::new(Mutex::new(())),
+                local_seal_locks: Arc::new(tn_types::LocalBatchSealLocks::default()),
                 node_config,
                 blockchain_provider,
                 evm_config,
@@ -391,13 +400,24 @@ impl RethEnv {
     /// The `base_fee` container supplies the pool's pending base fee for the worker's current
     /// epoch (issue #1262).
     pub fn init_txn_pool(&self, base_fee: BaseFeeContainer) -> eyre::Result<WorkerTxPool> {
-        WorkerTxPool::new(
+        WorkerTxPool::new_with_local_recovery(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
             base_fee,
+            self.inner.local_recovery.clone(),
         )
+    }
+
+    /// Shared node owner for atomic local recovery cache admission across workers.
+    pub fn local_batch_cache_gate(&self) -> Arc<Mutex<()>> {
+        self.inner.local_cache_gate.clone()
+    }
+
+    /// Node owner for bounded exact-digest cache/quorum/report/delete locks.
+    pub fn local_batch_seal_locks(&self) -> Arc<tn_types::LocalBatchSealLocks> {
+        self.inner.local_seal_locks.clone()
     }
 
     /// Initialize a worker transaction pool WITHOUT its canonical-state maintenance task.

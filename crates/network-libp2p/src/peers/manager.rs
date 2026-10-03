@@ -14,13 +14,18 @@ use crate::{
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
+    source_admission::{SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
-use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
+    PeerId,
+};
 use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
+    num::NonZeroUsize,
     task::Context,
     time::Duration,
 };
@@ -142,6 +147,12 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Optional ordinary-population ceiling independent of protected peer retention.
+    public_peer_limit: Option<NonZeroUsize>,
+    /// Bounded, operator-selected observer identities, measured separately from other pins.
+    dao_observers: HashSet<BlsPublicKey>,
+    /// Leases owned by this swarm using optional process-wide source accounting.
+    source_connections: SourceConnections,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
@@ -251,6 +262,28 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Install a shared budget before any swarm is polled.
+    pub(crate) fn set_source_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
+        self.source_connections.set_budget(budget);
+    }
+
+    /// Forward swarm lifecycle events to the connection lease owner.
+    pub(crate) fn on_source_swarm_event(&mut self, event: &libp2p::swarm::FromSwarm<'_>) {
+        self.source_connections.on_swarm_event(event);
+    }
+
+    /// Reserve source occupancy at the authenticated established-connection boundary.
+    pub(crate) fn reserve_source(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        address: &Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.source_connections
+            .reserve(connection, peer, address)
+            .map_err(libp2p::swarm::ConnectionDenied::new)
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -276,6 +309,9 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            public_peer_limit: None,
+            dao_observers: HashSet::new(),
+            source_connections: SourceConnections::default(),
             heartbeat,
             peers,
             known_peers: Default::default(),
@@ -293,7 +329,8 @@ impl PeerManager {
 
     /// Explicitly add a "trusted" peer and dial it.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain connections under population pressure and bypass load scoring.
+    /// Protocol and cryptographic violations remain eligible for penalties and bans.
     /// This does not unban ips and should only be called during initialization.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
@@ -461,6 +498,16 @@ impl PeerManager {
 
         // Emit peer metrics via tracing for OpenTelemetry export.
         let connected_count = self.peers.connected_peer_ids().count();
+        let ordinary =
+            self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count();
+        let observers = self
+            .peers
+            .connected_peer_ids()
+            .filter(|peer| {
+                self.peer_to_bls(peer).is_some_and(|key| self.dao_observers.contains(&key))
+            })
+            .count();
+        self.metrics.set_population_counts(ordinary, observers);
         let connected_or_dialing = self.connected_or_dialing_peers().len();
         let banned_count = self.temporarily_banned.len();
         tracing::info!(
@@ -562,11 +609,8 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
-    /// Returns a boolean if the peer is a known validator.
-    ///
-    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
-    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
-    /// work.)
+    /// Whether a peer belongs to any tracked committee slot, for membership regression tests.
+    #[cfg(test)]
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
@@ -601,22 +645,47 @@ impl PeerManager {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
-    /// Process new connection and return boolean indicating if the peer limit was reached.
+    /// Check whether a newly registered connection exceeds the ordinary population ceiling.
+    ///
+    /// The established count includes this connection. Pending dials use transport budgets.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
         debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
-        if endpoint.is_dialer() {
-            // this node dialed peer
-            self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
-        } else {
-            // peer dialed this node
-            self.connected_or_dialing_peers().len() >= self.config.max_peers()
-        }
+        self.public_peer_limit.map_or_else(
+            || {
+                if endpoint.is_dialer() {
+                    self.peers.connected_peer_ids().count()
+                        >= self.config.max_outbound_dialing_peers()
+                } else {
+                    self.connected_or_dialing_peers().len() >= self.config.max_peers()
+                }
+            },
+            |limit| {
+                self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count()
+                    > limit.get()
+            },
+        )
+    }
+
+    /// Set an ordinary-peer admission ceiling while preserving aggregate connection limits.
+    pub(crate) fn set_public_peer_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.public_peer_limit = limit;
+    }
+
+    /// Reserve retention for prevalidated DAO identities while preserving their penalty policy.
+    pub(crate) fn set_dao_observers(&mut self, observers: HashSet<BlsPublicKey>) {
+        self.dao_observers = observers;
+        self.metrics.set_population_counts(0, 0);
     }
 
     /// Return an iterator of peers that are connected or dialed.
     pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         trace!(target: "peer-manager", "all peers:\n{:?}", self.peers);
         self.peers.connected_or_dialing_peers()
+    }
+
+    /// Return authenticated peers with an established connection, excluding pending dials.
+    pub(crate) fn connected_peers(&self) -> Vec<PeerId> {
+        self.peers.connected_peer_ids().collect()
     }
 
     /// Record an inbound `AddProvider` from `provider` and report whether it
@@ -656,6 +725,7 @@ impl PeerManager {
     /// The application layer reports issues from peers that are processed here.
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
+    #[track_caller]
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
         // Never penalize our own identity. A self-connection (e.g. a learned
         // hairpin address routed back to our own peer id) must not feed the
@@ -667,6 +737,13 @@ impl PeerManager {
         }
         self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
+
+        if matches!(&action, PeerAction::Ban(_) | PeerAction::Disconnect) {
+            let caller = std::panic::Location::caller();
+            warn!(target: "peer-manager", ?peer_id, ?penalty, ?action,
+                source_file = caller.file(), source_line = caller.line(),
+                "peer penalty caused connection loss");
+        }
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
@@ -715,7 +792,13 @@ impl PeerManager {
         );
 
         debug!(target: "peer-manager", ?action, "disconnect peer results in:");
-        self.apply_peer_action(peer_id, action);
+        match action {
+            // The explicit disconnect above already includes the selected peer-exchange policy.
+            PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.temporarily_ban(peer_id),
+            PeerAction::Ban(_) | PeerAction::Unban(_) | PeerAction::NoAction => {
+                self.apply_peer_action(peer_id, action);
+            }
+        }
     }
 
     /// Register a connected peer if their reputation is sufficient.
@@ -792,22 +875,25 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
+        let public_excess = self.public_peer_limit.map_or(0, |limit| {
+            connected_peers
+                .iter()
+                .filter(|(peer_id, _)| !self.peer_is_important(peer_id))
+                .count()
+                .saturating_sub(limit.get())
+        });
         let mut excess_peer_count =
-            connected_peers.len().saturating_sub(self.config.target_num_peers);
+            connected_peers.len().saturating_sub(self.config.target_num_peers).max(public_excess);
         if excess_peer_count == 0 {
             // no excess peers
             return;
         }
 
-        // filter peers that are validators
+        // Retention protection does not exempt any peer from protocol bans or resource budgets.
         let ready_to_prune = connected_peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
-                    Some(*peer_id)
-                } else {
-                    None
-                }
+            .filter_map(|(peer_id, _)| {
+                (!self.peer_policy(peer_id).protects_retention()).then_some(*peer_id)
             })
             .collect::<Vec<_>>();
 
@@ -891,10 +977,27 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is operator-allowlisted or a validator.
+    /// Derive independent privileges from live committee membership and operator configuration.
+    ///
+    /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Configured DAO observers also reserve retention, while remaining subject to load penalties.
+    /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
+        let policy = self.peers.peer_policy(peer_id);
+        let policy = self
+            .peer_to_bls(peer_id)
+            .filter(|key| self.pinned_peers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap));
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.dao_observers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::DaoObserver))
+    }
+
+    /// Whether retention policy protects this peer from population pruning and mesh treatment.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+        let policy = self.peer_policy(peer_id);
+        trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
+        policy.protects_retention()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
@@ -930,6 +1033,9 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        if self.public_peer_limit.is_some() {
+            self.prune_connected_peers();
+        }
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,

@@ -118,17 +118,19 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
 /// Whether an orphaned batch can be removed from the durable recovery cache.
 #[derive(Debug, PartialEq, Eq)]
 enum OrphanBatchRecovery {
-    /// Forwarding accepted the batch, or an active pool considered every transaction.
+    /// Canonical account state has consumed every retained transaction nonce.
     Complete,
-    /// No active pool was available; retain the batch for the next recovery attempt.
+    /// Volatile replay succeeded; retain accepted batch bytes until canonical resolution.
+    Replayed,
+    /// Recovery could not transfer every byte; retain the batch for the next attempt.
     Retry,
 }
 
 /// Hand every transaction in `batch` back to an active worker's mempool.
 ///
 /// Pools can outlive their workers, so only the current epoch's `active_workers` are eligible.
-/// A removed worker falls back to worker 0. Invalid or refused transactions are logged and
-/// discarded under the pool's normal validation rules; a missing pool leaves the batch cached.
+/// A removed worker falls back to worker 0. Invalid or refused transactions remain cached
+/// until canonical nonce resolution or a later successful normal admission.
 async fn repool_batch_txns(
     pools: &[tn_reth::WorkerTxPool],
     active_workers: usize,
@@ -143,24 +145,27 @@ async fn repool_batch_txns(
         pools.first().filter(|_| active_workers > 0)
     });
     futures::future::OptionFuture::from(pool.map(|pool| async move {
-        futures::stream::iter(batch.transactions())
-            .filter_map(|tx_bytes| async move {
-                recover_raw_transaction(tx_bytes)
-                    .inspect_err(|error| {
-                        debug!(target: "epoch-manager", worker_id, ?error,
-                            "invalid orphaned transaction");
-                    })
-                    .ok()
+        let complete = futures::stream::iter(batch.transactions())
+            .then(|tx_bytes| async move {
+                if pool.local_transaction_canonically_resolved(tx_bytes).await {
+                    (true, true)
+                } else {
+                    futures::future::OptionFuture::from(recover_raw_transaction(tx_bytes).ok().map(|recovered| async move {
+                        let hash = *recovered.hash();
+                        pool.add_recovered_transaction_external(recovered).await
+                            .inspect_err(|error| {
+                                debug!(target: "epoch-manager", worker_id, ?error,
+                                    "pool refused an orphaned transaction; retaining recovery ownership");
+                            }).is_ok() || pool.get(&hash).is_some()
+                    })).await.map(|admitted| (false, admitted)).unwrap_or((false, false))
+                }
             })
-            .for_each(|recovered| async move {
-                let _ =
-                    pool.add_recovered_transaction_external(recovered).await.inspect_err(|error| {
-                        debug!(target: "epoch-manager", worker_id, ?error,
-                            "pool refused an orphaned transaction");
-                    });
-            })
-            .await;
-        OrphanBatchRecovery::Complete
+            .fold((true, true), |(canonical, complete), (resolved, recovered)| async move {
+                (canonical && resolved, complete && recovered)
+            }).await;
+        if complete.0 { OrphanBatchRecovery::Complete }
+        else if complete.1 { OrphanBatchRecovery::Replayed }
+        else { OrphanBatchRecovery::Retry }
     }))
     .await
     .unwrap_or_else(|| {
@@ -203,7 +208,7 @@ where
                                 processed_transactions + transactions,
                             ))
                         }
-                        OrphanBatchRecovery::Retry => {
+                        OrphanBatchRecovery::Replayed | OrphanBatchRecovery::Retry => {
                             Ok((processed_batches, processed_transactions))
                         }
                     }
@@ -233,10 +238,13 @@ where
     /// after handling it. This prevents a builder from recreating the same digest during a
     /// same-epoch restart before its old entry is removed. Network delivery remains in the
     /// background. Cancellation leaves unfinished batches available for the next attempt.
-    pub(super) async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
+    pub(super) async fn orphan_batches<
+        QuorumWaiter: QuorumWaiterTrait,
+        R: tn_worker::LocalBatchRecovery,
+    >(
         &mut self,
         engine: ExecutionNode,
-        workers: Vec<Worker<DB, QuorumWaiter>>,
+        workers: Vec<Worker<DB, QuorumWaiter, R>>,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // Collect any batches from this epoch that never made it to the consensus chain.
@@ -256,7 +264,7 @@ where
                     let pools = &pools;
                     let workers = &workers;
                     async move {
-                        if is_cvv {
+                        let recovery = if is_cvv {
                             repool_batch_txns(pools, workers.len(), &batch).await
                         } else {
                             let worker = workers.get(usize::from(batch.worker_id)).or_else(|| {
@@ -273,11 +281,15 @@ where
                                 debug!(target: "epoch-manager", worker_id = batch.worker_id, ?error,
                                     "orphaned batch disbursal refused; re-pooling");
                             }).is_ok()) {
-                                OrphanBatchRecovery::Complete
+                                OrphanBatchRecovery::Replayed
                             } else {
                                 repool_batch_txns(pools, workers.len(), &batch).await
                             }
+                        };
+                        if recovery != OrphanBatchRecovery::Retry {
+                            pools.iter().for_each(|pool| pool.release_local_batch_after_replay(digest));
                         }
+                        recovery
                     }
                 }).await
             }.instrument(span).await?;
@@ -1036,17 +1048,24 @@ mod tests {
         let hash = *transaction.hash();
         let batch = Batch {
             worker_id,
-            transactions: vec![b"invalid transaction".to_vec(), transaction.encoded_2718()],
+            transactions: vec![transaction.encoded_2718()],
             ..Default::default()
         };
 
         assert_eq!(
             repool_batch_txns(&pools, active_workers, &batch).await,
-            OrphanBatchRecovery::Complete
+            OrphanBatchRecovery::Replayed
         );
         pools.iter().enumerate().for_each(|(index, pool)| {
             assert_eq!(pool.get(&hash).is_some(), index == expected_pool);
         });
+        let mut unresolved = batch;
+        unresolved.transactions.push(b"invalid transaction".to_vec());
+        assert_eq!(
+            repool_batch_txns(&pools, active_workers, &unresolved).await,
+            OrphanBatchRecovery::Retry,
+            "an unresolved byte prevents durable ownership release while valid bytes still route"
+        );
         Ok(())
     }
 

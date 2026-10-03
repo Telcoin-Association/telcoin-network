@@ -14,15 +14,21 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
-    read_frame, types::NetworkEvent, write_frame, DenyReason, GossipMessage, ResponseChannel,
-    Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
+    read_frame,
+    types::{NetworkEvent, NetworkType},
+    write_frame, DenyReason, GossipMessage, ResponseChannel, Stream, SyncFrame, SyncFrameError,
+    WorkerSyncRequest,
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
     TnReceiver, WorkerId, B256,
 };
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 pub(crate) mod error;
@@ -80,7 +86,7 @@ pub const MAX_CONCURRENT_GOSSIP_PREFETCHES: usize = 8;
 /// is dropped without spawning (the requester sees a reset and retries
 /// elsewhere), so the worker's total sync-task fan-out stays bounded by
 /// [`MAX_CONCURRENT_BATCH_STREAMS`] admitted tasks plus this many shed tasks.
-pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+pub const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Timeout for reading the opening request frame of an inbound sync stream.
 ///
@@ -129,10 +135,15 @@ fn try_admit_sync(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *sync_guard.entry(peer).or_insert(0) += 1;
+            SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -273,15 +284,24 @@ where
         validator: Arc<dyn BatchValidation>,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
         Self {
             network_events,
             network_handle,
             request_handler,
-            batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
+            batch_stream_semaphore: Arc::new(Semaphore::new_for(
+                serve.batch_stream(),
+                ServeClass::BatchStream,
+                &NetworkType::Worker(id),
+            )),
             sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
-            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
+            shed_task_semaphore: Arc::new(Semaphore::new_for(
+                serve.worker_shed(),
+                ServeClass::WorkerShed,
+                &NetworkType::Worker(id),
+            )),
             metrics: WorkerMetrics::new_for_worker(id),
             consensus_chain,
         }

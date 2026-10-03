@@ -212,9 +212,9 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // mild
         HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
         // medium
-        HeaderError::InvalidParents
-        | HeaderError::WrongNumberOfParents(_, _)
-        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        HeaderError::InvalidParents | HeaderError::WrongNumberOfParents(_, _) => {
+            Some(Penalty::Medium)
+        }
         // severe
         //
         // `InvalidSeedSignature` is severe rather than fatal because it has a reachable honest
@@ -228,8 +228,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentRound
         | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
         // fatal
-        HeaderError::AlreadyVotedForLaterRound { .. }
-        | HeaderError::AlreadyVoted(_, _)
+        HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
         | HeaderError::TooManyBatches(_, _)
@@ -242,6 +241,10 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidTimestampMillis(_)
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
+        // Concurrent vote requests can arrive after a newer round was processed or collected.
+        // Reject the stale request without disconnecting its author. A different digest at the
+        // same epoch and round is still `AlreadyVoted`, with a fatal penalty above.
+        HeaderError::AlreadyVotedForLaterRound { .. } | HeaderError::TooOld { .. } => None,
         // ignore (local/transient, not the peer's fault)
         //
         // Storage is our own DB error, and UnknownExecutionResult means a peer is merely

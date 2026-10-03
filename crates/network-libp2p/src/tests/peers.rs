@@ -1085,8 +1085,8 @@ fn test_is_validator() {
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
-/// Regression guard for issue #715: a validator's exemption is derived from committee
-/// membership, not a stored flag, so rotating out of the committee revokes the exemption
+/// Regression guard for issue #715: a validator's load exemption is derived from committee
+/// membership, so rotating out of the committee revokes the load exemption
 /// (and, because operator trust is separate, never touches an operator allowlist).
 #[test]
 fn test_committee_rotation_revokes_validator_exemption() {
@@ -1101,18 +1101,74 @@ fn test_committee_rotation_revokes_validator_exemption() {
     all_peers.upsert_peer(bls, net, vec![]);
     all_peers.current_committee.insert(bls);
 
-    // while in the committee the peer is exempt: a fatal penalty is suppressed and its
-    // reputation is unaffected
-    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    // Load does not affect a committee peer's reputation.
+    let load = Penalty::Load(crate::LoadPenalty::KademliaFlood);
+    let action = all_peers.process_penalty(&peer_id, load);
     assert!(matches!(action, PeerAction::NoAction));
     assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
 
     // rotate the validator out of the committee
     all_peers.current_committee.clear();
 
-    // the exemption is gone: the same fatal penalty now lands and the peer is banned
-    let _ = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    // The same repeated load signals become scoreable once committee privileges expire.
+    (0..100).for_each(|_| {
+        all_peers.process_penalty(&peer_id, load);
+    });
     assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+}
+
+/// Trusted and committee peers retain load privileges while protocol bans survive rotation.
+#[test]
+fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), NetworkError> {
+    // This regression exercises the two policies with load exemptions.
+    enum LoadExemptBasis {
+        Operator,
+        Validator,
+    }
+
+    ensure_score_config(None);
+    [LoadExemptBasis::Operator, LoadExemptBasis::Validator].into_iter().try_for_each(|basis| {
+        let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+        let mut rng = StdRng::from_seed([46; 32]);
+        let (bls, net, peer_id) = committee_member(&mut rng);
+        match basis {
+            LoadExemptBasis::Operator => all_peers.add_trusted_peer(bls, net.clone()),
+            LoadExemptBasis::Validator => {
+                all_peers.upsert_peer(bls, net.clone(), vec![]);
+                all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+            }
+        }
+        let before = all_peers
+            .get_peer(&peer_id)
+            .ok_or(NetworkError::PeerMissing)?
+            .score()
+            .aggregate_score();
+        (0..100).for_each(|_| {
+            all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+        });
+        assert_eq!(
+            all_peers
+                .get_peer(&peer_id)
+                .ok_or(NetworkError::PeerMissing)?
+                .score()
+                .aggregate_score(),
+            before
+        );
+        assert!(all_peers.peer_policy(&peer_id).protects_retention());
+        let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+        assert!(action.is_ban());
+        assert!(all_peers.peer_banned(&peer_id));
+        assert!(all_peers
+            .update_committees(HashSet::from([bls]), HashSet::new(), HashSet::new())
+            .is_empty());
+        assert!(all_peers.apply_membership_if_committee(bls).is_empty());
+        assert!(all_peers.mark_committee_for_dial(HashSet::from([bls])).is_empty());
+        assert!(all_peers.peer_banned(&peer_id), "trust must not forgive a protocol ban");
+        all_peers.add_trusted_peer(bls, net);
+        assert!(all_peers.peer_banned(&peer_id), "trust reload must not forgive a protocol ban");
+        assert_eq!(all_peers.banned_peers.total(), 1);
+        Ok(())
+    })
 }
 
 #[test]
@@ -1576,7 +1632,7 @@ fn test_update_committees_no_change() {
     assert!(all_peers.is_peer_validator(&x_id));
     assert!(all_peers.current_committee.contains(&x_bls));
     assert!(all_peers.next_committee.contains(&x_bls));
-    assert_eq!(all_peers.trust_basis(&x_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&x_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1673,7 +1729,7 @@ fn test_update_committees_tracks_undiscovered_member_then_trusts_on_discovery() 
 
     // now the member resolves: validator + exempt, the moment discovery completed
     assert!(all_peers.is_peer_validator(&peer_id));
-    assert_eq!(all_peers.trust_basis(&peer_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&peer_id), PeerPolicy::from_bases([TrustBasis::Validator]));
     // a freshly discovered, never-banned peer needs no unban action
     assert!(actions.is_empty());
 }
@@ -1693,10 +1749,14 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
     assert!(!all_peers.is_peer_validator(&peer_id), "unidentified peer is not yet a validator");
 
-    // the member connects anonymously and is banned during the window (Unidentified record)
+    // An unidentified member incurs a load-only ban before its BLS identity is resolved.
     all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
-    let ban = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
-    assert!(matches!(ban, PeerAction::Ban(_)));
+    let ban = (0..100)
+        .map(|_| {
+            all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood))
+        })
+        .find(PeerAction::is_ban);
+    assert!(ban.is_some());
     assert!(all_peers.peer_banned(&peer_id), "member should be banned during the window");
     assert!(!all_peers.is_peer_validator(&peer_id), "still unidentified, still not a validator");
 
@@ -1710,8 +1770,8 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     assert!(all_peers.is_peer_validator(&peer_id), "discovered member is now a validator");
     assert!(!all_peers.peer_banned(&peer_id), "discovered committee member must be unbanned");
     assert_eq!(
-        all_peers.trust_basis(&peer_id),
-        Some(TrustBasis::Validator),
+        all_peers.peer_policy(&peer_id),
+        PeerPolicy::from_bases([TrustBasis::Validator]),
         "discovered member must be exempt as a validator"
     );
     assert!(
@@ -1733,7 +1793,7 @@ fn test_apply_membership_if_committee_is_noop_for_non_member() {
 
     assert!(actions.is_empty());
     assert!(!all_peers.is_peer_validator(&peer_id));
-    assert_eq!(all_peers.trust_basis(&peer_id), None);
+    assert_eq!(all_peers.peer_policy(&peer_id), PeerPolicy::default());
 }
 
 #[test]
@@ -1745,7 +1805,7 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     let (m_bls, m_net, m_id) = committee_member(&mut rng);
     discover(&mut all_peers, m_bls, &m_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([m_bls]), HashSet::new());
-    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&m_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
     let (other_bls, other_net, _other_id) = committee_member(&mut rng);
@@ -1756,7 +1816,7 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     // one-way ratchet, but because the exemption derives from its tracked membership.
     assert!(all_peers.previous_committee.contains(&m_bls));
     assert!(all_peers.is_peer_validator(&m_id));
-    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&m_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1768,7 +1828,7 @@ fn test_update_committees_demotes_peer_that_exits_window() {
     let (e_bls, e_net, e_id) = committee_member(&mut rng);
     discover(&mut all_peers, e_bls, &e_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([e_bls]), HashSet::new());
-    assert_eq!(all_peers.trust_basis(&e_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&e_id), PeerPolicy::from_bases([TrustBasis::Validator]));
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
@@ -1778,7 +1838,7 @@ fn test_update_committees_demotes_peer_that_exits_window() {
 
     // E fell out of the window: the validator exemption is gone (derived from the slots, so no
     // demotion pass is needed) and E no longer counts as a validator
-    assert_eq!(all_peers.trust_basis(&e_id), None);
+    assert_eq!(all_peers.peer_policy(&e_id), PeerPolicy::default());
     assert!(!all_peers.is_peer_validator(&e_id));
 }
 
@@ -1792,7 +1852,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
     let op_net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let op_id: PeerId = op_net.clone().into();
     all_peers.add_trusted_peer(op_bls, op_net);
-    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
+    assert_eq!(all_peers.peer_policy(&op_id), PeerPolicy::from_bases([TrustBasis::Operator]));
 
     // a committee update that does not involve the operator peer
     let (c_bls, c_net, _c_id) = committee_member(&mut rng);
@@ -1801,7 +1861,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
 
     // operator trust is stored at construction and never altered by epoch rotation, so the
     // committee update does not touch the operator peer's exemption
-    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
+    assert_eq!(all_peers.peer_policy(&op_id), PeerPolicy::from_bases([TrustBasis::Operator]));
 }
 
 #[test]
@@ -1844,7 +1904,7 @@ fn test_update_committees_populates_previous() {
 
     assert_eq!(all_peers.previous_committee, HashSet::from([p_bls]));
     assert!(all_peers.is_peer_validator(&p_id));
-    assert_eq!(all_peers.trust_basis(&p_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&p_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1878,8 +1938,8 @@ fn test_update_committees_invariants_under_random_committees() {
             prev_ids.iter().chain(curr_ids.iter()).chain(next_ids.iter()).copied().collect();
         for id in &union {
             assert_eq!(
-                all_peers.trust_basis(id),
-                Some(TrustBasis::Validator),
+                all_peers.peer_policy(id),
+                PeerPolicy::from_bases([TrustBasis::Validator]),
                 "union member {id} should be exempt after round {round}"
             );
         }
@@ -1888,8 +1948,8 @@ fn test_update_committees_invariants_under_random_committees() {
         // distinct across rounds, so the entire prior union re-enters the score model)
         for id in prev_union.difference(&union) {
             assert_eq!(
-                all_peers.trust_basis(id),
-                None,
+                all_peers.peer_policy(id),
+                PeerPolicy::default(),
                 "exited peer {id} should re-enter the score model after round {round}"
             );
         }

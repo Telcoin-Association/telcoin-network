@@ -1,12 +1,20 @@
 //! Configuration for network variables.
 
-use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
+use crate::{
+    ConfigFmt, ConfigTrait, GossipMeshConfig, NetworkBudgetError, NetworkProcessBudget,
+    NetworkServeConfig, SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
+};
 use libp2p::kad::K_VALUE;
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    num::NonZeroUsize,
+    time::Duration,
+};
 use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
 use tracing::warn;
 
@@ -16,6 +24,14 @@ impl ConfigTrait for NetworkConfig {}
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(default)]
 pub struct NetworkConfig {
+    /// Operator-selected topic mesh degrees, independent of consensus authorization.
+    gossip_mesh: GossipMeshConfig,
+    /// Independent finite concurrency budgets for stream, record, denial, and prefetch work.
+    serve_limits: NetworkServeConfig,
+    /// Optional ceiling for ordinary peers, leaving process-budget headroom for protected peers.
+    public_peer_limit: Option<NonZeroUsize>,
+    /// Prevalidated bootstrap identities with reserved DAO retention and normal load penalties.
+    dao_observers: BTreeSet<BlsPublicKey>,
     /// The configurations for libp2p library.
     ///
     /// This holds parameters for configuring gossipsub and request/response.
@@ -24,8 +40,13 @@ pub struct NetworkConfig {
     sync_config: SyncConfig,
     /// The configurations for quic protocol.
     quic_config: QuicConfig,
+    /// Optional process-wide allocation. Omission preserves the existing transport defaults.
+    process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// The startup wait for an established peer on each primary and worker network.
     peer_readiness_timeout: PeerReadinessTimeout,
     /// The hostname for the validator.
@@ -40,6 +61,43 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Return the mesh degrees used by the primary and every configured worker.
+    pub fn gossip_mesh(&self) -> &GossipMeshConfig {
+        &self.gossip_mesh
+    }
+
+    /// Per-class concurrency budgets applied to the primary and every worker.
+    pub fn serve_limits(&self) -> &NetworkServeConfig {
+        &self.serve_limits
+    }
+
+    /// Return the independent ordinary-peer ceiling, when an operator has selected one.
+    pub fn public_peer_limit(&self) -> Option<NonZeroUsize> {
+        self.public_peer_limit
+    }
+
+    /// Observer identities whose protected connectivity must survive public traffic.
+    pub fn dao_observers(&self) -> &BTreeSet<BlsPublicKey> {
+        &self.dao_observers
+    }
+
+    /// Validate the process budget against the primary plus every configured worker swarm.
+    pub fn validate_process_budget(&self, swarm_count: usize) -> Result<(), NetworkBudgetError> {
+        self.process_budget
+            .as_ref()
+            .map_or(Ok(()), |budget| budget.validate_swarm_count(swarm_count))
+    }
+
+    /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
+    pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
+        self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
+    }
+
     /// Return the startup peer-readiness budget for each primary and worker network.
     ///
     /// Defaults to 120 seconds. Expiry continues startup so a node started alone can
@@ -482,6 +540,27 @@ impl Default for QuicConfig {
             max_connection_data: 100 * 1024 * 1024, // 100MiB
             retry_unvalidated_incoming: true,
         }
+    }
+}
+
+impl QuicConfig {
+    /// Apply an allocation as an upper bound without increasing explicitly lower QUIC settings.
+    pub fn with_budget(&self, budget: Option<SwarmNetworkBudget>) -> Self {
+        budget.map_or_else(
+            || self.clone(),
+            |budget| {
+                let max_connection_data =
+                    self.max_connection_data.min(budget.receive_credit_per_connection());
+                Self {
+                    max_concurrent_stream_limit: self
+                        .max_concurrent_stream_limit
+                        .min(budget.streams_per_connection()),
+                    max_connection_data,
+                    max_stream_data: self.max_stream_data.min(max_connection_data),
+                    ..self.clone()
+                }
+            },
+        )
     }
 }
 
@@ -1187,6 +1266,41 @@ hostname: "my-validator"
         // A negative halflife flips exponential decay into unbounded growth.
         let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    /// Process allocations cap transport values and preserve lower operator settings.
+    #[test]
+    fn process_budget_caps_quic_without_raising_lower_settings() -> Result<(), std::io::Error> {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "process_budget": {
+                "swarm_count": 2,
+                "max_established_connections": 4,
+                "max_established_connections_per_peer": 1,
+                "max_inbound_streams": 40,
+                "max_receive_credit_bytes": 4000
+            }
+        }))?;
+        config.validate_process_budget(2).map_err(std::io::Error::other)?;
+        assert!(config.validate_process_budget(3).is_err());
+        let budget = config.swarm_budget().map_err(std::io::Error::other)?;
+        let capped = config.quic_config().with_budget(budget);
+        assert_eq!(capped.max_concurrent_stream_limit, 10);
+        assert_eq!(capped.max_connection_data, 1000);
+        assert_eq!(capped.max_stream_data, 1000);
+        let lower = QuicConfig {
+            max_concurrent_stream_limit: 3,
+            max_connection_data: 500,
+            max_stream_data: 100,
+            ..Default::default()
+        }
+        .with_budget(budget);
+        assert_eq!(lower.max_concurrent_stream_limit, 3);
+        assert_eq!(lower.max_connection_data, 500);
+        assert_eq!(lower.max_stream_data, 100);
+        let legacy: NetworkConfig = serde_json::from_str("{}")?;
+        assert_eq!(legacy.swarm_budget(), Ok(None));
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        Ok(())
     }
 
     #[test]

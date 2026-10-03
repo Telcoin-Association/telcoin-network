@@ -22,6 +22,52 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// A closed QUIC connection cannot score an honest peer, even with many requests in flight.
+/// Malformed response bytes retain the existing protocol penalty on the same tracked peer.
+#[tokio::test]
+async fn disconnected_request_io_does_not_score_peer() -> eyre::Result<()> {
+    use libp2p::swarm::ConnectionId;
+
+    let TestTypes { mut peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let source = register_untrusted_put_record_source(network)?;
+    (0..64).try_for_each(|_| {
+        let request_id = network
+            .swarm
+            .behaviour_mut()
+            .req_res
+            .send_request(&source, TestWorkerRequest::MissingBatches(Vec::new()));
+        network.process_reqres_event(ReqResEvent::OutboundFailure {
+            peer: source,
+            connection_id: ConnectionId::new_unchecked(0),
+            request_id,
+            error: ReqResOutboundFailure::Io(std::io::Error::new(
+                ErrorKind::NotConnected,
+                "QUIC connection closed",
+            )),
+        })
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), Some(0.0));
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+
+    let request_id = network
+        .swarm
+        .behaviour_mut()
+        .req_res
+        .send_request(&source, TestWorkerRequest::MissingBatches(Vec::new()));
+    network.process_reqres_event(ReqResEvent::OutboundFailure {
+        peer: source,
+        connection_id: ConnectionId::new_unchecked(0),
+        request_id,
+        error: ReqResOutboundFailure::Io(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed response",
+        )),
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), Some(-5.0));
+    Ok(())
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
@@ -303,6 +349,122 @@ where
     };
 
     TestTypes { peer1, peer2, _task_manager: task_manager }
+}
+
+/// Local record callers have finite admission and receive completion on both empty and valid
+/// queries.
+#[tokio::test]
+async fn application_record_queries_are_bounded_and_complete(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+    let key = network.key_config.primary_public_key();
+    let receivers = (0..100)
+        .map(|_| {
+            let (reply, receiver) = oneshot::channel();
+            network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+            Ok(receiver)
+        })
+        .collect::<crate::types::NetworkResult<Vec<_>>>()?;
+    let (reply, mut rejected) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    assert!(
+        rejected.try_recv().is_ok_and(|result| result.is_err()),
+        "allocation overflow must fail immediately"
+    );
+    let ids = network
+        .kad_record_queries
+        .iter()
+        .filter(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 100);
+    assert_eq!(
+        network
+            .swarm
+            .behaviour()
+            .kademlia
+            .iter_queries()
+            .filter(|query| {
+                matches!(query.info(), kad::QueryInfo::GetRecord { key: requested, .. }
+                    if requested == &crate::kad::node_record_key(&key))
+            })
+            .count(),
+        100,
+        "application lookups must query the same raw key used by signed record publishers"
+    );
+    ids.iter().for_each(|id| network.close_kad_query(id));
+    receivers.into_iter().try_for_each(|mut receiver| {
+        assert!(receiver.try_recv()?.is_err(), "an empty query must report failure");
+        Ok::<_, tokio::sync::oneshot::error::TryRecvError>(())
+    })?;
+    assert!(network.kad_record_queries.values().all(|query| query.reply.is_none()));
+
+    let record = network.node_record.clone();
+    let (reply, mut complete) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    let id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .ok_or("application query was not retained")?;
+    network
+        .kad_record_queries
+        .get_mut(&id)
+        .map(|query| query.result = Some(record.clone()))
+        .ok_or("application query disappeared")?;
+    network.close_kad_query(&id);
+    assert_eq!(encode(&complete.try_recv()??), encode(&record));
+
+    let (reply, mut first_record) = oneshot::channel();
+    network.process_command(crate::types::NetworkCommand::GetNodeRecord { key, reply })?;
+    let id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.reply.is_some())
+        .map(|(id, _)| *id)
+        .ok_or("application query was not retained")?;
+    network.process_kad_query_result(&id, key, record.clone(), None, false);
+    let result = first_record.try_recv();
+    assert!(result.is_ok(), "verified application records must reply before the final lookup step");
+    assert_eq!(encode(&result??), encode(&record));
+    assert!(
+        !network.kad_record_queries.contains_key(&id),
+        "completed application lookups must release their query allocation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn authority_record_is_usable_before_lookup_finishes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+    let key = peer2.network.key_config.primary_public_key();
+    let record = peer2.network.node_record.clone();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [key].into_iter().collect(),
+        Default::default(),
+    );
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(key).is_none());
+    let id = network.swarm.behaviour_mut().kademlia.get_record(crate::kad::node_record_key(&key));
+    network
+        .kad_record_queries
+        .insert(id, crate::consensus::KadQuery { request: key, result: None, reply: None });
+    network.process_kad_query_result(&id, key, record.clone(), None, false);
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(key).is_some(),
+        "verified authority bindings must be usable before the final lookup step"
+    );
+    assert!(
+        network.kad_record_queries.contains_key(&id),
+        "authority discovery must continue collecting newer signed records"
+    );
+    network.close_kad_query(&id);
+    Ok(())
 }
 
 /// Wait for a peer's BLS key to be discovered via kademlia.
@@ -1956,6 +2118,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Committee promotion forgives load-induced bans while protocol bans remain attributable.
 #[tokio::test]
 async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     // Start with two peers
@@ -1998,8 +2161,14 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     let connected_peers = peer1.connected_peer_ids().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
 
-    // Apply fatal penalty to peer2 - should ban it
-    peer1.report_penalty(config_2.key_config().primary_public_key(), Penalty::Fatal).await;
+    // Only load-induced bans are forgiven when a peer acquires committee privileges.
+    futures::future::join_all((0..20).map(|_| {
+        peer1.report_penalty(
+            config_2.key_config().primary_public_key(),
+            Penalty::Load(crate::LoadPenalty::KademliaFlood),
+        )
+    }))
+    .await;
 
     // Wait for ban to take effect
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -2174,6 +2343,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Committee admission forgives a load ban while its connection is still closing.
 #[tokio::test]
 async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> {
     // Start with two peers
@@ -2219,12 +2389,13 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Apply severe penalties to put peer in a disconnecting state pending ban
     // We need to apply penalties but not enough to cause immediate ban
     // First apply medium penalties
-    for _ in 0..3 {
-        peer1.report_penalty(peer2_bls, Penalty::Medium).await;
-    }
+    futures::future::join_all((0..3).map(|_| {
+        peer1.report_penalty(peer2_bls, Penalty::Load(crate::LoadPenalty::KademliaRateLimit))
+    }))
+    .await;
 
     // Then apply a severe penalty - should trigger disconnect pending ban
-    peer1.report_penalty(peer2_bls, Penalty::Severe).await;
+    peer1.report_penalty(peer2_bls, Penalty::Load(crate::LoadPenalty::KademliaFlood)).await;
 
     // Wait for disconnect to begin but not complete
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2868,6 +3039,196 @@ async fn test_own_record_refresh_reaches_peer() -> eyre::Result<()> {
     result
 }
 
+/// Unrelated signed records are not stored or used to identify a relayer; pins remain writable.
+#[tokio::test]
+async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
+    use tn_types::Signer as _;
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let domain = RecordDomain::new(network.config.chain_id, NetworkType::Primary);
+    let mut rng = StdRng::from_seed([146; 32]);
+    let unrelated_bls = BlsKeypair::generate(&mut rng);
+    let unrelated_network = NetworkKeypair::generate_ed25519();
+    let unrelated = NodeRecord::build(
+        domain,
+        unrelated_network.public().into(),
+        create_multiaddr(None),
+        None,
+        |data| unrelated_bls.sign(data),
+    );
+    let unrelated_record = kad::Record {
+        key: kad::RecordKey::new(unrelated_bls.public()),
+        value: encode(&unrelated),
+        publisher: Some(unrelated_network.public().to_peer_id()),
+        expires: None,
+    };
+    let relay = PeerId::random();
+    network.process_kad_put_request(relay, unrelated_record.clone())?;
+    assert!(network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&unrelated_record.key)
+        .is_none());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
+
+    let required = peer2.network.get_peer_record();
+    let required_bls = peer2.config.key_config().primary_public_key();
+    let (reply, response) = tokio::sync::oneshot::channel();
+    network.process_command(NetworkCommand::AddExplicitPeer {
+        bls_pubkey: required_bls,
+        network_pubkey: peer2.network.node_record.info.pubkey.clone(),
+        addr: create_multiaddr(None),
+        reply,
+    })?;
+    response.await??;
+    network.process_kad_put_request(relay, required.clone())?;
+    assert_eq!(
+        network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&required.key)
+            .map(|stored| stored.value.clone()),
+        Some(required.value.clone())
+    );
+
+    // Model the authenticated connected owner, then verify physical deletion on its last close.
+    let source = unrelated_network.public().to_peer_id();
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_connected(source, unrelated_record.key.clone())?;
+    network.process_kad_put_request(source, unrelated_record.clone())?;
+    assert_eq!(network.swarm.behaviour_mut().kademlia.store_mut().persisted_record_count(), 2);
+    network.swarm.behaviour_mut().kademlia.store_mut().release_connected(&source)?;
+    let store = network.swarm.behaviour_mut().kademlia.store_mut();
+    assert_eq!(
+        store.persisted_record_count(),
+        1,
+        "last-owner cleanup must delete the database row"
+    );
+    assert!(store.get(&unrelated_record.key).is_none());
+    assert!(store.get(&required.key).is_some(), "disconnect cannot delete a pin-owned row");
+
+    // An invalid publisher/source binding remains unauthenticated even when storage rejects it.
+    let invalid_source = PeerId::random();
+    let mut invalid = unrelated_record;
+    invalid.publisher = Some(invalid_source);
+    network.process_kad_put_request(invalid_source, invalid)?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&invalid_source), None);
+    Ok(())
+}
+
+/// Storage admission failure cannot leave the authentication committee on an obsolete epoch.
+#[tokio::test]
+async fn test_kad_capacity_does_not_block_authoritative_membership() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let member = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().set_retention_budget_for_test(1)?;
+    assert!(
+        network
+            .process_command(NetworkCommand::UpdateCommittees {
+                previous: HashSet::new(),
+                current: HashSet::from([member]),
+                next: HashSet::new(),
+            })
+            .is_err(),
+        "own-record reservation fills the isolated required allowance"
+    );
+    network.process_kad_put_request(source, record.clone())?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(member));
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(member).is_some());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none());
+    Ok(())
+}
+
+/// The resolved library republishes our record across job intervals, never third-party rows.
+#[tokio::test]
+async fn test_kad_record_jobs_publish_own_record_only() -> eyre::Result<()> {
+    use libp2p::swarm::NetworkBehaviour as _;
+
+    let local = PeerId::random();
+    let remote = PeerId::random();
+    let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let own_key = kad::RecordKey::new(&keys.primary_public_key());
+    // The remote is strictly closest to this key, so a re-enabled replication job must
+    // create an observable query instead of terminating with no eligible destination.
+    let third_key = kad::RecordKey::new(&remote.to_bytes());
+    let mut own = kad::Record::new(own_key.clone(), vec![1]);
+    own.publisher = Some(local);
+    let mut third = kad::Record::new(third_key.clone(), vec![2]);
+    third.publisher = Some(remote);
+    let mut store = KadStore::new(MemDatabase::default(), local, &keys, NetworkType::Primary);
+    store.enable_retention()?;
+    store.retain_connected(remote, third_key.clone())?;
+    store.put(own)?;
+    store.put(third)?;
+    assert!(store.get(&third_key).is_some(), "retained remote records must remain queryable");
+    let settings = tn_config::LibP2pConfig {
+        kad_publication_interval: Duration::from_millis(100),
+        kad_replication_interval: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let mut config = kad::Config::new(libp2p::StreamProtocol::new("/tn-retention-test"));
+    crate::consensus::configure_record_jobs(&mut config, &settings);
+    let mut behaviour = kad::Behaviour::with_config(local, store, config);
+    behaviour.add_address(&remote, "/ip4/192.0.2.1/tcp/1".parse()?);
+    let behaviour = std::cell::RefCell::new(behaviour);
+
+    wait_until(Duration::from_secs(5), "own-record publication job", || {
+        let mut behaviour = behaviour.borrow_mut();
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let _ = behaviour.poll(&mut context);
+        let publishing: Vec<_> = behaviour
+            .iter_queries()
+            .filter_map(|query| match query.info() {
+                kad::QueryInfo::PutRecord { record, .. } => Some(record.key.clone()),
+                kad::QueryInfo::Bootstrap { .. }
+                | kad::QueryInfo::GetClosestPeers { .. }
+                | kad::QueryInfo::GetProviders { .. }
+                | kad::QueryInfo::AddProvider { .. }
+                | kad::QueryInfo::GetRecord { .. } => None,
+            })
+            .collect();
+        assert!(
+            !publishing.contains(&third_key),
+            "third-party periodic replication must stay disabled"
+        );
+        std::future::ready(Ok(publishing.contains(&own_key)))
+    })
+    .await?;
+
+    // Serving a retained committee binding is independent of the publication job.
+    behaviour.borrow_mut().get_record(third_key.clone());
+    wait_until(Duration::from_secs(5), "retained committee record lookup", || {
+        let mut behaviour = behaviour.borrow_mut();
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let found = matches!(behaviour.poll(&mut context), std::task::Poll::Ready(
+            libp2p::swarm::ToSwarm::GenerateEvent(kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
+                    kad::PeerRecord { record, .. }
+                ))), ..
+            })
+        ) if record.key == third_key);
+        std::future::ready(Ok(found))
+    })
+    .await?;
+    Ok(())
+}
+
 /// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
 #[tokio::test]
 async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
@@ -2876,6 +3237,12 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     let mut network = peer1.network;
     let source = *peer2.network.swarm.local_peer_id();
     let mut record = peer2.network.get_peer_record();
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_connected(source, record.key.clone())?;
     let instant = std::time::Instant::now();
     record.expires = Some(instant + Duration::from_secs(60));
     network.process_kad_put_request(source, record.clone())?;
@@ -2926,6 +3293,12 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
     let mut network = peer1.network;
     let source = *peer2.network.swarm.local_peer_id();
     let current = peer2.network.get_peer_record();
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_connected(source, current.key.clone())?;
     network.process_kad_put_request(source, current.clone())?;
     let score = network.swarm.behaviour().peer_manager.peer_score(&source);
     assert!(score.is_some(), "publisher must be tracked for the score assertion");
@@ -2983,6 +3356,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    // This regression exercises physical database saturation independently of policy admission.
+    // Policy admission and its process ceiling are covered by the retention tests above.
+    *network.swarm.behaviour_mut().kademlia.store_mut() = crate::kad::KadStore::new(
+        MemDatabase::default(),
+        *network.swarm.local_peer_id(),
+        peer1.config.key_config(),
+        NetworkType::Primary,
+    );
     let owner = *peer2.network.swarm.local_peer_id();
     let owner_bls = peer2.config.key_config().primary_public_key();
     let domain = RecordDomain::new(
@@ -3058,6 +3439,15 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     let TestTypes { peer1, mut peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    // Model a legacy persisted row to keep the identity/freshness regression independent
+    // of the new policy that refuses unrelated relayed records in production.
+    let store = crate::kad::KadStore::new(
+        MemDatabase::default(),
+        *network.swarm.local_peer_id(),
+        peer1.config.key_config(),
+        NetworkType::Primary,
+    );
+    *network.swarm.behaviour_mut().kademlia.store_mut() = store;
     let owner = *peer2.network.swarm.local_peer_id();
     let owner_bls = peer2.config.key_config().primary_public_key();
     let relay = PeerId::random();
@@ -3141,6 +3531,7 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     peer2.network.node_record = old_record;
     let old_kad_record = peer2.network.get_peer_record();
     // put old record in store
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([peer2_pubkey])?;
     network.swarm.behaviour_mut().kademlia.store_mut().put(old_kad_record.clone())?;
     // assert kad store is old
     let store_record = network
@@ -3218,6 +3609,12 @@ async fn test_kad_put_shed_is_unscored_and_flood_is_penalized() -> eyre::Result<
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_committees([peer2.config.key_config().primary_public_key()])?;
     let source = register_untrusted_put_record_source(&mut network)?;
     // Relay another node's valid signed record. The source remains an ordinary connected peer.
     let record = peer2.network.get_peer_record();
@@ -3251,6 +3648,53 @@ async fn test_kad_put_shed_is_unscored_and_flood_is_penalized() -> eyre::Result<
         "later shed messages below the hard cutoff must not apply another penalty"
     );
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&source));
+    Ok(())
+}
+
+/// A trusted hub's excess Kademlia work is shed while its retention and score remain intact.
+#[tokio::test]
+async fn test_trusted_kad_flood_remains_bounded_and_protocol_bannable() -> eyre::Result<()> {
+    use crate::peers::PUT_RECORD_DISCONNECT_THRESHOLD;
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_committees([peer2.config.key_config().primary_public_key()])?;
+    let record = peer2.network.get_peer_record();
+    let source = record.publisher.ok_or_else(|| eyre::eyre!("fixture record has no publisher"))?;
+    let (reply, _ack) = tokio::sync::oneshot::channel();
+    network.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
+        peer2.config.key_config().primary_public_key(),
+        NetworkInfo {
+            pubkey: peer2.config.key_config().primary_network_public_key(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        },
+        reply,
+    );
+    let before = network.swarm.behaviour().peer_manager.peer_score(&source);
+    assert!(before.is_some());
+    (0..=PUT_RECORD_DISCONNECT_THRESHOLD)
+        .try_for_each(|_| network.process_kad_put_request(source, record.clone()))?;
+    // A different record arrives after the finite work allowance has been exhausted.
+    let excess = network.get_peer_record();
+    assert_ne!(excess.key, record.key);
+    network.swarm.behaviour_mut().kademlia.store_mut().remove(&excess.key);
+    network.process_kad_put_request(source, excess.clone())?;
+    let store = network.swarm.behaviour_mut().kademlia.store_mut();
+    assert!(store.get(&record.key).is_some());
+    assert!(store.get(&excess.key).is_none(), "trusted peers cannot bypass the write budget");
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_score(&source), before);
+    assert!(network.swarm.behaviour().peer_manager.peer_is_important(&source));
+    // Another message class has its own finite allowance, unaffected by put-record overload.
+    assert!(!network.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(source));
+    network.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
+    assert!(network.swarm.behaviour().peer_manager.peer_banned(&source));
     Ok(())
 }
 
@@ -3880,6 +4324,7 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
 
     // owner is a committee member so the gated discovery path (#827) retains its record;
     // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([owner_bls])?;
     network.swarm.behaviour_mut().peer_manager.update_committees(
         Default::default(),
         std::iter::once(owner_bls).collect(),
@@ -4105,11 +4550,9 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
         worker_0_address,
         None,
     )?;
-    assert_eq!(db.iter::<KadWorkerRecords>().collect::<Vec<_>>(), persisted);
-    assert_eq!(
-        store_0.get(&key).map(|record| record.value.clone()),
-        Some(encode(&worker_0_record))
-    );
+    // Startup applies ownership only to worker-0; worker-1's persisted row remains intact.
+    assert_eq!(db.iter::<KadWorkerRecords>().count(), 1);
+    assert_eq!(store_0.get(&key).map(|record| record.value.clone()), None);
     assert_eq!(
         store_1.get(&key).map(|record| record.value.clone()),
         Some(encode(&worker_1_record))
@@ -4361,7 +4804,7 @@ fn test_gossip_message() -> GossipMessage {
 fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message.clone(), None, None);
+        accepted_gossip_event(message.clone(), None, None, None);
     assert_matches!(
         event,
         NetworkEvent::Gossip(payload)
@@ -4378,7 +4821,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, Some(bls), None);
+        accepted_gossip_event(message, Some(bls), None, None);
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
@@ -4462,7 +4905,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let author = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, None, Some(author));
+        accepted_gossip_event(message, None, Some(author), None);
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }
@@ -4544,7 +4987,7 @@ fn connection_limit_caps_established_connections_per_peer() {
     };
 
     // the behaviour installed in production; the pending inbound budget is not under test here
-    let mut limits = super::connection_limits_behaviour(u32::MAX);
+    let mut limits = super::connection_limits_behaviour(u32::MAX, None);
     let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
 
     let peer = PeerId::random();
@@ -4641,7 +5084,7 @@ fn connection_limit_bounds_pending_incoming_connections() {
     };
 
     const CAP: u32 = 3;
-    let mut limits = super::connection_limits_behaviour(CAP);
+    let mut limits = super::connection_limits_behaviour(CAP, None);
     let addr = create_multiaddr(None);
 
     // the swarm asks for a pending inbound slot for connection `id`
@@ -4725,16 +5168,16 @@ fn connection_limit_bounds_pending_incoming_connections() {
 /// How long the swarm-level pending slot test waits for one listener event.
 const SWARM_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1)`,
-/// so it holds at most one pending inbound connection, and `connection_timeout` bounds every
-/// handshake.
+/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1,
+/// None)`, so it holds at most one pending inbound connection, and `connection_timeout` bounds
+/// every handshake.
 fn quic_connection_limits_swarm(
     connection_timeout: Duration,
 ) -> Swarm<connection_limits::Behaviour> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| super::connection_limits_behaviour(1))
+        .with_behaviour(|_| super::connection_limits_behaviour(1, None))
         .expect("the behaviour constructor is infallible")
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
         .with_connection_timeout(connection_timeout)

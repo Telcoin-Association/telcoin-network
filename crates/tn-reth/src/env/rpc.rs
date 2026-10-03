@@ -602,9 +602,22 @@ mod tests {
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<Methods> {
+        epoch_fee_methods_with_genesis_hash(epoch_fee, header_fee, rpc_args, task_manager, tmp_dir)
+            .map(|(methods, _genesis_hash)| methods)
+    }
+
+    /// Return the methods and the hash of the exact genesis used by their provider.
+    fn epoch_fee_methods_with_genesis_hash(
+        epoch_fee: u64,
+        header_fee: u64,
+        rpc_args: reth::args::RpcServerArgs,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<(Methods, B256)> {
         let mut genesis = test_genesis();
         genesis.base_fee_per_gas = Some(u128::from(header_fee));
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_hash = chain.genesis_hash();
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain,
             tmp_dir.path(),
@@ -621,7 +634,7 @@ mod tests {
         reth_env
             .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))
             .map(|server| {
-                server.methods_by(|name| {
+                let methods = server.methods_by(|name| {
                     matches!(
                         name,
                         "eth_call"
@@ -629,7 +642,8 @@ mod tests {
                             | "eth_createAccessList"
                             | "eth_fillTransaction"
                     )
-                })
+                });
+                (methods, genesis_hash)
             })
     }
 

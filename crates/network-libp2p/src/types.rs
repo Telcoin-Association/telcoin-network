@@ -211,6 +211,19 @@ pub struct GossipPayload {
     pub relayer: Option<BlsPublicKey>,
     /// BLS identity of the message author (`GossipMessage::source`), when resolved.
     pub author: Option<BlsPublicKey>,
+    /// Transport receipt metadata, present for messages received from the live swarm.
+    pub receipt: Option<GossipReceipt>,
+}
+
+/// Transport identities and arrival time for an accepted, authenticated gossip message.
+#[derive(Debug, serde::Serialize)]
+pub struct GossipReceipt {
+    /// The production gossipsub message identifier, matching the publisher's observation.
+    pub message_id: String,
+    /// The immediate authenticated QUIC peer that forwarded the message.
+    pub propagation_source: PeerId,
+    /// System-clock microseconds at acceptance, for isolated hosts sharing the same clock.
+    pub received_unix_us: u128,
 }
 
 // ============================================================================
@@ -460,6 +473,13 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Option<RpcInfo>>,
     },
+    /// Query the DHT for a signature-validated record in this swarm's chain and role domain.
+    GetNodeRecord {
+        /// The identity whose signed record is requested.
+        key: BlsPublicKey,
+        /// Completion after the query closes, including missing or failed lookups.
+        reply: oneshot::Sender<NetworkResult<NodeRecord>>,
+    },
     /// Snapshot of the current committee's advertised RPCs; triggers kad discovery
     /// for members with no known record.
     GetAllValidatorRpcs {
@@ -656,7 +676,7 @@ where
         count.await.map_err(Into::into)
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Retrieve authenticated peers with established connections, excluding pending dials.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
@@ -712,7 +732,7 @@ where
     ///
     /// This method closes all connections to the peer without waiting for handlers
     /// to complete.
-    pub(crate) async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
         res.await?.map_err(|_| NetworkError::DisconnectPeer)
@@ -788,6 +808,17 @@ where
         rx.await.map_err(Into::into)
     }
 
+    /// Issue a bounded DHT lookup instead of reading the peer manager's cached RPC metadata.
+    ///
+    /// The result passes the existing key, signature, chain, and swarm-domain validation.
+    /// A query that ends without a valid record is an error. Dropping the caller never adds
+    /// a waiting task, and the Kademlia deadline bounds the retained query.
+    pub async fn get_node_record(&self, key: BlsPublicKey) -> NetworkResult<NodeRecord> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetNodeRecord { key, reply }).await?;
+        rx.await?
+    }
+
     /// Snapshot of the current committee's advertised RPCs.
     ///
     /// Returns the RPC info for every current-committee validator that has
@@ -816,11 +847,13 @@ pub struct KadQuery {
     pub request: BlsPublicKey,
     /// The best result so far.
     pub result: Option<NodeRecord>,
+    /// Optional local application caller, absent for background committee discovery.
+    pub reply: Option<oneshot::Sender<NetworkResult<NodeRecord>>>,
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None }
+        Self { request, result: None, reply: None }
     }
 }
 
