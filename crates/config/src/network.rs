@@ -229,11 +229,14 @@ pub struct LibP2pConfig {
     /// Must be nonzero to give republication a positive cadence. Must also be <
     /// `kad_record_ttl`, otherwise records expire before they are refreshed.
     pub kad_publication_interval: Duration,
-    /// How often this node replicates every stored record (its own and others') to the
-    /// `replication_factor` closest peers.
+    /// The libp2p-kad replication cadence of peers on earlier releases.
     ///
-    /// This cadence drives the dominant inbound `PutRecord` fan-in each node sees from
-    /// each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
+    /// This node does not use it: network-libp2p disables the libp2p-kad record job and
+    /// republishes only its own record on `kad_publication_interval`. The field stays so that
+    /// existing configuration files parse and validate without change.
+    ///
+    /// On those peers this cadence drives the dominant inbound `PutRecord` fan-in each node sees
+    /// from each peer (see `MAX_PUT_RECORDS_PER_WINDOW` in network-libp2p). Pinned explicitly
     /// so the value is a deliberate choice rather than an inherited libp2p default; the
     /// default matches the libp2p default (1h).
     ///
