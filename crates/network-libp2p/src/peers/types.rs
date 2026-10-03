@@ -91,7 +91,10 @@ pub(super) enum PeerAction {
     /// Disconnect a peer with peer exchange information to support discovery.
     /// This results in a temporary ban to prevent immediate reconnection attempts.
     DisconnectWithPX,
-    /// Unban the peer and it's known ip addresses.
+    /// Unban the peer and the ip addresses whose banned counts this transition released.
+    ///
+    /// Empty when the status had already left `Banned` before the reputation recovered: the
+    /// counts were released then, but the `Unbanned` notification is still owed.
     Unban(Vec<IpAddr>),
 }
 

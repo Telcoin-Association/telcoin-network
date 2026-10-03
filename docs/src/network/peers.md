@@ -87,10 +87,15 @@ max_discovery_peers     = 30 * 2                                         = 60
 ```
 
 Three of these are enforced on the connection path today.
-An inbound connection is refused once connected-or-dialing peers reach 39.
-An outbound connection is refused once connected peers reach 42, the higher ceiling reflecting that this node chose to dial.
+Both connection ceilings count the population: the distinct peer IDs across connected peers and pending connection reservations.
+An inbound connection from a new peer is refused once the population reaches 39.
+An outbound connection to a new peer is refused once the population reaches 42, the higher ceiling reflecting that this node chose to dial; it is checked before dialing and again at establishment.
 The discovery candidate pool is trimmed to 60.
 An important peer bypasses both connection ceilings.
+A peer that already holds a connection may add connections at either ceiling.
+A node that sets `peer_exchange_at_capacity` (bootstrap nodes) accepts a new inbound peer at 39 only to disconnect it with peer exchange and a temporary ban, so the newcomer leaves with other peers to try.
+That hand-off holds no population slot, and validators leave the setting off.
+Capacity refusals show in `inbound_connections_denied_total` with reason `peer_capacity`.
 The remaining three values — 45 priority peers, 9 target outbound, and 6 minimum outbound-only — are configured and resolvable but are not read by any production code path at present.
 
 A separate per-peer ceiling caps concurrent established connections from a single peer at **8**.
@@ -102,7 +107,8 @@ QUIC Retry, enabled by default, validates the source address before a handshake 
 If `retry_unvalidated_incoming` is disabled as an operator rollback, a forged QUIC Initial datagram can hold a slot for the 10 second transport timeout, so a small cap would let a cheap flood refuse honest peers.
 Refusals show in `inbound_connections_denied_total`.
 
-Dial attempts time out after 15 seconds; a peer still dialing past that is marked disconnected, because dialing peers count against the inbound limit.
+Dial attempts time out after 15 seconds; a peer still dialing past that is marked disconnected.
+A `Dialing` status alone does not count against either ceiling.
 
 ## The heartbeat
 

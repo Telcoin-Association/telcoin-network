@@ -9,7 +9,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
-pub(crate) use manager::{PeerManager, PutRecordRate};
+pub(crate) use manager::{PeerCapacityReached, PeerManager, PutRecordRate};
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 

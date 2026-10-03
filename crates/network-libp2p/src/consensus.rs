@@ -149,9 +149,9 @@ enum RecordFreshness {
 /// directions (inbound and outbound).
 ///
 /// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of its
-/// own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct* `PeerId`s, so one
-/// peer holding many simultaneous connections still counts as one, and the inbound admission
-/// callback rejects only self-connections and banned peers. Without this cap a single unbanned peer
+/// own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct* `PeerId`s, and an
+/// identity already admitted may add connections at that limit, so one peer holding many
+/// simultaneous connections still counts as one. Without this cap a single unbanned peer
 /// could open connections up to the OS / QUIC file-descriptor and memory limits. Installing a
 /// [`connection_limits::Behaviour`] with this per-peer bound closes that gap (issue #1010).
 ///
@@ -172,11 +172,12 @@ const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 /// (about 10 seconds, see [`connection_limits_behaviour`]). A full budget refuses every new inbound
 /// handshake, committee peers included, so the value is sized to bound memory only.
 ///
-/// The value does not depend on [`PeerConfig`]. The peer manager has no inbound admission ceiling
-/// for this budget to mirror: it admits every connection that is not banned and disconnects excess
-/// peers that are not important only after establishment, and validators and allowlisted peers have
-/// no count ceiling. A dial that this budget refuses is retried only by `dial_peer_bls` (committee
-/// dials at epoch start, with a bounded backoff that gives up once other peers are connected).
+/// The value does not depend on [`PeerConfig`]. The peer manager's population limit applies to
+/// authenticated identities at establishment, and validators and allowlisted peers are exempt from
+/// it, so there is nothing for this budget to mirror: it runs before the remote is authenticated
+/// and sees only the address. A dial that this budget refuses is retried only by `dial_peer_bls`
+/// (committee dials at epoch start, with a bounded backoff that gives up once other peers are
+/// connected).
 ///
 /// Established connections do not count against this budget, so connected peers are not affected
 /// when it is full, and neither are this node's own outbound dials.
@@ -989,8 +990,9 @@ where
                 }
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling or the per-peer established ceiling); count it, and log only the configured
-            // limit and the fixed limit description, never peer-supplied data
+            // ceiling or the per-peer established ceiling) or by the peer population limit; count
+            // it, and log only the configured limit and the fixed limit description, never
+            // peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
                 peer_id,
@@ -1022,6 +1024,21 @@ where
                                     "inbound connections keep being refused by connection limits"
                                 );
                             });
+                    },
+                );
+                // capacity refusals are expected while this node is full, so they are counted and
+                // logged at debug without the operator warning; the peer manager logs the
+                // population and limit
+                cause.downcast_ref::<peers::PeerCapacityReached>().into_iter().for_each(
+                    |refused| {
+                        let denial = InboundDenial::PeerCapacity;
+                        self.metrics.record_inbound_denied(&denial);
+                        debug!(
+                            target: "network",
+                            ?denial,
+                            %refused,
+                            "inbound connection refused by peer population limit"
+                        );
                     },
                 );
             }

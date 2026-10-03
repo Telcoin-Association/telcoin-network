@@ -7,6 +7,7 @@
 //! release it, checked at dequeue so a queued notification cannot revoke a subsequent ban.
 
 use self::admission::ConnectionAdmission;
+pub(crate) use self::admission::PeerCapacityReached;
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
@@ -719,12 +720,12 @@ impl PeerManager {
     /// Disconnect from a peer.
     ///
     /// This is the recommended graceful disconnect method and is called when peers
-    /// are penalized or if connecting with a dialing peer would result in excess peer
-    /// count.
+    /// are penalized, when heartbeat pruning trims peers above `target_num_peers`, and for the
+    /// `peer_exchange_at_capacity` hand-off of a new inbound peer at capacity.
     ///
     /// The argument `support_discovery` indicates if the disconnect message should
     /// include additional connected peers to help the peer discovery other nodes.
-    /// Peers that are disconnected because of excess peer limits support discovery.
+    /// Pruned and handed-off peers support discovery.
     pub(crate) fn disconnect_peer(&mut self, peer_id: PeerId, support_discovery: bool) {
         // include peer exchange or not
         let event = if support_discovery {
@@ -855,7 +856,9 @@ impl PeerManager {
 
     /// Unban temporarily banned peers.
     ///
-    /// Peers are temporarily "banned" when trying to connect while this node has excess peers.
+    /// Peers are temporarily "banned" after this node disconnects them with peer exchange:
+    /// heartbeat pruning above `target_num_peers`, or the `peer_exchange_at_capacity` hand-off.
+    /// Peers refused at capacity without a hand-off are not temporarily banned.
     fn unban_temp_banned_peers(&mut self) {
         for peer_id in self.temporarily_banned.heartbeat() {
             self.push_event(PeerEvent::Unbanned(peer_id));
@@ -864,9 +867,9 @@ impl PeerManager {
 
     /// Process peer exchange for peer discovery.
     ///
-    /// This method is called when a peer disconnects immediately from this node due to having too
-    /// many peers. The disconnecting peer shares information about other known peers to
-    /// facilitate discovery.
+    /// This method is called when a peer disconnects from this node with peer exchange, because
+    /// the peer pruned this node above its target or handed it off at capacity. The disconnecting
+    /// peer shares information about other known peers to facilitate discovery.
     ///
     /// Peers should be wary of these reported peers (eclipse attacks). Peers discovered through
     /// kademlia are prioritized over peer exchange by only processing up to the missing target

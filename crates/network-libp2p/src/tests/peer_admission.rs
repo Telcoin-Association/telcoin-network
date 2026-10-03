@@ -431,3 +431,232 @@ async fn test_admission_authoritative_forgiveness() -> Result<(), ConnectionDeni
             admit(&mut manager, ConnectionId::new_unchecked(1), peer, Endpoint::Listener)
         })
 }
+
+/// The population of `manager_with_capacity` on a bootstrap node that hands off at capacity.
+fn hand_off_manager() -> PeerManager {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().target_num_peers = 2;
+    config.peer_config_mut().peer_excess_factor = 0.0;
+    config.peer_config_mut().priority_peer_excess = 1.0;
+    config.peer_config_mut().peer_exchange_at_capacity = true;
+    create_test_peer_manager(Some(config))
+}
+
+/// The typed capacity cause of a refused admission, if the refusal carries it.
+fn capacity_refusal(
+    manager: &mut PeerManager,
+    connection_id: ConnectionId,
+    peer_id: PeerId,
+    direction: Endpoint,
+) -> Option<PeerCapacityReached> {
+    admit(manager, connection_id, peer_id, direction)
+        .err()
+        .and_then(|denied| denied.downcast::<PeerCapacityReached>().ok())
+}
+
+/// Whether the peer's record holds a connection status that satisfies `expected`.
+fn status_is(
+    manager: &PeerManager,
+    peer_id: &PeerId,
+    expected: fn(&ConnectionStatus) -> bool,
+) -> bool {
+    manager.peers.get_peer(peer_id).is_some_and(|record| expected(record.connection_status()))
+}
+
+/// Whether the peer's reputation is at or past the ban threshold.
+fn reputation_banned(manager: &PeerManager, peer_id: &PeerId) -> bool {
+    manager.peers.get_peer(peer_id).is_some_and(|record| record.reputation().banned())
+}
+
+/// Count the `Unbanned` notifications for `peer_id` that reached the swarm.
+fn unbanned_count(events: &[PeerEvent], peer_id: PeerId) -> usize {
+    events.iter().filter(|event| matches!(event, PeerEvent::Unbanned(id) if *id == peer_id)).count()
+}
+
+/// Model heartbeat score recovery for a banned reputation.
+///
+/// The score decays on `std::time::Instant` behind a 30-minute ban lockout, so a unit test cannot
+/// wait for it. The record's score is restored, then the `Unbanned` transition is applied exactly
+/// as `AllPeers::update_peer_scores` and `PeerManager::heartbeat` apply it.
+fn recover_score(manager: &mut PeerManager, peer_id: PeerId) {
+    assert!(reputation_banned(manager, &peer_id), "recovery starts from a banned reputation");
+    manager.peers.get_peer_mut(&peer_id).into_iter().for_each(|record| record.reset_score_to_max());
+    assert!(!reputation_banned(manager, &peer_id), "the reputation must leave the ban threshold");
+    let action = manager.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+    manager.apply_peer_action(peer_id, action);
+}
+
+/// A ban on a disconnected peer that outlives a failed queued dial is released exactly once,
+/// after score recovery, and never at reconnect-cache expiry.
+#[tokio::test]
+async fn test_admission_unban_after_failed_dial_waits_for_score_recovery() {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().excess_peers_reconnection_timeout = Duration::ZERO;
+    let mut manager = create_test_peer_manager(Some(config));
+    let peer = register_peer(&mut manager, None);
+    manager.register_disconnected(&peer);
+    assert!(status_is(&manager, &peer, |status| matches!(
+        status,
+        ConnectionStatus::Disconnected { .. }
+    )));
+
+    // a ban lands while a dial for the peer is still queued
+    manager.process_penalty(peer, Penalty::Fatal);
+    assert!(status_is(&manager, &peer, |status| matches!(status, ConnectionStatus::Banned { .. })));
+    let banned = collect_all_events(&mut manager);
+    assert!(banned.iter().any(|event| matches!(event, PeerEvent::Banned(id) if *id == peer)));
+    assert_eq!(unbanned_count(&banned, peer), 0);
+
+    // the queued dial drains and fails, so the status leaves `Banned` before the score recovers
+    manager.register_dial_attempt(peer, None);
+    assert!(status_is(&manager, &peer, |status| matches!(
+        status,
+        ConnectionStatus::Dialing { .. }
+    )));
+    let error = DialError::Denied { cause: ConnectionDenied::new("queued dial refused") };
+    manager.on_swarm_event(FromSwarm::DialFailure(DialFailure {
+        connection_id: ConnectionId::new_unchecked(1),
+        peer_id: Some(peer),
+        error: &error,
+    }));
+    assert!(status_is(&manager, &peer, |status| matches!(
+        status,
+        ConnectionStatus::Disconnected { .. }
+    )));
+    assert!(reputation_banned(&manager, &peer));
+
+    // reconnect-cache expiry must not release the reputation owner's blacklist entry
+    manager.unban_temp_banned_peers();
+    assert!(!manager.temporarily_banned.contains(&peer));
+    assert!(manager.peer_banned(&peer));
+    assert_eq!(unbanned_count(&collect_all_events(&mut manager), peer), 0);
+
+    recover_score(&mut manager, peer);
+    assert!(status_is(&manager, &peer, |status| matches!(
+        status,
+        ConnectionStatus::Disconnected { .. }
+    )));
+    assert_eq!(unbanned_count(&collect_all_events(&mut manager), peer), 1);
+}
+
+/// A connected peer banned in the common order is released exactly once, after score recovery,
+/// and never at reconnect-cache expiry.
+#[tokio::test]
+async fn test_admission_unban_after_connected_ban_waits_for_score_recovery() {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().excess_peers_reconnection_timeout = Duration::ZERO;
+    let mut manager = create_test_peer_manager(Some(config));
+    let peer = register_peer(&mut manager, None);
+    manager.process_penalty(peer, Penalty::Fatal);
+    manager.register_disconnected(&peer);
+    assert!(status_is(&manager, &peer, |status| matches!(status, ConnectionStatus::Banned { .. })));
+    let banned = collect_all_events(&mut manager);
+    assert!(banned.iter().any(|event| matches!(event, PeerEvent::Banned(id) if *id == peer)));
+    assert_eq!(unbanned_count(&banned, peer), 0);
+
+    manager.unban_temp_banned_peers();
+    assert!(!manager.temporarily_banned.contains(&peer));
+    assert!(manager.peer_banned(&peer));
+    assert_eq!(unbanned_count(&collect_all_events(&mut manager), peer), 0);
+
+    recover_score(&mut manager, peer);
+    assert!(status_is(&manager, &peer, |status| matches!(
+        status,
+        ConnectionStatus::Disconnected { .. }
+    )));
+    assert_eq!(unbanned_count(&collect_all_events(&mut manager), peer), 1);
+}
+
+/// With peer exchange at capacity, a new inbound identity is a slotless hand-off that is
+/// disconnected with peer exchange and temporarily banned once established.
+#[tokio::test]
+async fn test_admission_hand_off_holds_no_slot() -> Result<(), ConnectionDenied> {
+    let mut manager = hand_off_manager();
+    assert!(manager.config.peer_exchange_at_capacity());
+    let first = PeerId::random();
+    let second = PeerId::random();
+    let newcomer = PeerId::random();
+    let first_id = ConnectionId::new_unchecked(1);
+    let second_id = ConnectionId::new_unchecked(2);
+    let newcomer_id = ConnectionId::new_unchecked(3);
+    let replacement_id = ConnectionId::new_unchecked(4);
+    let overflow_id = ConnectionId::new_unchecked(5);
+    admit(&mut manager, first_id, first, Endpoint::Listener)?;
+    establish(&mut manager, first_id, first);
+    admit(&mut manager, second_id, second, Endpoint::Listener)?;
+    establish(&mut manager, second_id, second);
+    admit(&mut manager, newcomer_id, newcomer, Endpoint::Listener)?;
+    assert!(manager.is_hand_off(&newcomer_id));
+    close(&mut manager, first_id, first, 0);
+    admit(&mut manager, replacement_id, PeerId::random(), Endpoint::Listener)?;
+    assert!(!manager.is_hand_off(&replacement_id), "a hand-off must not hold a population slot");
+    admit(&mut manager, overflow_id, PeerId::random(), Endpoint::Listener)?;
+    assert!(manager.is_hand_off(&overflow_id));
+    establish(&mut manager, newcomer_id, newcomer);
+    let events = collect_all_events(&mut manager);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, PeerEvent::DisconnectPeerX(peer, _) if *peer == newcomer)));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, PeerEvent::PeerConnected(peer, _) if *peer == newcomer)));
+    assert!(!manager.is_connected(&newcomer));
+    assert!(manager.temporarily_banned.contains(&newcomer));
+    // at capacity with the flag on, only the temporary ban can refuse this identity
+    assert!(
+        admit(&mut manager, ConnectionId::new_unchecked(6), newcomer, Endpoint::Listener).is_err()
+    );
+    Ok(())
+}
+
+/// Without peer exchange at capacity, a new inbound identity is refused with the typed cause and
+/// is not temporarily banned.
+#[tokio::test]
+async fn test_admission_inbound_capacity_refusal_is_typed() -> Result<(), ConnectionDenied> {
+    let mut manager = manager_with_capacity();
+    assert!(!manager.config.peer_exchange_at_capacity());
+    let limit = manager.config.max_peers();
+    (0..limit).try_for_each(|index| {
+        admit(
+            &mut manager,
+            ConnectionId::new_unchecked(index + 1),
+            PeerId::random(),
+            Endpoint::Listener,
+        )
+    })?;
+    let refused = PeerId::random();
+    let refused_id = ConnectionId::new_unchecked(limit + 1);
+    assert_eq!(
+        capacity_refusal(&mut manager, refused_id, refused, Endpoint::Listener),
+        Some(PeerCapacityReached)
+    );
+    assert!(!manager.is_hand_off(&refused_id));
+    assert!(!manager.temporarily_banned.contains(&refused));
+    Ok(())
+}
+
+/// Peer exchange at capacity never hands off outbound connections: they are refused with the
+/// typed cause, while an inbound newcomer at the same population is handed off.
+#[tokio::test]
+async fn test_admission_outbound_refused_with_hand_off_enabled() -> Result<(), ConnectionDenied> {
+    let mut manager = hand_off_manager();
+    let limit = manager.config.max_outbound_dialing_peers();
+    (0..limit).try_for_each(|index| {
+        admit(
+            &mut manager,
+            ConnectionId::new_unchecked(index + 1),
+            PeerId::random(),
+            Endpoint::Dialer,
+        )
+    })?;
+    let refused_id = ConnectionId::new_unchecked(limit + 1);
+    assert_eq!(
+        capacity_refusal(&mut manager, refused_id, PeerId::random(), Endpoint::Dialer),
+        Some(PeerCapacityReached)
+    );
+    assert!(!manager.is_hand_off(&refused_id));
+    let inbound_id = ConnectionId::new_unchecked(limit + 2);
+    admit(&mut manager, inbound_id, PeerId::random(), Endpoint::Listener)?;
+    assert!(manager.is_hand_off(&inbound_id));
+    Ok(())
+}

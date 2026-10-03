@@ -150,8 +150,12 @@ impl NetworkBehaviour for PeerManager {
                 //
                 // Another behaviour can terminate the connection early, making it unsafe to
                 // assume a peer is connected until this event is received.
-                self.commit_connection(connection_id, peer_id);
-                self.on_connection_established(peer_id, endpoint)
+                if self.is_hand_off(&connection_id) {
+                    self.hand_off_at_capacity(peer_id, endpoint);
+                } else {
+                    self.commit_connection(connection_id, peer_id);
+                    self.on_connection_established(peer_id, endpoint)
+                }
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
@@ -286,6 +290,32 @@ impl PeerManager {
             ?endpoint,
             "new connection established",
         );
+    }
+
+    /// Disconnect an inbound peer accepted at capacity only for a peer exchange hand-off.
+    ///
+    /// The peer is registered so the disconnect carries peer exchange and applies the
+    /// `excess_peers_reconnection_timeout` temporary ban, then moves to `Disconnecting` in the
+    /// same call, so it never counts as connected for pruning or admission. No `PeerConnected`
+    /// event is emitted.
+    fn hand_off_at_capacity(&mut self, peer_id: PeerId, endpoint: &ConnectedPoint) {
+        match endpoint {
+            ConnectedPoint::Listener { send_back_addr, .. } => {
+                self.register_peer_connection(
+                    &peer_id,
+                    ConnectionType::IncomingConnection { multiaddr: send_back_addr.clone() },
+                );
+                self.metrics.record_connection_established("in");
+                debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
+                // gracefully disconnect and indicate excess peers
+                self.disconnect_peer(peer_id, true);
+            }
+            ConnectedPoint::Dialer { .. } => {
+                // reserve_connection hands off inbound connections only
+                error!(target: "peer-manager", ?peer_id, "outbound connection marked for hand-off - disconnecting");
+                self.disconnect_peer(peer_id, false);
+            }
+        }
     }
 
     /// Handle the connection closed event.

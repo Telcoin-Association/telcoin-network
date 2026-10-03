@@ -813,9 +813,15 @@ impl AllPeers {
                     error!(target: "peer-manager", ?peer_id, "unbanning a connected peer");
                 }
             }
-        }
 
-        PeerAction::NoAction
+            // the reputation owner released the identity whatever its connection status, so the
+            // gossip blacklist entry must still be released; the banned-IP counts were already
+            // released when the status left `Banned`, so no addresses are carried, and the manager
+            // drops the notification at dequeue while the reconnect cache still holds the peer
+            PeerAction::Unban(Vec::new())
+        } else {
+            PeerAction::NoAction
+        }
     }
 
     /// Return the [Peer] by [PeerId] if it is known.
