@@ -1,0 +1,136 @@
+name: Issue 1460 validation
+on:
+  push:
+    branches: [validation/1460-worker-regrow-checks]
+permissions:
+  contents: read
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+      - name: Install pinned toolchains
+        run: |
+          rustup toolchain install 1.94 --profile minimal
+          rustup toolchain install "$(cat rust-nightly)" --profile minimal -c rustfmt,clippy,rust-src
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: test-cache
+          cache-on-failure: "true"
+      - name: Run every repository CI lane
+        env:
+          CARGO_BUILD_JOBS: 2
+          NEXTEST_TEST_THREADS: 2
+          RUST_TEST_THREADS: 2
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh all
+  regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94 --profile minimal
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: durable-e2e-cache
+          cache-on-failure: "true"
+      - name: Run accumulator and startup regressions
+        env:
+          CARGO_BUILD_JOBS: 2
+          NEXTEST_TEST_THREADS: 2
+        run: cargo nextest run --locked --workspace -E 'test(gas_accumulator::) | test(epoch_starts_all_workers_and_reuses_components)' --no-fail-fast --profile ci
+      - name: Confirm each regression rejects detached fee containers
+        env:
+          CARGO_BUILD_JOBS: 2
+          RUST_TEST_THREADS: 2
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          source = Path("crates/types/src/gas_accumulator.rs")
+          original = source.read_text()
+          method = original.index("pub fn set_num_workers")
+          start = original.index("        let mut retired = self.retired_base_fees.lock();", method)
+          end = original.index("\n    }\n", start)
+          source.write_text(original[:start] + "        self.retired_base_fees.lock().clear();\n        inner.resize_with(num_workers, Accumulated::default());" + original[end:])
+          tests = [
+              "held_container_clone_follows_shrink_and_regrow",
+              "repeated_regrows_reuse_containers_and_reset_only_removed_slots",
+              "epoch_starts_all_workers_and_reuses_components",
+              "active_cvv_epoch_starts_all_workers_and_reuses_components",
+              "inactive_cvv_epoch_starts_all_workers_and_reuses_components",
+          ]
+          try:
+              for name in tests:
+                  result = subprocess.run(["cargo", "+1.94", "test", "--locked", "--workspace", name, "--", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  print(result.stdout, flush=True)
+                  clean = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+                  failures = [line for line in clean.splitlines() if line.endswith("::" + name + " ... FAILED")]
+                  if result.returncode != 101 or not failures:
+                      raise SystemExit(f"Mutation did not produce the required assertion failure: {name}")
+                  print(f"CONFIRMED MUTATION FAILURE: {name}", flush=True)
+          finally:
+              source.write_text(original)
+          PY
+      - name: Build optimized node for e2e
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: make build-e2e-bin
+      - name: Prove growth traffic and post-shrink packs
+        env:
+          CARGO_BUILD_JOBS: 2
+          RUST_TEST_THREADS: 2
+          TN_TEST_MDBX_SYNC: safe-no-sync
+        run: |
+          export TN_BIN_PATH="$GITHUB_WORKSPACE/target/e2e/telcoin-network"
+          cargo +1.94 test --locked --workspace test_epoch_worker_count_changes_keep_nodes_running -- --ignored --nocapture
+      - name: Confirm post-shrink traffic rejects an inverted worker-id check
+        env:
+          CARGO_BUILD_JOBS: 2
+          RUST_TEST_THREADS: 2
+          TN_TEST_MDBX_SYNC: safe-no-sync
+        run: |
+          export TN_BIN_PATH="$GITHUB_WORKSPACE/target/e2e/telcoin-network"
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import subprocess
+          source = Path("crates/e2e-tests/tests/it/epochs.rs")
+          original = source.read_text()
+          start = original.index("fn assert_epoch_only_has_worker_zero(")
+          end = original.index("\n}\n", start)
+          section = original[start:end]
+          needle = "batch.worker_id == 0,"
+          assert section.count(needle) == 1
+          source.write_text(original[:start] + section.replace(needle, "batch.worker_id == 1,") + original[end:])
+          name = "test_epoch_worker_count_changes_keep_nodes_running"
+          try:
+              result = subprocess.run(["cargo", "+1.94", "test", "--locked", "--workspace", name, "--", "--ignored", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout, flush=True)
+              if result.returncode != 101 or "removed worker 0 produced a batch" not in result.stdout:
+                  raise SystemExit("The post-shrink mutation did not fail at the new pack assertion")
+              print("CONFIRMED MUTATION FAILURE: post-shrink worker-id check", flush=True)
+          finally:
+              source.write_text(original)
+          PY
+      - name: Verify sources restored
+        run: git diff --exit-code
