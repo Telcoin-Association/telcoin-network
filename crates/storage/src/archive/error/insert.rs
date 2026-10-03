@@ -12,10 +12,12 @@ pub enum AppendError {
     /// Got an io error writing the key/value record. Every such error moves a pack to its failed
     /// state.
     WriteDataError(io::Error),
-    /// The record is larger than any read path accepts, so it was rejected before any byte was
-    /// written. A caller/value error: the pack stays healthy.
+    /// The record is larger than any read path accepts, so it was refused and nothing of it is
+    /// left in the log (a record refused part-way through its write is rolled back). A
+    /// caller/value error: the pack stays healthy.
     RecordTooLarge {
-        /// The rejected size in bytes (decoded, or framed after compression).
+        /// The rejected size in bytes: decoded (the size at which the encode passed the cap), or
+        /// framed after compression.
         size: usize,
         /// The per-record maximum.
         max: u32,

@@ -10537,7 +10537,7 @@ pub(crate) mod test {
         };
         let record = PackRecord::Consensus(Box::new(consensus.clone()));
 
-        // `encode` is exactly the serialization `write_value` runs before framing and
+        // `encode` is exactly the serialization a pack append streams into framing and
         // compression, so a byte round trip here is a byte round trip of the stored record.
         let bytes = encode(&record);
         let decoded: PackRecord = decode(&bytes);

@@ -105,9 +105,12 @@ impl BtreeIndex {
             }
         }
         // In-place page overwrites → Random write mode; point-lookup descent → Random access hint.
+        // Derived from its data log, so its size waits for the seal (see the short-file check
+        // below).
         let opts = MmapFileOptions {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
+            derived: true,
             ..Default::default()
         };
         let mut file = MmapDataFile::open_with(dir.join("index.btx"), read_only, opts)?;
@@ -156,18 +159,25 @@ impl BtreeIndex {
             {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
+            // The file must physically hold every page the header names. Barriers do not fsync a
+            // derived file's size, so a crash after a sync can leave the header durable but a
+            // growth's size extension lost: the named pages are gone, and zero-filling them would
+            // trust a torn tree. Reject it so the owner rebuilds from the data log.
+            let want = header.page_count as u64 * PAGE_SIZE as u64;
+            if file.len() < want {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
             // Normalize to exactly the committed pages when writable — trims any crash padding or a
             // torn tail past `page_count` (which is authoritative). A read-only handle maps as-is;
             // reads are bounded by `page_count`, so trailing junk is simply never addressed.
             if !read_only {
-                let want = header.page_count as u64 * PAGE_SIZE as u64;
-                // `truncate` is shrink-only; a short file is extended (zero-filled) through the
-                // preallocating `ensure_len`, never a sparse remap.
                 if file.len() > want {
                     file.truncate(want)?;
-                } else if file.len() < want {
-                    file.ensure_len(want)?;
                 }
+                // That normalization is this index's recovery: the committed pages are exactly the
+                // ones a header-last sync made durable, so the file is consistent again and its
+                // clean close may re-seal it (an unclean open otherwise stays unsealed forever).
+                file.mark_consistent();
             }
             header
         };
@@ -897,6 +907,43 @@ mod tests {
             std::fs::metadata(&file).expect("meta").len(),
             before,
             "torn tail should be trimmed to page_count pages"
+        );
+    }
+
+    /// A btx shorter than its header's `page_count` — a growth's size extension lost in a crash,
+    /// which barriers do not fsync for a derived file — is rejected so its owner rebuilds it, never
+    /// zero-filled and trusted.
+    #[test]
+    fn test_archive_btx_short_file_rejected() {
+        let tmp = TempDir::with_prefix("test_archive_btx_short").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let file = dir.join("index.btx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            for i in 0..2_000 {
+                idx.save(&key_of(i), i).expect("save");
+            }
+            idx.sync().expect("sync");
+        }
+        // Drop the last committed page, and the clean-close sentinel with it.
+        let len = std::fs::metadata(&file).expect("meta").len();
+        let short = len - SENTINEL_LEN - PAGE_SIZE as u64;
+        let f = std::fs::OpenOptions::new().write(true).open(&file).expect("open file");
+        f.set_len(short).expect("truncate");
+        drop(f);
+
+        for read_only in [false, true] {
+            let Err(err) = BtreeIndex::open_btx_file(&dir, &data_header, 32, read_only) else {
+                panic!("a btx missing committed pages must not open (read_only={read_only})");
+            };
+            assert!(matches!(err, LoadHeaderError::InvalidIndexGeometry), "{err:?}");
+        }
+        assert_eq!(
+            std::fs::metadata(&file).expect("meta").len(),
+            short,
+            "rejection leaves the file"
         );
     }
 

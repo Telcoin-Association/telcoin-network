@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, sentinel_matches, MmapDataFile, SENTINEL_LEN},
+    data_file::{fsync_directory, sentinel_matches, MmapDataFile, MmapFileOptions, SENTINEL_LEN},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -151,7 +151,10 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = MmapDataFile::open(dir.join(file_name), read_only)?;
+        // Derived from the data log (rebuilt after any unclean open), so its size waits for the
+        // seal.
+        let opts = MmapFileOptions { derived: true, ..Default::default() };
+        let mut pdx_file = MmapDataFile::open_with(dir.join(file_name), read_only, opts)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {

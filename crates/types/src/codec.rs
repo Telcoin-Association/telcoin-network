@@ -25,6 +25,86 @@ where
 }
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+/// Serde helpers that encode a byte vector as one byte string (`serialize_bytes`) instead of as a
+/// sequence of `u8`. Use as `#[serde(with = "tn_types::byte_vec")]` on a `Vec<u8>` field.
+///
+/// serde has no byte specialization: a plain `Vec<u8>` serializes element by element, and `bcs`
+/// writes (and reads back) each element with its own call, so a large byte vector costs a call per
+/// byte. A byte string is one length prefix and one copy. The two are byte-identical in `bcs`
+/// (`ULEB128(len)` then the raw bytes, with the same length limit on decode), so switching a field
+/// to this leaves its encoding, and any digest over it, unchanged. Not for fixed `[u8; N]` arrays,
+/// which `bcs` writes without a length prefix.
+pub mod byte_vec {
+    use serde::{de, Deserializer, Serializer};
+    use std::fmt;
+
+    /// Serialize `bytes` as one byte string.
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    /// Deserialize a byte vector written by [`serialize`], or as a sequence of `u8` by a format
+    /// that presents bytes that way.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(ByteVecVisitor)
+    }
+
+    struct ByteVecVisitor;
+
+    impl<'de> de::Visitor<'de> for ByteVecVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a byte vector")
+        }
+
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            // Never trust a declared length for the allocation size.
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+/// A byte vector that serializes as one byte string (see [`byte_vec`]), for byte vectors held in a
+/// collection, where a field attribute cannot reach.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ByteVec(pub Vec<u8>);
+
+impl Serialize for ByteVec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        byte_vec::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteVec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        byte_vec::deserialize(deserializer).map(Self)
+    }
+}
+
+/// A borrowed byte slice that serializes as one byte string (see [`byte_vec`]), for serializing
+/// byte vectors held in a collection without copying them into [`ByteVec`]s.
+#[derive(Clone, Copy, Debug)]
+pub struct ByteSlice<'a>(pub &'a [u8]);
+
+impl Serialize for ByteSlice<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        byte_vec::serialize(self.0, serializer)
+    }
+}
+
 /// Decode bytes to a type for a DB key.
 ///
 /// This version will panic on failure, use with data that should be valid.

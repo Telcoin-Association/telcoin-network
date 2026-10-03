@@ -46,8 +46,12 @@
 //! ## Durability
 //!
 //! The default barrier `MmapDataFile::sync_all` is `msync` (flush dirty pages to the backing store)
-//! — this is sufficient for data written within an already-fsync'd file size, and each size
-//! extension is fsync'd when it happens (in the grow path). `MmapDataFile::sync_disk` is the full,
+//! — this is sufficient for data written within an already-fsync'd file size. `msync` does not
+//! persist a size extension, so a growth marks the size unsynced and the next barrier fsyncs it
+//! once after its `msync` (a barrier with no growth since the last stays `msync`-only). A
+//! [`derived`](MmapFileOptions::derived) index skips that fsync and leaves its size to the
+//! clean-close seal: its owner rebuilds it from the data log after any unclean open anyway.
+//! `MmapDataFile::sync_disk` is the full,
 //! slower `msync` + `fsync`, which additionally persists the file's size/metadata. (On macOS
 //! `fsync` is not a full power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync
 //! default is on Linux.)
@@ -152,6 +156,12 @@ pub struct MmapFileOptions {
     pub write_mode: WriteMode,
     /// Access-pattern `madvise` hint for the mapping (see [`MmapAccess`]).
     pub access: MmapAccess,
+    /// The file is a derived index that its owner rebuilds from the data log after any unclean
+    /// open, so its barriers skip the deferred size fsync ([`MmapDataFile::sync_size_if_grown`]):
+    /// a growth's size becomes durable at the clean-close seal (or [`MmapDataFile::sync_disk`]).
+    /// After a crash such a file may be shorter than its own header claims; that is safe only
+    /// because an unsealed derived file is never trusted.
+    pub derived: bool,
 }
 
 impl Default for MmapFileOptions {
@@ -162,6 +172,7 @@ impl Default for MmapFileOptions {
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
+            derived: false,
         }
     }
 }
@@ -306,6 +317,14 @@ pub struct MmapDataFile {
     /// the life of the handle (a durability failure is permanent until reopen); in particular
     /// `mark_consistent` does NOT clear it, so recovery cannot paper over lost data.
     write_failed: AtomicBool,
+    /// Set when a growth extended the file's size since the last fsync. `msync` does not persist
+    /// size (inode metadata), so the next durability barrier fsyncs once before it returns (see
+    /// [`Self::sync_size_if_grown`]); a growth itself does not sync. `AtomicBool` because the
+    /// barriers take `&self`.
+    size_unsynced: AtomicBool,
+    /// Test-only: how many deferred size fsyncs barriers have run.
+    #[cfg(test)]
+    size_syncs: std::sync::atomic::AtomicUsize,
     opts: MmapFileOptions,
 }
 
@@ -410,6 +429,9 @@ impl MmapDataFile {
             opened_unclean,
             committed_marker,
             write_failed: AtomicBool::new(false),
+            size_unsynced: AtomicBool::new(false),
+            #[cfg(test)]
+            size_syncs: std::sync::atomic::AtomicUsize::new(0),
             opts,
         };
         df.advise_backing();
@@ -466,8 +488,8 @@ impl MmapDataFile {
     }
 
     /// True iff the file has a physical size but every logical byte is zero — the signature of a
-    /// first write whose `grow_to` ftruncate+fsync sized the file (to `DEFAULT_INITIAL_SIZE`) but
-    /// whose header never reached disk before a crash. Such a file is semantically *unwritten*
+    /// first write whose `grow_to` sized the file (to `DEFAULT_INITIAL_SIZE`) but whose header
+    /// never reached disk before a crash. Such a file is semantically *unwritten*
     /// (the same "all-zero == unwritten" rule the pack applies to records), not corrupt. Only
     /// meaningful on an [`Self::opened_unclean`] file: a clean close always leaves a non-zero
     /// trailing sentinel, so a sealed file is never all-zero.
@@ -501,8 +523,8 @@ impl MmapDataFile {
     /// of the mmap capacity. Best-effort: it dirties one padding page but adds NO sync — the
     /// durability barrier stays the caller's `sync_all` (`msync` of `[flushed_end, end)`),
     /// which does not cover this page, so the marker reaches disk via OS writeback or the next
-    /// grow/clean-close fsync. That is enough for its purpose (at-rest rot is detected long
-    /// after the persist).
+    /// fsync (a barrier after a growth, or the clean close). That is enough for its purpose
+    /// (at-rest rot is detected long after the persist).
     ///
     /// Fail-safe by construction: callers stamp *after* the data `msync`, so the marker can never
     /// be ahead of durable data — a crash leaves it behind or absent, never fabricating a
@@ -600,7 +622,7 @@ impl MmapDataFile {
     /// then advance in `max_map_size` increments. Every allocation is floored at `initial_size`, so
     /// a small reopened file (its capacity is the reopened physical size, e.g. a 36-byte
     /// header-only pack) jumps straight to `initial_size` instead of paying an
-    /// ftruncate+mmap+fsync per doubling back up from that tiny capacity.
+    /// ftruncate+mmap (and a barrier fsync) per doubling back up from that tiny capacity.
     fn next_capacity(&self, needed: u64) -> u64 {
         let max_step = self.opts.max_map_size.max(1);
         let mut cap = self.capacity.max(self.opts.initial_size).max(1);
@@ -738,20 +760,35 @@ impl MmapDataFile {
         self.file.set_len(to)
     }
 
-    /// Grow the file to `new_cap`, preallocating the new range and fsyncing the size extension so
-    /// data later `msync`'d into the grown region survives a crash (`msync` alone does not
-    /// persist size growth). Preallocation ([`Self::allocate_range`]) reserves real blocks so a
-    /// full disk fails here with an `io::Error` rather than a later SIGBUS on the first store
-    /// into an unbacked page.
+    /// Grow the file to `new_cap`, preallocating the new range. Preallocation
+    /// ([`Self::allocate_range`]) reserves real blocks so a full disk fails here with an
+    /// `io::Error` rather than a later SIGBUS on the first store into an unbacked page.
+    ///
+    /// The size extension is not fsync'd here: `msync` does not persist size growth, so the next
+    /// durability barrier fsyncs it once ([`Self::sync_size_if_grown`]) before returning. Nothing
+    /// in the grown region is durable, or acked, before that barrier, so a crash in between loses
+    /// only unacked bytes (and a lost extension reads as unwritten, like any torn tail).
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
         // `capacity` is the current physical size (== physical EOF); reserve the new range from it.
         let from = self.capacity;
         self.allocate_range(from, new_cap).inspect_err(|_| self.poison())?;
         self.remap(new_cap)?;
-        self.file.sync_all().inspect_err(|_| self.poison())?;
-        // The fsync just persisted every dirty page (and the size), so all data `[0, end)` is now
-        // durable; advance the append sync watermark so the next flush only covers new writes.
-        self.flushed_end.store(self.end, Ordering::Relaxed);
+        self.size_unsynced.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The fsync a growth deferred: if the file grew since the last fsync, persist its size (and,
+    /// with it, everything written so far) before a durability barrier returns. Barriers call this
+    /// after their `msync`, so a barrier promises what it always has (data `[0, end)` durable
+    /// within a durable file size) while one with no growth since the last stays `msync`-only.
+    /// A [`derived`](MmapFileOptions::derived) file skips it and leaves its size to the seal.
+    fn sync_size_if_grown(&self) -> io::Result<()> {
+        if self.size_unsynced.load(Ordering::Relaxed) && !self.opts.derived {
+            self.file.sync_all().inspect_err(|_| self.poison())?;
+            self.size_unsynced.store(false, Ordering::Relaxed);
+            #[cfg(test)]
+            self.size_syncs.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -924,6 +961,7 @@ impl MmapDataFile {
                 // must not claim otherwise. A failed barrier poisons the handle.
                 map.flush_range(0, self.end as usize).inspect_err(|_| self.poison())?;
                 self.flushed_end.store(self.end, Ordering::Relaxed);
+                self.sync_size_if_grown()?;
             }
         }
         Ok((DataFileReader { file: self.file.try_clone()?, pos: 0 }, self.end))
@@ -964,6 +1002,10 @@ impl MmapDataFile {
             if sync && self.flushed_end.load(Ordering::Relaxed) < self.end {
                 self.file.sync_all().inspect_err(|_| self.poison())?;
                 self.flushed_end.store(self.end, Ordering::Relaxed);
+                // That fsync persisted the size too.
+                self.size_unsynced.store(false, Ordering::Relaxed);
+            } else if sync {
+                self.sync_size_if_grown()?;
             }
             return Ok(());
         };
@@ -972,6 +1014,10 @@ impl MmapDataFile {
             WriteMode::Random => 0,
         };
         if start >= self.end {
+            // No new data, but a growth (e.g. `ensure_len`) may still owe its size fsync.
+            if sync {
+                self.sync_size_if_grown()?;
+            }
             return Ok(());
         }
         let len = (self.end - start) as usize;
@@ -979,6 +1025,8 @@ impl MmapDataFile {
             map.flush_range(start as usize, len).inspect_err(|_| self.poison())?;
             // The tail is now durable; the next append-mode flush can start from here.
             self.flushed_end.store(self.end, Ordering::Relaxed);
+            // And within a durable file size: a growth since the last fsync is synced now.
+            self.sync_size_if_grown()?;
         } else {
             map.flush_async_range(start as usize, len).inspect_err(|_| self.poison())?;
         }
@@ -986,8 +1034,8 @@ impl MmapDataFile {
     }
 
     /// Default durability barrier: `msync` the region written since the last sync. Cheaper than
-    /// `fsync` and sufficient for data within the already-fsync'd file size (size extensions fsync
-    /// in the grow path).
+    /// `fsync` and sufficient for data within the already-fsync'd file size; after a growth it also
+    /// fsyncs once, to persist the size extension (see [`Self::sync_size_if_grown`]).
     pub fn sync_all(&self) -> io::Result<()> {
         self.flush_dirty(true)
     }
@@ -1026,7 +1074,9 @@ impl MmapDataFile {
             return Ok(());
         }
         self.flush_dirty(true)?;
-        self.file.sync_all().inspect_err(|_| self.poison())
+        self.file.sync_all().inspect_err(|_| self.poison())?;
+        self.size_unsynced.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Refresh the logical end for a read-only handle so it observes a writer's appends, re-mapping
@@ -1354,6 +1404,7 @@ mod tests {
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
+            derived: false,
         }
     }
 
@@ -1364,7 +1415,60 @@ mod tests {
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
+            derived: false,
         }
+    }
+
+    /// A growth does not fsync: it marks the size extension for the next durability barrier, which
+    /// fsyncs it once after its `msync`. A barrier with no growth since the last stays
+    /// `msync`-only, and every barrier, `try_clone`'s included, pays a pending one.
+    #[test]
+    fn growth_defers_its_size_fsync_to_the_next_barrier() {
+        let tmp = TempDir::with_prefix("mmap_df_deferred_size_sync").expect("temp dir");
+        let mut df =
+            MmapDataFile::open_with(tmp.path().join("data"), false, tiny_opts()).expect("open");
+        let size_syncs = |df: &MmapDataFile| df.size_syncs.load(Ordering::Relaxed);
+
+        // 64-byte initial capacity in 128-byte steps: 400 bytes grow the file several times.
+        df.write_all(&pattern(400)).expect("write");
+        assert_eq!(size_syncs(&df), 0, "a growth itself must not fsync");
+        df.sync_all().expect("barrier");
+        assert_eq!(size_syncs(&df), 1, "the barrier after growth fsyncs the size once");
+
+        // Append within the current capacity (no growth), then barrier again.
+        let room = (df.capacity - df.len()).min(8) as usize;
+        df.write_all(&pattern(room)).expect("write within capacity");
+        df.sync_all().expect("barrier without growth");
+        assert_eq!(size_syncs(&df), 1, "a barrier with no growth since the last stays msync-only");
+
+        df.write_all(&pattern(1_000)).expect("grow again");
+        let (_reader, end) = df.try_clone().expect("clone barrier");
+        assert_eq!(end, df.len());
+        assert_eq!(size_syncs(&df), 2, "try_clone's barrier pays the pending size fsync");
+    }
+
+    #[test]
+    fn derived_file_leaves_its_size_to_the_seal() {
+        let tmp = TempDir::with_prefix("mmap_df_derived_size").expect("temp dir");
+        let path = tmp.path().join("index");
+        let opts = MmapFileOptions { derived: true, ..tiny_opts() };
+        {
+            let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+            df.write_all(&pattern(400)).expect("write");
+            df.sync_all().expect("barrier");
+            let (_reader, _end) = df.try_clone().expect("clone barrier");
+            assert_eq!(
+                df.size_syncs.load(Ordering::Relaxed),
+                0,
+                "derived barriers skip the size fsync"
+            );
+        }
+        // The clean close still seals: the reopen is clean and reads every byte back.
+        let mut df = MmapDataFile::open_with(&path, true, opts).expect("reopen");
+        assert!(!df.opened_unclean(), "the seal made the derived file clean");
+        let mut buf = vec![0u8; 400];
+        df.read_exact(&mut buf).expect("read back");
+        assert_eq!(buf, pattern(400));
     }
 
     /// The digest-index write pattern: sequential fill, in-place overwrite, and extend-at-end.
@@ -2162,6 +2266,7 @@ mod tests {
             grow_mode: GrowMode::Segment,
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
+            derived: false,
         };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
