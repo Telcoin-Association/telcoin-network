@@ -598,6 +598,7 @@ impl WorkerTxPool {
     /// Kept separate from [`WorkerTxPool::new`] so tests can reproduce a pool that missed
     /// canonical updates (the drifted state the maintenance task's lag handling recovers
     /// from) without racing a live subscription (see issue #1236).
+    #[cfg(test)]
     pub(crate) fn build(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
