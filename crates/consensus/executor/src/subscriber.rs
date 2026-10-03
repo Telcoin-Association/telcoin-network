@@ -11,7 +11,7 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::PrimaryToWorkerClient;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
@@ -162,6 +162,10 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.metrics(),
         )
         .await?;
+        gc_certificates_for_durable_commit(
+            self.config.node_storage(),
+            consensus_output.leader_round(),
+        );
 
         // Once we've drained through the staged partial pack's final output, it has all been
         // written to the main pack in order — drop the staging dir. `clear_staging` is async so the
@@ -300,6 +304,7 @@ impl<DB: Database> Subscriber<DB> {
     ) -> SubscriberResult<()> {
         debug!(target: "subscriber", output=?output.digest(), "saving next output");
         save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        gc_certificates_for_durable_commit(self.config.node_storage(), output.leader_round());
         debug!(target: "subscriber", "broadcasting output...");
         // Publish the consensus result now that we are totally finished.
         let number = output.number();
@@ -407,6 +412,7 @@ impl<DB: Database> Subscriber<DB> {
                         &mut consensus_chain,
                         waiting,
                         Duration::from_secs(3),
+                        self.config.node_storage(),
                     )
                     .await;
                     return Ok(())
@@ -658,11 +664,26 @@ impl<DB: Database> Subscriber<DB> {
 /// `deadline` passes the drain stops pulling new outputs, but an output already dequeued is always
 /// saved and broadcast to completion. This preserves the original select-based drain's guarantee
 /// that a committed output, once dequeued, is never dropped mid-save during graceful shutdown.
-async fn drain_pending_on_shutdown<Fut>(
+fn gc_certificates_for_durable_commit<S: CertificateStore>(
+    store: &S,
+    committed_round: tn_types::Round,
+) {
+    if let Err(e) = store.gc_to_commit_round(committed_round) {
+        error!(
+            target: "subscriber",
+            ?e,
+            committed_round,
+            "certificate store GC after durable commit failed"
+        );
+    }
+}
+
+async fn drain_pending_on_shutdown<Fut, S: CertificateStore>(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &mut ConsensusChain,
     waiting: FuturesOrdered<Fut>,
     deadline: Duration,
+    certificate_store: &S,
 ) where
     Fut: std::future::Future<Output = SubscriberResult<ConsensusOutput>>,
 {
@@ -679,6 +700,7 @@ async fn drain_pending_on_shutdown<Fut>(
                 warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
                 Err(())
             } else {
+                gc_certificates_for_durable_commit(certificate_store, output.leader_round());
                 // Best-effort broadcast: if epoch manager already exited, this is a no-op.
                 // The DB-aware drain (Phase 2) handles the gap regardless.
                 let _ = consensus_bus.consensus_output().send(output).await;
@@ -769,12 +791,14 @@ mod tests {
         waiting.push_back(future::ready(Ok(out_next)));
 
         let mut rx = consensus_bus.subscribe_consensus_output();
+        let certificate_store = MemDatabase::default();
 
         drain_pending_on_shutdown(
             &consensus_bus,
             &mut consensus_chain,
             waiting,
             Duration::from_secs(3),
+            &certificate_store,
         )
         .await;
 
@@ -811,12 +835,14 @@ mod tests {
         waiting.push_back(future::pending::<Result<ConsensusOutput, SubscriberError>>());
 
         let mut rx = consensus_bus.subscribe_consensus_output();
+        let certificate_store = MemDatabase::default();
 
         drain_pending_on_shutdown(
             &consensus_bus,
             &mut consensus_chain,
             waiting,
             Duration::from_secs(3),
+            &certificate_store,
         )
         .await;
 
@@ -882,12 +908,14 @@ mod tests {
 
         // Subscribe before draining so we observe exactly what is broadcast.
         let mut rx = consensus_bus.subscribe_consensus_output();
+        let certificate_store = MemDatabase::default();
 
         drain_pending_on_shutdown(
             &consensus_bus,
             &mut consensus_chain,
             waiting,
             Duration::from_secs(3),
+            &certificate_store,
         )
         .await;
 
