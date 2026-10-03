@@ -205,8 +205,8 @@ production JSON log, with the measured hubs' actual vote-request latency,
 completion, failure and cancellation data.
 
 `workload.py` schedules all eight scenarios concurrently with bounded command
-concurrency. The declared scenarios overlap at 44 commands; the driver allows
-48 active commands and the private control server allows 64 handlers. Overload
+concurrency. The declared scenarios overlap at 60 commands; the driver allows
+64 active commands and the private control server allows 72 handlers. Overload
 refusals remain failed attempts. Its frozen manifest binds agent identities and
 argv; every reply must match its operation nonce, scenario and identity. Failed commands remain
 in the operation log and success denominator. Reconnect scheduling offsets NAT

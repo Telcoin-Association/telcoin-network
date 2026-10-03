@@ -151,7 +151,7 @@ def wait_canonical_inclusion(url, expected_hash, attempts, timeout=SEED_INCLUSIO
 
 
 def inclusion_timeout_observations(url, expected_hash):
-    """Retain bounded optional diagnostics after a failed inclusion fence."""
+    """Retain bounded read-only diagnostics after submission or inclusion failure."""
     observations = []
     for method, parameters in (("eth_getTransactionByHash", [expected_hash]),
                                ("eth_getTransactionCount", [ADDRESS, "latest"]),
@@ -192,6 +192,7 @@ def feed(fixture, url, output, stream, pid_file):
             time.sleep(max(0, origin + (nonce - start) * interval - time.monotonic()))
             raw = inputs["transactions"][nonce]
             row = {"nonce": nonce, "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                   "signed_transaction_hash": inputs["transaction_hashes"][nonce],
                    "success": False, "attempts": []}
             try:
                 row["transaction_hash"] = submit(url, raw, inputs["transaction_hashes"][nonce], row["attempts"])
@@ -205,6 +206,15 @@ def feed(fixture, url, output, stream, pid_file):
                         row["inclusion_timeout_observations"] = inclusion_timeout_observations(url, row["transaction_hash"])
                         raise
                     origin += time.monotonic() - before
+            except (OSError, ValueError) as error:
+                if not row["success"]:
+                    row["error"] = f"{type(error).__name__}: {error}"[:512]
+                    try:
+                        row["submission_failure_observations"] = inclusion_timeout_observations(
+                            url, row["signed_transaction_hash"])
+                    except Exception as diagnostic_error:
+                        row["submission_failure_observations_error"] = f"{type(diagnostic_error).__name__}: {diagnostic_error}"[:512]
+                raise
             finally:
                 row["unix_us"] = time.time_ns() // 1000
                 log.write(json.dumps(row) + "\n")

@@ -220,7 +220,7 @@ class TrafficTests(unittest.TestCase):
             with self.assertRaises(ConnectionResetError):
                 TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, True, None)
             rows = [json.loads(line) for line in output.read_text().splitlines()]
-        self.assertEqual(rpc.call_count, 6)
+        self.assertEqual(rpc.call_count, 10)
         self.assertEqual(len(rows), 1)
         self.assertFalse(rows[0]["success"])
         self.assertEqual(len(rows[0]["attempts"]), 6)
@@ -237,9 +237,75 @@ class TrafficTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, True, None)
             rows = [json.loads(line) for line in output.read_text().splitlines()]
-        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(rpc.call_count, 5)
         self.assertFalse(rows[0]["success"])
         self.assertEqual(rows[0]["attempts"], [{"attempt": 1, "success": False, "error": "ValueError"}])
+
+    def test_protocol_rejection_retains_bounded_nonce_diagnostics_without_acknowledgement(self):
+        hashes = ["0x" + f"{nonce:064x}" for nonce in range(512)]
+        failure = ValueError("transaction RPC rejected eth_sendRawTransaction: txpool full " + "x" * 1024)
+
+        def rpc(_url, method, parameters, timeout=10):
+            if method == "eth_sendRawTransaction":
+                self.assertEqual(parameters, ["signed-128"])
+                raise failure
+            self.assertEqual(timeout, 2)
+            if method == "eth_getTransactionByHash":
+                self.assertEqual(parameters, [hashes[128]])
+                return {"hash": hashes[128], "nonce": "0x80", "blockHash": None,
+                        "input": "0x" + "ab" * 32768}
+            if method == "eth_getTransactionCount":
+                self.assertEqual(parameters[0], TRAFFIC.ADDRESS)
+                self.assertIn(parameters[1], ("latest", "pending"))
+                return "0x80" if parameters[1] == "latest" else "0x81"
+            self.assertEqual(method, "txpool_status")
+            raise ValueError("optional pool probe unavailable " + "x" * 1024)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(TRAFFIC, "wait_chain"), \
+                patch.object(TRAFFIC.time, "sleep"), patch.object(TRAFFIC, "rpc", side_effect=rpc) as requests:
+            fixture, output = Path(directory) / "transactions.json", Path(directory) / "stream.jsonl"
+            fixture.write_text(json.dumps({"chain_id": TRAFFIC.CHAIN, "count": 512,
+                "transaction_hashes": hashes, "transactions": [f"signed-{nonce}" for nonce in range(512)]}))
+            with self.assertRaises(ValueError) as raised:
+                TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, True, None)
+            self.assertIs(raised.exception, failure)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["nonce"], 128)
+        self.assertEqual(row["signed_transaction_hash"], hashes[128])
+        self.assertEqual(row["error"], f"ValueError: {failure}"[:512])
+        self.assertFalse(row["success"])
+        self.assertNotIn("transaction_hash", row)
+        self.assertEqual(row["attempts"], [{"attempt": 1, "success": False, "error": "ValueError"}])
+        observations = row["submission_failure_observations"]
+        self.assertEqual([observation["method"] for observation in observations],
+                         ["eth_getTransactionByHash", "eth_getTransactionCount", "eth_getTransactionCount", "txpool_status"])
+        self.assertEqual(observations[0]["result"], {"hash": hashes[128], "nonce": "0x80", "blockHash": None})
+        self.assertEqual([observation["result"] for observation in observations[1:3]], ["0x80", "0x81"])
+        self.assertFalse(observations[3]["success"])
+        self.assertEqual(len(observations[3]["error"]), 512)
+        self.assertEqual([call.args[1] for call in requests.call_args_list],
+                         ["eth_sendRawTransaction", *[observation["method"] for observation in observations]])
+        self.assertEqual([call.kwargs["timeout"] for call in requests.call_args_list[1:]], [2] * 4)
+
+    def test_submission_diagnostic_collector_failure_preserves_original_rejection(self):
+        failure = ValueError("transaction RPC rejected eth_sendRawTransaction: txpool full")
+        with tempfile.TemporaryDirectory() as directory, patch.object(TRAFFIC, "wait_chain"), \
+                patch.object(TRAFFIC.time, "sleep"), patch.object(TRAFFIC, "rpc", side_effect=failure) as rpc, \
+                patch.object(TRAFFIC, "inclusion_timeout_observations", side_effect=RuntimeError("probe setup failed")):
+            fixture, output = Path(directory) / "transactions.json", Path(directory) / "stream.jsonl"
+            fixture.write_text(json.dumps({"chain_id": TRAFFIC.CHAIN, "count": 512,
+                "transaction_hashes": ["0x" + "a" * 64] * 512, "transactions": ["signed"] * 512}))
+            with self.assertRaises(ValueError) as raised:
+                TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, True, None)
+            self.assertIs(raised.exception, failure)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["success"])
+        self.assertEqual(rows[0]["error"], f"ValueError: {failure}")
+        self.assertEqual(rows[0]["submission_failure_observations_error"], "RuntimeError: probe setup failed")
 
     def test_failed_target_selection_retains_canonical_observations(self):
         block = {"nonce": "0x0", "sha3Uncles": "0x" + "a" * 64, "transactions": ["fixture"]}
