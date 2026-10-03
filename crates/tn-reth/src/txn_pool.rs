@@ -1862,9 +1862,9 @@ mod tests {
             owner.max_entries = 1;
         }
         let first_batch = B256::with_last_byte(1);
-        first_pool.reserve_local_seal(first_batch, &[raw.clone()])?.accepted();
+        first_pool.reserve_local_seal(first_batch, std::slice::from_ref(&raw))?.accepted();
         assert!(matches!(
-            second_pool.reserve_local_seal(B256::with_last_byte(2), &[raw.clone()]),
+            second_pool.reserve_local_seal(B256::with_last_byte(2), std::slice::from_ref(&raw)),
             Err(LocalSealRecoveryError::Capacity)
         ));
         assert!(first_pool.get(transaction.hash()).is_some());
@@ -1893,7 +1893,7 @@ mod tests {
         let raw = transaction.encoded_2718();
         factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
         let batch = B256::with_last_byte(1);
-        let first = pool.reserve_local_seal(batch, &[raw.clone()])?;
+        let first = pool.reserve_local_seal(batch, std::slice::from_ref(&raw))?;
         let duplicate = pool.reserve_local_seal(batch, &[raw])?;
         drop(first);
         {
@@ -1929,7 +1929,7 @@ mod tests {
         factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
         let batch = B256::with_last_byte(1);
         let output = B256::with_last_byte(2);
-        pool.reserve_local_seal(batch, &[raw.clone()])?.accepted();
+        pool.reserve_local_seal(batch, std::slice::from_ref(&raw))?.accepted();
         {
             let mut owner = pool.5.lock().unwrap();
             owner.pruned(pool.6, &[*transaction.hash()]);
@@ -1971,7 +1971,7 @@ mod tests {
         let hash = *transaction.hash();
         factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
         let batch = B256::with_last_byte(5);
-        pool.reserve_local_seal(batch, &[raw.clone()])?.accepted();
+        pool.reserve_local_seal(batch, std::slice::from_ref(&raw))?.accepted();
         pool.mark_observer_seal(batch);
         assert_eq!(pool.admit_forwards(vec![raw.clone()]), Some(vec![raw.clone()]));
         pool.pending_forwards().defer(&hash);
@@ -2029,7 +2029,7 @@ mod tests {
         pool.finish_local_replay_handoff(&observer);
         assert!(pool.5.lock().unwrap().seals.is_empty());
         drop(observer);
-        let resealed = pool.reserve_local_seal(batch, &[raw.clone()])?;
+        let resealed = pool.reserve_local_seal(batch, std::slice::from_ref(&raw))?;
         resealed.accepted();
         pool.5.lock().unwrap().pruned(pool.6, &[hash]);
         let quorum = LocalReplayLease {
