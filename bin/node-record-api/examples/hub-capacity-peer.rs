@@ -288,14 +288,20 @@ impl Peer {
             } else if require_existing {
                 Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
             }
-            handle.dial_by_bls(key).await.or_else(|error| {
-                matches!(
+            let confirm = handle.clone();
+            futures::TryFutureExt::or_else(handle.dial_by_bls(key), |error| async move {
+                if matches!(
                     &error,
                     NetworkError::AlreadyDialing(_) | NetworkError::AlreadyConnected(_)
-                )
-                .then_some(())
-                .ok_or(error)
-            })?;
+                ) {
+                    Ok(())
+                } else if matches!(&error, NetworkError::Dial(_)) {
+                    connected(&confirm, key, true).await.map_err(|_| error)
+                } else {
+                    Err(error)
+                }
+            })
+            .await?;
             connected(&handle, key, true).await
         }))
         .await?;
@@ -443,7 +449,7 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
     .map_err(eyre::Report::from)
     .and_then(|result| result);
     let response = result.map_or_else(
-        |error| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": false, "rejection_reason": error.to_string()}),
+        |error| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": false, "rejection_reason": format!("{error:#}")}),
         |trace| json!({"operation_id": request.operation_id, "scenario": request.scenario, "identity": peer.identity, "success": true, "route": trace.get("route"), "trace": trace}),
     );
     Json(response)

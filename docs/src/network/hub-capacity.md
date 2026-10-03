@@ -150,6 +150,14 @@ peer process, preserve its keys and verify connections to both hubs on every
 swarm. DAO checks observe those same live authenticated connections.
 Each client pins the two declared gateways as trusted peers in its own swarms.
 The measured hubs apply their public and DAO admission rules to those clients.
+Ordinary commands can enter a client's native bounded command server concurrently;
+its sixteen command slots provide the per-client limit. Shared-NAT restarts remain
+serialized and still stop the old process before checking the replacement's
+connections. Restart interference and protocol failures remain failed operations.
+If a dial reports an error during automatic gateway reconnection, the fixture
+requires an observed connection to the requested identity before accepting it.
+Penalties that disconnect or ban a peer log their severity and immediate call site
+without changing the score or its consequences.
 
 Transaction traffic uses 512 offline-signed chain-4476 transactions from the
 public Anvil test account funded in the local genesis. `cast` must be installed.

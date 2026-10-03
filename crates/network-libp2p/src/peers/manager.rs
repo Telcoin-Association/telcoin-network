@@ -725,6 +725,7 @@ impl PeerManager {
     /// The application layer reports issues from peers that are processed here.
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
+    #[track_caller]
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
         // Never penalize our own identity. A self-connection (e.g. a learned
         // hairpin address routed back to our own peer id) must not feed the
@@ -736,6 +737,13 @@ impl PeerManager {
         }
         self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
+
+        if matches!(&action, PeerAction::Ban(_) | PeerAction::Disconnect) {
+            let caller = std::panic::Location::caller();
+            warn!(target: "peer-manager", ?peer_id, ?penalty, ?action,
+                source_file = caller.file(), source_line = caller.line(),
+                "peer penalty caused connection loss");
+        }
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);

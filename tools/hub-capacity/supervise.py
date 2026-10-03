@@ -75,6 +75,10 @@ class Peer:
                 self.log.close()
 
     def command(self, request):
+        if request["scenario"] != "shared_nat_reconnect":
+            if self.stopping:
+                raise ValueError("peer supervisor is shutting down")
+            return self.forward(request, request, None)
         with self.lock:
             if self.stopping:
                 raise ValueError("peer supervisor is shutting down")
@@ -92,20 +96,23 @@ class Peer:
                 forwarded = {**request, "scenario": "dao_connectivity"}
             else:
                 forwarded = request
-            url = f"http://{self.declaration['ip']}:9500/"
-            control = urllib.request.Request(url, data=json.dumps(forwarded).encode(),
-                                             headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(control, timeout=29) as response:
-                data = response.read(65537)
-            if len(data) > 65536:
-                raise ValueError("peer acknowledgement exceeds 64 KiB")
-            result = json.loads(data)
-            if result["operation_id"] != request["operation_id"] or result["scenario"] != forwarded["scenario"] or result["identity"] != self.declaration["identity"]:
-                raise ValueError("protocol peer did not acknowledge the declared request and identity")
-            result["scenario"] = request["scenario"]
-            if restart is not None:
-                result["trace"] = {"restart": restart, "connections": result.get("trace")}
-            return result
+            return self.forward(request, forwarded, restart)
+
+    def forward(self, request, forwarded, restart):
+        url = f"http://{self.declaration['ip']}:9500/"
+        control = urllib.request.Request(url, data=json.dumps(forwarded).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(control, timeout=29) as response:
+            data = response.read(65537)
+        if len(data) > 65536:
+            raise ValueError("peer acknowledgement exceeds 64 KiB")
+        result = json.loads(data)
+        if result["operation_id"] != request["operation_id"] or result["scenario"] != forwarded["scenario"] or result["identity"] != self.declaration["identity"]:
+            raise ValueError("protocol peer did not acknowledge the declared request and identity")
+        result["scenario"] = request["scenario"]
+        if restart is not None:
+            result["trace"] = {"restart": restart, "connections": result.get("trace")}
+        return result
 
 
 def stop_peers(peers, grace_seconds=5, kill_seconds=5):

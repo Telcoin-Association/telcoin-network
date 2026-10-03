@@ -1,6 +1,7 @@
 """Verify failure acknowledgements preserve the measured peer and operation identity."""
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import io
 import json
@@ -17,6 +18,30 @@ SPEC.loader.exec_module(SUPERVISE)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_regular_commands_for_one_peer_enter_transport_concurrently(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                              Path("unused"), Path("unused"))
+        entered = threading.Barrier(2, timeout=1)
+
+        def transport(request, timeout):
+            payload = json.loads(request.data)
+            self.assertEqual(timeout, 29)
+            entered.wait()
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                **payload, "identity": "declared-peer", "success": True}).encode()
+            return response
+
+        requests = [{"operation_id": f"operation-{index}", "scenario": scenario}
+                    for index, scenario in enumerate(("gossip_two_hops", "record_lookup"))]
+        with mock.patch.object(SUPERVISE.urllib.request, "urlopen", side_effect=transport), \
+                ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(peer.command, request) for request in requests]
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual([result["operation_id"] for result in results],
+                         [request["operation_id"] for request in requests])
+        self.assertTrue(all(result["success"] for result in results))
+
     def test_shutdown_signals_every_child_before_shared_wait(self):
         peers = [SUPERVISE.Peer({}, Path("unused"), Path("unused")) for _ in range(4)]
         clock = [0.0]
@@ -56,6 +81,8 @@ class SupervisorTests(unittest.TestCase):
                 peer.start()
             with self.assertRaisesRegex(ValueError, "shutting down"):
                 peer.command({"scenario": "shared_nat_reconnect"})
+            with self.assertRaisesRegex(ValueError, "shutting down"):
+                peer.command({"scenario": "record_lookup"})
         launch.assert_not_called()
 
     def test_control_server_close_does_not_wait_for_active_handlers(self):
