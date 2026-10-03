@@ -306,6 +306,9 @@ pub struct GasAccumulator {
     /// [`GasAccumulator::set_num_workers`] can resize the slot list in place - per-slot state
     /// stays interior-mutable behind its own lock.
     inner: Arc<RwLock<Vec<Accumulated>>>,
+    /// Fee containers for removed worker ids, retained for pools that survive until regrow.
+    /// Accessed only while holding the slot list's write lock, so resizes remain atomic.
+    retired_base_fees: Arc<Mutex<BTreeMap<usize, BaseFeeContainer>>>,
     /// Leader block counts used to compute validator rewards at epoch boundaries.
     rewards_counter: RewardsCounter,
 }
@@ -318,11 +321,12 @@ impl GasAccumulator {
 
     /// Create a new [`GasAccumulator`] with `workers` slots and a pre-built [`RewardsCounter`].
     pub fn new_with_rewards(workers: usize, rewards: RewardsCounter) -> Self {
-        let mut inner = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            inner.push(Accumulated::default());
+        let inner = (0..workers).map(|_| Accumulated::default()).collect();
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
+            retired_base_fees: Arc::default(),
+            rewards_counter: rewards,
         }
-        Self { inner: Arc::new(RwLock::new(inner)), rewards_counter: rewards }
     }
 
     /// Increment the block count, gas used, and gas limit for `worker_id`.
@@ -384,11 +388,10 @@ impl GasAccumulator {
     /// Return the shared [`BaseFeeContainer`] for `worker_id`. Mutations are visible to all
     /// holders of the returned clone.
     ///
-    /// The clone pins the slot's *current* container: [`GasAccumulator::set_num_workers`]
-    /// replaces the container when the count shrinks and later regrows past `worker_id`, and
-    /// the pinned clone stops seeing fee updates (issue #1282). Holders that outlive an epoch
-    /// boundary (the RPC server) take a [`WorkerBaseFee`] from
-    /// [`GasAccumulator::worker_base_fee`] instead.
+    /// [`GasAccumulator::set_num_workers`] retains this container when its worker is removed
+    /// and reuses it on regrow, resetting its fee to [`MIN_PROTOCOL_BASE_FEE`]. A held clone
+    /// keeps its last fee while the worker is absent. RPC servers use [`WorkerBaseFee`] from
+    /// [`GasAccumulator::worker_base_fee`] to report the protocol minimum for absent workers.
     pub fn base_fee(&self, worker_id: WorkerId) -> BaseFeeContainer {
         let inner = self.inner.read();
         inner
@@ -407,10 +410,9 @@ impl GasAccumulator {
 
     /// Return a [`WorkerBaseFee`] handle that resolves `worker_id`'s base fee per read.
     ///
-    /// Unlike the container clone from [`GasAccumulator::base_fee`], the handle survives a
-    /// worker-count shrink and regrow: every read looks up the slot the accumulator currently
-    /// owns, so long-lived holders always see the fee the epoch schedule
-    /// (`EpochBaseFees::apply` in `tn-node`) last wrote (issue #1282).
+    /// Every read looks up the slot the accumulator currently owns, falling back to the
+    /// protocol minimum while the worker is absent. Long-lived holders see the fee the epoch
+    /// schedule (`EpochBaseFees::apply` in `tn-node`) last wrote (issue #1282).
     pub fn worker_base_fee(&self, worker_id: WorkerId) -> WorkerBaseFee {
         WorkerBaseFee { accumulator: self.clone(), worker_id }
     }
@@ -424,9 +426,10 @@ impl GasAccumulator {
     /// Resize the slot list in place to `num_workers` (clamped to at least 1).
     ///
     /// The change is visible to every clone of this accumulator, so node-lifetime handles (the
-    /// engine's, the EVM config's rewards counter) stay live. Growing appends default slots
-    /// (`MIN_PROTOCOL_BASE_FEE` fee, zero gas); shrinking truncates, discarding the removed
-    /// workers' totals and fees. Existing slots and the [`RewardsCounter`] are untouched.
+    /// engine's, the EVM config's rewards counter) stay live. Growing appends zeroed gas totals
+    /// and sets each added worker's fee to [`MIN_PROTOCOL_BASE_FEE`]. Shrinking discards removed
+    /// workers' gas totals but retains their fee containers, so pools holding clones see updates
+    /// again after regrow. Existing slots and the [`RewardsCounter`] are untouched.
     ///
     /// # Concurrency
     ///
@@ -451,7 +454,22 @@ impl GasAccumulator {
         if inner.len() == num_workers {
             return;
         }
-        inner.resize_with(num_workers, Accumulated::default);
+        let mut retired = self.retired_base_fees.lock();
+        if num_workers < inner.len() {
+            retired.extend(
+                inner
+                    .drain(num_workers..)
+                    .enumerate()
+                    .map(|(offset, slot)| (num_workers + offset, slot.base_fee)),
+            );
+        } else {
+            let first_worker = inner.len();
+            inner.extend((first_worker..num_workers).map(|worker_id| {
+                let base_fee = retired.remove(&worker_id).unwrap_or_default();
+                base_fee.set_base_fee(MIN_PROTOCOL_BASE_FEE);
+                Accumulated { base_fee, ..Accumulated::default() }
+            }));
+        }
     }
 
     /// Return a copy of the rewards counter object.
@@ -467,11 +485,9 @@ impl GasAccumulator {
 
 /// A per-read resolver for one worker's current epoch base fee.
 ///
-/// [`GasAccumulator::set_num_workers`] truncates slots on a shrink and rebuilds them with
-/// fresh default containers on a regrow, so a long-held [`BaseFeeContainer`] clone for a
-/// worker id >= 1 can end up pointing at a container the epoch schedule no longer writes to
-/// (issue #1282). This handle holds the accumulator itself and resolves the slot on every
-/// read, so it always reports the fee of the container the accumulator currently owns.
+/// This handle holds the accumulator itself and resolves the active slot on every read.
+/// Unlike a held [`BaseFeeContainer`] clone, it reports the protocol minimum while its worker
+/// is removed, even if the retained container still holds that worker's last active fee.
 ///
 /// A read while the slot is truncated answers the slot's rebirth value
 /// ([`MIN_PROTOCOL_BASE_FEE`], what a regrown slot holds until the epoch schedule writes it):
@@ -691,11 +707,9 @@ mod tests {
         assert_eq!(result, base + base / 8);
     }
 
-    /// Pin the issue #1282 hazard: a held [`BaseFeeContainer`] clone stops seeing fee
-    /// updates after a worker-count shrink and regrow replaces the slot's container, while a
-    /// [`WorkerBaseFee`] handle resolves the slot per read and reports the live value.
+    /// Held fee containers and resolving handles both follow a regrown worker's live fee.
     #[test]
-    fn held_container_clone_goes_stale_after_shrink_and_regrow() {
+    fn held_container_clone_follows_shrink_and_regrow() {
         let accumulator = GasAccumulator::new(2);
         let held_clone = accumulator.base_fee(1);
         let handle = accumulator.worker_base_fee(1);
@@ -707,10 +721,44 @@ mod tests {
 
         assert_eq!(
             held_clone.base_fee(),
-            MIN_PROTOCOL_BASE_FEE,
-            "the held clone still points at the truncated slot's container"
+            live_fee,
+            "the held clone must follow the regrown slot's container"
         );
         assert_eq!(handle.base_fee(), live_fee, "the handle reads the regrown slot's container");
+    }
+
+    /// Partial and repeated regrows preserve every held container but reset removed gas totals.
+    #[test]
+    fn repeated_regrows_reuse_containers_and_reset_only_removed_slots() {
+        let accumulator = GasAccumulator::new(4);
+        let held = (0..4).map(|id| (id, accumulator.base_fee(id))).collect::<Vec<_>>();
+        held.iter().for_each(|(id, fee)| {
+            fee.set_base_fee(MIN_PROTOCOL_BASE_FEE + u64::from(*id) + 10);
+            accumulator.inc_block(*id, 7, 11);
+        });
+        let clone = accumulator.clone();
+
+        // Slot 3 remains retired during the partial regrow, then returns in the second cycle.
+        [2, 3, 1, 4].into_iter().for_each(|count| {
+            clone.set_num_workers(count);
+            assert_eq!(accumulator.num_workers(), count);
+        });
+        assert_eq!(accumulator.get_values(0), (1, 7, 11));
+        assert_eq!(held.first().map(|(_, fee)| fee.base_fee()), Some(MIN_PROTOCOL_BASE_FEE + 10));
+        held.iter().skip(1).for_each(|(id, fee)| {
+            assert_eq!(accumulator.get_values(*id), (0, 0, 0));
+            assert_eq!(fee.base_fee(), MIN_PROTOCOL_BASE_FEE);
+            let live_fee = MIN_PROTOCOL_BASE_FEE + u64::from(*id) + 100;
+            accumulator.base_fee(*id).set_base_fee(live_fee);
+            assert_eq!(fee.base_fee(), live_fee);
+            fee.set_base_fee(live_fee + 1);
+            assert_eq!(accumulator.base_fee(*id).base_fee(), live_fee + 1);
+        });
+        accumulator.set_num_workers(4);
+        assert_eq!(accumulator.get_values(0), (1, 7, 11));
+        held.iter().skip(1).for_each(|(id, fee)| {
+            assert_eq!(fee.base_fee(), MIN_PROTOCOL_BASE_FEE + u64::from(*id) + 101);
+        });
     }
 
     /// A [`WorkerBaseFee`] read while its slot is truncated answers the slot's rebirth value
