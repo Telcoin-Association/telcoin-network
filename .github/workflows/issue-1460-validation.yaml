@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 949b45a5d06c127d4e79e7f5f965405e36a19587
+          ref: 67af7a4d89fd15e9b9b4c3328e4f6c42f86b1fce
           submodules: recursive
       - name: Install pinned toolchains
         run: |
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 949b45a5d06c127d4e79e7f5f965405e36a19587
+          ref: 67af7a4d89fd15e9b9b4c3328e4f6c42f86b1fce
           submodules: recursive
       - name: Install pinned Rust
         run: rustup toolchain install 1.94 --profile minimal
@@ -98,6 +98,13 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 2
         run: make build-e2e-bin
+      - name: Retain optimized validation binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue-1460-node-67af7a4d
+          path: target/e2e/telcoin-network
+          retention-days: 3
+          compression-level: 0
       - name: Prove growth traffic and post-shrink packs
         env:
           CARGO_BUILD_JOBS: 2

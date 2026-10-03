@@ -934,6 +934,7 @@ pub(crate) fn config_committee(
 }
 
 /// Start the network using the node cli command.
+/// Keep the WebSocket base at or above the HTTP base so worker RPC port bands cannot cross.
 pub(crate) fn start_nodes(
     temp_path: &Path,
     validators: &[(&str, Address)],
@@ -954,6 +955,7 @@ pub(crate) fn start_nodes(
         // Get dynamic ports for RPC - OS assigns ports, no instance compensation needed
         let rpc_port = get_available_tcp_port("127.0.0.1").expect("available tcp port");
         let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+        let (rpc_port, ws_port) = (rpc_port.min(ws_port), rpc_port.max(ws_port));
 
         // IPC - unique path under temp dir to avoid cross-test conflicts
         let ipc_path = temp_path.join(format!("{v}.ipc"));
