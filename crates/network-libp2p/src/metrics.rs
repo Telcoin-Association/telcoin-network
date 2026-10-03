@@ -49,13 +49,16 @@ struct SwarmMetricHandles {
     quic_incoming_budget_yields_total: Counter,
 }
 
-/// The `connection_limits` bound that refused an inbound connection.
+/// The bound that refused an inbound connection: a `connection_limits` bound or the peer
+/// manager's population limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InboundDenial {
     /// The pending inbound ceiling refused a handshake before the remote was authenticated.
     PendingIncomingLimit,
     /// The per-peer established ceiling refused an authenticated connection.
     EstablishedPerPeerLimit,
+    /// The peer manager refused a new authenticated identity at its population limit.
+    PeerCapacity,
 }
 
 /// Swarm-level metrics owned by `ConsensusNetwork`.
@@ -123,11 +126,13 @@ impl SwarmMetrics {
         .increment(1);
     }
 
-    /// Record an inbound connection refused by a `connection_limits` bound, by bound.
+    /// Record an inbound connection refused by a `connection_limits` bound or by the peer
+    /// population limit, by bound.
     pub(crate) fn record_inbound_denied(&self, denial: &InboundDenial) {
         let reason = match denial {
             InboundDenial::PendingIncomingLimit => "pending_incoming_limit",
             InboundDenial::EstablishedPerPeerLimit => "established_per_peer_limit",
+            InboundDenial::PeerCapacity => "peer_capacity",
         };
         metrics::counter!(
             "tn_network.inbound_connections_denied_total",

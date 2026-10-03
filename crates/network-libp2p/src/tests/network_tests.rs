@@ -1253,11 +1253,14 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
-    // Create a custom config with very low peer limits for testing
+    // Create a custom config with very low peer limits for testing: no excess factor, so
+    // max_peers equals the target and the 4 other committee peers plus peer2 fill it. nvv then
+    // arrives at capacity and gets the peer exchange hand-off; no heartbeat prune is involved.
     let target = NonZeroUsize::new(5).unwrap();
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 5; // entire committee + 1
-    network_config.peer_config_mut().peer_excess_factor = 0.1;
+    network_config.peer_config_mut().peer_excess_factor = 0.0;
+    network_config.peer_config_mut().peer_exchange_at_capacity = true;
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     network_config.libp2p_config_mut().k_bucket_size = target;
@@ -1405,7 +1408,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     nvv.subscribe_with_publishers(TEST_TOPIC.into(), vec![target_peer_bls].into_iter().collect())
         .await?;
 
-    // connect nvv to target (which already has too many peers)
+    // connect nvv to target (at capacity: accepted only for the peer exchange hand-off)
     nvv.dial_by_bls(target_peer_bls).await?;
 
     // allow time for kademlia records to propagate and libp2p connection state to
@@ -1475,12 +1478,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
-    // 4 committee peers fill the target to its limit; validators are protected from
-    // pruning, so the raw legacy peer is deterministically the excess one
+    // 4 committee peers fill max_peers (target 4, no excess factor), so the raw legacy peer is
+    // a new identity at capacity and gets the peer exchange hand-off; no heartbeat prune is
+    // involved
     let committee = NonZeroUsize::new(5).unwrap();
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
-    network_config.peer_config_mut().peer_excess_factor = 0.1;
+    network_config.peer_config_mut().peer_excess_factor = 0.0;
+    network_config.peer_config_mut().peer_exchange_at_capacity = true;
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     network_config.libp2p_config_mut().k_bucket_size = committee;
@@ -1552,7 +1557,7 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
 
-    // excess dial: accepted (max_peers = ceil(4 * 1.1) = 5), then pruned with px
+    // excess dial at capacity (max_peers = 4): accepted only for the peer exchange hand-off
     raw_swarm.dial(target_addr.clone())?;
 
     // drive the raw swarm: capture the legacy embedded goodbye and ack it
