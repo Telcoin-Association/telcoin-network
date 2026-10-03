@@ -390,8 +390,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         gas_accumulator::{BaseFeeContainer, GasAccumulator},
-        test_genesis, Address, Bytes, Decodable2718 as _, Encodable2718 as _, TaskManager,
-        TransactionTrait as _, WorkerId, B256, U256,
+        test_genesis, test_genesis_at, Address, Bytes, Decodable2718 as _, Encodable2718 as _,
+        TaskManager, TransactionTrait as _, WorkerId, B256, U256,
     };
     use url::Url;
 
@@ -593,6 +593,13 @@ mod tests {
         assert_eq!(pool.pool_size().pending, 0);
     }
 
+    /// Build the epoch-fee RPC fixture's chain with a reproducible genesis hash.
+    fn epoch_fee_chain_spec(header_fee: u64) -> RethChainSpec {
+        let mut genesis = test_genesis_at(0);
+        genesis.base_fee_per_gas = Some(u128::from(header_fee));
+        genesis.into()
+    }
+
     /// Return the production-registered simulation and fill methods with independently chosen epoch
     /// and header fees. Callers seed reth's defaults before constructing `rpc_args`.
     fn epoch_fee_methods(
@@ -602,9 +609,7 @@ mod tests {
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<Methods> {
-        let mut genesis = test_genesis();
-        genesis.base_fee_per_gas = Some(u128::from(header_fee));
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let chain = Arc::new(epoch_fee_chain_spec(header_fee));
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain,
             tmp_dir.path(),
