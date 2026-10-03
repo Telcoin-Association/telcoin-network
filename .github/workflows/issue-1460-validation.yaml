@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 5468f7760de434023c82333a9944a946ce9c516e
+          ref: 949b45a5d06c127d4e79e7f5f965405e36a19587
           submodules: recursive
       - name: Install pinned toolchains
         run: |
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 5468f7760de434023c82333a9944a946ce9c516e
+          ref: 949b45a5d06c127d4e79e7f5f965405e36a19587
           submodules: recursive
       - name: Install pinned Rust
         run: rustup toolchain install 1.94 --profile minimal
@@ -136,3 +136,14 @@ jobs:
           PY
       - name: Verify sources restored
         run: git diff --exit-code
+      - name: Preserve node diagnostics on failure
+        if: failure()
+        run: |
+          python3 -I - <<'PY'
+          from collections import deque
+          from pathlib import Path
+          for path in sorted(Path("crates/e2e-tests/test_logs/worker_count").glob("*.log")):
+              print(f"\nNODE LOG: {path}", flush=True)
+              with path.open(errors="replace") as log:
+                  print("".join(deque(log, maxlen=80)), flush=True)
+          PY

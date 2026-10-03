@@ -15,6 +15,7 @@ use alloy::{
     sol_types::SolCall,
 };
 use e2e_tests::{config_local_testnet_with_epoch_duration, NodeEndpoints};
+use eyre::WrapErr;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -850,7 +851,8 @@ async fn send_worker_config_update<P: Provider>(
 ///
 /// The epoch observed after confirmation may already include the update. Waiting through its
 /// successor guarantees a complete epoch under the changed count regardless of transaction timing.
-/// Return that complete epoch so callers can inspect its sealed consensus pack.
+/// Retry RPC interruptions while waiting for the boundary. Return that complete epoch so callers
+/// can inspect its sealed consensus pack.
 async fn change_worker_count_across_epoch_boundary<P: Provider>(
     provider: &P,
     governance: &mut TransactionFactory,
@@ -864,14 +866,20 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
         chain,
         WorkerConfigs::setNumWorkersCall { numWorkers_: worker_count }.abi_encode().into(),
     )
-    .await?;
+    .await
+    .wrap_err("confirm worker-count governance update")?;
     let configs = WorkerConfigs::new(WORKER_CONFIGS_ADDRESS, provider);
     eyre::ensure!(
-        configs.numWorkers().call().await? == worker_count,
+        configs.numWorkers().call().await.wrap_err("read governed worker count")? == worker_count,
         "governance did not set the worker count to {worker_count}",
     );
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
-    let observed_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let observed_epoch = registry
+        .getCurrentEpochInfo()
+        .call()
+        .await
+        .wrap_err("read epoch after worker-count governance")?
+        .epochId;
     let changed_epoch = observed_epoch.saturating_add(1);
     let following_epoch = changed_epoch.saturating_add(1);
 
@@ -885,7 +893,11 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
                 endpoint.http_url,
             ),
             || async {
-                Ok(registry.getCurrentEpochInfo().call().await?.epochId >= following_epoch)
+                Ok(registry
+                    .getCurrentEpochInfo()
+                    .call()
+                    .await
+                    .is_ok_and(|info| info.epochId >= following_epoch))
             },
         )
         .await?;
@@ -1083,7 +1095,12 @@ async fn assert_worker_commits_batch(
     let worker = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
     wait_for_rpc(&worker).await?;
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &worker);
-    let first_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let first_epoch = registry
+        .getCurrentEpochInfo()
+        .call()
+        .await
+        .wrap_err_with(|| format!("read worker {worker_id}'s epoch before traffic"))?
+        .epochId;
     let recipient = governance.address();
     let tx = governance.create_eip1559_encoded(
         chain,
@@ -1093,13 +1110,29 @@ async fn assert_worker_commits_batch(
         U256::ZERO,
         Bytes::new(),
     );
-    let pending = worker.send_raw_transaction(&tx).await?;
-    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
-    let last_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let pending = worker
+        .send_raw_transaction(&tx)
+        .await
+        .wrap_err_with(|| format!("submit worker {worker_id}'s traffic"))?;
+    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch())
+        .await?
+        .wrap_err_with(|| format!("confirm worker {worker_id}'s traffic"))?;
+    let last_epoch = registry
+        .getCurrentEpochInfo()
+        .call()
+        .await
+        .wrap_err_with(|| format!("read worker {worker_id}'s epoch after traffic"))?
+        .epochId;
     wait_until(
         Duration::from_secs(EPOCH_DURATION * 8),
         &format!("worker {worker_id}'s transaction epoch to close"),
-        || async { Ok(registry.getCurrentEpochInfo().call().await?.epochId > last_epoch) },
+        || async {
+            Ok(registry
+                .getCurrentEpochInfo()
+                .call()
+                .await
+                .is_ok_and(|info| info.epochId > last_epoch))
+        },
     )
     .await?;
     let records = futures::future::try_join_all(
@@ -1212,7 +1245,8 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         .abi_encode()
         .into(),
     )
-    .await?;
+    .await
+    .wrap_err("configure worker 1 before growth")?;
     change_worker_count_across_epoch_boundary(
         &provider,
         &mut governance,
@@ -1220,7 +1254,8 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         &endpoints,
         2,
     )
-    .await?;
+    .await
+    .wrap_err("grow worker count to two")?;
     assert_worker_commits_batch(
         first,
         &temp_dir.path().join(committee.first().ok_or_else(|| eyre::eyre!("no validator"))?.0),
@@ -1236,7 +1271,8 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         &endpoints,
         1,
     )
-    .await?;
+    .await
+    .wrap_err("shrink worker count to one")?;
     let traffic_epochs = assert_worker_commits_batch(
         first,
         &temp_dir.path().join(committee.first().ok_or_else(|| eyre::eyre!("no validator"))?.0),
