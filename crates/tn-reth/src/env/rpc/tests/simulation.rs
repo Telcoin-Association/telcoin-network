@@ -5,7 +5,7 @@ use alloy::{
     eips::{eip2930::AccessListResult, BlockId, BlockNumberOrTag},
     rpc::types::{
         state::{AccountOverride, StateOverride},
-        BlockOverrides, TransactionRequest,
+        Block, BlockOverrides, TransactionRequest,
     },
 };
 use futures::future::try_join_all;
@@ -115,11 +115,12 @@ async fn test_rpc_simulation_preserves_historical_fee() -> eyre::Result<()> {
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
     let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
-    let mut genesis = test_genesis();
-    genesis.base_fee_per_gas = Some(1_000);
-    let chain: RethChainSpec = genesis.into();
-    let blocks =
-        [BlockId::Number(BlockNumberOrTag::Number(0)), BlockId::from(chain.genesis_hash())];
+    // Read the fixture's hash: a fresh test genesis can have a different timestamp.
+    let genesis: Block = methods
+        .call("eth_getBlockByNumber", rpc_params![BlockNumberOrTag::Number(0), false])
+        .await?;
+    assert_eq!(genesis.header.base_fee_per_gas, Some(1_000));
+    let blocks = [BlockId::Number(BlockNumberOrTag::Number(0)), BlockId::from(genesis.header.hash)];
     let request = priced_transfer(7);
     try_join_all(
         blocks.map(|block| assert_simulation_cap_rejected(&methods, &request, Some(block))),

@@ -24,6 +24,7 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod service_class;
 pub mod stream;
 mod sync;
 pub mod types;
@@ -32,6 +33,7 @@ pub mod types;
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
+pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,

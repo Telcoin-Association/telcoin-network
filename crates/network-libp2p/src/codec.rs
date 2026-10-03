@@ -164,6 +164,14 @@ pub trait TNMessage:
     /// Function to intercept peer exchange messages at the network layer before passing to the
     /// application layer. Only the network layer needs peer exchange messages.
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
+
+    /// The service class of this message as an inbound request.
+    ///
+    /// The class labels the inbound occupancy, service time, and shed metrics. It does not change
+    /// how the swarm forwards the request. The default is [`crate::ServiceClass::Other`].
+    fn service_class(&self) -> crate::ServiceClass {
+        crate::ServiceClass::Other
+    }
 }
 
 /// The codec for the dedicated peer-exchange goodbye protocol.

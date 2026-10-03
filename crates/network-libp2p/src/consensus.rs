@@ -10,6 +10,7 @@ use crate::{
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
+    service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
@@ -39,9 +40,11 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     num::NonZeroUsize,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
+use tn_config::{
+    KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
+};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
     TnSender, WorkerId,
@@ -52,9 +55,28 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, instrument, trace, warn};
 
+/// An inbound request that the swarm forwarded to the application and has not yet answered.
+#[derive(Debug)]
+struct PendingInbound {
+    /// The cancel notice to the handler when the request ends.
+    notify: oneshot::Sender<()>,
+    /// The class that counts this request in the pending occupancy.
+    class: ServiceClass,
+    /// The time that the swarm forwarded the request, for the service time histogram.
+    received: Instant,
+}
+
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/network_budget_tests.rs"]
+mod network_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/inbound_service_tests.rs"]
+mod inbound_service_tests;
 
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
@@ -214,11 +236,15 @@ impl InboundDenialWarning {
 
 /// Build the [`connection_limits::Behaviour`] for one swarm.
 ///
-/// It sets two bounds:
-/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
-///   (issue #1010);
+/// It sets the following bounds:
+/// - at most the process allocation's per-peer ceiling, or [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]
+///   without an allocation, concurrent established connections per peer (issue #1010);
+/// - at most the process allocation's established connections in total, when configured;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Both directions and all peer classes consume the process allocation: this behaviour must never
+/// install bypass peer IDs.
 ///
 /// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
 /// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
@@ -236,16 +262,24 @@ impl InboundDenialWarning {
 /// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
 /// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
 ///
-/// The budget applies to each swarm separately. Each primary and worker network builds its own
-/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+/// The pending inbound ceiling applies to each swarm separately. Each primary and worker network
+/// builds its own [`TNBehavior`], so the host total is this ceiling times the number of swarms.
 ///
-/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
-/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
-/// exercise the identical limits.
-fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
+/// Pending outgoing and per-direction established caps stay unbounded. Established totals are
+/// unbounded without a process allocation. Shared by [`TNBehavior::new`] and the regression tests
+/// so all of them exercise the identical limits.
+fn connection_limits_behaviour(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_established_per_peer(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                    budget.connections_per_peer()
+                }),
+            ))
+            .with_max_established(budget.map(|budget| budget.connections()))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
@@ -272,8 +306,9 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
-    /// inbound connections (see [`connection_limits_behaviour`]).
+    /// Per-peer established connection ceiling (issue #1010), optional per-swarm process
+    /// allocation, and memory-only ceiling on pending inbound connections (see
+    /// [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
     /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
@@ -316,7 +351,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None);
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -411,7 +446,9 @@ where
     /// caller is responsible for decoding message bytes and reporting peers who return bad
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    inbound_requests: HashMap<InboundRequestId, PendingInbound>,
+    /// The pending inbound requests by service class. Changes only with `inbound_requests`.
+    inbound_pending: InboundOccupancy,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
@@ -534,6 +571,8 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -658,6 +697,8 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior.connection_limits =
+            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -691,13 +732,12 @@ where
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
+                config.handshake_timeout = quic_config.handshake_timeout;
+                config.max_idle_timeout = quic_config.max_idle_timeout;
+                config.keep_alive_interval = quic_config.keep_alive_interval;
+                config.max_concurrent_stream_limit = quic_config.max_concurrent_stream_limit;
+                config.max_stream_data = quic_config.max_stream_data;
+                config.max_connection_data = quic_config.max_connection_data;
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -737,6 +777,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            inbound_pending: InboundOccupancy::default(),
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
@@ -748,7 +789,7 @@ where
             external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
-            metrics: SwarmMetrics::new_for(&network_type),
+            metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
@@ -929,6 +970,9 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_established_connections(
+                self.swarm.network_info().connection_counters().num_established(),
+            );
             self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
@@ -939,6 +983,13 @@ where
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
+        if matches!(&event,
+            SwarmEvent::IncomingConnectionError { error: libp2p::swarm::ListenError::Denied { cause }, .. }
+            | SwarmEvent::OutgoingConnectionError { error: libp2p::swarm::DialError::Denied { cause }, .. }
+            if cause.downcast_ref::<connection_limits::Exceeded>().is_some()
+        ) {
+            self.metrics.record_connection_limit_rejection();
+        }
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
@@ -1389,6 +1440,7 @@ where
                             .try_send(accepted_gossip_event(message, relayer, author))
                         {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                            self.metrics.record_forward_failure(ServiceClass::Gossip, &e);
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1495,6 +1547,7 @@ where
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            let class = request.service_class();
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
@@ -1504,6 +1557,7 @@ where
                                 cancel,
                             }) {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
+                                self.metrics.record_forward_failure(class, &e);
                                 // ignore failures at the epoch boundary
                                 // During epoch change the event_stream reciever can be closed.
                                 return Ok(());
@@ -1513,11 +1567,14 @@ where
                             //
                             // NOTE: the request id is internally generated, so this should not
                             // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
+                            self.add_inbound(class);
+                            if let Some(duplicate) = self.inbound_requests.insert(
+                                request_id,
+                                PendingInbound { notify, class, received: Instant::now() },
+                            ) {
                                 // cancel if this is a duplicate request
                                 warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
+                                self.close_inbound(duplicate);
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
@@ -1661,20 +1718,37 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                // forward cancelation to handler and release the class occupancy
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.close_inbound(entry);
                 }
             }
 
             ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.metrics.record_service_time(entry.class, entry.received.elapsed());
+                    self.close_inbound(entry);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Count one forwarded inbound request of `class` as pending and export the occupancy.
+    fn add_inbound(&mut self, class: ServiceClass) {
+        self.inbound_pending = self.inbound_pending.added(class);
+        self.metrics.set_inbound_pending(class, self.inbound_pending.pending(class));
+    }
+
+    /// End a pending inbound request: notify the handler and release the class occupancy.
+    ///
+    /// Every removal of an `inbound_requests` entry calls this once, so the swarm releases each
+    /// added request exactly once.
+    fn close_inbound(&mut self, entry: PendingInbound) {
+        let _ = entry.notify.send(());
+        self.inbound_pending = self.inbound_pending.released(entry.class);
+        self.metrics.set_inbound_pending(entry.class, self.inbound_pending.pending(entry.class));
     }
 
     /// Process events from the dedicated peer-exchange goodbye protocol.
@@ -2031,6 +2105,7 @@ where
                         .try_send(NetworkEvent::InboundStream { peer: bls, stream })
                     {
                         error!(target: "network", ?e, "failed to forward inbound stream");
+                        self.metrics.record_forward_failure(ServiceClass::Other, &e);
                     }
                 } else {
                     warn!(target: "network", ?peer, "received inbound stream from unknown peer");

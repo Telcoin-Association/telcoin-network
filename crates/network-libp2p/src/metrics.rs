@@ -5,12 +5,16 @@
 
 use crate::{
     peers::{Penalty, PutRecordRate},
+    service_class::{ServiceClass, ShedReason},
     types::NetworkType,
 };
 use reth_metrics::{
-    metrics::{Counter, Gauge},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
+use std::time::Duration;
+use tn_config::{QuicConfig, SwarmNetworkBudget};
+use tn_types::TrySendError;
 
 /// Map a [`NetworkType`] to its metric label value.
 pub(crate) fn network_label(network_type: &NetworkType) -> String {
@@ -24,6 +28,16 @@ pub(crate) fn network_label(network_type: &NetworkType) -> String {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct SwarmMetricHandles {
+    /// Current established connections across both directions and all peer classes.
+    established_connections: Gauge,
+    /// Configured established-connection ceiling; zero denotes the legacy unbounded total.
+    established_connection_limit: Gauge,
+    /// Configured incoming bidirectional stream ceiling for each established connection.
+    inbound_streams_per_connection_limit: Gauge,
+    /// Advertised receive-credit ceiling per established connection, not retained bytes or RSS.
+    receive_credit_per_connection_bytes: Gauge,
+    /// Connections rejected by the total or per-peer established-connection limits.
+    connection_limit_rejections_total: Counter,
     /// Gossip messages published by this node.
     gossip_published_total: Counter,
     /// Gossip messages received from peers.
@@ -68,6 +82,34 @@ pub(crate) struct SwarmMetrics {
 }
 
 impl SwarmMetrics {
+    /// Record effective transport ceilings using only the configured network label.
+    pub(crate) fn with_capacity(
+        self,
+        quic: &QuicConfig,
+        budget: Option<SwarmNetworkBudget>,
+    ) -> Self {
+        self.handles
+            .established_connection_limit
+            .set(f64::from(budget.map_or(0, |budget| budget.connections())));
+        self.handles
+            .inbound_streams_per_connection_limit
+            .set(f64::from(quic.max_concurrent_stream_limit));
+        self.handles.receive_credit_per_connection_bytes.set(f64::from(quic.max_connection_data));
+        self.handles.established_connections.set(0.0);
+        self.register_service_classes();
+        self
+    }
+
+    /// Observe established connection occupancy, including multiple connections to one peer.
+    pub(crate) fn set_established_connections(&self, connections: u32) {
+        self.handles.established_connections.set(f64::from(connections));
+    }
+
+    /// Count shedding at the resource limit without peer or address labels.
+    pub(crate) fn record_connection_limit_rejection(&self) {
+        self.handles.connection_limit_rejections_total.increment(1);
+    }
+
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
@@ -135,6 +177,67 @@ impl SwarmMetrics {
             "reason" => reason,
         )
         .increment(1);
+    }
+
+    /// Register every class series at zero, so an absent series means "not exported".
+    fn register_service_classes(&self) {
+        ServiceClass::ALL.iter().for_each(|class| {
+            self.set_inbound_pending(*class, 0);
+            let _histogram = self.service_histogram(*class);
+            ShedReason::ALL
+                .iter()
+                .for_each(|reason| self.shed_counter(*class, *reason).increment(0));
+        });
+    }
+
+    /// Export the pending inbound requests of `class`.
+    pub(crate) fn set_inbound_pending(&self, class: ServiceClass, pending: u32) {
+        metrics::gauge!(
+            "tn_network.inbound_requests_pending",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+        )
+        .set(f64::from(pending));
+    }
+
+    /// Record the time from forwarding an inbound request to sending its response.
+    pub(crate) fn record_service_time(&self, class: ServiceClass, elapsed: Duration) {
+        self.service_histogram(class).record(elapsed.as_secs_f64());
+    }
+
+    /// Count inbound work that the swarm dropped before the application received it.
+    pub(crate) fn record_inbound_shed(&self, class: ServiceClass, reason: ShedReason) {
+        self.shed_counter(class, reason).increment(1);
+    }
+
+    /// Count a failed forward to the application as shed if the queue was full.
+    ///
+    /// A closed queue occurs at the epoch boundary, not under load, so it is not counted. A
+    /// broadcast failure is not a full queue, so it is not counted either.
+    pub(crate) fn record_forward_failure<T>(&self, class: ServiceClass, error: &TrySendError<T>) {
+        match error {
+            TrySendError::Full(_) => self.record_inbound_shed(class, ShedReason::QueueFull),
+            TrySendError::Closed(_) | TrySendError::Broadcast(_) => {}
+        }
+    }
+
+    /// The shed counter for `class` and `reason`.
+    fn shed_counter(&self, class: ServiceClass, reason: ShedReason) -> Counter {
+        metrics::counter!(
+            "tn_network.inbound_requests_shed_total",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+            "reason" => reason.label(),
+        )
+    }
+
+    /// The service time histogram for `class`.
+    fn service_histogram(&self, class: ServiceClass) -> Histogram {
+        metrics::histogram!(
+            "tn_network.inbound_request_service_seconds",
+            "network" => self.network.clone(),
+            "class" => class.label(),
+        )
     }
 }
 
@@ -267,6 +370,38 @@ impl PeerManagerMetrics {
 mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// Capacity observations have only the configured swarm label and track occupancy and shedding.
+    #[test]
+    fn budget_metrics_record_capacity_occupancy_and_shedding() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Worker(2))
+                .with_capacity(&QuicConfig::default(), None);
+            swarm.set_established_connections(7);
+            swarm.record_connection_limit_rejection();
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge_is = |name, expected| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key.key().labels().count() == 1
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| label.key() == "network" && label.value() == "worker-2")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        assert!(gauge_is("tn_network.established_connections", 7.0));
+        assert!(gauge_is("tn_network.established_connection_limit", 0.0));
+        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 10_000.0));
+        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 104_857_600.0));
+        assert!(snapshot.iter().any(|(key, _, _, value)| key.key().name()
+            == "tn_network.connection_limit_rejections_total"
+            && matches!(value, DebugValue::Counter(1))));
+    }
 
     /// Primary and worker metrics register their expected labels and update every handle.
     #[test]
