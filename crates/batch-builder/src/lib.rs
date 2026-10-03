@@ -1575,16 +1575,64 @@ mod tests {
             tn_types::SealedBatch,
             oneshot::Sender<Result<(), BlockSealError>>,
         )>,
+        stage: &str,
+        expected_hash: &tn_types::B256,
     ) -> eyre::Result<tn_types::SealedBatch> {
-        let result = builder.spawn_execution_task();
-        let (batch, ack) = timeout(Duration::from_secs(5), worker.recv())
-            .await?
-            .ok_or_else(|| eyre::eyre!("worker channel closed before local seal"))?;
-        ack.send(Ok(())).map_err(|_| eyre::eyre!("build task lost acknowledgement"))?;
-        let mined = match timeout(Duration::from_secs(5), result).await??? {
+        let describe = || {
+            format!(
+                "nonce-gap {stage}: pending={}, expected_present={}, expected_hash={expected_hash}",
+                builder.pool.pool_size().pending,
+                builder.pool.get(expected_hash).is_some(),
+            )
+        };
+        eprintln!("{}", describe());
+        let mut result = builder.spawn_execution_task();
+        let (batch, ack) = timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                batch = worker.recv() => batch.ok_or_else(||
+                    eyre::eyre!("{}: worker channel closed before local seal", describe())),
+                outcome = &mut result => {
+                    let outcome = outcome.map_err(|error|
+                        eyre::eyre!("{}: build result channel closed: {error}", describe()))?
+                        .map_err(|error| eyre::eyre!("{}: build failed: {error}", describe()))?;
+                    let kind = match outcome {
+                        BuildOutcome::Mined(_) => "Mined",
+                        BuildOutcome::Empty => "Empty",
+                        BuildOutcome::Refused => "Refused",
+                        BuildOutcome::Failed => "Failed",
+                    };
+                    Err(eyre::eyre!("{}: build completed as {kind} before worker proposal", describe()))
+                }
+            }
+        })
+        .await
+        .map_err(|error| eyre::eyre!("{}: worker proposal exceeded five seconds: {error}", describe()))??;
+        assert_eq!(batch.batch().transactions().len(), 1, "{stage}: one transaction per seal");
+        let encoded = batch
+            .batch()
+            .transactions()
+            .first()
+            .ok_or_else(|| eyre::eyre!("{}: worker proposed an empty batch", describe()))?;
+        assert_eq!(
+            recover_raw_transaction(encoded)?.hash(),
+            expected_hash,
+            "{stage}: selected the intended transaction",
+        );
+        ack.send(Ok(()))
+            .map_err(|_| eyre::eyre!("{}: build task lost acknowledgement", describe()))?;
+        let mined = match timeout(Duration::from_secs(5), result)
+            .await
+            .map_err(|error| {
+                eyre::eyre!("{}: acknowledged build exceeded five seconds: {error}", describe())
+            })?
+            .map_err(|error| {
+                eyre::eyre!("{}: acknowledged build result channel closed: {error}", describe())
+            })?
+            .map_err(|error| eyre::eyre!("{}: acknowledged build failed: {error}", describe()))?
+        {
             BuildOutcome::Mined(mined) => mined,
             BuildOutcome::Empty | BuildOutcome::Refused | BuildOutcome::Failed => {
-                panic!("expected acknowledged local batch")
+                panic!("{}: expected acknowledged local batch", describe())
             }
         };
         mined.local_retention.into_iter().for_each(tn_reth::LocalSealReservation::accepted);
@@ -1596,7 +1644,8 @@ mod tests {
                 mined.mined_transactions,
                 mined.changed_accounts,
             )
-            .await?;
+            .await
+            .map_err(|error| eyre::eyre!("{}: optimistic prune failed: {error}", describe()))?;
         Ok(batch)
     }
 
@@ -1625,9 +1674,12 @@ mod tests {
                 MIN_PROTOCOL_BASE_FEE,
                 0,
             )?;
+            // Admit the consecutive pair against one canonical sender state. Each declared gas
+            // limit exceeds half the existing batch budget, so selection seals them separately.
+            let gas_limit = tn_types::max_batch_gas(0) / 2 + 1;
             let first = tx_factory.create_eip1559(
                 chain.clone(),
-                Some(21_000),
+                Some(gas_limit),
                 7,
                 Some(Address::ZERO),
                 U256::from(1),
@@ -1635,7 +1687,7 @@ mod tests {
             );
             let later = tx_factory.create_eip1559(
                 chain.clone(),
-                Some(21_000),
+                Some(gas_limit),
                 7,
                 Some(Address::ZERO),
                 U256::from(1),
@@ -1650,10 +1702,35 @@ mod tests {
                 Bytes::new(),
             );
             tx_factory.submit_tx_to_pool(first.clone(), txpool.clone()).await;
-            let batch_a = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
-            assert!(txpool.get(first.hash()).is_none());
             tx_factory.submit_tx_to_pool(later.clone(), txpool.clone()).await;
-            let batch_b = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
+            assert_eq!(
+                txpool.pool_size().pending,
+                2,
+                "both admitted nonces are initially executable"
+            );
+            let batch_a = acknowledge_local_build(
+                &builder,
+                &reth_env,
+                &mut worker,
+                "seal nonce 0",
+                first.hash(),
+            )
+            .await?;
+            assert!(txpool.get(first.hash()).is_none());
+            assert!(txpool.get(later.hash()).is_some());
+            assert_eq!(
+                txpool.pool_size().pending,
+                1,
+                "nonce 1 remains executable after optimistic prune"
+            );
+            let batch_b = acknowledge_local_build(
+                &builder,
+                &reth_env,
+                &mut worker,
+                "seal nonce 1",
+                later.hash(),
+            )
+            .await?;
             assert!(txpool.get(later.hash()).is_none());
 
             // An unrelated canonical block cannot make either pending accepted batch replayable.
@@ -1714,7 +1791,14 @@ mod tests {
                 || async { Ok(txpool.pool_size().pending == 1) },
             )
             .await?;
-            let recovered = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
+            let recovered = acknowledge_local_build(
+                &builder,
+                &reth_env,
+                &mut worker,
+                "reseal recovered nonce 1",
+                later.hash(),
+            )
+            .await?;
             assert_eq!(
                 recover_raw_transaction(&recovered.batch().transactions()[0])?.hash(),
                 later.hash()
@@ -1741,7 +1825,14 @@ mod tests {
                 || async { Ok(txpool.pool_size().pending == 1) },
             )
             .await?;
-            let successor_batch = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
+            let successor_batch = acknowledge_local_build(
+                &builder,
+                &reth_env,
+                &mut worker,
+                "seal successor nonce 2",
+                successor.hash(),
+            )
+            .await?;
             let output_successor = consensus_output_for_tests(5, 0, 5, false);
             let executed = execute_payload_and_update_canonical_chain(
                 &reth_env,
