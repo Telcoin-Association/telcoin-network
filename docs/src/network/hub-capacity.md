@@ -75,6 +75,26 @@ collected the requested round. These requests are rejected without lowering the 
 reputation, and the receiver preserves its cached response and durable vote. A different header
 digest at the same author, epoch and round remains equivocation and receives a fatal penalty.
 
+### Local batch recovery
+
+Local seal recovery keeps raw signed transactions in a shared RAM owner and a
+durable node batch cache. Each independently caps retention at 64 MiB, 1,024
+transactions and 1,024 batches across all workers. Exhausting either budget
+applies backpressure before quorum acknowledgement. Quorum-accepted local bytes
+have no TTL. Observer forwarding admission is tracked separately; an observer
+acknowledgement does not establish committee quorum.
+
+After a nonce-gap skip is confirmed in canonical output, retained transactions
+return through normal `External` pool validation. Canonical transaction hashes
+or consumed sender nonces release RAM ownership. Accepted durable entries remain
+after RAM replay or a failed publication report until canonical nonces consume
+every signed transaction in the batch. Restart retries load the durable batch
+cache; ordinary RPC pool submissions receive no added crash-durability guarantee.
+A shared lock serializes retries of the exact batch digest across cache, quorum,
+reporting and cleanup, with at most 1,024 live digest keys. Runtime tests of this
+recovery path and a fresh measured comparison must pass before treating the
+profile as qualified.
+
 ## Predeclared qualification
 
 The GitHub Actions envelope declares two hubs, each with one assigned CPU and
@@ -147,6 +167,12 @@ compilation, tests, Clippy and compiling mutations pass. It uses the same commit
 attested binaries and retains raw evidence and diagnostics for ninety days.
 The artifact excludes generated validator key files and executable copies.
 
+The collector retains complete production diagnostic logs as
+`protocol-NN.jsonl`, with a 256 MiB per-file cap and a SHA-256 hash. Other raw
+artifacts keep their 64 MiB cap. Exceeding a cap fails collection or scoring;
+the collector removes incomplete copies. These evidence limits change neither
+the network profile nor any acceptance threshold.
+
 The peer example uses the production libp2p network, deterministic local test
 identities and three persistent swarms. Commands perform authenticated joins,
 fresh signature-validated record queries, worker submit-URL resolution and
@@ -178,8 +204,10 @@ appear in a receipt and its matching canonical block. Each fence has a 60-second
 deadline and polls at 250 ms; RPC timeouts cannot exceed the remaining deadline.
 The 500 ms seed cadence resumes after each fence, and all receipt probes are
 retained. Missing inclusion or a mismatched receipt fails setup.
-An inclusion timeout retains four optional transaction, account and pool probes,
-each limited to two seconds, before propagating the original setup failure.
+An inclusion timeout or failed submission retains four optional transaction,
+account and pool probes, each limited to two seconds, before propagating the
+original failure. Diagnostic errors cannot replace that failure. Each submission
+row retains its planned signed hash, including a rejected transaction.
 Every RPC acknowledgement and canonical batch-selection observation is retained.
 Offline Keccak transaction hashes are frozen with the signed inputs. A transport
 failure triggers a bounded lookup of that exact hash before resubmitting the same

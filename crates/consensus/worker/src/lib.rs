@@ -19,7 +19,7 @@ pub use crate::{
         handler::RequestHandler,
         message::{WorkerGossip, WorkerRPCError},
     },
-    worker::{new_worker, Worker, CHANNEL_CAPACITY},
+    worker::{new_worker, LocalBatchRecovery, Worker, CHANNEL_CAPACITY},
 };
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.

@@ -100,6 +100,23 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
     register_invalid_tx_skip_series();
+    reth_metrics::metrics::describe_gauge!(
+        "tn_reth.local_seal_retained_bytes",
+        "Signed bytes owned by bounded local seal recovery"
+    );
+    reth_metrics::metrics::describe_gauge!(
+        "tn_reth.local_seal_retained_entries",
+        "Transactions owned by bounded local seal recovery"
+    );
+    record_local_seal_retention(0, 0);
+}
+
+/// Publish the process-shared retention owner's current occupancy.
+pub(crate) fn record_local_seal_retention(bytes: usize, entries: usize) {
+    reth_metrics::metrics::gauge!("tn_reth.local_seal_retained_bytes")
+        .set(f64::from(u32::try_from(bytes).unwrap_or(u32::MAX)));
+    reth_metrics::metrics::gauge!("tn_reth.local_seal_retained_entries")
+        .set(f64::from(u32::try_from(entries).unwrap_or(u32::MAX)));
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus

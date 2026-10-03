@@ -16,6 +16,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 MAX_BYTES = 16 * 1024 * 1024
+MAX_RAW_ARTIFACT_BYTES = 64 * 1024**2
+# CI production logs reached 124 MiB with engine debug diagnostics enabled.
+MAX_PROTOCOL_LOG_BYTES = 256 * 1024**2
 SCENARIOS = {
     "public_join", "shared_nat_reconnect", "gossip_two_hops", "record_lookup",
     "submit_url_lookup", "concurrent_sync", "committee_progress", "dao_connectivity",
@@ -305,19 +308,25 @@ def score(plan, evidence):
     return {"passed": not failures, "failures": sorted(set(failures)), "scenarios": summary}
 
 
+def raw_artifact_limit(path):
+    """Reserve the larger finite budget for canonical production node logs."""
+    return MAX_PROTOCOL_LOG_BYTES if re.fullmatch(r"protocol-[0-9]{2}\.jsonl", path) else MAX_RAW_ARTIFACT_BYTES
+
+
 def verify_artifacts(evidence, directory):
     """Verify retained raw files without loading whole logs into memory."""
     if len(evidence["artifacts"]) > 64:
         fail("at most 64 raw artifacts per phase")
     for artifact in evidence["artifacts"]:
         path = directory / artifact["path"]
+        maximum_bytes = raw_artifact_limit(artifact["path"])
         hasher = hashlib.sha256()
         size = 0
         with path.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 size += len(chunk)
-                if size > 64 * 1024 * 1024:
-                    fail("split raw artifacts larger than 64 MiB before scoring")
+                if size > maximum_bytes:
+                    fail(f"raw artifact exceeds {maximum_bytes // 1024**2} MiB: {artifact['path']}")
                 hasher.update(chunk)
         if hasher.hexdigest() != artifact["sha256"]:
             fail(f"raw artifact digest mismatch: {artifact['path']}")

@@ -48,6 +48,8 @@ struct MinedBatchResult {
     mined_transactions: Vec<TxHash>,
     /// Account changes used to update the pool after mining a batch.
     changed_accounts: Vec<ChangedAccount>,
+    /// Stay reserved until the run loop owns the optimistic pool update.
+    local_retention: Option<tn_reth::LocalSealReservation>,
 }
 
 /// How one batch build task ended, as the run loop consumes it. Fatal errors travel beside
@@ -69,6 +71,14 @@ enum BuildOutcome {
     /// epoch's consensus shutdown has begun). The pool keeps its transactions and the loop
     /// retries on the next delay tick, as before.
     Failed,
+}
+
+/// A seal either owns recovery bytes or must leave its transactions in the pool.
+enum LocalRetentionDecision<T> {
+    /// Recovery capacity was reserved before asking the worker for quorum.
+    Reserved(T),
+    /// Capacity or source validation refused the seal.
+    Refused,
 }
 
 /// Ceiling for the refusal backoff (issue #1145).
@@ -253,6 +263,19 @@ impl BatchBuilder {
                 let batch = batch.seal_slow();
                 span.record("batch", batch.digest().to_string());
 
+                let retention = pool.reserve_local_seal(batch.digest(), batch.batch().transactions())
+                    .map_or_else(|error| {
+                        debug!(target: "worker::batch_builder", ?error, "local recovery capacity refused batch seal");
+                        LocalRetentionDecision::Refused
+                    }, LocalRetentionDecision::Reserved);
+                match retention {
+                    LocalRetentionDecision::Refused => {
+                        result.send(Ok(BuildOutcome::Failed)).err().into_iter().for_each(|e| {
+                            error!(target: "worker::batch_builder", ?e, "failed to report retained batch refusal");
+                        });
+                        Ok(())
+                    }
+                    LocalRetentionDecision::Reserved(local_retention) => {
                 // forward to worker and wait for ack that quorum was reached
                 if let Err(e) = to_worker.send((batch, ack)).await {
                     error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
@@ -275,7 +298,7 @@ impl BatchBuilder {
                                 debug!(target: "worker::batch-builder", ?res, "received ack");
                                 metrics.batches_sealed_total.increment(1);
                                 // signal to Self that this task is complete
-                                if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
+                                if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts, local_retention: Some(local_retention) }))) {
                                     error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                                 }
                             }
@@ -330,6 +353,8 @@ impl BatchBuilder {
                     }
                 }
                 Ok(())
+                    }
+                }
             }
         }.instrument(span_clone));
 
@@ -487,18 +512,20 @@ impl BatchBuilder {
                     // backoff, anything mined ends it. Empty, Refused and Failed take the
                     // pre-existing empty-mined path below: no pool update, one deferred build,
                     // park until a wake-up.
-                    let MinedBatchResult { mined_transactions, changed_accounts } = match outcome {
+                    let MinedBatchResult { mined_transactions, changed_accounts, local_retention } = match outcome {
                         BuildOutcome::Mined(mined) => mined,
                         BuildOutcome::Refused => {
                             self.note_refusal();
                             MinedBatchResult {
                                 mined_transactions: vec![],
                                 changed_accounts: vec![],
+                                local_retention: None,
                             }
                         }
                         BuildOutcome::Empty | BuildOutcome::Failed => MinedBatchResult {
                             mined_transactions: vec![],
                             changed_accounts: vec![],
+                            local_retention: None,
                         },
                     };
 
@@ -524,6 +551,7 @@ impl BatchBuilder {
                     // The pool derives its pending fee from the shared per-worker container, so
                     // a stale `last_canonical_update` (at an epoch boundary, the previous
                     // epoch's closing block) cannot reprice the pool (issue #1262).
+                    local_retention.into_iter().for_each(tn_reth::LocalSealReservation::accepted);
                     self.pool.update_canonical_state(
                         &self.last_canonical_update,
                         Some(u128::MAX), // set max fee for blobs
@@ -1537,6 +1565,198 @@ mod tests {
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
         Ok(())
+    }
+
+    /// Drive the real build/reservation/acknowledgement seam, then apply its optimistic prune.
+    async fn acknowledge_local_build(
+        builder: &BatchBuilder,
+        worker: &mut tokio::sync::mpsc::Receiver<(
+            tn_types::SealedBatch,
+            oneshot::Sender<Result<(), BlockSealError>>,
+        )>,
+    ) -> eyre::Result<tn_types::SealedBatch> {
+        let result = builder.spawn_execution_task();
+        let (batch, ack) = timeout(Duration::from_secs(5), worker.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("worker channel closed before local seal"))?;
+        ack.send(Ok(())).map_err(|_| eyre::eyre!("build task lost acknowledgement"))?;
+        let mined = match timeout(Duration::from_secs(5), result).await??? {
+            BuildOutcome::Mined(mined) => mined,
+            BuildOutcome::Empty | BuildOutcome::Refused | BuildOutcome::Failed => {
+                panic!("expected acknowledged local batch")
+            }
+        };
+        mined.local_retention.into_iter().for_each(tn_reth::LocalSealReservation::accepted);
+        builder
+            .pool
+            .update_canonical_state(
+                &builder.latest_canon_header()?,
+                Some(u128::MAX),
+                mined.mined_transactions,
+                mined.changed_accounts,
+            )
+            .await?;
+        Ok(batch)
+    }
+
+    /// Accepted local nonce gaps recover after their output commits, without RPC resubmission.
+    #[tokio::test]
+    async fn locally_sealed_nonce_gap_recovers_without_resubmission() -> eyre::Result<()> {
+        use tn_reth::{
+            payload::TNPayload,
+            test_utils::{consensus_output_for_tests, execute_payload_and_update_canonical_chain},
+        };
+        use tn_types::B256;
+        timeout(Duration::from_secs(20), async {
+            let tmp_dir = TempDir::new()?;
+            let TestTools { mut tx_factory, execution_components, task_manager } =
+                get_test_tools(tmp_dir.path());
+            let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
+            let (to_worker, mut worker) = tokio::sync::mpsc::channel(2);
+            let builder = BatchBuilder::new(
+                &reth_env,
+                txpool.clone(),
+                to_worker,
+                Address::ZERO,
+                Duration::from_secs(1),
+                task_manager.get_spawner(),
+                0,
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+            )?;
+            let first = tx_factory.create_eip1559(
+                chain.clone(),
+                Some(21_000),
+                7,
+                Some(Address::ZERO),
+                U256::from(1),
+                Bytes::new(),
+            );
+            let later = tx_factory.create_eip1559(
+                chain.clone(),
+                Some(21_000),
+                7,
+                Some(Address::ZERO),
+                U256::from(1),
+                Bytes::new(),
+            );
+            let successor = tx_factory.create_eip1559(
+                chain.clone(),
+                Some(21_000),
+                7,
+                Some(Address::ZERO),
+                U256::from(1),
+                Bytes::new(),
+            );
+            tx_factory.submit_tx_to_pool(first.clone(), txpool.clone()).await;
+            let batch_a = acknowledge_local_build(&builder, &mut worker).await?;
+            assert!(txpool.get(first.hash()).is_none());
+            tx_factory.submit_tx_to_pool(later.clone(), txpool.clone()).await;
+            let batch_b = acknowledge_local_build(&builder, &mut worker).await?;
+            assert!(txpool.get(later.hash()).is_none());
+
+            // An unrelated canonical block cannot make either pending accepted batch replayable.
+            let unrelated = consensus_output_for_tests(1, 0, 1, false);
+            let empty = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test(chain.sealed_genesis_header(), &unrelated),
+                vec![],
+            )?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(txpool.get(first.hash()).is_none());
+            assert!(txpool.get(later.hash()).is_none());
+
+            let output_b = consensus_output_for_tests(2, 0, 2, false);
+            let skipped = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test_with(
+                    empty.recovered_block.clone_sealed_header(),
+                    &output_b,
+                    Address::ZERO,
+                    batch_b.digest(),
+                    B256::ZERO,
+                ),
+                batch_b.batch().transactions().to_vec(),
+            )?;
+            assert!(
+                skipped.recovered_block.body().transactions.is_empty(),
+                "nonce 1 must be skipped before nonce 0"
+            );
+            tn_test_utils::wait_until(
+                Duration::from_secs(5),
+                "omitted nonce 1 is readmitted",
+                || async { Ok(txpool.get(later.hash()).is_some()) },
+            )
+            .await?;
+            assert_eq!(
+                txpool.pool_size().pending,
+                0,
+                "nonce 1 remains queued until its predecessor executes"
+            );
+
+            let output_a = consensus_output_for_tests(3, 0, 3, false);
+            let predecessor = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test_with(
+                    skipped.recovered_block.clone_sealed_header(),
+                    &output_a,
+                    Address::ZERO,
+                    batch_a.digest(),
+                    B256::ZERO,
+                ),
+                batch_a.batch().transactions().to_vec(),
+            )?;
+            assert_eq!(predecessor.recovered_block.body().transactions.len(), 1);
+            tn_test_utils::wait_until(
+                Duration::from_secs(5),
+                "recovered nonce 1 becomes executable",
+                || async { Ok(txpool.pool_size().pending == 1) },
+            )
+            .await?;
+            let recovered = acknowledge_local_build(&builder, &mut worker).await?;
+            assert_eq!(
+                recover_raw_transaction(&recovered.batch().transactions()[0])?.hash(),
+                later.hash()
+            );
+            let output_recovered = consensus_output_for_tests(4, 0, 4, false);
+            let executed = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test_with(
+                    predecessor.recovered_block.clone_sealed_header(),
+                    &output_recovered,
+                    Address::ZERO,
+                    recovered.digest(),
+                    B256::ZERO,
+                ),
+                recovered.batch().transactions().to_vec(),
+            )?;
+            assert_eq!(executed.recovered_block.body().transactions.len(), 1);
+
+            // This is a new submission, not resubmission of either accepted transaction.
+            tx_factory.submit_tx_to_pool(successor.clone(), txpool.clone()).await;
+            tn_test_utils::wait_until(
+                Duration::from_secs(5),
+                "nonce 2 becomes executable",
+                || async { Ok(txpool.pool_size().pending == 1) },
+            )
+            .await?;
+            let successor_batch = acknowledge_local_build(&builder, &mut worker).await?;
+            let output_successor = consensus_output_for_tests(5, 0, 5, false);
+            let executed = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test_with(
+                    executed.recovered_block.clone_sealed_header(),
+                    &output_successor,
+                    Address::ZERO,
+                    successor_batch.digest(),
+                    B256::ZERO,
+                ),
+                successor_batch.batch().transactions().to_vec(),
+            )?;
+            assert_eq!(executed.recovered_block.body().transactions.len(), 1);
+            Ok::<(), eyre::Report>(())
+        })
+        .await?
     }
 
     /// Regression test for issue #1262: after a mined batch the pool update must install the

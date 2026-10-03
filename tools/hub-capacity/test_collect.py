@@ -38,23 +38,87 @@ def telemetry():
 
 
 class CollectorTests(unittest.TestCase):
+    def test_production_log_retention_preserves_large_raw_input_and_scoped_guard(self):
+        with tempfile.TemporaryDirectory(prefix="capacity-log-retention-") as directory:
+            root = Path(directory)
+            source = root / "validator.jsonl"
+            with source.open("wb") as stream:
+                stream.write(b"raw diagnostic header\n")
+                stream.seek(65 * 1024**2 - 20)
+                stream.write(b"raw diagnostic tail\n")
+            output = root / "retained"
+            output.mkdir()
+            artifacts = COLLECT.retain_protocol_logs([source], output)
+            retained = output / artifacts[0]["path"]
+            self.assertEqual(artifacts[0]["sha256"], COLLECT.file_hash(source))
+            self.assertEqual(retained.stat().st_size, source.stat().st_size)
+            with source.open("rb") as incoming, retained.open("rb") as copied:
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                    self.assertEqual(copied.read(len(chunk)), chunk)
+                self.assertEqual(copied.read(1), b"")
+            COLLECT.QUALIFY.verify_artifacts({"artifacts": artifacts}, output)
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                COLLECT.retain_file(source, output / "topology.json")
+            self.assertFalse((output / "topology.json").exists())
+            for name in ("workload.log", "protocol-00.jsonl.extra", "unrelated-protocol-00.jsonl"):
+                retained.rename(output / name)
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "exceeds"):
+                    COLLECT.QUALIFY.verify_artifacts({"artifacts": [
+                        {"path": name, "sha256": artifacts[0]["sha256"]},
+                    ]}, output)
+                (output / name).rename(retained)
+
+    def test_production_log_budget_exhaustion_removes_partial_copy(self):
+        with tempfile.TemporaryDirectory(prefix="capacity-log-exhaustion-") as directory:
+            root = Path(directory)
+            source = root / "validator.jsonl"
+            with source.open("wb") as stream:
+                stream.truncate(1024**2 + 1)
+            output = root / "retained"
+            output.mkdir()
+            with mock.patch.object(COLLECT.QUALIFY, "MAX_PROTOCOL_LOG_BYTES", 1024**2):
+                with self.assertRaisesRegex(ValueError, "exceeds"):
+                    COLLECT.retain_protocol_logs([source], output)
+                self.assertEqual(list(output.iterdir()), [])
+                # Even a supplied matching hash cannot make an oversized log pass scoring.
+                source.rename(output / "protocol-00.jsonl")
+                artifact = {"path": "protocol-00.jsonl", "sha256": COLLECT.file_hash(output / "protocol-00.jsonl")}
+                with self.assertRaisesRegex(ValueError, "exceeds"):
+                    COLLECT.QUALIFY.verify_artifacts({"artifacts": [artifact]}, output)
+
+    def test_rejected_empty_copy_and_existing_destination_remain_distinct(self):
+        with tempfile.TemporaryDirectory(prefix="capacity-log-copy-") as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "retained"
+            source.write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "empty"):
+                COLLECT.retain_file(source, destination)
+            self.assertFalse(destination.exists())
+            destination.write_bytes(b"existing evidence")
+            source.write_bytes(b"replacement")
+            with self.assertRaises(FileExistsError):
+                COLLECT.retain_file(source, destination)
+            self.assertEqual(destination.read_bytes(), b"existing evidence")
+
     def test_operation_finishing_during_metrics_fetch_is_captured(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             profile = root / "profile.json"
             topology = root / "topology.json"
+            protocol_log = root / "validator.jsonl"
             profile.write_text("{}")
             topology.write_text("{}")
+            protocol_log.write_bytes(b"synthetic production log\n")
             phase = {"revision": "a" * 40, "profile": {},
                      "binary_sha256": {"telcoin-network": "b" * 64}}
             plan = {"hubs": ["hub"], "baseline": phase, "adapter_command": "synthetic-workload",
-                    "envelope": {"duration_seconds": 4, "committee_peers": 0}}
+                    "envelope": {"duration_seconds": 4, "committee_peers": 1}}
             frozen = {"plan": plan, "plan_sha256": COLLECT.QUALIFY.digest(plan)}
             bindings = {"hubs": {"hub": {"revision": phase["revision"], "profile_path": str(profile),
                         "pid": 42, "metrics_url": "http://synthetic.invalid/metrics",
                         "progress": {"name": "synthetic_progress"}}},
                         "workload": ["synthetic-workload"], "topology_artifact": str(topology),
-                        "protocol_logs": []}
+                        "protocol_logs": [str(protocol_log)]}
             output = root / "evidence"
             clock = {"time": 0.0, "reads": 0, "completed": False}
 
@@ -97,6 +161,8 @@ class CollectorTests(unittest.TestCase):
             self.assertFalse(operation["success"])
             self.assertGreaterEqual(evidence["samples"][-1]["elapsed_seconds"], operation["elapsed_seconds"])
             self.assertEqual(clock["reads"], 4)
+            self.assertEqual((output / "protocol-00.jsonl").read_bytes(), protocol_log.read_bytes())
+            self.assertIn({"path": "protocol-00.jsonl", "sha256": "b" * 64}, evidence["artifacts"])
 
     def test_full_mapping_and_worker_omission(self):
         binding = {"progress": {"name": "progress"}, "dao_connected": {"name": "dao"}}

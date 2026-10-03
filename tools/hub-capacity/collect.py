@@ -156,17 +156,33 @@ def file_hash(path):
     return hasher.hexdigest()
 
 
-def retain_file(source, destination):
-    """Copy a finite raw declaration or topology artifact without reading it into memory."""
+def retain_file(source, destination, *, maximum_bytes=QUALIFY.MAX_RAW_ARTIFACT_BYTES):
+    """Copy a bounded raw artifact and remove incomplete copies on failure."""
     size = 0
-    with Path(source).open("rb") as incoming, destination.open("xb") as outgoing:
-        for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
-            size += len(chunk)
-            if size > 64 * 1024**2:
-                raise ValueError("raw input exceeds 64 MiB")
-            outgoing.write(chunk)
-    if size == 0:
-        raise ValueError("raw input must not be empty")
+    with Path(source).open("rb") as incoming:
+        outgoing = destination.open("xb")
+        try:
+            with outgoing:
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    if size > maximum_bytes:
+                        raise ValueError(f"raw input exceeds {maximum_bytes // 1024**2} MiB")
+                    outgoing.write(chunk)
+                if size == 0:
+                    raise ValueError("raw input must not be empty")
+        except BaseException:
+            destination.unlink()
+            raise
+
+
+def retain_protocol_logs(paths, output):
+    """Retain complete production diagnostics within a separate per-node budget."""
+    artifacts = []
+    for index, path in enumerate(paths):
+        retained = output / f"protocol-{index:02}.jsonl"
+        retain_file(path, retained, maximum_bytes=QUALIFY.MAX_PROTOCOL_LOG_BYTES)
+        artifacts.append({"path": retained.name, "sha256": file_hash(retained)})
+    return artifacts
 
 
 class RawLog:
@@ -310,11 +326,7 @@ def collect(frozen, bindings, phase, output):
                 time.sleep(max(0, 2 - (time.monotonic() - started - elapsed)))
             if child.wait(timeout=30) != 0:
                 raise ValueError("workload driver failed")
-        protocol_artifacts = []
-        for index, path in enumerate(protocol_logs):
-            retained = output / f"protocol-{index:02}.jsonl"
-            retain_file(path, retained)
-            protocol_artifacts.append({"path": retained.name, "sha256": file_hash(retained)})
+        protocol_artifacts = retain_protocol_logs(protocol_logs, output)
         result = {
             "phase": phase, "plan_sha256": QUALIFY.digest(plan), "revision": plan[phase]["revision"],
             "profile_sha256": QUALIFY.digest(plan[phase]["profile"]),
