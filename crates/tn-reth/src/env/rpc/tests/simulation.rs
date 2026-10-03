@@ -115,7 +115,8 @@ async fn test_rpc_simulation_preserves_historical_fee() -> eyre::Result<()> {
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
     let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
-    let mut genesis = test_genesis();
+    // Match the RPC fixture's timestamp even when setup crosses a wall-clock second.
+    let mut genesis = test_genesis_at(0);
     genesis.base_fee_per_gas = Some(1_000);
     let chain: RethChainSpec = genesis.into();
     let blocks =

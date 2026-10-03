@@ -390,8 +390,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         gas_accumulator::{BaseFeeContainer, GasAccumulator},
-        test_genesis, Address, Bytes, Decodable2718 as _, Encodable2718 as _, TaskManager,
-        TransactionTrait as _, WorkerId, B256, U256,
+        test_genesis, test_genesis_at, Address, Bytes, Decodable2718 as _, Encodable2718 as _,
+        TaskManager, TransactionTrait as _, WorkerId, B256, U256,
     };
     use url::Url;
 
@@ -602,7 +602,7 @@ mod tests {
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<Methods> {
-        let mut genesis = test_genesis();
+        let mut genesis = test_genesis_at(0);
         genesis.base_fee_per_gas = Some(u128::from(header_fee));
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
