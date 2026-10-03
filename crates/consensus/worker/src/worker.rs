@@ -125,7 +125,8 @@ mod local_recovery_tests {
             WorkerRpcForwarder,
         };
         use tn_types::{
-            BaseFeeContainer, BlsKeypair, Bytes, Encodable2718, GenesisAccount, RpcInfo, U256,
+            gas_accumulator::BaseFeeContainer, BlsKeypair, Bytes, Encodable2718, GenesisAccount,
+            RpcInfo, U256,
         };
         tokio::time::timeout(Duration::from_secs(45), async {
             let directory = tempfile::tempdir()?;
