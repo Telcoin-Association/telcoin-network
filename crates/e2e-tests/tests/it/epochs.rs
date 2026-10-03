@@ -1245,6 +1245,15 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         0,
     )
     .await?;
+    // Each validator seals independently, so wait for its traffic epochs before reading its packs.
+    futures::future::try_join_all(endpoints.iter().map(|endpoint| {
+        futures::future::try_join_all(
+            traffic_epochs
+                .iter()
+                .map(|epoch| fetch_verified_epoch_record(&endpoint.http_url, *epoch, 60)),
+        )
+    }))
+    .await?;
     committee.iter().try_for_each(|(name, _)| {
         std::iter::once(shrunk_epoch).chain(traffic_epochs.iter().copied()).try_for_each(|epoch| {
             assert_epoch_only_has_worker_zero(&temp_dir.path().join(name), epoch)

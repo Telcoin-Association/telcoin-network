@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4b494f63a3d91fda19bd742101e978a97d00e4c2
+          ref: 5468f7760de434023c82333a9944a946ce9c516e
           submodules: recursive
       - name: Install pinned toolchains
         run: |
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4b494f63a3d91fda19bd742101e978a97d00e4c2
+          ref: 5468f7760de434023c82333a9944a946ce9c516e
           submodules: recursive
       - name: Install pinned Rust
         run: rustup toolchain install 1.94 --profile minimal
