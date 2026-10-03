@@ -74,7 +74,7 @@ jobs:
           method = original.index("pub fn set_num_workers")
           start = original.index("        let mut retired = self.retired_base_fees.lock();", method)
           end = original.index("\n    }\n", start)
-          source.write_text(original[:start] + "        self.retired_base_fees.lock().clear();\n        inner.resize_with(num_workers, Accumulated::default());" + original[end:])
+          source.write_text(original[:start] + "        self.retired_base_fees.lock().clear();\n        inner.resize_with(num_workers, Accumulated::default);" + original[end:])
           tests = [
               "held_container_clone_follows_shrink_and_regrow",
               "repeated_regrows_reuse_containers_and_reset_only_removed_slots",
