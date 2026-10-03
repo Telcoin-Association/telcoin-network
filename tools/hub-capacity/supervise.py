@@ -49,7 +49,9 @@ class Peer:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise ValueError(f"peer process exited with {self.process.returncode}")
+                name = self.declaration["name"]
+                log = self.phase / f"{name}-process-{self.generation:02}.log"
+                raise ValueError(f"peer {name} process exited with {self.process.returncode}; log: {log}")
             if self.ready.exists() and self.ready.stat().st_size:
                 try:
                     public = json.loads(self.ready.read_text())

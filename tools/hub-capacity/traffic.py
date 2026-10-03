@@ -21,13 +21,17 @@ ADDRESS = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SUBMISSION_ATTEMPTS = 3
 SUBMISSION_RETRY_SECONDS = 0.1
+SEED_GROUP_SIZE = 4
+SEED_GROUPS = 4
+SEED_INCLUSION_TIMEOUT = 60
+SEED_INCLUSION_POLL_SECONDS = 0.25
 
 
-def rpc(url, method, parameters):
+def rpc(url, method, parameters, timeout=10):
     """Read a bounded real RPC response, preserving protocol failures."""
     request = urllib.request.Request(url, json.dumps({"jsonrpc": "2.0", "id": 1,
         "method": method, "params": parameters}).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read(2 * 1024**2 + 1)
     if len(raw) > 2 * 1024**2:
         raise ValueError("transaction RPC response exceeds 2 MiB")
@@ -91,9 +95,12 @@ def create(cast, output):
     output.write_text(json.dumps({"chain_id": CHAIN, "sender": ADDRESS, "cast_version": version,
         "count": 512, "calldata_bytes": 32768, "initial_count": 128, "stream_count": 384,
         "stream_duration_seconds": 600, "initial_interval_seconds": 0.5,
+        "initial_fenced_groups": SEED_GROUPS, "initial_group_size": SEED_GROUP_SIZE,
+        "initial_inclusion_timeout_seconds": SEED_INCLUSION_TIMEOUT,
+        "initial_inclusion_poll_seconds": SEED_INCLUSION_POLL_SECONDS,
         "submission_attempts": SUBMISSION_ATTEMPTS,
         "submission_retry_seconds": SUBMISSION_RETRY_SECONDS,
-        "batch_selection": "first completed epoch with four distinct executed nonempty batches",
+        "batch_selection": "first four distinct executed nonempty batches from completed epochs; retain each source epoch",
         "transaction_hashes": transaction_hashes,
         "transactions": transactions}, separators=(",", ":")) + "\n")
 
@@ -113,6 +120,34 @@ def wait_chain(url):
                 raise ValueError("transaction fixture is restricted to chain 4476")
             return
     raise TimeoutError("isolated transaction RPC did not become ready")
+
+
+def wait_canonical_inclusion(url, expected_hash, attempts, timeout=SEED_INCLUSION_TIMEOUT):
+    """Bound warmup fences by a real receipt and its matching canonical block."""
+    deadline = time.monotonic() + timeout
+
+    def read(method, parameters):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("seed transaction did not reach canonical inclusion before its deadline")
+        return rpc(url, method, parameters, timeout=min(10, remaining))
+
+    while time.monotonic() < deadline:
+        attempt = {"unix_us": time.time_ns() // 1000}
+        attempts.append(attempt)
+        receipt = read("eth_getTransactionReceipt", [expected_hash])
+        attempt["receipt"] = receipt
+        if receipt is not None:
+            if receipt["transactionHash"] != expected_hash:
+                raise ValueError("seed receipt does not identify the exact signed transaction")
+            block = read("eth_getBlockByNumber", [receipt["blockNumber"], False])
+            attempt["canonical_block"] = block
+            if block is None or block["number"] != receipt["blockNumber"] or block["hash"] != receipt["blockHash"] or expected_hash not in block["transactions"]:
+                raise ValueError("seed receipt does not match an observed canonical block")
+            return {"transaction_hash": expected_hash, "block_number": receipt["blockNumber"],
+                    "block_hash": receipt["blockHash"]}
+        time.sleep(min(SEED_INCLUSION_POLL_SECONDS, max(0, deadline - time.monotonic())))
+    raise TimeoutError("seed transaction did not reach canonical inclusion before its deadline")
 
 
 def feed(fixture, url, output, stream, pid_file):
@@ -137,6 +172,11 @@ def feed(fixture, url, output, stream, pid_file):
             try:
                 row["transaction_hash"] = submit(url, raw, inputs["transaction_hashes"][nonce], row["attempts"])
                 row["success"] = True
+                if not stream and nonce < SEED_GROUP_SIZE * SEED_GROUPS and (nonce + 1) % SEED_GROUP_SIZE == 0:
+                    before = time.monotonic()
+                    row["inclusion_attempts"] = []
+                    row["canonical_inclusion"] = wait_canonical_inclusion(url, row["transaction_hash"], row["inclusion_attempts"])
+                    origin += time.monotonic() - before
             finally:
                 row["unix_us"] = time.time_ns() // 1000
                 log.write(json.dumps(row) + "\n")
@@ -144,7 +184,7 @@ def feed(fixture, url, output, stream, pid_file):
 
 
 def targets(url, output, observations):
-    """Select four real batch digests from the earliest completed epoch containing fixture traffic."""
+    """Select the first four distinct executed batches from completed epochs, retaining provenance."""
     wait_chain(url)
     height = int(rpc(url, "eth_blockNumber", []), 16)
     if height > 2048:
@@ -154,16 +194,17 @@ def targets(url, output, observations):
     if not blocks or any(block is None for block in blocks):
         raise ValueError("warmup has no complete canonical block observations")
     current_epoch = int(blocks[-1]["nonce"], 16) >> 32
-    by_epoch = {}
+    by_digest = {}
     for block in blocks:
         epoch = int(block["nonce"], 16) >> 32
         if epoch < current_epoch and block["transactions"]:
-            by_epoch.setdefault(epoch, set()).add(block["sha3Uncles"])
-    selected = next(((epoch, sorted(digests)[:4]) for epoch, digests in sorted(by_epoch.items())
-                     if len(digests) >= 4), None)
-    if selected is None:
-        raise ValueError("warmup has no completed epoch with four executed nonempty batches")
-    output.write_text(json.dumps({"sync_epoch": selected[0], "batch_digests": selected[1]}, separators=(",", ":")) + "\n")
+            by_digest.setdefault(block["sha3Uncles"], epoch)
+    selected = list(by_digest.items())[:4]
+    if len(selected) != 4:
+        raise ValueError("warmup has no completed epochs with four executed nonempty batches")
+    output.write_text(json.dumps({"sync_epoch": selected[0][1],
+        "batch_digests": [digest for digest, _epoch in selected],
+        "batch_epochs": dict(selected)}, separators=(",", ":")) + "\n")
 
 
 def main():

@@ -164,6 +164,12 @@ public Anvil test account funded in the local genesis. `cast` must be installed.
 Each transaction carries 32 KiB of deterministic calldata. The signed fixture
 is hashed into the workload manifest before freezing: 128 transactions seed
 the warmup, and 384 are submitted at a fixed cadence during measurement.
+The first sixteen seed transactions form four groups of four. Before submitting
+the next group, the producer requires the previous group's last transaction to
+appear in a receipt and its matching canonical block. Each fence has a 60-second
+deadline and polls at 250 ms; RPC timeouts cannot exceed the remaining deadline.
+The 500 ms seed cadence resumes after each fence, and all receipt probes are
+retained. Missing inclusion or a mismatched receipt fails setup.
 Every RPC acknowledgement and canonical batch-selection observation is retained.
 Offline Keccak transaction hashes are frozen with the signed inputs. A transport
 failure triggers a bounded lookup of that exact hash before resubmitting the same
@@ -173,8 +179,10 @@ unacknowledged transaction prevents the qualification run from completing.
 
 Bulk commands run in bursts of eight, divided between the two hubs. Each command
 simultaneously transfers a completed primary epoch pack and four executed batches
-on worker-0 and worker-1. The coordinator selects the first completed epoch with
-four distinct nonempty executed batches, using retained canonical block responses.
+on worker-0 and worker-1. The coordinator selects the first four distinct nonempty
+executed batches from completed epochs, using retained canonical block responses.
+Each digest's source epoch is recorded. The primary transfer uses the completed
+epoch containing the first selected batch.
 Peers decode each returned batch and verify its digest against those observations.
 Successful worker transfers require at least 128 KiB each. Missing workers,
 empty transfers, incomplete frame sequences and mismatched digests fail the command.

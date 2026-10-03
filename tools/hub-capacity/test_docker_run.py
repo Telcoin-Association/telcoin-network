@@ -53,7 +53,7 @@ class DeploymentTests(unittest.TestCase):
         supervisor.poll.return_value = 0
         RUNNER.wait_for_phase_exit([actor, supervisor], supervisor, timeout=0)
         supervisor.poll.return_value = 1
-        with self.assertRaisesRegex(ValueError, "failed to reap"):
+        with self.assertRaisesRegex(ValueError, "peer supervisor exited unsuccessfully"):
             RUNNER.wait_for_phase_exit([actor, supervisor], supervisor, timeout=0)
         supervisor.poll.return_value = 0
         actor.poll.return_value = None

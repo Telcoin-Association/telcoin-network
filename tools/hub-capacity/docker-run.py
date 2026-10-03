@@ -244,7 +244,7 @@ def wait_for_phase_exit(processes, peer_supervisor, timeout=30):
     if any(process.poll() is None for process in processes):
         raise ValueError("owned phase processes did not stop, refusing to reuse the topology")
     if peer_supervisor is not None and peer_supervisor.poll() != 0:
-        raise ValueError("peer supervisor failed to reap its owned children")
+        raise ValueError("peer supervisor exited unsuccessfully; inspect retained startup and cleanup logs")
 
 
 def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
@@ -296,6 +296,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                         for path in phase_dir.glob(pattern)},
                     "peer_readiness": json.loads((phase_dir / "peers-ready.json").read_text()),
                     "transaction_fixture_sha256": digest(docker.output / "transactions.json"),
+                    "initial_transactions_sha256": digest(phase_dir / "initial-transactions.jsonl"),
                     "bulk_targets": json.loads((phase_dir / "bulk-targets.json").read_text()),
                     "canonical_batch_observations_sha256": digest(phase_dir / "canonical-batch-observations.json"),
                     "linux_cpuinfo": docker.execute(coordinator, "cat", "/proc/cpuinfo"),

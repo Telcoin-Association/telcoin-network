@@ -23,6 +23,94 @@ TRAFFIC, WORKLOAD = load("traffic"), load("workload")
 
 
 class TrafficTests(unittest.TestCase):
+    def test_seed_fence_waits_for_the_exact_canonical_transaction(self):
+        expected = "0x" + "a" * 64
+        receipt = {"transactionHash": expected, "blockNumber": "0x2", "blockHash": "0x" + "b" * 64}
+        block = {"number": receipt["blockNumber"], "hash": receipt["blockHash"], "transactions": [expected]}
+        attempts = []
+        with patch.object(TRAFFIC, "rpc", side_effect=[None, receipt, block]) as rpc, \
+                patch.object(TRAFFIC.time, "monotonic", return_value=0), patch.object(TRAFFIC.time, "sleep"):
+            result = TRAFFIC.wait_canonical_inclusion("http://10.147.0.10:8545", expected, attempts)
+        self.assertEqual(result, {"transaction_hash": expected, "block_number": "0x2", "block_hash": receipt["blockHash"]})
+        self.assertEqual(attempts[0]["receipt"], None)
+        self.assertEqual(attempts[1]["receipt"], receipt)
+        self.assertEqual(attempts[1]["canonical_block"], block)
+        self.assertEqual([call.args[1] for call in rpc.call_args_list],
+                         ["eth_getTransactionReceipt", "eth_getTransactionReceipt", "eth_getBlockByNumber"])
+
+    def test_seed_fence_rejects_wrong_identity_block_membership_and_deadline(self):
+        expected = "0x" + "a" * 64
+        receipt = {"transactionHash": expected, "blockNumber": "0x2", "blockHash": "0x" + "b" * 64}
+        block = {"number": receipt["blockNumber"], "hash": receipt["blockHash"], "transactions": [expected]}
+        for replies in ([{**receipt, "transactionHash": "wrong"}],
+                        [receipt, {**block, "hash": "wrong"}],
+                        [receipt, {**block, "number": "0x3"}],
+                        [receipt, {**block, "transactions": []}]):
+            attempts = []
+            with self.subTest(replies=replies), patch.object(TRAFFIC, "rpc", side_effect=replies), \
+                    patch.object(TRAFFIC.time, "monotonic", return_value=0), self.assertRaises(ValueError):
+                TRAFFIC.wait_canonical_inclusion("http://10.147.0.10:8545", expected, attempts)
+            self.assertEqual(len(attempts), 1)
+            self.assertIn("receipt", attempts[0])
+        attempts = []
+        with patch.object(TRAFFIC, "rpc", return_value=None) as rpc, \
+                patch.object(TRAFFIC.time, "monotonic", side_effect=[0, 0, 0, 0.11, 0.11]), \
+                patch.object(TRAFFIC.time, "sleep"), self.assertRaises(TimeoutError):
+            TRAFFIC.wait_canonical_inclusion("http://10.147.0.10:8545", expected, attempts, timeout=0.1)
+        rpc.assert_called_once_with("http://10.147.0.10:8545", "eth_getTransactionReceipt", [expected], timeout=0.1)
+        self.assertEqual(attempts[0]["receipt"], None)
+
+    def test_initial_feed_fences_four_small_groups_before_submitting_more(self):
+        received, fences = [], []
+        hashes = ["0x" + f"{nonce:064x}" for nonce in range(512)]
+
+        def rpc(_url, method, parameters):
+            self.assertEqual(method, "eth_sendRawTransaction")
+            nonce = int(parameters[0].split("-")[1])
+            received.append(nonce)
+            return hashes[nonce]
+
+        def fence(_url, expected_hash, attempts):
+            nonce = hashes.index(expected_hash)
+            self.assertEqual(received[-1], nonce)
+            fences.append(nonce)
+            attempts.append({"receipt": {"transactionHash": expected_hash}})
+            return {"transaction_hash": expected_hash, "block_number": hex(len(fences))}
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(TRAFFIC, "wait_chain"), patch.object(TRAFFIC, "rpc", side_effect=rpc), \
+                patch.object(TRAFFIC, "wait_canonical_inclusion", side_effect=fence, create=True), \
+                patch.object(TRAFFIC.time, "monotonic", return_value=0), patch.object(TRAFFIC.time, "sleep"):
+            fixture, output = Path(temporary) / "fixture.json", Path(temporary) / "warmup.jsonl"
+            fixture.write_text(json.dumps({"chain_id": TRAFFIC.CHAIN, "count": 512,
+                "transaction_hashes": hashes, "transactions": [f"signed-{nonce}" for nonce in range(512)]}))
+            TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, False, None)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(received, list(range(128)))
+        self.assertEqual(fences, [3, 7, 11, 15])
+        self.assertEqual([row["nonce"] for row in rows if "canonical_inclusion" in row], fences)
+        self.assertTrue(all(row["success"] for row in rows))
+
+    def test_selects_four_distinct_batches_across_completed_epochs(self):
+        blocks = [{"nonce": hex(epoch << 32), "sha3Uncles": "0x" + f"{number:064x}",
+                   "transactions": ["fixture"] if number < 5 else []}
+                  for number, epoch in enumerate((0, 1, 1, 2, 3), start=1)]
+
+        def rpc(_url, method, parameters):
+            if method == "eth_blockNumber":
+                return hex(len(blocks))
+            return blocks[int(parameters[0], 16) - 1]
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(TRAFFIC, "wait_chain"), \
+                patch.object(TRAFFIC, "rpc", side_effect=rpc):
+            output = Path(temporary) / "targets.json"
+            TRAFFIC.targets("http://10.147.0.10:8545", output, Path(temporary) / "observations.json")
+            selected = json.loads(output.read_text())
+        self.assertEqual(selected["sync_epoch"], 0)
+        self.assertEqual(selected["batch_digests"], [block["sha3Uncles"] for block in blocks[:4]])
+        self.assertEqual(selected["batch_epochs"],
+                         {block["sha3Uncles"]: int(block["nonce"], 16) >> 32 for block in blocks[:4]})
+
     def test_feed_retries_reset_without_dropping_nonces(self):
         transactions = [f"signed-{nonce}" for nonce in range(512)]
         received = []
