@@ -839,7 +839,7 @@ impl WorkerTxPool {
         futures::stream::iter(ready)
             .for_each(|(lease, sender, nonce, raw)| async move {
                 let account = self.local_canonical_account(sender).await;
-                OptionFuture::from(account.map(|account| async {
+                OptionFuture::from(account.map(|account| async move {
                     self.0.update_accounts(vec![account]);
                     if account.nonce > nonce {
                         self.5
