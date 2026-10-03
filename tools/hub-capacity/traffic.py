@@ -150,6 +150,30 @@ def wait_canonical_inclusion(url, expected_hash, attempts, timeout=SEED_INCLUSIO
     raise TimeoutError("seed transaction did not reach canonical inclusion before its deadline")
 
 
+def inclusion_timeout_observations(url, expected_hash):
+    """Retain bounded optional diagnostics after a failed inclusion fence."""
+    observations = []
+    for method, parameters in (("eth_getTransactionByHash", [expected_hash]),
+                               ("eth_getTransactionCount", [ADDRESS, "latest"]),
+                               ("eth_getTransactionCount", [ADDRESS, "pending"]),
+                               ("txpool_status", [])):
+        row = {"unix_us": time.time_ns() // 1000, "method": method, "parameters": parameters, "success": False}
+        try:
+            result = rpc(url, method, parameters, timeout=2)
+            if isinstance(result, dict):
+                fields = ("hash", "from", "nonce", "gas", "gasPrice", "maxFeePerGas", "maxPriorityFeePerGas",
+                          "blockHash", "blockNumber") if method == "eth_getTransactionByHash" else ("pending", "queued")
+                result = {key: value for key, value in result.items() if key in fields
+                          and (value is None or isinstance(value, (str, int))) and len(str(value)) <= 256}
+            elif result is not None and (not isinstance(result, (str, int)) or len(str(result)) > 256):
+                raise ValueError("diagnostic response exceeds scalar bounds")
+            row.update(success=True, result=result)
+        except Exception as error:
+            row["error"] = f"{type(error).__name__}: {error}"[:512]
+        observations.append(row)
+    return observations
+
+
 def feed(fixture, url, output, stream, pid_file):
     """Submit real transactions at the declared cadence and retain each acknowledgement."""
     wait_chain(url)
@@ -175,7 +199,11 @@ def feed(fixture, url, output, stream, pid_file):
                 if not stream and nonce < SEED_GROUP_SIZE * SEED_GROUPS and (nonce + 1) % SEED_GROUP_SIZE == 0:
                     before = time.monotonic()
                     row["inclusion_attempts"] = []
-                    row["canonical_inclusion"] = wait_canonical_inclusion(url, row["transaction_hash"], row["inclusion_attempts"])
+                    try:
+                        row["canonical_inclusion"] = wait_canonical_inclusion(url, row["transaction_hash"], row["inclusion_attempts"])
+                    except TimeoutError:
+                        row["inclusion_timeout_observations"] = inclusion_timeout_observations(url, row["transaction_hash"])
+                        raise
                     origin += time.monotonic() - before
             finally:
                 row["unix_us"] = time.time_ns() // 1000

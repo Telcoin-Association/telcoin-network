@@ -170,6 +170,8 @@ appear in a receipt and its matching canonical block. Each fence has a 60-second
 deadline and polls at 250 ms; RPC timeouts cannot exceed the remaining deadline.
 The 500 ms seed cadence resumes after each fence, and all receipt probes are
 retained. Missing inclusion or a mismatched receipt fails setup.
+An inclusion timeout retains four optional transaction, account and pool probes,
+each limited to two seconds, before propagating the original setup failure.
 Every RPC acknowledgement and canonical batch-selection observation is retained.
 Offline Keccak transaction hashes are frozen with the signed inputs. A transport
 failure triggers a bounded lookup of that exact hash before resubmitting the same

@@ -91,6 +91,50 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual([row["nonce"] for row in rows if "canonical_inclusion" in row], fences)
         self.assertTrue(all(row["success"] for row in rows))
 
+    def test_inclusion_timeout_retains_bounded_diagnostics_and_stops_submission(self):
+        received = []
+        hashes = ["0x" + f"{nonce:064x}" for nonce in range(512)]
+        failure = TimeoutError("canonical inclusion deadline")
+
+        def rpc(_url, method, parameters, timeout=10):
+            if method == "eth_sendRawTransaction":
+                nonce = int(parameters[0].split("-")[1])
+                received.append(nonce)
+                return hashes[nonce]
+            self.assertEqual(timeout, 2)
+            if method == "eth_getTransactionByHash":
+                self.assertEqual(parameters, [hashes[3]])
+                return {"hash": hashes[3], "nonce": "0x3", "blockHash": None,
+                        "input": "0x" + "ab" * 32768}
+            if method == "eth_getTransactionCount":
+                self.assertEqual(parameters[0], TRAFFIC.ADDRESS)
+                return "0x3" if parameters[1] == "latest" else "0x4"
+            self.assertEqual(method, "txpool_status")
+            raise ValueError("optional pool method unavailable")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(TRAFFIC, "wait_chain"), \
+                patch.object(TRAFFIC, "rpc", side_effect=rpc) as requests, \
+                patch.object(TRAFFIC, "wait_canonical_inclusion", side_effect=failure), \
+                patch.object(TRAFFIC.time, "monotonic", return_value=0), patch.object(TRAFFIC.time, "sleep"):
+            fixture, output = Path(temporary) / "fixture.json", Path(temporary) / "warmup.jsonl"
+            fixture.write_text(json.dumps({"chain_id": TRAFFIC.CHAIN, "count": 512,
+                "transaction_hashes": hashes, "transactions": [f"signed-{nonce}" for nonce in range(512)]}))
+            with self.assertRaises(TimeoutError) as raised:
+                TRAFFIC.feed(fixture, "http://10.147.0.10:8545", output, False, None)
+            self.assertIs(raised.exception, failure)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(received, [0, 1, 2, 3])
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(rows[-1]["success"])
+        observations = rows[-1]["inclusion_timeout_observations"]
+        self.assertEqual([row["method"] for row in observations],
+                         ["eth_getTransactionByHash", "eth_getTransactionCount", "eth_getTransactionCount", "txpool_status"])
+        self.assertEqual(observations[0]["result"], {"hash": hashes[3], "nonce": "0x3", "blockHash": None})
+        self.assertEqual([row["result"] for row in observations[1:3]], ["0x3", "0x4"])
+        self.assertFalse(observations[3]["success"])
+        self.assertIn("optional pool method unavailable", observations[3]["error"])
+        self.assertEqual(len(requests.call_args_list), 8)
+
     def test_selects_four_distinct_batches_across_completed_epochs(self):
         blocks = [{"nonce": hex(epoch << 32), "sha3Uncles": "0x" + f"{number:064x}",
                    "transactions": ["fixture"] if number < 5 else []}

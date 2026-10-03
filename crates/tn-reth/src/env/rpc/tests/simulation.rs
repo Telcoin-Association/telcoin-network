@@ -114,12 +114,9 @@ async fn test_rpc_simulation_preserves_historical_fee() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
-    let mut genesis = test_genesis();
-    genesis.base_fee_per_gas = Some(1_000);
-    let chain: RethChainSpec = genesis.into();
-    let blocks =
-        [BlockId::Number(BlockNumberOrTag::Number(0)), BlockId::from(chain.genesis_hash())];
+    let (methods, genesis_hash) =
+        epoch_fee_methods_with_genesis_hash(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
+    let blocks = [BlockId::Number(BlockNumberOrTag::Number(0)), BlockId::from(genesis_hash)];
     let request = priced_transfer(7);
     try_join_all(
         blocks.map(|block| assert_simulation_cap_rejected(&methods, &request, Some(block))),
