@@ -593,8 +593,8 @@ mod tests {
         assert_eq!(pool.pool_size().pending, 0);
     }
 
-    /// Return the production-registered simulation and fill methods with independently chosen epoch
-    /// and header fees. Callers seed reth's defaults before constructing `rpc_args`.
+    /// Return the production-registered simulation, fill, and block methods with independently
+    /// chosen epoch and header fees. Callers seed reth's defaults before constructing `rpc_args`.
     fn epoch_fee_methods(
         epoch_fee: u64,
         header_fee: u64,
@@ -628,6 +628,7 @@ mod tests {
                             | "eth_estimateGas"
                             | "eth_createAccessList"
                             | "eth_fillTransaction"
+                            | "eth_getBlockByNumber"
                     )
                 })
             })
