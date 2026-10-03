@@ -3,60 +3,115 @@
 //! table name to that table's `TnTable` handle (a cheap `Clone` channel sender).
 //!
 //! This module is the typed layer, modeled on [`crate::mem_db`]: keys are encoded with `encode_key`
-//! (binary-sortable) and values with `encode` (bcs); each op sends the encoded bytes to the table's
-//! actor and decodes the reply.  The index's fixed key length is `encode_key(key).len()` —
-//! `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is `Arc<[u8; 32]>`, 8 bytes in
-//! memory but 32 encoded).
+//! (binary-sortable) and values with `encode` (bcs); each op hands the encoded bytes to the table
+//! and decodes the reply.  Encodes reuse buffers rather than allocating per op: writes use their
+//! table's `EncodeBufs`, point reads a per-thread key buffer.  The index's fixed key length is
+//! `encode_key(key).len()` — `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is
+//! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
 //!
 //! Scans stream lazily off the table actor.  Not yet covered: pack compaction on clear, warm-start
 //! reads before the first insert, and durability-barrier tuning.
 
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use dashmap::DashMap;
-use tn_types::{decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
+use parking_lot::Mutex;
+use serde::Serialize;
+use tn_types::{
+    decode, decode_key, encode_into_buffer, encode_key, encode_key_into, DBIter, Database, DbTx,
+    DbTxMut, Table,
+};
 
 use super::table::{ScanKind, TnTable};
 
-type StoreType = DashMap<&'static str, TnTable>;
+/// Reusable encode buffers for a table's writes, so an insert or remove encodes without allocating.
+/// The value buffer keeps the capacity of the largest value the table has written.
+#[derive(Debug, Default)]
+struct EncodeBufs {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// A table's handle plus its write buffers. The buffers sit behind their own lock, cloned out with
+/// the handle, so encoding never holds a `DashMap` shard lock. A write holds its table's buffer
+/// lock and then takes the table's write lock; the buffer lock is only ever contended by another
+/// write to the same table, which would wait on that table's write lock anyway.
+#[derive(Debug)]
+struct TableStore {
+    table: TnTable,
+    bufs: Arc<Mutex<EncodeBufs>>,
+}
+
+type StoreType = DashMap<&'static str, TableStore>;
+
+thread_local! {
+    /// Key buffer for point reads. Per thread, so concurrent readers of a table never contend on a
+    /// shared buffer.
+    static READ_KEY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Encode `key` into this thread's read-key buffer and run `f` on the bytes. `f` must not re-enter
+/// tndb on this thread (the buffer is borrowed for its duration).
+fn with_read_key<K: Serialize, R>(
+    key: &K,
+    f: impl FnOnce(&[u8]) -> eyre::Result<R>,
+) -> eyre::Result<R> {
+    READ_KEY.with_borrow_mut(|buf| {
+        buf.clear();
+        encode_key_into(buf, key)?;
+        f(buf)
+    })
+}
 
 // ---- shared table operations (used by both the `Database` and the txn impls) ----
 //
-// Each op clones the table's actor handle out of the `DashMap` and drops the shard `Ref` before the
-// (blocking) round-trip, so no lock is held across a table operation.
+// Each op clones the table's handle (and, for writes, its buffers) out of the `DashMap` and drops
+// the shard `Ref` before the (blocking) table operation, so no shard lock is held across one.
 //
 // NOTE: a table actor serves one scan at a time, so a caller must drain or drop an iterator
 // (`iter`/`reverse_iter`/`skip_to`) before issuing another blocking op on the *same* table from the
 // same thread — an unconsumed scan keeps the actor busy.
 
-/// Clone the table's actor handle out of the store, dropping the `DashMap` shard lock.
+/// Clone the table's handle out of the store, dropping the `DashMap` shard lock.
 fn handle(store: &StoreType, name: &'static str) -> Option<TnTable> {
-    store.get(name).map(|h| h.clone())
+    store.get(name).map(|h| h.table.clone())
+}
+
+/// Clone the table's handle and its write buffers out of the store, dropping the shard lock.
+fn writer(store: &StoreType, name: &'static str) -> Option<(TnTable, Arc<Mutex<EncodeBufs>>)> {
+    store.get(name).map(|h| (h.table.clone(), Arc::clone(&h.bufs)))
 }
 
 /// Look up a key: read its value bytes from the table, then decode.
 fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     let Some(table) = handle(store, T::NAME) else { return Ok(None) };
     // Decode `T::Value` straight from the log's mmap under the read lock (no intermediate `Vec`).
-    table.get_with(&encode_key(key), |bytes| decode::<T::Value>(bytes))
+    with_read_key(key, |key| table.get_with(key, |bytes| decode::<T::Value>(bytes)))
 }
 
 /// Insert `key → value` (no durability flush; callers flush explicitly).
 fn insert<T: Table>(store: &StoreType, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-    match handle(store, T::NAME) {
-        Some(table) => table.insert(encode_key(key), encode(value)),
-        None => Ok(()),
-    }
+    let Some((table, bufs)) = writer(store, T::NAME) else { return Ok(()) };
+    let mut bufs = bufs.lock();
+    let EncodeBufs { key: key_buf, value: value_buf } = &mut *bufs;
+    key_buf.clear();
+    encode_key_into(key_buf, key)?;
+    value_buf.clear();
+    encode_into_buffer(value_buf, value)?;
+    table.insert(key_buf, value_buf)
 }
 
 /// Remove a key (its log bytes are left as unreferenced garbage; pack compaction is a later step).
 fn remove<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<()> {
-    if let Some(table) = handle(store, T::NAME) {
-        table.remove(encode_key(key))?;
-    }
+    let Some((table, bufs)) = writer(store, T::NAME) else { return Ok(()) };
+    let mut bufs = bufs.lock();
+    bufs.key.clear();
+    encode_key_into(&mut bufs.key, key)?;
+    table.remove(&bufs.key)?;
     Ok(())
 }
 
@@ -79,7 +134,7 @@ fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
 /// True if the table contains `key`.
 fn contains_key<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<bool> {
     match handle(store, T::NAME) {
-        Some(table) => table.contains(encode_key(key)),
+        Some(table) => with_read_key(key, |key| table.contains(key)),
         None => Ok(false),
     }
 }
@@ -163,7 +218,8 @@ impl DbTxMut for TnDbTxMut {
     fn commit(self) -> eyre::Result<()> {
         // Durably flush every table's log.  Clone the handles out first so no shard lock is held
         // across a (blocking) flush.
-        let tables: Vec<TnTable> = self.store.iter().map(|entry| entry.value().clone()).collect();
+        let tables: Vec<TnTable> =
+            self.store.iter().map(|entry| entry.value().table.clone()).collect();
         for table in tables {
             table.flush()?;
         }
@@ -183,7 +239,8 @@ impl Database for TnDatabase {
         Self: 'txn;
 
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        self.store.insert(T::NAME, TnTable::open(self.base.join(T::NAME))?);
+        let table = TnTable::open(self.base.join(T::NAME))?;
+        self.store.insert(T::NAME, TableStore { table, bufs: Default::default() });
         Ok(())
     }
 
@@ -338,6 +395,30 @@ mod test {
     fn test_tndb_multi_remove() {
         let (db, _tmp) = open_db();
         test_multi_remove(db);
+    }
+
+    /// Writes reuse their table's encode buffers: a short value written after a long one (directly
+    /// and through a write txn) must read back exactly, with no stale tail from the longer encode.
+    #[test]
+    fn test_tndb_reused_buffers_keep_no_stale_bytes() {
+        use tn_types::DbTxMut as _;
+
+        let (db, _tmp) = open_db();
+        let long = "x".repeat(4096);
+        db.insert::<TestTable>(&1, &long).expect("insert long");
+        db.insert::<TestTable>(&2, &"short".to_string()).expect("insert short");
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&3, &long).expect("txn insert long");
+        txn.insert::<TestTable>(&1, &"s".to_string()).expect("txn overwrite short");
+        txn.commit().expect("commit");
+
+        assert_eq!(db.get::<TestTable>(&1).expect("get 1"), Some("s".to_string()));
+        assert_eq!(db.get::<TestTable>(&2).expect("get 2"), Some("short".to_string()));
+        assert_eq!(db.get::<TestTable>(&3).expect("get 3"), Some(long));
+
+        db.remove::<TestTable>(&2).expect("remove");
+        assert!(!db.contains_key::<TestTable>(&2).expect("contains 2"));
+        assert!(db.contains_key::<TestTable>(&1).expect("contains 1"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! non keys.  BCS encoding however does not meet the sorting requirements for DB keys so we have
 //! both encodings.  This can be experimented with by changing these functions.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 pub use bcs::Error as BcsError;
 use bincode::Options;
@@ -141,6 +141,19 @@ pub fn encode_key<T: Serialize>(obj: &T) -> Vec<u8> {
         .expect("Can not serialize!")
 }
 
+/// Encode a DB key into a provided buffer (appending), with the same binary-sortable encoding as
+/// [`encode_key`] — use it to reuse one buffer across keys instead of allocating a `Vec` per key.
+pub fn encode_key_into<W, T>(write: &mut W, key: &T) -> bincode::Result<()>
+where
+    W: ?Sized + Write,
+    T: ?Sized + Serialize,
+{
+    bincode::DefaultOptions::new()
+        .with_big_endian()
+        .with_fixint_encoding()
+        .serialize_into(&mut *write, key)
+}
+
 /// Decode bytes to a type.
 ///
 /// This version will panic on failure, use with data that should be valid.
@@ -187,4 +200,26 @@ where
     T: ?Sized + Serialize,
 {
     bcs::serialize_into(write, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert `encode_key_into` writes exactly `encode_key`'s bytes, appended after existing ones.
+    fn assert_key_into_matches<T: Serialize>(key: &T) {
+        let mut buf = vec![0xAA, 0xBB];
+        encode_key_into(&mut buf, key).expect("encode key");
+        assert_eq!(&buf[..2], &[0xAA, 0xBB], "existing bytes are kept");
+        assert_eq!(&buf[2..], &encode_key(key)[..]);
+    }
+
+    #[test]
+    fn key_into_buffer_matches_encode_key() {
+        assert_key_into_matches(&42_u64);
+        assert_key_into_matches(&(7_u32, u64::MAX));
+        assert_key_into_matches(&[0x5A_u8; 32]);
+        assert_key_into_matches(&crate::B256::repeat_byte(0x11));
+        assert_key_into_matches(&"a key".to_string());
+    }
 }

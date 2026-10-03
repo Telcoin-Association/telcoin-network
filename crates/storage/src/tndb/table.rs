@@ -1,7 +1,8 @@
 //! A single tndb table — a [`Pack`] value log plus its sorted [`BtreeIndex`] — as a cheap `Clone`
 //! [`TnTable`] handle.  It is a **hybrid**: point ops lock a shared [`Inner`] directly (no
 //! cross-thread hop), while ordered scans run on a dedicated thread.  This file is byte-oriented
-//! (`Vec<u8>` keys and values); the typed `encode`/`decode` stays in `database.rs`.
+//! (byte-slice keys and values in, owned bytes out of scans); the typed `encode`/`decode` stays in
+//! `database.rs`.
 //!
 //! Point reads/writes take the `RwLock<Inner>` — a shared read lock for reads (`&self`:
 //! `get`/`contains`/…), an exclusive write lock for writes (`&mut self`: `insert`/`remove`/…) — so
@@ -74,10 +75,10 @@ impl Inner {
         Ok(self.idx.as_mut().expect("index just created"))
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) -> eyre::Result<()> {
-        let pos = self.data.append_raw(&value)?;
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
+        let pos = self.data.append_raw(value)?;
         let ksize = key.len() as u16;
-        self.index_mut(ksize)?.save(&key, pos)?;
+        self.index_mut(ksize)?.save(key, pos)?;
         Ok(())
     }
 
@@ -192,7 +193,7 @@ impl TnTable {
     }
 
     /// Insert (or overwrite) `key → value`.
-    pub(crate) fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> eyre::Result<()> {
+    pub(crate) fn insert(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
         self.inner.write().insert(key, value)
     }
 
@@ -208,13 +209,13 @@ impl TnTable {
     }
 
     /// True if `key` is present.
-    pub(crate) fn contains(&self, key: Vec<u8>) -> eyre::Result<bool> {
-        self.inner.read().contains(&key)
+    pub(crate) fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
+        self.inner.read().contains(key)
     }
 
     /// Remove `key`; returns whether it was present.
-    pub(crate) fn remove(&self, key: Vec<u8>) -> eyre::Result<bool> {
-        self.inner.write().remove(&key)
+    pub(crate) fn remove(&self, key: &[u8]) -> eyre::Result<bool> {
+        self.inner.write().remove(key)
     }
 
     /// Reset the table to empty (index rebuilt empty; log bytes orphaned until compaction).
@@ -313,7 +314,7 @@ mod test {
         assert!(table.is_empty().expect("is_empty"));
         for i in 0..100u64 {
             let (k, v) = kv(i);
-            table.insert(k, v).expect("insert");
+            table.insert(&k, &v).expect("insert");
         }
         assert!(!table.is_empty().expect("is_empty"));
         assert_eq!(table.len().expect("len"), 100);
@@ -322,10 +323,10 @@ mod test {
         for i in 0..100u64 {
             let (k, v) = kv(i);
             assert_eq!(table.get_with(&k, |b| b.to_vec()).expect("get"), Some(v));
-            assert!(table.contains(k).expect("contains"));
+            assert!(table.contains(&k).expect("contains"));
         }
         assert_eq!(table.get_with(&kv(999).0, |b| b.to_vec()).expect("get miss"), None);
-        assert!(!table.contains(kv(999).0).expect("contains miss"));
+        assert!(!table.contains(&kv(999).0).expect("contains miss"));
 
         // Ordered scans.
         assert_eq!(keys_of(table.scan(ScanKind::Forward)), (0..100).collect::<Vec<_>>());
@@ -340,8 +341,8 @@ mod test {
         assert_eq!(head.len(), 3);
 
         // Remove + clear.
-        assert!(table.remove(kv(0).0).expect("remove"));
-        assert!(!table.remove(kv(0).0).expect("remove again"));
+        assert!(table.remove(&kv(0).0).expect("remove"));
+        assert!(!table.remove(&kv(0).0).expect("remove again"));
         assert_eq!(table.len().expect("len after remove"), 99);
     }
 
@@ -353,9 +354,9 @@ mod test {
             let table = TnTable::open(dir.clone()).expect("open");
             for i in 0..50u64 {
                 let (k, v) = kv(i);
-                table.insert(k, v).expect("insert");
+                table.insert(&k, &v).expect("insert");
             }
-            assert!(table.remove(kv(7).0).expect("remove"));
+            assert!(table.remove(&kv(7).0).expect("remove"));
             table.flush().expect("flush");
         } // drop -> actor thread joins, clean close (index synced, log sealed)
 
@@ -363,7 +364,7 @@ mod test {
         // visible.
         let table = TnTable::open(dir).expect("reopen");
         let (k100, v100) = kv(100);
-        table.insert(k100.clone(), v100.clone()).expect("insert after reopen");
+        table.insert(&k100, &v100).expect("insert after reopen");
         assert_eq!(table.get_with(&k100, |b| b.to_vec()).expect("get new"), Some(v100));
         assert_eq!(
             table.get_with(&kv(20).0, |b| b.to_vec()).expect("get old"),
