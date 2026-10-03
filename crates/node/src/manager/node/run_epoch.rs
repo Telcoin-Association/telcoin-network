@@ -30,9 +30,7 @@ use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::{ConsensusBus, NodeMode};
 use tn_reth::{error::StateReadError, RethEnv};
-use tn_storage::{
-    certificate_pack::CertificatePack, epoch_records::EpochRecordDb, tables::OurNodeBatchesCache,
-};
+use tn_storage::{certificate_pack::CertificatePack, epoch_records::EpochRecordDb};
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
@@ -615,7 +613,8 @@ where
     ///
     /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
-    /// retained in [`OurNodeBatchesCache`] until canonical nonce resolution or validated replay.
+    /// retained in [`tn_storage::tables::OurNodeBatchesCache`] until canonical nonce resolution or
+    /// validated replay.
     /// `last_forwarded_consensus_number` is updated
     /// only after the send succeeds, so the restart-replay and leftover-drain paths can rely on
     /// it marking what actually reached the engine rather than what was merely dequeued.
