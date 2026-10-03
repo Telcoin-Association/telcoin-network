@@ -1570,6 +1570,7 @@ mod tests {
     /// Drive the real build/reservation/acknowledgement seam, then apply its optimistic prune.
     async fn acknowledge_local_build(
         builder: &BatchBuilder,
+        reth_env: &RethEnv,
         worker: &mut tokio::sync::mpsc::Receiver<(
             tn_types::SealedBatch,
             oneshot::Sender<Result<(), BlockSealError>>,
@@ -1590,7 +1591,7 @@ mod tests {
         builder
             .pool
             .update_canonical_state(
-                &builder.latest_canon_header()?,
+                &BatchBuilder::latest_canon_header(reth_env)?,
                 Some(u128::MAX),
                 mined.mined_transactions,
                 mined.changed_accounts,
@@ -1649,10 +1650,10 @@ mod tests {
                 Bytes::new(),
             );
             tx_factory.submit_tx_to_pool(first.clone(), txpool.clone()).await;
-            let batch_a = acknowledge_local_build(&builder, &mut worker).await?;
+            let batch_a = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
             assert!(txpool.get(first.hash()).is_none());
             tx_factory.submit_tx_to_pool(later.clone(), txpool.clone()).await;
-            let batch_b = acknowledge_local_build(&builder, &mut worker).await?;
+            let batch_b = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
             assert!(txpool.get(later.hash()).is_none());
 
             // An unrelated canonical block cannot make either pending accepted batch replayable.
@@ -1713,7 +1714,7 @@ mod tests {
                 || async { Ok(txpool.pool_size().pending == 1) },
             )
             .await?;
-            let recovered = acknowledge_local_build(&builder, &mut worker).await?;
+            let recovered = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
             assert_eq!(
                 recover_raw_transaction(&recovered.batch().transactions()[0])?.hash(),
                 later.hash()
@@ -1740,7 +1741,7 @@ mod tests {
                 || async { Ok(txpool.pool_size().pending == 1) },
             )
             .await?;
-            let successor_batch = acknowledge_local_build(&builder, &mut worker).await?;
+            let successor_batch = acknowledge_local_build(&builder, &reth_env, &mut worker).await?;
             let output_successor = consensus_output_for_tests(5, 0, 5, false);
             let executed = execute_payload_and_update_canonical_chain(
                 &reth_env,
