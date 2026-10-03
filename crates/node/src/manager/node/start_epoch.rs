@@ -576,6 +576,12 @@ where
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<Vec<WorkerNode<DB>>> {
+        engine
+            .start_worker_readiness_epoch(
+                consensus_config.committee().number_of_workers(),
+                consensus_config.shutdown().subscribe(),
+            )
+            .await;
         self.worker_network_handles
             .iter_mut()
             .take(consensus_config.committee().number_of_workers())
@@ -1525,6 +1531,13 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, true),
+            ]
+        );
         assert_eq!(engine.worker_state(1).await, WorkerState::Running);
         assert_eq!(engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?, rpc_zero);
         let syncing: serde_json::Value =
@@ -1605,6 +1618,13 @@ mod tests {
             )
             .await?;
         assert_eq!(shrunk.len(), 1);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, false),
+            ]
+        );
         assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
         assert!(!engine.is_worker_initialized(1).await);
         assert!(engine.worker_http_client(&1).await.is_err());
@@ -1640,6 +1660,13 @@ mod tests {
             )
             .await?;
         assert_eq!(regrown.len(), 2);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, true),
+            ]
+        );
         assert!(engine.is_worker_initialized(1).await);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
@@ -1658,6 +1685,15 @@ mod tests {
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
+        consensus_config.shutdown().notify();
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, false),
+                crate::health::WorkerReadiness::new(1, false),
+            ]
+        );
+        assert!(engine.worker_http_local_address(&1).await?.is_some());
         Ok(())
     }
 
