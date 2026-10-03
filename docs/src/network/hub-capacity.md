@@ -70,6 +70,11 @@ pins all six values explicitly. Each primary and worker exports its allocation
 and occupancy, including idle swarms. A reserved task counts before its first
 poll and releases its measurement on completion, failure, or cancellation.
 
+Concurrent committee vote requests can arrive after the receiver has processed a later round or
+collected the requested round. These requests are rejected without lowering the author's peer
+reputation, and the receiver preserves its cached response and durable vote. A different header
+digest at the same author, epoch and round remains equivocation and receives a fatal penalty.
+
 ## Predeclared qualification
 
 The GitHub Actions envelope declares two hubs, each with one assigned CPU and

@@ -59,7 +59,15 @@ CASES = [
     ("duplicate_rotation_disconnect", "crates/network-libp2p/src/peers/manager.rs",
      "PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.temporarily_ban(peer_id),",
      "PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.apply_peer_action(peer_id, action),",
-     "public_peer_limit_prunes_after_committee_rotation"),
+      "public_peer_limit_prunes_after_committee_rotation"),
+    ("delayed_vote_penalty", "crates/consensus/primary/src/error/network.rs",
+     "HeaderError::AlreadyVotedForLaterRound { .. } | HeaderError::TooOld { .. } => None,",
+     "HeaderError::AlreadyVotedForLaterRound { .. } | HeaderError::TooOld { .. } => Some(Penalty::Fatal),",
+     "delayed_vote_errors_do_not_penalize_committee"),
+    ("cached_vote_equivocation", "crates/consensus/primary/src/network/handler.rs",
+     "// A second digest in the same slot is equivocation.\n                            HeaderError::AlreadyVoted(header.digest(), header.round())",
+     "// A second digest in the same slot is equivocation.\n                            HeaderError::AlreadyVotedForLaterRound { theirs: header.round(), ours: last_round }",
+     "test_vote_different_digest_same_round_rejected"),
 ]
 
 
