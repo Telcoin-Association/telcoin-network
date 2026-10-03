@@ -291,6 +291,8 @@ pub(crate) struct EpochManager<P, DB> {
     /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
     /// the long-running networks.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Hubs maintained by the swarm, excluded from per-epoch dial tasks.
+    trusted_peer_keys: HashSet<BlsPublicKey>,
 
     /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
@@ -795,6 +797,7 @@ where
             last_forwarded_consensus_number: 0,
             consensus_chain,
             bootstrap_servers,
+            trusted_peer_keys: HashSet::new(),
             version_str,
             exec_state_exporter,
             state_export_retention,
@@ -985,6 +988,15 @@ where
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.bootstrap_servers = network_config
             .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
+        let p2p_info = &self.builder.tn_config.node_info.p2p_info;
+        network_config.validate_trusted_nodes(
+            &self.bootstrap_servers,
+            p2p_info.workers.len(),
+            &self.key_config.primary_public_key(),
+            &p2p_info.primary,
+            &p2p_info.workers,
+        )?;
+        self.trusted_peer_keys = network_config.trusted_nodes().keys().copied().collect();
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         self.spawn_node_networks(
             node_task_spawner.clone(),
@@ -1012,6 +1024,16 @@ where
             )
             .await?;
         let node_info = &self.builder.tn_config.node_info;
+        primary_network_handle
+            .inner_handle()
+            .add_trusted_peers(
+                network_config
+                    .trusted_nodes()
+                    .iter()
+                    .map(|(bls, node)| (*bls, node.primary().clone()))
+                    .collect(),
+            )
+            .await?;
         let primary_address = Self::parse_listener_address_for_swarm(
             "PRIMARY_LISTENER_MULTIADDR",
             node_info.p2p_info.primary.network_key.clone(),
@@ -1019,16 +1041,22 @@ where
         )?;
         info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
         primary_network_handle.inner_handle().start_listening(primary_address).await?;
-        self.bootstrap_servers.keys().copied().for_each(|key| {
-            self.dial_peer_bls(
-                primary_network_handle.inner_handle().clone(),
-                key,
-                node_task_spawner.clone(),
-            );
-        });
+        self.bootstrap_servers
+            .keys()
+            .copied()
+            .filter(|key| !network_config.trusted_nodes().contains_key(key))
+            .for_each(|key| {
+                self.dial_peer_bls(
+                    primary_network_handle.inner_handle().clone(),
+                    key,
+                    node_task_spawner.clone(),
+                );
+            });
 
         let manager = &*self;
         let startup_spawner = &node_task_spawner;
+        let trusted_config = &network_config;
+        let trusted_nodes = network_config.trusted_nodes();
         futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
             .try_for_each(|network_handle| async move {
                 let worker_id = network_handle.worker_id();
@@ -1041,6 +1069,10 @@ where
                     })
                     .collect();
                 network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
+                network_handle
+                    .inner_handle()
+                    .add_trusted_peers(trusted_config.trusted_worker_peers(worker_id))
+                    .await?;
                 let configured_address =
                     node_info.worker_network_address(worker_id).cloned().ok_or_else(|| {
                         eyre!("no network address for worker {worker_id} in node info")
@@ -1056,13 +1088,16 @@ where
                     configured_address
                 };
                 network_handle.inner_handle().start_listening(worker_address).await?;
-                bootstrap_peers.into_keys().for_each(|key| {
-                    manager.dial_peer_bls(
-                        network_handle.inner_handle().clone(),
-                        key,
-                        startup_spawner.clone(),
-                    );
-                });
+                bootstrap_peers
+                    .into_keys()
+                    .filter(|key| !trusted_nodes.contains_key(key))
+                    .for_each(|key| {
+                        manager.dial_peer_bls(
+                            network_handle.inner_handle().clone(),
+                            key,
+                            startup_spawner.clone(),
+                        );
+                    });
                 Ok(())
             })
             .await?;

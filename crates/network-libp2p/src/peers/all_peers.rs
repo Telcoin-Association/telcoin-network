@@ -8,7 +8,7 @@ use super::{
     peer::Peer,
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, PeerIdentity, TrustBasis},
+    types::{ConnectionDirection, PeerIdentity, PenaltyOutcome, TrustBasis},
     PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -209,6 +209,20 @@ impl AllPeers {
         self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
     }
 
+    /// Retain an operator hub while preserving existing reputation and connection accounting.
+    pub(super) fn retain_operator_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        self.upsert_peer(bls_public_key, network_key, addrs);
+        self.peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .into_iter()
+            .for_each(|peer| peer.retain_for_operator());
+    }
+
     /// Create a peer.
     pub(super) fn upsert_peer(
         &mut self,
@@ -348,7 +362,7 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
-            let exemption = self.trust_basis(peer_id);
+            let exemption = self.trust_basis_for(&id);
             if let Some(peer) = self.peers.get_mut(&id) {
                 peer.ensure_banned(peer_id, exemption);
             } else {
@@ -875,9 +889,10 @@ impl AllPeers {
         }
     }
 
-    /// The [TrustBasis] exempting the peer identified by `peer_id`, if it is known and exempt.
+    /// Inspect the load exemption for a peer by transport identity in policy tests.
     ///
-    /// `None` means the peer is subject to the normal score model.
+    /// `None` means the peer is subject to ordinary load scoring.
+    #[cfg(test)]
     fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
         let id = self.identity_for(peer_id);
         self.trust_basis_for(&id)
@@ -895,6 +910,13 @@ impl AllPeers {
                 &self.next_committee,
             )
         })
+    }
+
+    /// The [PenaltyOutcome] of `penalty` for the peer identified by `peer_id`.
+    ///
+    /// The manager records penalty metrics with this outcome, after the exemption decision.
+    pub(super) fn penalty_outcome(&self, peer_id: &PeerId, penalty: Penalty) -> PenaltyOutcome {
+        penalty.outcome_for(self.trust_basis_for(&self.identity_for(peer_id)))
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.
@@ -1002,6 +1024,8 @@ impl AllPeers {
     /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
     /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
     /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
+    /// Operator entries are bounded by configuration and retained with their reputation, so
+    /// reconnect scheduling cannot recreate a pruned hub and erase its protocol ban.
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
@@ -1015,7 +1039,9 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) = filter(peer.connection_status()) {
+            if let Some(instant) =
+                filter(peer.connection_status()).filter(|_| !peer.is_operator_allowlisted())
+            {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 

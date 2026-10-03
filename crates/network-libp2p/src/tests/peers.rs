@@ -1089,7 +1089,7 @@ fn test_is_validator() {
 /// membership, not a stored flag, so rotating out of the committee revokes the exemption
 /// (and, because operator trust is separate, never touches an operator allowlist).
 #[test]
-fn test_committee_rotation_revokes_validator_exemption() {
+fn test_committee_rotation_revokes_validator_exemption() -> eyre::Result<()> {
     ensure_score_config(None);
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
 
@@ -1101,18 +1101,25 @@ fn test_committee_rotation_revokes_validator_exemption() {
     all_peers.upsert_peer(bls, net, vec![]);
     all_peers.current_committee.insert(bls);
 
-    // while in the committee the peer is exempt: a fatal penalty is suppressed and its
+    // While in the committee a load penalty is suppressed and its
     // reputation is unaffected
-    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    let action = all_peers.process_penalty(&peer_id, Penalty::LoadSevere);
     assert!(matches!(action, PeerAction::NoAction));
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
+    let reputation =
+        all_peers.get_peer(&peer_id).ok_or_else(|| eyre::eyre!("missing validator"))?;
+    assert_eq!(reputation.reputation(), Reputation::Trusted);
 
     // rotate the validator out of the committee
     all_peers.current_committee.clear();
 
-    // the exemption is gone: the same fatal penalty now lands and the peer is banned
-    let _ = all_peers.process_penalty(&peer_id, Penalty::Fatal);
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+    // Rotation revokes the load exemption, so repeated load penalties can now cause a ban.
+    (0..20).for_each(|_| {
+        all_peers.process_penalty(&peer_id, Penalty::LoadSevere);
+    });
+    let reputation =
+        all_peers.get_peer(&peer_id).ok_or_else(|| eyre::eyre!("missing validator"))?;
+    assert_eq!(reputation.reputation(), Reputation::Banned);
+    Ok(())
 }
 
 #[test]

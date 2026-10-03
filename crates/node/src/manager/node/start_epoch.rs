@@ -863,7 +863,8 @@ where
 
     /// Spawn a long-running task that dials a peer by [`BlsPublicKey`], retrying with backoff.
     ///
-    /// Dialing self is skipped. The task runs on the node-lifetime spawner (not the epoch
+    /// Dialing self and hubs maintained by their swarm is skipped. The task uses the node-lifetime
+    /// spawner (not the epoch
     /// spawner) so a slow-to-reach peer keeps being retried across epochs. Backoff doubles up to
     /// 120s; an already-connected or already-dialing error is treated as success. The task only
     /// gives up once it has retried enough and at least one other peer is connected — being
@@ -874,7 +875,9 @@ where
         bls_pubkey: BlsPublicKey,
         node_task_spawner: TaskSpawner,
     ) {
-        if bls_pubkey == self.key_config.public_key() {
+        if bls_pubkey == self.key_config.public_key()
+            || self.trusted_peer_keys.contains(&bls_pubkey)
+        {
             // Don't try to dial ourselves.
             return;
         }

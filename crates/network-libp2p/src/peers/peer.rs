@@ -3,7 +3,7 @@
 use super::{
     score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
-    types::{ConnectionDirection, TrustBasis},
+    types::{ConnectionDirection, PenaltyOutcome, TrustBasis},
     Penalty,
 };
 use libp2p::{
@@ -287,47 +287,50 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Exempt peers
-    /// (operator allowlist or committee validators) bypass the score model entirely.
+    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Committee validators
+    /// bypass the score model entirely. Operator-allowlisted peers outside the committee bypass
+    /// load penalties only: protocol and cryptographic penalties change their score.
     pub(super) fn apply_penalty(
         &mut self,
         penalty: Penalty,
         exemption: Option<TrustBasis>,
     ) -> Reputation {
-        if let Some(basis) = exemption {
-            // Exempt peers bypass the score model entirely. Severe/Fatal suppressions are
-            // operationally significant: they hint that an exempt peer (committee member or
-            // operator allowlist) is misbehaving in ways that would normally ban an untrusted
-            // peer. Surface as a warn! so ops can correlate downstream issues with the signal.
-            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
-                warn!(
-                    target: "peer-manager",
-                    ?penalty,
-                    ?basis,
-                    "skipping severe/fatal penalty for exempt peer"
-                );
+        match penalty.outcome_for(exemption) {
+            PenaltyOutcome::Applied => self.score.apply_penalty(penalty),
+            PenaltyOutcome::Exempt => {
+                // Severe/Fatal suppressions are operationally significant: they hint that an
+                // exempt peer (committee member or operator allowlist) is misbehaving in ways
+                // that would normally ban an untrusted peer. Surface as a warn! so ops can
+                // correlate downstream issues with the signal.
+                if matches!(penalty, Penalty::Severe | Penalty::LoadSevere | Penalty::Fatal) {
+                    warn!(
+                        target: "peer-manager",
+                        ?penalty,
+                        ?exemption,
+                        "skipping severe/fatal penalty for exempt peer"
+                    );
+                }
             }
-        } else {
-            self.score.apply_penalty(penalty);
         }
 
         // return new reputation
         self.reputation()
     }
 
+    /// Retain an operator-provisioned peer without resetting its score or connection state.
+    pub(super) fn retain_for_operator(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
     /// Ensure the peer's status is banned.
     ///
-    /// `exemption` is forwarded to [Self::apply_penalty]: an exempt peer (operator allowlist or
-    /// committee validator) bypasses the score model, so the `Fatal` here is suppressed and the
-    /// peer is not banned - the same protection exempt peers had before.
+    /// `exemption` is forwarded to [Self::apply_penalty]: a committee validator bypasses the
+    /// score model, so the `Fatal` here is suppressed and the peer is not banned. An operator
+    /// peer outside the committee is banned like any other peer.
     pub(super) fn ensure_banned(&mut self, peer_id: &PeerId, exemption: Option<TrustBasis>) {
-        match self.reputation() {
-            Reputation::Banned => {}
-            _ => {
-                // if the score isn't low enough to ban, this function has been called incorrectly.
-                error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
-                self.apply_penalty(Penalty::Fatal, exemption);
-            }
+        if self.reputation() != Reputation::Banned {
+            error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
+            self.apply_penalty(Penalty::Fatal, exemption);
         }
     }
 
@@ -452,13 +455,15 @@ impl Peer {
         self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
-    /// Heartbeat maintenance applies decaying penalty rates to a non-exempt peer's score.
+    /// Heartbeat maintenance applies decaying penalty rates to the peer's score.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any; exempt peers skip
-    /// score decay. The peer's reputation could change. This returns the reputation update for
-    /// the manager to react to.
+    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Committee validators
+    /// skip score decay because they are never scored. All other peers, operator peers included,
+    /// decay on every heartbeat, so the decay and the ban lockout of a penalty start when the
+    /// penalty is applied. The peer's reputation could change. This returns the reputation update
+    /// for the manager to react to.
     pub(super) fn heartbeat(&mut self, exemption: Option<TrustBasis>) -> ReputationUpdate {
-        if exemption.is_none() {
+        if exemption != Some(TrustBasis::Validator) {
             let prev_reputation = self.reputation();
             self.score.update();
             let new_reputation = self.reputation();

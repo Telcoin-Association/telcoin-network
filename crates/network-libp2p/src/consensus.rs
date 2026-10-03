@@ -809,7 +809,7 @@ where
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
-        // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
+        // decode the domain-scoped record (no legacy fallback) and verify bls signature
         let (pubkey, node_record) =
             NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
 
@@ -1068,6 +1068,10 @@ where
                 );
                 let _ = reply.send(Ok(()));
             }
+            NetworkCommand::AddTrustedPeers { peers, reply } => {
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peers(peers);
+                send_or_log_error!(reply, Ok(()), "AddTrustedPeers");
+            }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
                 // exists, e.g. restored unpinned from persistence), but never overwrite an
@@ -1152,6 +1156,11 @@ where
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
+            }
+            #[cfg(test)]
+            NetworkCommand::VerifiedPeerBls { peer, reply } => {
+                let binding = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                send_or_log_error!(reply, binding, "VerifiedPeerBls");
             }
             NetworkCommand::EstablishedPeerCount { reply } => {
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
@@ -1460,7 +1469,7 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::LoadMild);
             }
         }
 
@@ -1602,7 +1611,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::LoadMild);
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -2278,7 +2287,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::LoadSevere);
             }
             PutRecordRate::Shed => {
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
@@ -2386,7 +2398,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::LoadMedium);
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
