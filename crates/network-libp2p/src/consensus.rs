@@ -2706,7 +2706,7 @@ where
         // Authority discovery still collects records until the final lookup step.
         let discovered = matches_requested_key
             .then_some(())
-            .and_then(|_| query.result.as_ref())
+            .and(query.result.as_ref())
             .map(|record| record.info.clone());
         let application_ready = query.reply.is_some() && query.result.is_some();
         discovered.into_iter().for_each(|info| {
