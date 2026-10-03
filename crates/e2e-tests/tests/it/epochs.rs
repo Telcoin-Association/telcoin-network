@@ -32,7 +32,11 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_storage::pack_validate::{validate_pack_file, Verdict};
+use tn_storage::{
+    archive::pack::{Pack, PackCompression},
+    consensus_pack::{PackRecord, PACK_VERSION},
+    pack_validate::{validate_pack_file, Verdict},
+};
 use tn_test_utils::wait_until;
 use tn_types::{
     forks::{
@@ -846,13 +850,14 @@ async fn send_worker_config_update<P: Provider>(
 ///
 /// The epoch observed after confirmation may already include the update. Waiting through its
 /// successor guarantees a complete epoch under the changed count regardless of transaction timing.
+/// Return that complete epoch so callers can inspect its sealed consensus pack.
 async fn change_worker_count_across_epoch_boundary<P: Provider>(
     provider: &P,
     governance: &mut TransactionFactory,
     chain: Arc<RethChainSpec>,
     endpoints: &[NodeEndpoints],
     worker_count: u16,
-) -> eyre::Result<()> {
+) -> eyre::Result<u32> {
     send_worker_config_update(
         provider,
         governance,
@@ -889,7 +894,7 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
         Ok::<(), eyre::Report>(())
     }))
     .await?;
-    Ok(())
+    Ok(changed_epoch)
 }
 
 /// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
@@ -1056,6 +1061,100 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Submit traffic to a worker and find that transaction in a sealed batch from that worker.
+///
+/// Worker RPC listeners are derived from worker 0's configured port even when keytool has not
+/// advertised them. Check every epoch spanned by confirmation so crossing a boundary is harmless.
+/// Return those sealed epochs so callers can check every validator's batches.
+async fn assert_worker_commits_batch(
+    endpoint: &NodeEndpoints,
+    datadir: &Path,
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    worker_id: tn_types::WorkerId,
+) -> eyre::Result<Vec<u32>> {
+    // Reth assigns each worker an HTTP port 200 below its predecessor.
+    let port = endpoint
+        .http_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .and_then(|port| worker_id.checked_mul(200).and_then(|offset| port.checked_sub(offset)))
+        .ok_or_else(|| eyre::eyre!("worker 0 URL cannot yield worker {worker_id}'s port"))?;
+    let worker = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
+    wait_for_rpc(&worker).await?;
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &worker);
+    let first_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let recipient = governance.address();
+    let tx = governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(recipient),
+        U256::ZERO,
+        Bytes::new(),
+    );
+    let pending = worker.send_raw_transaction(&tx).await?;
+    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
+    let last_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    wait_until(
+        Duration::from_secs(EPOCH_DURATION * 8),
+        &format!("worker {worker_id}'s transaction epoch to close"),
+        || async { Ok(registry.getCurrentEpochInfo().call().await?.epochId > last_epoch) },
+    )
+    .await?;
+    let records = futures::future::try_join_all(
+        (first_epoch..=last_epoch)
+            .map(|epoch| fetch_verified_epoch_record(&endpoint.http_url, epoch, 60)),
+    )
+    .await?;
+    let expected_tx = tx.to_vec();
+    let found = records.iter().try_fold(false, |found, record| {
+        let pack = Pack::<PackRecord>::open(
+            epoch_pack_path(datadir, record.epoch),
+            u64::from(record.epoch),
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )?;
+        pack.raw_iter()?.try_fold(found, |found, record| {
+            let contains_tx = match record? {
+                PackRecord::Batch(batch) => {
+                    batch.worker_id == worker_id && batch.transactions.contains(&expected_tx)
+                }
+                PackRecord::EpochMeta(_) | PackRecord::Consensus(_) => false,
+            };
+            Ok::<_, eyre::Report>(found || contains_tx)
+        })
+    })?;
+    eyre::ensure!(found, "confirmed transaction is absent from sealed worker {worker_id} batches");
+    Ok((first_epoch..=last_epoch).collect())
+}
+
+/// A complete post-shrink epoch contains no removed worker's batches.
+fn assert_epoch_only_has_worker_zero(datadir: &Path, epoch: u32) -> eyre::Result<()> {
+    let pack = Pack::<PackRecord>::open(
+        epoch_pack_path(datadir, epoch),
+        u64::from(epoch),
+        true,
+        PackCompression::ZStd,
+        PACK_VERSION,
+    )?;
+    pack.raw_iter()?.try_for_each(|record| -> eyre::Result<()> {
+        match record? {
+            PackRecord::Batch(batch) => {
+                eyre::ensure!(
+                    batch.worker_id == 0,
+                    "removed worker {} produced a batch in epoch {epoch}",
+                    batch.worker_id,
+                );
+                Ok(())
+            }
+            PackRecord::EpochMeta(_) | PackRecord::Consensus(_) => Ok(()),
+        }
+    })?;
+    Ok(())
+}
+
 /// Governance can grow and shrink the protocol worker count while validators keep running.
 ///
 /// Every node provisions two workers while genesis activates only one. The original processes
@@ -1122,8 +1221,35 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         2,
     )
     .await?;
-    change_worker_count_across_epoch_boundary(&provider, &mut governance, chain, &endpoints, 1)
-        .await?;
+    assert_worker_commits_batch(
+        first,
+        &temp_dir.path().join(committee.first().ok_or_else(|| eyre::eyre!("no validator"))?.0),
+        &mut governance,
+        chain.clone(),
+        1,
+    )
+    .await?;
+    let shrunk_epoch = change_worker_count_across_epoch_boundary(
+        &provider,
+        &mut governance,
+        chain.clone(),
+        &endpoints,
+        1,
+    )
+    .await?;
+    let traffic_epochs = assert_worker_commits_batch(
+        first,
+        &temp_dir.path().join(committee.first().ok_or_else(|| eyre::eyre!("no validator"))?.0),
+        &mut governance,
+        chain,
+        0,
+    )
+    .await?;
+    committee.iter().try_for_each(|(name, _)| {
+        std::iter::once(shrunk_epoch).chain(traffic_epochs.iter().copied()).try_for_each(|epoch| {
+            assert_epoch_only_has_worker_zero(&temp_dir.path().join(name), epoch)
+        })
+    })?;
 
     guard.kill_all();
     Ok(())
