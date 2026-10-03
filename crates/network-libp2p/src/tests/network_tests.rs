@@ -2077,9 +2077,9 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Epoch admission preserves attributable protocol bans, including a refused reconnect.
+/// Epoch admission forgives a committee member's protocol ban and allows a reconnect.
 #[tokio::test]
-async fn test_new_epoch_preserves_protocol_bans() -> eyre::Result<()> {
+async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     // Start with two peers
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -2143,9 +2143,18 @@ async fn test_new_epoch_preserves_protocol_bans() -> eyre::Result<()> {
     // The following command observes the preceding epoch update in the swarm's command queue.
     let score_after_epoch =
         peer1.peer_score(peer2_id).await?.ok_or_else(|| eyre!("peer2 score"))?;
-    assert_eq!(score_after_epoch, min_score, "epoch admission must preserve the protocol ban");
+    assert_eq!(
+        score_after_epoch,
+        config_1.network_config().peer_config().score_config.max_score,
+        "epoch admission forgives a committee member's protocol ban"
+    );
 
-    assert!(peer1.dial_by_bls(config_2.key_config().primary_public_key()).await.is_err());
+    // Ignore `AlreadyConnected` if peer2 redials first.
+    let _ = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
+    wait_until(Duration::from_secs(5), "peer2 reconnects after epoch admission", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     Ok(())
 }

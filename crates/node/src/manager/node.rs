@@ -988,9 +988,13 @@ where
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.bootstrap_servers = network_config
             .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
+        let p2p_info = &self.builder.tn_config.node_info.p2p_info;
         network_config.validate_trusted_nodes(
             &self.bootstrap_servers,
-            self.builder.tn_config.node_info.p2p_info.workers.len(),
+            p2p_info.workers.len(),
+            &self.key_config.primary_public_key(),
+            &p2p_info.primary,
+            &p2p_info.workers,
         )?;
         self.trusted_peer_keys = network_config.trusted_nodes().keys().copied().collect();
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);

@@ -139,6 +139,28 @@ impl Penalty {
             Self::Mild | Self::Medium | Self::Severe | Self::Fatal => false,
         }
     }
+
+    /// Whether `exemption` suppresses this penalty.
+    ///
+    /// Committee validators are exempt from every penalty for now. Operator-allowlisted peers
+    /// outside the committee are exempt from load penalties only. The committee wins when a peer
+    /// is both, because the [TrustBasis] lookup resolves validator status first.
+    pub(super) fn outcome_for(self, exemption: Option<TrustBasis>) -> PenaltyOutcome {
+        match exemption {
+            Some(TrustBasis::Validator) => PenaltyOutcome::Exempt,
+            Some(TrustBasis::Operator) if self.is_load() => PenaltyOutcome::Exempt,
+            Some(TrustBasis::Operator) | None => PenaltyOutcome::Applied,
+        }
+    }
+}
+
+/// Whether a reported penalty changed the peer's score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PenaltyOutcome {
+    /// The penalty changed the peer's score.
+    Applied,
+    /// The peer's [TrustBasis] suppressed the penalty.
+    Exempt,
 }
 
 /// Request for dialing peers.

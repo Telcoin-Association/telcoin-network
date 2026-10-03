@@ -809,7 +809,7 @@ where
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
-        // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
+        // decode the domain-scoped record (no legacy fallback) and verify bls signature
         let (pubkey, node_record) =
             NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
 

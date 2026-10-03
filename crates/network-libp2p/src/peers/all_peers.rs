@@ -8,7 +8,7 @@ use super::{
     peer::Peer,
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, PeerIdentity, TrustBasis},
+    types::{ConnectionDirection, PeerIdentity, PenaltyOutcome, TrustBasis},
     PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -362,8 +362,9 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
+            let exemption = self.trust_basis_for(&id);
             if let Some(peer) = self.peers.get_mut(&id) {
-                peer.ensure_banned(peer_id);
+                peer.ensure_banned(peer_id, exemption);
             } else {
                 // unreachable
                 error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
@@ -911,6 +912,13 @@ impl AllPeers {
         })
     }
 
+    /// The [PenaltyOutcome] of `penalty` for the peer identified by `peer_id`.
+    ///
+    /// The manager records penalty metrics with this outcome, after the exemption decision.
+    pub(super) fn penalty_outcome(&self, peer_id: &PeerId, penalty: Penalty) -> PenaltyOutcome {
+        penalty.outcome_for(self.trust_basis_for(&self.identity_for(peer_id)))
+    }
+
     /// Boolean indicating if the ip address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
@@ -1218,12 +1226,7 @@ impl AllPeers {
             let identity = PeerIdentity::Confirmed(bls_key);
             // only members whose network identity is already known have a confirmed record and a
             // recoverable peer id; others are trusted lazily on discovery
-            let Some(peer_id) = self
-                .peers
-                .get(&identity)
-                .filter(|peer| !peer.has_protocol_penalty())
-                .and_then(|peer| peer.peer_id())
-            else {
+            let Some(peer_id) = self.peers.get(&identity).and_then(|peer| peer.peer_id()) else {
                 continue;
             };
 

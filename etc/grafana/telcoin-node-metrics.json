@@ -1494,7 +1494,7 @@
           },
           "expr": "rate(tn_network_peer_penalties_total{network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} {{severity}}"
+          "legendFormat": "{{network}} {{severity}} {{class}} {{outcome}}"
         }
       ],
       "fieldConfig": {

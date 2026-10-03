@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
 use tn_types::{BlsPublicKey, BootstrapServer, P2pNode, Round, WorkerId};
 
 mod trusted;
-use tracing::warn;
+use tracing::{info, warn};
 pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 impl ConfigTrait for NetworkConfig {}
@@ -62,12 +62,30 @@ impl NetworkConfig {
     }
 
     /// Validate every hub before spawning networks, including the resolved bootstrap overrides.
+    ///
+    /// A shared hub list can name this node too. An entry for this node's BLS key is valid only
+    /// when its network keys are this node's keys. That entry is then removed, so this node
+    /// never dials or retains itself. Any other entry that uses this node's network keys fails.
     pub fn validate_trusted_nodes(
-        &self,
+        &mut self,
         bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
         num_workers: usize,
+        local_bls: &BlsPublicKey,
+        local_primary: &P2pNode,
+        local_workers: &[P2pNode],
     ) -> Result<(), TrustedNodeConfigError> {
-        trusted::validate(&self.trusted_nodes, bootstrap, num_workers)
+        trusted::validate(
+            &self.trusted_nodes,
+            bootstrap,
+            num_workers,
+            local_bls,
+            local_primary,
+            local_workers,
+        )?;
+        if self.trusted_nodes.remove(local_bls).is_some() {
+            info!(target: "tn::config", %local_bls, "trusted_nodes names this node; entry skipped");
+        }
+        Ok(())
     }
 
     /// Return the startup peer-readiness budget for each primary and worker network.
@@ -783,6 +801,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use tn_types::{BlsKeypair, Multiaddr, NetworkKeypair};
 
     /// Default and legacy configs retain the production two-minute readiness budget.
     #[test]
@@ -828,13 +848,34 @@ mod tests {
         })
     }
 
+    /// Return a node identity that no fixture entry uses.
+    fn outside_identity() -> (BlsPublicKey, P2pNode, Vec<P2pNode>) {
+        let endpoint =
+            || P2pNode::from((NetworkKeypair::generate_ed25519().public(), Multiaddr::empty()));
+        (
+            *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public(),
+            endpoint(),
+            vec![endpoint(), endpoint()],
+        )
+    }
+
+    /// Validate as a node whose identity no fixture entry uses.
+    fn validate_outside(
+        config: &mut NetworkConfig,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: usize,
+    ) -> Result<(), TrustedNodeConfigError> {
+        let (bls, primary, workers) = outside_identity();
+        config.validate_trusted_nodes(bootstrap, num_workers, &bls, &primary, &workers)
+    }
+
     /// YAML preserves multiple hubs and explicit worker IDs, and old files need no new key.
     #[test]
     fn trusted_nodes_round_trip_multiple_workers() -> eyre::Result<()> {
         let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
-        let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        let mut parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
         assert_eq!(parsed.trusted_nodes(), config.trusted_nodes());
-        parsed.validate_trusted_nodes(&BTreeMap::new(), 2)?;
+        validate_outside(&mut parsed, &BTreeMap::new(), 2)?;
         assert!(parsed.trusted_nodes().values().all(|node| node.worker(0).is_some()
             && node.worker(1).is_some()
             && node.worker(2).is_none()));
@@ -846,10 +887,9 @@ mod tests {
     /// Missing and unsupported worker IDs fail before any swarm can be spawned.
     #[test]
     fn trusted_nodes_require_every_supported_worker() -> eyre::Result<()> {
-        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
         [1, 3].into_iter().try_for_each(|count| -> eyre::Result<()> {
-            let error = config
-                .validate_trusted_nodes(&BTreeMap::new(), count)
+            let error = validate_outside(&mut config, &BTreeMap::new(), count)
                 .err()
                 .ok_or_else(|| eyre::eyre!("expected invalid worker coverage"))?;
             assert!(error.to_string().contains(".workers: expected every worker ID"));
@@ -899,14 +939,13 @@ mod tests {
             })
             .collect();
         let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
-        config.validate_trusted_nodes(&bootstrap, 1)?;
+        validate_outside(&mut config, &bootstrap, 1)?;
         let alternate =
             bootstrap.values().nth(1).ok_or_else(|| eyre::eyre!("second hub"))?.primary.clone();
         let first =
             config.trusted_nodes.values_mut().next().ok_or_else(|| eyre::eyre!("first hub"))?;
         *first = TrustedNode::new(alternate.clone(), [(0, alternate)].into_iter().collect());
-        let error = config
-            .validate_trusted_nodes(&bootstrap, 1)
+        let error = validate_outside(&mut config, &bootstrap, 1)
             .err()
             .ok_or_else(|| eyre::eyre!("expected conflicting BLS binding"))?;
         assert!(error.to_string().contains("contradictory PeerId bindings"));
@@ -925,9 +964,8 @@ mod tests {
                 [(0, endpoint.clone()), (1, endpoint.clone())].into_iter().collect(),
             );
         });
-        let config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
-        let error = config
-            .validate_trusted_nodes(&BTreeMap::new(), 2)
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = validate_outside(&mut config, &BTreeMap::new(), 2)
             .err()
             .ok_or_else(|| eyre::eyre!("expected duplicate PeerId"))?;
         assert!(error.to_string().contains("assigned to multiple BLS keys"));
@@ -945,12 +983,62 @@ mod tests {
             endpoint,
             [(0, node.primary().clone()), (1, node.primary().clone())].into_iter().collect(),
         );
-        let config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
-        let error = config
-            .validate_trusted_nodes(&BTreeMap::new(), 2)
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = validate_outside(&mut config, &BTreeMap::new(), 2)
             .err()
             .ok_or_else(|| eyre::eyre!("expected conflicting address identity"))?;
         assert!(error.to_string().contains("address /p2p identity must match network key"));
+        Ok(())
+    }
+
+    /// A shared hub list may name this node; a matching self entry is valid and skipped.
+    #[test]
+    fn trusted_nodes_skip_matching_self_entry() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let (bls, node) = config
+            .trusted_nodes()
+            .iter()
+            .next()
+            .map(|(bls, node)| (*bls, node.clone()))
+            .ok_or_else(|| eyre::eyre!("first hub"))?;
+        let workers: Vec<_> = (0..2).filter_map(|id| node.worker(id).cloned()).collect();
+        let count = config.trusted_nodes().len();
+        config.validate_trusted_nodes(&BTreeMap::new(), 2, &bls, node.primary(), &workers)?;
+        assert_eq!(config.trusted_nodes().len() + 1, count);
+        assert!(!config.trusted_nodes().contains_key(&bls));
+        Ok(())
+    }
+
+    /// This node's BLS key with another network key is a contradictory self entry.
+    #[test]
+    fn trusted_nodes_reject_self_bls_with_other_network_key() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let bls = *config.trusted_nodes().keys().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        let (_, primary, workers) = outside_identity();
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2, &bls, &primary, &workers)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected self identity mismatch"))?;
+        assert!(error.to_string().contains("own BLS key must use this node's network key"));
+        Ok(())
+    }
+
+    /// Another hub cannot use one of this node's network keys.
+    #[test]
+    fn trusted_nodes_reject_other_bls_with_own_network_key() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let primary = config
+            .trusted_nodes()
+            .values()
+            .next()
+            .map(|node| node.primary().clone())
+            .ok_or_else(|| eyre::eyre!("first hub"))?;
+        let (bls, _, workers) = outside_identity();
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2, &bls, &primary, &workers)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected network key owned by this node"))?;
+        assert!(error.to_string().contains("belongs to this node"));
         Ok(())
     }
 

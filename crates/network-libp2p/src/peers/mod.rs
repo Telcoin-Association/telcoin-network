@@ -10,7 +10,7 @@ mod score;
 mod status;
 mod types;
 pub(crate) use manager::{PeerManager, PutRecordRate};
-pub(crate) use types::PeerEvent;
+pub(crate) use types::{PeerEvent, PenaltyOutcome};
 pub use types::{PeerExchangeMap, Penalty};
 
 // visibility for tests

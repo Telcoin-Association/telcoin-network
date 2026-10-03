@@ -39,17 +39,17 @@ Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`
 | Severe | -10.0 | Invalid validation data; `LoadSevere` for Kademlia put-record flooding. |
 | Fatal | Set to -100.0 | Invalid signatures, invalid encoding, and authenticated protocol violations. |
 
-Operator-provisioned hubs and tracked committee members ignore load penalties. Protocol penalties apply to every peer. Rate-limited work is still dropped for privileged peers, so load exemption never creates an unlimited service allowance.
+Members of the previous, current, and next committees are exempt from all penalties for now. Operator-provisioned hubs outside those committees ignore load penalties, and protocol penalties apply to them as to every other peer. A peer that is both a hub and a committee member gets the committee exemption. Rate-limited work is still dropped for privileged peers, so an exemption never creates an unlimited service allowance.
 
 The score thresholds remain -20.0 for disconnection and -50.0 for a ban. From a fresh score of 0.0, ignoring decay, 50 mild, 10 medium, or 5 severe penalties cause a ban. Each report is evaluated immediately.
 
-Crossing the ban threshold delays score decay for 30 minutes. Epoch rotation, identity discovery, and repeated hub installation preserve attributable protocol penalties and their bans. Committee admission may still forgive load-only penalties.
+Crossing the ban threshold delays score decay for 30 minutes. Epoch rotation, identity discovery, and repeated hub installation preserve the protocol penalties and bans of a hub outside the committee. Committee admission at each epoch unbans every committee member and resets its score.
 
 ## What makes a peer important
 
 A peer's identity is either `Confirmed`, carrying its BLS public key, or `Unidentified`, carrying its libp2p PeerId. Transport authentication proves the remote network key, and signed node records prove their advertised BLS binding. Configuration supplies expected identities and address hints; it does not replace either verification.
 
-Operator allowlisting remains sticky across epoch rotation. Validator membership derives from the previous, current, and next committee sets. Both grant connection-retention privileges and exemption from load-induced penalties, independently of permission to publish committee-only gossip. Neither grants exemption from protocol penalties. Finite connection, stream, message, and rate budgets continue to apply.
+Operator allowlisting remains sticky across epoch rotation. Validator membership derives from the previous, current, and next committee sets. Both grant connection-retention privileges, independently of permission to publish committee-only gossip. Committee membership also grants exemption from all penalties for now. Operator allowlisting grants exemption from load-induced penalties only. Finite connection, stream, message, and rate budgets continue to apply.
 
 Bootstrap entries supply discovery hints. They do not acquire operator retention or load privileges automatically. A compatible trusted entry takes precedence for persistent dial addresses. Conflicting BLS/PeerId bindings fail startup with the offending configuration field.
 
@@ -182,7 +182,7 @@ Every series below is exported under the `tn_network` prefix and carries a `netw
 | `discovery_peers` | Dial candidates held in the discovery pool, capped at 60. Persistently low means discovery is starved. |
 | `banned_peers` | Size of the temporary-ban cache, not the reputation-ban table. Rises during excess-peer churn. |
 | `peers_banned_total` | Cumulative reputation bans. This is the flow that matches the ban threshold; `banned_peers` is a different stock. |
-| `peer_penalties_total` | Penalties applied, labelled `severity` with `mild`, `medium`, `severe`, or `fatal`. The leading indicator for bans. |
+| `peer_penalties_total` | Penalties reported, labelled `severity` (`mild`, `medium`, `severe`, `fatal`), `class` (`load` or `protocol`), and `outcome` (`applied`, or `exempt` when the peer's trust basis suppressed the score change). Applied penalties are the leading indicator for bans. |
 | `connections_established_total` | Connections established, labelled `direction` with `in` or `out`. |
 | `connections_closed_total` | Connections closed, all directions. |
 | `dial_failures_total` | Failed dial attempts. |

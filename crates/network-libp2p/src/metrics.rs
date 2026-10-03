@@ -4,7 +4,7 @@
 //! carries a `network` label (`primary` or `worker-{id}`) set at construction.
 
 use crate::{
-    peers::{Penalty, PutRecordRate},
+    peers::{Penalty, PenaltyOutcome, PutRecordRate},
     types::NetworkType,
 };
 use reth_metrics::{
@@ -219,18 +219,30 @@ impl PeerManagerMetrics {
         self.handles.external_addr_confirmed.set(1.0);
     }
 
-    /// Record an application-layer penalty by severity.
-    pub(crate) fn record_penalty(&self, penalty: &Penalty) {
-        let severity = match penalty {
-            Penalty::Mild | Penalty::LoadMild => "mild",
-            Penalty::Medium | Penalty::LoadMedium => "medium",
-            Penalty::Severe | Penalty::LoadSevere => "severe",
-            Penalty::Fatal => "fatal",
+    /// Record an application-layer penalty by severity, class and outcome.
+    ///
+    /// `class` separates load penalties from protocol penalties. `outcome` separates penalties
+    /// that changed a score from penalties that the peer's trust basis suppressed.
+    pub(crate) fn record_penalty(&self, penalty: &Penalty, outcome: PenaltyOutcome) {
+        let (severity, class) = match penalty {
+            Penalty::LoadMild => ("mild", "load"),
+            Penalty::LoadMedium => ("medium", "load"),
+            Penalty::LoadSevere => ("severe", "load"),
+            Penalty::Mild => ("mild", "protocol"),
+            Penalty::Medium => ("medium", "protocol"),
+            Penalty::Severe => ("severe", "protocol"),
+            Penalty::Fatal => ("fatal", "protocol"),
+        };
+        let outcome = match outcome {
+            PenaltyOutcome::Applied => "applied",
+            PenaltyOutcome::Exempt => "exempt",
         };
         metrics::counter!(
             "tn_network.peer_penalties_total",
             "network" => self.network.clone(),
             "severity" => severity,
+            "class" => class,
+            "outcome" => outcome,
         )
         .increment(1);
     }
@@ -289,7 +301,7 @@ mod tests {
             peers.record_connection_closed();
             peers.record_dial_failure();
             peers.record_external_addr_confirmed();
-            peers.record_penalty(&Penalty::Severe);
+            peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
             peers.record_peer_banned();
             peers.record_put_record_rate_limited(&PutRecordRate::Shed);
         });
@@ -362,7 +374,7 @@ mod tests {
             second.set_peer_counts(7, 7, 7, 7);
             [&first, &second].into_iter().for_each(|peers| {
                 peers.record_connection_established("in");
-                peers.record_penalty(&Penalty::Severe);
+                peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
             });
         });
 
