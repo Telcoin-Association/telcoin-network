@@ -1445,10 +1445,18 @@ mod tests {
 
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
-        if mode == NodeMode::CvvInactive {
+        if mode.is_cvv_inactive() {
             manager.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
         }
-        assert_eq!(manager.identify_node_mode(&consensus_config, &consensus_bus).await?, mode);
+        let identified = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        assert!(
+            match mode {
+                NodeMode::Observer => identified.is_observer(),
+                NodeMode::CvvActive => identified.is_active_cvv(),
+                NodeMode::CvvInactive => identified.is_cvv_inactive(),
+            },
+            "expected {mode:?}, identified {identified:?}",
+        );
         // Neither worker can finish its first probe until both networks have entered their wait.
         let first_probes = Arc::new(tokio::sync::Barrier::new(2));
         let (topic_sender, mut topic_receiver) = mpsc::unbounded_channel();
@@ -1573,8 +1581,8 @@ mod tests {
         assert_eq!(engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?, rpc_zero);
         let syncing: serde_json::Value =
             startup_client.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
-        assert_eq!(syncing.is_object(), mode == NodeMode::CvvInactive);
-        if mode != NodeMode::CvvInactive {
+        assert_eq!(syncing.is_object(), mode.is_cvv_inactive());
+        if !mode.is_cvv_inactive() {
             assert_eq!(syncing, serde_json::Value::Bool(false));
         }
         assert_eq!(
@@ -1711,8 +1719,8 @@ mod tests {
             engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
         let syncing: serde_json::Value =
             reactivated.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
-        assert_eq!(syncing.is_object(), mode == NodeMode::CvvInactive);
-        if mode != NodeMode::CvvInactive {
+        assert_eq!(syncing.is_object(), mode.is_cvv_inactive());
+        if !mode.is_cvv_inactive() {
             assert_eq!(syncing, serde_json::Value::Bool(false));
         }
         let history: serde_json::Value = reactivated
