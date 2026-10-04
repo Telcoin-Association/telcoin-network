@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_types::{now, BlsPublicKey};
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
 
