@@ -695,21 +695,23 @@ async fn drain_pending_on_shutdown<Fut>(
 
 #[cfg(test)]
 mod tests {
-    use super::drain_pending_on_shutdown;
-    use crate::SubscriberError;
+    use super::{drain_pending_on_shutdown, Inner, Subscriber};
+    use crate::{metrics::ExecutorMetrics, SubscriberError};
     use futures::{future, stream::FuturesOrdered};
     use std::{
         collections::{BTreeSet, VecDeque},
+        sync::Arc,
         time::Duration,
     };
     use tempfile::TempDir;
-    use tn_primary::ConsensusBusApp;
+    use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
     use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         Certificate, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
-        ConsensusOutput, ReputationScores, TnReceiver as _, B256,
+        ConsensusOutput, ReputationScores, TnReceiver as _, TnSender as _, B256,
     };
+    use tokio::sync::mpsc;
 
     /// Build a valid `ConsensusOutput` at `number` (parent `parent`, sub-dag index `sub_dag_index`)
     /// from the fixture's certificates, returning it with its consensus-header digest so a caller
@@ -733,6 +735,49 @@ mod tests {
         let digest = ConsensusHeader::digest_from_parts(parent, &sub_dag, number);
         let output = ConsensusOutput::new(sub_dag, parent, number, false, VecDeque::new(), vec![]);
         (output, digest)
+    }
+
+    /// Build `count` contiguous, digest-chained outputs numbered from 1, the run a fresh chain
+    /// accepts in order.
+    fn chained_outputs(
+        fixture: &CommitteeFixture<MemDatabase>,
+        count: u64,
+    ) -> Vec<ConsensusOutput> {
+        let committee = fixture.committee();
+        let genesis: BTreeSet<_> = fixture.genesis().collect();
+        let (_, headers) = fixture.headers_round(0, &genesis);
+        let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+        let mut parent: ConsensusHeaderDigest = B256::ZERO.into();
+        let mut outputs = Vec::new();
+        for number in 1..=count {
+            let (output, digest) = output_at(&certificates, &committee, number, number - 1, parent);
+            outputs.push(output);
+            parent = digest;
+        }
+        outputs
+    }
+
+    /// Build a subscriber for the fixture's first authority over `consensus_chain`, enough to
+    /// drive `handle_sync_output`.
+    fn sync_subscriber(
+        fixture: &CommitteeFixture<MemDatabase>,
+        consensus_chain: ConsensusChain,
+        consensus_bus: &ConsensusBusApp,
+    ) -> Subscriber<MemDatabase> {
+        let config = fixture.authorities().next().unwrap().consensus_config().clone();
+        let (network_tx, _network_rx) = mpsc::channel(1);
+        Subscriber {
+            consensus_bus: consensus_bus.clone(),
+            config: config.clone(),
+            network_handle: PrimaryNetworkHandle::new_for_test(network_tx),
+            inner: Arc::new(Inner {
+                authority_id: config.authority_id(),
+                committee: config.committee().clone(),
+                consensus_chain,
+                epoch_boundary: u64::MAX,
+                metrics: ExecutorMetrics::default(),
+            }),
+        }
     }
 
     /// A save error mid-drain must fail-stop the drain the same way a fetch `Err` does: the output
@@ -907,6 +952,61 @@ mod tests {
             !matches!(consensus_chain.consensus_header_by_number(2).await, Ok(Some(_))),
             "output 2 (past the failed fetch) must not be persisted",
         );
+    }
+
+    /// A state-sync burst larger than any `sync_output` buffer must reach the subscriber intact.
+    ///
+    /// Replaying a local pack, `catch_up_consensus_from_to` waits for execution only before
+    /// outputs that carry an execution block, so across a run of empty outputs it sends as fast as
+    /// it reads while the subscriber saves (and fsyncs) each output before forwarding it. The
+    /// producer here sends more outputs than the old `sync_output` broadcast held (1_000) without
+    /// waiting on anything else, and the consumer drives the real `handle_sync_output`. Every
+    /// output must arrive exactly once and in order, and every output forwarded on
+    /// `consensus_output` must be the next number, the continuity
+    /// `EpochManager::wait_for_epoch_boundary` enforces before the engine. A lagging broadcast
+    /// drops the oldest outputs, so the subscriber sees a jump in numbers.
+    #[tokio::test]
+    async fn sync_output_burst_reaches_subscriber_without_gaps() {
+        // more than the old broadcast capacity (1_000) and the bounded queue depth
+        const OUTPUTS: u64 = 1_200;
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new().unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+        let subscriber = sync_subscriber(&fixture, consensus_chain, &consensus_bus);
+        let outputs = chained_outputs(&fixture, OUTPUTS);
+
+        // subscribe both ends before the producer starts, as `follow_consensus` and the epoch
+        // manager do
+        let mut rx_sync_output = consensus_bus.subscribe_sync_output();
+        let mut rx_consensus_output = consensus_bus.subscribe_consensus_output();
+        let producer_bus = consensus_bus.clone();
+        let producer = tokio::spawn(async move {
+            for output in outputs {
+                let sent = producer_bus.sync_output().send(output).await;
+                assert!(sent.is_ok(), "sync_output send failed");
+            }
+        });
+
+        let mut last_forwarded = 0;
+        for expected in 1..=OUTPUTS {
+            let output = tokio::time::timeout(Duration::from_secs(10), rx_sync_output.recv())
+                .await
+                .unwrap_or_else(|_| panic!("output {expected} never reached the subscriber"))
+                .expect("sync_output stays open");
+            assert_eq!(output.number(), expected, "sync_output lost or reordered outputs");
+            subscriber.handle_sync_output(output).await.expect("a contiguous output saves");
+            let forwarded =
+                rx_consensus_output.try_recv().expect("every saved output is forwarded");
+            assert_eq!(forwarded.number(), last_forwarded + 1, "consensus_output gap");
+            last_forwarded = forwarded.number();
+        }
+        producer.await.expect("the producer finishes once everything is consumed");
+        assert_eq!(subscriber.inner.consensus_chain.latest_consensus_number(), OUTPUTS);
     }
 }
 

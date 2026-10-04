@@ -428,10 +428,10 @@ async fn catch_up_consensus_from_to<DB: Database>(
 
         let base_execution_block = consensus_header.sub_dag.leader().latest_execution_block();
         // We need to make sure execution has caught up so we can verify we have not
-        // forked. This will force the follow function to not outrun
-        // execution...  this is probably fine. Also once we can
-        // follow gossiped consensus output this will not really be
-        // an issue (except during initial catch up).
+        // forked. This only throttles non-empty outputs: an empty output produces no block, so
+        // through a long empty stretch the leaders keep referencing a block that is already
+        // executed and this returns at once. There the bounded `sync_output` queue below is the
+        // only thing that keeps this loop from outrunning the subscriber.
         if consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
             // We seem to have forked, so die.
             error!(
@@ -445,7 +445,9 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 consensus_bus.recent_blocks().borrow()
             ));
         }
-        // Deliver the full, verified output (with batches) for execution.
+        // Deliver the full, verified output (with batches) for execution. The queue is bounded, so
+        // this send blocks while the subscriber is behind; the epoch task manager aborts this task
+        // at teardown, so a blocked send cannot outlive the epoch.
         result_header = consensus_header;
         consensus_bus.sync_output().send(output).await?;
     }
