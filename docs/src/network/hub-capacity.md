@@ -168,10 +168,19 @@ attested binaries and retains raw evidence and diagnostics for ninety days.
 The artifact excludes generated validator key files and executable copies.
 
 The collector retains complete production diagnostic logs as
-`protocol-NN.jsonl`, with a 256 MiB per-file cap and a SHA-256 hash. Other raw
-artifacts keep their 64 MiB cap. Exceeding a cap fails collection or scoring;
+`protocol-NN.jsonl`, with a 512 MiB per-file cap and a SHA-256 hash. Other raw
+artifacts keep their 64 MiB cap. The production observation follower uses the
+same protocol cap and reads incrementally with a 64 KiB line limit.
+Exceeding a cap fails collection, observation or scoring;
 the collector removes incomplete copies. These evidence limits change neither
 the network profile nor any acceptance threshold.
+
+Qualification node commands freeze `RUST_LOG=info,network::capacity=debug` in
+their retained command JSON. This keeps INFO, WARN and ERROR records plus the
+required gossip and committee DEBUG events. Engine and block-builder DEBUG
+records containing full execution output are excluded: CI47 produced records
+above the unchanged 64 KiB observation line limit. Existing logs are diagnostic
+evidence; qualification requires a fresh run with the frozen filter.
 
 The peer example uses the production libp2p network, deterministic local test
 identities and three persistent swarms. Commands perform authenticated joins,

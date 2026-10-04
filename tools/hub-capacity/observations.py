@@ -2,6 +2,7 @@
 """Correlate bounded production JSON logs with real gossip and committee observations."""
 
 import argparse
+import importlib.util
 import os
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +10,12 @@ import json
 from pathlib import Path
 import threading
 import time
+
+
+ROOT = Path(__file__).resolve().parent
+SPEC = importlib.util.spec_from_file_location("hub_qualify", ROOT / "qualify.py")
+QUALIFY = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(QUALIFY)
 
 
 class Observations:
@@ -76,8 +83,8 @@ def follow(observations, source, path):
     try:
         with path.open("rb") as stream:
             while True:
-                if path.stat().st_size > 64 * 1024**2:
-                    raise ValueError("production log exceeds 64 MiB")
+                if path.stat().st_size > QUALIFY.MAX_PROTOCOL_LOG_BYTES:
+                    raise ValueError(f"production log exceeds {QUALIFY.MAX_PROTOCOL_LOG_BYTES // 1024**2} MiB")
                 position = stream.tell()
                 line = stream.readline(65537)
                 if len(line) > 65536:

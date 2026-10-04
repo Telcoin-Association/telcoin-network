@@ -86,6 +86,25 @@ class CollectorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exceeds"):
                     COLLECT.QUALIFY.verify_artifacts({"artifacts": [artifact]}, output)
 
+    def test_production_log_512mib_limit_rejects_next_byte_without_partial_copy(self):
+        self.assertEqual(COLLECT.QUALIFY.MAX_PROTOCOL_LOG_BYTES, 512 * 1024**2)
+        with tempfile.TemporaryDirectory(prefix="capacity-log-boundary-") as directory:
+            root = Path(directory)
+            source = root / "validator.jsonl"
+            with source.open("wb") as stream:
+                stream.truncate(COLLECT.QUALIFY.MAX_PROTOCOL_LOG_BYTES + 1)
+            self.assertEqual(source.stat().st_size, 536870913)
+            output = root / "retained"
+            output.mkdir()
+            with self.assertRaisesRegex(ValueError, "exceeds 512 MiB"):
+                COLLECT.retain_protocol_logs([source], output)
+            self.assertEqual(list(output.iterdir()), [])
+            source.rename(output / "protocol-00.jsonl")
+            with self.assertRaisesRegex(ValueError, "exceeds 512 MiB"):
+                COLLECT.QUALIFY.verify_artifacts({"artifacts": [
+                    {"path": "protocol-00.jsonl", "sha256": "0" * 64},
+                ]}, output)
+
     def test_rejected_empty_copy_and_existing_destination_remain_distinct(self):
         with tempfile.TemporaryDirectory(prefix="capacity-log-copy-") as directory:
             root = Path(directory)

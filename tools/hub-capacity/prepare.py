@@ -120,7 +120,7 @@ def phase_inputs(root, phase, binary, profile_path):
                              "--bls-passphrase-source", "no-passphrase", "--http", "--http.addr", "0.0.0.0",
                              "--http.port", "8545", "--ipcdisable", "--node-name", node["name"],
                              "--metrics", "0.0.0.0:9000", "--log.stdout.format", "json"],
-                   "environment": {"RUST_LOG": "info,network::capacity=debug,engine=debug,block-builder=debug"},
+                   "environment": {"RUST_LOG": "info,network::capacity=debug"},
                    "log": str(output / f"{node['name']}.jsonl"), "pid_file": str(output / f"{node['name']}.pid")}
         write_json(output / f"{node['name']}-command.json", command)
     peers = output / "peers"

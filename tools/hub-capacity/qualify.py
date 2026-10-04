@@ -17,8 +17,8 @@ import sys
 ROOT = Path(__file__).resolve().parent
 MAX_BYTES = 16 * 1024 * 1024
 MAX_RAW_ARTIFACT_BYTES = 64 * 1024**2
-# CI production logs reached 124 MiB with engine debug diagnostics enabled.
-MAX_PROTOCOL_LOG_BYTES = 256 * 1024**2
+# A CI47 baseline validator log reached 355,304,227 bytes.
+MAX_PROTOCOL_LOG_BYTES = 512 * 1024**2
 SCENARIOS = {
     "public_join", "shared_nat_reconnect", "gossip_two_hops", "record_lookup",
     "submit_url_lookup", "concurrent_sync", "committee_progress", "dao_connectivity",
