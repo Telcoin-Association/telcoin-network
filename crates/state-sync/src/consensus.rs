@@ -284,6 +284,12 @@ async fn get_consensus_output<DB: TNDatabase>(
 
 /// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
 /// record.
+///
+/// An epoch whose pack is already complete locally is not requested, so no fetcher will raise the
+/// stream target for it. Instead, raise the `last_consensus_header` watch to the final header of
+/// the highest complete epoch seen here, as a fetcher does after a download, so the stream task
+/// replays those packs locally. The stream stops at the first missing output and drains the rest
+/// once a requested pack below fills it.
 async fn request_epochs(
     current_fetch_epoch: &mut Epoch,
     consensus_chain: &ConsensusChain,
@@ -301,6 +307,7 @@ async fn request_epochs(
     } else {
         consensus_chain.epochs().record_by_epoch(current_fetch_epoch.saturating_sub(1)).await
     };
+    let mut highest_complete = None;
     if let Some(mut previous_epoch_record) = maybe_previous {
         while let Some(epoch_record) =
             consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
@@ -310,13 +317,30 @@ async fn request_epochs(
             // If the pack file is missing or incomplete request it.
             // Note since we have an epoch record this is a past epoch
             // not the current epoch.
-            if !contains_final_header {
+            if contains_final_header {
+                highest_complete = Some(epoch_record.final_consensus.number);
+            } else {
                 consensus_bus
                     .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
                     .await;
             }
             previous_epoch_record = epoch_record;
         }
+    }
+    let Some(final_number) = highest_complete else {
+        return;
+    };
+    match consensus_chain.consensus_header_by_number(final_number).await {
+        Ok(Some(final_header)) => {
+            if consensus_bus.send_last_consensus_header_if_newer(final_header) {
+                info!(target: "state-sync", final_header_number = final_number,
+                    "local epoch packs complete, signaling stream to replay locally");
+            }
+        }
+        Ok(None) => warn!(target: "state-sync", final_header_number = final_number,
+            "complete local epoch pack is missing its final header"),
+        Err(e) => warn!(target: "state-sync", final_header_number = final_number, ?e,
+            "unable to read the final header of a complete local epoch pack"),
     }
 }
 
@@ -864,6 +888,7 @@ pub async fn request_missing_packs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, VecDeque};
     use tempfile::TempDir;
     use tn_network_libp2p::types::NetworkCommand;
     use tn_primary::{
@@ -872,7 +897,9 @@ mod tests {
     };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
-    use tn_types::TaskManager;
+    use tn_types::{
+        CommittedSubDag, ConsensusOutput, EpochSeedChainValue, ReputationScores, TaskManager,
+    };
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     type NetworkRx = mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>;
@@ -904,6 +931,36 @@ mod tests {
             ..EpochRecord::default()
         };
         chain.epochs().save_record(record).await.expect("save epoch 0 record");
+    }
+
+    /// Save chained outputs `1..=count` into the epoch-0 pack and return the last header's digest.
+    async fn save_chained_outputs(
+        chain: &ConsensusChain,
+        fixture: &CommitteeFixture<MemDatabase>,
+        count: u64,
+    ) -> ConsensusHeaderDigest {
+        let committee = fixture.committee();
+        let genesis: BTreeSet<_> = fixture.genesis().collect();
+        let (_, headers) = fixture.headers_round(0, &genesis);
+        let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+        let leader = certificates.last().cloned().expect("a leader certificate");
+        let mut parent_hash = ConsensusHeaderDigest::default();
+        for number in 1..=count {
+            let sub_dag = CommittedSubDag::new(
+                certificates.clone(),
+                leader.clone(),
+                number - 1,
+                ReputationScores::new(&committee),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            );
+            let output =
+                ConsensusOutput::new(sub_dag, parent_hash, number, false, VecDeque::new(), vec![]);
+            parent_hash = output.consensus_header_hash();
+            chain.save_consensus_output(output).await.expect("save consensus output");
+        }
+        chain.persist_current().await.expect("persist current pack");
+        parent_hash
     }
 
     /// A backward walk from a height in an epoch that no local pack can decode must end at once
@@ -1019,6 +1076,75 @@ mod tests {
         assert!(
             partial_gate.try_begin(Instant::now()).is_none(),
             "the failed attempt starts the retry backoff"
+        );
+    }
+
+    /// An epoch whose pack is already complete locally is never fetched, so before the fix nothing
+    /// raised the stream target for it and the observer replayed none of it until gossip or a
+    /// later download did. Startup now seeds the target with the final header of the highest
+    /// complete local epoch.
+    #[tokio::test]
+    async fn request_missing_packs_raises_target_for_complete_local_pack() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        let final_hash = save_chained_outputs(&chain, &fixture, 3).await;
+        save_epoch0_record(&chain, 3, final_hash).await;
+        let consensus_bus = ConsensusBusApp::new();
+
+        request_missing_packs(&consensus_bus, &chain).await;
+
+        let target = consensus_bus
+            .last_consensus_header()
+            .borrow()
+            .clone()
+            .expect("a complete local pack seeds the stream target");
+        assert_eq!(target.number, 3);
+        assert_eq!(target.digest(), final_hash);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                consensus_bus.get_next_epoch_pack_file_request()
+            )
+            .await
+            .is_err(),
+            "a complete local pack is not requested"
+        );
+    }
+
+    /// An epoch whose local pack stops short of its final header is queued for download and does
+    /// not raise the stream target; the fetcher raises it once the download lands.
+    #[tokio::test]
+    async fn request_epochs_queues_but_does_not_raise_for_incomplete_pack() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        save_chained_outputs(&chain, &fixture, 3).await;
+        // the record ends the epoch at 5, past the last local output
+        save_epoch0_record(&chain, 5, ConsensusHeaderDigest::default()).await;
+        let consensus_bus = ConsensusBusApp::new();
+        let mut current_fetch_epoch = chain.latest_consensus_epoch();
+
+        request_epochs(&mut current_fetch_epoch, &chain, &consensus_bus).await;
+
+        assert_eq!(current_fetch_epoch, 1, "every known record was visited");
+        assert!(consensus_bus.last_consensus_header().borrow().is_none());
+        let (_, record) = tokio::time::timeout(
+            Duration::from_millis(100),
+            consensus_bus.get_next_epoch_pack_file_request(),
+        )
+        .await
+        .expect("the incomplete pack is requested")
+        .expect("request queue open");
+        assert_eq!(record.epoch, 0);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                consensus_bus.get_next_epoch_pack_file_request()
+            )
+            .await
+            .is_err(),
+            "exactly one request is queued"
         );
     }
 
