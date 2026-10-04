@@ -348,6 +348,13 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// applied header early, leaving the caller (`spawn_stream_consensus_headers`) to re-drive a
 /// request for the missing range.
 /// Returns the last ConsensusHeader that was applied on success.
+///
+/// A fresh node (`from` is the default header at number 0) anchors block 1 on the
+/// `parent_hash` block 1 carries rather than on `from.digest()`. The default header's digest is
+/// build-flavor dependent and differs from the anchor that existing networks (adiri) built block 1
+/// on, so checking against it fails every fresh node. Block 1 only reaches this loop as a verified
+/// cache entry or from a chain-verified local pack, and its digest commits to its own parent, so
+/// the default anchor adds no integrity. The strict parent check applies from block 2 on.
 async fn catch_up_consensus_from_to<DB: Database>(
     consensus_bus: &ConsensusBusApp,
     from: ConsensusHeader,
@@ -356,6 +363,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
     consensus_chain: &ConsensusChain,
     epoch: Epoch,
 ) -> eyre::Result<ConsensusHeader> {
+    // number 0 is only reachable from the default header a fresh node starts from
+    let fresh_start = from.number == 0;
     let mut last_parent = from.digest();
 
     // Catch up to the current chain state if we need to.
@@ -408,7 +417,20 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 "catching up consensus blocks"
             );
         }
-        let parent_hash = last_parent;
+        let parent_hash = if fresh_start && number == 1 {
+            // see the doc comment: the default header is not a reliable anchor for block 1
+            if consensus_header.parent_hash != last_parent {
+                info!(
+                    target: "tn::observer",
+                    adopted_parent = ?consensus_header.parent_hash,
+                    default_parent = ?last_parent,
+                    "fresh node: anchoring catch-up on block 1's parent instead of the default header"
+                );
+            }
+            consensus_header.parent_hash
+        } else {
+            last_parent
+        };
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
@@ -457,11 +479,56 @@ async fn catch_up_consensus_from_to<DB: Database>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{collections::VecDeque, time::Duration};
     use tempfile::TempDir;
     use tn_config::NetworkConfig;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::{CommittedSubDag, EpochSeedChainValue, ReputationScores, B256};
+
+    /// Consensus output `number` chained on `parent`, built from one round-1 certificate per
+    /// authority. The headers carry no batches, so a saved output reads back from the pack without
+    /// batch records.
+    fn output_at(
+        fixture: &CommitteeFixture<MemDatabase>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+    ) -> ConsensusOutput {
+        let committee = fixture.committee();
+        let certificates: Vec<_> = fixture
+            .authorities()
+            .map(|a| fixture.certificate(&a.header_with_round(&committee, 1)))
+            .collect();
+        let leader = certificates.last().cloned().expect("fixture yields certificates");
+        let sub_dag = CommittedSubDag::new(
+            certificates,
+            leader,
+            number - 1,
+            ReputationScores::new(&committee),
+            None,
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        ConsensusOutput::new(sub_dag, parent, number, false, VecDeque::new(), vec![])
+    }
+
+    /// A parent digest that no honest chain links to.
+    fn wrong_parent() -> ConsensusHeaderDigest {
+        [99u8; 32].into()
+    }
+
+    /// A consensus chain holding block 1 with `parent_hash = B256::ZERO`. Zero is not the default
+    /// header's digest in either build flavor, like adiri's block 1, which predates the #1032
+    /// default anchor.
+    async fn chain_with_block1(
+        fixture: &CommitteeFixture<MemDatabase>,
+        temp_dir: &TempDir,
+    ) -> eyre::Result<(ConsensusChain, ConsensusOutput)> {
+        let mut chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        let block1 = output_at(fixture, 1, B256::ZERO.into());
+        save_consensus(block1.clone(), &mut chain, &PrimaryMetrics::default()).await?;
+        Ok((chain, block1))
+    }
 
     /// Issue #836: when the observer catch-up loop makes no progress within its budget, it must
     /// hand the missing range to the fetch task (rather than parking on the next gossip update)
@@ -523,6 +590,66 @@ mod tests {
         assert_eq!(floor, 1, "floor is last_consensus_height + 1 (0 + 1) for an empty chain");
 
         handle.abort();
+        Ok(())
+    }
+
+    /// A fresh node starts catch-up from the default header, whose digest is build-flavor
+    /// dependent and differs from the anchor adiri's block 1 was built on. Block 1's own parent
+    /// must be adopted instead of failing the digest check, and the strict chain check must carry
+    /// on from block 1's digest.
+    #[tokio::test]
+    async fn catch_up_adopts_block1_parent_on_fresh_node() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (mut chain, block1) = chain_with_block1(&fixture, &temp_dir).await?;
+        let block2 = output_at(&fixture, 2, block1.consensus_header().digest());
+        save_consensus(block2.clone(), &mut chain, &PrimaryMetrics::default()).await?;
+        assert_ne!(
+            ConsensusHeader::default().digest(),
+            ConsensusHeaderDigest::from(B256::ZERO),
+            "block 1's parent must differ from the default anchor for this test to mean anything"
+        );
+
+        // both outputs are at or below the chain's latest number, so catch-up only walks the
+        // parent chain: no execution wait and no send to the subscriber
+        let reached = catch_up_consensus_from_to(
+            &ConsensusBusApp::new(),
+            ConsensusHeader::default(),
+            block2.consensus_header(),
+            &MemDatabase::default(),
+            &chain,
+            fixture.committee().epoch(),
+        )
+        .await?;
+        assert_eq!(reached.number, 2, "catch-up must walk past block 1 to the target");
+        Ok(())
+    }
+
+    /// The fresh-node anchor applies to block 1 only: a block 2 whose parent is not block 1's
+    /// digest is still rejected.
+    #[tokio::test]
+    async fn catch_up_still_rejects_wrong_parent_after_block1() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (chain, _block1) = chain_with_block1(&fixture, &temp_dir).await?;
+        let forked2 = output_at(&fixture, 2, wrong_parent());
+        let db = MemDatabase::default();
+        db.insert::<ConsensusCache>(&2, &forked2)?;
+
+        let err = catch_up_consensus_from_to(
+            &ConsensusBusApp::new(),
+            ConsensusHeader::default(),
+            forked2.consensus_header(),
+            &db,
+            &chain,
+            fixture.committee().epoch(),
+        )
+        .await
+        .expect_err("a wrong parent after block 1 must be rejected");
+        assert!(err.to_string().contains("digest mismatch"), "unexpected error: {err}");
+        // the cache entry is consumed just before the check, so its absence proves the walk
+        // accepted block 1 and rejected block 2 (not block 1)
+        assert!(db.get::<ConsensusCache>(&2)?.is_none(), "catch-up never reached block 2");
         Ok(())
     }
 }
