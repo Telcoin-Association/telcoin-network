@@ -5,20 +5,28 @@ import argparse
 import json
 import os
 from pathlib import Path
+import time
 import urllib.request
 
 
-def post(url, payload):
+def post(url, payload, timings=None):
     request = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json"}, method="POST")
+    started = time.time_ns() // 1000
     with urllib.request.urlopen(request, timeout=29) as response:
         body = response.read(64 * 1024 + 1)
+    completed = time.time_ns() // 1000
     if len(body) > 64 * 1024:
         raise ValueError("protocol acknowledgement exceeds 64 KiB")
+    if timings is not None:
+        timings.append({"request_started_unix_us": started,
+                        "response_completed_unix_us": completed})
     return json.loads(body)
 
 
 def main():
+    started = time.time_ns() // 1000
+    timings = []
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url")
     parser.add_argument("--identity", help="measured hub identity for committee log observations")
@@ -42,17 +50,19 @@ def main():
         if not args.identity or not args.observations:
             raise ValueError("committee observations require a declared hub and production-log service")
         result = {"operation_id": payload["operation_id"], "scenario": payload["scenario"],
-                  "identity": args.identity, **post(args.observations, {**payload, "identity": args.identity})}
+                  "identity": args.identity, **post(args.observations, {**payload, "identity": args.identity}, timings)}
     else:
         if not args.url:
             raise ValueError("peer control URL is required")
-        result = post(args.url, payload)
+        result = post(args.url, payload, timings)
         if payload["scenario"] == "gossip_two_hops" and result.get("success"):
             if not args.observations:
                 raise ValueError("gossip latency requires its production publisher observation")
-            result.update(post(args.observations, {**payload, "trace": result["trace"]}))
+            result.update(post(args.observations, {**payload, "trace": result["trace"]}, timings))
     if result.get("operation_id") != payload["operation_id"] or result.get("scenario") != payload["scenario"]:
         raise ValueError("peer acknowledgement does not match the workload command")
+    result["control_timing"] = {"started_unix_us": started, "requests": timings,
+                                "completed_unix_us": time.time_ns() // 1000}
     print(json.dumps(result, allow_nan=False, separators=(",", ":")))
 
 

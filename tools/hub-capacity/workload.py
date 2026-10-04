@@ -56,7 +56,8 @@ def execute(agent, scenario, operation_id, origin, timeout):
     """Measure one command, keeping timeouts and refusals in the operation population."""
     started = time.monotonic()
     result = {"scenario": scenario, "id": operation_id, "success": False,
-              "rejection_reason": None, "agent": agent["identity"], "argv": agent["argv"]}
+              "rejection_reason": None, "agent": agent["identity"], "argv": agent["argv"],
+              "driver_started_unix_us": time.time_ns() // 1000}
     environment = {**os.environ, "HUB_CAPACITY_OPERATION_ID": operation_id,
                    "HUB_CAPACITY_SCENARIO": scenario,
                    "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(time.time_ns() // 1000 - int((started - origin) * 1_000_000))}
@@ -64,6 +65,7 @@ def execute(agent, scenario, operation_id, origin, timeout):
     try:
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
             child = subprocess.Popen(agent["argv"], stdout=output, stderr=errors, env=environment)
+            result["driver_spawn_completed_unix_us"] = time.time_ns() // 1000
             while child.poll() is None:
                 if time.monotonic() - started > timeout:
                     result["rejection_reason"] = "timeout"
@@ -75,6 +77,7 @@ def execute(agent, scenario, operation_id, origin, timeout):
                     break
                 time.sleep(0.01)
             status = child.wait()
+            result["driver_child_completed_unix_us"] = time.time_ns() // 1000
             output.seek(0)
             errors.seek(0)
             stdout = output.read(65536).decode(errors="replace")

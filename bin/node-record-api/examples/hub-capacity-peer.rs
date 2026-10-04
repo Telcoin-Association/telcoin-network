@@ -58,6 +58,9 @@ use tower_http as _;
 use tracing as _;
 use url as _;
 
+/// Maximum Unicode characters retained from a native dial rejection.
+const MAX_DIAL_ERROR_CHARS: usize = 256;
+
 /// Command-line input paths, frozen into the workload manifest.
 #[derive(Parser)]
 struct Args {
@@ -236,6 +239,14 @@ where
     F: Future<Output = std::result::Result<(), NetworkError>>,
 {
     let outcome = dial.await;
+    if let Some(error) =
+        outcome.as_ref().err().filter(|error| matches!(error, NetworkError::Dial(_)))
+    {
+        tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
+            phase = "confirmation", peer = %target,
+            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            "native dial rejected");
+    }
     if outcome.as_ref().is_err_and(|error| {
         !matches!(
             error,
@@ -259,6 +270,14 @@ where
     F: Future<Output = std::result::Result<(), NetworkError>>,
 {
     let outcome = dial.await;
+    if let Some(error) =
+        outcome.as_ref().err().filter(|error| matches!(error, NetworkError::Dial(_)))
+    {
+        tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
+            phase = "startup", peer = %target,
+            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            "native dial rejected");
+    }
     if outcome.is_ok() {
         Ok(())
     } else if outcome.as_ref().is_err_and(|error| matches!(error, NetworkError::Dial(_))) {
@@ -274,6 +293,14 @@ where
     } else {
         dial_and_confirm(handle, target, futures::future::ready(outcome)).await
     }
+}
+
+/// Finish every started reconnect transition before propagating a native target error.
+async fn settle_reconnects<F>(transitions: impl IntoIterator<Item = F>) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    futures::future::join_all(transitions).await.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
 }
 
 impl Peer {
@@ -324,7 +351,7 @@ impl Peer {
                 self.config.required_hubs.iter().map(move |key| (handle.clone(), *key))
             })
             .collect::<Vec<_>>();
-        futures::future::try_join_all(targets.into_iter().map(|(handle, key)| async move {
+        settle_reconnects(targets.into_iter().map(|(handle, key)| async move {
             let peers = handle.connected_peers().await?;
             if peers.contains(&key) {
                 let record = handle.get_node_record(key).await?;
@@ -699,6 +726,142 @@ mod tests {
 
     use super::*;
     use tn_network_libp2p::types::NetworkCommand;
+
+    /// Real rejected startup requests retain bounded native detail without replacing the error.
+    #[tokio::test]
+    async fn startup_dial_trace_bounds_native_detail_and_keeps_error() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(5376)));
+        let target = keys.primary_public_key();
+        let trace = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(trace.as_file().try_clone()?)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (sender, mut receiver) = mpsc::channel(4);
+        let handle = Handle::new(sender);
+        let detail = "界".repeat(300);
+        let commands = async {
+            let reply = retry_command(&mut receiver, target).await?;
+            reply
+                .send(Err(NetworkError::ProtocolError("retry refused".to_owned())))
+                .map_err(|_| eyre!("the original startup recovery was canceled"))
+        };
+        let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                startup_dial(
+                    &handle,
+                    target,
+                    futures::future::ready(Err(NetworkError::Dial(detail.clone())))
+                ),
+                commands
+            )
+        })
+        .await?;
+        commands?;
+        let error = result.expect_err("failed recovery must preserve the initial Dial error");
+        assert!(
+            matches!(error.downcast_ref::<NetworkError>(), Some(NetworkError::Dial(original)) if original == &detail)
+        );
+        let retained = std::fs::read_to_string(trace.path())?;
+        assert!(retained.contains("peer_dial_rejection"));
+        assert!(retained.contains("phase=\"startup\""));
+        assert!(retained.contains(&format!("peer={target}")));
+        assert_eq!(retained.matches('界').count(), MAX_DIAL_ERROR_CHARS);
+        assert!(!retained.contains(&detail));
+        Ok(())
+    }
+
+    /// Model a sibling that has disconnected and must remain alive until redial completes.
+    async fn held_reconnect(
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        completed: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        started.send(()).map_err(|_| eyre!("started observer dropped"))?;
+        release.await?;
+        completed.send(()).map_err(|_| eyre!("completion observer dropped"))
+    }
+
+    /// A native error cannot cancel another already-started reconnect transition.
+    #[tokio::test]
+    async fn reconnect_failure_waits_for_started_sibling() -> Result<()> {
+        let (started, mut started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let (completed, mut completed_rx) = tokio::sync::oneshot::channel();
+        let transitions = [
+            futures::future::Either::Left(held_reconnect(started, release_rx, completed)),
+            futures::future::Either::Right(futures::future::ready(Err(eyre::Report::from(
+                NetworkError::Dial("original reconnect failure".to_owned()),
+            )))),
+        ];
+        let mut batch = Box::pin(settle_reconnects(transitions));
+        assert!(futures::poll!(batch.as_mut()).is_pending());
+        started_rx.try_recv()?;
+        assert!(!release.is_closed(), "the started sibling must remain owned");
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).map_err(|_| eyre!("the started reconnect was canceled"))?;
+        let error = batch.await.expect_err("the original native failure must propagate");
+        completed_rx.try_recv()?;
+        assert!(matches!(
+            error.downcast_ref::<NetworkError>(),
+            Some(NetworkError::Dial(detail)) if detail == "original reconnect failure"
+        ));
+        Ok(())
+    }
+
+    /// The former aggregation cancels a sibling after it has started its transition.
+    #[tokio::test]
+    async fn old_reconnect_join_cancels_started_sibling() -> Result<()> {
+        let (started, mut started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let (completed, mut completed_rx) = tokio::sync::oneshot::channel();
+        let transitions = [
+            futures::future::Either::Left(held_reconnect(started, release_rx, completed)),
+            futures::future::Either::Right(futures::future::ready(Err(eyre::Report::from(
+                NetworkError::Dial("original reconnect failure".to_owned()),
+            )))),
+        ];
+        let mut old_batch = Box::pin(futures::future::try_join_all(transitions));
+        let error = match futures::poll!(old_batch.as_mut()) {
+            std::task::Poll::Ready(Err(error)) => error,
+            std::task::Poll::Ready(Ok(_)) => panic!("the failing transition must fail"),
+            std::task::Poll::Pending => panic!("the old join must return its immediate error"),
+        };
+        started_rx.try_recv()?;
+        assert!(release.is_closed(), "the old join canceled the started sibling");
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            error.downcast_ref::<NetworkError>(),
+            Some(NetworkError::Dial(detail)) if detail == "original reconnect failure"
+        ));
+        Ok(())
+    }
+
+    /// All six successful hub/swarm transitions finish before the aggregate succeeds.
+    #[tokio::test]
+    async fn reconnect_success_finishes_all_six_transitions() -> Result<()> {
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        settle_reconnects((0..6).map(|_| {
+            let completed = Arc::clone(&completed);
+            async move {
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }))
+        .await?;
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 6);
+        Ok(())
+    }
 
     /// Supply one authenticated peer observation through the real handle command channel.
     async fn observe_peer(
