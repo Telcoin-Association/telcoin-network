@@ -7,13 +7,24 @@
 //! OS page cache is the cache. It complements the hash-based
 //! [`HdxIndex`](crate::archive::digest_index::index::HdxIndex), which offers only point lookups.
 //!
-//! Durability mirrors the digest index's **lazy-CRC** regime: a modified page's 4-byte CRC trailer
-//! is `zero_crc`'d as a "dirty" marker, reads do **not** verify a per-op CRC, and [`Index::sync`]
-//! CRCs only the dirty pages (`crc_is_zero`) in one pass, then `msync`s the data pages and finally
-//! rewrites + `msync`s the header page (the commit marker) — so a crash always reopens on the last
-//! consistent tree. The index is deterministically rebuildable from its pack
-//! ([`BtreeIndex::rebuild_from`]), which is why it can defer the CRC and skip per-read
-//! verification; [`BtreeIndex::page_crc_scan`] is the off-hot-path integrity check.
+//! ## CRC (deferred, rebuildable)
+//! Like the digest index, this index is not the durability source — it is derived from its data
+//! log and rebuilt from it ([`BtreeIndex::rebuild_from`]) — so it does not pay a per-op CRC. A
+//! modified page's 4-byte CRC trailer is `zero_crc`'d as a "dirty" marker and the page recorded as
+//! written by this handle; [`Index::sync`] CRC-stamps exactly those pages. Reads do not verify the
+//! full CRC ([`BtreeIndex::page_crc_scan`] is the off-path check), but a zero trailer on a page
+//! this handle did not write is at-rest damage and surfaces as `CorruptIndex`, never a wrong answer
+//! — and a write into such a page is refused rather than stamped valid at the next sync.
+//!
+//! ## Crash consistency (owner-driven rebuild)
+//! [`Index::sync`] msyncs the data pages first and the header page (root pointer, page count,
+//! `data_file_length`) last, so a header never names pages that did not reach disk with it. The
+//! index is synced only at an explicit sync or a clean close (the file is `derived`: its size is
+//! made durable by the clean-close seal). An index opened without a clean-close sentinel
+//! ([`BtreeIndex::opened_unclean`]) is therefore never trusted — it may lag its log — and its owner
+//! rebuilds it from the log and calls [`BtreeIndex::mark_consistent`] so the next clean close
+//! seals it. A file shorter than the pages its header names (a lost size extension) is rejected
+//! at open, as is a cleanly-sealed one whose root page fails its CRC.
 
 use std::{
     fs, io,
@@ -27,7 +38,7 @@ use crate::archive::{
         header::{BtreeHeader, VALUE_SIZE},
         page::{Node, NULL_PAGE, PAGE_SIZE},
     },
-    crc::{add_crc32, crc_is_zero, crc_state, zero_crc, CrcState},
+    crc::{add_crc32_nonzero, crc_is_zero, crc_state, zero_crc, CrcState},
     data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
@@ -45,6 +56,7 @@ fn fetch_to_append(e: FetchError) -> AppendError {
     match e {
         FetchError::IO(io) => AppendError::WriteDataError(io),
         FetchError::CrcFailed => AppendError::CrcError,
+        FetchError::CorruptIndex(e) => AppendError::CorruptIndex(e),
         other => AppendError::SerializeValue(other.to_string()),
     }
 }
@@ -58,6 +70,47 @@ pub struct PageCrcReport {
     pub dirty: u64,
     /// Data pages whose non-zero CRC fails to match the payload — genuine corruption.
     pub corrupt: u64,
+}
+
+/// A set of page numbers as a dense bitset. Pages are numbered `1..page_count`, so a bit per page
+/// is compact, and the hot-path test/set is a single bit operation with no hashing.
+#[derive(Debug, Default)]
+struct PageSet {
+    words: Vec<u64>,
+}
+
+impl PageSet {
+    fn insert(&mut self, p: u32) {
+        let word = p as usize / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << (p % 64);
+    }
+
+    fn contains(&self, p: u32) -> bool {
+        self.words.get(p as usize / 64).is_some_and(|word| word & (1 << (p % 64)) != 0)
+    }
+
+    /// Empty the set, keeping its allocation.
+    fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
+    /// Yield every page in ascending order, clearing each word as it is reached (consume it fully
+    /// to empty the set).
+    fn drain(&mut self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter_mut().enumerate().flat_map(|(i, word)| {
+            let mut bits = std::mem::take(word);
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    (i * 64) as u32 + bit
+                })
+            })
+        })
+    }
 }
 
 /// A paged, mmap-backed on-disk B+tree "sortable index" over fixed `ksize`-byte keys → `u64` file
@@ -74,6 +127,15 @@ pub struct BtreeIndex {
     node: Node,
     read_only: bool,
     synced: bool,
+    /// Set by [`Self::set_remove_on_drop`]: the file is deleted on drop, so `Drop` skips the sync
+    /// it would otherwise run.
+    remove_on_drop: bool,
+    /// Pages this handle has written (or allocated) since the last sync. Their all-zero CRC
+    /// trailer is the lazy-write marker; a zero trailer on any OTHER page is at-rest damage (a
+    /// clean close CRC-stamps every written page, and an unclean index is rebuilt rather than
+    /// trusted). Empty on open, so a read-only handle trusts no zero-trailer page; cleared by each
+    /// sync, which stamps exactly this set.
+    unsynced_pages: PageSet,
     _index_dir: PathBuf,
 }
 
@@ -97,7 +159,9 @@ impl BtreeIndex {
         }
 
         let dir = dir.as_ref();
-        let dir_created = fs::create_dir(dir).is_ok();
+        // A read-only open must not create the index directory (an absent dir still fails
+        // `NotFound` in `open_with` below), matching the digest index.
+        let dir_created = !read_only && fs::create_dir(dir).is_ok();
         if dir_created {
             // Brand new index directory; fsync the parent so the entry survives a crash.
             if let Some(parent) = dir.parent() {
@@ -126,13 +190,13 @@ impl BtreeIndex {
             file.slice_mut(0, PAGE_SIZE)
                 .ok_or_else(|| io::Error::other("header page not mapped"))?
                 .copy_from_slice(&page);
-            // Page 1: the empty root leaf (valid CRC).
+            // Page 1: the empty root leaf (valid, never-zero CRC).
             {
                 let leaf = file
                     .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
                     .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
                 node.init_leaf(leaf, NULL_PAGE, NULL_PAGE);
-                add_crc32(leaf);
+                add_crc32_nonzero(leaf);
             }
             file.sync_all()?; // msync the fresh empty tree
             let _ = fsync_directory(dir);
@@ -159,6 +223,19 @@ impl BtreeIndex {
             {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
+            // A CRC-valid header can still be absurd (a writer bug or a forged page): every page it
+            // names must lie inside the tree, and the height must stay under the descent cap.
+            // Reject it so the writable doors rebuild from the data log.
+            let in_tree = |p: u32| p >= 1 && p < header.page_count;
+            if header.page_count < 2
+                || !in_tree(header.root_page)
+                || !in_tree(header.first_leaf)
+                || !in_tree(header.last_leaf)
+                || header.height == 0
+                || header.height as usize > MAX_DEPTH
+            {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
             // The file must physically hold every page the header names. Barriers do not fsync a
             // derived file's size, so a crash after a sync can leave the header durable but a
             // growth's size extension lost: the named pages are gone, and zero-filling them would
@@ -167,22 +244,39 @@ impl BtreeIndex {
             if file.len() < want {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Normalize to exactly the committed pages when writable — trims any crash padding or a
-            // torn tail past `page_count` (which is authoritative). A read-only handle maps as-is;
-            // reads are bounded by `page_count`, so trailing junk is simply never addressed.
-            if !read_only {
-                if file.len() > want {
-                    file.truncate(want)?;
+            // Trim any crash padding or torn tail past `page_count` when writable, so pages
+            // allocated later start zero-filled. This is NOT recovery: an unclean index stays
+            // `opened_unclean` (and unsealed) until its owner rebuilds it from the data log and
+            // calls `mark_consistent`. A read-only handle maps as-is; reads are bounded by
+            // `page_count`, so trailing junk is never addressed.
+            if !read_only && file.len() > want {
+                file.truncate(want)?;
+            }
+            // A cleanly-sealed index has a CRC-valid root (a clean close stamps every written
+            // page). Checking it catches at-rest damage to the page every lookup starts from, so
+            // the writable doors rebuild and read-only refuses. Skipped for an unclean file, whose
+            // pages may legitimately be unstamped (it is rebuilt, not trusted).
+            if !file.opened_unclean() {
+                let root_valid = file
+                    .slice(Self::page_offset(header.root_page), PAGE_SIZE)
+                    .is_some_and(|buf| crc_state(buf) == CrcState::Valid);
+                if !root_valid {
+                    return Err(LoadHeaderError::CrcFailed);
                 }
-                // That normalization is this index's recovery: the committed pages are exactly the
-                // ones a header-last sync made durable, so the file is consistent again and its
-                // clean close may re-seal it (an unclean open otherwise stays unsealed forever).
-                file.mark_consistent();
             }
             header
         };
 
-        Ok(Self { header, file, node, read_only, synced: true, _index_dir: dir.to_owned() })
+        Ok(Self {
+            header,
+            file,
+            node,
+            read_only,
+            synced: true,
+            remove_on_drop: false,
+            unsynced_pages: PageSet::default(),
+            _index_dir: dir.to_owned(),
+        })
     }
 
     /// Number of keys stored in this index.
@@ -203,6 +297,28 @@ impl BtreeIndex {
     /// The key length in bytes this index was created with.
     pub fn ksize(&self) -> usize {
         self.node.ksize()
+    }
+
+    /// True when the index file was opened without a valid clean-close sentinel. An unclean index
+    /// is not trusted: it may lag its data log (the index is not synced on the hot path) or hold
+    /// unstamped pages, so its owner must rebuild it from the log ([`Self::rebuild_from`]) and
+    /// then [`Self::mark_consistent`].
+    pub fn opened_unclean(&self) -> bool {
+        self.file.opened_unclean()
+    }
+
+    /// Clear the "opened unclean" flag after a successful rebuild, so a clean `Drop` re-seals the
+    /// file and the next open skips recovery. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.file.mark_consistent();
+    }
+
+    /// Mark the index file to be removed (not synced) when this handle drops. Used to abandon a
+    /// partial/failed build cheaply, skipping the drop-time sync.
+    pub fn set_remove_on_drop(&mut self) {
+        self.remove_on_drop = true;
+        self.file.set_remove_on_drop();
     }
 
     /// Set the tracked length of the paired pack file (used by pack wrappers for crash repair);
@@ -280,8 +396,9 @@ impl BtreeIndex {
                 .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
                 .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
             self.node.init_leaf(leaf, NULL_PAGE, NULL_PAGE);
-            add_crc32(leaf);
+            add_crc32_nonzero(leaf);
         }
+        self.unsynced_pages.clear();
         self.file.sync_all()?;
         self.synced = true;
         Ok(())
@@ -293,24 +410,51 @@ impl BtreeIndex {
         p as u64 * PAGE_SIZE as u64
     }
 
-    /// Borrow page `p`'s bytes directly from the mapping (no CRC verification — reads trust the
-    /// mapping; corruption is caught off-path by [`Self::page_crc_scan`]).
+    /// Borrow page `p`'s bytes directly from the mapping. Reads do not verify the full CRC (the
+    /// mapping is trusted; [`Self::page_crc_scan`] is the off-path check), but two cheap checks
+    /// turn damage into [`FetchError::CorruptIndex`] instead of a wrong answer: `p` must lie inside
+    /// the tree, and a page with an all-zero CRC trailer must be one this handle wrote since its
+    /// last sync (anywhere else the zero marker is at-rest damage, e.g. a zeroed page).
     fn page(&self, p: u32) -> Result<&[u8], FetchError> {
-        self.file.slice(Self::page_offset(p), PAGE_SIZE).ok_or(FetchError::CrcFailed)
+        if p == 0 || p >= self.header.page_count {
+            return Err(FetchError::CorruptIndex(format!(
+                "page {p} is outside the tree (page_count {})",
+                self.header.page_count
+            )));
+        }
+        let buf = self.file.slice(Self::page_offset(p), PAGE_SIZE).ok_or_else(|| {
+            FetchError::CorruptIndex(format!("page {p} is beyond the mapped index"))
+        })?;
+        if crc_is_zero(buf) && !self.unsynced_pages.contains(p) {
+            return Err(FetchError::CorruptIndex(format!(
+                "page {p} has an all-zero CRC this handle did not write (at-rest corruption, not a \
+                 live unsynced write)"
+            )));
+        }
+        Ok(buf)
     }
 
-    /// Borrow page `p`'s bytes mutably from the mapping for in-place modification.
+    /// Borrow page `p`'s bytes mutably for in-place modification, recording it as written. The
+    /// same checks as [`Self::page`] run first, so a write never lands in (and a later sync never
+    /// CRC-stamps as valid) a page that is damaged at rest.
     fn page_mut(&mut self, p: u32) -> Result<&mut [u8], FetchError> {
-        self.file.slice_mut(Self::page_offset(p), PAGE_SIZE).ok_or(FetchError::CrcFailed)
+        self.page(p)?;
+        self.unsynced_pages.insert(p);
+        self.file
+            .slice_mut(Self::page_offset(p), PAGE_SIZE)
+            .ok_or_else(|| FetchError::CorruptIndex(format!("page {p} is beyond the mapped index")))
     }
 
     /// Allocate the next page number (append-only bump allocator; no free list), growing the
     /// mapping to cover it. The grown region is zero-filled, so a fresh page reads as a zero-CRC
-    /// (dirty) page until it is written and CRC'd at [`Index::sync`].
+    /// (dirty) page — recorded as written by this handle — until it is CRC'd at [`Index::sync`].
+    /// The page count only moves once the growth succeeded (a failed growth also poisons the file,
+    /// so it never seals and is rebuilt on the next open).
     fn allocate_page(&mut self) -> Result<u32, io::Error> {
         let p = self.header.page_count;
-        self.header.page_count += 1;
         self.file.ensure_len((p as u64 + 1) * PAGE_SIZE as u64)?;
+        self.header.page_count += 1;
+        self.unsynced_pages.insert(p);
         Ok(p)
     }
 
@@ -348,7 +492,7 @@ impl BtreeIndex {
             let ci = node.internal_child_index(buf, key);
             pno = node.internal_child(buf, ci);
         }
-        Err(FetchError::CrcFailed)
+        Err(FetchError::CorruptIndex("btree descent exceeded max depth".to_string()))
     }
 
     // ---- lookup ----
@@ -367,7 +511,7 @@ impl BtreeIndex {
             let ci = node.internal_child_index(buf, key);
             pno = node.internal_child(buf, ci);
         }
-        Err(FetchError::CrcFailed)
+        Err(FetchError::CorruptIndex("btree descent exceeded max depth".to_string()))
     }
 
     // ---- insertion (all in place on the mapping) ----
@@ -390,7 +534,7 @@ impl BtreeIndex {
             pno = child;
         }
         let leaf_no = leaf_no.ok_or_else(|| {
-            AppendError::SerializeValue("btree descent exceeded max depth".to_string())
+            AppendError::CorruptIndex("btree descent exceeded max depth".to_string())
         })?;
         self.insert_into_leaf(leaf_no, path, key, val)
     }
@@ -561,7 +705,7 @@ impl BtreeIndex {
             let ci = node.internal_child_index(buf, key);
             pno = node.internal_child(buf, ci);
         }
-        Err(AppendError::SerializeValue("btree descent exceeded max depth".to_string()))
+        Err(AppendError::CorruptIndex("btree descent exceeded max depth".to_string()))
     }
 
     /// Remove `key` from the index. Returns `true` if the key was present and removed, `false` if
@@ -622,13 +766,17 @@ impl BtreeIndex {
 
     // ---- durability (lazy CRC + msync, header-last commit) ----
 
-    /// CRC every dirty (zero-CRC) data page in one pass. Page 0 (the header) is written separately.
+    /// CRC-stamp the pages this handle wrote since the last sync (and only those), consuming the
+    /// set. Never iterating every page keeps sync O(written) and, crucially, never re-stamps a page
+    /// zeroed at rest as valid — that page stays dirty, so lookups and [`Self::page_crc_scan`]
+    /// still flag it. Page 0 (the header) is written separately.
     fn crc_dirty_pages(&mut self) {
-        let page_count = self.header.page_count;
-        for p in 1..page_count {
+        for p in self.unsynced_pages.drain() {
             if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
                 if crc_is_zero(buf) {
-                    add_crc32(buf);
+                    // `crc_state` classifies pages, so stamp never-zero: a genuine CRC of 0 must
+                    // not be re-read as the all-zero dirty marker.
+                    add_crc32_nonzero(buf);
                 }
             }
         }
@@ -700,11 +848,10 @@ impl BtreeIndex {
 
 impl Drop for BtreeIndex {
     fn drop(&mut self) {
-        if !self.read_only && !self.synced {
-            if !std::thread::panicking() {
-                tracing::warn!("BtreeIndex dropped with unsynced data - caller should call sync()");
-            }
-            // Commit the tree before MmapDataFile's own clean-close (msync + truncate + fsync).
+        if !self.read_only && !self.synced && !self.remove_on_drop {
+            // The data log is the source of truth and the index is not synced on the hot path, so
+            // a clean close is the expected place it is made durable — not a misuse to warn about.
+            // Commit the tree (pages, then the header) before MmapDataFile's own clean-close seal.
             if let Err(e) = self.sync_impl() {
                 if !std::thread::panicking() {
                     tracing::error!("BtreeIndex: failed to sync on drop: {e}");
@@ -862,8 +1009,11 @@ mod tests {
         );
     }
 
+    /// A torn tail (here: junk after the clean-close sentinel) makes the index unclean, and an
+    /// unclean index is never trusted on its own: closing it without `mark_consistent` leaves it
+    /// unsealed, and only a rebuild from the data log plus `mark_consistent` seals it again.
     #[test]
-    fn test_archive_btx_torn_tail_normalized() {
+    fn test_archive_btx_torn_tail_is_unclean_until_rebuilt() {
         use std::io::Write as _;
 
         let tmp = TempDir::with_prefix("test_archive_btx_torn").expect("temp dir");
@@ -894,20 +1044,33 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&file).expect("meta").len(), before + 3);
 
-        // A writable reopen normalizes the file back to exactly the committed pages; keys read
-        // back.
-        let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
-        for i in 0..2_000 {
-            assert_eq!(idx.load(&key_of(i)).expect("load"), i);
+        // The reopen reports unclean. Closing without a rebuild + `mark_consistent` must not seal
+        // it: the next open is unclean again.
+        {
+            let idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
+            assert!(idx.opened_unclean(), "a torn tail is an unclean close");
         }
-        idx.sync().expect("sync");
-        drop(idx);
+        let entries: Vec<([u8; 32], u64)> = (0..2_000).map(|i| (key_of(i), i)).collect();
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
+            assert!(idx.opened_unclean(), "an unclean index must not seal itself on close");
+            // The owner's recovery: rebuild from the data log, then mark consistent.
+            idx.rebuild_from(entries.iter().copied()).expect("rebuild");
+            idx.mark_consistent();
+        }
         assert_eq!(
             std::fs::metadata(&file).expect("meta").len(),
             before,
-            "torn tail should be trimmed to page_count pages"
+            "the rebuilt index seals to whole pages plus the sentinel"
         );
+        let idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
+        assert!(!idx.opened_unclean(), "rebuilt and marked consistent: sealed clean");
+        for (k, v) in &entries {
+            assert_eq!(idx.load(k).expect("load"), *v);
+        }
     }
 
     /// A btx shorter than its header's `page_count` — a growth's size extension lost in a crash,
@@ -945,6 +1108,220 @@ mod tests {
             short,
             "rejection leaves the file"
         );
+    }
+
+    #[test]
+    fn test_archive_btx_page_set() {
+        let mut set = PageSet::default();
+        for p in [1, 63, 64, 65, 200, 4_000] {
+            set.insert(p);
+        }
+        set.insert(64); // idempotent
+        assert!(
+            set.contains(63) && set.contains(4_000) && !set.contains(2) && !set.contains(9_999)
+        );
+        assert_eq!(set.drain().collect::<Vec<_>>(), vec![1, 63, 64, 65, 200, 4_000]);
+        assert!(!set.contains(1) && set.drain().next().is_none(), "drain empties the set");
+        set.insert(7);
+        set.clear();
+        assert!(!set.contains(7));
+    }
+
+    /// Overwrite `len` bytes at `offset` of a closed index file.
+    fn write_at(file: &Path, offset: u64, bytes: &[u8]) {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(file).expect("open rw");
+        f.seek(SeekFrom::Start(offset)).expect("seek");
+        f.write_all(bytes).expect("write");
+        f.sync_all().expect("sync");
+    }
+
+    /// A sealed 2,000-key index whose leftmost leaf (page 1, never the root at this size) was
+    /// zeroed at rest. Returns the index dir, its data header, and the smallest key (which lives
+    /// in that leaf).
+    fn sealed_index_with_zeroed_first_leaf(tmp: &TempDir) -> (PathBuf, DataHeader, [u8; 32]) {
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            for i in 0..2_000 {
+                idx.save(&key_of(i), i).expect("save");
+            }
+            assert_eq!(idx.header.first_leaf, 1, "the first leaf stays page 1 across splits");
+            assert_ne!(idx.header.root_page, 1, "page 1 must not be the root here");
+        }
+        write_at(&dir.join("index.btx"), PAGE_SIZE as u64, &[0_u8; PAGE_SIZE]);
+        let smallest = (0..2_000).map(key_of).min().expect("keys");
+        (dir, data_header, smallest)
+    }
+
+    /// A page zeroed AT REST in a sealed index is not laundered back to valid by a later sync,
+    /// and a lookup that reaches it surfaces `CorruptIndex` — not a silent `NotFound`. A zero CRC
+    /// trailer is the lazy-write marker only for a page the handle wrote since its last sync.
+    #[test]
+    fn test_archive_btx_zeroed_page_not_laundered_and_errors_on_read() {
+        let tmp = TempDir::with_prefix("test_archive_btx_zeroed").expect("temp dir");
+        let (dir, data_header, smallest) = sealed_index_with_zeroed_first_leaf(&tmp);
+
+        let idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
+        assert!(!idx.opened_unclean(), "content damage leaves the seal intact");
+        assert!(
+            matches!(idx.load(&smallest), Err(FetchError::CorruptIndex(_))),
+            "a lookup into the zeroed leaf must be CorruptIndex"
+        );
+        // The iterator fetches its first leaf eagerly, so the error may surface from `iter()`.
+        let first = idx.iter().and_then(|mut scan| scan.next().transpose());
+        assert!(
+            matches!(first, Err(FetchError::CorruptIndex(_))),
+            "a scan starting at the zeroed leaf must be CorruptIndex, got {first:?}"
+        );
+        drop(idx);
+
+        // A writable handle that syncs without touching the page must not stamp it valid.
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
+            idx.set_data_file_length(1_000); // force a real sync on close
+            idx.sync().expect("sync");
+        }
+        let idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("reopen ro");
+        assert_eq!(idx.page_crc_scan().dirty, 1, "the zeroed page stays dirty (not laundered)");
+    }
+
+    /// A `save` into a page that is damaged at rest is refused with `CorruptIndex`, rather than
+    /// overwriting it and having the next sync stamp it valid.
+    #[test]
+    fn test_archive_btx_save_into_at_rest_dirty_page_is_refused() {
+        let tmp = TempDir::with_prefix("test_archive_btx_refuse").expect("temp dir");
+        let (dir, data_header, smallest) = sealed_index_with_zeroed_first_leaf(&tmp);
+
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
+        // The all-zero key sorts first, so it descends into the zeroed leaf.
+        assert!(matches!(idx.save(&[0_u8; 32], 7), Err(AppendError::CorruptIndex(_))));
+        assert!(matches!(idx.remove(&smallest), Err(AppendError::CorruptIndex(_))));
+        idx.sync().expect("sync");
+        assert_eq!(idx.page_crc_scan().dirty, 1, "the refused page was not stamped valid");
+    }
+
+    /// A cleanly-sealed index whose root page fails its CRC is rejected at open (the writable
+    /// doors rebuild it, read-only refuses), rather than misreading every lookup.
+    #[test]
+    fn test_archive_btx_clean_open_rejects_corrupt_root_page() {
+        let tmp = TempDir::with_prefix("test_archive_btx_root").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let root = {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            for i in 0..2_000 {
+                idx.save(&key_of(i), i).expect("save");
+            }
+            idx.sync().expect("sync");
+            idx.header.root_page
+        };
+        write_at(&dir.join("index.btx"), BtreeIndex::page_offset(root) + 100, &[0xFF; 16]);
+        for read_only in [true, false] {
+            let Err(err) = BtreeIndex::open_btx_file(&dir, &data_header, 32, read_only) else {
+                panic!("a corrupt root must not open (read_only={read_only})");
+            };
+            assert!(matches!(err, LoadHeaderError::CrcFailed), "{err:?}");
+        }
+    }
+
+    /// A CRC-valid but absurd header (pages outside the tree, an impossible height) is rejected
+    /// as `InvalidIndexGeometry` instead of being descended.
+    #[test]
+    fn test_archive_btx_open_rejects_absurd_header() {
+        let tmp = TempDir::with_prefix("test_archive_btx_absurd").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let file = dir.join("index.btx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            for i in 0..2_000 {
+                idx.save(&key_of(i), i).expect("save");
+            }
+        }
+        let good = {
+            let bytes = std::fs::read(&file).expect("read");
+            BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("header")
+        };
+        let mutations: [(&str, fn(&mut BtreeHeader)); 5] = [
+            ("root past the tree", |h| h.root_page = h.page_count + 5),
+            ("root is the header page", |h| h.root_page = 0),
+            ("first leaf past the tree", |h| h.first_leaf = h.page_count),
+            ("zero height", |h| h.height = 0),
+            ("height over the descent cap", |h| h.height = MAX_DEPTH as u32 + 1),
+        ];
+        for (what, mutate) in mutations {
+            let mut bad = good.clone();
+            mutate(&mut bad);
+            write_at(&file, 0, &bad.to_page());
+            let Err(err) = BtreeIndex::open_btx_file(&dir, &data_header, 32, true) else {
+                panic!("{what}: an absurd header must not open");
+            };
+            assert!(matches!(err, LoadHeaderError::InvalidIndexGeometry), "{what}: {err:?}");
+        }
+        write_at(&file, 0, &good.to_page());
+        BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("the original header opens");
+    }
+
+    /// `set_remove_on_drop` deletes the index file on drop without syncing it (abandoning a
+    /// partial build).
+    #[test]
+    fn test_archive_btx_remove_on_drop_deletes_without_sync() {
+        let tmp = TempDir::with_prefix("test_archive_btx_remove_on_drop").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+        for i in 0..500 {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        idx.set_remove_on_drop();
+        drop(idx);
+        assert!(!dir.join("index.btx").exists(), "the abandoned index file is removed");
+    }
+
+    /// A read-only open never creates the index directory (it fails instead).
+    #[test]
+    fn test_archive_btx_read_only_open_does_not_create_dir() {
+        let tmp = TempDir::with_prefix("test_archive_btx_ro_dir").expect("temp dir");
+        let dir = tmp.path().join("absent");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        assert!(BtreeIndex::open_btx_file(&dir, &data_header, 32, true).is_err());
+        assert!(!dir.exists(), "a read-only open must not create the directory");
+    }
+
+    /// `data_file_length` is part of the header commit: it reaches disk only when the index is
+    /// synced, never on a bare `set_data_file_length`, so a second (read-only) handle sees the
+    /// last synced value.
+    #[test]
+    fn test_archive_btx_data_file_length_durable_only_at_sync() {
+        let tmp = TempDir::with_prefix("test_archive_btx_dfl").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+        idx.save(&key_of(1), 1).expect("save");
+        idx.sync().expect("sync");
+        let synced = idx.data_file_length();
+
+        idx.set_data_file_length(12_345);
+        let reader: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("open ro");
+        assert_eq!(reader.data_file_length(), synced, "an unsynced length is not visible");
+        drop(reader);
+
+        idx.sync().expect("sync");
+        let reader: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("open ro");
+        assert_eq!(reader.data_file_length(), 12_345, "the synced length is visible");
     }
 
     #[test]
