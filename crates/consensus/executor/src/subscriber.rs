@@ -151,6 +151,21 @@ impl<DB: Database> Subscriber<DB> {
             return Ok(());
         }
         let number = consensus_output.number();
+        let latest = self.inner.consensus_chain.latest_consensus_number();
+        match classify_sync_output(latest, number) {
+            SyncContinuity::Stale => {
+                debug!(target: "subscriber", number, latest, "skipping already saved sync output");
+                return Ok(());
+            }
+            SyncContinuity::Gap => {
+                error!(target: "subscriber", number, latest, "sync output does not follow the latest saved consensus output");
+                return Err(SubscriberError::SyncOutputGap {
+                    expected: latest + 1,
+                    received: number,
+                });
+            }
+            SyncContinuity::Next => {}
+        }
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
@@ -693,9 +708,44 @@ async fn drain_pending_on_shutdown<Fut>(
     }
 }
 
+/// Where a sync output's consensus number falls relative to the latest saved number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncContinuity {
+    /// At or below the latest saved number: already saved, skip it.
+    Stale,
+    /// Exactly the next number: save and forward it.
+    Next,
+    /// Past the next number: the outputs in between were lost.
+    Gap,
+}
+
+/// Classify a sync output's consensus `number` against the `latest` saved consensus number.
+///
+/// State sync only sends contiguous runs (it stops at the first output it cannot resolve and
+/// skips only a leading run at or below `latest`), and `latest` only moves when the subscriber
+/// saves, so the first output of every run is `latest + 1`: on a fresh chain, at an epoch start,
+/// after a mode change, through staging and through static packs. A larger number can only mean a
+/// lost output.
+///
+/// Mirrors `check_output_continuity` in `tn-node`'s epoch manager, which applies the same rule to
+/// outputs forwarded to the engine; it is not shared because `tn-node` depends on this crate.
+/// Checking here, before the save, keeps a lost output from being saved past.
+fn classify_sync_output(latest: u64, number: u64) -> SyncContinuity {
+    if number <= latest {
+        SyncContinuity::Stale
+    } else if number == latest + 1 {
+        SyncContinuity::Next
+    } else {
+        SyncContinuity::Gap
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{drain_pending_on_shutdown, Inner, Subscriber};
+    use super::{
+        classify_sync_output, drain_pending_on_shutdown, save_consensus, Inner, Subscriber,
+        SyncContinuity,
+    };
     use crate::{metrics::ExecutorMetrics, SubscriberError};
     use futures::{future, stream::FuturesOrdered};
     use std::{
@@ -1007,6 +1057,118 @@ mod tests {
         }
         producer.await.expect("the producer finishes once everything is consumed");
         assert_eq!(subscriber.inner.consensus_chain.latest_consensus_number(), OUTPUTS);
+    }
+
+    /// The sync-output guard's table: a number at or below the latest saved one is stale, exactly
+    /// one past it is next, and anything further is a gap.
+    #[test]
+    fn classify_sync_output_table() {
+        let cases = [
+            (0, 1, SyncContinuity::Next),
+            (5, 5, SyncContinuity::Stale),
+            (5, 0, SyncContinuity::Stale),
+            (5, 6, SyncContinuity::Next),
+            (5, 7, SyncContinuity::Gap),
+            (5, u64::MAX, SyncContinuity::Gap),
+        ];
+        for (latest, number, expected) in cases {
+            assert_eq!(
+                classify_sync_output(latest, number),
+                expected,
+                "latest {latest}, number {number}"
+            );
+        }
+    }
+
+    /// The guard agrees with what the consensus chain accepts: an output the chain already holds is
+    /// stale (and saving it again fails), the next number is accepted, and one past it is a gap
+    /// until the next number is saved.
+    #[tokio::test]
+    async fn sync_guard_matches_chain_state() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new().unwrap();
+        let mut consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+        let outputs = chained_outputs(&fixture, 5);
+        for output in &outputs[..3] {
+            save_consensus(output.clone(), &mut consensus_chain, consensus_bus.metrics())
+                .await
+                .expect("a contiguous output saves");
+        }
+        let latest = consensus_chain.latest_consensus_number();
+        assert_eq!(latest, 3);
+
+        assert_eq!(classify_sync_output(latest, outputs[1].number()), SyncContinuity::Stale);
+        assert!(
+            save_consensus(outputs[1].clone(), &mut consensus_chain, consensus_bus.metrics())
+                .await
+                .is_err(),
+            "the chain refuses an output it already holds",
+        );
+        assert_eq!(consensus_chain.latest_consensus_number(), 3, "a refused save keeps latest");
+        assert_eq!(classify_sync_output(latest, outputs[3].number()), SyncContinuity::Next);
+        assert_eq!(classify_sync_output(latest, outputs[4].number()), SyncContinuity::Gap);
+
+        save_consensus(outputs[3].clone(), &mut consensus_chain, consensus_bus.metrics())
+            .await
+            .expect("the next output saves");
+        let latest = consensus_chain.latest_consensus_number();
+        assert_eq!(latest, 4);
+        assert_eq!(classify_sync_output(latest, outputs[4].number()), SyncContinuity::Next);
+    }
+
+    /// `handle_sync_output` applies the guard before it saves: an output the chain already holds
+    /// is skipped without being saved again or forwarded, an output past the next number is
+    /// refused with `SyncOutputGap` and leaves the chain and `consensus_output` untouched, and the
+    /// next number still saves and forwards afterwards.
+    #[tokio::test]
+    async fn handle_sync_output_refuses_gap_and_skips_stale() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new().unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+        let subscriber = sync_subscriber(&fixture, consensus_chain, &consensus_bus);
+        let chain = &subscriber.inner.consensus_chain;
+        let outputs = chained_outputs(&fixture, 5);
+        let mut rx_consensus_output = consensus_bus.subscribe_consensus_output();
+
+        for output in &outputs[..3] {
+            subscriber.handle_sync_output(output.clone()).await.expect("a contiguous output saves");
+            let forwarded = rx_consensus_output.try_recv().expect("a saved output is forwarded");
+            assert_eq!(forwarded.number(), output.number());
+        }
+        assert_eq!(chain.latest_consensus_number(), 3);
+
+        // a stale output would fail the save, so it must be skipped before it
+        subscriber.handle_sync_output(outputs[1].clone()).await.expect("a stale output is skipped");
+        assert_eq!(chain.latest_consensus_number(), 3, "a stale output is not saved");
+        assert!(rx_consensus_output.try_recv().is_err(), "a stale output is not forwarded");
+
+        let err = subscriber
+            .handle_sync_output(outputs[4].clone())
+            .await
+            .expect_err("an output past the next number is refused");
+        assert!(
+            matches!(err, SubscriberError::SyncOutputGap { expected: 4, received: 5 }),
+            "expected SyncOutputGap {{ expected: 4, received: 5 }}, got {err:?}"
+        );
+        assert_eq!(chain.latest_consensus_number(), 3, "a refused output is not saved");
+        assert!(
+            !matches!(chain.consensus_header_by_number(5).await, Ok(Some(_))),
+            "a refused output is not persisted",
+        );
+        assert!(rx_consensus_output.try_recv().is_err(), "a refused output is not forwarded");
+
+        subscriber.handle_sync_output(outputs[3].clone()).await.expect("the next output saves");
+        assert_eq!(chain.latest_consensus_number(), 4, "the next output advances the chain");
+        let forwarded = rx_consensus_output.try_recv().expect("the next output is forwarded");
+        assert_eq!(forwarded.number(), 4);
     }
 }
 
