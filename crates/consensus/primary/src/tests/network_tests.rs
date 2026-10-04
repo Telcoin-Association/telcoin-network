@@ -11,7 +11,7 @@ mod vote_observation_tests {
     use futures::StreamExt as _;
     use rand::SeedableRng as _;
     use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
-    use tn_types::{Hash as _, Vote};
+    use tn_types::Vote;
     use tracing::{field::Field, span, Event, Metadata, Subscriber};
 
     /// Recorded fields of the existing committee request event.
