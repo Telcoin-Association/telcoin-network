@@ -1,6 +1,12 @@
 //! Tasks and helpers for collecting consensus headers and epoch pack files trustlessly.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
@@ -22,6 +28,14 @@ const PARTIAL_PACK_CATCHUP_THRESHOLD: u64 = 5;
 /// A backward walk that keeps failing to fetch one output warns on the first failure and then on
 /// every this many attempts (about every 100 s at the 5 s retry cap), and logs the rest at debug.
 const RETRY_WARN_EVERY: u64 = 20;
+/// Seconds between attempts at the current epoch's partial pack while no local pack can decode that
+/// epoch (see [`PartialPackGate`]).
+///
+/// Fixed, with no growth: each attempt opens at most `MAX_EPOCH_SYNC_PROBES` (3) sync streams, a
+/// peer that refuses is cached unsyncable for the epoch, and a peer that fails moves to the back of
+/// the probe order (`order_probe_peers`), so successive attempts work through the peer set until
+/// they reach one that serves. A growing backoff would only delay reaching that peer.
+const PARTIAL_PACK_RETRY_SECS: u64 = 30;
 
 enum ConsensusHeaderResult {
     Done,
@@ -145,6 +159,54 @@ struct WalkGuard {
 impl Drop for WalkGuard {
     fn drop(&mut self) {
         self.tracker.inner.lock().ranges.retain(|r| r.id != self.id);
+    }
+}
+
+/// Decides when the gossip handler may start a partial pack catch-up of the current epoch.
+///
+/// The first attempt is always allowed. After that an attempt is allowed only when none is in
+/// flight and the previous one started at least [`PARTIAL_PACK_RETRY_SECS`] earlier. The caller
+/// asks again only while no local pack decodes the gossiped epoch, the one state in which the
+/// backward walk cannot run at all, so an observer that merely lags a little keeps using the walk
+/// instead of re-streaming a small prefix every 30 s.
+#[derive(Default)]
+struct PartialPackGate {
+    /// Set while an attempt runs and cleared by its [`PartialPackFlight`] on drop.
+    in_flight: Arc<AtomicBool>,
+    /// When the most recent attempt started; `None` before the first.
+    last_attempt: Option<Instant>,
+}
+
+impl PartialPackGate {
+    /// True until the first attempt has started.
+    fn is_first(&self) -> bool {
+        self.last_attempt.is_none()
+    }
+
+    /// Start an attempt at `now`, or return `None` while one is in flight or the previous one
+    /// started less than [`PARTIAL_PACK_RETRY_SECS`] before `now`. Taking `now` as a parameter
+    /// keeps the backoff testable without a clock.
+    fn try_begin(&mut self, now: Instant) -> Option<PartialPackFlight> {
+        let backing_off = self.last_attempt.is_some_and(|last| {
+            now.saturating_duration_since(last) < Duration::from_secs(PARTIAL_PACK_RETRY_SECS)
+        });
+        if backing_off || self.in_flight.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        self.last_attempt = Some(now);
+        Some(PartialPackFlight { in_flight: self.in_flight.clone() })
+    }
+}
+
+/// Marks a partial pack attempt finished when dropped, including when its task panics or is
+/// cancelled, so a lost attempt cannot close the [`PartialPackGate`] for good.
+struct PartialPackFlight {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl Drop for PartialPackFlight {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -560,6 +622,13 @@ async fn get_consensus_header_range<DB: TNDatabase>(
 /// Deal with an incoming consensus header request.
 /// This exists to keep the select macro below smaller, hence the
 /// large parameter list.
+///
+/// The first gossip tries a partial pack of the current epoch, as does every later gossip (gated
+/// by `partial_gate`) while no local pack decodes the epoch `number` falls in. In that state a
+/// backward walk cannot fetch anything, so only the partial pack, or the full pack once the epoch
+/// closes, can make progress. No walk is started then: it would abort at once, and its
+/// `last_number` bump would leave a hole below the next walk's floor. Otherwise the gossip starts a
+/// backward walk down to the previous gossip point.
 #[allow(clippy::too_many_arguments)]
 async fn manage_new_consensus<DB: TNDatabase>(
     db: &DB,
@@ -571,7 +640,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
     epoch: Epoch,
     number: u64,
     hash: ConsensusHeaderDigest,
-    first_gossipped_epoch: &mut Option<Epoch>,
+    partial_gate: &mut PartialPackGate,
     last_number: &mut Option<u64>,
     current_fetch_epoch: &mut Epoch,
 ) {
@@ -579,9 +648,18 @@ async fn manage_new_consensus<DB: TNDatabase>(
     let consensus_bus_clone = consensus_bus.clone();
     let network_clone = network.clone();
     let consensus_chain_clone = consensus_chain.clone();
-    if first_gossipped_epoch.is_none() {
-        *first_gossipped_epoch = Some(epoch);
-        // On the first epoch we will try to do partial pack download to build retrieve consensus.
+    // map the number to an epoch the same way `request_consensus_output` does
+    let walk_epoch = consensus_chain.epochs().number_to_epoch(number);
+    let decodable = consensus_chain.staging_epoch() == Some(walk_epoch)
+        || consensus_chain.contains_decode_epoch(walk_epoch).await;
+    // the last three conditions are bails inside `try_partial_pack_catch_up`, checked here so an
+    // attempt that would bail does not start the backoff
+    let want_partial = (partial_gate.is_first() || !decodable)
+        && !consensus_bus.is_active_cvv()
+        && consensus_chain.staging_final().is_none()
+        && !consensus_chain.already_streaming_epoch(epoch);
+    let flight = want_partial.then(|| partial_gate.try_begin(Instant::now())).flatten();
+    if let Some(flight) = flight {
         let end_number = last_number.unwrap_or_default();
         let consensus_bus = consensus_bus.clone();
         let network = network.clone();
@@ -590,7 +668,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
         task_spawner.spawn_task(format!("partial pack catchup epoch {epoch}"), async move {
             // Bulk fast-path: if we're far behind on the in-progress current epoch, stream a verified
             // partial pack into staging in one shot instead of only crawling headers.
-            if !try_partial_pack_catch_up(
+            let caught_up = try_partial_pack_catch_up(
                 &consensus_bus,
                 &network,
                 &consensus_chain,
@@ -599,8 +677,14 @@ async fn manage_new_consensus<DB: TNDatabase>(
                 number,
                 hash,
             )
-            .await
-            {
+            .await;
+            // the gate tracks the partial pack attempt only, so a fallback walk below does not hold
+            // off the next attempt
+            drop(flight);
+            if caught_up {
+                return Ok(());
+            }
+            if consensus_chain.contains_decode_epoch(walk_epoch).await {
                 info!(target: "state-sync", "Failed to initialize a bulk current epoch {epoch} download, falling back to backwards download");
                 // If this fails then try to do "normal" backwards download.
                 // Note we do this no matter the tasks count "for free"
@@ -619,36 +703,37 @@ async fn manage_new_consensus<DB: TNDatabase>(
                     end_number,
                 )
                 .await;
+            } else {
+                info!(target: "state-sync", epoch, number, walk_epoch,
+                    "partial pack unavailable and no local pack decodes this epoch; next attempt in {PARTIAL_PACK_RETRY_SECS}s, or the full pack once the epoch closes");
             }
             Ok(())
         });
-    } else {
+    } else if decodable && walk_tracker.active() < 6 {
         // A loose throttle: the ledger read can race a walk finishing, but one walk more or less
         // does not matter, and the reservation below still keeps this walk from racing another over
         // the same range.
         // Skip for now, this number will be subsumed by gossip once enough tasks end.
-        if walk_tracker.active() < 6 {
-            let end_number = last_number.unwrap_or_default();
-            *last_number = Some(number + 1);
-            let guard = walk_tracker.reserve(end_number, number);
-            task_spawner.spawn_task(
-                format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
-                async move {
-                    let _guard = guard;
-                    get_consensus_header_range(
-                        number,
-                        hash,
-                        &db_clone,
-                        &consensus_bus_clone,
-                        &network_clone,
-                        &consensus_chain_clone,
-                        end_number,
-                    )
-                    .await;
-                    Ok(())
-                },
-            );
-        }
+        let end_number = last_number.unwrap_or_default();
+        *last_number = Some(number + 1);
+        let guard = walk_tracker.reserve(end_number, number);
+        task_spawner.spawn_task(
+            format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
+            async move {
+                let _guard = guard;
+                get_consensus_header_range(
+                    number,
+                    hash,
+                    &db_clone,
+                    &consensus_bus_clone,
+                    &network_clone,
+                    &consensus_chain_clone,
+                    end_number,
+                )
+                .await;
+                Ok(())
+            },
+        );
     }
 
     if *current_fetch_epoch < epoch {
@@ -679,7 +764,9 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     }
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
-    let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
+    // Gates the current-epoch partial pack: always on the first gossip, then retried while no
+    // local pack decodes the gossiped epoch.
+    let mut partial_gate = PartialPackGate::default();
     let mut last_number = None;
     // One ledger for every fetch walk (bulk backfill, gossip backfill, gap fill): it throttles how
     // many run at once and lets a gap fill defer to a walk already covering its range instead of
@@ -704,7 +791,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                     &task_spawner,
                     &walk_tracker,
                     epoch, number, hash,
-                    &mut first_gossipped_epoch,
+                    &mut partial_gate,
                     &mut last_number,
                     &mut current_fetch_epoch,
                 ).await;
@@ -779,9 +866,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tn_network_libp2p::types::NetworkCommand;
-    use tn_primary::network::{PrimaryRequest, PrimaryResponse};
+    use tn_primary::{
+        network::{PrimaryRequest, PrimaryResponse},
+        NodeMode,
+    };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::TaskManager;
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     type NetworkRx = mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>;
@@ -846,6 +937,88 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Err(TryRecvError::Empty)),
             "the walk must not issue a network command"
+        );
+    }
+
+    /// The partial pack gate lets the first attempt through, holds every other attempt while one
+    /// is in flight, and after that waits out the fixed backoff measured from when the previous
+    /// attempt started.
+    #[test]
+    fn partial_pack_gate_retries_after_backoff() {
+        let mut gate = PartialPackGate::default();
+        let t0 = Instant::now();
+        let backoff = Duration::from_secs(PARTIAL_PACK_RETRY_SECS);
+        assert!(gate.is_first());
+
+        let flight = gate.try_begin(t0).expect("the first attempt always starts");
+        assert!(!gate.is_first());
+        assert!(gate.try_begin(t0).is_none(), "no second attempt while one is in flight");
+        assert!(
+            gate.try_begin(t0 + backoff).is_none(),
+            "no second attempt while one is in flight, even past the backoff"
+        );
+
+        drop(flight);
+        assert!(gate.try_begin(t0 + Duration::from_secs(10)).is_none(), "inside the backoff");
+        let retry = gate.try_begin(t0 + backoff).expect("a retry starts once the backoff passes");
+        assert!(gate.try_begin(t0 + backoff * 3).is_none(), "the retry is in flight");
+        drop(retry);
+    }
+
+    /// Gossip for an epoch that no local pack decodes tries the partial pack and, when no peer
+    /// serves it, starts no backward walk: such a walk could fetch nothing, and before the fix its
+    /// `last_number` bump (to 12 on the second gossip here) left a hole and its reservation
+    /// blocked gap fills. The failed attempt leaves nothing in flight and starts the backoff.
+    #[tokio::test]
+    async fn manage_new_consensus_skips_walk_for_undecodable_epoch() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        // epoch 0 ends at 3, so 10 and 11 are in epoch 1, which has no local pack
+        save_epoch0_record(&chain, 3, ConsensusHeaderDigest::default()).await;
+        // a dropped receiver makes every probe fail at once, as when no peer serves the pack
+        let (network, rx) = test_network();
+        drop(rx);
+        let db = MemDatabase::default();
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.node_mode().send_replace(NodeMode::Observer);
+        let task_manager = TaskManager::new("t");
+        let spawner = task_manager.get_spawner();
+        let walk_tracker = WalkTracker::default();
+        let mut partial_gate = PartialPackGate::default();
+        let mut last_number = None;
+        // the epoch-0 record is already known, so no pack request is queued
+        let mut current_fetch_epoch = 1;
+
+        for number in [10, 11] {
+            manage_new_consensus(
+                &db,
+                &consensus_bus,
+                &network,
+                &chain,
+                &spawner,
+                &walk_tracker,
+                1,
+                number,
+                ConsensusHeaderDigest::default(),
+                &mut partial_gate,
+                &mut last_number,
+                &mut current_fetch_epoch,
+            )
+            .await;
+        }
+        assert_eq!(last_number, None, "no walk may claim heights it cannot fetch");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while partial_gate.in_flight.load(Ordering::Acquire) || walk_tracker.active() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed attempt must end without leaving a walk behind");
+        assert!(
+            partial_gate.try_begin(Instant::now()).is_none(),
+            "the failed attempt starts the retry backoff"
         );
     }
 
