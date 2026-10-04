@@ -10,6 +10,7 @@ use tn_test_utils as _;
 #[cfg(test)]
 use tn_test_utils_committee as _;
 
+use std::time::Duration;
 use tn_config::ConsensusConfig;
 use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
@@ -26,6 +27,12 @@ mod metrics;
 use crate::metrics::STATE_SYNC_METRICS;
 use consensus::spawn_track_recent_consensus;
 pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
+
+/// First delay before the consensus stream retries a failed step; doubled after each consecutive
+/// failure up to [`STREAM_RETRY_MAX_DELAY`].
+const STREAM_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+/// Upper bound on the consensus stream retry delay.
+const STREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
@@ -85,6 +92,10 @@ pub fn spawn_state_sync<DB: Database>(
                     Ok(())
                 },
             );
+            // not critical on purpose: the stream returns Ok at every epoch boundary before the
+            // epoch shutdown is noticed, which a critical task reports as CriticalExitOk and would
+            // fail every healthy epoch change (CvvInactive epochs included, they share this path).
+            // catch-up errors are retried inside the task instead of ending it.
             task_spawner.spawn_task(
                 "state sync: stream consensus headers",
                 async move {
@@ -217,12 +228,28 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
-    // A failed lookup aborts this task (the spawner logs and surfaces the error); only a
-    // genuinely absent header (fresh chain) defaults so streaming starts from genesis.
-    let mut last_consensus_header =
-        consensus_bus.last_consensus_block(&consensus_chain).await?.unwrap_or_default();
-    let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
+    // A failed lookup is retried with backoff (nothing restarts this task if it ends, and shutdown
+    // still interrupts the wait); only a genuinely absent header (fresh chain) defaults so
+    // streaming starts from genesis.
+    let mut retry_delay = STREAM_RETRY_INITIAL_DELAY;
+    let mut last_consensus_header = loop {
+        match consensus_bus.last_consensus_block(&consensus_chain).await {
+            Ok(header) => break header.unwrap_or_default(),
+            Err(e) => {
+                STATE_SYNC_METRICS.stream_errors_total.increment(1);
+                error!(target: "state-sync", ?epoch, ?retry_delay,
+                    "failed to read the last consensus header, retrying: {e}");
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    _ = &rx_shutdown => return Ok(()),
+                }
+                retry_delay = retry_delay.saturating_mul(2).min(STREAM_RETRY_MAX_DELAY);
+            }
+        }
+    };
+    retry_delay = STREAM_RETRY_INITIAL_DELAY;
+    let mut last_consensus_height = last_consensus_header.number;
 
     // Catch-up tuning (observer-only): how long to poll local storage between catch-up attempts
     // and how many no-progress polls to tolerate before asking the fetch task to backfill. Copied
@@ -260,15 +287,17 @@ async fn spawn_stream_consensus_headers<DB: Database>(
             let mut no_progress_count = 0u32;
             loop {
                 let prev_height = last_consensus_height;
-                last_consensus_header = catch_up_consensus_from_to(
+                // on error too, the header names the last output applied or skipped, so the
+                // retry resumes there and never re-sends an output already queued for execution
+                let caught_up = catch_up_consensus_from_to(
                     &consensus_bus,
-                    last_consensus_header,
+                    &mut last_consensus_header,
                     pending_header.clone(),
                     config.node_storage(),
                     &consensus_chain,
                     epoch,
                 )
-                .await?;
+                .await;
                 if last_consensus_header.sub_dag.leader_epoch() > epoch {
                     return Ok(());
                 }
@@ -276,6 +305,28 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                 STATE_SYNC_METRICS
                     .headers_fetched_total
                     .increment(last_consensus_height.saturating_sub(prev_height));
+
+                if let Err(e) = caught_up {
+                    // a mismatched cache entry was already removed, so the retry refetches it
+                    // through the stall and gap path below; a real fork keeps failing here, logged
+                    // and counted on every attempt instead of silently halting the stream
+                    STATE_SYNC_METRICS.stream_errors_total.increment(1);
+                    error!(target: "state-sync", ?epoch, last_consensus_height,
+                        target = pending_header.number, ?retry_delay,
+                        "consensus catch-up failed, retrying: {e}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_delay) => {}
+                        _ = &rx_shutdown => return Ok(()),
+                    }
+                    retry_delay = retry_delay.saturating_mul(2).min(STREAM_RETRY_MAX_DELAY);
+                    continue;
+                }
+                if last_consensus_height > prev_height {
+                    // only progress resets the backoff: a pass that stops on a cache miss also
+                    // returns Ok, and resetting there would pin a persistent failure at the
+                    // initial delay
+                    retry_delay = STREAM_RETRY_INITIAL_DELAY;
+                }
 
                 if last_consensus_height >= pending_header.number {
                     break; // Fully caught up to the target.
@@ -344,10 +395,15 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 ///
 /// This function does not itself query peers: the backward traversal spawned by
 /// `spawn_track_recent_consensus` / `spawn_fetch_recent_consensus` is what fetches missing outputs
-/// into the cache. On a cache miss for an output that has not been fetched yet, it returns the last
-/// applied header early, leaving the caller (`spawn_stream_consensus_headers`) to re-drive a
-/// request for the missing range.
-/// Returns the last ConsensusHeader that was applied on success.
+/// into the cache. On a cache miss for an output that has not been fetched yet, it returns early,
+/// leaving the caller (`spawn_stream_consensus_headers`) to re-drive a request for the missing
+/// range.
+///
+/// Progress is written through `from`, on success and on error alike: it holds the last header
+/// applied (sent for execution) or skipped (already saved), or the first header of the next epoch,
+/// which ends the walk. After an error the caller resumes from it. Re-reading the last consensus
+/// block (the executed tip) instead would re-send outputs still queued in `sync_output` but not yet
+/// saved, which the subscriber rejects as `NonMonotonicConsensusNumber`.
 ///
 /// A fresh node (`from` is the default header at number 0) anchors block 1 on the
 /// `parent_hash` block 1 carries rather than on `from.digest()`. The default header's digest is
@@ -357,12 +413,12 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// the default anchor adds no integrity. The strict parent check applies from block 2 on.
 async fn catch_up_consensus_from_to<DB: Database>(
     consensus_bus: &ConsensusBusApp,
-    from: ConsensusHeader,
+    from: &mut ConsensusHeader,
     max_consensus: ConsensusHeader,
     db: &DB,
     consensus_chain: &ConsensusChain,
     epoch: Epoch,
-) -> eyre::Result<ConsensusHeader> {
+) -> eyre::Result<()> {
     // number 0 is only reachable from the default header a fresh node starts from
     let fresh_start = from.number == 0;
     let mut last_parent = from.digest();
@@ -372,9 +428,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let max_consensus_height = max_consensus.number;
     let catchup_distance = max_consensus_height.saturating_sub(last_consensus_height);
     if last_consensus_height >= max_consensus_height {
-        return Ok(from);
+        return Ok(());
     }
-    let mut result_header = from;
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
         // Resolve the full, verified ConsensusOutput for this number: from the sync cache (pulled
@@ -397,12 +452,13 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 );
             }
             // We should have the required outputs in local storage by now...
-            return Ok(result_header);
+            return Ok(());
         };
         let consensus_header = output.consensus_header();
         if consensus_header.sub_dag.leader_epoch() > epoch {
             // Don't outrun the epoch and produce next epochs output.
-            return Ok(consensus_header);
+            *from = consensus_header;
+            return Ok(());
         }
         if from_cache {
             let _ = db.remove::<ConsensusCache>(&number); // Done with this cache entry.
@@ -434,17 +490,24 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
+            let source = if from_cache { "cache" } else { "pack" };
             error!(
                 target: "tn::observer",
                 block_number = number,
+                local_parent = ?parent_hash,
+                header_parent = ?consensus_header.parent_hash,
+                source,
                 "consensus header digest mismatch - possible fork detected"
             );
-            return Err(eyre::eyre!("consensus header digest mismatch!"));
+            return Err(eyre::eyre!(
+                "consensus header digest mismatch at block {number}: local parent {parent_hash:?}, header parent {:?}, output from {source}",
+                consensus_header.parent_hash
+            ));
         }
         if consensus_header.number <= consensus_chain.latest_consensus_number() {
             // We have already processed this consensus so ignore it (advance the parent chain
             // only).
-            result_header = consensus_header;
+            *from = consensus_header;
             continue;
         }
 
@@ -469,11 +532,12 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
         // Deliver the full, verified output (with batches) for execution. The queue is bounded, so
         // this send blocks while the subscriber is behind; the epoch task manager aborts this task
-        // at teardown, so a blocked send cannot outlive the epoch.
-        result_header = consensus_header;
+        // at teardown, so a blocked send cannot outlive the epoch. Record the header as progress
+        // only once the output is queued, so `from` never names an output that was not sent.
         consensus_bus.sync_output().send(output).await?;
+        *from = consensus_header;
     }
-    Ok(result_header)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -612,16 +676,17 @@ mod tests {
 
         // both outputs are at or below the chain's latest number, so catch-up only walks the
         // parent chain: no execution wait and no send to the subscriber
-        let reached = catch_up_consensus_from_to(
+        let mut from = ConsensusHeader::default();
+        catch_up_consensus_from_to(
             &ConsensusBusApp::new(),
-            ConsensusHeader::default(),
+            &mut from,
             block2.consensus_header(),
             &MemDatabase::default(),
             &chain,
             fixture.committee().epoch(),
         )
         .await?;
-        assert_eq!(reached.number, 2, "catch-up must walk past block 1 to the target");
+        assert_eq!(from.number, 2, "catch-up must walk past block 1 to the target");
         Ok(())
     }
 
@@ -636,9 +701,10 @@ mod tests {
         let db = MemDatabase::default();
         db.insert::<ConsensusCache>(&2, &forked2)?;
 
+        let mut from = ConsensusHeader::default();
         let err = catch_up_consensus_from_to(
             &ConsensusBusApp::new(),
-            ConsensusHeader::default(),
+            &mut from,
             forked2.consensus_header(),
             &db,
             &chain,
@@ -647,9 +713,55 @@ mod tests {
         .await
         .expect_err("a wrong parent after block 1 must be rejected");
         assert!(err.to_string().contains("digest mismatch"), "unexpected error: {err}");
+        assert!(err.to_string().contains("at block 2"), "rejected the wrong block: {err}");
         // the cache entry is consumed just before the check, so its absence proves the walk
         // accepted block 1 and rejected block 2 (not block 1)
         assert!(db.get::<ConsensusCache>(&2)?.is_none(), "catch-up never reached block 2");
+        // the error keeps the caller's progress: block 1 was walked and stays recorded
+        assert_eq!(from.number, 1, "progress before the error must survive it");
+        Ok(())
+    }
+
+    /// A catch-up error (here a digest mismatch on block 2) must not end the stream task, which is
+    /// not critical and would otherwise leave the subscriber waiting forever. The task logs, backs
+    /// off and retries, and shutdown still ends it during the backoff.
+    #[tokio::test]
+    async fn stream_task_survives_digest_mismatch() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (base_config, node_storage, key_config) = {
+            let authority = fixture.authorities().next().expect("fixture yields an authority");
+            let cc = authority.consensus_config();
+            (cc.config().clone(), cc.node_storage().clone(), cc.key_config().clone())
+        };
+        let config = ConsensusConfig::new_with_committee_for_test(
+            base_config,
+            node_storage.clone(),
+            key_config,
+            fixture.committee(),
+            NetworkConfig::default(),
+        )?;
+        let temp_dir = TempDir::new()?;
+        let (chain, _block1) = chain_with_block1(&fixture, &temp_dir).await?;
+        let forked2 = output_at(&fixture, 2, wrong_parent());
+        node_storage.insert::<ConsensusCache>(&2, &forked2)?;
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.last_consensus_header().send_replace(Some(forked2.consensus_header()));
+        let shutdown = config.shutdown().clone();
+
+        let handle = tokio::spawn(spawn_stream_consensus_headers(config, consensus_bus, chain));
+
+        // the mismatch happens at once; the task must now be parked in its retry backoff
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!handle.is_finished(), "a catch-up error must not end the stream task");
+        assert!(
+            node_storage.get::<ConsensusCache>(&2)?.is_none(),
+            "the mismatched cache entry is dropped so the retry refetches it"
+        );
+
+        shutdown.notify();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown must interrupt the retry backoff")??;
         Ok(())
     }
 }
