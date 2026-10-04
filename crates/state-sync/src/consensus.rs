@@ -19,11 +19,17 @@ const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
 /// bulk-downloading a verified partial pack (into staging) rather than crawling headers one at a
 /// time. Small gaps stay on the cheap header-by-header path.
 const PARTIAL_PACK_CATCHUP_THRESHOLD: u64 = 5;
+/// A backward walk that keeps failing to fetch one output warns on the first failure and then on
+/// every this many attempts (about every 100 s at the 5 s retry cap), and logs the rest at debug.
+const RETRY_WARN_EVERY: u64 = 20;
 
 enum ConsensusHeaderResult {
     Done,
     Continue(u64, ConsensusHeaderDigest),
     Retry,
+    /// No local pack (or staging) can decode this epoch, so no peer's output for it can be
+    /// verified until its pack arrives; the walk must stop rather than retry.
+    Abort(Epoch),
 }
 
 /// A single consensus-height range `[floor..=ceil]` currently being walked by a fetch task.
@@ -152,6 +158,12 @@ impl Drop for WalkGuard {
 /// peer penalized) without ever materializing it. This upholds the invariant that we never
 /// cache/execute an output that is not verified (directly by gossip, or as an ancestor of one). The
 /// walk proceeds recent→earliest, so each cached entry is a verified output.
+///
+/// Returns [`ConsensusHeaderResult::Abort`] without touching the network when `number` falls in an
+/// epoch that no local pack or staging pack can decode: `request_consensus_output` refuses that
+/// case on every attempt, so a retry could only succeed after the epoch's pack arrives, and that
+/// arrival raises the stream target on its own. `attempt` counts the consecutive failed attempts
+/// at this height and only rate-limits the retry warning.
 async fn get_consensus_output<DB: TNDatabase>(
     number: u64,
     hash: ConsensusHeaderDigest,
@@ -159,6 +171,7 @@ async fn get_consensus_output<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
+    attempt: u64,
 ) -> ConsensusHeaderResult {
     // Already in a pack file (chain/staging) -> done.
     if consensus_chain.consensus_header_by_number(number).await.ok().flatten().is_some() {
@@ -173,6 +186,11 @@ async fn get_consensus_output<DB: TNDatabase>(
             ConsensusHeaderResult::Done
         };
     }
+    // the same test `request_consensus_output` makes, done before any network round trip
+    let epoch = consensus_chain.epochs().number_to_epoch(number);
+    if !consensus_chain.contains_decode_epoch(epoch).await {
+        return ConsensusHeaderResult::Abort(epoch);
+    }
     // Pull, stream-decode, and header-hash-verify the output from any peer in one shot. The v1
     // pack is header-first, so the fetch checks the decoded header digest against `hash` before
     // buffering batches and returns only a verified output; a wrong-hash peer is penalized and
@@ -180,8 +198,12 @@ async fn get_consensus_output<DB: TNDatabase>(
     let output = match network.request_consensus_output(number, consensus_chain, hash).await {
         Ok(output) => output,
         Err(e) => {
-            // Includes no peer serving it yet, or not yet holding this epoch's committee/pack.
-            warn!(target: "tn::observer", %e, ?hash, ?number, "failed to fetch/verify consensus output from peer, will retry");
+            // includes no peer serving it yet
+            if attempt.is_multiple_of(RETRY_WARN_EVERY) {
+                warn!(target: "tn::observer", %e, ?hash, ?number, attempt, "failed to fetch/verify consensus output from peer, will retry");
+            } else {
+                debug!(target: "tn::observer", %e, ?hash, ?number, attempt, "failed to fetch/verify consensus output from peer, will retry");
+            }
             return ConsensusHeaderResult::Retry;
         }
     };
@@ -472,6 +494,10 @@ pub async fn spawn_fetch_consensus(
 
 /// Retrieve a consensus headers from a peer.
 /// Start at number/hash and work backwards to end number.
+///
+/// The walk gives up when it reaches an epoch that no local pack can decode (see
+/// [`get_consensus_output`]); returning drops the caller's [`WalkGuard`], which releases its range
+/// so gap fills under it are no longer deferred to a walk that cannot progress.
 async fn get_consensus_header_range<DB: TNDatabase>(
     number: u64,
     hash: ConsensusHeaderDigest,
@@ -489,8 +515,18 @@ async fn get_consensus_header_range<DB: TNDatabase>(
     let mut hash = hash;
     let mut count = 1;
     let mut retries = 0;
+    let mut attempts = 0;
     loop {
-        match get_consensus_output(number, hash, db, consensus_bus, network, consensus_chain).await
+        match get_consensus_output(
+            number,
+            hash,
+            db,
+            consensus_bus,
+            network,
+            consensus_chain,
+            attempts,
+        )
+        .await
         {
             ConsensusHeaderResult::Continue(next_number, next_hash) => {
                 number = next_number;
@@ -503,13 +539,19 @@ async fn get_consensus_header_range<DB: TNDatabase>(
                 }
                 count += 1;
                 retries = 0;
+                attempts = 0;
             }
             ConsensusHeaderResult::Done => break,
             ConsensusHeaderResult::Retry => {
                 if retries < 5 {
                     retries += 1;
                 }
+                attempts += 1;
                 tokio::time::sleep(Duration::from_secs(retries)).await;
+            }
+            ConsensusHeaderResult::Abort(epoch) => {
+                warn!(target: "state-sync", epoch, ?number, ?end_number, "no local pack decodes this epoch; abandoning backward walk");
+                break;
             }
         }
     }
@@ -735,6 +777,77 @@ pub async fn request_missing_packs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use tn_network_libp2p::types::NetworkCommand;
+    use tn_primary::network::{PrimaryRequest, PrimaryResponse};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+    use tokio::sync::mpsc::{self, error::TryRecvError};
+
+    type NetworkRx = mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>;
+
+    /// A fresh chain whose only pack is the (current) epoch-0 pack.
+    async fn test_chain(dir: &TempDir, fixture: &CommitteeFixture<MemDatabase>) -> ConsensusChain {
+        ConsensusChain::new_for_test(dir.path().to_owned(), fixture.committee())
+            .await
+            .expect("test consensus chain")
+    }
+
+    /// A network handle plus its command receiver. Holding the receiver without answering makes
+    /// every network call hang; dropping it makes every network call fail at once.
+    fn test_network() -> (PrimaryNetworkHandle, NetworkRx) {
+        let (tx, rx) = mpsc::channel(16);
+        (PrimaryNetworkHandle::new_for_test(tx), rx)
+    }
+
+    /// Save the epoch-0 record ending at `final_number`, so every higher consensus number maps to
+    /// epoch 1.
+    async fn save_epoch0_record(
+        chain: &ConsensusChain,
+        final_number: u64,
+        final_hash: ConsensusHeaderDigest,
+    ) {
+        let record = EpochRecord {
+            epoch: 0,
+            final_consensus: ConsensusNumHash::new(final_number, final_hash),
+            ..EpochRecord::default()
+        };
+        chain.epochs().save_record(record).await.expect("save epoch 0 record");
+    }
+
+    /// A backward walk from a height in an epoch that no local pack can decode must end at once
+    /// without touching the network. `request_consensus_output` refuses such an epoch on every
+    /// attempt, so before the fix the walk retried forever and its range reservation blocked
+    /// every gap fill under it.
+    #[tokio::test]
+    async fn backward_walk_aborts_on_undecodable_epoch() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        // epoch 0 ends at 3, so 10 is in epoch 1, which has no local pack
+        save_epoch0_record(&chain, 3, ConsensusHeaderDigest::default()).await;
+        // never answered: a network call would hang the walk
+        let (network, mut rx) = test_network();
+        let db = MemDatabase::default();
+        let consensus_bus = ConsensusBusApp::new();
+
+        let walk = get_consensus_header_range(
+            10,
+            ConsensusHeaderDigest::default(),
+            &db,
+            &consensus_bus,
+            &network,
+            &chain,
+            0,
+        );
+        tokio::time::timeout(Duration::from_secs(1), walk)
+            .await
+            .expect("a walk over an undecodable epoch must return");
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "the walk must not issue a network command"
+        );
+    }
 
     /// The shared walk ledger is what keeps a catch-up gap fill from racing a walk that already
     /// covers its range: it defers while such a walk is in flight, still fires for a range no walk
