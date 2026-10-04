@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
+    future::Future,
     io::Write,
     net::SocketAddr,
     path::PathBuf,
@@ -230,6 +231,28 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
     Ok(())
 }
 
+/// Confirm the authenticated target after a successful or potentially raced dial.
+async fn dial_and_confirm<F>(handle: &Handle, target: BlsPublicKey, dial: F) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), NetworkError>>,
+{
+    let outcome = dial.await;
+    if outcome.as_ref().is_err_and(|error| {
+        !matches!(
+            error,
+            NetworkError::AlreadyDialing(_)
+                | NetworkError::AlreadyConnected(_)
+                | NetworkError::Dial(_)
+        )
+    }) {
+        outcome.map_err(eyre::Report::from)
+    } else {
+        connected(handle, target, true).await.map_err(|confirmation_error| {
+            outcome.err().map(eyre::Report::from).unwrap_or(confirmation_error)
+        })
+    }
+}
+
 impl Peer {
     /// Observe the next accepted delivery through a distinct authenticated forwarding peer.
     async fn gossip(&self, not_before_unix_us: u128) -> Result<Value> {
@@ -288,21 +311,7 @@ impl Peer {
             } else if require_existing {
                 Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
             }
-            let confirm = handle.clone();
-            futures::TryFutureExt::or_else(handle.dial_by_bls(key), |error| async move {
-                if matches!(
-                    &error,
-                    NetworkError::AlreadyDialing(_) | NetworkError::AlreadyConnected(_)
-                ) {
-                    Ok(())
-                } else if matches!(&error, NetworkError::Dial(_)) {
-                    connected(&confirm, key, true).await.map_err(|_| error)
-                } else {
-                    Err(error)
-                }
-            })
-            .await?;
-            connected(&handle, key, true).await
+            dial_and_confirm(&handle, key, handle.dial_by_bls(key)).await
         }))
         .await?;
         self.connectivity().await
@@ -525,22 +534,16 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                 futures::future::try_join_all(gateways.into_iter().map(|(key, gateway)| {
                     let handle = handle.clone();
                     async move {
-                        handle
-                            .add_trusted_peer_and_dial(
+                        dial_and_confirm(
+                            &handle,
+                            key,
+                            handle.add_trusted_peer_and_dial(
                                 key,
                                 gateway.network_key,
                                 gateway.network_address,
-                            )
-                            .await
-                            .or_else(|error| {
-                                matches!(
-                                    &error,
-                                    NetworkError::AlreadyDialing(_)
-                                        | NetworkError::AlreadyConnected(_)
-                                )
-                                .then_some(())
-                                .ok_or(error)
-                            })
+                            ),
+                        )
+                        .await
                     }
                 }))
                 .await?;
@@ -595,16 +598,16 @@ async fn run_peer(args: RunArgs) -> Result<()> {
         slots: Arc::new(Semaphore::new(16)),
         gossip: Mutex::new(gossip_rx),
     });
-    let startup = futures::future::try_join_all(peer.handles.iter().map(|(_, handle)| async {
-        futures::future::try_join_all(peer.config.required_hubs.iter().map(|key| async {
-            handle.dial_by_bls(*key).await?;
-            connected(handle, *key, true).await
+    let startup =
+        futures::future::try_join_all(peer.handles.iter().map(|(_, handle)| async {
+            futures::future::try_join_all(peer.config.required_hubs.iter().map(|key| async {
+                dial_and_confirm(handle, *key, handle.dial_by_bls(*key)).await
+            }))
+            .await
         }))
         .await
-    }))
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string());
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     let listener = tokio::net::TcpListener::bind(peer.config.control).await?;
     let public = json!({"identity": peer.identity, "bls_key": keys.primary_public_key(), "control": listener.local_addr()?, "startup_error": startup.err(), "swarms": roles.into_iter().zip(peer.config.listen.iter()).map(|(role, address)| {
         let key = match role { NetworkType::Primary => keys.primary_network_public_key(), NetworkType::Worker(id) => keys.worker_network_public_key(id) };
@@ -660,7 +663,103 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Deployment domain and authenticated dial confirmation regressions.
+
     use super::*;
+    use tn_network_libp2p::types::NetworkCommand;
+
+    /// Supply one authenticated peer observation through the real handle command channel.
+    async fn observe_peer(
+        receiver: &mut mpsc::Receiver<NetworkCommand<Message, Message>>,
+        peer: BlsPublicKey,
+    ) -> Result<()> {
+        let command = receiver.recv().await.ok_or_else(|| eyre!("peer observation missing"))?;
+        if let NetworkCommand::ConnectedPeers { reply } = command {
+            reply.send(vec![peer]).map_err(|_| eyre!("peer observation canceled"))
+        } else {
+            Err(eyre!("expected authenticated peer observation"))
+        }
+    }
+
+    /// A rejected trusted dial becomes ready only after the target identity is established.
+    #[tokio::test]
+    async fn rejected_trusted_dial_waits_for_authenticated_target() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(4476)));
+        let wrong_keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(4477)));
+        let target = keys.primary_public_key();
+        let wrong = wrong_keys.primary_public_key();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let handle = Handle::new(sender);
+        let dial = handle.add_trusted_peer_and_dial(
+            target,
+            keys.primary_network_public_key(),
+            "/ip4/127.0.0.1/udp/9000/quic-v1".parse()?,
+        );
+        let commands = async {
+            let command =
+                receiver.recv().await.ok_or_else(|| eyre!("trusted dial command missing"))?;
+            let reply =
+                if let NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, reply, .. } = command {
+                    assert_eq!(bls_pubkey, target);
+                    Ok(reply)
+                } else {
+                    Err(eyre!("expected trusted dial command"))
+                }?;
+            reply
+                .send(Err(NetworkError::Dial("opaque pending dial rejection".to_owned())))
+                .map_err(|_| eyre!("trusted dial reply canceled"))?;
+            observe_peer(&mut receiver, wrong).await?;
+            observe_peer(&mut receiver, target).await
+        };
+        let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(dial_and_confirm(&handle, target, dial), commands)
+        })
+        .await?;
+        commands?;
+        result
+    }
+
+    /// Failed authenticated observation preserves the original opaque dial error.
+    #[tokio::test]
+    async fn rejected_bls_dial_keeps_error_when_observation_fails() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(4476)));
+        let target = keys.primary_public_key();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let handle = Handle::new(sender);
+        let original = "original opaque dial rejection";
+        let commands = async {
+            let command = receiver.recv().await.ok_or_else(|| eyre!("BLS dial command missing"))?;
+            let reply = if let NetworkCommand::DialBls { bls_key, reply } = command {
+                assert_eq!(bls_key, target);
+                Ok(reply)
+            } else {
+                Err(eyre!("expected BLS dial command"))
+            }?;
+            reply
+                .send(Err(NetworkError::Dial(original.to_owned())))
+                .map_err(|_| eyre!("BLS dial reply canceled"))?;
+            let command = receiver.recv().await.ok_or_else(|| eyre!("peer observation missing"))?;
+            if let NetworkCommand::ConnectedPeers { reply } = command {
+                drop(reply);
+                Ok::<_, eyre::Report>(())
+            } else {
+                Err(eyre!("expected authenticated peer observation"))
+            }
+        };
+        let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(dial_and_confirm(&handle, target, handle.dial_by_bls(target)), commands)
+        })
+        .await?;
+        commands?;
+        let error = result.expect_err("missing observation must fail readiness");
+        assert!(
+            matches!(error.downcast_ref::<NetworkError>(), Some(NetworkError::Dial(message)) if message == original)
+        );
+        Ok(())
+    }
 
     #[test]
     fn deployment_chain_overrides_non_persisted_network_domain() -> Result<()> {
