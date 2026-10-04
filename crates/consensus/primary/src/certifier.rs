@@ -16,7 +16,7 @@ use tn_types::{
     AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
     Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, enabled, error, info, instrument, warn};
 
 #[cfg(test)]
@@ -560,21 +560,36 @@ impl<DB: Database> Certifier<DB> {
     async fn run(self, mut rx_headers: impl TnReceiver<Header>) -> TaskResult {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let shutdown = &self.config.shutdown().subscribe();
+        let mut active_proposal: Option<(HeaderDigest, oneshot::Receiver<()>)> = None;
         loop {
             tokio::select! {
                 // receive headers from proposer
                 Some(header) = rx_headers.recv() => {
                     debug!(target: "primary::certifier", ?header, "{:?} received header!", &self.authority_id);
 
-                    // cancel any outstanding proposals and vote requests
-                    self.new_proposal.notify();
+                    // Preserve pending votes when the proposer retransmits the same header.
+                    // Completed proposals still run again to republish their stored certificate.
+                    let collecting_same_header = active_proposal.as_mut().is_some_and(|(digest, completed)| {
+                        *digest == header.digest()
+                            && matches!(completed.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+                    });
+                    if !collecting_same_header {
+                        // cancel any outstanding proposals and vote requests
+                        self.new_proposal.notify();
 
-                    // spawn certifier task so new proposals can cancel
-                    let certifier = self.clone();
-                    self.task_spawner.spawn_task(
-                        format!("propose-header-{:?}", header.digest()),
-                        certifier.spawn_header_proposal(header)
-                    );
+                        // spawn certifier task so new proposals can cancel
+                        let certifier = self.clone();
+                        let (completed, completion) = oneshot::channel();
+                        active_proposal = Some((header.digest(), completion));
+                        self.task_spawner.spawn_task(
+                            format!("propose-header-{:?}", header.digest()),
+                            async move {
+                                let result = certifier.spawn_header_proposal(header).await;
+                                let _ = completed.send(());
+                                result
+                            }
+                        );
+                    }
                 },
 
                 // listen for consensus shutdown

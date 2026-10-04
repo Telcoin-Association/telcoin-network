@@ -56,7 +56,6 @@ use tn_test_utils as _;
 use tower as _;
 use tower_http as _;
 use tracing as _;
-use tracing_subscriber as _;
 use url as _;
 
 /// Command-line input paths, frozen into the workload manifest.
@@ -672,7 +671,14 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Mode::Run(args) => run_peer(args).await,
+        Mode::Run(args) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_ansi(false)
+                .with_writer(std::io::stderr)
+                .init();
+            run_peer(args).await
+        }
     }
 }
 

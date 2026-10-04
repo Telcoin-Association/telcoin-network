@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -24,6 +25,10 @@ class Peer:
         self.phase = phase
         self.binary = binary
         self.lock = threading.Lock()
+        self.condition = threading.Condition()
+        self.command_slots = threading.BoundedSemaphore(72)
+        self.active_forwards = 0
+        self.restarting = False
         self.lifecycle_lock = threading.RLock()
         self.stopping = False
         self.generation = -1
@@ -79,28 +84,88 @@ class Peer:
     def command(self, request):
         if self.stopping:
             raise ValueError("peer supervisor is shutting down")
-        if request["scenario"] != "shared_nat_reconnect" and not self.declaration["nat"]:
-            if self.stopping:
-                raise ValueError("peer supervisor is shutting down")
-            return self.forward(request, request, None)
-        with self.lock:
-            if self.stopping:
-                raise ValueError("peer supervisor is shutting down")
+        # Match the existing server's 72-handler bound without adding queued application work.
+        if not self.command_slots.acquire(blocking=False):
+            raise ValueError("peer control admission exhausted")
+        entered = time.monotonic_ns()
+        leased = False
+        started = None
+        generation = None
+        process = None
+        try:
             restart = None
             if request["scenario"] == "shared_nat_reconnect":
-                if not self.declaration["nat"] or self.process.poll() is not None:
-                    raise ValueError("shared-NAT restart requires the existing declared NAT peer")
-                old_pid = self.process.pid
-                self.stop()
-                self.start()
-                public = self.wait_ready()
-                restart = {"old_pid": old_pid, "new_pid": self.process.pid,
-                           "generation": self.generation, "public_ready": public}
-                # The old process is gone. Check both live connections in the replacement process.
+                with self.lock:
+                    with self.condition:
+                        self.restarting = True
+                    try:
+                        with self.condition:
+                            self.condition.wait_for(lambda: not self.active_forwards or self.stopping)
+                            if self.stopping:
+                                raise ValueError("peer supervisor is shutting down")
+                        if not self.declaration["nat"] or self.process is None or self.process.poll() is not None:
+                            raise ValueError("shared-NAT restart requires the existing declared NAT peer")
+                        old_pid = self.process.pid
+                        self.stop()
+                        self.start()
+                        public = self.wait_ready()
+                        restart = {"old_pid": old_pid, "new_pid": self.process.pid,
+                                   "generation": self.generation, "public_ready": public}
+                        # Lease the replacement before admitting other commands or another restart.
+                        with self.condition:
+                            if self.stopping:
+                                raise ValueError("peer supervisor is shutting down")
+                            self.active_forwards += 1
+                            leased = True
+                            generation, process = self.generation, self.process
+                    finally:
+                        with self.condition:
+                            self.restarting = False
+                            self.condition.notify_all()
                 forwarded = {**request, "scenario": "dao_connectivity"}
             else:
+                with self.condition:
+                    self.condition.wait_for(lambda: not self.restarting or self.stopping)
+                    if self.stopping:
+                        raise ValueError("peer supervisor is shutting down")
+                    self.active_forwards += 1
+                    leased = True
+                    generation, process = self.generation, self.process
                 forwarded = request
-            return self.forward(request, forwarded, restart)
+            started = time.monotonic_ns()
+            self.diagnostic(request, "forward_start", generation, process, entered, started)
+            result = self.forward(request, forwarded, restart)
+            with self.condition:
+                if self.stopping or self.generation != generation or self.process is not process:
+                    raise ValueError("peer generation changed during control operation")
+                if process is not None and process.poll() is not None:
+                    raise ValueError("peer process exited during control operation")
+            result["supervisor"] = {"generation": generation,
+                                    "pid": process.pid if process is not None else None}
+            return result
+        finally:
+            try:
+                if started is not None:
+                    self.diagnostic(request, "forward_end", generation, process, entered, started)
+            finally:
+                with self.condition:
+                    if leased:
+                        self.active_forwards -= 1
+                    self.condition.notify_all()
+                self.command_slots.release()
+
+    def diagnostic(self, request, event, generation, process, entered, started):
+        """Emit bounded lifecycle evidence without retaining per-operation history."""
+        record = {"event": event, "operation_id": str(request.get("operation_id", ""))[:128],
+                  "scenario": str(request.get("scenario", ""))[:64],
+                  "generation": generation, "pid": process.pid if process is not None else None,
+                  "child_status": process.poll() if process is not None else None,
+                  "admission_wait_us": (started - entered) // 1000,
+                  "forward_us": (time.monotonic_ns() - started) // 1000}
+        try:
+            print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
 
     def forward(self, request, forwarded, restart):
         url = f"http://{self.declaration['ip']}:9500/"
@@ -123,7 +188,9 @@ def stop_peers(peers, grace_seconds=5, kill_seconds=5):
     """Stop only recorded children, with shared deadlines and no restart during shutdown."""
     peers = tuple(peers)
     for peer in peers:
-        peer.stopping = True
+        with peer.condition:
+            peer.stopping = True
+            peer.condition.notify_all()
     owned = []
     for peer in peers:
         with peer.lifecycle_lock:

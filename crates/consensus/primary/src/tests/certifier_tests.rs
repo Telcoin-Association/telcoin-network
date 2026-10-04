@@ -615,6 +615,63 @@ async fn vote_retry_backoff_schedule() {
     );
 }
 
+/// Identical reproposals preserve delayed votes, then republish the completed certificate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_header_reproposals_preserve_inflight_votes_and_republish() {
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let digest = header.digest();
+    let votes = cx.peer_votes(&header);
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let responses = cx
+        .network
+        .respond(votes.len(), "initial proposal: every vote held", |_, _| Reply::Hold)
+        .await;
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        responses.held.iter().all(|reply| !reply.is_closed()),
+        "identical reproposals must preserve every original pending vote request"
+    );
+
+    responses.held.into_iter().zip(responses.requests).for_each(|(reply, request)| {
+        assert_eq!(request.header, digest, "the held request must target the original header");
+        assert!(
+            reply
+                .send(Ok(NetworkResponseMessage {
+                    peer: request.peer,
+                    result: PrimaryResponse::Vote(votes[&request.peer].clone()),
+                }))
+                .is_ok(),
+            "the original vote collection must accept its delayed reply"
+        );
+    });
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the original delayed votes must form a certificate")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), digest);
+    certificate.clone().verify_cert(&committee.bls_keys()).expect("the certificate verifies");
+    let expected_gossip = certificate_gossip(certificate).await;
+    assert_eq!(cx.network.next_publish("completed original proposal").await, expected_gossip);
+    cx.network.assert_quiet("identical reproposals must not start replacement vote requests").await;
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    assert_eq!(
+        cx.network.next_publish("identical header after completion republishes").await,
+        expected_gossip
+    );
+    cx.network.assert_quiet("completed identical header must not collect votes again").await;
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
+        panic!("identical reproposals must not form a second certificate, got {result:?}");
+    }
+}
+
 /// A new header cancels the proposal in flight: every vote request for the old header is dropped,
 /// the new header is certified, and the old one never is.
 ///

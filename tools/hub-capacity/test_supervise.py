@@ -19,7 +19,12 @@ SPEC.loader.exec_module(SUPERVISE)
 
 class SupervisorTests(unittest.TestCase):
     def test_regular_commands_for_one_peer_enter_transport_concurrently(self):
-        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+        for nat in (False, True):
+            with self.subTest(nat=nat):
+                self.regular_command_overlap(nat)
+
+    def regular_command_overlap(self, nat):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": nat},
                               Path("unused"), Path("unused"))
         entered = threading.Barrier(2, timeout=1)
 
@@ -46,23 +51,19 @@ class SupervisorTests(unittest.TestCase):
         peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
                               Path("unused"), Path("unused"))
         restarting, release, ordinary_waiting = threading.Event(), threading.Event(), threading.Event()
-        mutex = threading.Lock()
-
-        class CoordinatedLock:
-            def __enter__(self):
+        class CoordinatedCondition(threading.Condition):
+            def wait(self, timeout=None):
                 if restarting.is_set():
                     ordinary_waiting.set()
-                mutex.acquire()
+                return super().wait(timeout)
 
-            def __exit__(self, *_error):
-                mutex.release()
-
-        peer.lock = CoordinatedLock()
+        peer.condition = CoordinatedCondition()
         peer.process = mock.Mock(pid=123)
         peer.process.poll.return_value = None
 
         def start():
             peer.process = mock.Mock(pid=456)
+            peer.process.poll.return_value = None
             peer.generation = 1
 
         def ready():
@@ -99,6 +100,149 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(all(result["success"] for result in results))
         self.assertEqual(results[0]["trace"]["restart"]["old_pid"], 123)
         self.assertEqual(results[0]["trace"]["restart"]["new_pid"], 456)
+        self.assertEqual(results[0]["trace"]["restart"]["generation"], 1)
+        self.assertEqual([result["supervisor"] for result in results],
+                         [{"generation": 1, "pid": 456}] * 2)
+
+    def test_hung_forward_does_not_serialize_ordinary_calls_and_releases_restart(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        peer.process = mock.Mock(pid=123)
+        peer.process.poll.return_value = None
+        peer.generation = 0
+        entered, release, draining = threading.Event(), threading.Event(), threading.Event()
+
+        class DrainCondition(threading.Condition):
+            def wait(self, timeout=None):
+                if peer.restarting:
+                    draining.set()
+                return super().wait(timeout)
+
+        peer.condition = DrainCondition()
+
+        def start():
+            peer.process = mock.Mock(pid=456)
+            peer.process.poll.return_value = None
+            peer.generation = 1
+
+        def transport(request, timeout):
+            self.assertEqual(timeout, 29)
+            payload = json.loads(request.data)
+            if payload["operation_id"] == "hung":
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("test did not release hung transport")
+                raise TimeoutError("peer transport reached its 29-second deadline")
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                **payload, "identity": "declared-peer", "success": True}).encode()
+            return response
+
+        with mock.patch.object(peer, "stop") as stop, \
+                mock.patch.object(peer, "start", side_effect=start), \
+                mock.patch.object(peer, "wait_ready", return_value={"identity": "declared-peer"}), \
+                mock.patch.object(SUPERVISE.urllib.request, "urlopen", side_effect=transport), \
+                ThreadPoolExecutor(max_workers=3) as executor:
+            hung = executor.submit(peer.command, {"operation_id": "hung", "scenario": "record_lookup"})
+            try:
+                self.assertTrue(entered.wait(1))
+                ordinary = executor.submit(peer.command, {"operation_id": "ordinary", "scenario": "gossip_two_hops"})
+                before = ordinary.result(timeout=1)
+                self.assertEqual(before["supervisor"], {"generation": 0, "pid": 123})
+                self.assertFalse(hung.done())
+                reconnect = executor.submit(peer.command, {"operation_id": "restart", "scenario": "shared_nat_reconnect"})
+                self.assertTrue(draining.wait(1))
+                stop.assert_not_called()
+            finally:
+                release.set()
+            with self.assertRaisesRegex(TimeoutError, "29-second deadline"):
+                hung.result(timeout=1)
+            after = reconnect.result(timeout=1)
+            self.assertEqual(after["supervisor"], {"generation": 1, "pid": 456})
+            self.assertEqual(after["trace"]["restart"]["generation"], 1)
+            self.assertTrue(peer.command({"operation_id": "after", "scenario": "record_lookup"})["success"])
+        self.assertEqual(peer.active_forwards, 0)
+        self.assertFalse(peer.restarting)
+
+    def test_command_admission_is_bounded_without_queued_transport(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        entered, release = threading.Event(), threading.Event()
+        count = 0
+        lock = threading.Lock()
+
+        def transport(request, timeout):
+            nonlocal count
+            self.assertEqual(timeout, 29)
+            with lock:
+                count += 1
+                if count == 72:
+                    entered.set()
+            if not release.wait(timeout=3):
+                raise TimeoutError("test did not release admitted transports")
+            payload = json.loads(request.data)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                **payload, "identity": "declared-peer", "success": True}).encode()
+            return response
+
+        with mock.patch.object(peer, "diagnostic"), \
+                mock.patch.object(SUPERVISE.urllib.request, "urlopen", side_effect=transport), \
+                ThreadPoolExecutor(max_workers=72) as executor:
+            futures = [executor.submit(peer.command, {"operation_id": str(index), "scenario": "record_lookup"})
+                       for index in range(72)]
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaisesRegex(ValueError, "admission exhausted"):
+                    peer.command({"operation_id": "excess", "scenario": "record_lookup"})
+                self.assertEqual(count, 72)
+            finally:
+                release.set()
+            self.assertTrue(all(future.result(timeout=2)["success"] for future in futures))
+            self.assertTrue(peer.command({"operation_id": "reused", "scenario": "record_lookup"})["success"])
+        self.assertEqual(peer.active_forwards, 0)
+
+    def test_shutdown_wakes_commands_waiting_for_restart(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        waiting = threading.Event()
+
+        class WaitingCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+
+        peer.condition = WaitingCondition()
+        peer.restarting = True
+        with mock.patch.object(peer, "forward") as forward, ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(peer.command, {"operation_id": "waiting", "scenario": "record_lookup"})
+            self.assertTrue(waiting.wait(1))
+            SUPERVISE.stop_peers([peer])
+            with self.assertRaisesRegex(ValueError, "shutting down"):
+                pending.result(timeout=1)
+            forward.assert_not_called()
+        self.assertEqual(peer.active_forwards, 0)
+
+    def test_diagnostics_are_bounded_and_do_not_override_transport_failure(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        output = io.StringIO()
+        request = {"operation_id": "x" * 1000, "scenario": "record_lookup"}
+        with mock.patch.object(SUPERVISE.sys, "stderr", output), \
+                mock.patch.object(peer, "forward", side_effect=TimeoutError("original timeout")):
+            with self.assertRaisesRegex(TimeoutError, "original timeout"):
+                peer.command(request)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([event["event"] for event in events], ["forward_start", "forward_end"])
+        self.assertTrue(all(len(event["operation_id"]) == 128 for event in events))
+        self.assertTrue(all("admission_wait_us" in event and "forward_us" in event for event in events))
+        for diagnostic_error in (OSError("diagnostic unavailable"), ValueError("diagnostic stream closed")):
+            with self.subTest(error=type(diagnostic_error).__name__), \
+                    mock.patch.object(SUPERVISE.sys.stderr, "write", side_effect=diagnostic_error), \
+                    mock.patch.object(peer, "forward", side_effect=TimeoutError("original timeout")):
+                with self.assertRaisesRegex(TimeoutError, "original timeout"):
+                    peer.command(request)
+        self.assertEqual(peer.active_forwards, 0)
 
     def test_shutdown_signals_every_child_before_shared_wait(self):
         peers = [SUPERVISE.Peer({}, Path("unused"), Path("unused")) for _ in range(4)]
