@@ -1,0 +1,298 @@
+{
+  "schema": 1,
+  "fixture_commit": "c9ae96a57efe3cd38f8f345539925f159e90c2a9",
+  "fixture_pr": "https://github.com/Telcoin-Association/telcoin-network/pull/1449",
+  "controller_sha256": "b9c082ef65b9bf46099fef99be2d544419bc91bd7c6a83cc1303167cf540ebad",
+  "network": "loopback",
+  "build_profile": "debug",
+  "pairs": {
+    "0.13.1-to-0.13.1": {
+      "status": "passed",
+      "result_sha256": "2d084603f6da2100f07a0025f014c77310c1b77abe963af458963fa33a90f711",
+      "resolved_releases": {
+        "0.13.1": {
+          "libp2p": [
+            "0.56.0"
+          ],
+          "libp2p-quic": [
+            "0.13.1"
+          ],
+          "libp2p-tls": [
+            "0.6.2"
+          ],
+          "quinn": [
+            "0.11.12"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.45"
+          ]
+        },
+        "0.14.0": {
+          "libp2p": [
+            "0.57.0"
+          ],
+          "libp2p-quic": [
+            "0.14.0"
+          ],
+          "libp2p-tls": [
+            "0.7.0"
+          ],
+          "quinn": [
+            "0.11.9"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.37"
+          ]
+        }
+      },
+      "binaries": {
+        "listener": "e7003411da7e6d65438c6b3158893f450077820013d80f7cced2a637fe936364",
+        "dialer": "e7003411da7e6d65438c6b3158893f450077820013d80f7cced2a637fe936364"
+      },
+      "connection_elapsed_us": [
+        2973,
+        1642,
+        1547
+      ],
+      "verified_streams": 9,
+      "bytes_per_stream": 32768,
+      "observed_closures": 3,
+      "deadlines": {
+        "outbound": {
+          "elapsed_ms": 30003,
+          "error": "Connection(ConnectionError(TimedOut))",
+          "event": "failed"
+        },
+        "inbound": {
+          "elapsed_ms": 50986,
+          "error": "Quic(Connection(ConnectionError(TimedOut)))",
+          "event": "failed"
+        },
+        "forwarded": 9,
+        "dropped": 21
+      }
+    },
+    "0.14.0-to-0.13.1": {
+      "status": "passed",
+      "result_sha256": "eb46f7e635acc8b65ffe385cfc89f1402423b9f5bf9726939f10631403aa4bab",
+      "resolved_releases": {
+        "0.13.1": {
+          "libp2p": [
+            "0.56.0"
+          ],
+          "libp2p-quic": [
+            "0.13.1"
+          ],
+          "libp2p-tls": [
+            "0.6.2"
+          ],
+          "quinn": [
+            "0.11.12"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.45"
+          ]
+        },
+        "0.14.0": {
+          "libp2p": [
+            "0.57.0"
+          ],
+          "libp2p-quic": [
+            "0.14.0"
+          ],
+          "libp2p-tls": [
+            "0.7.0"
+          ],
+          "quinn": [
+            "0.11.9"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.37"
+          ]
+        }
+      },
+      "binaries": {
+        "listener": "e7003411da7e6d65438c6b3158893f450077820013d80f7cced2a637fe936364",
+        "dialer": "a61edadd5d882ee9f73fed6753e8dbc12ac927cc5abc28392f65d70b50ea0a97"
+      },
+      "connection_elapsed_us": [
+        32696,
+        1665,
+        1642
+      ],
+      "verified_streams": 9,
+      "bytes_per_stream": 32768,
+      "observed_closures": 3,
+      "deadlines": {
+        "outbound": {
+          "elapsed_ms": 30030,
+          "error": "Connection(ConnectionError(TimedOut))",
+          "event": "failed"
+        },
+        "inbound": {
+          "elapsed_ms": 50990,
+          "error": "Quic(Connection(ConnectionError(TimedOut)))",
+          "event": "failed"
+        },
+        "forwarded": 10,
+        "dropped": 21
+      }
+    },
+    "0.13.1-to-0.14.0": {
+      "status": "passed",
+      "result_sha256": "98c35ba8a2a385b6be3cbb6833208da97a6c02092fe81311dca38756c7d8b778",
+      "resolved_releases": {
+        "0.13.1": {
+          "libp2p": [
+            "0.56.0"
+          ],
+          "libp2p-quic": [
+            "0.13.1"
+          ],
+          "libp2p-tls": [
+            "0.6.2"
+          ],
+          "quinn": [
+            "0.11.12"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.45"
+          ]
+        },
+        "0.14.0": {
+          "libp2p": [
+            "0.57.0"
+          ],
+          "libp2p-quic": [
+            "0.14.0"
+          ],
+          "libp2p-tls": [
+            "0.7.0"
+          ],
+          "quinn": [
+            "0.11.9"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.37"
+          ]
+        }
+      },
+      "binaries": {
+        "listener": "a61edadd5d882ee9f73fed6753e8dbc12ac927cc5abc28392f65d70b50ea0a97",
+        "dialer": "e7003411da7e6d65438c6b3158893f450077820013d80f7cced2a637fe936364"
+      },
+      "connection_elapsed_us": [
+        41022,
+        3085,
+        2235
+      ],
+      "verified_streams": 9,
+      "bytes_per_stream": 32768,
+      "observed_closures": 3,
+      "deadlines": {
+        "outbound": {
+          "elapsed_ms": 30002,
+          "error": "Connection(ConnectionError(TimedOut))",
+          "event": "failed"
+        },
+        "inbound": {
+          "elapsed_ms": 50986,
+          "error": "Quic(Connection(ConnectionError(TimedOut)))",
+          "event": "failed"
+        },
+        "forwarded": 9,
+        "dropped": 22
+      }
+    },
+    "0.14.0-to-0.14.0": {
+      "status": "passed",
+      "result_sha256": "c4ffa54565a24a78ac5a09922bc0d3c2fb7b515a14785c7dd84a3c994a7ad08c",
+      "resolved_releases": {
+        "0.13.1": {
+          "libp2p": [
+            "0.56.0"
+          ],
+          "libp2p-quic": [
+            "0.13.1"
+          ],
+          "libp2p-tls": [
+            "0.6.2"
+          ],
+          "quinn": [
+            "0.11.12"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.45"
+          ]
+        },
+        "0.14.0": {
+          "libp2p": [
+            "0.57.0"
+          ],
+          "libp2p-quic": [
+            "0.14.0"
+          ],
+          "libp2p-tls": [
+            "0.7.0"
+          ],
+          "quinn": [
+            "0.11.9"
+          ],
+          "quinn-proto": [
+            "0.11.18"
+          ],
+          "rustls": [
+            "0.23.37"
+          ]
+        }
+      },
+      "binaries": {
+        "listener": "a61edadd5d882ee9f73fed6753e8dbc12ac927cc5abc28392f65d70b50ea0a97",
+        "dialer": "a61edadd5d882ee9f73fed6753e8dbc12ac927cc5abc28392f65d70b50ea0a97"
+      },
+      "connection_elapsed_us": [
+        52975,
+        2159,
+        1747
+      ],
+      "verified_streams": 9,
+      "bytes_per_stream": 32768,
+      "observed_closures": 3,
+      "deadlines": {
+        "outbound": {
+          "elapsed_ms": 30029,
+          "error": "Connection(ConnectionError(TimedOut))",
+          "event": "failed"
+        },
+        "inbound": {
+          "elapsed_ms": 50984,
+          "error": "Quic(Connection(ConnectionError(TimedOut)))",
+          "event": "failed"
+        },
+        "forwarded": 10,
+        "dropped": 23
+      }
+    }
+  }
+}
