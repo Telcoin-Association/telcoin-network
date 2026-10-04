@@ -559,11 +559,15 @@ async fn propose_round_two(
 /// gap, not whole seconds, and the header lands strictly after the latest parent.
 ///
 /// Fork-active voters require a header's millisecond timestamp to exceed every parent's, so the
-/// proposer waits for, and clamps to, one millisecond past the latest parent. The latest parent
-/// sits mid-list so reading any parent but the maximum fails the clamp. With tokio's clock paused
-/// the wait costs no real time, so the header is normally stamped while the wall clock still
-/// trails the parent and the clamp decides the timestamp: a wait rounded up to whole seconds fails
-/// the wait bound, and a missing clamp or missing `+ 1` fails the timestamp bound.
+/// proposer waits for, and clamps to, one millisecond past the latest parent. The clamp alone
+/// satisfies the timestamp bound; the wait is what keeps the header from being stamped ahead of
+/// this node's clock, and so ahead of its voters' clocks. The latest parent sits mid-list so
+/// reading any parent but the maximum fails the clamp. With tokio's clock paused the wait costs no
+/// real time, so the header is stamped while the wall clock still trails the parent and the clamp
+/// decides the timestamp. The wait is bounded from both sides: a skipped wait falls short of the
+/// lead the latest parent still held over the wall clock when the proposal returned, and a wait
+/// rounded up to whole seconds overshoots the gap from `base`. A missing clamp or missing `+ 1`
+/// fails the timestamp bound.
 #[tokio::test(start_paused = true)]
 async fn test_proposal_waits_milliseconds_for_future_parents() {
     pin_subsecond_fork(true);
@@ -573,24 +577,45 @@ async fn test_proposal_waits_milliseconds_for_future_parents() {
     assert!(subsecond_timestamp_active(committee.epoch()), "the pin must activate the fork");
 
     let base = now_ms();
-    let latest_parent = base.saturating_add_millis(30);
+    // the lead has to outlast the real time the proposal takes (it signs the seed) even on a
+    // loaded machine, or nothing is left for the lower bound on the wait to check. it stays under
+    // a second so a wait rounded up to whole seconds still overshoots
+    let latest_parent = base.saturating_add_millis(300);
     let parents = parents_created_at(
         &fixture,
         &[
-            base.saturating_add_millis(10),
+            base.saturating_add_millis(100),
             latest_parent,
-            base.saturating_add_millis(20),
-            base.saturating_add_millis(5),
+            base.saturating_add_millis(200),
+            base.saturating_add_millis(50),
         ],
     );
 
     let (header, waited) = propose_round_two(primary, &committee, parents).await;
+    let after = now_ms();
 
     let min_created_at = latest_parent.saturating_add_millis(1);
     assert!(
         header.created_at_ms() >= min_created_at,
         "header created at {} must be at least 1ms after the latest parent {latest_parent}",
         header.created_at_ms(),
+    );
+    // the proposer reads the wall clock no later than `after` and sleeps out the gap from that
+    // reading, so it waits at least as long as `min_created_at` still led the clock at `after`.
+    // the bound comes from `after` rather than from checking `created_at <= now_ms()`: a paused
+    // tokio clock sleeps without moving the wall clock, so the header is stamped ahead of the wall
+    // clock here whether or not the proposer waited
+    let min_wait =
+        Duration::from_millis(min_created_at.as_millis().saturating_sub(after.as_millis()));
+    assert!(
+        !min_wait.is_zero(),
+        "the parent's lead ran out before the proposal returned at {after}, so the lower bound on \
+         the wait would hold with no wait at all; the fixture needs a longer lead"
+    );
+    assert!(
+        waited >= min_wait,
+        "proposer waited {waited:?}, less than the {min_wait:?} that {min_created_at} still led \
+         the clock by when the proposal returned"
     );
     // the wait is `min_created_at - now_ms()` measured after `base`; tokio's timer may round the
     // deadline up to its next millisecond tick
@@ -603,11 +628,13 @@ async fn test_proposal_waits_milliseconds_for_future_parents() {
 }
 
 /// Before the sub-second fork the proposer keeps the seconds-only rule (`>=` against the latest
-/// parent's whole second, millisecond part 0) but still waits only the millisecond gap.
+/// parent's whole second, millisecond part 0) but still waits out the millisecond gap to that
+/// parent, no less and no more.
 ///
-/// Pre-fork parents carry whole seconds, so the latest parent sits on the next second boundary,
-/// less than a second ahead of this node's clock. A seconds-granular sleep waits out a whole
-/// second there and overshoots the gap to that boundary.
+/// Pre-fork parents carry whole seconds, so the latest parent sits on a second boundary ahead of
+/// this node's clock. A skipped wait falls short of the lead that parent still held over the wall
+/// clock when the proposal returned, and a seconds-granular sleep waits out whole seconds and
+/// overshoots the gap from `base` to the boundary.
 #[tokio::test(start_paused = true)]
 async fn test_pre_fork_proposal_keeps_seconds_rule_with_millisecond_wait() {
     pin_subsecond_fork(false);
@@ -617,7 +644,11 @@ async fn test_pre_fork_proposal_keeps_seconds_rule_with_millisecond_wait() {
     assert!(!subsecond_timestamp_active(committee.epoch()), "the pin must keep the fork dormant");
 
     let base = now_ms();
-    let latest_parent = TimestampMs::from_parts(base.secs() + 1, 0);
+    // two second boundaries ahead, not the next one. late in a second the next boundary can be a
+    // few milliseconds away, the proposal's own latency (the seed fork stays active, so it signs)
+    // can use up that lead, and the lower bound on the wait would then be zero. two boundaries
+    // ahead the lead is over one second and at most two, whatever `base`'s millisecond part is
+    let latest_parent = TimestampMs::from_parts(base.secs() + 2, 0);
     let current_second = TimestampMs::from_parts(base.secs(), 0);
     let parents = parents_created_at(
         &fixture,
@@ -629,6 +660,7 @@ async fn test_pre_fork_proposal_keeps_seconds_rule_with_millisecond_wait() {
     );
 
     let (header, waited) = propose_round_two(primary, &committee, parents).await;
+    let after = now_ms();
 
     assert_eq!(header.created_at_millis(), 0, "a pre-fork header must not carry milliseconds");
     assert!(
@@ -637,12 +669,26 @@ async fn test_pre_fork_proposal_keeps_seconds_rule_with_millisecond_wait() {
         header.created_at(),
         latest_parent.secs(),
     );
+    // pre-fork the proposer waits for the latest parent itself, with no `+ 1`. the bound comes
+    // from `after` for the reason given in `test_proposal_waits_milliseconds_for_future_parents`
+    let min_wait =
+        Duration::from_millis(latest_parent.as_millis().saturating_sub(after.as_millis()));
+    assert!(
+        !min_wait.is_zero(),
+        "the parent's lead ran out before the proposal returned at {after}, so the lower bound on \
+         the wait would hold with no wait at all; the fixture needs a longer lead"
+    );
+    assert!(
+        waited >= min_wait,
+        "proposer waited {waited:?}, less than the {min_wait:?} that {latest_parent} still led \
+         the clock by when the proposal returned"
+    );
     // the wait is `latest_parent - now_ms()` measured after `base`; tokio's timer may round the
     // deadline up to its next millisecond tick
     let max_wait = Duration::from_millis(latest_parent.as_millis() - base.as_millis() + 1);
     assert!(
         waited <= max_wait,
-        "proposer waited {waited:?}, more than the {max_wait:?} gap to the next second"
+        "proposer waited {waited:?}, more than the {max_wait:?} gap to the latest parent's second"
     );
 }
 
