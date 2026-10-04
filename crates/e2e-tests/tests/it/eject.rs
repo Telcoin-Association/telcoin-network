@@ -222,7 +222,7 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     committee.push((NEW_VALIDATOR, new_validator.address()));
     let (procs, endpoints) = start_nodes(temp_path, &committee, "eject_future", 1)?;
     // Guard ensures processes are killed on drop (normal return, error, or panic).
-    let _guard = ProcessGuard::new(procs);
+    let mut guard = ProcessGuard::new(procs);
     let newval_url = &endpoints[5].http_url;
 
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -420,6 +420,7 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     // the burned validator's node keeps following the chain (epoch-close blocks keep coming)
     wait_for_head_at_least(newval_url, head_before.max(burn_block) + 1, EPOCH_DURATION * 3).await?;
 
+    guard.finish();
     Ok(())
 }
 
@@ -730,6 +731,7 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
     wait_for_head_at_least(&victim_url, tx_block + 1, EPOCH_DURATION * 3).await?;
     fetch_verified_epoch_record(&victim_url, e, EPOCH_DURATION * 3).await?;
 
+    guard.finish();
     Ok(())
 }
 
@@ -1109,6 +1111,7 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
         "burned validator's BLS key must be absent from record {e}'s committee"
     );
 
+    guard.finish();
     Ok(())
 }
 
@@ -1320,5 +1323,6 @@ async fn test_network_halts_when_ejections_shrink_committee_below_tolerance() ->
         );
     }
 
+    guard.finish();
     Ok(())
 }

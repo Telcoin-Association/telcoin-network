@@ -570,15 +570,12 @@ fn test_restartstt() -> eyre::Result<()> {
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
 fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
-    for _ in 0..60 {
-        if let Ok(n) = get_block_number(node) {
-            if n >= target_block {
-                return Ok(());
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    Err(eyre::eyre!("Node {node} did not reach block {target_block} within 60 seconds"))
+    wait_until_blocking(
+        Duration::from_secs(60),
+        &format!("node {node} to reach block {target_block}"),
+        || Ok(get_block_number(node).map(|n| n >= target_block).unwrap_or(false)),
+    )?;
+    Ok(())
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -722,7 +719,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
     let alone_dir = temp.path().join("validator-1");
     let mut network_config = NetworkConfig::read_config(&alone_dir)?;
-    network_config.set_peer_readiness_timeout(Duration::from_secs(5));
+    network_config.set_peer_readiness_timeout(Duration::from_secs(2));
     network_config.write_config(&alone_dir)?;
     let peer_readiness_wait = NetworkConfig::read_config(&alone_dir)?.peer_readiness_timeout();
     let bin = e2e_tests::get_telcoin_network_binary();
@@ -812,6 +809,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let key = get_key("test-source");
     send_and_confirm(alone_url, peer_url, &key, address_from_word("cold-genesis-target"), 0)?;
     wait_for_block(alone_url, get_block_number(peer_url)?)?;
+    guard.finish();
     Ok(())
 }
 
@@ -885,6 +883,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
                 .unwrap_or(false))
         },
     )?;
+    guard.finish();
     Ok(())
 }
 
@@ -923,9 +922,21 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "reconnect", 0));
 
-    // Wait for network to advance and observer to be in sync
+    // Wait for the network to advance, then for the observer to reach the consensus height that
+    // validator 0 reported earlier in the same poll. The start value below is then in sync.
     network_advancing(&client_urls)?;
-    std::thread::sleep(Duration::from_secs(5));
+    wait_until_blocking(
+        Duration::from_secs(45),
+        "observer in sync with validator 0 before pause (test_logs/reconnect/)",
+        || {
+            Ok(get_latest_consensus_header_number(&client_urls[0])
+                .and_then(|validator| {
+                    get_latest_consensus_header_number(&obs_url)
+                        .map(|observer| observer > 0 && observer >= validator)
+                })
+                .unwrap_or(false))
+        },
+    )?;
 
     let initial_obs_consensus_height = get_latest_consensus_header_number(&obs_url)?;
     info!(target: "restart-test", ?initial_obs_consensus_height, "observer synced, pausing it");
@@ -960,5 +971,6 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
                 .unwrap_or(false))
         },
     )?;
+    guard.finish();
     Ok(())
 }

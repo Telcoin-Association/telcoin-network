@@ -108,6 +108,7 @@ impl Drop for TestSemaphoreGuard<'_> {
 ///
 /// Avoids global `panic::set_hook` which causes cross-test contamination in parallel runs.
 /// Sends SIGTERM to all children first (parallel graceful shutdown), then waits for each.
+/// A test that passes ends with [`Self::finish`] instead, which skips the graceful wait.
 pub(crate) struct ProcessGuard {
     /// Owned child processes that exit on `drop`.
     children: Vec<Option<Child>>,
@@ -189,6 +190,18 @@ impl ProcessGuard {
                 }
             });
         }
+        self.children.iter_mut().for_each(|slot| *slot = None);
+    }
+
+    /// SIGKILL and reap every child, then clear all slots. Safe to call multiple times.
+    ///
+    /// The success-path teardown: call it as the last statement of a test, after the last
+    /// assert. A graceful node shutdown waits out the task manager join timeout (about 2.3s per
+    /// test), and no test reads an exit status, a node log or a datadir after its last assert.
+    /// [`Self::kill_all`] and `Drop` stay graceful, so an early `?` return or a panic still gets
+    /// complete node logs.
+    pub(crate) fn finish(&mut self) {
+        self.children.iter_mut().flatten().for_each(force_kill_and_reap);
         self.children.iter_mut().for_each(|slot| *slot = None);
     }
 
@@ -675,20 +688,26 @@ pub(crate) fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre
     get_balance_above_with_retry(node, address, 0)
 }
 
-/// Retry up to 45 times to retrieve an account balance > above.
+/// Retry for up to 54s (the former 45 tries at 1.2s) to retrieve an account balance > above.
+///
+/// Polls every 50ms. A balance read error ends the retry and is returned.
 pub(crate) fn get_balance_above_with_retry(
     node: &str,
     address: &str,
     above: u128,
 ) -> eyre::Result<u128> {
-    let mut bal = get_balance(node, address, 5)?;
-    let mut i = 0;
-    while i < 45 && bal <= above {
-        std::thread::sleep(Duration::from_millis(1200));
-        i += 1;
-        bal = get_balance(node, address, 5)?;
-    }
-    if i == 45 && bal <= above {
+    let deadline = std::time::Instant::now() + Duration::from_millis(45 * 1200);
+    let bal = std::iter::successors(Some(get_balance(node, address, 5)), |prev| {
+        prev.as_ref().ok().filter(|bal| **bal <= above && std::time::Instant::now() < deadline).map(
+            |_| {
+                std::thread::sleep(Duration::from_millis(50));
+                get_balance(node, address, 5)
+            },
+        )
+    })
+    .last()
+    .unwrap_or_else(|| get_balance(node, address, 5))?;
+    if bal <= above {
         error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");
         Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
     } else {
@@ -1178,8 +1197,8 @@ pub(crate) async fn wait_for_epoch_at_least<P: Provider>(
                 snap.epoch_id
             ));
         }
-        // Poll ~4x/sec: with 5s epochs a 1s cadence adds up to ~1s of slop per boundary.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Poll every 50ms: with 5s epochs a coarse cadence adds slop at every boundary.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1266,8 +1285,9 @@ pub(crate) async fn wait_for_mid_epoch<P: Provider>(
                 snap.epoch_duration
             ));
         }
-        // Poll ~4x/sec so the mid-epoch window (as narrow as ~2s at a 5s epoch) is caught promptly.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Poll every 50ms so the mid-epoch window (as narrow as ~2s at a 5s epoch) is caught
+        // promptly.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1314,7 +1334,7 @@ pub(crate) fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u6
         if std::time::Instant::now() >= deadline {
             return Err(eyre::eyre!("no receipt for confirmed tx {tx_hash} on {node} within 10s"));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1582,7 +1602,7 @@ pub(crate) fn scrape_metric_value(addr: &str, name: &str) -> eyre::Result<f64> {
                 &last[..last.len().min(2000)]
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
