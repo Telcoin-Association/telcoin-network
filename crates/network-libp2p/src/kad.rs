@@ -419,19 +419,38 @@ impl<DB: Database> KadStore<DB> {
         if self.retains(key) {
             Ok(())
         } else {
-            let hash = self.key_to_hash(key);
-            self.remove(key);
-            let remains = match self.kad_type {
-                NetworkType::Primary => self.db.get::<KadRecords>(&hash),
-                NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
-            }
-            .map_err(|_| Error::MaxRecords)?;
-            if remains.is_some() {
-                Err(Error::MaxRecords)
-            } else {
-                Ok(())
-            }
+            self.delete_row(key).then_some(()).ok_or(Error::MaxRecords)
         }
+    }
+
+    /// Delete one owned row and report whether the database accepted the delete.
+    ///
+    /// The layered database applies the persistent delete later on its writer thread and
+    /// keeps no tombstone. A `get` immediately after an accepted delete can still return the
+    /// disk row, so the delete result is the report and a read-back is not.
+    fn delete_row(&mut self, k: &RecordKey) -> bool {
+        let key = self.key_to_hash(k);
+        let row_counted = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .ok()
+        .flatten()
+        .and_then(|raw| self.decode_record(&key, &raw))
+        .is_some();
+        let deleted = match self.kad_type {
+            NetworkType::Primary => self.db.remove::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
+        }
+        .is_ok();
+        if deleted && row_counted {
+            // Only readable owned rows contribute to startup accounting. An absent or
+            // malformed row cannot uncount another row even when MDBX removal returns Ok.
+            // Saturation also tolerates a preexisting stale count without wrapping capacity.
+            self.num_records = self.num_records.saturating_sub(1);
+            self.update_records_gauge();
+        }
+        deleted
     }
 
     /// Prune startup rows and rotated-out keys. Failed deletions stay counted and are explicit.
@@ -701,28 +720,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn remove(&mut self, k: &RecordKey) {
-        let key = self.key_to_hash(k);
-        let row_counted = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
-        }
-        .ok()
-        .flatten()
-        .and_then(|raw| self.decode_record(&key, &raw))
-        .is_some();
-        if match self.kad_type {
-            NetworkType::Primary => self.db.remove::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
-        }
-        .is_ok()
-            && row_counted
-        {
-            // Only readable owned rows contribute to startup accounting. An absent or
-            // malformed row cannot uncount another row even when MDBX removal returns Ok.
-            // Saturation also tolerates a preexisting stale count without wrapping capacity.
-            self.num_records = self.num_records.saturating_sub(1);
-            self.update_records_gauge();
-        }
+        // This trait method has no failure channel. `prune_record` reports failed deletes.
+        self.delete_row(k);
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
