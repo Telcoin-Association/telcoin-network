@@ -1,5 +1,273 @@
 //! Test for Primary <-> Primary handler.
 
+mod vote_observation_tests {
+    //! Capture retained vote diagnostics from the public request command path.
+
+    use super::{
+        BlsKeypair, BlsPublicKey, CommitteeFixture, Header, HeaderDigest, MemDatabase,
+        NetworkCommand, NetworkError, NetworkResponseMessage, NetworkResult, PrimaryNetworkHandle,
+        PrimaryRPCError, PrimaryRequest, PrimaryResponse, RequestVoteResult, StdRng,
+    };
+    use futures::StreamExt as _;
+    use rand::SeedableRng as _;
+    use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+    use tn_types::{Hash as _, Vote};
+    use tracing::{field::Field, span, Event, Metadata, Subscriber};
+
+    /// Recorded fields of the existing committee request event.
+    type VoteEventFields = BTreeMap<String, String>;
+
+    /// Collect actual request events without changing the production subscriber.
+    #[derive(Clone, Default)]
+    struct VoteEventCapture {
+        /// Events emitted while the request future is polled or dropped.
+        events: Arc<parking_lot::Mutex<Vec<VoteEventFields>>>,
+    }
+
+    /// Preserve string fields as text and numeric fields in their debug representation.
+    #[derive(Default)]
+    struct VoteFieldVisitor {
+        /// Fields reported by tracing's native visitor interface.
+        fields: VoteEventFields,
+    }
+
+    impl tracing::field::Visit for VoteFieldVisitor {
+        /// Record a field through the required tracing visitor interface.
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.fields.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        /// Keep strings unquoted so diagnostic text can be checked byte for byte.
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    impl Subscriber for VoteEventCapture {
+        /// Admit only the existing retained capacity target.
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "network::capacity"
+        }
+
+        /// Supply the required span identifier; these controls create no spans.
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        /// Span fields are outside these event controls.
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        /// Span relationships are outside these event controls.
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        /// Retain only the real committee request event.
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = VoteFieldVisitor::default();
+            event.record(&mut visitor);
+            if visitor.fields.get("event").map(String::as_str) == Some("committee_request") {
+                self.events.lock().push(visitor.fields);
+            }
+        }
+
+        /// Span entry does not affect event capture.
+        fn enter(&self, _span: &span::Id) {}
+
+        /// Span exit does not affect event capture.
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    /// Build a real header and signed vote for the response controls.
+    fn vote_fixture() -> (Header, BlsPublicKey, Vote) {
+        let committee = CommitteeFixture::builder(MemDatabase::default).build();
+        let header = committee.header_builder_last_authority().build();
+        let signer = BlsKeypair::generate(&mut StdRng::seed_from_u64(52));
+        let vote = Vote::new_with_signer(&header, header.author().clone(), &signer);
+        (header, *signer.public(), vote)
+    }
+
+    /// Return the one observed request and verify the unchanged identity and timing fields.
+    fn observed_event(
+        capture: &VoteEventCapture,
+        header: &Header,
+        peer: BlsPublicKey,
+    ) -> VoteEventFields {
+        let mut events = capture.events.lock();
+        assert_eq!(events.len(), 1, "one request must emit exactly one retained event");
+        let event = events.pop().expect("the request event must be present");
+        assert_eq!(event.get("header"), Some(&header.digest().to_string()));
+        assert_eq!(event.get("peer"), Some(&peer.to_string()));
+        assert!(event.get("latency_us").and_then(|value| value.parse::<u64>().ok()).is_some());
+        assert!(event.get("unix_us").and_then(|value| value.parse::<u64>().ok()).is_some());
+        event
+    }
+
+    /// Answer public SendRequest commands and capture their actual observation.
+    async fn observed_request(
+        responses: Vec<NetworkResult<PrimaryResponse>>,
+    ) -> (NetworkResult<RequestVoteResult>, VoteEventFields) {
+        let (header, peer, _) = vote_fixture();
+        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(10);
+        let requester = PrimaryNetworkHandle::new_for_test(commands_tx);
+        let capture = VoteEventCapture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let expected_digest = header.digest();
+        let replies = futures::stream::iter(responses).fold(
+            commands_rx,
+            |mut commands, response| async move {
+                let command = commands.recv().await.expect("a real request must arrive");
+                let NetworkCommand::SendRequest {
+                    peer: requested_peer,
+                    request: PrimaryRequest::Vote { header, parents },
+                    reply,
+                } = command
+                else {
+                    panic!("expected a vote SendRequest command");
+                };
+                assert_eq!(requested_peer, peer);
+                assert_eq!(header.digest(), expected_digest);
+                assert!(parents.is_empty());
+                reply
+                    .send(response.map(|result| NetworkResponseMessage { peer, result }))
+                    .expect("the requester must still await the response");
+                commands
+            },
+        );
+        let (result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(requester.request_vote(peer, header.clone(), Vec::new()), replies)
+        })
+        .await
+        .expect("the unchanged retry policy must complete within the watchdog");
+        (result, observed_event(&capture, &header, peer))
+    }
+
+    /// Successful vote and missing-parent responses retain distinct outcomes.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observation_records_success_and_missing_parents() {
+        let (_, _, vote) = vote_fixture();
+        let (result, event) = observed_request(vec![Ok(PrimaryResponse::Vote(vote.clone()))]).await;
+        assert_eq!(result.expect("a vote must succeed"), RequestVoteResult::Vote(vote));
+        assert_eq!(event.get("outcome").map(String::as_str), Some("vote"));
+        assert_eq!(event.get("completed").map(String::as_str), Some("true"));
+        assert_eq!(event.get("success").map(String::as_str), Some("true"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("0"));
+        assert_eq!(event.get("error").map(String::as_str), Some(""));
+        let parents = vec![HeaderDigest::default()];
+        let (result, event) =
+            observed_request(vec![Ok(PrimaryResponse::MissingParents(parents.clone()))]).await;
+        assert_eq!(
+            result.expect("missing parents is a response"),
+            RequestVoteResult::MissingParents(parents)
+        );
+        assert_eq!(event.get("outcome").map(String::as_str), Some("missing_parents"));
+        assert_eq!(event.get("success").map(String::as_str), Some("true"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("0"));
+    }
+
+    /// Exhaustion reports all six started retries without changing their native error.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observation_records_recoverable_retry_exhaustion() {
+        let responses = std::iter::repeat_with(|| {
+            Ok(PrimaryResponse::RecoverableError(PrimaryRPCError("still recovering".to_owned())))
+        })
+        .take(7)
+        .collect();
+        let (result, event) = observed_request(responses).await;
+        assert!(
+            matches!(result, Err(NetworkError::RPCRetryable(error)) if error == "still recovering")
+        );
+        assert_eq!(event.get("outcome").map(String::as_str), Some("rpc_retryable"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("6"));
+        assert_eq!(event.get("completed").map(String::as_str), Some("true"));
+        assert_eq!(event.get("success").map(String::as_str), Some("false"));
+        assert_eq!(event.get("error").map(String::as_str), Some("still recovering"));
+    }
+
+    /// Native transport details remain bounded and UTF8 safe; RPC failures keep their category.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observation_bounds_error_details() {
+        let detail = "界".repeat(300);
+        let error = NetworkError::StdIo(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            detail.clone(),
+        ));
+        let expected = error.to_string().chars().take(256).collect::<String>();
+        let (result, event) = observed_request(vec![Err(error)]).await;
+        assert!(matches!(result, Err(NetworkError::StdIo(error)) if error.to_string() == detail));
+        assert_eq!(event.get("outcome").map(String::as_str), Some("network_error"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("0"));
+        assert_eq!(event.get("completed").map(String::as_str), Some("true"));
+        assert_eq!(event.get("success").map(String::as_str), Some("false"));
+        assert_eq!(event.get("error"), Some(&expected));
+        assert_eq!(expected.chars().count(), 256);
+        let (result, event) = observed_request(vec![Ok(PrimaryResponse::Error(PrimaryRPCError(
+            "invalid header".to_owned(),
+        )))])
+        .await;
+        assert!(matches!(result, Err(NetworkError::RPCError(error)) if error == "invalid header"));
+        assert_eq!(event.get("outcome").map(String::as_str), Some("rpc_error"));
+        assert_eq!(event.get("error").map(String::as_str), Some("invalid header"));
+    }
+
+    /// A propagated retryable native error is not mislabeled as retry exhaustion.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observation_retryable_error_without_started_retry() {
+        let (result, event) = observed_request(vec![Err(NetworkError::RPCRetryable(
+            "upstream retryable".to_owned(),
+        ))])
+        .await;
+        assert!(
+            matches!(result, Err(NetworkError::RPCRetryable(error)) if error == "upstream retryable")
+        );
+        assert_eq!(event.get("outcome").map(String::as_str), Some("rpc_retryable"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("0"));
+        assert_eq!(event.get("completed").map(String::as_str), Some("true"));
+        assert_eq!(event.get("success").map(String::as_str), Some("false"));
+    }
+
+    /// Dropping a live retry retains an incomplete event and the started retry count.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observation_records_cancelled_started_retry() {
+        let (header, peer, _) = vote_fixture();
+        let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(10);
+        let requester = PrimaryNetworkHandle::new_for_test(commands_tx);
+        let capture = VoteEventCapture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let mut request = Box::pin(requester.request_vote(peer, header.clone(), Vec::new()));
+        let first = tokio::select! {
+            command = commands_rx.recv() => command.expect("the first request must arrive"),
+            result = &mut request => panic!("request completed before its first response: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("the first request must start within the watchdog"),
+        };
+        let NetworkCommand::SendRequest { reply, .. } = first else {
+            panic!("expected the first vote request");
+        };
+        reply
+            .send(Ok(NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RecoverableError(PrimaryRPCError(
+                    "retry later".to_owned(),
+                )),
+            }))
+            .expect("the first response must reach the requester");
+        let retry = tokio::select! {
+            command = commands_rx.recv() => command.expect("the retry request must arrive"),
+            result = &mut request => panic!("request completed before its retry response: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("the retry must start within the watchdog"),
+        };
+        let NetworkCommand::SendRequest { reply: held_reply, .. } = retry else {
+            panic!("expected the retry vote request");
+        };
+        drop(request);
+        drop(held_reply);
+        let event = observed_event(&capture, &header, peer);
+        assert_eq!(event.get("completed").map(String::as_str), Some("false"));
+        assert_eq!(event.get("success").map(String::as_str), Some("false"));
+        assert_eq!(event.get("outcome").map(String::as_str), Some("cancelled"));
+        assert_eq!(event.get("retry_count").map(String::as_str), Some("1"));
+        assert_eq!(event.get("error").map(String::as_str), Some(""));
+    }
+}
+
 use crate::{
     error::PrimaryNetworkError,
     network::{

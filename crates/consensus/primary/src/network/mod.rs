@@ -46,6 +46,37 @@ pub mod handler;
 mod message;
 mod sync_codec;
 
+/// Finite terminal categories for the retained vote request observation.
+#[derive(Clone, Copy)]
+enum VoteRequestOutcome {
+    /// The request future was dropped before producing its final result.
+    Cancelled,
+    /// The peer returned a vote.
+    Vote,
+    /// The peer identified missing parents.
+    MissingParents,
+    /// The request returned a retryable RPC error.
+    RpcRetryable,
+    /// The peer returned a permanent RPC error or an unexpected response.
+    RpcError,
+    /// Dispatch, response transport or acknowledgement failed.
+    NetworkError,
+}
+
+impl VoteRequestOutcome {
+    /// Stable bounded value used by the existing capacity observation event.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Vote => "vote",
+            Self::MissingParents => "missing_parents",
+            Self::RpcRetryable => "rpc_retryable",
+            Self::RpcError => "rpc_error",
+            Self::NetworkError => "network_error",
+        }
+    }
+}
+
 /// Observe a real vote request, including errors and cancellation, when capacity tracing is
 /// enabled.
 struct VoteObservation {
@@ -59,6 +90,12 @@ struct VoteObservation {
     completed: bool,
     /// Whether that final response was a vote or a missing-parent response.
     success: bool,
+    /// Native result category, or cancellation while the request is still pending.
+    outcome: VoteRequestOutcome,
+    /// Native error display clipped to the existing peer error character bound.
+    error: Option<String>,
+    /// Inner retry requests started, including attempts interrupted before their response.
+    retry_count: u8,
 }
 
 impl Drop for VoteObservation {
@@ -66,6 +103,8 @@ impl Drop for VoteObservation {
         debug!(target: "network::capacity", event = "committee_request",
             header = %self.header, peer = %self.peer, completed = self.completed,
             success = self.success, latency_us = %self.started.elapsed().as_micros(),
+            outcome = self.outcome.label(), error = self.error.as_deref().unwrap_or_default(),
+            retry_count = self.retry_count,
             unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |time| time.as_micros()), "capacity observation");
     }
@@ -487,6 +526,9 @@ impl PrimaryNetworkHandle {
             peer,
             completed: false,
             success: false,
+            outcome: VoteRequestOutcome::Cancelled,
+            error: None,
+            retry_count: 0,
         };
         let result = async {
             let header = Arc::new(header);
@@ -504,6 +546,7 @@ impl PrimaryNetworkHandle {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let request =
                     PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+                observation.retry_count += 1;
                 let res_raw = self.handle.send_request(request, peer).await?;
                 res = res_raw.await??.result;
                 tries += 1;
@@ -535,6 +578,22 @@ impl PrimaryNetworkHandle {
         .await;
         observation.completed = true;
         observation.success = result.is_ok();
+        observation.outcome = result.as_ref().map_or_else(
+            |error| {
+                if matches!(error, NetworkError::RPCRetryable(_)) {
+                    VoteRequestOutcome::RpcRetryable
+                } else if matches!(error, NetworkError::RPCError(_)) {
+                    VoteRequestOutcome::RpcError
+                } else {
+                    VoteRequestOutcome::NetworkError
+                }
+            },
+            |response| match response {
+                RequestVoteResult::Vote(_) => VoteRequestOutcome::Vote,
+                RequestVoteResult::MissingParents(_) => VoteRequestOutcome::MissingParents,
+            },
+        );
+        observation.error = result.as_ref().err().map(|error| clip_peer_error(error.to_string()));
         result
     }
 
