@@ -7,9 +7,9 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use libp2p::{
-    core::Endpoint,
+    core::{transport::TransportError, Endpoint},
     kad::GetClosestPeersError,
-    swarm::{ConnectionId, DialError, NetworkBehaviour as _},
+    swarm::{dial_opts::PeerCondition, ConnectionId, DialError, NetworkBehaviour as _},
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -474,6 +474,61 @@ async fn test_dial_failure_surfaces_real_error() {
         old_timeout,
         "regression: the real dial error was erased by the hardcoded timeout string"
     );
+}
+
+/// A disconnected-only rejection keeps its native cause and known transport identity.
+#[tokio::test]
+async fn disconnected_condition_failure_retains_already_connected_identity() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let (sender, mut receiver) = oneshot::channel();
+    peer_manager.register_dial_attempt(peer_id, Some(sender));
+    let native = DialError::DialPeerConditionFalse(PeerCondition::Disconnected);
+
+    peer_manager.on_dial_failure(None, &native);
+    assert!(matches!(receiver.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    peer_manager.on_dial_failure(Some(peer_id), &native);
+    let result = timeout(Duration::from_millis(500), receiver).await??;
+    let error =
+        result.err().ok_or_else(|| eyre::eyre!("condition rejection must remain an error"))?;
+    assert_matches!(error, NetworkError::AlreadyConnected(detail)
+        if detail == format!("{peer_id}: {native}"));
+    assert!(!peer_manager.is_connected(&peer_id));
+    Ok(())
+}
+
+/// Transport failures and other peer conditions retain the ordinary native dial error.
+#[tokio::test]
+async fn non_disconnected_dial_failures_preserve_native_errors() -> eyre::Result<()> {
+    futures::future::try_join_all(
+        [
+            DialError::Transport(vec![(
+                create_multiaddr(None),
+                TransportError::Other(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "controlled transport refusal",
+                )),
+            )]),
+            DialError::DialPeerConditionFalse(PeerCondition::NotDialing),
+            DialError::DialPeerConditionFalse(PeerCondition::DisconnectedAndNotDialing),
+            DialError::Aborted,
+        ]
+        .into_iter()
+        .map(|native| async move {
+            let mut peer_manager = create_test_peer_manager(None);
+            let peer_id = PeerId::random();
+            let (sender, receiver) = oneshot::channel();
+            peer_manager.register_dial_attempt(peer_id, Some(sender));
+            peer_manager.on_dial_failure(Some(peer_id), &native);
+            let result = timeout(Duration::from_millis(500), receiver).await??;
+            let error = result.err().ok_or_else(|| eyre::eyre!("native dial must fail"))?;
+            assert_matches!(error, NetworkError::Dial(detail) if detail == native.to_string());
+            assert!(!peer_manager.is_connected(&peer_id));
+            Ok::<_, eyre::Report>(())
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
-use crate::peers::types::ConnectionType;
+use crate::{error::NetworkError, peers::types::ConnectionType};
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
@@ -321,10 +321,17 @@ impl PeerManager {
                 self.register_disconnected(&peer_id);
             }
 
-            // return the genuine dial error to the dialer. `register_disconnected` no longer
-            // consumes the reply channel with a hardcoded cause, so the real `DialError`
-            // (wrong key, refused, firewall, timeout) reaches the caller.
-            self.notify_dial_result(&peer_id, Err(error.into()));
+            // A disconnected-only dial can lose a race to an established transport. Preserve
+            // that typed distinction; authenticated peer readiness still belongs to the caller.
+            let error = if matches!(
+                error,
+                DialError::DialPeerConditionFalse(PeerCondition::Disconnected)
+            ) {
+                NetworkError::AlreadyConnected(format!("{peer_id}: {error}"))
+            } else {
+                error.into()
+            };
+            self.notify_dial_result(&peer_id, Err(error));
         }
     }
 }

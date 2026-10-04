@@ -234,19 +234,21 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
 }
 
 /// Confirm the authenticated target after a successful or potentially raced dial.
-async fn dial_and_confirm<F>(handle: &Handle, target: BlsPublicKey, dial: F) -> Result<()>
+async fn dial_and_confirm<F>(
+    handle: &Handle,
+    role: NetworkType,
+    target: BlsPublicKey,
+    dial: F,
+) -> Result<()>
 where
     F: Future<Output = std::result::Result<(), NetworkError>>,
 {
-    let outcome = dial.await;
-    if let Some(error) =
-        outcome.as_ref().err().filter(|error| matches!(error, NetworkError::Dial(_)))
-    {
+    let outcome = dial.await.inspect_err(|error| {
         tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
-            phase = "confirmation", peer = %target,
+            phase = "confirmation", role = %role_name(role), peer = %target, outcome = "rejected",
             cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
             "native dial rejected");
-    }
+    });
     if outcome.as_ref().is_err_and(|error| {
         !matches!(
             error,
@@ -255,44 +257,95 @@ where
                 | NetworkError::Dial(_)
         )
     }) {
-        outcome.map_err(eyre::Report::from)
+        outcome
+            .inspect_err(|error| {
+                tracing::error!(target: "hub_capacity::peer", event = "peer_dial_confirmation",
+                    phase = "confirmation", role = %role_name(role), peer = %target,
+                    confirmation = "not_attempted",
+                    cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+                    "native dial failure prevents authenticated confirmation");
+            })
+            .map_err(eyre::Report::from)
     } else {
-        connected(handle, target, true).await.map_err(|confirmation_error| {
-            outcome.err().map(eyre::Report::from).unwrap_or(confirmation_error)
-        })
+        connected(handle, target, true)
+            .await
+            .inspect_err(|error| {
+                tracing::error!(target: "hub_capacity::peer", event = "peer_dial_confirmation",
+                    phase = "confirmation", role = %role_name(role), peer = %target, confirmation = "failed",
+                    cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+                    "authenticated target confirmation failed");
+            })
+            .map_err(|confirmation_error| {
+                outcome.err().map(eyre::Report::from).unwrap_or(confirmation_error)
+            })
     }
 }
 
 /// Accept queued startup dials and recover opaque dial failures with one bounded same-target retry.
 /// Race rejections still require authenticated target observation.
-async fn startup_dial<F>(handle: &Handle, target: BlsPublicKey, dial: F) -> Result<()>
+async fn startup_dial<F>(
+    handle: &Handle,
+    role: NetworkType,
+    target: BlsPublicKey,
+    dial: F,
+) -> Result<()>
 where
     F: Future<Output = std::result::Result<(), NetworkError>>,
 {
     let outcome = dial.await;
-    if let Some(error) =
-        outcome.as_ref().err().filter(|error| matches!(error, NetworkError::Dial(_)))
+    let retry_count = if outcome.as_ref().is_err_and(|error| matches!(error, NetworkError::Dial(_)))
     {
+        1
+    } else {
+        0
+    };
+    let needs_confirmation = outcome.as_ref().is_err_and(|error| {
+        matches!(
+            error,
+            NetworkError::Dial(_)
+                | NetworkError::AlreadyDialing(_)
+                | NetworkError::AlreadyConnected(_)
+        )
+    });
+    let outcome = outcome.inspect_err(|error| {
         tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
-            phase = "startup", peer = %target,
+            phase = "startup", role = %role_name(role), peer = %target, outcome = "rejected", retry_count,
             cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
             "native dial rejected");
-    }
-    if outcome.is_ok() {
+    });
+    let result = if outcome.is_ok() {
         Ok(())
     } else if outcome.as_ref().is_err_and(|error| matches!(error, NetworkError::Dial(_))) {
         // The retry and authenticated observation share the existing recovery window.
         tokio::time::timeout(
             Duration::from_secs(8),
-            dial_and_confirm(handle, target, handle.dial_by_bls(target)),
+            dial_and_confirm(handle, role, target, handle.dial_by_bls(target)),
         )
         .await
-        .map_err(eyre::Report::from)
+        .map_err(|error| {
+            tracing::error!(target: "hub_capacity::peer", event = "peer_startup_recovery",
+                role = %role_name(role), peer = %target, retry_count,
+                confirmation = "deadline", "startup recovery window elapsed");
+            eyre::Report::from(error)
+        })
         .and_then(std::convert::identity)
         .or_else(|_| outcome.map_err(eyre::Report::from))
     } else {
-        dial_and_confirm(handle, target, futures::future::ready(outcome)).await
+        dial_and_confirm(handle, role, target, futures::future::ready(outcome)).await
+    };
+    if needs_confirmation {
+        tracing::warn!(target: "hub_capacity::peer", event = "peer_startup_recovery",
+            role = %role_name(role), peer = %target, retry_count,
+            confirmation = if result.is_ok() { "confirmed" } else { "failed" },
+            "startup authenticated recovery completed");
     }
+    result.inspect_err(|error| {
+        tracing::error!(target: "hub_capacity::peer", event = "peer_startup_failure",
+            phase = "startup", role = %role_name(role), peer = %target, outcome = "rejected", retry_count,
+            confirmation = if needs_confirmation { "failed" } else { "not_attempted" },
+            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            "startup dial failed");
+    })
 }
 
 /// Finish every started reconnect transition before propagating a native target error.
@@ -347,11 +400,11 @@ impl Peer {
         let targets = self
             .handles
             .iter()
-            .flat_map(|(_, handle)| {
-                self.config.required_hubs.iter().map(move |key| (handle.clone(), *key))
+            .flat_map(|(role, handle)| {
+                self.config.required_hubs.iter().map(move |key| (*role, handle.clone(), *key))
             })
             .collect::<Vec<_>>();
-        settle_reconnects(targets.into_iter().map(|(handle, key)| async move {
+        settle_reconnects(targets.into_iter().map(|(role, handle, key)| async move {
             let peers = handle.connected_peers().await?;
             if peers.contains(&key) {
                 let record = handle.get_node_record(key).await?;
@@ -361,7 +414,7 @@ impl Peer {
             } else if require_existing {
                 Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
             }
-            dial_and_confirm(&handle, key, handle.dial_by_bls(key)).await
+            dial_and_confirm(&handle, role, key, handle.dial_by_bls(key)).await
         }))
         .await?;
         self.connectivity().await
@@ -621,6 +674,7 @@ async fn run_peer(args: RunArgs) -> Result<()> {
                     async move {
                         startup_dial(
                             &handle,
+                            role,
                             key,
                             handle.add_trusted_peer_and_dial(
                                 key,
@@ -648,18 +702,16 @@ async fn run_peer(args: RunArgs) -> Result<()> {
         slots: Arc::new(Semaphore::new(16)),
         gossip: Mutex::new(gossip_rx),
     });
-    let startup = futures::future::try_join_all(peer.handles.iter().map(|(_, handle)| async {
-        futures::future::try_join_all(
-            peer.config
-                .required_hubs
-                .iter()
-                .map(|key| async { startup_dial(handle, *key, handle.dial_by_bls(*key)).await }),
-        )
+    let startup =
+        futures::future::try_join_all(peer.handles.iter().map(|(role, handle)| async {
+            futures::future::try_join_all(peer.config.required_hubs.iter().map(|key| async {
+                startup_dial(handle, *role, *key, handle.dial_by_bls(*key)).await
+            }))
+            .await
+        }))
         .await
-    }))
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string());
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     let listener = tokio::net::TcpListener::bind(peer.config.control).await?;
     let public = json!({"identity": peer.identity, "bls_key": keys.primary_public_key(), "control": listener.local_addr()?, "startup_error": startup.err(), "swarms": roles.into_iter().zip(peer.config.listen.iter()).map(|(role, address)| {
         let key = match role { NetworkType::Primary => keys.primary_network_public_key(), NetworkType::Worker(id) => keys.worker_network_public_key(id) };
@@ -727,7 +779,7 @@ mod tests {
     use super::*;
     use tn_network_libp2p::types::NetworkCommand;
 
-    /// Real rejected startup requests retain bounded native detail without replacing the error.
+    /// The production default ERROR filter retains bounded fatal detail and the original error.
     #[tokio::test]
     async fn startup_dial_trace_bounds_native_detail_and_keeps_error() -> Result<()> {
         let keys =
@@ -735,7 +787,11 @@ mod tests {
         let target = keys.primary_public_key();
         let trace = tempfile::NamedTempFile::new()?;
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+                    .parse("")?,
+            )
             .without_time()
             .with_ansi(false)
             .with_writer(trace.as_file().try_clone()?)
@@ -744,16 +800,18 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(4);
         let handle = Handle::new(sender);
         let detail = "界".repeat(300);
+        let retry_detail = "路".repeat(300);
         let commands = async {
             let reply = retry_command(&mut receiver, target).await?;
             reply
-                .send(Err(NetworkError::ProtocolError("retry refused".to_owned())))
+                .send(Err(NetworkError::ProtocolError(retry_detail.clone())))
                 .map_err(|_| eyre!("the original startup recovery was canceled"))
         };
         let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
                 startup_dial(
                     &handle,
+                    NetworkType::Worker(1),
                     target,
                     futures::future::ready(Err(NetworkError::Dial(detail.clone())))
                 ),
@@ -767,11 +825,24 @@ mod tests {
             matches!(error.downcast_ref::<NetworkError>(), Some(NetworkError::Dial(original)) if original == &detail)
         );
         let retained = std::fs::read_to_string(trace.path())?;
-        assert!(retained.contains("peer_dial_rejection"));
+        assert!(!retained.contains("peer_dial_rejection"));
+        assert!(retained.contains("peer_startup_failure"));
+        assert!(retained.contains("peer_dial_confirmation"));
         assert!(retained.contains("phase=\"startup\""));
+        assert!(retained.contains("role=worker-1"));
+        assert!(retained.contains("outcome=\"rejected\""));
+        assert!(retained.contains("retry_count=1"));
+        assert!(retained.contains("confirmation=\"failed\""));
         assert!(retained.contains(&format!("peer={target}")));
         assert_eq!(retained.matches('界').count(), MAX_DIAL_ERROR_CHARS);
+        assert_eq!(
+            retained.matches('路').count(),
+            MAX_DIAL_ERROR_CHARS.saturating_sub(
+                NetworkError::ProtocolError(String::new()).to_string().chars().count()
+            )
+        );
         assert!(!retained.contains(&detail));
+        assert!(!retained.contains(&retry_detail));
         Ok(())
     }
 
@@ -901,6 +972,7 @@ mod tests {
         let startup = async {
             startup_dial(
                 &handle,
+                NetworkType::Primary,
                 target,
                 handle.add_trusted_peer_and_dial(
                     target,
@@ -909,7 +981,7 @@ mod tests {
                 ),
             )
             .await?;
-            startup_dial(&handle, target, handle.dial_by_bls(target)).await
+            startup_dial(&handle, NetworkType::Primary, target, handle.dial_by_bls(target)).await
         };
         let commands = async {
             let command =
@@ -964,7 +1036,10 @@ mod tests {
             observe_peer(&mut receiver, target).await
         };
         let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(dial_and_confirm(&handle, target, handle.dial_by_bls(target)), commands)
+            tokio::join!(
+                dial_and_confirm(&handle, NetworkType::Primary, target, handle.dial_by_bls(target)),
+                commands
+            )
         })
         .await?;
         commands?;
@@ -1008,7 +1083,7 @@ mod tests {
             observe_peer(&mut receiver, target).await
         };
         let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(startup_dial(&handle, target, dial), commands)
+            tokio::join!(startup_dial(&handle, NetworkType::Primary, target, dial), commands)
         })
         .await?;
         commands?;
@@ -1048,7 +1123,10 @@ mod tests {
             }
         };
         let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(startup_dial(&handle, target, handle.dial_by_bls(target)), commands)
+            tokio::join!(
+                startup_dial(&handle, NetworkType::Primary, target, handle.dial_by_bls(target)),
+                commands
+            )
         })
         .await?;
         commands?;
@@ -1079,7 +1157,10 @@ mod tests {
             Ok::<_, eyre::Report>(())
         };
         let (result, commands) = tokio::time::timeout(Duration::from_secs(9), async {
-            tokio::join!(startup_dial(&handle, target, handle.dial_by_bls(target)), commands)
+            tokio::join!(
+                startup_dial(&handle, NetworkType::Primary, target, handle.dial_by_bls(target)),
+                commands
+            )
         })
         .await?;
         commands?;
@@ -1090,7 +1171,7 @@ mod tests {
         Ok(())
     }
 
-    /// An already-dialing rejection observes the authenticated target without another dial.
+    /// Already-dialing and already-connected races require the exact target without another dial.
     #[tokio::test]
     async fn raced_startup_rejection_observes_target_without_transport_retry() -> Result<()> {
         let keys =
@@ -1099,22 +1180,95 @@ mod tests {
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(4477)));
         let target = keys.primary_public_key();
         let wrong = wrong_keys.primary_public_key();
+        futures::future::try_join_all(
+            [
+                NetworkError::AlreadyDialing("opaque dialing race".to_owned()),
+                NetworkError::AlreadyConnected("opaque connected race".to_owned()),
+            ]
+            .into_iter()
+            .map(|native| async move {
+                let (sender, mut receiver) = mpsc::channel(4);
+                let handle = Handle::new(sender);
+                let commands = async {
+                    retry_command(&mut receiver, target)
+                        .await?
+                        .send(Err(native))
+                        .map_err(|_| eyre!("raced startup reply canceled"))?;
+                    observe_peer(&mut receiver, wrong).await?;
+                    observe_peer(&mut receiver, target).await
+                };
+                let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::join!(
+                        startup_dial(
+                            &handle,
+                            NetworkType::Primary,
+                            target,
+                            handle.dial_by_bls(target)
+                        ),
+                        commands
+                    )
+                })
+                .await?;
+                commands?;
+                result?;
+                assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                Ok::<_, eyre::Report>(())
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// An unauthenticated target preserves its original already-connected cause without retrying.
+    #[tokio::test]
+    async fn already_connected_startup_keeps_error_when_target_is_absent() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(5776)));
+        let wrong_keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(5777)));
+        let target = keys.primary_public_key();
+        let wrong = wrong_keys.primary_public_key();
         let (sender, mut receiver) = mpsc::channel(4);
         let handle = Handle::new(sender);
+        let original = "native disconnected-condition rejection for the declared transport";
         let commands = async {
-            retry_command(&mut receiver, target)
-                .await?
-                .send(Err(NetworkError::AlreadyDialing("opaque race rejection".to_owned())))
-                .map_err(|_| eyre!("raced startup reply canceled"))?;
+            let command =
+                receiver.recv().await.ok_or_else(|| eyre!("trusted dial command missing"))?;
+            let reply =
+                if let NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, reply, .. } = command {
+                    assert_eq!(bls_pubkey, target);
+                    Ok(reply)
+                } else {
+                    Err(eyre!("expected the declared trusted target"))
+                }?;
+            reply
+                .send(Err(NetworkError::AlreadyConnected(original.to_owned())))
+                .map_err(|_| eyre!("trusted dial reply canceled"))?;
             observe_peer(&mut receiver, wrong).await?;
-            observe_peer(&mut receiver, target).await
+            let command = receiver.recv().await.ok_or_else(|| eyre!("peer observation missing"))?;
+            if let NetworkCommand::ConnectedPeers { reply } = command {
+                drop(reply);
+                Ok::<_, eyre::Report>(())
+            } else {
+                Err(eyre!("expected exact authenticated confirmation without retry"))
+            }
         };
+        let dial = handle.add_trusted_peer_and_dial(
+            target,
+            keys.primary_network_public_key(),
+            "/ip4/127.0.0.1/udp/9000/quic-v1".parse()?,
+        );
         let (result, commands) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(startup_dial(&handle, target, handle.dial_by_bls(target)), commands)
+            tokio::join!(startup_dial(&handle, NetworkType::Worker(1), target, dial), commands)
         })
         .await?;
         commands?;
-        result
+        let error =
+            result.err().ok_or_else(|| eyre!("an absent authenticated target cannot be ready"))?;
+        assert!(matches!(error.downcast_ref::<NetworkError>(),
+            Some(NetworkError::AlreadyConnected(cause)) if cause == original));
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        Ok(())
     }
 
     #[test]
