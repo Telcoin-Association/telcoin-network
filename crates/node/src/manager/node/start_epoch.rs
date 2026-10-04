@@ -24,7 +24,10 @@
 
 use super::{read_num_workers_at_epoch_entry, run_epoch::retry_provider_faults};
 use crate::{
-    engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
+    engine::{ExecutionNode, WorkerState},
+    manager::EpochManager,
+    primary::PrimaryNode,
+    worker::WorkerNode,
     EngineToPrimaryRpc,
 };
 use eyre::{eyre, OptionExt, WrapErr as _};
@@ -60,6 +63,34 @@ use tn_types::{
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Delay between peer-readiness probes within the configured readiness budget.
+const PEER_WAIT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Distinguish an unavailable peer from an unavailable network command channel.
+#[derive(Debug)]
+enum PeerWaitError {
+    /// No established peer was observed within the configured readiness budget.
+    TimedOut {
+        /// Network whose readiness budget expired.
+        network_name: &'static str,
+    },
+    /// The swarm could not answer a readiness probe.
+    Network(NetworkError),
+}
+
+impl std::fmt::Display for PeerWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut { network_name } => {
+                write!(formatter, "{network_name} unable to join, cannot connect to any peers!")
+            }
+            Self::Network(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for PeerWaitError {}
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -293,6 +324,26 @@ where
     /// `epoch_start` is the timestamp of the pinned header, the previous epoch's closing block
     /// (genesis for epoch 0), from the same entry read as `committee`. It becomes the config's
     /// [`ConsensusConfig::prior_epoch_close`] for every epoch after 0.
+    ///
+    /// The vote-window check ([`ConsensusConfig::validate_epoch_timing`]) runs here, after
+    /// [`ConsensusConfig::new_for_epoch`] has built the config and enforced the operational
+    /// floors, and only for an epoch this node can still vote in. Every epoch the node enters
+    /// passes through this method, including the historical epochs that a catching-up node (a
+    /// fresh joiner, an observer following from genesis, a validator restoring an old snapshot)
+    /// only replays. Before the sub-second fork the voter rounds the drift tolerance up to whole
+    /// seconds, so the window is wider for pre-fork epochs. A config tuned for the post-fork
+    /// window would otherwise stop the node at the first pre-fork epoch it replays, although the
+    /// network has already closed that epoch and the node can never vote in it.
+    ///
+    /// An epoch counts as closed only when its record is stored with a certificate that verifies
+    /// against it (`certified_record_by_epoch`). Startup syncs records toward the network tip and
+    /// stores each one with its certificate, and the epoch record collector keeps extending that
+    /// certified prefix for the life of the process, so a catching-up node normally holds the
+    /// record of a closed epoch before it enters it; an epoch whose certified record it does not
+    /// hold yet keeps the check. A plain record lookup is not enough: a fresh genesis start seeds
+    /// an uncertified dummy record for epoch 0, and that dummy must not let the node skip the
+    /// check for the epoch it is about to vote in. A failed read of any kind leaves the check in
+    /// force.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
@@ -304,8 +355,9 @@ where
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
+        let epoch = committee.epoch();
         // epoch 0's pin is genesis, not a closed epoch, so there is no seam to floor
-        let prior_epoch_close = (committee.epoch() > 0).then_some(epoch_start);
+        let prior_epoch_close = (epoch > 0).then_some(epoch_start);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -317,6 +369,19 @@ where
             next_committee_keys,
             PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
         )?;
+
+        // a missing record, a missing certificate and a storage error all mean "not known to be
+        // closed", so only a verified certificate relaxes the check
+        let closed = self.consensus_chain.epochs().certified_record_by_epoch(epoch).await.is_ok();
+        if closed {
+            info!(
+                target: "epoch-manager",
+                epoch,
+                "epoch already closed by its committee; replaying it without the vote-window check"
+            );
+        } else {
+            consensus_config.validate_epoch_timing()?;
+        }
 
         Ok(consensus_config)
     }
@@ -453,11 +518,13 @@ where
         ))
     }
 
-    /// Construct every worker in the committee's on-chain worker range, in id order.
+    /// Construct every worker in the committee's on-chain worker range.
     ///
-    /// Refresh each active handle before creating its pool, RPC server, validator and network.
-    /// Sequential initialization preserves the engine's contiguous worker indexing. Extra
-    /// configured swarms stay idle until a future epoch activates their ids.
+    /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
+    /// engine's contiguous worker indexing, then bring up the epoch networks concurrently so peer
+    /// waits overlap. Extra configured swarms stay idle until a future epoch activates their ids.
+    /// Workers removed from the committee stop their RPC listeners before the new epoch's workers
+    /// start.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
@@ -468,6 +535,12 @@ where
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<Vec<WorkerNode<DB>>> {
+        engine
+            .start_worker_readiness_epoch(
+                consensus_config.committee().number_of_workers(),
+                consensus_config.shutdown().subscribe(),
+            )
+            .await;
         self.worker_network_handles
             .iter_mut()
             .take(consensus_config.committee().number_of_workers())
@@ -475,6 +548,8 @@ where
                 handle.update_task_spawner(epoch_task_spawner.clone());
                 handle.update_epoch(consensus_config.committee().epoch());
             });
+
+        engine.deactivate_workers_above(consensus_config.committee().number_of_workers()).await;
 
         // Follow mode changes while workers initialize and wait for network peers.
         let engine_for_sync_status = engine.clone();
@@ -489,40 +564,44 @@ where
             }
         });
 
-        let workers = futures::stream::iter(consensus_config.committee().worker_ids())
-            .then(|worker_id| {
-                self.spawn_worker_node(
+        futures::stream::iter(consensus_config.committee().worker_ids().map(Ok))
+            .try_for_each(|worker_id| {
+                self.initialize_worker_node(
                     worker_id,
-                    consensus_config,
                     engine,
                     engine_to_primary.clone(),
                     &gas_accumulator,
-                    previous_committee_keys.clone(),
                 )
             })
-            .try_collect()
             .await?;
 
-        Ok(workers)
+        futures::future::try_join_all(consensus_config.committee().worker_ids().map(|worker_id| {
+            self.spawn_worker_node(
+                worker_id,
+                consensus_config,
+                engine,
+                &gas_accumulator,
+                previous_committee_keys.clone(),
+            )
+        }))
+        .await
     }
 
-    /// Initialize one worker's persistent components and attach its epoch-scoped tasks.
+    /// Initialize one worker's persistent components in ascending worker-id order.
     ///
     /// Test initialization per id so activating a new worker after startup creates its pool
     /// and RPC server without reopening the existing workers' listeners.
-    async fn spawn_worker_node(
+    async fn initialize_worker_node(
         &self,
         worker_id: WorkerId,
-        consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         mut engine_to_primary: EngineToPrimaryRpc,
         gas_accumulator: &GasAccumulator,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<WorkerNode<DB>> {
+    ) -> eyre::Result<()> {
         // The worker's shared base-fee container and a u64 snapshot of its current value. The
         // pool receives the live container so its pending fee tracks the accumulator across
-        // epoch boundaries (issue #1262). The snapshot serves the batch validator and the
-        // every-epoch setter below (base fee is constant within an epoch).
+        // epoch boundaries (issue #1262). The snapshot serves the every-epoch setter below
+        // (base fee is constant within an epoch).
         let base_fee_container = gas_accumulator.base_fee(worker_id);
         let base_fee = base_fee_container.base_fee();
         // The worker's per-query base-fee handle: the RPC server keeps it and resolves
@@ -536,28 +615,33 @@ where
                 .get(usize::from(worker_id))
                 .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?;
 
-            // Worker 0 is initialized in EpochManager::run before startup sync. Other workers are
-            // initialized on the first epoch entry where their id is active, including ids
-            // activated later by governance. Network tasks are attached below on every
-            // entry.
-            if !engine.is_worker_initialized(worker_id).await {
-                engine_to_primary.node_info.worker_network_key =
-                    self.key_config.worker_network_public_key(worker_id);
-                engine_to_primary.node_info.worker_external_address = self
-                    .builder
-                    .tn_config
-                    .node_info
-                    .worker_network_address(worker_id)
-                    .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
-                    .clone();
-                engine
-                    .initialize_worker_components(
-                        worker_id,
-                        engine_to_primary,
-                        base_fee_container,
-                        worker_base_fee,
-                    )
-                    .await?;
+            // Worker 0 is initialized in EpochManager::run before startup sync. Other workers
+            // are initialized on the first epoch entry where their id is active. Retained pools
+            // are reused when governance reactivates their worker ids.
+            match engine.worker_state(worker_id).await {
+                WorkerState::Uninitialized => {
+                    engine_to_primary.node_info.worker_network_key =
+                        self.key_config.worker_network_public_key(worker_id);
+                    engine_to_primary.node_info.worker_external_address = self
+                        .builder
+                        .tn_config
+                        .node_info
+                        .worker_network_address(worker_id)
+                        .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
+                        .clone();
+                    engine
+                        .initialize_worker_components(
+                            worker_id,
+                            engine_to_primary,
+                            base_fee_container,
+                            worker_base_fee,
+                        )
+                        .await?;
+                }
+                WorkerState::Stopped | WorkerState::Running => {
+                    // Restore this epoch's fee before a removed worker starts accepting again.
+                    engine.restart_worker_rpc(worker_id, base_fee).await?;
+                }
             }
 
             // Each epoch owns one peer-count task, including for RPCs bound before startup sync.
@@ -574,6 +658,19 @@ where
             .set_workers_syncing(node_mode_is_syncing(self.consensus_bus.current_node_mode()))
             .await;
 
+        Ok(())
+    }
+
+    /// Attach one initialized worker's epoch network and node, independently of other workers.
+    async fn spawn_worker_node(
+        &self,
+        worker_id: WorkerId,
+        consensus_config: &ConsensusConfig<DB>,
+        engine: &ExecutionNode,
+        gas_accumulator: &GasAccumulator,
+        previous_committee_keys: HashSet<BlsPublicKey>,
+    ) -> eyre::Result<WorkerNode<DB>> {
+        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
         let network_handle = self
             .worker_network_handles
             .get(usize::from(worker_id))
@@ -740,7 +837,12 @@ where
             }
         }
 
-        Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
+        Self::wait_for_network_peers(
+            network_handle.inner_handle(),
+            "primary network",
+            consensus_config.network_config().peer_readiness_timeout(),
+        )
+        .await?;
 
         // re-probe each peer's epoch-pack sync capability this epoch: committees
         // rotate and binaries are upgraded at the boundary, so a peer that could
@@ -879,7 +981,12 @@ where
             );
         }
 
-        Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
+        Self::wait_for_worker_network_peers(
+            network_handle.inner_handle(),
+            *worker_id,
+            consensus_config.network_config().peer_readiness_timeout(),
+        )
+        .await?;
 
         // Decide the batch-digest gossip subscription for this epoch (issue #960). Committee
         // validators subscribe to warm the vote path's batch cache; observers unsubscribe,
@@ -1030,34 +1137,78 @@ where
             .unwrap_or(Ok(fallback))
     }
 
+    /// Let a peerless worker lane start after its bounded wait, leaving committee dials running.
+    ///
+    /// A timeout degrades this lane's batch availability without stopping primary consensus.
+    /// Command-channel failures remain fatal because the worker swarm itself is unavailable.
+    async fn wait_for_worker_network_peers<Req: TNMessage, Res: TNMessage>(
+        handle: &NetworkHandle<Req, Res>,
+        worker_id: WorkerId,
+        readiness_timeout: Duration,
+    ) -> Result<(), NetworkError> {
+        Self::probe_network_peers(handle, "worker network", readiness_timeout).await.or_else(|error| match error {
+            PeerWaitError::TimedOut { .. } => {
+                warn!(target: "epoch-manager", worker_id,
+                    "worker swarm has no established peers at epoch entry; continuing while dials retry");
+                crate::metrics::EpochMetrics::record_worker_peer_wait_timeout(worker_id);
+                Ok(())
+            }
+            PeerWaitError::Network(error) => Err(error),
+        })
+    }
+
     /// Give the given [`NetworkHandle`] a bounded wait for an established peer available for
     /// requests. Pending dials do not satisfy this readiness check.
     ///
-    /// Polls the peer count every 500ms, logging periodically, and continues startup after 240
-    /// attempts (~2 minutes) even if no peer has connected. A validator can start before the rest
-    /// of its committee: the live swarm keeps accepting connections, and consensus can form
-    /// once peers arrive. A readiness timeout must not terminate the node or its RPC service.
-    /// Generic over the [`TNMessage`] request/response types so it serves both the primary and
-    /// worker networks.
+    /// Polls the peer count every 500ms, logging periodically, and continues startup when the
+    /// configured budget expires, even if no peer has connected. A validator can start before the
+    /// rest of its committee: the live swarm keeps accepting connections, and consensus can
+    /// form once peers arrive. A readiness timeout must not terminate the node or its RPC
+    /// service. Generic over the [`TNMessage`] request/response types so it serves both the
+    /// primary and worker networks. A failed command-channel probe returns immediately as an
+    /// error.
     async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
-        network_name: &str,
-    ) -> eyre::Result<()> {
-        let mut peers = handle.established_peer_count().await.unwrap_or(0);
-        let mut retries = 0;
-        while peers == 0 {
-            retries += 1;
-            if retries > 240 {
+        network_name: &'static str,
+        readiness_timeout: Duration,
+    ) -> Result<(), NetworkError> {
+        Self::probe_network_peers(handle, network_name, readiness_timeout).await.or_else(|error| match error {
+            PeerWaitError::TimedOut { .. } => {
                 warn!(target: "epoch-manager", "{network_name} has no connected peers; continuing startup");
-                return Ok(());
+                Ok(())
             }
-            if retries % 10 == 0 {
-                error!(target: "epoch-manager", "failed to join the {network_name}!");
+            PeerWaitError::Network(error) => Err(error),
+        })
+    }
+
+    /// Probe for an established peer within the bounded readiness budget.
+    ///
+    /// Pending dials do not satisfy readiness. Poll every 500ms until the configured deadline,
+    /// including time spent awaiting command-channel replies. Return a peer timeout separately
+    /// from a command-channel failure so callers can continue startup and record role-specific
+    /// metrics.
+    async fn probe_network_peers<Req: TNMessage, Res: TNMessage>(
+        handle: &NetworkHandle<Req, Res>,
+        network_name: &'static str,
+        readiness_timeout: Duration,
+    ) -> Result<(), PeerWaitError> {
+        let readiness = async {
+            let mut peers =
+                handle.established_peer_count().await.map_err(PeerWaitError::Network)?;
+            let mut retries = 0;
+            while peers == 0 {
+                retries += 1;
+                if retries % 10 == 0 {
+                    error!(target: "epoch-manager", "failed to join the {network_name}!");
+                }
+                tokio::time::sleep(PEER_WAIT_INTERVAL).await;
+                peers = handle.established_peer_count().await.map_err(PeerWaitError::Network)?;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = handle.established_peer_count().await.unwrap_or(0);
-        }
-        Ok(())
+            Ok(())
+        };
+        tokio::time::timeout(readiness_timeout, readiness)
+            .await
+            .unwrap_or(Err(PeerWaitError::TimedOut { network_name }))
     }
 }
 
@@ -1144,7 +1295,39 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
-    /// Epoch entry reuses worker 0's early RPC, initializes other workers and refreshes sync state.
+    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
+    /// there: the on-disk state an `EpochManager` is built from.
+    fn reth_config_and_db<P>(
+        config: &tn_config::Config,
+        committee: &tn_types::Committee,
+        datadir: &P,
+    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
+    where
+        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
+    {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+
+        tn_reth::init_reth_defaults();
+        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            datadir,
+            true,
+            std::sync::Arc::new(config.chain_spec()),
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
+        Ok((node_config, reth_db))
+    }
+
+    /// Epoch entry reuses worker 0's early RPC and joins worker peer waits concurrently.
+    /// Subsequent entries reuse active RPC servers and pools, refresh sync state, and stop and
+    /// reactivate removed workers over their retained pools.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
@@ -1154,12 +1337,11 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+        use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
-        use tn_test_utils::CommitteeFixture;
-        use tn_types::{BlsKeypair, P2pNode};
+        use tn_test_utils::{wait_until, CommitteeFixture};
+        use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
 
-        tn_reth::init_reth_defaults();
         let temp = tempfile::TempDir::new()?;
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
@@ -1180,20 +1362,7 @@ mod tests {
             .committee()
             .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
-        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
-        let chain = Arc::new(config.chain_spec());
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            &datadir,
-            true,
-            chain,
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.join("manager-db"))?;
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
         let reth_env =
@@ -1202,13 +1371,14 @@ mod tests {
         let engine = ExecutionNode::new(&builder, reth_env)?;
         let db = MemDatabase::default();
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
-            config,
+            config.clone(),
             db.clone(),
             keys.clone(),
-            committee,
+            committee.clone(),
             NetworkConfig::default(),
         )?;
-        let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
+        let mut manager =
+            EpochManager::new(builder, datadir.clone(), db.clone(), keys, "test").await?;
 
         accumulator.base_fee(DEFAULT_WORKER_ID).set_base_fee(100_000_000);
         // The startup listener needs no worker network or epoch tasks. It must report syncing
@@ -1242,13 +1412,20 @@ mod tests {
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
         let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
         assert!(mode.is_observer(), "fixture must start as an observer");
+        // Neither worker can finish its first probe until both networks have entered their wait.
+        let first_probes = Arc::new(tokio::sync::Barrier::new(2));
         manager.worker_network_handles = (0..2)
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
+                let first_probes = first_probes.clone();
                 network_tasks.spawn_task("test worker commands", async move {
+                    let probed = std::sync::atomic::AtomicBool::new(false);
                     tokio_stream::wrappers::ReceiverStream::new(receiver)
-                        .for_each(|command| async move {
+                        .for_each(|command| async {
                             if let NetworkCommand::EstablishedPeerCount { reply } = command {
+                                if !probed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    first_probes.wait().await;
+                                }
                                 let _ = reply.send(1);
                             } else if let NetworkCommand::Unsubscribe { reply, .. } = command {
                                 let _ = reply.send(false);
@@ -1294,6 +1471,7 @@ mod tests {
         );
         accumulator.base_fee(0).set_base_fee(100_000_001);
         accumulator.base_fee(1).set_base_fee(100_000_002);
+        assert_eq!(engine.worker_state(1).await, WorkerState::Uninitialized);
         let mut epoch_tasks = TaskManager::default();
         let workers = manager
             .spawn_worker_node_components(
@@ -1308,6 +1486,14 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, true),
+            ]
+        );
+        assert_eq!(engine.worker_state(1).await, WorkerState::Running);
         assert_eq!(engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?, rpc_zero);
         let syncing: serde_json::Value =
             startup_client.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
@@ -1321,7 +1507,8 @@ mod tests {
             100_000_001
         );
         let rpc_one = engine.worker_http_local_address(&1).await?;
-        assert!(rpc_one.is_some());
+        let worker_one_address = rpc_one.ok_or_else(|| eyre!("worker one address"))?;
+        let retained_pool = engine.get_worker_transaction_pool(&1).await?;
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
         let info: serde_json::Value = client.request("tn_info", jsonrpsee::rpc_params![]).await?;
         assert_eq!(
@@ -1342,15 +1529,15 @@ mod tests {
         epoch_tasks.abort_all_tasks();
         epoch_tasks.wait_for_task_shutdown().await;
         drop(epoch_tasks);
-        let next_tasks = TaskManager::default();
+        let mut next_tasks = TaskManager::default();
         accumulator.base_fee(1).set_base_fee(100_000_003);
         let restarted = manager
             .spawn_worker_node_components(
                 &consensus_config,
                 &engine,
                 next_tasks.get_spawner(),
-                rpc,
-                accumulator,
+                rpc.clone(),
+                accumulator.clone(),
                 HashSet::new(),
             )
             .await?;
@@ -1360,6 +1547,327 @@ mod tests {
             engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
             100_000_003
         );
+
+        drop(restarted);
+        next_tasks.update_tasks();
+        next_tasks.abort_all_tasks();
+        next_tasks.wait_for_task_shutdown().await;
+        drop(next_tasks);
+        accumulator.set_num_workers(1);
+        let smaller_committee = ConsensusConfig::new_with_committee_for_test(
+            config,
+            db,
+            manager.key_config.clone(),
+            committee.with_num_workers(NonZeroUsize::MIN),
+            NetworkConfig::default(),
+        )?;
+        let mut shrink_tasks = TaskManager::default();
+        let shrunk = manager
+            .spawn_worker_node_components(
+                &smaller_committee,
+                &engine,
+                shrink_tasks.get_spawner(),
+                rpc.clone(),
+                accumulator.clone(),
+                HashSet::new(),
+            )
+            .await?;
+        assert_eq!(shrunk.len(), 1);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, false),
+            ]
+        );
+        assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+        assert!(!engine.is_worker_initialized(1).await);
+        assert!(engine.worker_http_client(&1).await.is_err());
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
+        assert!(engine.is_worker_initialized(0).await);
+        assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+        wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
+            Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
+        })
+        .await?;
+
+        // Repeated deactivation and mode updates must not make the removed worker ready.
+        engine.deactivate_workers_above(1).await;
+        engine.set_workers_syncing(false).await;
+        assert!(!engine.is_worker_initialized(1).await);
+        drop(shrunk);
+        shrink_tasks.update_tasks();
+        shrink_tasks.abort_all_tasks();
+        shrink_tasks.wait_for_task_shutdown().await;
+        drop(shrink_tasks);
+
+        accumulator.set_num_workers(2);
+        accumulator.base_fee(1).set_base_fee(100_000_004);
+        let regrow_tasks = TaskManager::default();
+        let regrown = manager
+            .spawn_worker_node_components(
+                &consensus_config,
+                &engine,
+                regrow_tasks.get_spawner(),
+                rpc,
+                accumulator,
+                HashSet::new(),
+            )
+            .await?;
+        assert_eq!(regrown.len(), 2);
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, true),
+                crate::health::WorkerReadiness::new(1, true),
+            ]
+        );
+        assert!(engine.is_worker_initialized(1).await);
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
+        assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
+        let reactivated =
+            engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
+        let syncing: serde_json::Value =
+            reactivated.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
+        assert_eq!(syncing, serde_json::Value::Bool(false));
+        let history: serde_json::Value = reactivated
+            .request("eth_feeHistory", jsonrpsee::rpc_params!["0x1", "latest", Vec::<f64>::new()])
+            .await?;
+        assert_eq!(
+            history
+                .get("baseFeePerGas")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|fees| fees.last()),
+            Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
+        );
+        consensus_config.shutdown().notify();
+        assert_eq!(
+            engine.worker_readiness().await,
+            vec![
+                crate::health::WorkerReadiness::new(0, false),
+                crate::health::WorkerReadiness::new(1, false),
+            ]
+        );
+        assert!(engine.worker_http_local_address(&1).await?.is_some());
+        Ok(())
+    }
+
+    /// Every epoch after 0 floors its first commit on the timestamp of the previous epoch's
+    /// closing block, and `configure_consensus` is where that timestamp enters the consensus
+    /// config. Epoch 0's entry read is pinned to genesis, which closes no epoch, so its config
+    /// carries no close even though the pinned header has a timestamp.
+    #[tokio::test]
+    async fn configure_consensus_carries_prior_epoch_close_after_epoch_zero() -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{BlsKeypair, TimestampSec};
+
+        // both epochs get the same pinned-header timestamp, so only the committee's epoch decides
+        // whether it becomes the close
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let config = Config::default_for_test();
+        let genesis = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+
+        let epoch_zero = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_zero.prior_epoch_close(),
+            None,
+            "epoch 0 follows genesis rather than a closed epoch, so there is no close to floor on"
+        );
+
+        let committee =
+            CommitteeFixture::builder(MemDatabase::default).epoch(1).build().committee();
+        let epoch_one = manager
+            .configure_consensus(
+                &network_config,
+                committee,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_one.prior_epoch_close(),
+            Some(EPOCH_START),
+            "epoch 1 must floor its first commit on the timestamp of epoch 0's closing block"
+        );
+        Ok(())
+    }
+
+    /// The vote window bounds this node's own votes, so entering an epoch enforces it only while
+    /// the epoch may still be open. A record stored with a verified certificate is the
+    /// committee's own statement that the epoch closed, and a node entering such an epoch only
+    /// replays it. Anything less, including the uncertified dummy record a fresh genesis start
+    /// seeds for epoch 0, keeps the check strict. The parameters miss the window in both fork
+    /// regimes, so the outcome does not depend on the build's fork schedule.
+    #[tokio::test]
+    async fn configure_consensus_enforces_the_vote_window_only_while_the_epoch_is_open(
+    ) -> eyre::Result<()> {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{
+            BlsAggregateSignature, BlsKeypair, EpochCertificate, EpochRecord, TimestampSec,
+        };
+
+        /// A record for `epoch` whose committee is `fixture`'s, with a certificate every member
+        /// signed, aggregated the way the epoch vote collector does.
+        fn certified_record(
+            fixture: &CommitteeFixture<MemDatabase>,
+            epoch: Epoch,
+            parent_hash: EpochDigest,
+        ) -> (EpochRecord, EpochCertificate) {
+            let keys: Vec<BlsPublicKey> =
+                fixture.authorities().map(|authority| authority.primary_public_key()).collect();
+            let record = EpochRecord {
+                epoch,
+                committee: keys.clone(),
+                next_committee: keys,
+                parent_hash,
+                ..Default::default()
+            };
+            let signatures: Vec<_> = fixture
+                .authorities()
+                .map(|authority| record.sign_vote(authority.consensus_config().key_config()))
+                .map(|vote| vote.signature)
+                .collect();
+            let signature = BlsAggregateSignature::aggregate(&signatures, true)
+                .expect("committee votes aggregate")
+                .to_signature();
+            let signed_authorities = (0..signatures.len() as u32).collect();
+            let cert =
+                EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
+            (record, cert)
+        }
+
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let mut config = Config::default_for_test();
+        // 2 s misses the vote window with sub-second timestamps (2.25 s) and without them (3 s),
+        // and still passes the operational floors
+        config.parameters.max_header_delay = Duration::from_secs(2);
+        config.parameters.vote_timeout = Duration::from_secs(2);
+        let genesis_fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let genesis = genesis_fixture.committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(29)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+        let epoch_one_fixture = CommitteeFixture::builder(MemDatabase::default).epoch(1).build();
+        let epochs = manager.consensus_chain.epochs();
+
+        // `err()` keeps a failure message free of the whole config's debug dump
+        let Some(err) = manager
+            .configure_consensus(
+                &network_config,
+                epoch_one_fixture.committee(),
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .err()
+        else {
+            panic!("an epoch with no stored record may still be open, so its vote window holds");
+        };
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "entering an open epoch must fail with the config's own vote_timeout error: {err}"
+        );
+
+        // the in-memory anchor a fresh genesis start seeds before it syncs any record
+        let genesis_keys: Vec<BlsPublicKey> = genesis.bls_keys().iter().copied().collect();
+        epochs
+            .save_dummy_epoch0(EpochRecord {
+                epoch: 0,
+                committee: genesis_keys.clone(),
+                next_committee: genesis_keys,
+                ..Default::default()
+            })
+            .await?;
+        let Some(err) = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .err()
+        else {
+            panic!(
+                "the uncertified epoch-0 dummy does not show that epoch 0 closed, so a fresh \
+                 genesis start must still enforce the vote window"
+            );
+        };
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "entering epoch 0 over the dummy record must fail with the vote_timeout error: {err}"
+        );
+
+        let (record_zero, cert_zero) =
+            certified_record(&genesis_fixture, 0, EpochDigest::default());
+        let (record_one, cert_one) = certified_record(&epoch_one_fixture, 1, record_zero.digest());
+        epochs.save(record_zero, cert_zero).await?;
+        epochs.save(record_one, cert_one).await?;
+        assert!(
+            epochs.certified_record_by_epoch(1).await.is_ok(),
+            "epoch 1's stored record must verify against its certificate"
+        );
+        manager
+            .configure_consensus(
+                &network_config,
+                epoch_one_fixture.committee(),
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await
+            .expect(
+                "an epoch its committee certified as closed is only replayed, so entering it must \
+                 not apply the vote window",
+            );
         Ok(())
     }
 
@@ -1374,8 +1882,11 @@ mod tests {
 
         let (sender, mut commands) = tokio::sync::mpsc::channel(2);
         let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
-        let readiness =
-            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network");
+        let readiness = EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(
+            &handle,
+            "test network",
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        );
         tokio::pin!(readiness);
         assert!(futures::poll!(&mut readiness).is_pending());
         let initial_probe = commands.try_recv()?;
@@ -1389,15 +1900,191 @@ mod tests {
         assert!(futures::poll!(&mut readiness).is_pending());
         if let NetworkCommand::EstablishedPeerCount { reply } = commands.try_recv()? {
             reply.send(1).map_err(|count| eyre::eyre!("established count {count} was dropped"))?;
-            readiness.await
+            readiness.await.map_err(Into::into)
         } else {
             Err(eyre::eyre!("readiness probe must exclude pending dials"))
         }
     }
 
+    /// Answer only readiness probes, then close the channel when the supplied counts run out.
+    fn peer_count_responder(
+        counts: impl Iterator<Item = usize> + Send + 'static,
+    ) -> (
+        super::NetworkHandle<
+            tn_network_libp2p::PeerExchangeMap,
+            tn_network_libp2p::PeerExchangeMap,
+        >,
+        tokio::task::JoinHandle<usize>,
+    ) {
+        use futures::StreamExt as _;
+        use tn_network_libp2p::types::NetworkCommand;
+
+        let (sender, commands) = tokio::sync::mpsc::channel(2);
+        let handle = super::NetworkHandle::new(sender);
+        let responder = tokio::spawn(async move {
+            tokio_stream::wrappers::ReceiverStream::new(commands)
+                .zip(futures::stream::iter(counts))
+                .fold(0, |answered, (command, count)| async move {
+                    assert!(matches!(&command, NetworkCommand::EstablishedPeerCount { .. }));
+                    if let NetworkCommand::EstablishedPeerCount { reply } = command {
+                        // The configured deadline can cancel a probe before its reply is sent.
+                        let _ = reply.send(count);
+                    }
+                    answered + 1
+                })
+                .await
+        });
+        (handle, responder)
+    }
+
+    /// A peerless probe exhausts the default readiness budget and reports a typed timeout.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_exhausts_retry_budget() -> eyre::Result<()> {
+        use super::{EpochManager, PeerWaitError};
+        use std::{path::PathBuf, time::Duration};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (handle, responder) = peer_count_responder(std::iter::repeat_n(0, 241));
+        let start = tokio::time::Instant::now();
+        let result = EpochManager::<PathBuf, MemDatabase>::probe_network_peers(
+            &handle,
+            "primary network",
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        )
+        .await;
+        assert!(matches!(result, Err(PeerWaitError::TimedOut { .. })));
+        assert_eq!(start.elapsed(), Duration::from_secs(120));
+        drop(handle);
+        // The deadline may cancel the final probe before the responder observes it.
+        assert!((240..=241).contains(&responder.await?));
+        Ok(())
+    }
+
+    /// The same exhausted budget is recoverable for a worker, even with no established peers.
+    #[tokio::test(start_paused = true)]
+    async fn worker_readiness_timeout_is_nonfatal() -> eyre::Result<()> {
+        use super::EpochManager;
+        use std::{path::PathBuf, time::Duration};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (handle, responder) = peer_count_responder(std::iter::repeat_n(0, 241));
+        let start = tokio::time::Instant::now();
+        EpochManager::<PathBuf, MemDatabase>::wait_for_worker_network_peers(
+            &handle,
+            1,
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        )
+        .await?;
+        assert_eq!(start.elapsed(), Duration::from_secs(120));
+        drop(handle);
+        // The deadline may cancel the final probe before the responder observes it.
+        assert!((240..=241).contains(&responder.await?));
+        Ok(())
+    }
+
+    /// A worker uses its configured deadline even when the initial probe never receives a reply.
+    #[tokio::test(start_paused = true)]
+    async fn worker_readiness_bounds_stalled_probe() -> eyre::Result<()> {
+        use super::{EpochManager, NetworkHandle};
+        use std::{path::PathBuf, time::Duration};
+        use tn_network_libp2p::{types::NetworkCommand, PeerExchangeMap};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (sender, mut commands) = tokio::sync::mpsc::channel(2);
+        let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
+        let timeout = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let readiness = EpochManager::<PathBuf, MemDatabase>::wait_for_worker_network_peers(
+            &handle, 1, timeout,
+        );
+        tokio::pin!(readiness);
+        assert!(futures::poll!(&mut readiness).is_pending());
+        let initial_probe = commands.try_recv()?;
+        assert!(matches!(&initial_probe, NetworkCommand::EstablishedPeerCount { .. }));
+        tokio::time::advance(timeout).await;
+        tokio::time::timeout(Duration::from_secs(1), readiness).await??;
+        assert_eq!(started.elapsed(), timeout);
+        Ok(())
+    }
+
+    /// A failed initial probe is fatal for both network roles and consumes no retry interval.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_rejects_closed_channel() -> eyre::Result<()> {
+        use super::{EpochManager, PeerWaitError};
+        use std::{path::PathBuf, time::Duration};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (handle, responder) = peer_count_responder(std::iter::empty());
+        assert_eq!(responder.await?, 0);
+        let start = tokio::time::Instant::now();
+        let timeout = tn_config::NetworkConfig::default().peer_readiness_timeout();
+        let result = EpochManager::<PathBuf, MemDatabase>::probe_network_peers(
+            &handle,
+            "primary network",
+            timeout,
+        )
+        .await;
+        assert!(matches!(result, Err(PeerWaitError::Network(_))));
+        assert!(EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(
+            &handle,
+            "primary network",
+            timeout,
+        )
+        .await
+        .is_err());
+        assert!(EpochManager::<PathBuf, MemDatabase>::wait_for_worker_network_peers(
+            &handle, 1, timeout
+        )
+        .await
+        .is_err());
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        Ok(())
+    }
+
+    /// Losing the swarm after a successful zero-peer probe must not consume the remaining budget.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_rejects_closed_channel_on_retry() -> eyre::Result<()> {
+        use super::EpochManager;
+        use std::{path::PathBuf, time::Duration};
+        use tn_storage::mem_db::MemDatabase;
+
+        let (handle, responder) = peer_count_responder(std::iter::once(0));
+        let start = tokio::time::Instant::now();
+        assert!(EpochManager::<PathBuf, MemDatabase>::wait_for_worker_network_peers(
+            &handle,
+            1,
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        )
+        .await
+        .is_err());
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+        assert_eq!(responder.await?, 1);
+        Ok(())
+    }
+
     /// A network with no established peers exhausts its readiness wait without failing startup.
     #[tokio::test(start_paused = true)]
     async fn network_readiness_timeout_allows_startup() -> eyre::Result<()> {
+        assert_network_readiness_timeout(
+            tn_config::NetworkConfig::default().peer_readiness_timeout(),
+        )
+        .await
+    }
+
+    /// Configured budgets, including zero and sub-poll intervals, bound the entire readiness wait.
+    #[tokio::test(start_paused = true)]
+    async fn network_readiness_uses_configured_timeout() -> eyre::Result<()> {
+        use futures::{StreamExt as _, TryStreamExt as _};
+        use std::time::Duration;
+
+        futures::stream::iter([Duration::ZERO, Duration::from_millis(125), Duration::from_secs(5)])
+            .map(Ok::<_, eyre::Report>)
+            .try_for_each(assert_network_readiness_timeout)
+            .await
+    }
+
+    /// Assert that a peerless network continues startup at the requested deadline.
+    async fn assert_network_readiness_timeout(timeout: std::time::Duration) -> eyre::Result<()> {
         use super::{EpochManager, NetworkHandle};
         use futures::{StreamExt as _, TryStreamExt as _};
         use std::{path::PathBuf, time::Duration};
@@ -1413,7 +2100,9 @@ mod tests {
             .map(Ok::<_, eyre::Report>)
             .try_for_each(|command| async move {
                 if let NetworkCommand::EstablishedPeerCount { reply } = command {
-                    reply.send(0).map_err(|count| eyre::eyre!("peer count {count} was dropped"))
+                    // Deadline expiry can cancel an in-flight probe before this reply is sent.
+                    let _ = reply.send(0);
+                    Ok(())
                 } else {
                     Err(eyre::eyre!("readiness probe must exclude pending dials"))
                 }
@@ -1423,11 +2112,15 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
-            Duration::from_secs(121),
-            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(&handle, "test network"),
+            timeout + Duration::from_secs(1),
+            EpochManager::<PathBuf, MemDatabase>::wait_for_network_peers(
+                &handle,
+                "test network",
+                timeout,
+            ),
         )
         .await??;
-        assert_eq!(started.elapsed(), Duration::from_secs(120));
+        assert_eq!(started.elapsed(), timeout);
         drop(handle);
         replies.await??;
         Ok(())

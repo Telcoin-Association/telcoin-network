@@ -130,6 +130,7 @@ mod evm;
 pub mod forward;
 mod forward_pending;
 mod metrics;
+mod rpc_call;
 mod rpc_fee_cap;
 mod rpc_fee_history;
 mod rpc_fill_transaction;
