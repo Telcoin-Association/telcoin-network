@@ -1,0 +1,5 @@
+{
+  "status": "killed",
+  "mutation": "remove dependency traversal, retaining only named roots",
+  "failure": "Traceback (most recent call last):\n  File \"etc/transport-patches/test_closure.py\", line 28, in test_transitive_runtime_and_build_dependencies_keep_versions\n    self.assertIn((\"certificate-parser\", \"1.0.0\"), selected)\n    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('certificate-parser', '1.0.0') not found in {('libp2p-tls', '0.7.0'), ('libp2p-quic', '0.14.0')}\n"
+}
