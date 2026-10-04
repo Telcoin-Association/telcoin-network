@@ -16,7 +16,9 @@ Copy [TEMPLATE.md](TEMPLATE.md) to a directory named for the patch, as `README.m
 and keep its evidence beside it. Link the record here in the same PR that changes
 the dependency. A template with pending fields is not release approval.
 
-There are no carried transport patches yet. The
+The [carried libp2p-quic record](libp2p-quic/README.md) covers the active vendored
+Retry and queue bounds patch, accepted owners, measured advisory gaps and the
+required compatibility gate. The
 [libp2p-tls upstream candidate](libp2p-tls-6634/README.md) records a concrete patch
 and the checks still required before adopting it in a Telcoin release.
 

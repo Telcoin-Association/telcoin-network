@@ -60,8 +60,9 @@ pub struct PrimaryMetrics {
     pub(crate) committed_round: Gauge,
     /// Committed subdags.
     pub(crate) subdags_committed_total: Counter,
-    /// Time from leader header creation to subdag commit (whole seconds - the
-    /// timestamps are second-granularity, so this flags pathological commits, not p50s).
+    /// Time from leader header creation to subdag commit, in fractional seconds at millisecond
+    /// resolution. Before the sub-second timestamp fork a leader's creation time is a whole
+    /// second, so a pre-fork reading overstates the latency by up to one second.
     pub(crate) commit_latency_seconds: Histogram,
     /// The largest consensus output (in pack file encoded bytes) we have seen since startup.
     pub(crate) max_consensus_output_bytes: Gauge,
