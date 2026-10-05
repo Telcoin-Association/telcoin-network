@@ -615,6 +615,12 @@ impl PeerManager {
         self.peers.is_peer_validator(peer_id)
     }
 
+    /// Simulate temporary-ban expiry without completing a pending connection close.
+    #[cfg(test)]
+    pub(crate) fn simulate_temporary_ban_expiry(&mut self, peer_id: &PeerId) -> bool {
+        self.temporarily_banned.remove(peer_id)
+    }
+
     /// Returns a boolean if the peer is connected.
     pub(crate) fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.peers.get_peer(peer_id).is_some_and(|peer| {

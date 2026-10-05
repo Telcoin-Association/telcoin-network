@@ -37,7 +37,7 @@ CASES = [
     ("expired_identity_pending_ban", "crates/network-libp2p/src/consensus.rs",
      "&& self.swarm.behaviour().peer_manager.is_connected(&source)",
      "&& true",
-     "expired_kad_pending_protocol_ban_cannot_promote_identity"),
+     "expired_kad_pending_disconnect_cannot_promote_identity"),
     ("expired_identity_configured_cache", "crates/network-libp2p/src/peers/manager.rs",
      "if self.can_confirm_expired_public_identity(&source, &bls_key) {",
      "if { let _eligible = self.can_confirm_expired_public_identity(&source, &bls_key); true } {",

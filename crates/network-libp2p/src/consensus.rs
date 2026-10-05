@@ -2619,7 +2619,7 @@ where
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
             }
             PutRecordRate::Allowed => {
-                self.peer_record_valid(&record).and_then(|(key, value)| {
+                self.peer_record_valid(&record).map(|(key, value)| {
                     // Publisher validation binds the signed advertised network key. DHT expiry
                     // still permits a live self-owned identity proof, without storage ownership.
                     if record.is_expired(Instant::now()) {
@@ -2632,11 +2632,7 @@ where
                                 .peer_manager
                                 .confirm_expired_public_identity(source, key, value.info);
                         }
-                        None
                     } else {
-                        Some((key, value))
-                    }
-                }).map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
 
                     let freshness = self.record_freshness(&record);
@@ -2699,6 +2695,7 @@ where
                             // version. Log only; no penalty.
                             trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
                         }
+                    }
                     }
                 }).unwrap_or_else(|| {
                     warn!(target: "network-kad", "Received invalid peer record!");

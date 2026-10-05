@@ -3379,6 +3379,8 @@ async fn expired_kad_connected_fixture(
         .ok_or_else(|| eyre!("connection progress ended"))?;
     drop(established);
     assert_eq!(fixture.peer1.network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+    let own = fixture.peer1.network.get_peer_record();
+    fixture.peer1.network.swarm.behaviour_mut().kademlia.store_mut().put(own)?;
     Ok(fixture)
 }
 
@@ -3619,8 +3621,8 @@ async fn expired_kad_pending_protocol_ban_cannot_promote_identity() -> eyre::Res
         "the protocol ban must mark the live connection Disconnecting"
     );
     assert!(
-        !manager.peer_banned(&source),
-        "the pending ban is applied after the last connection close"
+        manager.peer_banned(&source),
+        "the fatal reputation and temporary ban must reject records before connection close"
     );
     assert!(peer1.network.swarm.is_connected(&source));
     let connected = manager.connected_peers();
@@ -3631,7 +3633,38 @@ async fn expired_kad_pending_protocol_ban_cannot_promote_identity() -> eyre::Res
     assert!(!manager.is_connected(&source));
     assert_eq!(manager.connected_peers(), connected);
     assert_eq!(manager.peer_score(&source), score);
+    assert!(manager.peer_banned(&source));
+    assert!(peer1.network.swarm.is_connected(&source));
+    assert!(peer1.network.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none());
+    Ok(())
+}
+
+/// A pending disconnect remains ineligible after its independent temporary ban expires.
+#[tokio::test]
+async fn expired_kad_pending_disconnect_cannot_promote_identity() -> eyre::Result<()> {
+    let TestTypes { mut peer1, peer2, _task_manager } = expired_kad_connected_fixture().await?;
+    let source = *peer2.network.swarm.local_peer_id();
+    let record = expired_kad_updated_record(&peer2)?;
+    let manager = &mut peer1.network.swarm.behaviour_mut().peer_manager;
+    manager.disconnect_peer(source, false);
+    assert!(!manager.is_connected(&source));
+    assert!(manager.peer_banned(&source));
+    assert!(manager.simulate_temporary_ban_expiry(&source));
     assert!(!manager.peer_banned(&source));
+    assert_eq!(manager.peer_to_bls(&source), None);
+    let connected = manager.connected_peers();
+    let score = manager.peer_score(&source);
+    let address_count = manager.peer_multiaddr_count(&source);
+    assert!(peer1.network.swarm.is_connected(&source));
+    assert!(peer1.network.peer_record_valid(&record).is_some());
+    peer1.network.process_kad_put_request(source, record.clone())?;
+    let manager = &peer1.network.swarm.behaviour().peer_manager;
+    assert_eq!(manager.peer_to_bls(&source), None);
+    assert!(!manager.is_connected(&source));
+    assert!(!manager.peer_banned(&source));
+    assert_eq!(manager.connected_peers(), connected);
+    assert_eq!(manager.peer_score(&source), score);
+    assert_eq!(manager.peer_multiaddr_count(&source), address_count);
     assert!(peer1.network.swarm.is_connected(&source));
     assert!(peer1.network.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none());
     Ok(())
@@ -3640,47 +3673,100 @@ async fn expired_kad_pending_protocol_ban_cannot_promote_identity() -> eyre::Res
 #[tokio::test]
 async fn expired_kad_invalid_or_rate_shed_record_cannot_confirm_identity() -> eyre::Result<()> {
     use crate::peers::MAX_PUT_RECORDS_PER_WINDOW;
+    use futures::TryStreamExt;
+
+    /// Independent invalid envelopes exercise each validation path before any ban.
+    enum InvalidExpiredRecord {
+        /// The record key cannot decode as a BLS public key.
+        Key,
+        /// The signature belongs to another BLS key.
+        Signature,
+        /// The signature belongs to a different chain domain.
+        Domain,
+    }
+
+    futures::stream::iter([
+        InvalidExpiredRecord::Key,
+        InvalidExpiredRecord::Signature,
+        InvalidExpiredRecord::Domain,
+    ])
+    .map(Ok)
+    .try_for_each(|invalid| async move {
+        let TestTypes { mut peer1, peer2, _task_manager } = expired_kad_connected_fixture().await?;
+        let source = *peer2.network.swarm.local_peer_id();
+        let mut valid = peer2.network.get_peer_record();
+        valid.expires = Some(std::time::Instant::now() - Duration::from_secs(1));
+        let record = match invalid {
+            InvalidExpiredRecord::Key => {
+                kad::Record { key: kad::RecordKey::new(&[0_u8]), ..valid.clone() }
+            }
+            InvalidExpiredRecord::Signature => {
+                let info = peer2.network.node_record.info.clone();
+                let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+                let bytes = encode(&(
+                    b"telcoin-network/node-record/v1".as_slice(),
+                    chain_id,
+                    0u8,
+                    0u16,
+                    &info,
+                ));
+                let signature = peer1.config.key_config().request_signature_direct(&bytes);
+                kad::Record { value: encode(&NodeRecord { info, signature }), ..valid.clone() }
+            }
+            InvalidExpiredRecord::Domain => {
+                let info = peer2.network.node_record.info.clone();
+                let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+                let bytes = encode(&(
+                    b"telcoin-network/node-record/v1".as_slice(),
+                    chain_id + 1,
+                    0u8,
+                    0u16,
+                    &info,
+                ));
+                let signature = peer2.config.key_config().request_signature_direct(&bytes);
+                kad::Record { value: encode(&NodeRecord { info, signature }), ..valid.clone() }
+            }
+        };
+        assert!(!peer1.network.swarm.behaviour().peer_manager.peer_banned(&source));
+        assert!(peer1.network.swarm.behaviour().peer_manager.is_connected(&source));
+        assert!(peer1.network.swarm.is_connected(&source));
+        assert!(peer1.network.peer_record_valid(&valid).is_some());
+        assert!(peer1.network.peer_record_valid(&record).is_none());
+        peer1.network.process_kad_put_request(source, record)?;
+        let manager = &peer1.network.swarm.behaviour().peer_manager;
+        assert!(manager.peer_banned(&source));
+        assert!(!manager.is_connected(&source));
+        let ban_threshold =
+            peer1.config.network_config().peer_config().score_config.min_score_before_ban;
+        assert!(manager.peer_score(&source).is_some_and(|score| score <= ban_threshold));
+        assert_eq!(peer1.network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+        assert!(peer1.network.swarm.behaviour_mut().kademlia.store_mut().get(&valid.key).is_none());
+        Ok::<_, eyre::Report>(())
+    })
+    .await?;
+
     let TestTypes { mut peer1, peer2, _task_manager } = expired_kad_connected_fixture().await?;
     let source = *peer2.network.swarm.local_peer_id();
     let mut valid = peer2.network.get_peer_record();
     valid.expires = Some(std::time::Instant::now() - Duration::from_secs(1));
-    let mut bad_key = valid.clone();
-    bad_key.key = kad::RecordKey::new(&[0_u8]);
-    let mut bad_signature = valid.clone();
-    bad_signature.value[0] ^= 1;
-    let info = peer2.network.node_record.info.clone();
-    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
-    let bytes =
-        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id + 1, 0u8, 0u16, &info));
-    let signature = peer2.config.key_config().request_signature_direct(&bytes);
-    let bad_domain =
-        kad::Record { value: encode(&NodeRecord { info, signature }), ..valid.clone() };
-    [bad_key, bad_signature, bad_domain].into_iter().try_for_each(
-        |record| -> eyre::Result<()> {
-            assert!(peer1.network.peer_record_valid(&record).is_none());
-            peer1.network.process_kad_put_request(source, record)?;
-            assert_eq!(peer1.network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
-            assert!(peer1
-                .network
-                .swarm
-                .behaviour_mut()
-                .kademlia
-                .store_mut()
-                .get(&valid.key)
-                .is_none());
-            Ok(())
-        },
-    )?;
-    // Fill the remaining allowance directly, without admitting a valid identity.
-    (3..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+    assert!(!peer1.network.swarm.behaviour().peer_manager.peer_banned(&source));
+    assert!(peer1.network.peer_record_valid(&valid).is_some());
+    // Exhaust a fresh source's allowance without admitting an identity or assessing penalties.
+    (0..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
         assert!(matches!(
             peer1.network.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source),
             PutRecordRate::Allowed
         ));
     });
+    assert!(matches!(
+        peer1.network.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source),
+        PutRecordRate::Shed
+    ));
+    assert!(!peer1.network.swarm.behaviour().peer_manager.peer_banned(&source));
     let score = peer1.network.swarm.behaviour().peer_manager.peer_score(&source);
     peer1.network.process_kad_put_request(source, valid.clone())?;
     assert_eq!(peer1.network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+    assert!(!peer1.network.swarm.behaviour().peer_manager.peer_banned(&source));
     assert_eq!(peer1.network.swarm.behaviour().peer_manager.peer_score(&source), score);
     assert!(peer1.network.swarm.behaviour_mut().kademlia.store_mut().get(&valid.key).is_none());
     Ok(())
@@ -3749,6 +3835,7 @@ async fn expired_kad_relay_cannot_replace_pinned_or_own_record() -> eyre::Result
         .store_mut()
         .get(&own.key)
         .map(|stored| stored.value.clone());
+    assert_eq!(stored_own, Some(own.value.clone()));
     let expired_own = kad::Record { expires: record.expires, ..own };
     peer1.network.process_kad_put_request(source, expired_own.clone())?;
     assert_eq!(
@@ -3767,8 +3854,7 @@ async fn expired_kad_relay_cannot_replace_pinned_or_own_record() -> eyre::Result
 
 #[tokio::test]
 async fn expired_kad_banned_source_or_publisher_cannot_confirm_identity() -> eyre::Result<()> {
-    let TestTypes { mut peer1, peer2, _task_manager } =
-        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let TestTypes { mut peer1, peer2, _task_manager } = expired_kad_connected_fixture().await?;
     let source = *peer2.network.swarm.local_peer_id();
     let mut record = peer2.network.get_peer_record();
     record.expires = Some(std::time::Instant::now() - Duration::from_secs(1));
