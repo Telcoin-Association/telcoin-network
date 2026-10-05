@@ -539,6 +539,8 @@ impl ConsensusChain {
         // here would reject the re-entry and strand the node. Keeping the
         // original pack is load-bearing: this epoch's consensus output must be
         // decoded and verified against the committee the epoch started with.
+        // For an imported epoch that snapshot is the serving peer's copy,
+        // authenticated on its BLS key set only.
         if old_pack.epoch() == committee.epoch() && !old_pack.is_static() {
             // TRIPWIRE (diagnostics only): the pack's persisted committee is the epoch-START
             // snapshot, and the entry `committee` is derived from a read pinned to that same
@@ -2294,6 +2296,7 @@ mod test {
     use crate::consensus::{ConsensusSlot, LatestConsensus};
     use std::{
         collections::BTreeMap,
+        num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -2303,7 +2306,7 @@ mod test {
 
     use tn_types::{
         test_genesis, Authority, BlsPublicKey, Committee, ConsensusHeader, ConsensusHeaderDigest,
-        ConsensusNumHash, Epoch, EpochRecord, Hash as _,
+        ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _,
     };
 
     use crate::{
@@ -4482,6 +4485,210 @@ mod test {
                 .expect("imported output readable after restart");
             compare_outputs(&got, output);
         }
+    }
+
+    /// Returns `committee` as a node's own chain read may see it while agreeing with a peer on
+    /// everything import authenticates: same epoch and BLS keys, but every execution address
+    /// changed and, where the multi-worker fork is active for its epoch, one more worker. Before
+    /// the fork (adiri builds) the committee layout encodes a single worker, so only the addresses
+    /// drift. Imported outputs still decode under it because the worker count never shrinks.
+    fn drifted(committee: &Committee) -> Committee {
+        use tn_types::forks::multi_workers_fork_active;
+
+        let authorities = committee
+            .authorities()
+            .into_iter()
+            .map(|authority| {
+                let key = *authority.protocol_key();
+                // the bitwise complement differs from the original address in every byte
+                (key, Authority::new_for_test(key, !authority.execution_address()))
+            })
+            .collect();
+        // the pre-fork layout refuses to encode any worker count but one
+        let added = if multi_workers_fork_active(committee.epoch()) { 1 } else { 0 };
+        let workers = NonZeroUsize::new(committee.number_of_workers() + added)
+            .expect("a positive worker count");
+        let drifted =
+            Committee::new_for_test(authorities, committee.epoch(), committee.bootstrap_servers())
+                .with_num_workers(workers);
+        assert_eq!(drifted.bls_keys(), committee.bls_keys(), "drift must keep the BLS keys");
+        assert_ne!(&drifted, committee, "drift must change the committee");
+        drifted
+    }
+
+    /// Asserts each of `expected` reads back from `chain`'s current pack with the same header and
+    /// batches, and with every batch producer resolved through `local`: the chain-derived
+    /// committee the pack was opened with, not the peer-served meta on disk.
+    async fn assert_outputs_decode_with(
+        chain: &ConsensusChain,
+        local: &Committee,
+        expected: &[ConsensusOutput],
+    ) {
+        for want in expected {
+            let number = want.number();
+            let got =
+                chain.get_consensus_output_current(number).await.expect("imported output readable");
+            assert_eq!(got.digest(), want.digest(), "output {number} header");
+            assert_eq!(got.batch_digests(), want.batch_digests(), "output {number} batch digests");
+            let producer = local
+                .authority(got.leader().author())
+                .expect("leader is in the local committee")
+                .execution_address();
+            assert_eq!(got.batches().len(), want.batches().len(), "output {number} batch count");
+            for (got_batch, want_batch) in got.batches().iter().zip(want.batches()) {
+                assert_eq!(got_batch.batches, want_batch.batches, "output {number} batches");
+                assert_eq!(got_batch.address, producer, "output {number} batch producer");
+            }
+        }
+    }
+
+    /// A node that imports a future epoch before reaching it opens that pack through `new_epoch`
+    /// once it gets there. Its committee comes from its own chain read and may differ from the
+    /// peer-served pack meta in fields import never authenticates (execution addresses, worker
+    /// count). The open must accept that drift, keep the chain-derived committee, and serve the
+    /// imported outputs.
+    #[tokio::test]
+    async fn test_new_epoch_opens_imported_future_epoch_with_drifted_committee() {
+        // A source chain with a complete epoch 1 behind a complete epoch 0.
+        let source_dir = TempDir::with_prefix("test_drift_future_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let committee1 = committee.advance_epoch_for_test(1);
+        let (source, record0, mut parent) =
+            chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source epoch 0");
+        source.new_epoch(record0.clone(), committee1.clone()).await.expect("source epoch 1");
+        let mut outputs = Vec::new();
+        for n in 4..=6u64 {
+            let output = make_test_output(&committee1, (n as usize) % 4, chain.clone(), n, parent);
+            parent = output.digest();
+            outputs.push(output.clone());
+            source.save_consensus_output(output).await.expect("save epoch-1 output");
+        }
+        source.persist_current().await.expect("persist source epoch 1");
+        let record1 = EpochRecord {
+            epoch: 1,
+            committee: committee1.bls_keys().iter().copied().collect(),
+            next_committee: committee1.bls_keys().iter().copied().collect(),
+            parent_hash: record0.digest(),
+            final_consensus: ConsensusNumHash { number: 6, hash: parent },
+            ..Default::default()
+        };
+        source.epochs().save_record(record0.clone()).await.expect("save epoch-0 record");
+        source.epochs().save_record(record1.clone()).await.expect("save epoch-1 record");
+
+        // The target imports epoch 1 while still in epoch 0.
+        let target_dir = TempDir::with_prefix("test_drift_future_target").expect("temp dir");
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = source.get_epoch_stream(1).await.expect("source epoch-1 stream");
+        target
+            .stream_import(stream.take(len), &record1, &record0, Duration::from_secs(5))
+            .await
+            .expect("import future epoch 1");
+
+        let local1 = drifted(&committee1);
+        target
+            .new_epoch(record0, local1.clone())
+            .await
+            .expect("new_epoch must open the imported epoch-1 pack despite committee drift");
+        assert_eq!(target.current_pack().epoch(), 1);
+        assert_eq!(target.current_pack().committee(), &local1, "pack keeps the chain committee");
+        assert_outputs_decode_with(&target, &local1, &outputs).await;
+    }
+
+    /// Importing the epoch a node is in swaps its current pack for a static, read-only copy of
+    /// the peer's pack. The next `new_epoch` for that epoch reopens it for appending with the
+    /// node's own chain-derived committee, which may differ from the imported meta in fields
+    /// import never authenticates. The reopen must accept that drift and keep serving the
+    /// imported outputs.
+    #[tokio::test]
+    async fn test_new_epoch_replaces_static_current_import_with_drifted_committee() {
+        let source_dir = TempDir::with_prefix("test_drift_static_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let mut outputs = Vec::new();
+        for n in 1..=3u64 {
+            outputs.push(source.get_consensus_output_current(n).await.expect("source output"));
+        }
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let local = drifted(&committee);
+        let target_dir = TempDir::with_prefix("test_drift_static_target").expect("temp dir");
+        let target = ConsensusChain::new(target_dir.path().to_owned(), local.clone()).unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+        target
+            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import current epoch 0");
+        assert!(
+            target.current_pack().is_static(),
+            "importing the current epoch installs it static"
+        );
+
+        target
+            .new_epoch(previous_epoch, local.clone())
+            .await
+            .expect("new_epoch must reopen the imported current epoch despite committee drift");
+        assert!(!target.current_pack().is_static(), "new_epoch must replace the static pack");
+        assert_eq!(target.current_pack().epoch(), 0);
+        assert_eq!(target.current_pack().committee(), &local, "pack keeps the chain committee");
+        assert_outputs_decode_with(&target, &local, &outputs).await;
+    }
+
+    /// A node that imported epoch 0 without replaying it still has `latest_consensus` at `0/0`,
+    /// so on restart `ConsensusChain::new` opens epoch 0 with `open_append` against the imported
+    /// meta, using its own committee. That committee may differ from the imported meta in fields
+    /// import never authenticates; startup must accept the drift and serve the imported outputs.
+    #[tokio::test]
+    async fn test_new_restarts_after_epoch0_import_with_drifted_committee() {
+        let source_dir = TempDir::with_prefix("test_drift_restart_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let mut outputs = Vec::new();
+        for n in 1..=3u64 {
+            outputs.push(source.get_consensus_output_current(n).await.expect("source output"));
+        }
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let local = drifted(&committee);
+        let target_dir = TempDir::with_prefix("test_drift_restart_target").expect("temp dir");
+        {
+            let target = ConsensusChain::new(target_dir.path().to_owned(), local.clone()).unwrap();
+            use tokio::io::AsyncReadExt as _;
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+            target
+                .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+                .await
+                .expect("import epoch 0");
+            // no replay: latest_consensus stays at 0/0, so the restart takes the epoch-0 branch
+        }
+
+        let reopened = ConsensusChain::new(target_dir.path().to_owned(), local.clone())
+            .expect("restart must open the imported epoch 0 despite committee drift");
+        assert_eq!(reopened.current_pack().epoch(), 0);
+        assert_eq!(reopened.current_pack().committee(), &local, "pack keeps the chain committee");
+        assert_outputs_decode_with(&reopened, &local, &outputs).await;
     }
 
     /// `current_data_len` must reject a mismatched epoch: the state export pairs the returned
