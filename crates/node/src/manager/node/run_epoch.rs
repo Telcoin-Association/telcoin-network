@@ -637,10 +637,10 @@ where
         while let Some(mut output) = consensus_output.recv().await {
             // The engine executes exactly the sequence forwarded here, so enforce continuity
             // against the last number that actually reached it. A stale output (already
-            // forwarded, e.g. replayed from the DB) would double-execute; a gap (e.g. the
-            // broadcast lagged this receiver) would silently diverge execution from
-            // consensus. Every output is saved to the consensus DB before it is broadcast,
-            // so erroring here lets the restart path replay the gap from the DB.
+            // forwarded, e.g. replayed from the DB) would double-execute; a gap would silently
+            // diverge execution from consensus. The `consensus_output` queue never drops an
+            // output, so a gap means an output was saved to the consensus DB but never sent;
+            // erroring here lets the restart path replay it from the DB.
             match check_output_continuity(self.last_forwarded_consensus_number, output.number()) {
                 OutputContinuity::Stale => {
                     warn!(

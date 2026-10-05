@@ -293,11 +293,12 @@ where
     /// When the epoch ends early (e.g. a CVV that is behind), output may have
     /// been committed without yet reaching the engine; forwarding it here keeps
     /// it from being orphaned. Two phases cover the two ways output can be left
-    /// behind. Phase 1 drains whatever is still queued in the broadcast channel.
-    /// Phase 2 backfills the gap the channel cannot cover: during subscriber
-    /// shutdown, output is saved to the pack-file DB but may never be
-    /// broadcast, so we load every entry between `last_forwarded_consensus_number`
-    /// and the DB latest and forward those too.
+    /// behind. Phase 1 drains whatever is still queued in the `consensus_output`
+    /// queue. Phase 2 backfills the gap the queue cannot cover: during subscriber
+    /// shutdown, output is saved to the pack-file DB but may never be sent (the
+    /// subscriber can be aborted while its send waits on a full queue), so we load
+    /// every entry between `last_forwarded_consensus_number` and the DB latest and
+    /// forward those too.
     ///
     /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
     /// past the epoch boundary, signalling that an epoch-boundary output was
@@ -315,7 +316,7 @@ where
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) -> Option<ConsensusHeaderDigest> {
-        // Phase 1: Drain broadcast channel (existing behavior)
+        // Phase 1: drain the consensus_output queue
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                 // stash the boundary header for the caller's close-and-write sequence
@@ -336,10 +337,11 @@ where
             }
         }
 
-        // Phase 2: Check DB for outputs saved during subscriber shutdown drain.
+        // Phase 2: check the DB for outputs saved during subscriber shutdown drain.
         // During shutdown, the subscriber saves outputs to the pack file DB but may not
-        // broadcast them through the channel. Scan for any gap between the last output
-        // we forwarded and the DB latest, loading missing entries from the pack file.
+        // send them through the queue (it can be aborted while its send waits on a full
+        // queue). Scan for any gap between the last output we forwarded and the DB latest,
+        // loading missing entries from the pack file.
         let latest_db = self.consensus_chain.latest_consensus_number();
         let last_sent = self.last_forwarded_consensus_number;
         if latest_db > last_sent {
