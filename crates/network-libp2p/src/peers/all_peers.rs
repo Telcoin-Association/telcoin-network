@@ -216,14 +216,36 @@ impl AllPeers {
             .flatten()
             .into_iter()
             .for_each(|displaced| self.release_displaced_record(&displaced));
-        self.evict(&confirmed)
+        let prior_confirmed = self.evict(&confirmed);
+        prior_confirmed
+            .as_ref()
             .into_iter()
-            .for_each(|displaced| self.release_displaced_record(&displaced));
+            .for_each(|displaced| self.release_displaced_record(displaced));
         let mut peer = Peer::new_trusted(bls_public_key, network_key);
+        prior_confirmed
+            .as_ref()
+            .into_iter()
+            .for_each(|record| peer.retain_connection_state(record));
         protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
         if peer.reputation().banned() {
             peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
             self.banned_peers.add_banned_peer(&peer);
+        } else {
+            match peer.connection_status() {
+                ConnectionStatus::Disconnected { .. } => {
+                    self.disconnected_peers = self.disconnected_peers.saturating_add(1);
+                }
+                // A trust grant still forgives a load-only ban, as before.
+                ConnectionStatus::Banned { .. } => {
+                    peer.set_connection_status(ConnectionStatus::Unknown);
+                }
+                ConnectionStatus::Disconnecting { .. } => {
+                    peer.set_connection_status(ConnectionStatus::Disconnecting { banned: false });
+                }
+                ConnectionStatus::Connected { .. }
+                | ConnectionStatus::Dialing { .. }
+                | ConnectionStatus::Unknown => {}
+            }
         }
         let previous_key = self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
